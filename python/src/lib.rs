@@ -47,7 +47,7 @@ impl Context {
     }
 
     #[pyo3(signature = (label = None))]
-    fn snapshot(&self, label: Option<&str>) -> String {
+    fn snapshot(&mut self, label: Option<&str>) -> String {
         self.inner.snapshot(label)
     }
 
