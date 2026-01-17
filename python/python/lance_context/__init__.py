@@ -1,0 +1,7 @@
+from __future__ import annotations
+
+from ._internal import Context, version as _version
+
+__all__ = ["Context", "__version__"]
+
+__version__ = _version()
