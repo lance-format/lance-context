@@ -1,0 +1,15 @@
+[package]
+name = "lance-context-python"
+version = "0.1.0"
+edition = "2021"
+authors = ["Lance Devs <dev@lancedb.com>"]
+publish = false
+
+[lib]
+name = "_internal"
+crate-type = ["cdylib"]
+
+[dependencies]
+lance-context = { path = "../rust/lance-context" }
+pyo3 = { version = "0.25", features = ["extension-module", "abi3-py39", "py-clone"] }
+

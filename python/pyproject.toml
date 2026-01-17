@@ -1,0 +1,57 @@
+[project]
+name = "lance-context"
+version = "0.1.0"
+dependencies = [
+    "pylance==1.0.2",
+    "lancedb==0.26.1",
+    "lance-namespace==0.4.5",
+    "lance-graph==0.4.0",
+]
+description = "Multimodal, versioned context storage for agentic workflows"
+authors = [{ name = "Lance Devs", email = "dev@lancedb.com" }]
+license = { file = "LICENSE" }
+repository = "https://github.com/lancedb/lance-context"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+keywords = ["context", "memory", "multimodal", "lance", "agents"]
+categories = ["database", "science"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering",
+]
+
+[tool.maturin]
+python-source = "python"
+python-packages = ["lance_context"]
+module-name = "lance_context._internal"
+
+[build-system]
+requires = ["maturin>=1.4"]
+build-backend = "maturin"
+
+[project.optional-dependencies]
+tests = ["pytest", "ruff"]
+dev = ["ruff", "pyright"]
+
+[tool.ruff]
+lint.select = ["F", "E", "W", "I", "G", "TCH", "PERF", "B019"]
+
+[tool.pyright]
+pythonVersion = "3.13"
+include = ["python/lance_context/__init__.py"]
+reportMissingTypeStubs = "warning"
+reportImportCycles = "error"
+reportUnusedImport = "error"
+reportPropertyTypeMismatch = "error"
+reportUnnecessaryCast = "error"

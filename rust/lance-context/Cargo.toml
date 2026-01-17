@@ -1,0 +1,18 @@
+[package]
+name = "lance-context"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Lance Devs <dev@lancedb.com>"]
+repository = "https://github.com/lancedb/lance-context"
+readme = "README.md"
+description = "Multimodal, versioned context storage for agentic workflows"
+keywords = ["context", "multimodal", "lance", "agents", "storage"]
+categories = ["database", "data-structures", "science"]
+
+[dependencies]
+lance = "1.0.0"
+lancedb = "0.23.1"
+lance-namespace = "1.0.1"
+lance-graph = "0.4.0"
+serde = { version = "1", features = ["derive"] }
