@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from ._internal import Context
-from ._internal import version as _version
+from ._internal import Context  # pyright: ignore[reportMissingImports]
+from ._internal import version as _version  # pyright: ignore[reportMissingImports]
 
 __all__ = ["Context", "__version__"]
 
