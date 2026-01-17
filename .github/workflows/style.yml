@@ -38,6 +38,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust/lance-context
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y protobuf-compiler
       - name: Clippy
         run: cargo clippy --manifest-path rust/lance-context/Cargo.toml --all-targets -- -D warnings
 
