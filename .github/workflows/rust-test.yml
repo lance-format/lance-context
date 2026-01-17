@@ -39,6 +39,10 @@ jobs:
         with:
           workspaces: rust/lance-context
           cache-targets: false
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y protobuf-compiler
       - name: Build tests
         run: cargo test --manifest-path rust/lance-context/Cargo.toml --no-run
       - name: Run unit tests
