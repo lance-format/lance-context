@@ -12,6 +12,7 @@ categories = ["database", "data-structures", "science"]
 
 [dependencies]
 arrow-array = "56.2.0"
+arrow-ipc = "56.2.0"
 arrow-schema = "56.2.0"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 lance = "1.0.0"

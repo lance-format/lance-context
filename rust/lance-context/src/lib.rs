@@ -2,6 +2,7 @@
 
 mod context;
 mod record;
+pub mod serde;
 mod store;
 
 pub use context::{Context, ContextEntry, Snapshot};
