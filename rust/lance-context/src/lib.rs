@@ -8,7 +8,7 @@ use arrow_array::builder::{
     StringBuilder, StringDictionaryBuilder, StructBuilder, TimestampMicrosecondBuilder,
 };
 use arrow_array::types::Int8Type;
-use arrow_array::{ArrayRef, DictionaryArray, RecordBatch, RecordBatchIterator};
+use arrow_array::{ArrayRef, RecordBatch, RecordBatchIterator};
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Schema, TimeUnit};
 use chrono::{DateTime, Utc};
 use lance::dataset::{Dataset, WriteMode, WriteParams};
@@ -77,8 +77,10 @@ impl ContextStore {
 
         let batch = Self::records_to_batch(entries)?;
         let schema = batch.schema();
-        let reader =
-            RecordBatchIterator::new(vec![Ok::<RecordBatch, ArrowError>(batch)].into_iter(), schema);
+        let reader = RecordBatchIterator::new(
+            vec![Ok::<RecordBatch, ArrowError>(batch)].into_iter(),
+            schema,
+        );
         self.dataset.append(reader, None).await?;
 
         Ok(self.dataset.manifest.version)
@@ -96,21 +98,20 @@ impl ContextStore {
             ),
             Field::new(
                 "role",
-                DataType::Dictionary(
-                    Box::new(DataType::Int8),
-                    Box::new(DataType::Utf8),
-                ),
+                DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
                 false,
             ),
             Field::new(
                 "state_metadata",
-                DataType::Struct(vec![
-                    Field::new("step", DataType::Int32, true),
-                    Field::new("active_plan_id", DataType::Utf8, true),
-                    Field::new("tokens_used", DataType::Int32, true),
-                    Field::new("custom", DataType::Utf8, true),
-                ]
-                .into()),
+                DataType::Struct(
+                    vec![
+                        Field::new("step", DataType::Int32, true),
+                        Field::new("active_plan_id", DataType::Utf8, true),
+                        Field::new("tokens_used", DataType::Int32, true),
+                        Field::new("custom", DataType::Utf8, true),
+                    ]
+                    .into(),
+                ),
                 true,
             ),
             Field::new("content_type", DataType::Utf8, false),
@@ -234,8 +235,7 @@ impl ContextStore {
         let id_array: ArrayRef = Arc::new(id_builder.finish());
         let run_id_array: ArrayRef = Arc::new(run_id_builder.finish());
         let created_at_array: ArrayRef = Arc::new(created_at_builder.finish());
-        let role_array: ArrayRef =
-            Arc::new(DictionaryArray::<Int8Type>::from(role_builder.finish()));
+        let role_array: ArrayRef = Arc::new(role_builder.finish());
         let content_type_array: ArrayRef = Arc::new(content_type_builder.finish());
         let text_array: ArrayRef = Arc::new(text_builder.finish());
         let binary_array: ArrayRef = Arc::new(binary_builder.finish());
