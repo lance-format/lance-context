@@ -15,12 +15,67 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-C debuginfo=1"
+  RUSTFLAGS: "-C debuginfo=0 -C codegen-units=16"
+  CARGO_TARGET_DIR: ${{ github.workspace }}/.cargo-target
 
 jobs:
+  build-wheel:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - name: Cache Rust build (shared)
+        uses: actions/cache@v4
+        with:
+          path: |
+            .cargo-target
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y protobuf-compiler
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+      - name: Setup sccache
+        uses: Mozilla-Actions/sccache-action@v0.0.9
+      - name: Configure sccache
+        run: echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+      - name: Cache uv downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: ${{ runner.os }}-uv-${{ hashFiles('python/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-uv-
+      - name: Build wheel (Debug Mode)
+        working-directory: python
+        run: |
+          uv venv
+          source .venv/bin/activate
+          uv pip install maturin[patchelf]
+          maturin build -o dist
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-wheel
+          path: python/dist/*.whl
+
   test:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    needs: build-wheel
     strategy:
       matrix:
         python-version: ["3.11"]
@@ -34,28 +89,50 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache: false
-      - uses: Swatinem/rust-cache@v2
+      - name: Cache Rust build (shared)
+        uses: actions/cache@v4
         with:
-          workspaces: python
-          cache-targets: false
+          path: |
+            .cargo-target
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
       - name: Install dependencies
         run: |
           sudo apt update
           sudo apt install -y protobuf-compiler
       - name: Install uv
         uses: astral-sh/setup-uv@v3
+      - name: Setup sccache
+        uses: Mozilla-Actions/sccache-action@v0.0.9
+      - name: Configure sccache
+        run: echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+      - name: Cache uv downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: ${{ runner.os }}-uv-${{ hashFiles('python/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-uv-
       - name: Create virtual environment and install dependencies
         working-directory: python
         run: |
           uv venv
           source .venv/bin/activate
-          uv pip install maturin[patchelf]
-          uv pip install -e .[tests]
-      - name: Build Python extension
+          uv pip install pytest
+      - name: Download wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: python-wheel
+          path: python/dist
+      - name: Install wheel
         working-directory: python
         run: |
           source .venv/bin/activate
-          maturin develop
+          uv pip install dist/*.whl
+
       - name: Run tests
         working-directory: python
         run: |
@@ -80,6 +157,17 @@ jobs:
           python-version: "3.11"
       - name: Install uv
         uses: astral-sh/setup-uv@v3
+      - name: Setup sccache
+        uses: Mozilla-Actions/sccache-action@v0.0.9
+      - name: Configure sccache
+        run: echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+      - name: Cache uv downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: ${{ runner.os }}-uv-${{ hashFiles('python/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-uv-
       - name: Install linting tools
         working-directory: python
         run: |

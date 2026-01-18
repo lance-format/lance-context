@@ -13,7 +13,7 @@ Run project checks locally, then prepare and open a PR with a clear title and su
 1. Ensure you are on a feature branch (not `main`).
 2. Run local checks via the script in `scripts/`.
 3. Draft a PR title/body using the template below.
-4. If `gh` is available and authenticated, surface the exact `gh pr create` command (do not execute it). Share it with the user so they can run it locally.
+4. If `gh` is available and authenticated, run `gh pr create` yourself; otherwise, surface the exact command for the user to execute manually.
 
 ## Local checks
 
@@ -49,10 +49,12 @@ If you need to check auth status, you may still run:
 gh auth status
 ```
 
-When ready, construct (but do not execute) the PR command:
+When ready:
+
+- If `gh` is ready to use, execute:
 
 ```bash
 gh pr create --title "<title>" --body "<body>"
 ```
 
-Return this command to the user so they can launch it in their own shell.
+- If `gh` is missing or fails, print the command instead so the user can run it locally.

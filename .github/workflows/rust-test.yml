@@ -19,6 +19,7 @@ env:
   RUSTFLAGS: "-C debuginfo=1"
   RUST_BACKTRACE: "1"
   CARGO_INCREMENTAL: "0"
+  CARGO_TARGET_DIR: ${{ github.workspace }}/.cargo-target
 
 jobs:
   test:
@@ -35,10 +36,16 @@ jobs:
         run: |
           rustup toolchain install ${{ matrix.toolchain }}
           rustup default ${{ matrix.toolchain }}
-      - uses: Swatinem/rust-cache@v2
+      - name: Cache Rust build (shared)
+        uses: actions/cache@v4
         with:
-          workspaces: rust/lance-context
-          cache-targets: false
+          path: |
+            .cargo-target
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
       - name: Install dependencies
         run: |
           sudo apt update
