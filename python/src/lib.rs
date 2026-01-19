@@ -54,6 +54,10 @@ impl Context {
         self.inner.entries()
     }
 
+    fn version(&self) -> u64 {
+        self.store.version()
+    }
+
     #[pyo3(signature = (role, content, data_type = None))]
     fn add(
         &mut self,
@@ -116,8 +120,12 @@ impl Context {
         }
     }
 
-    fn checkout(&mut self, snapshot_id: &str) {
-        self.inner.checkout(snapshot_id);
+    fn checkout(&mut self, version_id: u64) -> PyResult<()> {
+        self.runtime
+            .block_on(self.store.checkout(version_id))
+            .map_err(to_py_err)?;
+        self.run_id = new_run_id();
+        Ok(())
     }
 }
 

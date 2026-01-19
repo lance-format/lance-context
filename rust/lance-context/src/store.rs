@@ -61,6 +61,18 @@ impl ContextStore {
         Ok(self.dataset.manifest.version)
     }
 
+    /// Current dataset version.
+    pub fn version(&self) -> u64 {
+        self.dataset.manifest.version
+    }
+
+    /// Checkout a specific dataset version.
+    pub async fn checkout(&mut self, version_id: u64) -> LanceResult<()> {
+        let dataset = self.dataset.checkout_version(version_id).await?;
+        self.dataset = dataset;
+        Ok(())
+    }
+
     /// Lance schema for the context store.
     pub fn schema() -> Schema {
         Schema::new(vec![
