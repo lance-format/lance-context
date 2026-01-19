@@ -23,9 +23,10 @@ Key motivations inspired by the broader Lance roadmap<sup>[1](https://github.com
 ## Project layout
 
 ```
-rust/lance-context     # Core Rust crate (ContextStore, schema, serialization)
-python/                # Python bindings, wheel build, and pytest suite
-python/tests/          # High-level integration tests
+crates/lance-context-core  # Pure Rust context engine (no Python deps)
+crates/lance-context       # Re-export crate consumed by downstream clients/bindings
+python/                    # PyO3 bindings, wheel build, and pytest suite
+python/tests/              # High-level integration tests
 ```
 
 ## Getting started
@@ -99,7 +100,7 @@ println!("Current version {}", store.version());
 ## Testing
 
 - `make test` – Python pytest suite (including persistence integration tests).
-- `cargo test --manifest-path rust/lance-context/Cargo.toml` – Rust unit tests.
+- `cargo test --manifest-path crates/lance-context-core/Cargo.toml` – Rust unit tests.
 - `python/.venv/bin/ruff check python/` and `python/.venv/bin/pyright` – linting/type checks.
 
 ## Roadmap
@@ -121,7 +122,7 @@ Contributions are welcome—feel free to comment on the issues above or open you
    make venv      # creates python/.venv using uv
    make install   # installs the package in editable mode with test extras
    make test      # runs pytest (python/tests/)
-   cargo test --manifest-path rust/lance-context/Cargo.toml
+   cargo test --manifest-path crates/lance-context-core/Cargo.toml
    ```
 4. Run linting/type checks: `python/.venv/bin/ruff check python/`, `python/.venv/bin/pyright`, and `~/.cargo/bin/cargo fmt -- --check`.
 5. Open a Pull Request with a clear summary of the change.
