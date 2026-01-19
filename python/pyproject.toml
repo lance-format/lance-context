@@ -49,7 +49,7 @@ lint.select = ["F", "E", "W", "I", "G", "TCH", "PERF", "B019"]
 
 [tool.pyright]
 pythonVersion = "3.13"
-include = ["python/lance_context/__init__.py"]
+include = ["python/lance_context/__init__.py", "python/lance_context/api.py"]
 reportMissingTypeStubs = "warning"
 reportImportCycles = "error"
 reportUnusedImport = "error"

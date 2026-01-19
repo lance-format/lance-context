@@ -10,6 +10,7 @@ name = "_internal"
 crate-type = ["cdylib"]
 
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 lance-context = { path = "../rust/lance-context" }
 pyo3 = { version = "0.25", features = ["extension-module", "abi3-py39", "py-clone"] }
-
+tokio = { version = "1", features = ["rt-multi-thread"] }

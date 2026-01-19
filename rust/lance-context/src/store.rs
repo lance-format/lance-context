@@ -203,6 +203,11 @@ impl ContextStore {
                 }
                 embedding_builder.append(true);
             } else {
+                // FixedSizeListBuilder requires padding values for null slots.
+                let values_builder = embedding_builder.values();
+                for _ in 0..DEFAULT_EMBEDDING_DIM {
+                    values_builder.append_null();
+                }
                 embedding_builder.append(false);
             }
         }
