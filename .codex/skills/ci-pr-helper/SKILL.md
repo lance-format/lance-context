@@ -57,4 +57,7 @@ When ready:
 gh pr create --title "<title>" --body "<body>"
 ```
 
+- Some environments emit a spurious `Unsupported subcommand 'pr'` warning before running
+  `gh`; ignore that message and continue with the command.
+
 - If `gh` is missing or fails, print the command instead so the user can run it locally.
