@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 from io import BytesIO
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -11,7 +12,6 @@ if str(PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT))
 
 lance = pytest.importorskip("lance")
-Image = pytest.importorskip("PIL.Image")
 
 from lance_context.api import Context
 
@@ -22,9 +22,9 @@ def _read_rows(uri: str, version: int | None = None) -> list[dict[str, object]]:
     return table.to_pylist()
 
 
-def _image_bytes(image: Image.Image, *, format: str | None = None) -> bytes:
+def _image_bytes(image: Any, *, format: str | None = None) -> bytes:
     buffer = BytesIO()
-    image.save(buffer, format=format or image.format or "PNG")
+    image.save(buffer, format=format or getattr(image, "format", None) or "PNG")
     return buffer.getvalue()
 
 
@@ -44,6 +44,7 @@ def test_text_round_trip(tmp_path: Path) -> None:
 
 
 def test_image_round_trip(tmp_path: Path) -> None:
+    Image = pytest.importorskip("PIL.Image")
     uri = tmp_path / "context.lance"
     ctx = Context.create(str(uri))
 
@@ -58,3 +59,24 @@ def test_image_round_trip(tmp_path: Path) -> None:
     assert record["text_payload"] is None
     assert record["content_type"] == "image/png"
     assert record["binary_payload"] == _image_bytes(image)
+
+
+def test_time_travel_checkout(tmp_path: Path) -> None:
+    uri = tmp_path / "context.lance"
+    ctx = Context.create(str(uri))
+
+    ctx.add("system", "first-entry")
+    version_first = ctx.version()
+
+    ctx.add("system", "second-entry")
+    version_second = ctx.version()
+    assert version_second >= version_first
+
+    ctx.checkout(version_first)
+
+    rows_versioned = _read_rows(str(uri), version=ctx.version())
+    assert len(rows_versioned) == 1
+    assert rows_versioned[0]["text_payload"] == "first-entry"
+
+    latest_rows = _read_rows(str(uri))
+    assert [row["text_payload"] for row in latest_rows] == ["first-entry", "second-entry"]
