@@ -6,7 +6,7 @@ on:
   pull_request:
     paths:
       - python/**
-      - rust/lance-context/**
+      - crates/**
       - .github/workflows/python-test.yml
 
 concurrency:
