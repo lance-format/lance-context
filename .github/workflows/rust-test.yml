@@ -5,7 +5,7 @@ on:
       - main
   pull_request:
     paths:
-      - rust/**
+      - crates/**
       - .github/workflows/rust-test.yml
       - Cargo.toml
       - Cargo.lock
@@ -51,8 +51,8 @@ jobs:
           sudo apt update
           sudo apt install -y protobuf-compiler
       - name: Build tests
-        run: cargo test --manifest-path rust/lance-context/Cargo.toml --no-run
+        run: cargo test -p lance-context-core --no-run
       - name: Run unit tests
-        run: cargo test --manifest-path rust/lance-context/Cargo.toml --lib
+        run: cargo test -p lance-context-core --lib
       - name: Run doc tests
-        run: cargo test --manifest-path rust/lance-context/Cargo.toml --doc
+        run: cargo test -p lance-context-core --doc
