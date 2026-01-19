@@ -1,0 +1,14 @@
+[workspace]
+members = [
+    "crates/lance-context-core",
+    "crates/lance-context",
+    "python",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.metadata]
+# reserved for future use

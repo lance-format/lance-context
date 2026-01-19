@@ -1,11 +1,11 @@
 [package]
-name = "lance-context"
+name = "lance-context-core"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Lance Devs <dev@lancedb.com>"]
 repository = "https://github.com/lancedb/lance-context"
-readme = "README.md"
+readme = "../../README.md"
 description = "Multimodal, versioned context storage for agentic workflows"
 keywords = ["context", "multimodal", "lance", "agents", "storage"]
 categories = ["database", "data-structures", "science"]
