@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-PACKAGE_ROOT = Path(__file__).resolve().parents[1] / "python" / "python"
+PACKAGE_ROOT = Path(__file__).resolve().parents[2] / "python" / "python"
 if str(PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT))
 
