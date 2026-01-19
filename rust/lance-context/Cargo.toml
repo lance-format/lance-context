@@ -20,3 +20,8 @@ lancedb = "0.23.1"
 lance-namespace = "1.0.1"
 lance-graph = "0.4.0"
 serde = { version = "1", features = ["derive"] }
+futures = "0.3"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread"] }

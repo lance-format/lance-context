@@ -5,15 +5,22 @@ use arrow_array::builder::{
     StringBuilder, StringDictionaryBuilder, StructBuilder, TimestampMicrosecondBuilder,
 };
 use arrow_array::types::Int8Type;
-use arrow_array::{ArrayRef, RecordBatch, RecordBatchIterator};
+use arrow_array::{
+    Array, ArrayRef, DictionaryArray, FixedSizeListArray, Float32Array, Int32Array,
+    LargeBinaryArray, LargeStringArray, RecordBatch, RecordBatchIterator, StringArray, StructArray,
+    TimestampMicrosecondArray,
+};
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Schema, TimeUnit};
+use chrono::DateTime;
+use futures::TryStreamExt;
 use lance::dataset::{Dataset, WriteMode, WriteParams};
 use lance::{Error as LanceError, Result as LanceResult};
 
-use crate::record::ContextRecord;
+use crate::record::{ContextRecord, SearchResult, StateMetadata};
 
 /// Embedding length used for the semantic index column.
 const DEFAULT_EMBEDDING_DIM: i32 = 1536;
+const DEFAULT_SEARCH_LIMIT: usize = 10;
 
 /// Persistent Lance-backed context store.
 #[derive(Clone)]
@@ -71,6 +78,40 @@ impl ContextStore {
         let dataset = self.dataset.checkout_version(version_id).await?;
         self.dataset = dataset;
         Ok(())
+    }
+
+    /// Perform a nearest-neighbor search over stored embeddings.
+    pub async fn search(
+        &self,
+        query: &[f32],
+        limit: Option<usize>,
+    ) -> LanceResult<Vec<SearchResult>> {
+        if query.len() != DEFAULT_EMBEDDING_DIM as usize {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "query length {} does not match embedding dimension {}",
+                query.len(),
+                DEFAULT_EMBEDDING_DIM
+            ))
+            .into());
+        }
+
+        let top_k = limit.unwrap_or(DEFAULT_SEARCH_LIMIT);
+        if top_k == 0 {
+            return Ok(Vec::new());
+        }
+
+        let query_array = Float32Array::from(query.to_vec());
+
+        let mut scanner = self.dataset.scan();
+        scanner.nearest("embedding", &query_array, top_k)?;
+        scanner.limit(Some(top_k as i64), Some(0))?;
+
+        let mut stream = scanner.try_into_stream().await?;
+        let mut results = Vec::new();
+        while let Some(batch) = stream.try_next().await? {
+            results.extend(batch_to_search_results(&batch)?);
+        }
+        Ok(results)
     }
 
     /// Lance schema for the context store.
@@ -251,5 +292,275 @@ impl ContextStore {
         )?;
 
         Ok(batch)
+    }
+}
+
+fn batch_to_search_results(batch: &RecordBatch) -> LanceResult<Vec<SearchResult>> {
+    let id_array = column_as::<StringArray>(batch, "id")?;
+    let run_id_array = column_as::<StringArray>(batch, "run_id")?;
+    let created_at_array = column_as::<TimestampMicrosecondArray>(batch, "created_at")?;
+    let role_array = column_as::<DictionaryArray<Int8Type>>(batch, "role")?;
+    let state_array = column_as::<StructArray>(batch, "state_metadata")?;
+    let content_type_array = column_as::<StringArray>(batch, "content_type")?;
+    let text_array = column_as::<LargeStringArray>(batch, "text_payload")?;
+    let binary_array = column_as::<LargeBinaryArray>(batch, "binary_payload")?;
+    let embedding_array = column_as::<FixedSizeListArray>(batch, "embedding")?;
+
+    let distance_column = batch.column_by_name("_distance").ok_or_else(|| {
+        LanceError::from(ArrowError::InvalidArgumentError(
+            "search results missing _distance column".to_string(),
+        ))
+    })?;
+    let distance_array = distance_column
+        .as_ref()
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .ok_or_else(|| {
+            LanceError::from(ArrowError::InvalidArgumentError(
+                "_distance column has unexpected data type".to_string(),
+            ))
+        })?;
+
+    let step_array = state_array
+        .column(0)
+        .as_ref()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .ok_or_else(|| {
+            LanceError::from(ArrowError::InvalidArgumentError(
+                "step column has unexpected data type".to_string(),
+            ))
+        })?;
+    let active_plan_array = state_array
+        .column(1)
+        .as_ref()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            LanceError::from(ArrowError::InvalidArgumentError(
+                "active_plan_id column has unexpected data type".to_string(),
+            ))
+        })?;
+    let tokens_used_array = state_array
+        .column(2)
+        .as_ref()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .ok_or_else(|| {
+            LanceError::from(ArrowError::InvalidArgumentError(
+                "tokens_used column has unexpected data type".to_string(),
+            ))
+        })?;
+    let custom_array = state_array
+        .column(3)
+        .as_ref()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            LanceError::from(ArrowError::InvalidArgumentError(
+                "custom column has unexpected data type".to_string(),
+            ))
+        })?;
+
+    let mut results = Vec::with_capacity(batch.num_rows());
+    for row in 0..batch.num_rows() {
+        let created_at =
+            DateTime::from_timestamp_micros(created_at_array.value(row)).ok_or_else(|| {
+                LanceError::from(ArrowError::InvalidArgumentError(format!(
+                    "invalid timestamp value {}",
+                    created_at_array.value(row)
+                )))
+            })?;
+
+        let state_metadata = if state_array.is_null(row) {
+            None
+        } else {
+            Some(StateMetadata {
+                step: if step_array.is_null(row) {
+                    None
+                } else {
+                    Some(step_array.value(row))
+                },
+                active_plan_id: if active_plan_array.is_null(row) {
+                    None
+                } else {
+                    Some(active_plan_array.value(row).to_string())
+                },
+                tokens_used: if tokens_used_array.is_null(row) {
+                    None
+                } else {
+                    Some(tokens_used_array.value(row))
+                },
+                custom: if custom_array.is_null(row) {
+                    None
+                } else {
+                    Some(custom_array.value(row).to_string())
+                },
+            })
+        };
+
+        let text_payload = if text_array.is_null(row) {
+            None
+        } else {
+            Some(text_array.value(row).to_string())
+        };
+
+        let binary_payload = if binary_array.is_null(row) {
+            None
+        } else {
+            Some(binary_array.value(row).to_vec())
+        };
+
+        let embedding = if embedding_array.is_null(row) {
+            None
+        } else {
+            Some(embedding_from_list(embedding_array, row)?)
+        };
+
+        let role = if role_array.is_null(row) {
+            return Err(LanceError::from(ArrowError::InvalidArgumentError(
+                "role column contains null values".to_string(),
+            )));
+        } else {
+            let role_values = role_array
+                .values()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    LanceError::from(ArrowError::InvalidArgumentError(
+                        "role dictionary values are not strings".to_string(),
+                    ))
+                })?;
+            let key = role_array.keys().value(row) as usize;
+            role_values.value(key).to_string()
+        };
+
+        let record = ContextRecord {
+            id: id_array.value(row).to_string(),
+            run_id: run_id_array.value(row).to_string(),
+            created_at,
+            role,
+            state_metadata,
+            content_type: content_type_array.value(row).to_string(),
+            text_payload,
+            binary_payload,
+            embedding,
+        };
+
+        results.push(SearchResult {
+            record,
+            distance: distance_array.value(row),
+        });
+    }
+
+    Ok(results)
+}
+
+fn embedding_from_list(list: &FixedSizeListArray, row: usize) -> LanceResult<Vec<f32>> {
+    let values = list.value(row);
+    let float_array = values
+        .as_ref()
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .ok_or_else(|| {
+            LanceError::from(ArrowError::InvalidArgumentError(
+                "embedding column does not contain float32 values".to_string(),
+            ))
+        })?;
+    let mut embedding = Vec::with_capacity(float_array.len());
+    for idx in 0..float_array.len() {
+        embedding.push(float_array.value(idx));
+    }
+    Ok(embedding)
+}
+
+fn column_as<'a, A>(batch: &'a RecordBatch, name: &str) -> LanceResult<&'a A>
+where
+    A: Array + 'static,
+{
+    let column = batch.column_by_name(name).ok_or_else(|| {
+        LanceError::from(ArrowError::InvalidArgumentError(format!(
+            "column '{name}' not found"
+        )))
+    })?;
+    column.as_ref().as_any().downcast_ref::<A>().ok_or_else(|| {
+        LanceError::from(ArrowError::InvalidArgumentError(format!(
+            "column '{name}' has unexpected data type"
+        )))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::serde::CONTENT_TYPE_TEXT;
+    use chrono::Utc;
+    use tempfile::TempDir;
+
+    fn make_embedding(pivot: f32) -> Vec<f32> {
+        let mut values = vec![0.0; DEFAULT_EMBEDDING_DIM as usize];
+        if !values.is_empty() {
+            values[0] = pivot;
+        }
+        values
+    }
+
+    fn text_record(id: &str, embedding_pivot: f32) -> ContextRecord {
+        ContextRecord {
+            id: id.to_string(),
+            run_id: format!("run-{id}"),
+            created_at: Utc::now(),
+            role: "user".to_string(),
+            state_metadata: Some(StateMetadata {
+                step: Some(1),
+                active_plan_id: Some("plan".to_string()),
+                tokens_used: Some(10),
+                custom: None,
+            }),
+            content_type: CONTENT_TYPE_TEXT.to_string(),
+            text_payload: Some(format!("payload-{id}")),
+            binary_payload: None,
+            embedding: Some(make_embedding(embedding_pivot)),
+        }
+    }
+
+    #[test]
+    fn search_orders_by_distance() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = ContextStore::open(&uri).await.unwrap();
+            let first = text_record("a", 0.0);
+            let second = text_record("b", 1.0);
+            store.add(&[first.clone(), second.clone()]).await.unwrap();
+
+            let query = make_embedding(1.0);
+            let results = store.search(&query, Some(2)).await.unwrap();
+
+            assert_eq!(results.len(), 2);
+            assert_eq!(results[0].record.id, second.id);
+            assert!(
+                results[0].distance <= results[1].distance,
+                "results not ordered by distance: {:?}",
+                results
+            );
+        });
+    }
+
+    #[test]
+    fn search_validates_query_length() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let store = ContextStore::open(&uri).await.unwrap();
+            let err = store.search(&[0.0_f32], None).await.unwrap_err();
+            let message = err.to_string();
+            assert!(
+                message.contains("embedding dimension"),
+                "unexpected error message: {message}"
+            );
+        });
     }
 }

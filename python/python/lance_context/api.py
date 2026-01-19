@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from io import BytesIO
 from typing import Any
 
@@ -96,6 +97,34 @@ def _normalize_content(value: Any, content_type: str | None):
     return value, content_type
 
 
+def _coerce_vector(query: Any) -> list[float]:
+    if hasattr(query, "tolist"):
+        query = query.tolist()
+    elif hasattr(query, "__array__"):
+        query = query.__array__().tolist()
+    if isinstance(query, (list, tuple)):
+        return [float(item) for item in query]
+    raise TypeError("search query must be a sequence of floats")
+
+
+def _normalize_search_hit(raw: dict[str, Any]) -> dict[str, Any]:
+    created_at = raw.get("created_at")
+    if isinstance(created_at, str):
+        created_at = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+    return {
+        "id": raw.get("id"),
+        "run_id": raw.get("run_id"),
+        "role": raw.get("role"),
+        "content_type": raw.get("content_type"),
+        "text": raw.get("text_payload"),
+        "binary": raw.get("binary_payload"),
+        "embedding": raw.get("embedding"),
+        "distance": raw.get("distance"),
+        "created_at": created_at,
+        "state_metadata": raw.get("state_metadata"),
+    }
+
+
 class Context:
     def __init__(self, uri: str) -> None:
         self._inner = _Context.create(uri)
@@ -139,6 +168,11 @@ class Context:
 
     def checkout(self, version_id: int | str) -> None:
         self._inner.checkout(int(version_id))
+
+    def search(self, query: Any, limit: int | None = None) -> list[dict[str, Any]]:
+        vector = _coerce_vector(query)
+        results = self._inner.search(vector, limit)
+        return [_normalize_search_hit(item) for item in results]
 
     def __repr__(self) -> str:
         return (

@@ -22,3 +22,10 @@ pub struct ContextRecord {
     pub binary_payload: Option<Vec<u8>>,
     pub embedding: Option<Vec<f32>>,
 }
+
+/// Result returned from a vector similarity search.
+#[derive(Debug, Clone)]
+pub struct SearchResult {
+    pub record: ContextRecord,
+    pub distance: f32,
+}

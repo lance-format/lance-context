@@ -1,13 +1,14 @@
 use std::sync::Arc;
 
-use chrono::Utc;
+use chrono::{SecondsFormat, Utc};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::PyType;
+use pyo3::IntoPy;
+use pyo3::types::{PyBytes, PyDict, PyType};
 use tokio::runtime::Runtime;
 
 use lance_context::serde::CONTENT_TYPE_TEXT;
-use lance_context::{Context as RustContext, ContextRecord, ContextStore};
+use lance_context::{Context as RustContext, ContextRecord, ContextStore, SearchResult};
 
 const DEFAULT_BINARY_CONTENT_TYPE: &str = "application/octet-stream";
 const BINARY_PLACEHOLDER: &str = "[binary]";
@@ -127,10 +128,72 @@ impl Context {
         self.run_id = new_run_id();
         Ok(())
     }
+
+    #[pyo3(signature = (query, limit = None))]
+    fn search(
+        &self,
+        py: Python<'_>,
+        query: Vec<f32>,
+        limit: Option<usize>,
+    ) -> PyResult<Vec<PyObject>> {
+        let hits = self
+            .runtime
+            .block_on(self.store.search(&query, limit))
+            .map_err(to_py_err)?;
+        hits.into_iter()
+            .map(|hit| search_hit_to_py(py, hit))
+            .collect()
+    }
 }
 
 fn new_run_id() -> String {
     format!("run-{}-{}", Utc::now().timestamp_micros(), std::process::id())
+}
+
+fn search_hit_to_py(py: Python<'_>, hit: SearchResult) -> PyResult<PyObject> {
+    let SearchResult { record, distance } = hit;
+    let ContextRecord {
+        id,
+        run_id,
+        created_at,
+        role,
+        state_metadata,
+        content_type,
+        text_payload,
+        binary_payload,
+        embedding,
+    } = record;
+
+    let dict = PyDict::new(py);
+    dict.set_item("id", id)?;
+    dict.set_item("run_id", run_id)?;
+    dict.set_item(
+        "created_at",
+        created_at.to_rfc3339_opts(SecondsFormat::Micros, true),
+    )?;
+    dict.set_item("role", role)?;
+
+    let state_obj: PyObject = match state_metadata {
+        Some(metadata) => {
+            let state_dict = PyDict::new(py);
+            state_dict.set_item("step", metadata.step)?;
+            state_dict.set_item("active_plan_id", metadata.active_plan_id)?;
+            state_dict.set_item("tokens_used", metadata.tokens_used)?;
+            state_dict.set_item("custom", metadata.custom)?;
+            state_dict.into_py(py)
+        }
+        None => py.None().into_py(py),
+    };
+    dict.set_item("state_metadata", state_obj)?;
+    dict.set_item("content_type", content_type)?;
+    dict.set_item("text_payload", text_payload)?;
+    match binary_payload {
+        Some(payload) => dict.set_item("binary_payload", PyBytes::new(py, &payload))?,
+        None => dict.set_item("binary_payload", py.None())?,
+    }
+    dict.set_item("embedding", embedding)?;
+    dict.set_item("distance", distance)?;
+    Ok(dict.into_py(py))
 }
 
 fn to_py_err<E: std::fmt::Display>(err: E) -> PyErr {
