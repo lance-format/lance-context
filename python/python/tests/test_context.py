@@ -10,6 +10,9 @@ def test_context_create_and_add():
     ctx.add("user", "hello")
     ctx.add("assistant", 123, data_type="text/plain")
     assert ctx.entries() == 2
+    version = ctx.version()
+    assert isinstance(version, int)
+    ctx.checkout(version)
 
 
 def test_context_snapshot_and_fork():
@@ -25,3 +28,4 @@ def test_context_snapshot_and_fork():
     fork = ctx.fork("branch-a")
     assert fork.branch() == "branch-a"
     assert fork.entries() == ctx.entries()
+    assert fork.version() == ctx.version()

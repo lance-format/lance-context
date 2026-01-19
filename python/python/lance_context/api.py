@@ -19,7 +19,7 @@ def _is_module(value: Any, prefix: str) -> bool:
 
 def _get_pyarrow():
     try:
-        import pyarrow as pa  # pyright: ignore[reportMissingImports]
+        import pyarrow as pa  # pyright: ignore[reportMissingTypeStubs]
     except ImportError as exc:  # pragma: no cover - optional dependency
         raise ImportError(
             "pyarrow is required to serialize pandas/polars dataframes"
@@ -113,6 +113,9 @@ class Context:
     def entries(self) -> int:
         return self._inner.entries()
 
+    def version(self) -> int:
+        return self._inner.version()
+
     def add(
         self,
         role: str,
@@ -134,8 +137,8 @@ class Context:
         inner = self._inner.fork(branch_name)
         return self._from_inner(inner)
 
-    def checkout(self, snapshot_id: str) -> None:
-        self._inner.checkout(snapshot_id)
+    def checkout(self, version_id: int | str) -> None:
+        self._inner.checkout(int(version_id))
 
     def __repr__(self) -> str:
         return (
