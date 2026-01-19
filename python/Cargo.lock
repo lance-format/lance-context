@@ -3394,6 +3394,7 @@ name = "lance-context"
 version = "0.1.0"
 dependencies = [
  "arrow-array",
+ "arrow-ipc",
  "arrow-schema",
  "chrono",
  "lance",
@@ -3407,8 +3408,10 @@ dependencies = [
 name = "lance-context-python"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "lance-context",
  "pyo3",
+ "tokio",
 ]
 
 [[package]]
