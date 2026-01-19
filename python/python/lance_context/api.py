@@ -19,7 +19,7 @@ def _is_module(value: Any, prefix: str) -> bool:
 
 def _get_pyarrow():
     try:
-        import pyarrow as pa  # pyright: ignore[reportMissingTypeStubs]
+        import pyarrow as pa  # pyright: ignore[reportMissingImports,reportMissingTypeStubs]
     except ImportError as exc:  # pragma: no cover - optional dependency
         raise ImportError(
             "pyarrow is required to serialize pandas/polars dataframes"
