@@ -3,8 +3,8 @@ use std::sync::Arc;
 use chrono::{SecondsFormat, Utc};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::IntoPy;
 use pyo3::types::{PyBytes, PyDict, PyType};
+use pyo3::IntoPyObject;
 use tokio::runtime::Runtime;
 
 use lance_context::serde::CONTENT_TYPE_TEXT;
@@ -69,9 +69,7 @@ impl Context {
         let (content_type, text_payload, binary_payload, inner_content) =
             match content.extract::<&[u8]>() {
                 Ok(bytes) => (
-                    data_type
-                        .unwrap_or(DEFAULT_BINARY_CONTENT_TYPE)
-                        .to_string(),
+                    data_type.unwrap_or(DEFAULT_BINARY_CONTENT_TYPE).to_string(),
                     None,
                     Some(bytes.to_vec()),
                     BINARY_PLACEHOLDER.to_string(),
@@ -147,7 +145,11 @@ impl Context {
 }
 
 fn new_run_id() -> String {
-    format!("run-{}-{}", Utc::now().timestamp_micros(), std::process::id())
+    format!(
+        "run-{}-{}",
+        Utc::now().timestamp_micros(),
+        std::process::id()
+    )
 }
 
 fn search_hit_to_py(py: Python<'_>, hit: SearchResult) -> PyResult<PyObject> {
@@ -180,9 +182,9 @@ fn search_hit_to_py(py: Python<'_>, hit: SearchResult) -> PyResult<PyObject> {
             state_dict.set_item("active_plan_id", metadata.active_plan_id)?;
             state_dict.set_item("tokens_used", metadata.tokens_used)?;
             state_dict.set_item("custom", metadata.custom)?;
-            state_dict.into_py(py)
+            state_dict.into_pyobject(py)?.unbind().into()
         }
-        None => py.None().into_py(py),
+        None => py.None().into_pyobject(py)?.unbind().into(),
     };
     dict.set_item("state_metadata", state_obj)?;
     dict.set_item("content_type", content_type)?;
@@ -193,7 +195,7 @@ fn search_hit_to_py(py: Python<'_>, hit: SearchResult) -> PyResult<PyObject> {
     }
     dict.set_item("embedding", embedding)?;
     dict.set_item("distance", distance)?;
-    Ok(dict.into_py(py))
+    Ok(dict.into_pyobject(py)?.unbind().into())
 }
 
 fn to_py_err<E: std::fmt::Display>(err: E) -> PyErr {
