@@ -3388,11 +3388,14 @@ dependencies = [
  "arrow-ipc",
  "arrow-schema",
  "chrono",
+ "futures",
  "lance",
  "lance-graph",
  "lance-namespace",
  "lancedb",
  "serde",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

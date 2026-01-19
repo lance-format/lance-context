@@ -3397,6 +3397,7 @@ dependencies = [
  "arrow-ipc",
  "arrow-schema",
  "chrono",
+ "futures",
  "lance",
  "lance-graph",
  "lance-namespace",
