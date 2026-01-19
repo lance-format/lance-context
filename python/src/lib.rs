@@ -184,7 +184,7 @@ fn search_hit_to_py(py: Python<'_>, hit: SearchResult) -> PyResult<PyObject> {
             state_dict.set_item("custom", metadata.custom)?;
             state_dict.into_pyobject(py)?.unbind().into()
         }
-        None => py.None().into_pyobject(py)?.unbind().into(),
+        None => py.None().into_pyobject(py)?.unbind(),
     };
     dict.set_item("state_metadata", state_obj)?;
     dict.set_item("content_type", content_type)?;
