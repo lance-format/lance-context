@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::builder::{
@@ -13,7 +14,8 @@ use arrow_array::{
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Schema, TimeUnit};
 use chrono::DateTime;
 use futures::TryStreamExt;
-use lance::dataset::{Dataset, WriteMode, WriteParams};
+use lance::dataset::{builder::DatasetBuilder, Dataset, WriteMode, WriteParams};
+use lance::io::ObjectStoreParams;
 use lance::{Error as LanceError, Result as LanceResult};
 
 use crate::record::{ContextRecord, SearchResult, StateMetadata};
@@ -28,23 +30,32 @@ pub struct ContextStore {
     dataset: Dataset,
 }
 
+/// Additional configuration when opening a [`ContextStore`].
+#[derive(Debug, Clone, Default)]
+pub struct ContextStoreOptions {
+    pub storage_options: Option<HashMap<String, String>>,
+}
+
+impl ContextStoreOptions {
+    #[must_use]
+    pub fn storage_options(&self) -> Option<HashMap<String, String>> {
+        self.storage_options.clone()
+    }
+}
+
 impl ContextStore {
     /// Open an existing context dataset or create a new one with the project schema.
     pub async fn open(uri: &str) -> LanceResult<Self> {
-        match Dataset::open(uri).await {
+        Self::open_with_options(uri, ContextStoreOptions::default()).await
+    }
+
+    /// Open a dataset with explicit object store configuration (e.g. S3 credentials).
+    pub async fn open_with_options(uri: &str, options: ContextStoreOptions) -> LanceResult<Self> {
+        let storage_options = options.storage_options();
+        match Self::load_with_options(uri, storage_options.clone()).await {
             Ok(dataset) => Ok(Self { dataset }),
             Err(LanceError::DatasetNotFound { .. }) => {
-                let schema = Arc::new(Self::schema());
-                let empty_batch = RecordBatch::new_empty(schema.clone());
-                let batches = RecordBatchIterator::new(
-                    vec![Ok::<RecordBatch, ArrowError>(empty_batch)].into_iter(),
-                    schema.clone(),
-                );
-                let params = WriteParams {
-                    mode: WriteMode::Create,
-                    ..Default::default()
-                };
-                let dataset = Dataset::write(batches, uri, Some(params)).await?;
+                let dataset = Self::create_with_options(uri, storage_options).await?;
                 Ok(Self { dataset })
             }
             Err(err) => Err(err),
@@ -154,6 +165,47 @@ impl ContextStore {
                 true,
             ),
         ])
+    }
+
+    async fn load_with_options(
+        uri: &str,
+        storage_options: Option<HashMap<String, String>>,
+    ) -> LanceResult<Dataset> {
+        if let Some(options) = storage_options {
+            DatasetBuilder::from_uri(uri)
+                .with_storage_options(options)
+                .load()
+                .await
+        } else {
+            Dataset::open(uri).await
+        }
+    }
+
+    async fn create_with_options(
+        uri: &str,
+        storage_options: Option<HashMap<String, String>>,
+    ) -> LanceResult<Dataset> {
+        let schema = Arc::new(Self::schema());
+        let empty_batch = RecordBatch::new_empty(schema.clone());
+        let batches = RecordBatchIterator::new(
+            vec![Ok::<RecordBatch, ArrowError>(empty_batch)].into_iter(),
+            schema.clone(),
+        );
+
+        let mut params = WriteParams {
+            mode: WriteMode::Create,
+            ..Default::default()
+        };
+
+        if let Some(options) = storage_options {
+            let store_params = ObjectStoreParams {
+                storage_options: Some(options),
+                ..Default::default()
+            };
+            params.store_params = Some(store_params);
+        }
+
+        Dataset::write(batches, uri, Some(params)).await
     }
 
     fn records_to_batch(entries: &[ContextRecord]) -> LanceResult<RecordBatch> {

@@ -41,7 +41,7 @@ requires = ["maturin>=1.4"]
 build-backend = "maturin"
 
 [project.optional-dependencies]
-tests = ["pytest", "ruff"]
+tests = ["pytest", "ruff", "moto[s3]", "boto3", "botocore"]
 dev = ["ruff", "pyright"]
 
 [tool.ruff]

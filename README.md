@@ -17,6 +17,7 @@ Key motivations inspired by the broader Lance roadmap<sup>[1](https://github.com
 
 - Unified schema for agent messages (`ContextRecord`) with optional embeddings and metadata.
 - Automatic versioning via Lance manifests with `checkout(version)` support.
+- Remote persistence: point the store at `s3://` URIs with either AWS environment variables or explicit credentials/endpoint overrides.
 - Python API (`lance_context.api.Context`) aligned with the Rust implementation.
 - Integration tests that exercise real persistence, image serialization, and version rollbacks.
 
@@ -65,6 +66,17 @@ ctx.add("assistant", "Let me fetch suggestions…")
 ctx.checkout(first_version)
 
 print("Entries after checkout:", ctx.entries())
+
+# Store context in S3 (e.g., for MinIO/moto test endpoints)
+ctx = Context.create(
+    "s3://my-bucket/context.lance",
+    aws_access_key_id="minioadmin",
+    aws_secret_access_key="minioadmin",
+    region="us-east-1",
+    endpoint_url="http://localhost:9000",
+    allow_http=True,
+)
+# AWS_* environment variables work too—pass overrides only when you need custom endpoints.
 ```
 
 ### Rust
