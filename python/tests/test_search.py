@@ -1,7 +1,6 @@
 from datetime import datetime
 
 import pytest
-
 from lance_context.api import Context, _coerce_vector, _normalize_search_hit
 
 

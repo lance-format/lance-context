@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::{SecondsFormat, Utc};
@@ -8,7 +9,9 @@ use pyo3::IntoPyObject;
 use tokio::runtime::Runtime;
 
 use lance_context::serde::CONTENT_TYPE_TEXT;
-use lance_context::{Context as RustContext, ContextRecord, ContextStore, SearchResult};
+use lance_context::{
+    Context as RustContext, ContextRecord, ContextStore, ContextStoreOptions, SearchResult,
+};
 
 const DEFAULT_BINARY_CONTENT_TYPE: &str = "application/octet-stream";
 const BINARY_PLACEHOLDER: &str = "[binary]";
@@ -26,13 +29,59 @@ struct Context {
     run_id: String,
 }
 
+fn storage_options_from_dict<'py>(
+    dict: Option<&Bound<'py, PyDict>>,
+) -> PyResult<Option<HashMap<String, String>>> {
+    let Some(dict) = dict else {
+        return Ok(None);
+    };
+
+    let mut options = HashMap::new();
+    for (key, value) in dict.iter() {
+        let key_str = key.extract::<String>()?;
+        if value.is_none() {
+            continue;
+        }
+        let string_value = if let Ok(boolean) = value.extract::<bool>() {
+            if boolean {
+                "true".to_string()
+            } else {
+                "false".to_string()
+            }
+        } else if let Ok(number) = value.extract::<i64>() {
+            number.to_string()
+        } else if let Ok(float_val) = value.extract::<f64>() {
+            float_val.to_string()
+        } else {
+            value.str()?.to_string()
+        };
+        options.insert(key_str, string_value);
+    }
+
+    if options.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(options))
+    }
+}
+
 #[pymethods]
 impl Context {
     #[classmethod]
-    fn create(_cls: &Bound<'_, PyType>, uri: &str) -> PyResult<Self> {
+    #[pyo3(signature = (uri, *, storage_options=None))]
+    fn create(
+        _cls: &Bound<'_, PyType>,
+        uri: &str,
+        storage_options: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Self> {
         let runtime = Arc::new(Runtime::new().map_err(to_py_err)?);
+
+        let options = ContextStoreOptions {
+            storage_options: storage_options_from_dict(storage_options)?,
+        };
+
         let store = runtime
-            .block_on(ContextStore::open(uri))
+            .block_on(ContextStore::open_with_options(uri, options))
             .map_err(to_py_err)?;
         let run_id = new_run_id();
         Ok(Self {

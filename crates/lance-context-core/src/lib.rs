@@ -7,4 +7,4 @@ mod store;
 
 pub use context::{Context, ContextEntry, Snapshot};
 pub use record::{ContextRecord, SearchResult, StateMetadata};
-pub use store::ContextStore;
+pub use store::{ContextStore, ContextStoreOptions};

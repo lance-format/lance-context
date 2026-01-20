@@ -126,12 +126,60 @@ def _normalize_search_hit(raw: dict[str, Any]) -> dict[str, Any]:
 
 
 class Context:
-    def __init__(self, uri: str) -> None:
-        self._inner = _Context.create(uri)
+    def __init__(
+        self,
+        uri: str,
+        *,
+        storage_options: dict[str, Any] | None = None,
+        aws_access_key_id: str | None = None,
+        aws_secret_access_key: str | None = None,
+        aws_session_token: str | None = None,
+        region: str | None = None,
+        endpoint_url: str | None = None,
+        allow_http: bool = False,
+    ) -> None:
+        options = dict(storage_options or {})
+        if aws_access_key_id is not None:
+            options["aws_access_key_id"] = aws_access_key_id
+        if aws_secret_access_key is not None:
+            options["aws_secret_access_key"] = aws_secret_access_key
+        if aws_session_token is not None:
+            options["aws_session_token"] = aws_session_token
+        if region is not None:
+            options["aws_region"] = region
+        if endpoint_url is not None:
+            options["aws_endpoint_url"] = endpoint_url
+        if allow_http:
+            options["aws_allow_http"] = True
+
+        if options:
+            self._inner = _Context.create(uri, storage_options=options)
+        else:
+            self._inner = _Context.create(uri)
 
     @classmethod
-    def create(cls, uri: str) -> Context:
-        return cls(uri)
+    def create(
+        cls,
+        uri: str,
+        *,
+        storage_options: dict[str, Any] | None = None,
+        aws_access_key_id: str | None = None,
+        aws_secret_access_key: str | None = None,
+        aws_session_token: str | None = None,
+        region: str | None = None,
+        endpoint_url: str | None = None,
+        allow_http: bool = False,
+    ) -> Context:
+        return cls(
+            uri,
+            storage_options=storage_options,
+            aws_access_key_id=aws_access_key_id,
+            aws_secret_access_key=aws_secret_access_key,
+            aws_session_token=aws_session_token,
+            region=region,
+            endpoint_url=endpoint_url,
+            allow_http=allow_http,
+        )
 
     def uri(self) -> str:
         return self._inner.uri()
