@@ -179,3 +179,4 @@ jobs:
           echo "1. Review the draft release on the [releases page](https://github.com/${{ github.repository }}/releases)" >> $GITHUB_STEP_SUMMARY
           echo "2. Edit the release notes if needed" >> $GITHUB_STEP_SUMMARY
           echo "3. Publish the release to trigger automatic publishing to PyPI and crates.io" >> $GITHUB_STEP_SUMMARY
+        fi
