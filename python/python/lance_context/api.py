@@ -107,7 +107,8 @@ def _coerce_vector(query: Any) -> list[float]:
     raise TypeError("search query must be a sequence of floats")
 
 
-def _normalize_search_hit(raw: dict[str, Any]) -> dict[str, Any]:
+def _normalize_record(raw: dict[str, Any]) -> dict[str, Any]:
+    """Normalize a raw record dict from the Rust layer."""
     created_at = raw.get("created_at")
     if isinstance(created_at, str):
         created_at = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
@@ -119,10 +120,16 @@ def _normalize_search_hit(raw: dict[str, Any]) -> dict[str, Any]:
         "text": raw.get("text_payload"),
         "binary": raw.get("binary_payload"),
         "embedding": raw.get("embedding"),
-        "distance": raw.get("distance"),
         "created_at": created_at,
         "state_metadata": raw.get("state_metadata"),
     }
+
+
+def _normalize_search_hit(raw: dict[str, Any]) -> dict[str, Any]:
+    """Normalize a search hit - adds distance to the base record."""
+    result = _normalize_record(raw)
+    result["distance"] = raw.get("distance")
+    return result
 
 
 class Context:
@@ -221,6 +228,22 @@ class Context:
         vector = _coerce_vector(query)
         results = self._inner.search(vector, limit)
         return [_normalize_search_hit(item) for item in results]
+
+    def list(
+        self, limit: int | None = None, offset: int | None = None
+    ) -> list[dict[str, Any]]:
+        """Return stored entries.
+
+        Args:
+            limit: Maximum number of entries to return. If None, returns all.
+            offset: Number of entries to skip before returning results.
+
+        Returns:
+            List of entry dicts with keys: id, run_id, role, content_type,
+            text, binary, embedding, created_at, state_metadata.
+        """
+        results = self._inner.list(limit, offset)
+        return [_normalize_record(item) for item in results]
 
     def __repr__(self) -> str:
         return (

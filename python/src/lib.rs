@@ -191,6 +191,23 @@ impl Context {
             .map(|hit| search_hit_to_py(py, hit))
             .collect()
     }
+
+    #[pyo3(signature = (limit = None, offset = None))]
+    fn list(
+        &self,
+        py: Python<'_>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> PyResult<Vec<PyObject>> {
+        let records = self
+            .runtime
+            .block_on(self.store.list(limit, offset))
+            .map_err(to_py_err)?;
+        records
+            .into_iter()
+            .map(|record| record_to_py(py, record))
+            .collect()
+    }
 }
 
 fn new_run_id() -> String {
@@ -203,6 +220,13 @@ fn new_run_id() -> String {
 
 fn search_hit_to_py(py: Python<'_>, hit: SearchResult) -> PyResult<PyObject> {
     let SearchResult { record, distance } = hit;
+    let dict = record_to_py(py, record)?;
+    let dict_ref = dict.downcast_bound::<PyDict>(py)?;
+    dict_ref.set_item("distance", distance)?;
+    Ok(dict)
+}
+
+fn record_to_py(py: Python<'_>, record: ContextRecord) -> PyResult<PyObject> {
     let ContextRecord {
         id,
         run_id,
@@ -243,7 +267,6 @@ fn search_hit_to_py(py: Python<'_>, hit: SearchResult) -> PyResult<PyObject> {
         None => dict.set_item("binary_payload", py.None())?,
     }
     dict.set_item("embedding", embedding)?;
-    dict.set_item("distance", distance)?;
     Ok(dict.into_pyobject(py)?.unbind().into())
 }
 

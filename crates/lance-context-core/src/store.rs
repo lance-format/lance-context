@@ -91,6 +91,27 @@ impl ContextStore {
         Ok(())
     }
 
+    /// List all records in the dataset.
+    pub async fn list(
+        &self,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> LanceResult<Vec<ContextRecord>> {
+        let mut scanner = self.dataset.scan();
+        if let Some(limit) = limit {
+            scanner.limit(Some(limit as i64), offset.map(|o| o as i64))?;
+        } else if let Some(offset) = offset {
+            scanner.limit(None, Some(offset as i64))?;
+        }
+
+        let mut stream = scanner.try_into_stream().await?;
+        let mut results = Vec::new();
+        while let Some(batch) = stream.try_next().await? {
+            results.extend(batch_to_records(&batch)?);
+        }
+        Ok(results)
+    }
+
     /// Perform a nearest-neighbor search over stored embeddings.
     pub async fn search(
         &self,
@@ -348,15 +369,7 @@ impl ContextStore {
 }
 
 fn batch_to_search_results(batch: &RecordBatch) -> LanceResult<Vec<SearchResult>> {
-    let id_array = column_as::<StringArray>(batch, "id")?;
-    let run_id_array = column_as::<StringArray>(batch, "run_id")?;
-    let created_at_array = column_as::<TimestampMicrosecondArray>(batch, "created_at")?;
-    let role_array = column_as::<DictionaryArray<Int8Type>>(batch, "role")?;
-    let state_array = column_as::<StructArray>(batch, "state_metadata")?;
-    let content_type_array = column_as::<StringArray>(batch, "content_type")?;
-    let text_array = column_as::<LargeStringArray>(batch, "text_payload")?;
-    let binary_array = column_as::<LargeBinaryArray>(batch, "binary_payload")?;
-    let embedding_array = column_as::<FixedSizeListArray>(batch, "embedding")?;
+    let records = batch_to_records(batch)?;
 
     let distance_column = batch.column_by_name("_distance").ok_or_else(|| {
         LanceError::from(ArrowError::InvalidArgumentError(
@@ -372,6 +385,28 @@ fn batch_to_search_results(batch: &RecordBatch) -> LanceResult<Vec<SearchResult>
                 "_distance column has unexpected data type".to_string(),
             ))
         })?;
+
+    Ok(records
+        .into_iter()
+        .enumerate()
+        .map(|(i, record)| SearchResult {
+            record,
+            distance: distance_array.value(i),
+        })
+        .collect())
+}
+
+/// Convert a record batch to context records.
+fn batch_to_records(batch: &RecordBatch) -> LanceResult<Vec<ContextRecord>> {
+    let id_array = column_as::<StringArray>(batch, "id")?;
+    let run_id_array = column_as::<StringArray>(batch, "run_id")?;
+    let created_at_array = column_as::<TimestampMicrosecondArray>(batch, "created_at")?;
+    let role_array = column_as::<DictionaryArray<Int8Type>>(batch, "role")?;
+    let state_array = column_as::<StructArray>(batch, "state_metadata")?;
+    let content_type_array = column_as::<StringArray>(batch, "content_type")?;
+    let text_array = column_as::<LargeStringArray>(batch, "text_payload")?;
+    let binary_array = column_as::<LargeBinaryArray>(batch, "binary_payload")?;
+    let embedding_array = column_as::<FixedSizeListArray>(batch, "embedding")?;
 
     let step_array = state_array
         .column(0)
@@ -487,7 +522,7 @@ fn batch_to_search_results(batch: &RecordBatch) -> LanceResult<Vec<SearchResult>
             role_values.value(key).to_string()
         };
 
-        let record = ContextRecord {
+        results.push(ContextRecord {
             id: id_array.value(row).to_string(),
             run_id: run_id_array.value(row).to_string(),
             created_at,
@@ -497,11 +532,6 @@ fn batch_to_search_results(batch: &RecordBatch) -> LanceResult<Vec<SearchResult>
             text_payload,
             binary_payload,
             embedding,
-        };
-
-        results.push(SearchResult {
-            record,
-            distance: distance_array.value(row),
         });
     }
 
