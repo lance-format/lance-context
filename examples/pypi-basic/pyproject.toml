@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lance-context-example"
+version = "0.1.0"
+description = "Example project demonstrating the lance-context PyPI package."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["lance-context>=0.1.0"]
+
+[project.scripts]
+context-demo = "context_example.main:main"
