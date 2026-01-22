@@ -248,10 +248,13 @@ impl Context {
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> PyResult<Vec<PyObject>> {
-        let records = self
-            .runtime
-            .block_on(self.store.list(limit, offset))
-            .map_err(to_py_err)?;
+        // Release GIL during data retrieval
+        let records = py.allow_threads(|| {
+            self.runtime
+                .block_on(self.store.list(limit, offset))
+                .map_err(to_py_err)
+        })?;
+
         records
             .into_iter()
             .map(|record| record_to_py(py, record))
@@ -265,6 +268,7 @@ impl Context {
         target_rows_per_fragment: Option<usize>,
         materialize_deletions: Option<bool>,
     ) -> PyResult<PyObject> {
+        // Prepare config before releasing GIL
         let config = if target_rows_per_fragment.is_some() || materialize_deletions.is_some() {
             let mut cfg = self.store.compaction_config.clone();
             if let Some(rows) = target_rows_per_fragment {
@@ -278,19 +282,23 @@ impl Context {
             None
         };
 
-        let metrics = self
-            .runtime
-            .block_on(self.store.compact(config))
-            .map_err(to_py_err)?;
+        // Release GIL during expensive compaction operation
+        let metrics = py.allow_threads(|| {
+            self.runtime
+                .block_on(self.store.compact(config))
+                .map_err(to_py_err)
+        })?;
 
         compaction_metrics_to_py(py, metrics)
     }
 
     fn compaction_stats(&self, py: Python<'_>) -> PyResult<PyObject> {
-        let stats = self
-            .runtime
-            .block_on(self.store.compaction_stats())
-            .map_err(to_py_err)?;
+        // Release GIL during stats query
+        let stats = py.allow_threads(|| {
+            self.runtime
+                .block_on(self.store.compaction_stats())
+                .map_err(to_py_err)
+        })?;
 
         compaction_stats_to_py(py, stats)
     }
