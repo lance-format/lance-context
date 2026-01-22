@@ -17,6 +17,7 @@ Key motivations inspired by the broader Lance roadmap<sup>[1](https://github.com
 
 - Unified schema for agent messages (`ContextRecord`) with optional embeddings and metadata.
 - Automatic versioning via Lance manifests with `checkout(version)` support.
+- Background compaction to optimize storage and read performance.
 - Remote persistence: point the store at `s3://` URIs with either AWS environment variables or explicit credentials/endpoint overrides.
 - Python API (`lance_context.api.Context`) aligned with the Rust implementation.
 - Integration tests that exercise real persistence, image serialization, and version rollbacks.
@@ -77,6 +78,27 @@ ctx = Context.create(
     allow_http=True,
 )
 # AWS_* environment variables work too—pass overrides only when you need custom endpoints.
+
+# Background Compaction - optimize storage and read performance
+ctx = Context.create(
+    "context.lance",
+    enable_background_compaction=True,  # Enable automatic compaction
+    compaction_interval_secs=300,       # Check every 5 minutes
+    compaction_min_fragments=10,        # Trigger when 10+ fragments exist
+    quiet_hours=[(22, 6)],              # Skip compaction 10pm-6am
+)
+
+# Manual compaction control
+for i in range(100):
+    ctx.add("user", f"message {i}")  # Creates many small fragments
+
+# Check compaction status
+stats = ctx.compaction_stats()
+print(f"Fragments: {stats['total_fragments']}")
+
+# Manually trigger compaction
+metrics = ctx.compact()
+print(f"Compaction removed {metrics['fragments_removed']} fragments")
 ```
 
 ### Rust
@@ -121,7 +143,7 @@ We are tracking future enhancements as GitHub issues:
 
 - [Support S3-backed context stores](https://github.com/lance-format/lance-context/issues/14)
 - [Add relationship column for GraphRAG workflows](https://github.com/lance-format/lance-context/issues/15)
-- [Background compaction for Lance fragments](https://github.com/lance-format/lance-context/issues/16)
+- ~~[Background compaction for Lance fragments](https://github.com/lance-format/lance-context/issues/16)~~ ✅ **Implemented**
 
 Contributions are welcome—feel free to comment on the issues above or open your own proposals.
 

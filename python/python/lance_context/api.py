@@ -144,6 +144,12 @@ class Context:
         region: str | None = None,
         endpoint_url: str | None = None,
         allow_http: bool = False,
+        # Compaction configuration
+        enable_background_compaction: bool = False,
+        compaction_interval_secs: int = 300,
+        compaction_min_fragments: int = 5,
+        compaction_target_rows: int = 1_000_000,
+        quiet_hours: list[tuple[int, int]] | None = None,
     ) -> None:
         options = dict(storage_options or {})
         if aws_access_key_id is not None:
@@ -159,8 +165,19 @@ class Context:
         if allow_http:
             options["aws_allow_http"] = True
 
-        if options:
-            self._inner = _Context.create(uri, storage_options=options)
+        # Build compaction config
+        compaction_config = {
+            "enabled": enable_background_compaction,
+            "check_interval_secs": compaction_interval_secs,
+            "min_fragments": compaction_min_fragments,
+            "target_rows_per_fragment": compaction_target_rows,
+            "quiet_hours": quiet_hours or [],
+        }
+
+        if options or compaction_config["enabled"]:
+            self._inner = _Context.create(
+                uri, storage_options=options or None, compaction_config=compaction_config
+            )
         else:
             self._inner = _Context.create(uri)
 
@@ -176,6 +193,12 @@ class Context:
         region: str | None = None,
         endpoint_url: str | None = None,
         allow_http: bool = False,
+        # Compaction configuration
+        enable_background_compaction: bool = False,
+        compaction_interval_secs: int = 300,
+        compaction_min_fragments: int = 5,
+        compaction_target_rows: int = 1_000_000,
+        quiet_hours: list[tuple[int, int]] | None = None,
     ) -> Context:
         return cls(
             uri,
@@ -186,6 +209,11 @@ class Context:
             region=region,
             endpoint_url=endpoint_url,
             allow_http=allow_http,
+            enable_background_compaction=enable_background_compaction,
+            compaction_interval_secs=compaction_interval_secs,
+            compaction_min_fragments=compaction_min_fragments,
+            compaction_target_rows=compaction_target_rows,
+            quiet_hours=quiet_hours,
         )
 
     def uri(self) -> str:
@@ -244,6 +272,55 @@ class Context:
         """
         results = self._inner.list(limit, offset)
         return [_normalize_record(item) for item in results]
+
+    def compact(
+        self,
+        *,
+        target_rows_per_fragment: int | None = None,
+        materialize_deletions: bool = True,
+    ) -> dict[str, int]:
+        """Manually trigger compaction.
+
+        Compaction merges small fragments into larger ones, improving
+        read performance and reducing storage overhead.
+
+        Args:
+            target_rows_per_fragment: Target rows per fragment (default: 1M)
+            materialize_deletions: Remove deleted rows during compaction
+
+        Returns:
+            Metrics dict with:
+                - fragments_removed: Number of old fragments removed
+                - fragments_added: Number of new fragments created
+                - files_removed: Number of data files removed
+                - files_added: Number of data files created
+
+        Example:
+            >>> ctx = Context.create("context.lance")
+            >>> for i in range(100):
+            ...     ctx.add("user", f"message {i}")
+            >>> metrics = ctx.compact()
+            >>> print(f"Reduced fragments by {metrics['fragments_removed']}")
+        """
+        return self._inner.compact(target_rows_per_fragment, materialize_deletions)
+
+    def compaction_stats(self) -> dict[str, Any]:
+        """Get current compaction statistics.
+
+        Returns:
+            Stats dict with:
+                - total_fragments: Current fragment count
+                - is_compacting: Whether compaction is running
+                - last_compaction: ISO timestamp of last compaction
+                - last_error: Error message from last failed compaction
+                - total_compactions: Total successful compactions
+
+        Example:
+            >>> stats = ctx.compaction_stats()
+            >>> if stats['total_fragments'] > 50:
+            ...     ctx.compact()
+        """
+        return self._inner.compaction_stats()
 
     def __repr__(self) -> str:
         return (

@@ -7,4 +7,7 @@ mod store;
 
 pub use context::{Context, ContextEntry, Snapshot};
 pub use record::{ContextRecord, SearchResult, StateMetadata};
-pub use store::{ContextStore, ContextStoreOptions};
+pub use store::{CompactionConfig, CompactionStats, ContextStore, ContextStoreOptions};
+
+// Re-export CompactionMetrics from lance for Python bindings
+pub use lance::dataset::optimize::CompactionMetrics;
