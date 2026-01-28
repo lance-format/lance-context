@@ -10,7 +10,8 @@ use tokio::runtime::Runtime;
 
 use lance_context::serde::CONTENT_TYPE_TEXT;
 use lance_context::{
-    Context as RustContext, ContextRecord, ContextStore, ContextStoreOptions, SearchResult,
+    CompactionConfig, CompactionMetrics, CompactionStats, Context as RustContext, ContextRecord,
+    ContextStore, ContextStoreOptions, SearchResult,
 };
 
 const DEFAULT_BINARY_CONTENT_TYPE: &str = "application/octet-stream";
@@ -65,25 +66,67 @@ fn storage_options_from_dict<'py>(
     }
 }
 
+fn compaction_config_from_dict<'py>(
+    dict: Option<&Bound<'py, PyDict>>,
+) -> PyResult<CompactionConfig> {
+    let Some(dict) = dict else {
+        return Ok(CompactionConfig::default());
+    };
+
+    let mut config = CompactionConfig::default();
+
+    if let Some(enabled) = dict.get_item("enabled")? {
+        config.enabled = enabled.extract()?;
+    }
+    if let Some(min_frags) = dict.get_item("min_fragments")? {
+        config.min_fragments = min_frags.extract()?;
+    }
+    if let Some(target_rows) = dict.get_item("target_rows_per_fragment")? {
+        config.target_rows_per_fragment = target_rows.extract()?;
+    }
+    if let Some(max_rows) = dict.get_item("max_rows_per_group")? {
+        config.max_rows_per_group = max_rows.extract()?;
+    }
+    if let Some(materialize) = dict.get_item("materialize_deletions")? {
+        config.materialize_deletions = materialize.extract()?;
+    }
+    if let Some(threshold) = dict.get_item("materialize_deletions_threshold")? {
+        config.materialize_deletions_threshold = threshold.extract()?;
+    }
+    if let Some(threads) = dict.get_item("num_threads")? {
+        config.num_threads = Some(threads.extract()?);
+    }
+    if let Some(interval) = dict.get_item("check_interval_secs")? {
+        config.check_interval_secs = interval.extract()?;
+    }
+    if let Some(quiet) = dict.get_item("quiet_hours")? {
+        let quiet_list: Vec<(u8, u8)> = quiet.extract()?;
+        config.quiet_hours = quiet_list;
+    }
+
+    Ok(config)
+}
+
 #[pymethods]
 impl Context {
     #[classmethod]
-    #[pyo3(signature = (uri, *, storage_options=None))]
+    #[pyo3(signature = (uri, *, storage_options=None, compaction_config=None))]
     fn create(
         _cls: &Bound<'_, PyType>,
         py: Python<'_>,
         uri: &str,
         storage_options: Option<&Bound<'_, PyDict>>,
+        compaction_config: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Self> {
         let runtime = Arc::new(Runtime::new().map_err(to_py_err)?);
 
         let options = ContextStoreOptions {
             storage_options: storage_options_from_dict(storage_options)?,
+            compaction: compaction_config_from_dict(compaction_config)?,
         };
 
-        let store_res = py.allow_threads(|| {
-            runtime.block_on(ContextStore::open_with_options(uri, options))
-        });
+        let store_res =
+            py.allow_threads(|| runtime.block_on(ContextStore::open_with_options(uri, options)));
         let store = store_res.map_err(to_py_err)?;
         let run_id = new_run_id();
         Ok(Self {
@@ -187,10 +230,7 @@ impl Context {
         query: Vec<f32>,
         limit: Option<usize>,
     ) -> PyResult<Vec<PyObject>> {
-        let hits_res = py.allow_threads(|| {
-            self.runtime
-                .block_on(self.store.search(&query, limit))
-        });
+        let hits_res = py.allow_threads(|| self.runtime.block_on(self.store.search(&query, limit)));
         let hits = hits_res.map_err(to_py_err)?;
         hits.into_iter()
             .map(|hit| search_hit_to_py(py, hit))
@@ -204,15 +244,84 @@ impl Context {
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> PyResult<Vec<PyObject>> {
-        let records = self
-            .runtime
-            .block_on(self.store.list(limit, offset))
-            .map_err(to_py_err)?;
+        // Release GIL during data retrieval
+        let records = py.allow_threads(|| {
+            self.runtime
+                .block_on(self.store.list(limit, offset))
+                .map_err(to_py_err)
+        })?;
+
         records
             .into_iter()
             .map(|record| record_to_py(py, record))
             .collect()
     }
+
+    #[pyo3(signature = (target_rows_per_fragment=None, materialize_deletions=None))]
+    fn compact(
+        &mut self,
+        py: Python<'_>,
+        target_rows_per_fragment: Option<usize>,
+        materialize_deletions: Option<bool>,
+    ) -> PyResult<PyObject> {
+        // Prepare config before releasing GIL
+        let config = if target_rows_per_fragment.is_some() || materialize_deletions.is_some() {
+            let mut cfg = self.store.compaction_config.clone();
+            if let Some(rows) = target_rows_per_fragment {
+                cfg.target_rows_per_fragment = rows;
+            }
+            if let Some(mat) = materialize_deletions {
+                cfg.materialize_deletions = mat;
+            }
+            Some(cfg)
+        } else {
+            None
+        };
+
+        // Release GIL during expensive compaction operation
+        let metrics = py.allow_threads(|| {
+            self.runtime
+                .block_on(self.store.compact(config))
+                .map_err(to_py_err)
+        })?;
+
+        compaction_metrics_to_py(py, metrics)
+    }
+
+    fn compaction_stats(&self, py: Python<'_>) -> PyResult<PyObject> {
+        // Release GIL during stats query
+        let stats = py.allow_threads(|| {
+            self.runtime
+                .block_on(self.store.compaction_stats())
+                .map_err(to_py_err)
+        })?;
+
+        compaction_stats_to_py(py, stats)
+    }
+}
+
+fn compaction_metrics_to_py(py: Python<'_>, metrics: CompactionMetrics) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("fragments_removed", metrics.fragments_removed)?;
+    dict.set_item("fragments_added", metrics.fragments_added)?;
+    dict.set_item("files_removed", metrics.files_removed)?;
+    dict.set_item("files_added", metrics.files_added)?;
+    Ok(dict.into_pyobject(py)?.unbind().into())
+}
+
+fn compaction_stats_to_py(py: Python<'_>, stats: CompactionStats) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("total_fragments", stats.total_fragments)?;
+    dict.set_item("is_compacting", stats.is_compacting)?;
+    dict.set_item(
+        "last_compaction",
+        stats
+            .last_compaction
+            .map(|dt| dt.to_rfc3339_opts(SecondsFormat::Micros, true)),
+    )?;
+    dict.set_item("last_error", stats.last_error)?;
+    dict.set_item("total_compactions", stats.total_compactions)?;
+    Ok(dict.into_pyobject(py)?.unbind().into())
 }
 
 fn new_run_id() -> String {

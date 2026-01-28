@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow_array::builder::{
     FixedSizeListBuilder, Float32Builder, Int32Builder, LargeBinaryBuilder, LargeStringBuilder,
@@ -12,11 +13,15 @@ use arrow_array::{
     TimestampMicrosecondArray,
 };
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Schema, TimeUnit};
-use chrono::DateTime;
+use chrono::{DateTime, Timelike, Utc};
 use futures::TryStreamExt;
+use lance::dataset::optimize::{compact_files, CompactionMetrics, CompactionOptions};
 use lance::dataset::{builder::DatasetBuilder, Dataset, WriteMode, WriteParams};
 use lance::io::ObjectStoreParams;
 use lance::{Error as LanceError, Result as LanceResult};
+use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
+use tracing::{error, info, warn};
 
 use crate::record::{ContextRecord, SearchResult, StateMetadata};
 
@@ -24,16 +29,82 @@ use crate::record::{ContextRecord, SearchResult, StateMetadata};
 const DEFAULT_EMBEDDING_DIM: i32 = 1536;
 const DEFAULT_SEARCH_LIMIT: usize = 10;
 
+/// Configuration for background compaction.
+#[derive(Debug, Clone)]
+pub struct CompactionConfig {
+    /// Whether background compaction is enabled.
+    pub enabled: bool,
+    /// Minimum number of fragments to trigger compaction.
+    pub min_fragments: usize,
+    /// Target rows per fragment after compaction.
+    pub target_rows_per_fragment: usize,
+    /// Maximum rows per row group.
+    pub max_rows_per_group: usize,
+    /// Whether to materialize (remove) deleted rows during compaction.
+    pub materialize_deletions: bool,
+    /// Deletion threshold (0.0-1.0) to trigger materialization.
+    pub materialize_deletions_threshold: f32,
+    /// Number of threads for compaction (None = auto).
+    pub num_threads: Option<usize>,
+    /// Interval in seconds between compaction checks.
+    pub check_interval_secs: u64,
+    /// Quiet hours during which compaction is skipped [(start_hour, end_hour)].
+    pub quiet_hours: Vec<(u8, u8)>,
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_fragments: 5,
+            target_rows_per_fragment: 1_000_000,
+            max_rows_per_group: 1024,
+            materialize_deletions: true,
+            materialize_deletions_threshold: 0.1,
+            num_threads: None,
+            check_interval_secs: 300,
+            quiet_hours: vec![],
+        }
+    }
+}
+
+/// Statistics about compaction status and history.
+#[derive(Debug, Clone)]
+pub struct CompactionStats {
+    /// Current number of fragments in the dataset.
+    pub total_fragments: usize,
+    /// Whether a compaction is currently in progress.
+    pub is_compacting: bool,
+    /// Timestamp of the last successful compaction.
+    pub last_compaction: Option<DateTime<Utc>>,
+    /// Error message from the last failed compaction.
+    pub last_error: Option<String>,
+    /// Total number of successful compactions performed.
+    pub total_compactions: u64,
+}
+
+/// Internal state for tracking background compaction.
+struct CompactionState {
+    background_task: Option<JoinHandle<()>>,
+    is_compacting: bool,
+    last_compaction: Option<DateTime<Utc>>,
+    last_error: Option<String>,
+    total_compactions: u64,
+}
+
 /// Persistent Lance-backed context store.
 #[derive(Clone)]
 pub struct ContextStore {
     dataset: Dataset,
+    compaction_state: Arc<Mutex<CompactionState>>,
+    pub compaction_config: CompactionConfig,
 }
 
 /// Additional configuration when opening a [`ContextStore`].
 #[derive(Debug, Clone, Default)]
 pub struct ContextStoreOptions {
     pub storage_options: Option<HashMap<String, String>>,
+    pub compaction: CompactionConfig,
 }
 
 impl ContextStoreOptions {
@@ -52,14 +123,30 @@ impl ContextStore {
     /// Open a dataset with explicit object store configuration (e.g. S3 credentials).
     pub async fn open_with_options(uri: &str, options: ContextStoreOptions) -> LanceResult<Self> {
         let storage_options = options.storage_options();
-        match Self::load_with_options(uri, storage_options.clone()).await {
-            Ok(dataset) => Ok(Self { dataset }),
+        let dataset = match Self::load_with_options(uri, storage_options.clone()).await {
+            Ok(dataset) => dataset,
             Err(LanceError::DatasetNotFound { .. }) => {
-                let dataset = Self::create_with_options(uri, storage_options).await?;
-                Ok(Self { dataset })
+                Self::create_with_options(uri, storage_options).await?
             }
-            Err(err) => Err(err),
-        }
+            Err(err) => return Err(err),
+        };
+
+        let mut store = Self {
+            dataset,
+            compaction_state: Arc::new(Mutex::new(CompactionState {
+                background_task: None,
+                is_compacting: false,
+                last_compaction: None,
+                last_error: None,
+                total_compactions: 0,
+            })),
+            compaction_config: options.compaction,
+        };
+
+        // Start background compaction if enabled
+        store.start_background_compaction().await?;
+
+        Ok(store)
     }
 
     /// Append context records to the store and return the new dataset version.
@@ -144,6 +231,172 @@ impl ContextStore {
             results.extend(batch_to_search_results(&batch)?);
         }
         Ok(results)
+    }
+
+    /// Manually trigger compaction to merge small fragments.
+    pub async fn compact(
+        &mut self,
+        options: Option<CompactionConfig>,
+    ) -> LanceResult<CompactionMetrics> {
+        let config = options.unwrap_or_else(|| self.compaction_config.clone());
+
+        info!(
+            "Starting compaction: {} fragments",
+            self.dataset.count_fragments()
+        );
+        let start = std::time::Instant::now();
+
+        // Mark as compacting
+        {
+            let mut state = self.compaction_state.lock().await;
+            if state.is_compacting {
+                warn!("Compaction already in progress, skipping");
+                return Err(LanceError::from(ArrowError::InvalidArgumentError(
+                    "Compaction already in progress".to_string(),
+                )));
+            }
+            state.is_compacting = true;
+        }
+
+        // Build Lance CompactionOptions
+        let lance_options = CompactionOptions {
+            target_rows_per_fragment: config.target_rows_per_fragment,
+            max_rows_per_group: config.max_rows_per_group,
+            materialize_deletions: config.materialize_deletions,
+            materialize_deletions_threshold: config.materialize_deletions_threshold,
+            num_threads: config.num_threads,
+            ..Default::default()
+        };
+
+        // Run compaction
+        let result = compact_files(&mut self.dataset, lance_options, None).await;
+
+        // Update state
+        let mut state = self.compaction_state.lock().await;
+        state.is_compacting = false;
+
+        match result {
+            Ok(metrics) => {
+                state.last_compaction = Some(Utc::now());
+                state.total_compactions += 1;
+                state.last_error = None;
+
+                info!(
+                    "Compaction completed in {:?}: removed {} fragments ({}files), added {} fragments ({} files)",
+                    start.elapsed(),
+                    metrics.fragments_removed,
+                    metrics.files_removed,
+                    metrics.fragments_added,
+                    metrics.files_added
+                );
+
+                // Reload dataset to see new version
+                self.dataset = Dataset::open(self.dataset.uri()).await?;
+
+                Ok(metrics)
+            }
+            Err(e) => {
+                error!("Compaction failed: {}", e);
+                state.last_error = Some(e.to_string());
+                Err(e)
+            }
+        }
+    }
+
+    /// Check if compaction should run based on configuration thresholds.
+    pub async fn should_compact(&self) -> LanceResult<bool> {
+        let fragment_count = self.dataset.count_fragments();
+
+        if fragment_count < self.compaction_config.min_fragments {
+            return Ok(false);
+        }
+
+        // Check quiet hours
+        if !self.compaction_config.quiet_hours.is_empty() {
+            let now = Utc::now();
+            let current_hour = now.hour() as u8;
+
+            for (start, end) in &self.compaction_config.quiet_hours {
+                if current_hour >= *start && current_hour < *end {
+                    info!("Skipping compaction during quiet hours ({}-{})", start, end);
+                    return Ok(false);
+                }
+            }
+        }
+
+        Ok(true)
+    }
+
+    /// Get current compaction statistics.
+    pub async fn compaction_stats(&self) -> LanceResult<CompactionStats> {
+        let state = self.compaction_state.lock().await;
+
+        Ok(CompactionStats {
+            total_fragments: self.dataset.count_fragments(),
+            is_compacting: state.is_compacting,
+            last_compaction: state.last_compaction,
+            last_error: state.last_error.clone(),
+            total_compactions: state.total_compactions,
+        })
+    }
+
+    /// Start background compaction task if enabled.
+    async fn start_background_compaction(&mut self) -> LanceResult<()> {
+        if !self.compaction_config.enabled {
+            return Ok(());
+        }
+
+        let mut state = self.compaction_state.lock().await;
+        if state.background_task.is_some() {
+            warn!("Background compaction already running");
+            return Ok(());
+        }
+
+        info!(
+            "Starting background compaction (interval: {}s, min fragments: {})",
+            self.compaction_config.check_interval_secs, self.compaction_config.min_fragments
+        );
+
+        let mut store_clone = self.clone();
+        let interval_secs = self.compaction_config.check_interval_secs;
+
+        let task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+
+            loop {
+                interval.tick().await;
+
+                match store_clone.should_compact().await {
+                    Ok(true) => {
+                        info!("Background compaction triggered");
+                        if let Err(e) = store_clone.compact(None).await {
+                            error!("Background compaction failed: {}", e);
+                        }
+                    }
+                    Ok(false) => {
+                        // Not needed or in quiet hours
+                    }
+                    Err(e) => {
+                        error!("Error checking compaction need: {}", e);
+                    }
+                }
+            }
+        });
+
+        state.background_task = Some(task);
+        Ok(())
+    }
+
+    /// Stop background compaction task.
+    pub async fn stop_background_compaction(&mut self) -> LanceResult<()> {
+        let mut state = self.compaction_state.lock().await;
+
+        if let Some(task) = state.background_task.take() {
+            info!("Stopping background compaction");
+            task.abort();
+        }
+
+        Ok(())
     }
 
     /// Lance schema for the context store.
@@ -365,6 +618,17 @@ impl ContextStore {
         )?;
 
         Ok(batch)
+    }
+}
+
+impl Drop for ContextStore {
+    fn drop(&mut self) {
+        // Best-effort cleanup of background task
+        if let Ok(mut state) = self.compaction_state.try_lock() {
+            if let Some(task) = state.background_task.take() {
+                task.abort();
+            }
+        }
     }
 }
 

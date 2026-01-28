@@ -21,6 +21,8 @@ lance-namespace = "1.0.1"
 lance-graph = "0.4.0"
 serde = { version = "1", features = ["derive"] }
 futures = "0.3"
+tokio = { version = "1", features = ["sync", "time"] }
+tracing = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
