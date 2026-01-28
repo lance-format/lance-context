@@ -153,13 +153,14 @@ impl Context {
         self.store.version()
     }
 
-    #[pyo3(signature = (role, content, data_type = None))]
+    #[pyo3(signature = (role, content, data_type = None, embedding = None))]
     fn add(
         &mut self,
         py: Python<'_>,
         role: &str,
         content: &Bound<'_, PyAny>,
         data_type: Option<&str>,
+        embedding: Option<Vec<f32>>,
     ) -> PyResult<()> {
         let (content_type, text_payload, binary_payload, inner_content) =
             match content.extract::<&[u8]>() {
@@ -190,7 +191,7 @@ impl Context {
             content_type,
             text_payload,
             binary_payload,
-            embedding: None,
+            embedding,
         };
 
         let add_res = py.allow_threads(|| {
