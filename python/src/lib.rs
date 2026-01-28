@@ -125,9 +125,8 @@ impl Context {
             compaction: compaction_config_from_dict(compaction_config)?,
         };
 
-        let store_res = py.allow_threads(|| {
-            runtime.block_on(ContextStore::open_with_options(uri, options))
-        });
+        let store_res =
+            py.allow_threads(|| runtime.block_on(ContextStore::open_with_options(uri, options)));
         let store = store_res.map_err(to_py_err)?;
         let run_id = new_run_id();
         Ok(Self {
@@ -231,10 +230,7 @@ impl Context {
         query: Vec<f32>,
         limit: Option<usize>,
     ) -> PyResult<Vec<PyObject>> {
-        let hits_res = py.allow_threads(|| {
-            self.runtime
-                .block_on(self.store.search(&query, limit))
-        });
+        let hits_res = py.allow_threads(|| self.runtime.block_on(self.store.search(&query, limit)));
         let hits = hits_res.map_err(to_py_err)?;
         hits.into_iter()
             .map(|hit| search_hit_to_py(py, hit))
