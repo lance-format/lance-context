@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Any
 
 import pytest
 from lance_context.api import Context, _coerce_vector, _normalize_record, _normalize_search_hit
@@ -8,6 +9,10 @@ class DummyInner:
     def __init__(self) -> None:
         self.search_calls: list[tuple[list[float], int | None]] = []
         self.list_calls: list[tuple[int | None, int | None]] = []
+        self.add_calls: list[tuple[str, Any, str | None, list[float] | None]] = []
+
+    def add(self, role: str, content: Any, data_type: str | None, embedding: list[float] | None):
+        self.add_calls.append((role, content, data_type, embedding))
 
     def search(self, vector: list[float], limit: int | None):
         self.search_calls.append((vector, limit))
@@ -140,3 +145,48 @@ def test_context_list_default_args():
     ctx.list()
 
     assert dummy.list_calls == [(None, None)]
+
+
+def test_context_add_with_embedding():
+    ctx = Context.__new__(Context)
+    dummy = DummyInner()
+    ctx._inner = dummy  # type: ignore[attr-defined]
+
+    embedding = [0.1, 0.2, 0.3]
+    ctx.add("user", "hello", embedding=embedding)
+
+    assert len(dummy.add_calls) == 1
+    role, content, data_type, passed_embedding = dummy.add_calls[0]
+    assert role == "user"
+    assert content == "hello"
+    assert data_type is None
+    assert passed_embedding == [0.1, 0.2, 0.3]
+
+
+def test_context_add_without_embedding():
+    ctx = Context.__new__(Context)
+    dummy = DummyInner()
+    ctx._inner = dummy  # type: ignore[attr-defined]
+
+    ctx.add("assistant", "world")
+
+    assert len(dummy.add_calls) == 1
+    role, content, data_type, passed_embedding = dummy.add_calls[0]
+    assert role == "assistant"
+    assert content == "world"
+    assert passed_embedding is None
+
+
+def test_context_add_with_content_type_and_embedding():
+    ctx = Context.__new__(Context)
+    dummy = DummyInner()
+    ctx._inner = dummy  # type: ignore[attr-defined]
+
+    embedding = [0.5, 0.6]
+    ctx.add("system", "prompt", content_type="text/markdown", embedding=embedding)
+
+    assert len(dummy.add_calls) == 1
+    role, content, data_type, passed_embedding = dummy.add_calls[0]
+    assert role == "system"
+    assert data_type == "text/markdown"
+    assert passed_embedding == [0.5, 0.6]

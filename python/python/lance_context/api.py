@@ -236,13 +236,14 @@ class Context:
         content: Any,
         content_type: str | None = None,
         data_type: str | None = None,
+        embedding: list[float] | None = None,
     ) -> None:
         if content_type is not None and data_type is not None:
             raise ValueError("Specify only one of content_type or data_type")
         if content_type is None:
             content_type = data_type
         payload, resolved_type = _normalize_content(content, content_type)
-        self._inner.add(role, payload, resolved_type)
+        self._inner.add(role, payload, resolved_type, embedding)
 
     def snapshot(self, label: str | None = None) -> str:
         return self._inner.snapshot(label)
