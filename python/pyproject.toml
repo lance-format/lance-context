@@ -1,6 +1,6 @@
 [project]
 name = "lance-context"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
     "pylance==1.0.2",
     "lancedb==0.26.1",
