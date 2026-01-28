@@ -176,7 +176,9 @@ class Context:
 
         if options or compaction_config["enabled"]:
             self._inner = _Context.create(
-                uri, storage_options=options or None, compaction_config=compaction_config
+                uri,
+                storage_options=options or None,
+                compaction_config=compaction_config,
             )
         else:
             self._inner = _Context.create(uri)
