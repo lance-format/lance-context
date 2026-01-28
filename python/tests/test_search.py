@@ -9,10 +9,18 @@ class DummyInner:
     def __init__(self) -> None:
         self.search_calls: list[tuple[list[float], int | None]] = []
         self.list_calls: list[tuple[int | None, int | None]] = []
-        self.add_calls: list[tuple[str, Any, str | None, list[float] | None]] = []
+        self.add_calls: list[tuple[str, Any, str | None, list[float] | None, str | None, str | None]] = []
 
-    def add(self, role: str, content: Any, data_type: str | None, embedding: list[float] | None):
-        self.add_calls.append((role, content, data_type, embedding))
+    def add(
+        self,
+        role: str,
+        content: Any,
+        data_type: str | None,
+        embedding: list[float] | None,
+        bot_id: str | None,
+        session_id: str | None,
+    ):
+        self.add_calls.append((role, content, data_type, embedding, bot_id, session_id))
 
     def search(self, vector: list[float], limit: int | None):
         self.search_calls.append((vector, limit))
@@ -20,6 +28,8 @@ class DummyInner:
             {
                 "id": "rec-1",
                 "run_id": "run-1",
+                "bot_id": "support_bot",
+                "session_id": None,
                 "role": "user",
                 "content_type": "text/plain",
                 "text_payload": "hello",
@@ -37,6 +47,8 @@ class DummyInner:
             {
                 "id": "rec-1",
                 "run_id": "run-1",
+                "bot_id": "support_bot",
+                "session_id": "user_1",
                 "role": "user",
                 "content_type": "text/plain",
                 "text_payload": "hello",
@@ -48,6 +60,8 @@ class DummyInner:
             {
                 "id": "rec-2",
                 "run_id": "run-1",
+                "bot_id": None,
+                "session_id": None,
                 "role": "assistant",
                 "content_type": "text/plain",
                 "text_payload": "world",
@@ -156,11 +170,13 @@ def test_context_add_with_embedding():
     ctx.add("user", "hello", embedding=embedding)
 
     assert len(dummy.add_calls) == 1
-    role, content, data_type, passed_embedding = dummy.add_calls[0]
+    role, content, data_type, passed_embedding, bot_id, session_id = dummy.add_calls[0]
     assert role == "user"
     assert content == "hello"
     assert data_type is None
     assert passed_embedding == [0.1, 0.2, 0.3]
+    assert bot_id is None
+    assert session_id is None
 
 
 def test_context_add_without_embedding():
@@ -171,10 +187,12 @@ def test_context_add_without_embedding():
     ctx.add("assistant", "world")
 
     assert len(dummy.add_calls) == 1
-    role, content, data_type, passed_embedding = dummy.add_calls[0]
+    role, content, data_type, passed_embedding, bot_id, session_id = dummy.add_calls[0]
     assert role == "assistant"
     assert content == "world"
     assert passed_embedding is None
+    assert bot_id is None
+    assert session_id is None
 
 
 def test_context_add_with_content_type_and_embedding():
@@ -186,7 +204,89 @@ def test_context_add_with_content_type_and_embedding():
     ctx.add("system", "prompt", content_type="text/markdown", embedding=embedding)
 
     assert len(dummy.add_calls) == 1
-    role, content, data_type, passed_embedding = dummy.add_calls[0]
+    role, content, data_type, passed_embedding, bot_id, session_id = dummy.add_calls[0]
     assert role == "system"
     assert data_type == "text/markdown"
     assert passed_embedding == [0.5, 0.6]
+    assert bot_id is None
+    assert session_id is None
+
+
+def test_context_add_with_bot_id():
+    ctx = Context.__new__(Context)
+    dummy = DummyInner()
+    ctx._inner = dummy  # type: ignore[attr-defined]
+
+    ctx.add("user", "hello", bot_id="support_bot")
+
+    assert len(dummy.add_calls) == 1
+    role, content, data_type, passed_embedding, bot_id, session_id = dummy.add_calls[0]
+    assert role == "user"
+    assert content == "hello"
+    assert bot_id == "support_bot"
+    assert session_id is None
+
+
+def test_context_add_with_session_id():
+    ctx = Context.__new__(Context)
+    dummy = DummyInner()
+    ctx._inner = dummy  # type: ignore[attr-defined]
+
+    ctx.add("user", "hello", session_id="user_123")
+
+    assert len(dummy.add_calls) == 1
+    role, content, data_type, passed_embedding, bot_id, session_id = dummy.add_calls[0]
+    assert role == "user"
+    assert content == "hello"
+    assert bot_id is None
+    assert session_id == "user_123"
+
+
+def test_context_add_with_agent_and_session_id():
+    ctx = Context.__new__(Context)
+    dummy = DummyInner()
+    ctx._inner = dummy  # type: ignore[attr-defined]
+
+    ctx.add("user", "hello", bot_id="sales_bot", session_id="conv_456")
+
+    assert len(dummy.add_calls) == 1
+    role, content, data_type, passed_embedding, bot_id, session_id = dummy.add_calls[0]
+    assert role == "user"
+    assert bot_id == "sales_bot"
+    assert session_id == "conv_456"
+
+
+def test_context_add_with_all_options():
+    ctx = Context.__new__(Context)
+    dummy = DummyInner()
+    ctx._inner = dummy  # type: ignore[attr-defined]
+
+    embedding = [0.1, 0.2]
+    ctx.add("user", "hello", embedding=embedding, bot_id="bot", session_id="sess")
+
+    assert len(dummy.add_calls) == 1
+    role, content, data_type, passed_embedding, bot_id, session_id = dummy.add_calls[0]
+    assert role == "user"
+    assert passed_embedding == [0.1, 0.2]
+    assert bot_id == "bot"
+    assert session_id == "sess"
+
+
+def test_normalize_record_with_agent_and_session_id():
+    result = _normalize_record(
+        {
+            "id": "rec-1",
+            "created_at": "2024-01-01T00:00:00Z",
+            "content_type": "text/plain",
+            "text_payload": "hello",
+            "binary_payload": None,
+            "embedding": None,
+            "run_id": "run-1",
+            "bot_id": "support_bot",
+            "session_id": "user_88",
+            "role": "user",
+            "state_metadata": None,
+        }
+    )
+    assert result["bot_id"] == "support_bot"
+    assert result["session_id"] == "user_88"

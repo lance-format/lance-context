@@ -14,6 +14,8 @@ pub struct StateMetadata {
 pub struct ContextRecord {
     pub id: String,
     pub run_id: String,
+    pub bot_id: Option<String>,
+    pub session_id: Option<String>,
     pub created_at: DateTime<Utc>,
     pub role: String,
     pub state_metadata: Option<StateMetadata>,

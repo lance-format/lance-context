@@ -153,7 +153,7 @@ impl Context {
         self.store.version()
     }
 
-    #[pyo3(signature = (role, content, data_type = None, embedding = None))]
+    #[pyo3(signature = (role, content, data_type = None, embedding = None, bot_id = None, session_id = None))]
     fn add(
         &mut self,
         py: Python<'_>,
@@ -161,6 +161,8 @@ impl Context {
         content: &Bound<'_, PyAny>,
         data_type: Option<&str>,
         embedding: Option<Vec<f32>>,
+        bot_id: Option<String>,
+        session_id: Option<String>,
     ) -> PyResult<()> {
         let (content_type, text_payload, binary_payload, inner_content) =
             match content.extract::<&[u8]>() {
@@ -185,6 +187,8 @@ impl Context {
         let record = ContextRecord {
             id: record_id,
             run_id: self.run_id.clone(),
+            bot_id,
+            session_id,
             created_at: Utc::now(),
             role: role.to_string(),
             state_metadata: None,
@@ -345,6 +349,8 @@ fn record_to_py(py: Python<'_>, record: ContextRecord) -> PyResult<PyObject> {
     let ContextRecord {
         id,
         run_id,
+        bot_id,
+        session_id,
         created_at,
         role,
         state_metadata,
@@ -357,6 +363,8 @@ fn record_to_py(py: Python<'_>, record: ContextRecord) -> PyResult<PyObject> {
     let dict = PyDict::new(py);
     dict.set_item("id", id)?;
     dict.set_item("run_id", run_id)?;
+    dict.set_item("bot_id", bot_id)?;
+    dict.set_item("session_id", session_id)?;
     dict.set_item(
         "created_at",
         created_at.to_rfc3339_opts(SecondsFormat::Micros, true),

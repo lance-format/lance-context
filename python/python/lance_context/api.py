@@ -115,6 +115,8 @@ def _normalize_record(raw: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": raw.get("id"),
         "run_id": raw.get("run_id"),
+        "bot_id": raw.get("bot_id"),
+        "session_id": raw.get("session_id"),
         "role": raw.get("role"),
         "content_type": raw.get("content_type"),
         "text": raw.get("text_payload"),
@@ -237,13 +239,15 @@ class Context:
         content_type: str | None = None,
         data_type: str | None = None,
         embedding: list[float] | None = None,
+        bot_id: str | None = None,
+        session_id: str | None = None,
     ) -> None:
         if content_type is not None and data_type is not None:
             raise ValueError("Specify only one of content_type or data_type")
         if content_type is None:
             content_type = data_type
         payload, resolved_type = _normalize_content(content, content_type)
-        self._inner.add(role, payload, resolved_type, embedding)
+        self._inner.add(role, payload, resolved_type, embedding, bot_id, session_id)
 
     def snapshot(self, label: str | None = None) -> str:
         return self._inner.snapshot(label)
