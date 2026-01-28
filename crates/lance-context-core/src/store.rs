@@ -234,10 +234,16 @@ impl ContextStore {
     }
 
     /// Manually trigger compaction to merge small fragments.
-    pub async fn compact(&mut self, options: Option<CompactionConfig>) -> LanceResult<CompactionMetrics> {
+    pub async fn compact(
+        &mut self,
+        options: Option<CompactionConfig>,
+    ) -> LanceResult<CompactionMetrics> {
         let config = options.unwrap_or_else(|| self.compaction_config.clone());
 
-        info!("Starting compaction: {} fragments", self.dataset.count_fragments());
+        info!(
+            "Starting compaction: {} fragments",
+            self.dataset.count_fragments()
+        );
         let start = std::time::Instant::now();
 
         // Mark as compacting
