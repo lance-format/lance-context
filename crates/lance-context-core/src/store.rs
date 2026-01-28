@@ -798,23 +798,21 @@ fn batch_to_records(batch: &RecordBatch) -> LanceResult<Vec<ContextRecord>> {
             role_values.value(key).to_string()
         };
 
-        let bot_id = bot_id_array
-            .and_then(|arr| {
-                if arr.is_null(row) {
-                    None
-                } else {
-                    Some(arr.value(row).to_string())
-                }
-            });
+        let bot_id = bot_id_array.and_then(|arr| {
+            if arr.is_null(row) {
+                None
+            } else {
+                Some(arr.value(row).to_string())
+            }
+        });
 
-        let session_id = session_id_array
-            .and_then(|arr| {
-                if arr.is_null(row) {
-                    None
-                } else {
-                    Some(arr.value(row).to_string())
-                }
-            });
+        let session_id = session_id_array.and_then(|arr| {
+            if arr.is_null(row) {
+                None
+            } else {
+                Some(arr.value(row).to_string())
+            }
+        });
 
         results.push(ContextRecord {
             id: id_array.value(row).to_string(),

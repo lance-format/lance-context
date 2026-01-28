@@ -153,6 +153,7 @@ impl Context {
         self.store.version()
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (role, content, data_type = None, embedding = None, bot_id = None, session_id = None))]
     fn add(
         &mut self,
