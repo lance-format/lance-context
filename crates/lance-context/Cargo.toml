@@ -9,4 +9,4 @@ description = "Public re-export crate for lance-context bindings"
 readme = "README.md"
 
 [dependencies]
-lance-context-core = { path = "../lance-context-core" }
+lance-context-core = { version = "0.2.1", path = "../lance-context-core" }
