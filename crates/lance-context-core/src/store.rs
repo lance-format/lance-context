@@ -404,6 +404,8 @@ impl ContextStore {
         Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
             Field::new("run_id", DataType::Utf8, false),
+            Field::new("bot_id", DataType::Utf8, true),
+            Field::new("session_id", DataType::Utf8, true),
             Field::new(
                 "created_at",
                 DataType::Timestamp(TimeUnit::Microsecond, None),
@@ -485,6 +487,8 @@ impl ContextStore {
     fn records_to_batch(entries: &[ContextRecord]) -> LanceResult<RecordBatch> {
         let mut id_builder = StringBuilder::new();
         let mut run_id_builder = StringBuilder::new();
+        let mut bot_id_builder = StringBuilder::new();
+        let mut session_id_builder = StringBuilder::new();
         let mut created_at_builder = TimestampMicrosecondBuilder::with_capacity(entries.len());
         let mut role_builder = StringDictionaryBuilder::<Int8Type>::new();
         let mut content_type_builder = StringBuilder::new();
@@ -513,6 +517,8 @@ impl ContextStore {
         for entry in entries {
             id_builder.append_value(&entry.id);
             run_id_builder.append_value(&entry.run_id);
+            bot_id_builder.append_option(entry.bot_id.as_deref());
+            session_id_builder.append_option(entry.session_id.as_deref());
             created_at_builder.append_value(entry.created_at.timestamp_micros());
             role_builder.append(&entry.role)?;
             content_type_builder.append_value(&entry.content_type);
@@ -593,6 +599,8 @@ impl ContextStore {
 
         let id_array: ArrayRef = Arc::new(id_builder.finish());
         let run_id_array: ArrayRef = Arc::new(run_id_builder.finish());
+        let bot_id_array: ArrayRef = Arc::new(bot_id_builder.finish());
+        let session_id_array: ArrayRef = Arc::new(session_id_builder.finish());
         let created_at_array: ArrayRef = Arc::new(created_at_builder.finish());
         let role_array: ArrayRef = Arc::new(role_builder.finish());
         let content_type_array: ArrayRef = Arc::new(content_type_builder.finish());
@@ -607,6 +615,8 @@ impl ContextStore {
             vec![
                 id_array,
                 run_id_array,
+                bot_id_array,
+                session_id_array,
                 created_at_array,
                 role_array,
                 state_array,
@@ -664,6 +674,8 @@ fn batch_to_search_results(batch: &RecordBatch) -> LanceResult<Vec<SearchResult>
 fn batch_to_records(batch: &RecordBatch) -> LanceResult<Vec<ContextRecord>> {
     let id_array = column_as::<StringArray>(batch, "id")?;
     let run_id_array = column_as::<StringArray>(batch, "run_id")?;
+    let bot_id_array = column_as_optional::<StringArray>(batch, "bot_id");
+    let session_id_array = column_as_optional::<StringArray>(batch, "session_id");
     let created_at_array = column_as::<TimestampMicrosecondArray>(batch, "created_at")?;
     let role_array = column_as::<DictionaryArray<Int8Type>>(batch, "role")?;
     let state_array = column_as::<StructArray>(batch, "state_metadata")?;
@@ -786,9 +798,27 @@ fn batch_to_records(batch: &RecordBatch) -> LanceResult<Vec<ContextRecord>> {
             role_values.value(key).to_string()
         };
 
+        let bot_id = bot_id_array.and_then(|arr| {
+            if arr.is_null(row) {
+                None
+            } else {
+                Some(arr.value(row).to_string())
+            }
+        });
+
+        let session_id = session_id_array.and_then(|arr| {
+            if arr.is_null(row) {
+                None
+            } else {
+                Some(arr.value(row).to_string())
+            }
+        });
+
         results.push(ContextRecord {
             id: id_array.value(row).to_string(),
             run_id: run_id_array.value(row).to_string(),
+            bot_id,
+            session_id,
             created_at,
             role,
             state_metadata,
@@ -836,6 +866,15 @@ where
     })
 }
 
+fn column_as_optional<'a, A>(batch: &'a RecordBatch, name: &str) -> Option<&'a A>
+where
+    A: Array + 'static,
+{
+    batch
+        .column_by_name(name)
+        .and_then(|col| col.as_ref().as_any().downcast_ref::<A>())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -855,6 +894,8 @@ mod tests {
         ContextRecord {
             id: id.to_string(),
             run_id: format!("run-{id}"),
+            bot_id: None,
+            session_id: None,
             created_at: Utc::now(),
             role: "user".to_string(),
             state_metadata: Some(StateMetadata {
