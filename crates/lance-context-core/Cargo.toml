@@ -16,13 +16,15 @@ arrow-ipc = "58"
 arrow-schema = "58"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 lance = "7.0.0"
-lancedb = "0.30.0"
+lance-index = "7.0.0"
 lance-namespace = "7.0.0"
+lancedb = "0.30.0"
 lance-graph = "0.5.4"
 serde = { version = "1", features = ["derive"] }
 futures = "0.3"
 tokio = { version = "1", features = ["sync", "time"] }
 tracing = "0.1"
+uuid = { version = "1.20.0", features = ["v4", "v5"] }
 
 [dev-dependencies]
 tempfile = "3"
