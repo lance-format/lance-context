@@ -1,10 +1,13 @@
 """Tests for compaction functionality."""
+
 from __future__ import annotations
 
 import time
-from pathlib import Path
+from typing import TYPE_CHECKING
 
-import pytest
+if TYPE_CHECKING:
+    from pathlib import Path
+
 from lance_context.api import Context
 
 
@@ -27,9 +30,9 @@ def test_manual_compaction_reduces_fragments(tmp_path: Path) -> None:
     assert metrics["fragments_added"] > 0, "Should create consolidated fragments"
 
     stats_after = ctx.compaction_stats()
-    assert (
-        stats_after["total_fragments"] < initial_fragments
-    ), "Compaction should reduce fragment count"
+    assert stats_after["total_fragments"] < initial_fragments, (
+        "Compaction should reduce fragment count"
+    )
     assert stats_after["total_compactions"] == 1, "Should track compaction count"
     assert stats_after["last_compaction"] is not None, "Should record timestamp"
     assert stats_after["last_error"] is None, "Should have no errors"

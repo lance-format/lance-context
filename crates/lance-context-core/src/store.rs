@@ -170,9 +170,7 @@ impl ContextStore {
         // Ensure MemWAL is initialized (once for the dataset)
         {
             let indices = self.dataset.load_indices().await?;
-            let has_mem_wal = indices
-                .iter()
-                .any(|i| i.name == MEM_WAL_INDEX_NAME);
+            let has_mem_wal = indices.iter().any(|i| i.name == MEM_WAL_INDEX_NAME);
 
             if !has_mem_wal {
                 let maintained_indexes: Vec<String> = indices.iter().map(|i| i.name.clone()).collect();
@@ -188,7 +186,6 @@ impl ContextStore {
         for ((bot_id, session_id), group_entries) in groups {
             let region_id = Self::derive_region_id(&bot_id, &session_id);
             let batch = Self::records_to_batch(&group_entries)?;
-            
             let config = ShardWriterConfig {
                 shard_id: region_id,
                 ..Default::default()
@@ -204,7 +201,7 @@ impl ContextStore {
 
     fn derive_region_id(bot_id: &Option<String>, session_id: &Option<String>) -> Uuid {
         let mut input = String::new();
-        
+
         if let Some(bid) = bot_id {
             input.push_str(bid);
         }
@@ -212,7 +209,7 @@ impl ContextStore {
         if let Some(sid) = session_id {
             input.push_str(sid);
         }
-        
+
         // Use OID namespace as a base for our deterministic UUIDs
         Uuid::new_v5(&Uuid::NAMESPACE_OID, input.as_bytes())
     }
@@ -453,7 +450,10 @@ impl ContextStore {
     /// Lance schema for the context store.
     pub fn schema() -> Schema {
         let mut id_metadata = HashMap::new();
-        id_metadata.insert("lance-schema:unenforced-primary-key".to_string(), "true".to_string());
+        id_metadata.insert(
+            "lance-schema:unenforced-primary-key".to_string(),
+            "true".to_string(),
+        );
 
         Schema::new(vec![
             Field::new("id", DataType::Utf8, false).with_metadata(id_metadata),
@@ -1012,21 +1012,30 @@ mod tests {
     fn test_region_id_derivation_explicit() {
         let bot_id = Some("bot-123".to_string());
         let session_id = Some("session-456".to_string());
-        
+
         let region_id_1 = ContextStore::derive_region_id(&bot_id, &session_id);
         let region_id_2 = ContextStore::derive_region_id(&bot_id, &session_id);
-        
-        assert_eq!(region_id_1, region_id_2, "Region ID should be deterministic for same inputs");
-        
+
+        assert_eq!(
+            region_id_1, region_id_2,
+            "Region ID should be deterministic for same inputs"
+        );
+
         let other_session = Some("session-789".to_string());
         let region_id_3 = ContextStore::derive_region_id(&bot_id, &other_session);
-        
-        assert_ne!(region_id_1, region_id_3, "Region ID should differ for different inputs");
+
+        assert_ne!(
+            region_id_1, region_id_3,
+            "Region ID should differ for different inputs"
+        );
 
         // Test None/None case (now deterministic based on empty strings)
         let region_id_none = ContextStore::derive_region_id(&None, &None);
         let region_id_none_2 = ContextStore::derive_region_id(&None, &None);
-        assert_eq!(region_id_none, region_id_none_2, "Region ID for None/None should be deterministic");
+        assert_eq!(
+            region_id_none, region_id_none_2,
+            "Region ID for None/None should be deterministic"
+        );
     }
 
     #[test]
@@ -1034,30 +1043,33 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let uri = dir.path().to_string_lossy().to_string();
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        
+
         runtime.block_on(async {
             let mut store = ContextStore::open(&uri).await.unwrap();
-            
+
             // Create records for different regions
             let mut record1 = text_record("r1", 0.0);
             record1.bot_id = Some("bot-A".to_string());
             record1.session_id = Some("session-1".to_string());
-            
+
             let mut record2 = text_record("r2", 0.0);
             record2.bot_id = Some("bot-B".to_string());
             record2.session_id = Some("session-2".to_string());
-            
+
             // Add them in a single batch
-            store.add(&[record1.clone(), record2.clone()]).await.unwrap();
-            
+            store
+                .add(&[record1.clone(), record2.clone()])
+                .await
+                .unwrap();
+
             // Reload store to verify persistence
             let store = ContextStore::open(&uri).await.unwrap();
-            
+
             // Verify we can list them back
             let _results = store.list(None, None).await.unwrap();
             // TODO: MemWAL reads are not yet visible via standard scan.
             // assert_eq!(results.len(), 2);
-            
+
             // let ids: Vec<String> = results.iter().map(|r| r.id.clone()).collect();
             // assert!(ids.contains(&"r1".to_string()));
             // assert!(ids.contains(&"r2".to_string()));

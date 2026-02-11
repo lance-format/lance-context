@@ -2,14 +2,21 @@ from datetime import datetime
 from typing import Any
 
 import pytest
-from lance_context.api import Context, _coerce_vector, _normalize_record, _normalize_search_hit
+from lance_context.api import (
+    Context,
+    _coerce_vector,
+    _normalize_record,
+    _normalize_search_hit,
+)
 
 
 class DummyInner:
     def __init__(self) -> None:
         self.search_calls: list[tuple[list[float], int | None]] = []
         self.list_calls: list[tuple[int | None, int | None]] = []
-        self.add_calls: list[tuple[str, Any, str | None, list[float] | None, str | None, str | None]] = []
+        self.add_calls: list[
+            tuple[str, Any, str | None, list[float] | None, str | None, str | None]
+        ] = []
 
     def add(
         self,
