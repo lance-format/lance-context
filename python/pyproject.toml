@@ -10,7 +10,7 @@ dependencies = [
 description = "Multimodal, versioned context storage for agentic workflows"
 authors = [{ name = "Lance Devs", email = "dev@lancedb.com" }]
 license = { file = "LICENSE" }
-repository = "https://github.com/lancedb/lance-context"
+repository = "https://github.com/lance-format/lance-context"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
 keywords = ["context", "memory", "multimodal", "lance", "agents"]
