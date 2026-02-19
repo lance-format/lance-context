@@ -59,7 +59,7 @@ jobs:
       - name: Build distributions
         working-directory: python
         run: |
-          uv build --sdist --wheel --out-dir dist
+          maturin build --release --out dist --sdist
 
       - name: Upload distributions
         uses: actions/upload-artifact@v4
