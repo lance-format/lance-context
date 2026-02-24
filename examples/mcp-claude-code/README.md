@@ -51,6 +51,17 @@ claude mcp list
 Now you can use tools like `add_entry`, `list_entries`, `search_entries`,
 `stats`, and `checkout_version` inside Claude Code.
 
+## Skill example
+
+For teams using Codex skills, an example skill definition lives at:
+
+```
+examples/mcp-claude-code/skills/mcp-lance-context
+```
+
+It is provided as a reference for how to document MCP tooling and Claude Code
+setup in a reusable skill.
+
 ## Resetting the store
 
 To start fresh, stop the server and delete `.artifacts/claude_context.lance`.
