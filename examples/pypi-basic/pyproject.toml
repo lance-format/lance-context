@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Example project demonstrating the lance-context PyPI package."
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["lance-context>=0.1.0"]
+dependencies = ["lance-context>=0.2.4"]
 
 [project.scripts]
 context-demo = "context_example.main:main"

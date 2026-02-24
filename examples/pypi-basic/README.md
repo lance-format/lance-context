@@ -1,6 +1,6 @@
 # Lance Context PyPI Example
 
-This example demonstrates how to install the `lance-context` package from PyPI and work with a context store using the Python API.
+This example demonstrates how to install the `lance-context` package (0.2.4 or newer) from PyPI and work with a context store using the Python API.
 
 ## Setup
 
@@ -13,7 +13,7 @@ This example runs directly from the `src/` directory and only installs `lance-co
 cd examples/pypi-basic
 uv venv
 source .venv/bin/activate
-uv pip install lance-context
+uv pip install "lance-context>=0.2.4"
 ```
 
 ### Using pip
@@ -22,7 +22,7 @@ uv pip install lance-context
 cd examples/pypi-basic
 python -m venv .venv
 source .venv/bin/activate
-pip install lance-context
+pip install "lance-context>=0.2.4"
 ```
 
 ## Run the demo
