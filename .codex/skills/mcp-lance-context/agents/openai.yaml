@@ -1,0 +1,4 @@
+interface:
+  display_name: "MCP Lance Context"
+  short_description: "Build MCP server + Claude Code example"
+  default_prompt: "Use $mcp-lance-context to update the MCP server and Claude Code example."
