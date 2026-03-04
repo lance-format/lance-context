@@ -17,6 +17,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-C debuginfo=1"
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   format:
@@ -37,7 +38,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: .
+          shared-key: "lance-context-deps"
+          workspaces: |
+            crates/lance-context-core
+            python
       - name: Install dependencies
         run: |
           sudo apt update

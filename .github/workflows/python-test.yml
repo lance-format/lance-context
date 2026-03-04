@@ -16,7 +16,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-C debuginfo=0 -C codegen-units=16"
-  CARGO_TARGET_DIR: ${{ github.workspace }}/.cargo-target
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   build-wheel:
@@ -32,16 +32,12 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache: false
-      - name: Cache Rust build (shared)
-        uses: actions/cache@v4
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            .cargo-target
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          shared-key: "lance-context-deps"
+          workspaces: |
+            crates/lance-context-core
+            python
       - name: Install dependencies
         run: |
           sudo apt update
@@ -89,16 +85,12 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache: false
-      - name: Cache Rust build (shared)
-        uses: actions/cache@v4
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            .cargo-target
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          shared-key: "lance-context-deps"
+          workspaces: |
+            crates/lance-context-core
+            python
       - name: Install dependencies
         run: |
           sudo apt update
