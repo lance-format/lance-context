@@ -61,11 +61,13 @@ def moto_endpoint() -> str:
     from botocore.config import Config  # type: ignore[import-not-found]
 
     port = _free_port()
+    # moto >= 5 dropped the positional service argument; a single mock_server
+    # now serves every service. Older moto (<5) accepted an `s3` positional
+    # arg which is silently ignored here.
     cmd = [
         sys.executable,
         "-m",
         "moto.server",
-        "s3",
         "-H",
         "127.0.0.1",
         "-p",
@@ -196,24 +198,43 @@ def test_time_travel_checkout(tmp_path: Path) -> None:
     ]
 
 
-def test_s3_round_trip_remote_store(moto_endpoint: str, s3_client) -> None:
+def test_s3_round_trip_with_storage_options(moto_endpoint: str, s3_client) -> None:
+    """Canonical path: generic storage_options dict (aligns with lance/lance-graph)."""
     bucket = f"context-{uuid.uuid4().hex}"
     s3_client.create_bucket(Bucket=bucket)
     key = f"contexts/{uuid.uuid4().hex}/context.lance"
     uri = f"s3://{bucket}/{key}"
 
-    ctx = Context.create(
-        uri,
-        aws_access_key_id=_S3_ACCESS_KEY,
-        aws_secret_access_key=_S3_SECRET_KEY,
-        region=_S3_REGION,
-        endpoint_url=moto_endpoint,
-        allow_http=True,
-    )
+    ctx = Context.create(uri, storage_options=_s3_storage_options(moto_endpoint))
 
     ctx.add("user", "remote-hello")
     ctx.add("assistant", "remote-response")
     ctx.checkout(ctx.version())
+
+    rows = _read_rows(uri, storage_options=_s3_storage_options(moto_endpoint))
+    assert [row["text_payload"] for row in rows] == ["remote-hello", "remote-response"]
+    assert ctx.entries() == 2
+
+
+def test_s3_deprecated_aws_kwargs_still_work(moto_endpoint: str, s3_client) -> None:
+    """AWS kwargs keep working (back-compat) and emit a DeprecationWarning."""
+    bucket = f"context-{uuid.uuid4().hex}"
+    s3_client.create_bucket(Bucket=bucket)
+    key = f"contexts/{uuid.uuid4().hex}/context.lance"
+    uri = f"s3://{bucket}/{key}"
+
+    with pytest.warns(DeprecationWarning, match="storage_options"):
+        ctx = Context.create(
+            uri,
+            aws_access_key_id=_S3_ACCESS_KEY,
+            aws_secret_access_key=_S3_SECRET_KEY,
+            region=_S3_REGION,
+            endpoint_url=moto_endpoint,
+            allow_http=True,
+        )
+
+    ctx.add("user", "remote-hello")
+    ctx.add("assistant", "remote-response")
 
     rows = _read_rows(uri, storage_options=_s3_storage_options(moto_endpoint))
     assert [row["text_payload"] for row in rows] == ["remote-hello", "remote-response"]

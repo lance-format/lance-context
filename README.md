@@ -18,7 +18,8 @@ Key motivations inspired by the broader Lance roadmap<sup>[1](https://github.com
 - Unified schema for agent messages (`ContextRecord`) with optional embeddings and metadata.
 - Automatic versioning via Lance manifests with `checkout(version)` support.
 - Background compaction to optimize storage and read performance.
-- Remote persistence: point the store at `s3://` URIs with either AWS environment variables or explicit credentials/endpoint overrides.
+- Remote persistence on any `object_store` backend (S3, GCS, Azure Blob, ...)
+  via the generic `storage_options` dict, aligned with `lance` and `lance-graph`.
 - Python API (`lance_context.api.Context`) aligned with the Rust implementation.
 - Integration tests that exercise real persistence, image serialization, and version rollbacks.
 
@@ -68,16 +69,42 @@ ctx.checkout(first_version)
 
 print("Entries after checkout:", ctx.entries())
 
-# Store context in S3 (e.g., for MinIO/moto test endpoints)
+# Remote persistence on any object_store backend uses a generic `storage_options`
+# dict, matching the conventions used by `lance` and `lance-graph`.
+#
+# Amazon S3 (and S3-compatible endpoints like MinIO / moto):
 ctx = Context.create(
     "s3://my-bucket/context.lance",
-    aws_access_key_id="minioadmin",
-    aws_secret_access_key="minioadmin",
-    region="us-east-1",
-    endpoint_url="http://localhost:9000",
-    allow_http=True,
+    storage_options={
+        "aws_access_key_id": "minioadmin",
+        "aws_secret_access_key": "minioadmin",
+        "aws_region": "us-east-1",
+        "aws_endpoint_url": "http://localhost:9000",  # optional
+        "aws_allow_http": "true",                      # optional
+    },
 )
-# AWS_* environment variables work too—pass overrides only when you need custom endpoints.
+# Environment variables (AWS_ACCESS_KEY_ID, ...) are picked up by lance when
+# `storage_options` isn't provided; pass overrides only when you need them.
+
+# Google Cloud Storage:
+ctx = Context.create(
+    "gs://my-bucket/context.lance",
+    storage_options={
+        # Pick one: inline service-account JSON, path to the JSON file, or ADC.
+        "google_service_account_key": service_account_json,
+        # "google_service_account_path": "/path/to/sa.json",
+        # "google_application_credentials": "/path/to/adc.json",
+    },
+)
+
+# Azure Blob Storage:
+ctx = Context.create(
+    "az://my-container/context.lance",
+    storage_options={
+        "azure_storage_account_name": "...",
+        "azure_storage_account_key": "...",
+    },
+)
 
 # Background Compaction - optimize storage and read performance
 ctx = Context.create(
@@ -141,7 +168,8 @@ println!("Current version {}", store.version());
 
 We are tracking future enhancements as GitHub issues:
 
-- [Support S3-backed context stores](https://github.com/lance-format/lance-context/issues/14)
+- ~~[Support S3-backed context stores](https://github.com/lance-format/lance-context/issues/14)~~ ✅ **Implemented**
+- ~~[Support standard storage_options / GCS](https://github.com/lance-format/lance-context/issues/45)~~ ✅ **Implemented**
 - [Add relationship column for GraphRAG workflows](https://github.com/lance-format/lance-context/issues/15)
 - ~~[Background compaction for Lance fragments](https://github.com/lance-format/lance-context/issues/16)~~ ✅ **Implemented**
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from datetime import datetime
 from io import BytesIO
 from typing import Any
@@ -134,40 +135,145 @@ def _normalize_search_hit(raw: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+_AWS_KWARG_MAP: dict[str, str] = {
+    "aws_access_key_id": "aws_access_key_id",
+    "aws_secret_access_key": "aws_secret_access_key",
+    "aws_session_token": "aws_session_token",
+    "region": "aws_region",
+    "endpoint_url": "aws_endpoint_url",
+}
+
+
+def _merge_storage_options(
+    storage_options: dict[str, Any] | None,
+    *,
+    aws_access_key_id: str | None,
+    aws_secret_access_key: str | None,
+    aws_session_token: str | None,
+    region: str | None,
+    endpoint_url: str | None,
+    allow_http: bool,
+) -> dict[str, Any]:
+    """Merge deprecated AWS-specific kwargs into a generic storage_options dict.
+
+    Emits a single DeprecationWarning when any AWS kwarg is used so callers
+    can migrate to the generic `storage_options` path (which works for S3,
+    GCS, Azure, and any other lance/object_store backend).
+    """
+    options: dict[str, Any] = dict(storage_options or {})
+
+    aws_kwargs = {
+        "aws_access_key_id": aws_access_key_id,
+        "aws_secret_access_key": aws_secret_access_key,
+        "aws_session_token": aws_session_token,
+        "region": region,
+        "endpoint_url": endpoint_url,
+    }
+    used = [name for name, value in aws_kwargs.items() if value is not None]
+    if allow_http:
+        used.append("allow_http")
+
+    if used:
+        warnings.warn(
+            "The AWS-specific kwargs "
+            f"({', '.join(sorted(used))}) are deprecated and will be removed in a "
+            "future release. Pass credentials via the generic "
+            "`storage_options` dict instead (e.g. "
+            "storage_options={'aws_access_key_id': ..., "
+            "'aws_secret_access_key': ...} for S3, or "
+            "storage_options={'google_service_account_key': ...} for GCS).",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+
+    for kwarg_name, option_key in _AWS_KWARG_MAP.items():
+        value = aws_kwargs[kwarg_name]
+        if value is not None:
+            options.setdefault(option_key, value)
+    if allow_http:
+        options.setdefault("aws_allow_http", True)
+
+    return options
+
+
 class Context:
+    """Multimodal, versioned context store backed by Lance.
+
+    Storage backends are configured via the generic ``storage_options`` dict,
+    aligned with the conventions used by ``lance`` and ``lance-graph``. Any
+    keys understood by the underlying ``object_store`` crate are accepted.
+
+    Examples:
+        Local filesystem::
+
+            Context.create("/tmp/context.lance")
+
+        Amazon S3 (or S3-compatible endpoints like MinIO / moto)::
+
+            Context.create(
+                "s3://bucket/prefix/context.lance",
+                storage_options={
+                    "aws_access_key_id": "...",
+                    "aws_secret_access_key": "...",
+                    "aws_region": "us-east-1",
+                    "aws_endpoint_url": "http://localhost:9000",  # optional
+                    "aws_allow_http": "true",                      # optional
+                },
+            )
+
+        Google Cloud Storage::
+
+            Context.create(
+                "gs://bucket/prefix/context.lance",
+                storage_options={
+                    # Any one of these is enough; pick whatever fits your
+                    # deployment (inline JSON, file path, or ADC).
+                    "google_service_account_key": service_account_json,
+                    # "google_service_account_path": "/path/to/sa.json",
+                    # "google_application_credentials": "/path/to/adc.json",
+                },
+            )
+
+        Azure Blob Storage::
+
+            Context.create(
+                "az://container/prefix/context.lance",
+                storage_options={
+                    "azure_storage_account_name": "...",
+                    "azure_storage_account_key": "...",
+                },
+            )
+    """
+
     def __init__(
         self,
         uri: str,
         *,
         storage_options: dict[str, Any] | None = None,
+        # --- Deprecated AWS-specific shortcuts (kept for backwards compat). ---
         aws_access_key_id: str | None = None,
         aws_secret_access_key: str | None = None,
         aws_session_token: str | None = None,
         region: str | None = None,
         endpoint_url: str | None = None,
         allow_http: bool = False,
-        # Compaction configuration
+        # --- Compaction configuration. ---
         enable_background_compaction: bool = False,
         compaction_interval_secs: int = 300,
         compaction_min_fragments: int = 5,
         compaction_target_rows: int = 1_000_000,
         quiet_hours: list[tuple[int, int]] | None = None,
     ) -> None:
-        options = dict(storage_options or {})
-        if aws_access_key_id is not None:
-            options["aws_access_key_id"] = aws_access_key_id
-        if aws_secret_access_key is not None:
-            options["aws_secret_access_key"] = aws_secret_access_key
-        if aws_session_token is not None:
-            options["aws_session_token"] = aws_session_token
-        if region is not None:
-            options["aws_region"] = region
-        if endpoint_url is not None:
-            options["aws_endpoint_url"] = endpoint_url
-        if allow_http:
-            options["aws_allow_http"] = True
+        options = _merge_storage_options(
+            storage_options,
+            aws_access_key_id=aws_access_key_id,
+            aws_secret_access_key=aws_secret_access_key,
+            aws_session_token=aws_session_token,
+            region=region,
+            endpoint_url=endpoint_url,
+            allow_http=allow_http,
+        )
 
-        # Build compaction config
         compaction_config = {
             "enabled": enable_background_compaction,
             "check_interval_secs": compaction_interval_secs,
@@ -197,7 +303,6 @@ class Context:
         region: str | None = None,
         endpoint_url: str | None = None,
         allow_http: bool = False,
-        # Compaction configuration
         enable_background_compaction: bool = False,
         compaction_interval_secs: int = 300,
         compaction_min_fragments: int = 5,
