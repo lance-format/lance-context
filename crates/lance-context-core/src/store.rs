@@ -173,7 +173,8 @@ impl ContextStore {
             let has_mem_wal = indices.iter().any(|i| i.name == MEM_WAL_INDEX_NAME);
 
             if !has_mem_wal {
-                let maintained_indexes: Vec<String> = indices.iter().map(|i| i.name.clone()).collect();
+                let maintained_indexes: Vec<String> =
+                    indices.iter().map(|i| i.name.clone()).collect();
                 self.dataset
                     .initialize_mem_wal()
                     .unsharded()
