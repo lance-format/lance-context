@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lance-context-multi-session"
+version = "0.1.0"
+description = "Multi-bot, multi-session context with MemWAL sharding."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["lance-context>=0.2.5"]
+
+[project.scripts]
+multi-session-demo = "multi_session_example.main:main"
