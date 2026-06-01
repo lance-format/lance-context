@@ -2,10 +2,10 @@
 name = "lance-context"
 version = "0.2.4"
 dependencies = [
-    "pylance==1.0.2",
-    "lancedb==0.26.1",
-    "lance-namespace==0.4.5",
-    "lance-graph==0.4.0",
+    "pylance==7.0.0",
+    "lancedb==0.27.1",
+    "lance-namespace==0.8.0",
+    "lance-graph==0.5.4",
 ]
 description = "Multimodal, versioned context storage for agentic workflows"
 authors = [{ name = "Lance Devs", email = "dev@lancedb.com" }]

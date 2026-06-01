@@ -17,7 +17,7 @@ use chrono::{DateTime, Timelike, Utc};
 use futures::TryStreamExt;
 use lance::dataset::optimize::{compact_files, CompactionMetrics, CompactionOptions};
 use lance::dataset::{builder::DatasetBuilder, Dataset, WriteMode, WriteParams};
-use lance::io::ObjectStoreParams;
+use lance::io::{ObjectStoreParams, StorageOptionsAccessor};
 use lance::{Error as LanceError, Result as LanceResult};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -475,7 +475,9 @@ impl ContextStore {
 
         if let Some(options) = storage_options {
             let store_params = ObjectStoreParams {
-                storage_options: Some(options),
+                storage_options_accessor: Some(std::sync::Arc::new(
+                    StorageOptionsAccessor::with_static_options(options),
+                )),
                 ..Default::default()
             };
             params.store_params = Some(store_params);
