@@ -11,7 +11,7 @@ use tokio::runtime::Runtime;
 use lance_context::serde::CONTENT_TYPE_TEXT;
 use lance_context::{
     CompactionConfig, CompactionMetrics, CompactionStats, Context as RustContext, ContextRecord,
-    ContextStore, ContextStoreOptions, SearchResult,
+    ContextStore, ContextStoreOptions, IdIndexType, SearchResult,
 };
 
 const DEFAULT_BINARY_CONTENT_TYPE: &str = "application/octet-stream";
@@ -110,7 +110,7 @@ fn compaction_config_from_dict<'py>(
 #[pymethods]
 impl Context {
     #[classmethod]
-    #[pyo3(signature = (uri, *, storage_options=None, compaction_config=None, blob_columns=None))]
+    #[pyo3(signature = (uri, *, storage_options=None, compaction_config=None, blob_columns=None, id_index_type=None))]
     fn create(
         _cls: &Bound<'_, PyType>,
         py: Python<'_>,
@@ -118,15 +118,29 @@ impl Context {
         storage_options: Option<&Bound<'_, PyDict>>,
         compaction_config: Option<&Bound<'_, PyDict>>,
         blob_columns: Option<Vec<String>>,
+        id_index_type: Option<String>,
     ) -> PyResult<Self> {
         let runtime = Arc::new(Runtime::new().map_err(to_py_err)?);
 
         let blob_set: HashSet<String> = blob_columns.unwrap_or_default().into_iter().collect();
 
+        let id_idx = match id_index_type.as_deref() {
+            Some("btree") => IdIndexType::BTree,
+            Some("zonemap") => IdIndexType::ZoneMap,
+            Some("none") | None => IdIndexType::None,
+            Some(other) => {
+                return Err(PyRuntimeError::new_err(format!(
+                    "invalid id_index_type '{}': valid values are 'btree', 'zonemap'",
+                    other
+                )))
+            }
+        };
+
         let options = ContextStoreOptions {
             storage_options: storage_options_from_dict(storage_options)?,
             compaction: compaction_config_from_dict(compaction_config)?,
             blob_columns: blob_set,
+            id_index_type: id_idx,
         };
 
         let store_res =

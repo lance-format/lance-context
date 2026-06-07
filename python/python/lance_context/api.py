@@ -263,6 +263,7 @@ class Context:
         compaction_min_fragments: int = 5,
         compaction_target_rows: int = 1_000_000,
         quiet_hours: list[tuple[int, int]] | None = None,
+        id_index_type: str | None = None,
     ) -> None:
         options = _merge_storage_options(
             storage_options,
@@ -282,11 +283,12 @@ class Context:
             "quiet_hours": quiet_hours or [],
         }
 
-        if options or compaction_config["enabled"]:
+        if options or compaction_config["enabled"] or id_index_type:
             self._inner = _Context.create(
                 uri,
                 storage_options=options or None,
                 compaction_config=compaction_config,
+                id_index_type=id_index_type,
             )
         else:
             self._inner = _Context.create(uri)
@@ -308,6 +310,7 @@ class Context:
         compaction_min_fragments: int = 5,
         compaction_target_rows: int = 1_000_000,
         quiet_hours: list[tuple[int, int]] | None = None,
+        id_index_type: str | None = None,
     ) -> Context:
         return cls(
             uri,
@@ -323,6 +326,7 @@ class Context:
             compaction_min_fragments=compaction_min_fragments,
             compaction_target_rows=compaction_target_rows,
             quiet_hours=quiet_hours,
+            id_index_type=id_index_type,
         )
 
     def uri(self) -> str:

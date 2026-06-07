@@ -21,6 +21,8 @@ use lance::dataset::{builder::DatasetBuilder, Dataset, WriteMode, WriteParams};
 use lance::index::DatasetIndexExt;
 use lance::io::{ObjectStoreParams, StorageOptionsAccessor};
 use lance::{Error as LanceError, Result as LanceResult};
+use lance_index::scalar::ScalarIndexParams;
+use lance_index::IndexType;
 use lance_index::mem_wal::MEM_WAL_INDEX_NAME;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -32,6 +34,7 @@ use crate::record::{ContextRecord, SearchResult, StateMetadata};
 /// Embedding length used for the semantic index column.
 const DEFAULT_EMBEDDING_DIM: i32 = 1536;
 const DEFAULT_SEARCH_LIMIT: usize = 10;
+const ID_INDEX_NAME: &str = "id_idx";
 
 /// Configuration for background compaction.
 #[derive(Debug, Clone)]
@@ -72,6 +75,18 @@ impl Default for CompactionConfig {
     }
 }
 
+/// Type of scalar index on the `id` column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IdIndexType {
+    /// No index on the id column.
+    #[default]
+    None,
+    /// Zone-map index (min/max per fragment, lightweight).
+    ZoneMap,
+    /// B-tree index (point lookups, heavier).
+    BTree,
+}
+
 /// Statistics about compaction status and history.
 #[derive(Debug, Clone)]
 pub struct CompactionStats {
@@ -106,6 +121,7 @@ pub struct ContextStore {
     compaction_state: Arc<Mutex<CompactionState>>,
     pub compaction_config: CompactionConfig,
     blob_columns: HashSet<String>,
+    id_index_type: IdIndexType,
 }
 
 /// Additional configuration when opening a [`ContextStore`].
@@ -116,6 +132,8 @@ pub struct ContextStoreOptions {
     /// Column names that should use Lance V1 blob encoding.
     /// Valid values: `"text_payload"`, `"binary_payload"`.
     pub blob_columns: HashSet<String>,
+    /// Type of scalar index to create on the `id` column.
+    pub id_index_type: IdIndexType,
 }
 
 impl ContextStoreOptions {
@@ -164,7 +182,11 @@ impl ContextStore {
             })),
             compaction_config: options.compaction,
             blob_columns,
+            id_index_type: options.id_index_type,
         };
+
+        // Ensure id index if configured
+        store.ensure_id_index().await?;
 
         // Start background compaction if enabled
         store.start_background_compaction().await?;
@@ -192,8 +214,12 @@ impl ContextStore {
             let has_mem_wal = indices.iter().any(|i| i.name == MEM_WAL_INDEX_NAME);
 
             if !has_mem_wal {
-                let maintained_indexes: Vec<String> =
-                    indices.iter().map(|i| i.name.clone()).collect();
+                // ZoneMap indices are not supported by MemWAL; exclude them
+                let maintained_indexes: Vec<String> = indices
+                    .iter()
+                    .filter(|i| !(self.id_index_type == IdIndexType::ZoneMap && i.name == ID_INDEX_NAME))
+                    .map(|i| i.name.clone())
+                    .collect();
                 self.dataset
                     .initialize_mem_wal()
                     .unsharded()
@@ -348,6 +374,7 @@ impl ContextStore {
                 state.last_compaction = Some(Utc::now());
                 state.total_compactions += 1;
                 state.last_error = None;
+                drop(state); // Release lock before ensure_id_index
 
                 info!(
                     "Compaction completed in {:?}: removed {} fragments ({}files), added {} fragments ({} files)",
@@ -360,6 +387,12 @@ impl ContextStore {
 
                 // Reload dataset to see new version
                 self.dataset = Dataset::open(self.dataset.uri()).await?;
+
+                // Ensure id index exists after compaction
+                // (handles first-time creation on previously empty dataset)
+                if let Err(e) = self.ensure_id_index().await {
+                    warn!("Failed to ensure id index after compaction: {}", e);
+                }
 
                 Ok(metrics)
             }
@@ -406,6 +439,44 @@ impl ContextStore {
             last_error: state.last_error.clone(),
             total_compactions: state.total_compactions,
         })
+    }
+
+    /// Ensure the configured id index exists on the dataset.
+    async fn ensure_id_index(&mut self) -> LanceResult<()> {
+        if self.id_index_type == IdIndexType::None {
+            return Ok(());
+        }
+
+        let indices = self.dataset.load_indices().await?;
+        if indices.iter().any(|i| i.name == ID_INDEX_NAME) {
+            return Ok(());
+        }
+
+        self.create_id_index().await
+    }
+
+    /// Create (or replace) the scalar index on the `id` column.
+    pub async fn create_id_index(&mut self) -> LanceResult<()> {
+        let index_type = match self.id_index_type {
+            IdIndexType::ZoneMap => IndexType::ZoneMap,
+            IdIndexType::BTree => IndexType::BTree,
+            IdIndexType::None => return Ok(()),
+        };
+
+        info!("Creating {:?} index on id column", index_type);
+
+        let params = ScalarIndexParams::default();
+
+        self.dataset
+            .create_index_builder(&["id"], index_type, &params)
+            .name(ID_INDEX_NAME.to_string())
+            .replace(true)
+            .await?;
+
+        // Reload dataset to pick up new index
+        self.dataset = Dataset::open(self.dataset.uri()).await?;
+
+        Ok(())
     }
 
     /// Start background compaction task if enabled.
@@ -1377,6 +1448,132 @@ mod tests {
                 .unwrap();
             let results_binary = batch_to_records(&batch_binary).unwrap();
             assert_eq!(results_binary[0].text_payload, record.text_payload);
+        });
+    }
+
+    #[test]
+    fn test_id_index_btree() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        runtime.block_on(async {
+            let options = ContextStoreOptions {
+                id_index_type: IdIndexType::BTree,
+                ..Default::default()
+            };
+            let mut store = ContextStore::open_with_options(&uri, options).await.unwrap();
+
+            // Index should be created eagerly on open
+            let indices = store.dataset.load_indices().await.unwrap();
+            assert!(
+                indices.iter().any(|i| i.name == ID_INDEX_NAME),
+                "btree index should be created on open"
+            );
+
+            // Add data and verify it still works with the index
+            for i in 0..5 {
+                store
+                    .add(&[text_record(&format!("btree-{i}"), i as f32)])
+                    .await
+                    .unwrap();
+            }
+            store.compact(None).await.unwrap();
+
+            // Index should still exist after compaction
+            let indices = store.dataset.load_indices().await.unwrap();
+            assert!(
+                indices.iter().any(|i| i.name == ID_INDEX_NAME),
+                "btree index should persist after compaction"
+            );
+        });
+    }
+
+    #[test]
+    fn test_id_index_zonemap() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        runtime.block_on(async {
+            let options = ContextStoreOptions {
+                id_index_type: IdIndexType::ZoneMap,
+                ..Default::default()
+            };
+            let mut store = ContextStore::open_with_options(&uri, options).await.unwrap();
+
+            // Index should be created eagerly on open
+            let indices = store.dataset.load_indices().await.unwrap();
+            assert!(
+                indices.iter().any(|i| i.name == ID_INDEX_NAME),
+                "zonemap index should be created on open"
+            );
+
+            for i in 0..5 {
+                store
+                    .add(&[text_record(&format!("zm-{i}"), i as f32)])
+                    .await
+                    .unwrap();
+            }
+            store.compact(None).await.unwrap();
+
+            let indices = store.dataset.load_indices().await.unwrap();
+            assert!(
+                indices.iter().any(|i| i.name == ID_INDEX_NAME),
+                "zonemap index should persist after compaction"
+            );
+        });
+    }
+
+    #[test]
+    fn test_id_index_none_by_default() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        runtime.block_on(async {
+            let mut store = ContextStore::open(&uri).await.unwrap();
+
+            store
+                .add(&[text_record("no-idx-1", 0.0)])
+                .await
+                .unwrap();
+            store.compact(None).await.unwrap();
+
+            let indices = store.dataset.load_indices().await.unwrap();
+            assert!(
+                !indices.iter().any(|i| i.name == ID_INDEX_NAME),
+                "no id index should be created when IdIndexType::None"
+            );
+        });
+    }
+
+    #[test]
+    fn test_id_index_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        runtime.block_on(async {
+            let options = ContextStoreOptions {
+                id_index_type: IdIndexType::BTree,
+                ..Default::default()
+            };
+            let mut store = ContextStore::open_with_options(&uri, options).await.unwrap();
+
+            for i in 0..5 {
+                store
+                    .add(&[text_record(&format!("idem-{i}"), i as f32)])
+                    .await
+                    .unwrap();
+            }
+
+            // Create index twice -- second call should be a no-op
+            store.create_id_index().await.unwrap();
+            let v1 = store.version();
+            store.ensure_id_index().await.unwrap();
+            let v2 = store.version();
+            assert_eq!(v1, v2, "ensure_id_index should not recreate existing index");
         });
     }
 }
