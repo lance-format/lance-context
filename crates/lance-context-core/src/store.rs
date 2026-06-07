@@ -809,7 +809,7 @@ fn batch_to_records(batch: &RecordBatch) -> LanceResult<Vec<ContextRecord>> {
     let text_is_binary = batch
         .schema()
         .field_with_name("text_payload")
-        .map_or(false, |f| f.data_type() == &DataType::LargeBinary);
+        .is_ok_and(|f| f.data_type() == &DataType::LargeBinary);
 
     let text_string_array = if !text_is_binary {
         Some(column_as::<LargeStringArray>(batch, "text_payload")?)
