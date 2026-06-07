@@ -1185,7 +1185,7 @@ mod tests {
 
             let mut record = text_record("blob-bin-1", 0.0);
             record.binary_payload = Some(vec![0xDE, 0xAD, 0xBE, 0xEF]);
-            store.add(&[record.clone()]).await.unwrap();
+            store.add(std::slice::from_ref(&record)).await.unwrap();
 
             // Verify schema has blob metadata on binary_payload
             let schema = ContextStore::schema(&store.blob_columns);
@@ -1217,10 +1217,12 @@ mod tests {
                 .unwrap();
 
             let record = text_record("blob-txt-1", 0.0);
-            store.add(&[record.clone()]).await.unwrap();
+            store.add(std::slice::from_ref(&record)).await.unwrap();
 
             // Roundtrip: records_to_batch -> batch_to_records
-            let batch = store.records_to_batch(&[record.clone()]).unwrap();
+            let batch = store
+                .records_to_batch(std::slice::from_ref(&record))
+                .unwrap();
             let batch_schema = batch.schema();
             let text_field = batch_schema.field_with_name("text_payload").unwrap();
             assert_eq!(
@@ -1258,7 +1260,7 @@ mod tests {
 
             let mut record = text_record("blob-both-1", 0.0);
             record.binary_payload = Some(b"hello binary".to_vec());
-            store.add(&[record.clone()]).await.unwrap();
+            store.add(std::slice::from_ref(&record)).await.unwrap();
 
             // Both columns should have blob metadata
             let schema = ContextStore::schema(&store.blob_columns);
@@ -1274,7 +1276,9 @@ mod tests {
             );
 
             // Roundtrip via batch
-            let batch = store.records_to_batch(&[record.clone()]).unwrap();
+            let batch = store
+                .records_to_batch(std::slice::from_ref(&record))
+                .unwrap();
             let roundtripped = batch_to_records(&batch).unwrap();
             assert_eq!(roundtripped.len(), 1);
             assert_eq!(roundtripped[0].text_payload, record.text_payload);
@@ -1352,7 +1356,9 @@ mod tests {
             let uri1 = dir1.path().to_string_lossy().to_string();
             let store_default = ContextStore::open(&uri1).await.unwrap();
             let record = text_record("auto-1", 0.0);
-            let batch_utf8 = store_default.records_to_batch(&[record.clone()]).unwrap();
+            let batch_utf8 = store_default
+                .records_to_batch(std::slice::from_ref(&record))
+                .unwrap();
             let results_utf8 = batch_to_records(&batch_utf8).unwrap();
             assert_eq!(results_utf8[0].text_payload, record.text_payload);
 
@@ -1366,7 +1372,9 @@ mod tests {
             let store_blob = ContextStore::open_with_options(&uri2, options)
                 .await
                 .unwrap();
-            let batch_binary = store_blob.records_to_batch(&[record.clone()]).unwrap();
+            let batch_binary = store_blob
+                .records_to_batch(std::slice::from_ref(&record))
+                .unwrap();
             let results_binary = batch_to_records(&batch_binary).unwrap();
             assert_eq!(results_binary[0].text_payload, record.text_payload);
         });
