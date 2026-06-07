@@ -21,9 +21,9 @@ use lance::dataset::{builder::DatasetBuilder, Dataset, WriteMode, WriteParams};
 use lance::index::DatasetIndexExt;
 use lance::io::{ObjectStoreParams, StorageOptionsAccessor};
 use lance::{Error as LanceError, Result as LanceResult};
+use lance_index::mem_wal::MEM_WAL_INDEX_NAME;
 use lance_index::scalar::ScalarIndexParams;
 use lance_index::IndexType;
-use lance_index::mem_wal::MEM_WAL_INDEX_NAME;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
@@ -217,7 +217,9 @@ impl ContextStore {
                 // ZoneMap indices are not supported by MemWAL; exclude them
                 let maintained_indexes: Vec<String> = indices
                     .iter()
-                    .filter(|i| !(self.id_index_type == IdIndexType::ZoneMap && i.name == ID_INDEX_NAME))
+                    .filter(|i| {
+                        !(self.id_index_type == IdIndexType::ZoneMap && i.name == ID_INDEX_NAME)
+                    })
                     .map(|i| i.name.clone())
                     .collect();
                 self.dataset
@@ -1462,7 +1464,9 @@ mod tests {
                 id_index_type: IdIndexType::BTree,
                 ..Default::default()
             };
-            let mut store = ContextStore::open_with_options(&uri, options).await.unwrap();
+            let mut store = ContextStore::open_with_options(&uri, options)
+                .await
+                .unwrap();
 
             // Index should be created eagerly on open
             let indices = store.dataset.load_indices().await.unwrap();
@@ -1500,7 +1504,9 @@ mod tests {
                 id_index_type: IdIndexType::ZoneMap,
                 ..Default::default()
             };
-            let mut store = ContextStore::open_with_options(&uri, options).await.unwrap();
+            let mut store = ContextStore::open_with_options(&uri, options)
+                .await
+                .unwrap();
 
             // Index should be created eagerly on open
             let indices = store.dataset.load_indices().await.unwrap();
@@ -1534,10 +1540,7 @@ mod tests {
         runtime.block_on(async {
             let mut store = ContextStore::open(&uri).await.unwrap();
 
-            store
-                .add(&[text_record("no-idx-1", 0.0)])
-                .await
-                .unwrap();
+            store.add(&[text_record("no-idx-1", 0.0)]).await.unwrap();
             store.compact(None).await.unwrap();
 
             let indices = store.dataset.load_indices().await.unwrap();
@@ -1559,7 +1562,9 @@ mod tests {
                 id_index_type: IdIndexType::BTree,
                 ..Default::default()
             };
-            let mut store = ContextStore::open_with_options(&uri, options).await.unwrap();
+            let mut store = ContextStore::open_with_options(&uri, options)
+                .await
+                .unwrap();
 
             for i in 0..5 {
                 store
