@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{SecondsFormat, Utc};
@@ -110,19 +110,23 @@ fn compaction_config_from_dict<'py>(
 #[pymethods]
 impl Context {
     #[classmethod]
-    #[pyo3(signature = (uri, *, storage_options=None, compaction_config=None))]
+    #[pyo3(signature = (uri, *, storage_options=None, compaction_config=None, blob_columns=None))]
     fn create(
         _cls: &Bound<'_, PyType>,
         py: Python<'_>,
         uri: &str,
         storage_options: Option<&Bound<'_, PyDict>>,
         compaction_config: Option<&Bound<'_, PyDict>>,
+        blob_columns: Option<Vec<String>>,
     ) -> PyResult<Self> {
         let runtime = Arc::new(Runtime::new().map_err(to_py_err)?);
+
+        let blob_set: HashSet<String> = blob_columns.unwrap_or_default().into_iter().collect();
 
         let options = ContextStoreOptions {
             storage_options: storage_options_from_dict(storage_options)?,
             compaction: compaction_config_from_dict(compaction_config)?,
+            blob_columns: blob_set,
         };
 
         let store_res =

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -96,12 +96,16 @@ struct CompactionState {
     total_compactions: u64,
 }
 
+/// Valid column names that may use blob encoding.
+const VALID_BLOB_COLUMNS: &[&str] = &["text_payload", "binary_payload"];
+
 /// Persistent Lance-backed context store.
 #[derive(Clone)]
 pub struct ContextStore {
     dataset: Dataset,
     compaction_state: Arc<Mutex<CompactionState>>,
     pub compaction_config: CompactionConfig,
+    blob_columns: HashSet<String>,
 }
 
 /// Additional configuration when opening a [`ContextStore`].
@@ -109,6 +113,9 @@ pub struct ContextStore {
 pub struct ContextStoreOptions {
     pub storage_options: Option<HashMap<String, String>>,
     pub compaction: CompactionConfig,
+    /// Column names that should use Lance V1 blob encoding.
+    /// Valid values: `"text_payload"`, `"binary_payload"`.
+    pub blob_columns: HashSet<String>,
 }
 
 impl ContextStoreOptions {
@@ -126,11 +133,24 @@ impl ContextStore {
 
     /// Open a dataset with explicit object store configuration (e.g. S3 credentials).
     pub async fn open_with_options(uri: &str, options: ContextStoreOptions) -> LanceResult<Self> {
+        // Validate blob_columns
+        for col in &options.blob_columns {
+            if !VALID_BLOB_COLUMNS.contains(&col.as_str()) {
+                return Err(LanceError::from(ArrowError::InvalidArgumentError(
+                    format!(
+                        "invalid blob column '{}': valid columns are {:?}",
+                        col, VALID_BLOB_COLUMNS
+                    ),
+                )));
+            }
+        }
+
         let storage_options = options.storage_options();
+        let blob_columns = options.blob_columns.clone();
         let dataset = match Self::load_with_options(uri, storage_options.clone()).await {
             Ok(dataset) => dataset,
             Err(LanceError::DatasetNotFound { .. }) => {
-                Self::create_with_options(uri, storage_options).await?
+                Self::create_with_options(uri, storage_options, &blob_columns).await?
             }
             Err(err) => return Err(err),
         };
@@ -145,6 +165,7 @@ impl ContextStore {
                 total_compactions: 0,
             })),
             compaction_config: options.compaction,
+            blob_columns,
         };
 
         // Start background compaction if enabled
@@ -186,7 +207,7 @@ impl ContextStore {
 
         for ((bot_id, session_id), group_entries) in groups {
             let region_id = Self::derive_region_id(&bot_id, &session_id);
-            let batch = Self::records_to_batch(&group_entries)?;
+            let batch = self.records_to_batch(&group_entries)?;
             let config = ShardWriterConfig {
                 shard_id: region_id,
                 ..Default::default()
@@ -449,12 +470,32 @@ impl ContextStore {
     }
 
     /// Lance schema for the context store.
-    pub fn schema() -> Schema {
+    ///
+    /// When `blob_columns` contains a column name, that column is stored using
+    /// Lance V1 blob encoding (out-of-line binary buffers). For `text_payload`,
+    /// this also changes the Arrow type from `LargeUtf8` to `LargeBinary`.
+    pub fn schema(blob_columns: &HashSet<String>) -> Schema {
         let mut id_metadata = HashMap::new();
         id_metadata.insert(
             "lance-schema:unenforced-primary-key".to_string(),
             "true".to_string(),
         );
+
+        let text_field = if blob_columns.contains("text_payload") {
+            let mut metadata = HashMap::new();
+            metadata.insert("lance-encoding:blob".to_string(), "true".to_string());
+            Field::new("text_payload", DataType::LargeBinary, true).with_metadata(metadata)
+        } else {
+            Field::new("text_payload", DataType::LargeUtf8, true)
+        };
+
+        let binary_field = if blob_columns.contains("binary_payload") {
+            let mut metadata = HashMap::new();
+            metadata.insert("lance-encoding:blob".to_string(), "true".to_string());
+            Field::new("binary_payload", DataType::LargeBinary, true).with_metadata(metadata)
+        } else {
+            Field::new("binary_payload", DataType::LargeBinary, true)
+        };
 
         Schema::new(vec![
             Field::new("id", DataType::Utf8, false).with_metadata(id_metadata),
@@ -485,8 +526,8 @@ impl ContextStore {
                 true,
             ),
             Field::new("content_type", DataType::Utf8, false),
-            Field::new("text_payload", DataType::LargeUtf8, true),
-            Field::new("binary_payload", DataType::LargeBinary, true),
+            text_field,
+            binary_field,
             Field::new(
                 "embedding",
                 DataType::FixedSizeList(
@@ -515,8 +556,9 @@ impl ContextStore {
     async fn create_with_options(
         uri: &str,
         storage_options: Option<HashMap<String, String>>,
+        blob_columns: &HashSet<String>,
     ) -> LanceResult<Dataset> {
-        let schema = Arc::new(Self::schema());
+        let schema = Arc::new(Self::schema(blob_columns));
         let empty_batch = RecordBatch::new_empty(schema.clone());
         let batches = RecordBatchIterator::new(
             vec![Ok::<RecordBatch, ArrowError>(empty_batch)].into_iter(),
@@ -541,7 +583,7 @@ impl ContextStore {
         Dataset::write(batches, uri, Some(params)).await
     }
 
-    fn records_to_batch(entries: &[ContextRecord]) -> LanceResult<RecordBatch> {
+    fn records_to_batch(&self, entries: &[ContextRecord]) -> LanceResult<RecordBatch> {
         let mut id_builder = StringBuilder::new();
         let mut run_id_builder = StringBuilder::new();
         let mut bot_id_builder = StringBuilder::new();
@@ -549,8 +591,19 @@ impl ContextStore {
         let mut created_at_builder = TimestampMicrosecondBuilder::with_capacity(entries.len());
         let mut role_builder = StringDictionaryBuilder::<Int8Type>::new();
         let mut content_type_builder = StringBuilder::new();
-        let mut text_builder = LargeStringBuilder::new();
         let mut binary_builder = LargeBinaryBuilder::new();
+
+        let text_is_blob = self.blob_columns.contains("text_payload");
+        let mut text_string_builder = if !text_is_blob {
+            Some(LargeStringBuilder::new())
+        } else {
+            None
+        };
+        let mut text_binary_builder = if text_is_blob {
+            Some(LargeBinaryBuilder::new())
+        } else {
+            None
+        };
 
         let state_fields: Vec<FieldRef> = vec![
             Arc::new(Field::new("step", DataType::Int32, true)),
@@ -580,9 +633,19 @@ impl ContextStore {
             role_builder.append(&entry.role)?;
             content_type_builder.append_value(&entry.content_type);
 
-            match &entry.text_payload {
-                Some(value) => text_builder.append_value(value),
-                None => text_builder.append_null(),
+            if text_is_blob {
+                match &entry.text_payload {
+                    Some(value) => text_binary_builder
+                        .as_mut()
+                        .unwrap()
+                        .append_value(value.as_bytes()),
+                    None => text_binary_builder.as_mut().unwrap().append_null(),
+                }
+            } else {
+                match &entry.text_payload {
+                    Some(value) => text_string_builder.as_mut().unwrap().append_value(value),
+                    None => text_string_builder.as_mut().unwrap().append_null(),
+                }
             }
 
             match &entry.binary_payload {
@@ -661,12 +724,16 @@ impl ContextStore {
         let created_at_array: ArrayRef = Arc::new(created_at_builder.finish());
         let role_array: ArrayRef = Arc::new(role_builder.finish());
         let content_type_array: ArrayRef = Arc::new(content_type_builder.finish());
-        let text_array: ArrayRef = Arc::new(text_builder.finish());
+        let text_array: ArrayRef = if text_is_blob {
+            Arc::new(text_binary_builder.unwrap().finish())
+        } else {
+            Arc::new(text_string_builder.unwrap().finish())
+        };
         let binary_array: ArrayRef = Arc::new(binary_builder.finish());
         let state_array: ArrayRef = Arc::new(state_builder.finish());
         let embedding_array: ArrayRef = Arc::new(embedding_builder.finish());
 
-        let schema = Arc::new(Self::schema());
+        let schema = Arc::new(Self::schema(&self.blob_columns));
         let batch = RecordBatch::try_new(
             schema,
             vec![
@@ -737,9 +804,25 @@ fn batch_to_records(batch: &RecordBatch) -> LanceResult<Vec<ContextRecord>> {
     let role_array = column_as::<DictionaryArray<Int8Type>>(batch, "role")?;
     let state_array = column_as::<StructArray>(batch, "state_metadata")?;
     let content_type_array = column_as::<StringArray>(batch, "content_type")?;
-    let text_array = column_as::<LargeStringArray>(batch, "text_payload")?;
     let binary_array = column_as::<LargeBinaryArray>(batch, "binary_payload")?;
     let embedding_array = column_as::<FixedSizeListArray>(batch, "embedding")?;
+
+    // Auto-detect whether text_payload is LargeBinary (blob) or LargeUtf8 (default)
+    let text_is_binary = batch
+        .schema()
+        .field_with_name("text_payload")
+        .map_or(false, |f| f.data_type() == &DataType::LargeBinary);
+
+    let text_string_array = if !text_is_binary {
+        Some(column_as::<LargeStringArray>(batch, "text_payload")?)
+    } else {
+        None
+    };
+    let text_binary_array = if text_is_binary {
+        Some(column_as::<LargeBinaryArray>(batch, "text_payload")?)
+    } else {
+        None
+    };
 
     let step_array = state_array
         .column(0)
@@ -819,10 +902,20 @@ fn batch_to_records(batch: &RecordBatch) -> LanceResult<Vec<ContextRecord>> {
             })
         };
 
-        let text_payload = if text_array.is_null(row) {
-            None
+        let text_payload = if text_is_binary {
+            let arr = text_binary_array.unwrap();
+            if arr.is_null(row) {
+                None
+            } else {
+                Some(String::from_utf8_lossy(arr.value(row)).to_string())
+            }
         } else {
-            Some(text_array.value(row).to_string())
+            let arr = text_string_array.unwrap();
+            if arr.is_null(row) {
+                None
+            } else {
+                Some(arr.value(row).to_string())
+            }
         };
 
         let binary_payload = if binary_array.is_null(row) {
@@ -1074,6 +1167,202 @@ mod tests {
             // let ids: Vec<String> = results.iter().map(|r| r.id.clone()).collect();
             // assert!(ids.contains(&"r1".to_string()));
             // assert!(ids.contains(&"r2".to_string()));
+        });
+    }
+
+    #[test]
+    fn test_blob_binary_payload() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        runtime.block_on(async {
+            let options = ContextStoreOptions {
+                blob_columns: HashSet::from(["binary_payload".to_string()]),
+                ..Default::default()
+            };
+            let mut store = ContextStore::open_with_options(&uri, options).await.unwrap();
+
+            let mut record = text_record("blob-bin-1", 0.0);
+            record.binary_payload = Some(vec![0xDE, 0xAD, 0xBE, 0xEF]);
+            store.add(&[record.clone()]).await.unwrap();
+
+            // Verify schema has blob metadata on binary_payload
+            let schema = ContextStore::schema(&store.blob_columns);
+            let field = schema.field_with_name("binary_payload").unwrap();
+            assert_eq!(
+                field.metadata().get("lance-encoding:blob"),
+                Some(&"true".to_string()),
+            );
+            // text_payload should remain LargeUtf8 without blob metadata
+            let text_field = schema.field_with_name("text_payload").unwrap();
+            assert_eq!(text_field.data_type(), &DataType::LargeUtf8);
+            assert!(text_field.metadata().get("lance-encoding:blob").is_none());
+        });
+    }
+
+    #[test]
+    fn test_blob_text_payload() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        runtime.block_on(async {
+            let options = ContextStoreOptions {
+                blob_columns: HashSet::from(["text_payload".to_string()]),
+                ..Default::default()
+            };
+            let mut store = ContextStore::open_with_options(&uri, options).await.unwrap();
+
+            let record = text_record("blob-txt-1", 0.0);
+            store.add(&[record.clone()]).await.unwrap();
+
+            // Roundtrip: records_to_batch -> batch_to_records
+            let batch = store.records_to_batch(&[record.clone()]).unwrap();
+            let batch_schema = batch.schema();
+            let text_field = batch_schema.field_with_name("text_payload").unwrap();
+            assert_eq!(
+                text_field.data_type(),
+                &DataType::LargeBinary,
+                "text_payload should be LargeBinary when blob-encoded"
+            );
+
+            let roundtripped = batch_to_records(&batch).unwrap();
+            assert_eq!(roundtripped.len(), 1);
+            assert_eq!(
+                roundtripped[0].text_payload,
+                record.text_payload,
+                "text payload should survive blob roundtrip"
+            );
+        });
+    }
+
+    #[test]
+    fn test_blob_both_columns() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        runtime.block_on(async {
+            let options = ContextStoreOptions {
+                blob_columns: HashSet::from([
+                    "text_payload".to_string(),
+                    "binary_payload".to_string(),
+                ]),
+                ..Default::default()
+            };
+            let mut store = ContextStore::open_with_options(&uri, options).await.unwrap();
+
+            let mut record = text_record("blob-both-1", 0.0);
+            record.binary_payload = Some(b"hello binary".to_vec());
+            store.add(&[record.clone()]).await.unwrap();
+
+            // Both columns should have blob metadata
+            let schema = ContextStore::schema(&store.blob_columns);
+            let text_field = schema.field_with_name("text_payload").unwrap();
+            let bin_field = schema.field_with_name("binary_payload").unwrap();
+            assert_eq!(
+                text_field.metadata().get("lance-encoding:blob"),
+                Some(&"true".to_string()),
+            );
+            assert_eq!(
+                bin_field.metadata().get("lance-encoding:blob"),
+                Some(&"true".to_string()),
+            );
+
+            // Roundtrip via batch
+            let batch = store.records_to_batch(&[record.clone()]).unwrap();
+            let roundtripped = batch_to_records(&batch).unwrap();
+            assert_eq!(roundtripped.len(), 1);
+            assert_eq!(roundtripped[0].text_payload, record.text_payload);
+            assert_eq!(roundtripped[0].binary_payload, record.binary_payload);
+        });
+    }
+
+    #[test]
+    fn test_no_blob_default() {
+        // Default options should produce no blob metadata
+        let schema = ContextStore::schema(&HashSet::new());
+        let text_field = schema.field_with_name("text_payload").unwrap();
+        let bin_field = schema.field_with_name("binary_payload").unwrap();
+
+        assert_eq!(text_field.data_type(), &DataType::LargeUtf8);
+        assert!(text_field.metadata().get("lance-encoding:blob").is_none());
+        assert_eq!(bin_field.data_type(), &DataType::LargeBinary);
+        assert!(bin_field.metadata().get("lance-encoding:blob").is_none());
+    }
+
+    #[test]
+    fn test_blob_schema_metadata() {
+        let blob_columns = HashSet::from(["text_payload".to_string(), "binary_payload".to_string()]);
+        let schema = ContextStore::schema(&blob_columns);
+
+        let text_field = schema.field_with_name("text_payload").unwrap();
+        assert_eq!(text_field.data_type(), &DataType::LargeBinary);
+        assert_eq!(
+            text_field.metadata().get("lance-encoding:blob"),
+            Some(&"true".to_string()),
+        );
+
+        let bin_field = schema.field_with_name("binary_payload").unwrap();
+        assert_eq!(bin_field.data_type(), &DataType::LargeBinary);
+        assert_eq!(
+            bin_field.metadata().get("lance-encoding:blob"),
+            Some(&"true".to_string()),
+        );
+
+        // Non-blob fields should have no blob metadata
+        let id_field = schema.field_with_name("id").unwrap();
+        assert!(id_field.metadata().get("lance-encoding:blob").is_none());
+    }
+
+    #[test]
+    fn test_blob_invalid_column_name() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        runtime.block_on(async {
+            let options = ContextStoreOptions {
+                blob_columns: HashSet::from(["nonexistent_column".to_string()]),
+                ..Default::default()
+            };
+            let result = ContextStore::open_with_options(&uri, options).await;
+            assert!(result.is_err(), "should reject invalid blob column names");
+            let err_msg = result.err().unwrap().to_string();
+            assert!(
+                err_msg.contains("invalid blob column"),
+                "error should mention invalid blob column: {err_msg}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_batch_to_records_autodetects_text_type() {
+        // Verify that batch_to_records works on both LargeUtf8 and LargeBinary
+        // text_payload without needing configuration.
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            // Build a batch with text_payload as LargeUtf8 (default)
+            let dir1 = TempDir::new().unwrap();
+            let uri1 = dir1.path().to_string_lossy().to_string();
+            let store_default = ContextStore::open(&uri1).await.unwrap();
+            let record = text_record("auto-1", 0.0);
+            let batch_utf8 = store_default.records_to_batch(&[record.clone()]).unwrap();
+            let results_utf8 = batch_to_records(&batch_utf8).unwrap();
+            assert_eq!(results_utf8[0].text_payload, record.text_payload);
+
+            // Build a batch with text_payload as LargeBinary (blob)
+            let dir2 = TempDir::new().unwrap();
+            let uri2 = dir2.path().to_string_lossy().to_string();
+            let options = ContextStoreOptions {
+                blob_columns: HashSet::from(["text_payload".to_string()]),
+                ..Default::default()
+            };
+            let store_blob = ContextStore::open_with_options(&uri2, options).await.unwrap();
+            let batch_binary = store_blob.records_to_batch(&[record.clone()]).unwrap();
+            let results_binary = batch_to_records(&batch_binary).unwrap();
+            assert_eq!(results_binary[0].text_payload, record.text_payload);
         });
     }
 }
