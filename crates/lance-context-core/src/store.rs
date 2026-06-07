@@ -136,12 +136,10 @@ impl ContextStore {
         // Validate blob_columns
         for col in &options.blob_columns {
             if !VALID_BLOB_COLUMNS.contains(&col.as_str()) {
-                return Err(LanceError::from(ArrowError::InvalidArgumentError(
-                    format!(
-                        "invalid blob column '{}': valid columns are {:?}",
-                        col, VALID_BLOB_COLUMNS
-                    ),
-                )));
+                return Err(LanceError::from(ArrowError::InvalidArgumentError(format!(
+                    "invalid blob column '{}': valid columns are {:?}",
+                    col, VALID_BLOB_COLUMNS
+                ))));
             }
         }
 
@@ -1181,7 +1179,9 @@ mod tests {
                 blob_columns: HashSet::from(["binary_payload".to_string()]),
                 ..Default::default()
             };
-            let mut store = ContextStore::open_with_options(&uri, options).await.unwrap();
+            let mut store = ContextStore::open_with_options(&uri, options)
+                .await
+                .unwrap();
 
             let mut record = text_record("blob-bin-1", 0.0);
             record.binary_payload = Some(vec![0xDE, 0xAD, 0xBE, 0xEF]);
@@ -1212,7 +1212,9 @@ mod tests {
                 blob_columns: HashSet::from(["text_payload".to_string()]),
                 ..Default::default()
             };
-            let mut store = ContextStore::open_with_options(&uri, options).await.unwrap();
+            let mut store = ContextStore::open_with_options(&uri, options)
+                .await
+                .unwrap();
 
             let record = text_record("blob-txt-1", 0.0);
             store.add(&[record.clone()]).await.unwrap();
@@ -1230,8 +1232,7 @@ mod tests {
             let roundtripped = batch_to_records(&batch).unwrap();
             assert_eq!(roundtripped.len(), 1);
             assert_eq!(
-                roundtripped[0].text_payload,
-                record.text_payload,
+                roundtripped[0].text_payload, record.text_payload,
                 "text payload should survive blob roundtrip"
             );
         });
@@ -1251,7 +1252,9 @@ mod tests {
                 ]),
                 ..Default::default()
             };
-            let mut store = ContextStore::open_with_options(&uri, options).await.unwrap();
+            let mut store = ContextStore::open_with_options(&uri, options)
+                .await
+                .unwrap();
 
             let mut record = text_record("blob-both-1", 0.0);
             record.binary_payload = Some(b"hello binary".to_vec());
@@ -1294,7 +1297,8 @@ mod tests {
 
     #[test]
     fn test_blob_schema_metadata() {
-        let blob_columns = HashSet::from(["text_payload".to_string(), "binary_payload".to_string()]);
+        let blob_columns =
+            HashSet::from(["text_payload".to_string(), "binary_payload".to_string()]);
         let schema = ContextStore::schema(&blob_columns);
 
         let text_field = schema.field_with_name("text_payload").unwrap();
@@ -1359,7 +1363,9 @@ mod tests {
                 blob_columns: HashSet::from(["text_payload".to_string()]),
                 ..Default::default()
             };
-            let store_blob = ContextStore::open_with_options(&uri2, options).await.unwrap();
+            let store_blob = ContextStore::open_with_options(&uri2, options)
+                .await
+                .unwrap();
             let batch_binary = store_blob.records_to_batch(&[record.clone()]).unwrap();
             let results_binary = batch_to_records(&batch_binary).unwrap();
             assert_eq!(results_binary[0].text_payload, record.text_payload);
