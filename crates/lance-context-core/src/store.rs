@@ -15,7 +15,9 @@ use arrow_array::{
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Schema, TimeUnit};
 use chrono::{DateTime, Timelike, Utc};
 use futures::TryStreamExt;
-use lance::dataset::mem_wal::{DatasetMemWalExt, ShardWriterConfig};
+use lance::dataset::mem_wal::{
+    DatasetMemWalExt, LsmScanner, ShardManifestStore, ShardSnapshot, ShardWriterConfig,
+};
 use lance::dataset::optimize::{compact_files, CompactionMetrics, CompactionOptions};
 use lance::dataset::{builder::DatasetBuilder, Dataset, WriteMode, WriteParams};
 use lance::index::DatasetIndexExt;
@@ -34,6 +36,7 @@ use crate::record::{ContextRecord, SearchResult, StateMetadata};
 /// Embedding length used for the semantic index column.
 const DEFAULT_EMBEDDING_DIM: i32 = 1536;
 const DEFAULT_SEARCH_LIMIT: usize = 10;
+const DEFAULT_MANIFEST_SCAN_BATCH_SIZE: usize = 16;
 const ID_INDEX_NAME: &str = "id_idx";
 
 /// Configuration for background compaction.
@@ -280,17 +283,18 @@ impl ContextStore {
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> LanceResult<Vec<ContextRecord>> {
-        let mut scanner = self.dataset.scan();
-        if let Some(limit) = limit {
-            scanner.limit(Some(limit as i64), offset.map(|o| o as i64))?;
-        } else if let Some(offset) = offset {
-            scanner.limit(None, Some(offset as i64))?;
-        }
-
+        let scanner = self.lsm_scanner().await?;
         let mut stream = scanner.try_into_stream().await?;
         let mut results = Vec::new();
         while let Some(batch) = stream.try_next().await? {
             results.extend(batch_to_records(&batch)?);
+        }
+
+        if let Some(offset) = offset {
+            results = results.into_iter().skip(offset).collect();
+        }
+        if let Some(limit) = limit {
+            results.truncate(limit);
         }
         Ok(results)
     }
@@ -315,18 +319,51 @@ impl ContextStore {
             return Ok(Vec::new());
         }
 
-        let query_array = Float32Array::from(query.to_vec());
-
-        let mut scanner = self.dataset.scan();
-        scanner.nearest("embedding", &query_array, top_k)?;
-        scanner.limit(Some(top_k as i64), Some(0))?;
-
-        let mut stream = scanner.try_into_stream().await?;
-        let mut results = Vec::new();
-        while let Some(batch) = stream.try_next().await? {
-            results.extend(batch_to_search_results(&batch)?);
-        }
+        let mut results: Vec<SearchResult> = self
+            .list(None, None)
+            .await?
+            .into_iter()
+            .filter_map(|record| {
+                let distance = l2_distance(query, record.embedding.as_ref()?);
+                Some(SearchResult { record, distance })
+            })
+            .collect();
+        results.sort_by(|left, right| left.distance.total_cmp(&right.distance));
+        results.truncate(top_k);
         Ok(results)
+    }
+
+    async fn lsm_scanner(&self) -> LanceResult<LsmScanner> {
+        let object_store = self.dataset.object_store(None).await?;
+        let branch_location = self.dataset.branch_location();
+        let shard_ids = self.dataset.list_mem_wal_latest_shard_ids().await?;
+
+        let mut shard_snapshots = Vec::with_capacity(shard_ids.len());
+        for shard_id in shard_ids {
+            let manifest_store = ShardManifestStore::new(
+                object_store.clone(),
+                &branch_location.path,
+                shard_id,
+                DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
+            );
+            let Some(manifest) = manifest_store.read_latest().await? else {
+                continue;
+            };
+
+            let mut snapshot = ShardSnapshot::new(shard_id)
+                .with_spec_id(manifest.shard_spec_id)
+                .with_current_generation(manifest.current_generation);
+            for flushed in manifest.flushed_generations {
+                snapshot = snapshot.with_flushed_generation(flushed.generation, flushed.path);
+            }
+            shard_snapshots.push(snapshot);
+        }
+
+        Ok(LsmScanner::new(
+            Arc::new(self.dataset.clone()),
+            shard_snapshots,
+            vec!["id".to_string()],
+        ))
     }
 
     /// Manually trigger compaction to merge small fragments.
@@ -837,34 +874,6 @@ impl Drop for ContextStore {
     }
 }
 
-fn batch_to_search_results(batch: &RecordBatch) -> LanceResult<Vec<SearchResult>> {
-    let records = batch_to_records(batch)?;
-
-    let distance_column = batch.column_by_name("_distance").ok_or_else(|| {
-        LanceError::from(ArrowError::InvalidArgumentError(
-            "search results missing _distance column".to_string(),
-        ))
-    })?;
-    let distance_array = distance_column
-        .as_ref()
-        .as_any()
-        .downcast_ref::<Float32Array>()
-        .ok_or_else(|| {
-            LanceError::from(ArrowError::InvalidArgumentError(
-                "_distance column has unexpected data type".to_string(),
-            ))
-        })?;
-
-    Ok(records
-        .into_iter()
-        .enumerate()
-        .map(|(i, record)| SearchResult {
-            record,
-            distance: distance_array.value(i),
-        })
-        .collect())
-}
-
 /// Convert a record batch to context records.
 fn batch_to_records(batch: &RecordBatch) -> LanceResult<Vec<ContextRecord>> {
     let id_array = column_as::<StringArray>(batch, "id")?;
@@ -1071,6 +1080,17 @@ fn embedding_from_list(list: &FixedSizeListArray, row: usize) -> LanceResult<Vec
     Ok(embedding)
 }
 
+fn l2_distance(left: &[f32], right: &[f32]) -> f32 {
+    left.iter()
+        .zip(right)
+        .map(|(left, right)| {
+            let delta = left - right;
+            delta * delta
+        })
+        .sum::<f32>()
+        .sqrt()
+}
+
 fn column_as<'a, A>(batch: &'a RecordBatch, name: &str) -> LanceResult<&'a A>
 where
     A: Array + 'static,
@@ -1144,16 +1164,15 @@ mod tests {
             store.add(&[first.clone(), second.clone()]).await.unwrap();
 
             let query = make_embedding(1.0);
-            let _results = store.search(&query, Some(2)).await.unwrap();
+            let results = store.search(&query, Some(2)).await.unwrap();
 
-            // TODO: MemWAL reads are not yet visible via standard scan.
-            // assert_eq!(results.len(), 2);
-            // assert_eq!(results[0].record.id, second.id);
-            // assert!(
-            //     results[0].distance <= results[1].distance,
-            //     "results not ordered by distance: {:?}",
-            //     results
-            // );
+            assert_eq!(results.len(), 2);
+            assert_eq!(results[0].record.id, second.id);
+            assert!(
+                results[0].distance <= results[1].distance,
+                "results not ordered by distance: {:?}",
+                results
+            );
         });
     }
 
@@ -1231,13 +1250,12 @@ mod tests {
             let store = ContextStore::open(&uri).await.unwrap();
 
             // Verify we can list them back
-            let _results = store.list(None, None).await.unwrap();
-            // TODO: MemWAL reads are not yet visible via standard scan.
-            // assert_eq!(results.len(), 2);
+            let results = store.list(None, None).await.unwrap();
+            assert_eq!(results.len(), 2);
 
-            // let ids: Vec<String> = results.iter().map(|r| r.id.clone()).collect();
-            // assert!(ids.contains(&"r1".to_string()));
-            // assert!(ids.contains(&"r2".to_string()));
+            let ids: Vec<String> = results.iter().map(|r| r.id.clone()).collect();
+            assert!(ids.contains(&"r1".to_string()));
+            assert!(ids.contains(&"r2".to_string()));
         });
     }
 
