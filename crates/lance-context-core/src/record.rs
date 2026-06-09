@@ -1,5 +1,7 @@
 use chrono::{DateTime, Utc};
 
+use crate::serde::CONTENT_TYPE_TOMBSTONE;
+
 pub const LIFECYCLE_ACTIVE: &str = "active";
 pub const LIFECYCLE_CONTRADICTED: &str = "contradicted";
 
@@ -37,6 +39,11 @@ pub struct ContextRecord {
 }
 
 impl ContextRecord {
+    #[must_use]
+    pub fn is_tombstone(&self) -> bool {
+        self.content_type == CONTENT_TYPE_TOMBSTONE
+    }
+
     #[must_use]
     pub fn is_expired_at(&self, now: DateTime<Utc>) -> bool {
         self.expires_at.is_some_and(|expires_at| expires_at <= now)
@@ -95,7 +102,8 @@ impl LifecycleQueryOptions {
 
     #[must_use]
     pub fn is_visible(&self, record: &ContextRecord) -> bool {
-        (self.include_expired || !record.is_expired_at(self.reference_time))
+        !record.is_tombstone()
+            && (self.include_expired || !record.is_expired_at(self.reference_time))
             && (self.include_retired || !record.is_hidden_by_lifecycle())
     }
 }

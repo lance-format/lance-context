@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 pub const CONTENT_TYPE_TEXT: &str = "text/plain";
 pub const CONTENT_TYPE_ARROW_STREAM: &str = "application/vnd.apache.arrow.stream";
+pub const CONTENT_TYPE_TOMBSTONE: &str = "application/vnd.lance-context.tombstone";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SerializedContent {
