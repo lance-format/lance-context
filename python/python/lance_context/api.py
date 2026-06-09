@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import warnings
+from collections.abc import Iterable, Mapping
 from datetime import datetime
 from io import BytesIO
 from typing import Any
@@ -367,6 +368,46 @@ class Context:
             session_id,
             external_id,
         )
+
+    def add_many(self, records: Iterable[Mapping[str, Any]]) -> None:
+        """Append multiple records in one storage operation.
+
+        Each record accepts the same fields as :meth:`add`: ``role``,
+        ``content``, optional ``content_type``/``data_type``, ``embedding``,
+        ``bot_id``, ``session_id``, and ``external_id``.
+        """
+        normalized: list[dict[str, Any]] = []
+        for index, record in enumerate(records):
+            if not isinstance(record, Mapping):
+                raise TypeError(f"records[{index}] must be a mapping")
+            if "role" not in record:
+                raise ValueError(f"records[{index}] is missing required key 'role'")
+            if "content" not in record:
+                raise ValueError(f"records[{index}] is missing required key 'content'")
+
+            content_type = record.get("content_type")
+            data_type = record.get("data_type")
+            if content_type is not None and data_type is not None:
+                raise ValueError(
+                    f"records[{index}] specifies both content_type and data_type"
+                )
+            if content_type is None:
+                content_type = data_type
+
+            payload, resolved_type = _normalize_content(record["content"], content_type)
+            normalized.append(
+                {
+                    "role": record["role"],
+                    "content": payload,
+                    "data_type": resolved_type,
+                    "embedding": record.get("embedding"),
+                    "bot_id": record.get("bot_id"),
+                    "session_id": record.get("session_id"),
+                    "external_id": record.get("external_id"),
+                }
+            )
+
+        self._inner.add_many(normalized)
 
     def snapshot(self, label: str | None = None) -> str:
         return self._inner.snapshot(label)

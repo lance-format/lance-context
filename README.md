@@ -69,6 +69,22 @@ ctx.add("assistant", image)
 
 print("Current version:", ctx.version())
 
+# Batch append source chunks in one storage operation
+ctx.add_many([
+    {
+        "role": "source",
+        "content": "Chunk 1 from a runbook",
+        "content_type": "text/markdown",
+        "session_id": "runbook-import",
+    },
+    {
+        "role": "source",
+        "content": "Chunk 2 from the same runbook",
+        "content_type": "text/markdown",
+        "session_id": "runbook-import",
+    },
+])
+
 # Time-travel to prior state
 first_version = ctx.version()
 ctx.add("assistant", "Let me fetch suggestions…")
