@@ -239,6 +239,30 @@ def test_search_applies_lifecycle_filter_before_limit(tmp_path: Path) -> None:
     assert [hit["text"] for hit in hits_with_expired] == ["expired but closer"]
 
 
+def test_supersedes_pointer_hides_old_record_by_default(tmp_path: Path) -> None:
+    uri = tmp_path / "context.lance"
+    ctx = Context.create(str(uri))
+
+    ctx.add("user", "old value", embedding=_embedding(0.0))
+    old = ctx.list()[0]
+
+    ctx.add(
+        "user",
+        "new value",
+        embedding=_embedding(1.0),
+        supersedes_id=old["id"],
+    )
+
+    assert [record["text"] for record in ctx.list()] == ["new value"]
+    assert [record["text"] for record in ctx.search(_embedding(0.0), limit=10)] == [
+        "new value"
+    ]
+
+    history = ctx.list(include_retired=True)
+    assert [record["text"] for record in history] == ["old value", "new value"]
+    assert history[1]["supersedes_id"] == old["id"]
+
+
 def test_image_round_trip(tmp_path: Path) -> None:
     Image = pytest.importorskip("PIL.Image")
     uri = tmp_path / "context.lance"

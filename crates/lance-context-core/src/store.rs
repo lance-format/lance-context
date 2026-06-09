@@ -399,7 +399,7 @@ impl ContextStore {
             .await
     }
 
-    /// List records, applying lifecycle visibility before offset/limit.
+    /// List records, applying lifecycle visibility and supersession before offset/limit.
     pub async fn list_with_options(
         &self,
         limit: Option<usize>,
@@ -410,12 +410,24 @@ impl ContextStore {
         let mut stream = scanner.try_into_stream().await?;
         let mut results = Vec::new();
         while let Some(batch) = stream.try_next().await? {
-            results.extend(
-                batch_to_records(&batch)?
-                    .into_iter()
-                    .filter(|record| options.is_visible(record)),
-            );
+            results.extend(batch_to_records(&batch)?);
         }
+
+        let superseded_ids: HashSet<String> = results
+            .iter()
+            .filter_map(|record| {
+                let supersedes_id = record.supersedes_id.as_ref()?;
+                if supersedes_id == &record.id {
+                    None
+                } else {
+                    Some(supersedes_id.clone())
+                }
+            })
+            .collect();
+        results.retain(|record| {
+            options.is_visible(record)
+                && (options.include_retired || !superseded_ids.contains(&record.id))
+        });
 
         if let Some(offset) = offset {
             results = results.into_iter().skip(offset).collect();
@@ -1562,6 +1574,35 @@ mod tests {
                 superseded_roundtrip.superseded_by_id.as_deref(),
                 Some("active")
             );
+        });
+    }
+
+    #[test]
+    fn list_hides_records_superseded_by_newer_pointer() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = ContextStore::open(&uri).await.unwrap();
+            let old = text_record("old", 0.0);
+            let mut replacement = text_record("new", 1.0);
+            replacement.supersedes_id = Some(old.id.clone());
+            store
+                .add(&[old.clone(), replacement.clone()])
+                .await
+                .unwrap();
+
+            let visible = store.list(None, None).await.unwrap();
+            assert_eq!(visible.len(), 1);
+            assert_eq!(visible[0].id, replacement.id);
+
+            let history = store
+                .list_with_options(None, None, LifecycleQueryOptions::new(false, true))
+                .await
+                .unwrap();
+            assert_eq!(history.len(), 2);
+            assert!(history.iter().any(|record| record.id == old.id));
+            assert!(history.iter().any(|record| record.id == replacement.id));
         });
     }
 

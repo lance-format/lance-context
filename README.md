@@ -87,22 +87,19 @@ ctx.add_many([
     },
 ])
 
-# Lifecycle metadata is stored in first-class columns. Expired and retired rows
-# are excluded from default list/search calls, while contradicted records stay
-# visible so negative knowledge can remain a guardrail for future recall.
+# Lifecycle metadata is stored in first-class columns. Expired, retired, and
+# superseded rows are excluded from default list/search calls, while contradicted
+# records stay visible so negative knowledge can remain a guardrail for recall.
 ctx.add(
     "assistant",
     "temporary session note",
     expires_at="2026-07-01T00:00:00Z",
     retention_policy="session",
 )
-ctx.add(
-    "system",
-    "older fact kept as history",
-    lifecycle_status="superseded",
-    retired_reason="replaced by newer fact",
-    superseded_by_id="new-record-id",
-)
+ctx.add("system", "deployment endpoint is /v1")
+old_endpoint = ctx.list()[-1]
+ctx.add("system", "deployment endpoint is /v2", supersedes_id=old_endpoint["id"])
+ctx.add("system", "do not use the legacy parser", lifecycle_status="contradicted")
 
 visible = ctx.list()
 with_lifecycle_history = ctx.list(include_expired=True, include_retired=True)
