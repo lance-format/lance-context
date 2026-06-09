@@ -14,8 +14,17 @@ class DummyInner:
     def __init__(self) -> None:
         self.search_calls: list[tuple[list[float], int | None]] = []
         self.list_calls: list[tuple[int | None, int | None]] = []
+        self.get_calls: list[tuple[str | None, str | None]] = []
         self.add_calls: list[
-            tuple[str, Any, str | None, list[float] | None, str | None, str | None]
+            tuple[
+                str,
+                Any,
+                str | None,
+                list[float] | None,
+                str | None,
+                str | None,
+                str | None,
+            ]
         ] = []
 
     def add(
@@ -26,14 +35,24 @@ class DummyInner:
         embedding: list[float] | None,
         bot_id: str | None,
         session_id: str | None,
+        external_id: str | None,
     ):
-        self.add_calls.append((role, content, data_type, embedding, bot_id, session_id))
+        self.add_calls.append(
+            (role, content, data_type, embedding, bot_id, session_id, external_id)
+        )
+
+    def get(self, id: str | None, external_id: str | None):
+        self.get_calls.append((id, external_id))
+        if id == "rec-1" or external_id == "source-1":
+            return self.list(None, None)[0]
+        return None
 
     def search(self, vector: list[float], limit: int | None):
         self.search_calls.append((vector, limit))
         return [
             {
                 "id": "rec-1",
+                "external_id": "source-1",
                 "run_id": "run-1",
                 "bot_id": "support_bot",
                 "session_id": None,
@@ -53,6 +72,7 @@ class DummyInner:
         return [
             {
                 "id": "rec-1",
+                "external_id": "source-1",
                 "run_id": "run-1",
                 "bot_id": "support_bot",
                 "session_id": "user_1",
@@ -66,6 +86,7 @@ class DummyInner:
             },
             {
                 "id": "rec-2",
+                "external_id": None,
                 "run_id": "run-1",
                 "bot_id": None,
                 "session_id": None,
@@ -78,6 +99,11 @@ class DummyInner:
                 "state_metadata": None,
             },
         ]
+
+
+def _only_add_call(dummy: DummyInner):
+    assert len(dummy.add_calls) == 1
+    return dummy.add_calls[0]
 
 
 def test_coerce_vector_from_list():
@@ -93,6 +119,7 @@ def test_normalize_search_hit_converts_timestamp():
     result = _normalize_search_hit(
         {
             "id": "rec-2",
+            "external_id": None,
             "created_at": "2024-01-01T00:00:00Z",
             "content_type": "text/plain",
             "text_payload": None,
@@ -125,6 +152,7 @@ def test_normalize_record_without_distance():
     result = _normalize_record(
         {
             "id": "rec-1",
+            "external_id": "source-1",
             "created_at": "2024-01-01T00:00:00Z",
             "content_type": "text/plain",
             "text_payload": "hello",
@@ -158,6 +186,50 @@ def test_context_list_returns_entries():
     assert isinstance(entries[0]["created_at"], datetime)
 
 
+def test_context_get_by_external_id():
+    ctx = Context.__new__(Context)
+    dummy = DummyInner()
+    ctx._inner = dummy  # type: ignore[attr-defined]
+
+    entry = ctx.get(external_id="source-1")
+
+    assert dummy.get_calls == [(None, "source-1")]
+    assert entry is not None
+    assert entry["id"] == "rec-1"
+    assert entry["external_id"] == "source-1"
+
+
+def test_context_get_by_id():
+    ctx = Context.__new__(Context)
+    dummy = DummyInner()
+    ctx._inner = dummy  # type: ignore[attr-defined]
+
+    entry = ctx.get(id="rec-1")
+
+    assert dummy.get_calls == [("rec-1", None)]
+    assert entry is not None
+    assert entry["id"] == "rec-1"
+
+
+def test_context_get_missing_returns_none():
+    ctx = Context.__new__(Context)
+    dummy = DummyInner()
+    ctx._inner = dummy  # type: ignore[attr-defined]
+
+    assert ctx.get(external_id="missing") is None
+
+
+def test_context_get_requires_exactly_one_identifier():
+    ctx = Context.__new__(Context)
+    dummy = DummyInner()
+    ctx._inner = dummy  # type: ignore[attr-defined]
+
+    with pytest.raises(ValueError, match="exactly one"):
+        ctx.get()
+    with pytest.raises(ValueError, match="exactly one"):
+        ctx.get(id="rec-1", external_id="source-1")
+
+
 def test_context_list_default_args():
     ctx = Context.__new__(Context)
     dummy = DummyInner()
@@ -176,14 +248,16 @@ def test_context_add_with_embedding():
     embedding = [0.1, 0.2, 0.3]
     ctx.add("user", "hello", embedding=embedding)
 
-    assert len(dummy.add_calls) == 1
-    role, content, data_type, passed_embedding, bot_id, session_id = dummy.add_calls[0]
+    role, content, data_type, passed_embedding, bot_id, session_id, external_id = (
+        _only_add_call(dummy)
+    )
     assert role == "user"
     assert content == "hello"
     assert data_type is None
     assert passed_embedding == [0.1, 0.2, 0.3]
     assert bot_id is None
     assert session_id is None
+    assert external_id is None
 
 
 def test_context_add_without_embedding():
@@ -193,13 +267,15 @@ def test_context_add_without_embedding():
 
     ctx.add("assistant", "world")
 
-    assert len(dummy.add_calls) == 1
-    role, content, data_type, passed_embedding, bot_id, session_id = dummy.add_calls[0]
+    role, content, data_type, passed_embedding, bot_id, session_id, external_id = (
+        _only_add_call(dummy)
+    )
     assert role == "assistant"
     assert content == "world"
     assert passed_embedding is None
     assert bot_id is None
     assert session_id is None
+    assert external_id is None
 
 
 def test_context_add_with_content_type_and_embedding():
@@ -210,13 +286,15 @@ def test_context_add_with_content_type_and_embedding():
     embedding = [0.5, 0.6]
     ctx.add("system", "prompt", content_type="text/markdown", embedding=embedding)
 
-    assert len(dummy.add_calls) == 1
-    role, content, data_type, passed_embedding, bot_id, session_id = dummy.add_calls[0]
+    role, content, data_type, passed_embedding, bot_id, session_id, external_id = (
+        _only_add_call(dummy)
+    )
     assert role == "system"
     assert data_type == "text/markdown"
     assert passed_embedding == [0.5, 0.6]
     assert bot_id is None
     assert session_id is None
+    assert external_id is None
 
 
 def test_context_add_with_bot_id():
@@ -226,12 +304,14 @@ def test_context_add_with_bot_id():
 
     ctx.add("user", "hello", bot_id="support_bot")
 
-    assert len(dummy.add_calls) == 1
-    role, content, data_type, passed_embedding, bot_id, session_id = dummy.add_calls[0]
+    role, content, data_type, passed_embedding, bot_id, session_id, external_id = (
+        _only_add_call(dummy)
+    )
     assert role == "user"
     assert content == "hello"
     assert bot_id == "support_bot"
     assert session_id is None
+    assert external_id is None
 
 
 def test_context_add_with_session_id():
@@ -241,12 +321,14 @@ def test_context_add_with_session_id():
 
     ctx.add("user", "hello", session_id="user_123")
 
-    assert len(dummy.add_calls) == 1
-    role, content, data_type, passed_embedding, bot_id, session_id = dummy.add_calls[0]
+    role, content, data_type, passed_embedding, bot_id, session_id, external_id = (
+        _only_add_call(dummy)
+    )
     assert role == "user"
     assert content == "hello"
     assert bot_id is None
     assert session_id == "user_123"
+    assert external_id is None
 
 
 def test_context_add_with_agent_and_session_id():
@@ -256,11 +338,13 @@ def test_context_add_with_agent_and_session_id():
 
     ctx.add("user", "hello", bot_id="sales_bot", session_id="conv_456")
 
-    assert len(dummy.add_calls) == 1
-    role, content, data_type, passed_embedding, bot_id, session_id = dummy.add_calls[0]
+    role, content, data_type, passed_embedding, bot_id, session_id, external_id = (
+        _only_add_call(dummy)
+    )
     assert role == "user"
     assert bot_id == "sales_bot"
     assert session_id == "conv_456"
+    assert external_id is None
 
 
 def test_context_add_with_all_options():
@@ -269,20 +353,30 @@ def test_context_add_with_all_options():
     ctx._inner = dummy  # type: ignore[attr-defined]
 
     embedding = [0.1, 0.2]
-    ctx.add("user", "hello", embedding=embedding, bot_id="bot", session_id="sess")
+    ctx.add(
+        "user",
+        "hello",
+        embedding=embedding,
+        bot_id="bot",
+        session_id="sess",
+        external_id="doc-1#chunk-1",
+    )
 
-    assert len(dummy.add_calls) == 1
-    role, content, data_type, passed_embedding, bot_id, session_id = dummy.add_calls[0]
+    role, content, data_type, passed_embedding, bot_id, session_id, external_id = (
+        _only_add_call(dummy)
+    )
     assert role == "user"
     assert passed_embedding == [0.1, 0.2]
     assert bot_id == "bot"
     assert session_id == "sess"
+    assert external_id == "doc-1#chunk-1"
 
 
 def test_normalize_record_with_agent_and_session_id():
     result = _normalize_record(
         {
             "id": "rec-1",
+            "external_id": "source-1",
             "created_at": "2024-01-01T00:00:00Z",
             "content_type": "text/plain",
             "text_payload": "hello",
@@ -297,3 +391,4 @@ def test_normalize_record_with_agent_and_session_id():
     )
     assert result["bot_id"] == "support_bot"
     assert result["session_id"] == "user_88"
+    assert result["external_id"] == "source-1"

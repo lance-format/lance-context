@@ -13,6 +13,7 @@ pub struct StateMetadata {
 #[derive(Debug, Clone)]
 pub struct ContextRecord {
     pub id: String,
+    pub external_id: Option<String>,
     pub run_id: String,
     pub bot_id: Option<String>,
     pub session_id: Option<String>,

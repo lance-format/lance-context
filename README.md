@@ -54,7 +54,12 @@ uri = Path("context.lance").as_posix()
 ctx = Context.create(uri)
 
 # Add multimodal entries
-ctx.add("user", "Where should I travel in spring?")
+ctx.add(
+    "user",
+    "Where should I travel in spring?",
+    external_id="conversation-2026-03-01#turn-1",
+)
+print(ctx.get(external_id="conversation-2026-03-01#turn-1"))
 
 from PIL import Image
 image = Image.new("RGB", (2, 2), color="teal")
@@ -138,6 +143,7 @@ use chrono::Utc;
 let mut store = ContextStore::open("context.lance").await?;
 let record = ContextRecord {
     id: "run-1-1".into(),
+    external_id: None,
     run_id: "run-1".into(),
     created_at: Utc::now(),
     role: "user".into(),

@@ -172,7 +172,7 @@ impl Context {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (role, content, data_type = None, embedding = None, bot_id = None, session_id = None))]
+    #[pyo3(signature = (role, content, data_type = None, embedding = None, bot_id = None, session_id = None, external_id = None))]
     fn add(
         &mut self,
         py: Python<'_>,
@@ -182,6 +182,7 @@ impl Context {
         embedding: Option<Vec<f32>>,
         bot_id: Option<String>,
         session_id: Option<String>,
+        external_id: Option<String>,
     ) -> PyResult<()> {
         let (content_type, text_payload, binary_payload, inner_content) =
             match content.extract::<&[u8]>() {
@@ -205,6 +206,7 @@ impl Context {
         let record_id = format!("{}-{}", self.run_id, self.inner.entries() + 1);
         let record = ContextRecord {
             id: record_id,
+            external_id,
             run_id: self.run_id.clone(),
             bot_id,
             session_id,
@@ -279,6 +281,39 @@ impl Context {
             .into_iter()
             .map(|record| record_to_py(py, record))
             .collect()
+    }
+
+    #[pyo3(signature = (id = None, external_id = None))]
+    fn get(
+        &self,
+        py: Python<'_>,
+        id: Option<String>,
+        external_id: Option<String>,
+    ) -> PyResult<Option<PyObject>> {
+        let record = match (id, external_id) {
+            (Some(id), None) => py.allow_threads(|| {
+                self.runtime
+                    .block_on(self.store.get_by_id(&id))
+                    .map_err(to_py_err)
+            })?,
+            (None, Some(external_id)) => py.allow_threads(|| {
+                self.runtime
+                    .block_on(self.store.get_by_external_id(&external_id))
+                    .map_err(to_py_err)
+            })?,
+            (None, None) => {
+                return Err(PyRuntimeError::new_err(
+                    "get() requires either id or external_id",
+                ));
+            }
+            (Some(_), Some(_)) => {
+                return Err(PyRuntimeError::new_err(
+                    "get() accepts only one of id or external_id",
+                ));
+            }
+        };
+
+        record.map(|record| record_to_py(py, record)).transpose()
     }
 
     #[pyo3(signature = (target_rows_per_fragment=None, materialize_deletions=None))]
@@ -367,6 +402,7 @@ fn search_hit_to_py(py: Python<'_>, hit: SearchResult) -> PyResult<PyObject> {
 fn record_to_py(py: Python<'_>, record: ContextRecord) -> PyResult<PyObject> {
     let ContextRecord {
         id,
+        external_id,
         run_id,
         bot_id,
         session_id,
@@ -381,6 +417,7 @@ fn record_to_py(py: Python<'_>, record: ContextRecord) -> PyResult<PyObject> {
 
     let dict = PyDict::new(py);
     dict.set_item("id", id)?;
+    dict.set_item("external_id", external_id)?;
     dict.set_item("run_id", run_id)?;
     dict.set_item("bot_id", bot_id)?;
     dict.set_item("session_id", session_id)?;
