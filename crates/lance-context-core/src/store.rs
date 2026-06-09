@@ -676,9 +676,7 @@ impl ContextStore {
             Field::new("binary_payload", DataType::LargeBinary, true)
         };
 
-        let mut fields = vec![
-            Field::new("id", DataType::Utf8, false).with_metadata(id_metadata),
-        ];
+        let mut fields = vec![Field::new("id", DataType::Utf8, false).with_metadata(id_metadata)];
         if include_external_id {
             fields.push(Field::new("external_id", DataType::Utf8, true));
         }
@@ -770,11 +768,7 @@ impl ContextStore {
     }
 
     fn records_to_batch(&self, entries: &[ContextRecord]) -> LanceResult<RecordBatch> {
-        let include_external_id = self
-            .dataset
-            .schema()
-            .field_with_name("external_id")
-            .is_ok();
+        let include_external_id = self.dataset.schema().field_with_name("external_id").is_ok();
         if !include_external_id && entries.iter().any(|entry| entry.external_id.is_some()) {
             return Err(ArrowError::InvalidArgumentError(
                 "external_id requires a context dataset created with external_id support"
