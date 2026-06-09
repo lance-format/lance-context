@@ -29,3 +29,16 @@ def test_context_snapshot_and_fork():
     assert fork.branch() == "branch-a"
     assert fork.entries() == ctx.entries()
     assert fork.version() == ctx.version()
+
+
+def test_context_delete_and_forget_by_external_id(tmp_path):
+    ctx = lc.Context.create(str(tmp_path / "context.lance"))
+    ctx.add("user", "stale", external_id="doc-1#chunk-1")
+
+    entry = ctx.get(external_id="doc-1#chunk-1")
+    assert entry is not None
+
+    assert ctx.delete(external_id="doc-1#chunk-1") is True
+    assert ctx.get(external_id="doc-1#chunk-1") is None
+    assert ctx.get(id=entry["id"]) is None
+    assert ctx.forget(external_id="doc-1#chunk-1") is False

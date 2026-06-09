@@ -66,6 +66,8 @@ ctx.add(
     },
 )
 print(ctx.get(external_id="conversation-2026-03-01#turn-1"))
+ctx.delete(external_id="conversation-2026-03-01#turn-1")
+assert ctx.get(external_id="conversation-2026-03-01#turn-1") is None
 
 # Scoped recall and provenance-oriented metadata
 runbook_embedding = [0.0] * 1536
@@ -184,6 +186,13 @@ print(f"Fragments: {stats['total_fragments']}")
 metrics = ctx.compact()
 print(f"Compaction removed {metrics['fragments_removed']} fragments")
 ```
+
+`delete()` and its alias `forget()` write a versioned tombstone for the target
+record and return `False` if the id is already absent. Default `list()`,
+`get()`, and `search()` calls hide tombstoned records, but this is logical
+forgetting rather than guaranteed physical erasure: older dataset versions and
+underlying files may still contain the original payload until retention or
+physical cleanup policies remove them.
 
 ### Rust
 

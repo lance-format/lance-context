@@ -2,6 +2,8 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::collections::HashMap;
 
+use crate::serde::CONTENT_TYPE_TOMBSTONE;
+
 /// Structured metadata captured alongside each context entry.
 #[derive(Debug, Clone, Default)]
 pub struct StateMetadata {
@@ -27,6 +29,13 @@ pub struct ContextRecord {
     pub text_payload: Option<String>,
     pub binary_payload: Option<Vec<u8>>,
     pub embedding: Option<Vec<f32>>,
+}
+
+impl ContextRecord {
+    #[must_use]
+    pub fn is_tombstone(&self) -> bool {
+        self.content_type == CONTENT_TYPE_TOMBSTONE
+    }
 }
 
 /// Result returned from a vector similarity search.

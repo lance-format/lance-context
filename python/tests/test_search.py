@@ -16,6 +16,7 @@ class DummyInner:
         self.search_calls: list[tuple[list[float], int | None, str | None]] = []
         self.list_calls: list[tuple[int | None, int | None, str | None]] = []
         self.get_calls: list[tuple[str | None, str | None]] = []
+        self.delete_calls: list[tuple[str | None, str | None]] = []
         self.add_calls: list[
             tuple[
                 str,
@@ -59,6 +60,10 @@ class DummyInner:
         if id == "rec-1" or external_id == "source-1":
             return self.list(None, None, None)[0]
         return None
+
+    def delete(self, id: str | None, external_id: str | None):
+        self.delete_calls.append((id, external_id))
+        return id == "rec-1" or external_id == "source-1"
 
     def search(self, vector: list[float], limit: int | None, filters_json: str | None):
         self.search_calls.append((vector, limit, filters_json))
@@ -261,6 +266,52 @@ def test_context_get_requires_exactly_one_identifier():
         ctx.get()
     with pytest.raises(ValueError, match="exactly one"):
         ctx.get(id="rec-1", external_id="source-1")
+
+
+def test_context_delete_by_external_id():
+    ctx = Context.__new__(Context)
+    dummy = DummyInner()
+    ctx._inner = dummy  # type: ignore[attr-defined]
+
+    assert ctx.delete(external_id="source-1") is True
+    assert dummy.delete_calls == [(None, "source-1")]
+
+
+def test_context_delete_by_id():
+    ctx = Context.__new__(Context)
+    dummy = DummyInner()
+    ctx._inner = dummy  # type: ignore[attr-defined]
+
+    assert ctx.delete(id="rec-1") is True
+    assert dummy.delete_calls == [("rec-1", None)]
+
+
+def test_context_delete_missing_returns_false():
+    ctx = Context.__new__(Context)
+    dummy = DummyInner()
+    ctx._inner = dummy  # type: ignore[attr-defined]
+
+    assert ctx.delete(external_id="missing") is False
+
+
+def test_context_forget_aliases_delete():
+    ctx = Context.__new__(Context)
+    dummy = DummyInner()
+    ctx._inner = dummy  # type: ignore[attr-defined]
+
+    assert ctx.forget(external_id="source-1") is True
+    assert dummy.delete_calls == [(None, "source-1")]
+
+
+def test_context_delete_requires_exactly_one_identifier():
+    ctx = Context.__new__(Context)
+    dummy = DummyInner()
+    ctx._inner = dummy  # type: ignore[attr-defined]
+
+    with pytest.raises(ValueError, match="exactly one"):
+        ctx.delete()
+    with pytest.raises(ValueError, match="exactly one"):
+        ctx.delete(id="rec-1", external_id="source-1")
 
 
 def test_context_list_default_args():

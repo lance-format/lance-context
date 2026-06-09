@@ -476,6 +476,23 @@ class Context:
             return None
         return _normalize_record(result)
 
+    def delete(self, *, id: str | None = None, external_id: str | None = None) -> bool:
+        """Logically forget one entry by internal id or caller-supplied external id.
+
+        Returns True when an entry was found and tombstoned, False when the
+        identifier is already absent. This is a versioned logical delete:
+        default reads hide the entry, but older dataset versions and underlying
+        storage files may still contain the original payload until retention or
+        physical cleanup policies remove them.
+        """
+        if (id is None) == (external_id is None):
+            raise ValueError("Specify exactly one of id or external_id")
+        return bool(self._inner.delete(id, external_id))
+
+    def forget(self, *, id: str | None = None, external_id: str | None = None) -> bool:
+        """Alias for :meth:`delete`."""
+        return self.delete(id=id, external_id=external_id)
+
     def compact(
         self,
         *,
