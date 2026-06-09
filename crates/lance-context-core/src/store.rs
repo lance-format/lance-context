@@ -1460,6 +1460,38 @@ mod tests {
     }
 
     #[test]
+    fn delete_by_id_hides_record_from_default_reads() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = ContextStore::open(&uri).await.unwrap();
+            let mut first = text_record("a", 0.0);
+            first.external_id = Some("doc-123#chunk-1".to_string());
+            let second = text_record("b", 2.0);
+            store.add(&[first.clone(), second.clone()]).await.unwrap();
+
+            assert!(store.delete_by_id(&first.id).await.unwrap());
+
+            assert!(store.get_by_id(&first.id).await.unwrap().is_none());
+            assert!(store
+                .get_by_external_id("doc-123#chunk-1")
+                .await
+                .unwrap()
+                .is_none());
+
+            let records = store.list(None, None).await.unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].id, second.id);
+
+            let query = make_embedding(0.0);
+            let hits = store.search(&query, Some(10)).await.unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].record.id, second.id);
+        });
+    }
+
+    #[test]
     fn delete_missing_id_is_noop() {
         let dir = TempDir::new().unwrap();
         let uri = dir.path().to_string_lossy().to_string();
