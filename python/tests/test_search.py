@@ -17,6 +17,7 @@ class DummyInner:
         self.add_calls: list[
             tuple[str, Any, str | None, list[float] | None, str | None, str | None]
         ] = []
+        self.add_many_calls: list[list[dict[str, Any]]] = []
 
     def add(
         self,
@@ -28,6 +29,9 @@ class DummyInner:
         session_id: str | None,
     ):
         self.add_calls.append((role, content, data_type, embedding, bot_id, session_id))
+
+    def add_many(self, records: list[dict[str, Any]]):
+        self.add_many_calls.append(records)
 
     def search(self, vector: list[float], limit: int | None):
         self.search_calls.append((vector, limit))
@@ -277,6 +281,81 @@ def test_context_add_with_all_options():
     assert passed_embedding == [0.1, 0.2]
     assert bot_id == "bot"
     assert session_id == "sess"
+
+
+def test_context_add_many_normalizes_records():
+    ctx = Context.__new__(Context)
+    dummy = DummyInner()
+    ctx._inner = dummy  # type: ignore[attr-defined]
+
+    ctx.add_many(
+        [
+            {"role": "user", "content": "hello"},
+            {
+                "role": "assistant",
+                "content": "world",
+                "content_type": "text/markdown",
+                "embedding": [0.1, 0.2],
+                "bot_id": "bot",
+                "session_id": "sess",
+            },
+        ]
+    )
+
+    assert dummy.add_many_calls == [
+        [
+            {
+                "role": "user",
+                "content": "hello",
+                "data_type": None,
+                "embedding": None,
+                "bot_id": None,
+                "session_id": None,
+            },
+            {
+                "role": "assistant",
+                "content": "world",
+                "data_type": "text/markdown",
+                "embedding": [0.1, 0.2],
+                "bot_id": "bot",
+                "session_id": "sess",
+            },
+        ]
+    ]
+
+
+def test_context_add_many_accepts_data_type_alias():
+    ctx = Context.__new__(Context)
+    dummy = DummyInner()
+    ctx._inner = dummy  # type: ignore[attr-defined]
+
+    ctx.add_many([{"role": "system", "content": "prompt", "data_type": "text/plain"}])
+
+    assert dummy.add_many_calls[0][0]["data_type"] == "text/plain"
+
+
+def test_context_add_many_rejects_invalid_records():
+    ctx = Context.__new__(Context)
+    dummy = DummyInner()
+    ctx._inner = dummy  # type: ignore[attr-defined]
+
+    with pytest.raises(TypeError, match="records\\[0\\]"):
+        ctx.add_many(["not-a-record"])  # type: ignore[list-item]
+    with pytest.raises(ValueError, match="missing required key 'role'"):
+        ctx.add_many([{"content": "hello"}])
+    with pytest.raises(ValueError, match="missing required key 'content'"):
+        ctx.add_many([{"role": "user"}])
+    with pytest.raises(ValueError, match="both content_type and data_type"):
+        ctx.add_many(
+            [
+                {
+                    "role": "user",
+                    "content": "hello",
+                    "content_type": "text/plain",
+                    "data_type": "text/markdown",
+                }
+            ]
+        )
 
 
 def test_normalize_record_with_agent_and_session_id():
