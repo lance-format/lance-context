@@ -32,7 +32,8 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::record::{
-    ContextRecord, LifecycleQueryOptions, SearchResult, StateMetadata, LIFECYCLE_ACTIVE,
+    ContextRecord, LifecycleQueryOptions, RecordFilters, SearchResult, StateMetadata,
+    LIFECYCLE_ACTIVE,
 };
 use crate::serde::CONTENT_TYPE_TOMBSTONE;
 
@@ -293,6 +294,7 @@ impl ContextStore {
             created_at: Utc::now(),
             role: record.role,
             state_metadata: None,
+            metadata: None,
             expires_at: None,
             retention_policy: None,
             lifecycle_status: LIFECYCLE_ACTIVE.to_string(),
@@ -395,7 +397,18 @@ impl ContextStore {
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> LanceResult<Vec<ContextRecord>> {
-        self.list_with_options(limit, offset, LifecycleQueryOptions::default())
+        self.list_filtered_with_options(limit, offset, None, LifecycleQueryOptions::default())
+            .await
+    }
+
+    /// List records matching filters.
+    pub async fn list_filtered(
+        &self,
+        limit: Option<usize>,
+        offset: Option<usize>,
+        filters: Option<&RecordFilters>,
+    ) -> LanceResult<Vec<ContextRecord>> {
+        self.list_filtered_with_options(limit, offset, filters, LifecycleQueryOptions::default())
             .await
     }
 
@@ -404,6 +417,18 @@ impl ContextStore {
         &self,
         limit: Option<usize>,
         offset: Option<usize>,
+        options: LifecycleQueryOptions,
+    ) -> LanceResult<Vec<ContextRecord>> {
+        self.list_filtered_with_options(limit, offset, None, options)
+            .await
+    }
+
+    /// List records matching filters, applying lifecycle visibility before offset/limit.
+    pub async fn list_filtered_with_options(
+        &self,
+        limit: Option<usize>,
+        offset: Option<usize>,
+        filters: Option<&RecordFilters>,
         options: LifecycleQueryOptions,
     ) -> LanceResult<Vec<ContextRecord>> {
         let scanner = self.lsm_scanner().await?;
@@ -428,6 +453,9 @@ impl ContextStore {
             options.is_visible(record)
                 && (options.include_retired || !superseded_ids.contains(&record.id))
         });
+        if let Some(filters) = filters.filter(|filters| !filters.is_empty()) {
+            results.retain(|record| filters.matches(record));
+        }
 
         if let Some(offset) = offset {
             results = results.into_iter().skip(offset).collect();
@@ -465,7 +493,18 @@ impl ContextStore {
         query: &[f32],
         limit: Option<usize>,
     ) -> LanceResult<Vec<SearchResult>> {
-        self.search_with_options(query, limit, LifecycleQueryOptions::default())
+        self.search_filtered_with_options(query, limit, None, LifecycleQueryOptions::default())
+            .await
+    }
+
+    /// Perform a nearest-neighbor search over stored embeddings matching filters.
+    pub async fn search_filtered(
+        &self,
+        query: &[f32],
+        limit: Option<usize>,
+        filters: Option<&RecordFilters>,
+    ) -> LanceResult<Vec<SearchResult>> {
+        self.search_filtered_with_options(query, limit, filters, LifecycleQueryOptions::default())
             .await
     }
 
@@ -474,6 +513,18 @@ impl ContextStore {
         &self,
         query: &[f32],
         limit: Option<usize>,
+        options: LifecycleQueryOptions,
+    ) -> LanceResult<Vec<SearchResult>> {
+        self.search_filtered_with_options(query, limit, None, options)
+            .await
+    }
+
+    /// Perform nearest-neighbor search after applying filters and lifecycle visibility.
+    pub async fn search_filtered_with_options(
+        &self,
+        query: &[f32],
+        limit: Option<usize>,
+        filters: Option<&RecordFilters>,
         options: LifecycleQueryOptions,
     ) -> LanceResult<Vec<SearchResult>> {
         if query.len() != DEFAULT_EMBEDDING_DIM as usize {
@@ -491,7 +542,7 @@ impl ContextStore {
         }
 
         let mut results: Vec<SearchResult> = self
-            .list_with_options(None, None, options)
+            .list_filtered_with_options(None, None, filters, options)
             .await?
             .into_iter()
             .filter_map(|record| {
@@ -754,12 +805,13 @@ impl ContextStore {
     /// Lance V1 blob encoding (out-of-line binary buffers). For `text_payload`,
     /// this also changes the Arrow type from `LargeUtf8` to `LargeBinary`.
     pub fn schema(blob_columns: &HashSet<String>) -> Schema {
-        Self::schema_with_options(blob_columns, true, true)
+        Self::schema_with_options(blob_columns, true, true, true)
     }
 
     fn schema_with_options(
         blob_columns: &HashSet<String>,
         include_external_id: bool,
+        include_metadata: bool,
         include_lifecycle: bool,
     ) -> Schema {
         let mut id_metadata = HashMap::new();
@@ -816,6 +868,9 @@ impl ContextStore {
                 true,
             ),
         ]);
+        if include_metadata {
+            fields.push(Field::new("metadata", DataType::LargeUtf8, true));
+        }
         if include_lifecycle {
             fields.extend([
                 Field::new(
@@ -909,10 +964,22 @@ impl ContextStore {
             .field_paths()
             .iter()
             .any(|path| path == "expires_at");
+        let include_metadata = self
+            .dataset
+            .schema()
+            .field_paths()
+            .iter()
+            .any(|path| path == "metadata");
         if !include_external_id && entries.iter().any(|entry| entry.external_id.is_some()) {
             return Err(ArrowError::InvalidArgumentError(
                 "external_id requires a context dataset created with external_id support"
                     .to_string(),
+            )
+            .into());
+        }
+        if !include_metadata && entries.iter().any(|entry| entry.metadata.is_some()) {
+            return Err(ArrowError::InvalidArgumentError(
+                "metadata requires a context dataset created with metadata support".to_string(),
             )
             .into());
         }
@@ -931,6 +998,7 @@ impl ContextStore {
         let mut session_id_builder = StringBuilder::new();
         let mut created_at_builder = TimestampMicrosecondBuilder::with_capacity(entries.len());
         let mut role_builder = StringDictionaryBuilder::<Int8Type>::new();
+        let mut metadata_builder = LargeStringBuilder::new();
         let mut expires_at_builder = TimestampMicrosecondBuilder::with_capacity(entries.len());
         let mut retention_policy_builder = StringBuilder::new();
         let mut lifecycle_status_builder = StringBuilder::new();
@@ -980,6 +1048,10 @@ impl ContextStore {
             session_id_builder.append_option(entry.session_id.as_deref());
             created_at_builder.append_value(entry.created_at.timestamp_micros());
             role_builder.append(&entry.role)?;
+            match &entry.metadata {
+                Some(metadata) => metadata_builder.append_value(metadata.to_string()),
+                None => metadata_builder.append_null(),
+            }
             expires_at_builder
                 .append_option(entry.expires_at.map(|value| value.timestamp_micros()));
             retention_policy_builder.append_option(entry.retention_policy.as_deref());
@@ -1082,6 +1154,7 @@ impl ContextStore {
         let session_id_array: ArrayRef = Arc::new(session_id_builder.finish());
         let created_at_array: ArrayRef = Arc::new(created_at_builder.finish());
         let role_array: ArrayRef = Arc::new(role_builder.finish());
+        let metadata_array: ArrayRef = Arc::new(metadata_builder.finish());
         let expires_at_array: ArrayRef = Arc::new(expires_at_builder.finish());
         let retention_policy_array: ArrayRef = Arc::new(retention_policy_builder.finish());
         let lifecycle_status_array: ArrayRef = Arc::new(lifecycle_status_builder.finish());
@@ -1102,6 +1175,7 @@ impl ContextStore {
         let schema = Arc::new(Self::schema_with_options(
             &self.blob_columns,
             include_external_id,
+            include_metadata,
             include_lifecycle,
         ));
         let mut arrays = vec![id_array];
@@ -1116,6 +1190,9 @@ impl ContextStore {
             role_array,
             state_array,
         ]);
+        if include_metadata {
+            arrays.push(metadata_array);
+        }
         if include_lifecycle {
             arrays.extend([
                 expires_at_array,
@@ -1160,6 +1237,7 @@ fn batch_to_records(batch: &RecordBatch) -> LanceResult<Vec<ContextRecord>> {
     let created_at_array = column_as::<TimestampMicrosecondArray>(batch, "created_at")?;
     let role_array = column_as::<DictionaryArray<Int8Type>>(batch, "role")?;
     let state_array = column_as::<StructArray>(batch, "state_metadata")?;
+    let metadata_array = column_as_optional::<LargeStringArray>(batch, "metadata");
     let expires_at_array = column_as_optional::<TimestampMicrosecondArray>(batch, "expires_at");
     let retention_policy_array = column_as_optional::<StringArray>(batch, "retention_policy");
     let lifecycle_status_array = column_as_optional::<StringArray>(batch, "lifecycle_status");
@@ -1322,6 +1400,18 @@ fn batch_to_records(batch: &RecordBatch) -> LanceResult<Vec<ContextRecord>> {
             }
         });
 
+        let metadata = match metadata_array {
+            Some(arr) if !arr.is_null(row) => {
+                Some(serde_json::from_str(arr.value(row)).map_err(|err| {
+                    LanceError::from(ArrowError::InvalidArgumentError(format!(
+                        "invalid metadata JSON for record {}: {}",
+                        id_array.value(row),
+                        err
+                    )))
+                })?)
+            }
+            _ => None,
+        };
         let expires_at = optional_timestamp_from_array(expires_at_array, row, "expires_at")?;
         let retention_policy = optional_string_from_array(retention_policy_array, row);
         let lifecycle_status = optional_string_from_array(lifecycle_status_array, row)
@@ -1346,6 +1436,7 @@ fn batch_to_records(batch: &RecordBatch) -> LanceResult<Vec<ContextRecord>> {
             created_at,
             role,
             state_metadata,
+            metadata,
             expires_at,
             retention_policy,
             lifecycle_status,
@@ -1480,6 +1571,7 @@ mod tests {
                 tokens_used: Some(10),
                 custom: None,
             }),
+            metadata: None,
             expires_at: None,
             retention_policy: None,
             lifecycle_status: LIFECYCLE_ACTIVE.to_string(),

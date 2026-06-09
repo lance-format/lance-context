@@ -1,5 +1,9 @@
 from __future__ import annotations
 
-from .api import Context, __version__  # pyright: ignore[reportMissingImports]
+from .api import (  # pyright: ignore[reportMissingImports]
+    AsyncContext,
+    Context,
+    __version__,
+)
 
-__all__ = ["Context", "__version__"]
+__all__ = ["AsyncContext", "Context", "__version__"]

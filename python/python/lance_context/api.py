@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import warnings
 from collections.abc import Iterable, Mapping
 from datetime import datetime
@@ -9,7 +11,7 @@ from typing import Any
 from ._internal import Context as _Context  # pyright: ignore[reportMissingImports]
 from ._internal import version as _version  # pyright: ignore[reportMissingImports]
 
-__all__ = ["Context", "__version__"]
+__all__ = ["AsyncContext", "Context", "__version__"]
 
 __version__ = _version()
 
@@ -142,6 +144,7 @@ def _normalize_record(raw: dict[str, Any]) -> dict[str, Any]:
         "embedding": raw.get("embedding"),
         "created_at": _normalize_timestamp(raw.get("created_at")),
         "state_metadata": raw.get("state_metadata"),
+        "metadata": raw.get("metadata"),
         "expires_at": _normalize_timestamp(raw.get("expires_at")),
         "retention_policy": raw.get("retention_policy"),
         "lifecycle_status": raw.get("lifecycle_status"),
@@ -166,6 +169,15 @@ _AWS_KWARG_MAP: dict[str, str] = {
     "region": "aws_region",
     "endpoint_url": "aws_endpoint_url",
 }
+
+
+def _json_dumps(value: dict[str, Any] | None, name: str) -> str | None:
+    if value is None:
+        return None
+    try:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"{name} must be JSON-serializable") from exc
 
 
 def _merge_storage_options(
@@ -375,6 +387,7 @@ class Context:
         bot_id: str | None = None,
         session_id: str | None = None,
         external_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
         expires_at: datetime | str | None = None,
         retention_policy: str | None = None,
         lifecycle_status: str | None = None,
@@ -396,6 +409,7 @@ class Context:
             bot_id,
             session_id,
             external_id,
+            _json_dumps(metadata, "metadata"),
             _coerce_timestamp(expires_at, field_name="expires_at"),
             retention_policy,
             lifecycle_status,
@@ -410,8 +424,8 @@ class Context:
 
         Each record accepts the same fields as :meth:`add`: ``role``,
         ``content``, optional ``content_type``/``data_type``, ``embedding``,
-        ``bot_id``, ``session_id``, ``external_id``, and lifecycle fields such
-        as ``expires_at`` and ``lifecycle_status``.
+        ``bot_id``, ``session_id``, ``external_id``, ``metadata``, and
+        lifecycle fields such as ``expires_at`` and ``lifecycle_status``.
         """
         normalized: list[dict[str, Any]] = []
         for index, record in enumerate(records):
@@ -441,6 +455,7 @@ class Context:
                     "bot_id": record.get("bot_id"),
                     "session_id": record.get("session_id"),
                     "external_id": record.get("external_id"),
+                    "metadata_json": _json_dumps(record.get("metadata"), "metadata"),
                     "expires_at": _coerce_timestamp(
                         record.get("expires_at"),
                         field_name=f"records[{index}].expires_at",
@@ -473,18 +488,26 @@ class Context:
         self,
         query: Any,
         limit: int | None = None,
+        filters: dict[str, Any] | None = None,
         *,
         include_expired: bool = False,
         include_retired: bool = False,
     ) -> list[dict[str, Any]]:
         vector = _coerce_vector(query)
-        results = self._inner.search(vector, limit, include_expired, include_retired)
+        results = self._inner.search(
+            vector,
+            limit,
+            _json_dumps(filters, "filters"),
+            include_expired,
+            include_retired,
+        )
         return [_normalize_search_hit(item) for item in results]
 
     def list(
         self,
         limit: int | None = None,
         offset: int | None = None,
+        filters: dict[str, Any] | None = None,
         *,
         include_expired: bool = False,
         include_retired: bool = False,
@@ -494,15 +517,24 @@ class Context:
         Args:
             limit: Maximum number of entries to return. If None, returns all.
             offset: Number of entries to skip before returning results.
+            filters: Optional equality filters for built-in fields
+                (bot_id, session_id, role, content_type), created_at range
+                filters, or metadata fields.
             include_expired: Include records whose ``expires_at`` is in the past.
             include_retired: Include retired/superseded/revoked records.
 
         Returns:
             List of entry dicts with keys: id, run_id, role, content_type,
-            text, binary, embedding, created_at, state_metadata, and lifecycle
-            metadata.
+            text, binary, embedding, created_at, metadata, state_metadata, and
+            lifecycle metadata.
         """
-        results = self._inner.list(limit, offset, include_expired, include_retired)
+        results = self._inner.list(
+            limit,
+            offset,
+            _json_dumps(filters, "filters"),
+            include_expired,
+            include_retired,
+        )
         return [_normalize_record(item) for item in results]
 
     def get(
@@ -594,3 +626,167 @@ class Context:
         obj = cls.__new__(cls)
         obj._inner = inner
         return obj
+
+
+class AsyncContext:
+    """Async wrapper around :class:`Context`.
+
+    Every I/O method is dispatched to a thread-pool executor via
+    :func:`asyncio.get_running_loop().run_in_executor`. The underlying Rust
+    code releases the GIL during I/O, so the executor thread is only occupied
+    briefly for the Python ↔ Rust boundary crossing.
+
+    Usage::
+
+        ctx = await AsyncContext.create("/tmp/context.lance")
+        await ctx.add("user", "hello")
+        results = await ctx.list()
+    """
+
+    def __init__(self, sync_ctx: Context) -> None:
+        self._sync = sync_ctx
+
+    @classmethod
+    async def create(
+        cls,
+        uri: str,
+        **kwargs: Any,
+    ) -> AsyncContext:
+        loop = asyncio.get_running_loop()
+        sync_ctx = await loop.run_in_executor(
+            None, lambda: Context.create(uri, **kwargs)
+        )
+        return cls(sync_ctx)
+
+    def uri(self) -> str:
+        return self._sync.uri()
+
+    def branch(self) -> str:
+        return self._sync.branch()
+
+    def entries(self) -> int:
+        return self._sync.entries()
+
+    def version(self) -> int:
+        return self._sync.version()
+
+    async def add(
+        self,
+        role: str,
+        content: Any,
+        content_type: str | None = None,
+        data_type: str | None = None,
+        embedding: list[float] | None = None,
+        bot_id: str | None = None,
+        session_id: str | None = None,
+        external_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        expires_at: datetime | str | None = None,
+        retention_policy: str | None = None,
+        lifecycle_status: str | None = None,
+        retired_at: datetime | str | None = None,
+        retired_reason: str | None = None,
+        supersedes_id: str | None = None,
+        superseded_by_id: str | None = None,
+    ) -> None:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None,
+            lambda: self._sync.add(
+                role,
+                content,
+                content_type=content_type,
+                data_type=data_type,
+                embedding=embedding,
+                bot_id=bot_id,
+                session_id=session_id,
+                external_id=external_id,
+                metadata=metadata,
+                expires_at=expires_at,
+                retention_policy=retention_policy,
+                lifecycle_status=lifecycle_status,
+                retired_at=retired_at,
+                retired_reason=retired_reason,
+                supersedes_id=supersedes_id,
+                superseded_by_id=superseded_by_id,
+            ),
+        )
+
+    def snapshot(self, label: str | None = None) -> str:
+        return self._sync.snapshot(label)
+
+    def fork(self, branch_name: str) -> AsyncContext:
+        sync_fork = self._sync.fork(branch_name)
+        return AsyncContext(sync_fork)
+
+    async def checkout(self, version_id: int | str) -> None:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, lambda: self._sync.checkout(version_id))
+
+    async def search(
+        self,
+        query: Any,
+        limit: int | None = None,
+        filters: dict[str, Any] | None = None,
+        *,
+        include_expired: bool = False,
+        include_retired: bool = False,
+    ) -> list[dict[str, Any]]:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self._sync.search(
+                query,
+                limit,
+                filters,
+                include_expired=include_expired,
+                include_retired=include_retired,
+            ),
+        )
+
+    async def list(
+        self,
+        limit: int | None = None,
+        offset: int | None = None,
+        filters: dict[str, Any] | None = None,
+        *,
+        include_expired: bool = False,
+        include_retired: bool = False,
+    ) -> list[dict[str, Any]]:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self._sync.list(
+                limit,
+                offset,
+                filters,
+                include_expired=include_expired,
+                include_retired=include_retired,
+            ),
+        )
+
+    async def compact(
+        self,
+        *,
+        target_rows_per_fragment: int | None = None,
+        materialize_deletions: bool = True,
+    ) -> dict[str, int]:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self._sync.compact(
+                target_rows_per_fragment=target_rows_per_fragment,
+                materialize_deletions=materialize_deletions,
+            ),
+        )
+
+    async def compaction_stats(self) -> dict[str, Any]:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._sync.compaction_stats)
+
+    def __repr__(self) -> str:
+        return (
+            f"AsyncContext(uri={self._sync.uri()!r}, "
+            f"branch={self._sync.branch()!r}, "
+            f"entries={self._sync.entries()})"
+        )

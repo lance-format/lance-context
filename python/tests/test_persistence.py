@@ -8,7 +8,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import pytest
 
@@ -19,9 +19,6 @@ if str(PACKAGE_ROOT) not in sys.path:
 from lance_context.api import Context  # noqa: E402
 
 lance = pytest.importorskip("lance")
-
-if TYPE_CHECKING:
-    from collections.abc import Iterator
 
 _S3_ACCESS_KEY = "test"
 _S3_SECRET_KEY = "test"
@@ -65,7 +62,7 @@ def _wait_for_moto_ready(client: Any, timeout: float = 5.0) -> None:
 
 
 @pytest.fixture(scope="module")
-def moto_endpoint() -> Iterator[str]:
+def moto_endpoint() -> str:
     pytest.importorskip("moto.server")
     boto3 = pytest.importorskip("boto3")
     from botocore.config import Config  # type: ignore[import-not-found]
@@ -164,6 +161,99 @@ def test_text_round_trip(tmp_path: Path) -> None:
     assert record["text_payload"] == "hello world"
     assert record["binary_payload"] is None
     assert record["content_type"] == "text/plain"
+
+
+def test_metadata_and_filters_round_trip(tmp_path: Path) -> None:
+    uri = tmp_path / "context.lance"
+    ctx = Context.create(str(uri))
+    ctx.add(
+        "assistant",
+        "The runbook owner is the platform team.",
+        bot_id="support-bot",
+        session_id="incident-1",
+        metadata={
+            "tenant": "example-org",
+            "scope": "team",
+            "source_uri": "docs://runbooks/service-a",
+            "tags": ["runbook", "ownership"],
+            "confidence": 0.92,
+        },
+    )
+    ctx.add(
+        "user",
+        "What is the owner?",
+        bot_id="support-bot",
+        session_id="incident-2",
+        metadata={"tenant": "example-org", "scope": "personal"},
+    )
+
+    scoped = ctx.list(
+        filters={
+            "bot_id": "support-bot",
+            "session_id": "incident-1",
+            "role": "assistant",
+            "content_type": "text/plain",
+            "scope": "team",
+            "tags": {"contains": "runbook"},
+        }
+    )
+
+    assert len(scoped) == 1
+    assert scoped[0]["text"] == "The runbook owner is the platform team."
+    assert scoped[0]["metadata"] == {
+        "tenant": "example-org",
+        "scope": "team",
+        "source_uri": "docs://runbooks/service-a",
+        "tags": ["runbook", "ownership"],
+        "confidence": 0.92,
+    }
+
+    created_at = scoped[0]["created_at"]
+    assert isinstance(created_at, datetime)
+    timestamp_scoped = ctx.list(
+        filters={
+            "created_at": {
+                "gte": created_at.isoformat(),
+                "lte": created_at.isoformat(),
+            }
+        }
+    )
+    assert [record["id"] for record in timestamp_scoped] == [scoped[0]["id"]]
+
+
+def test_search_applies_filters_before_limit(tmp_path: Path) -> None:
+    uri = tmp_path / "context.lance"
+    ctx = Context.create(str(uri))
+    near = [0.0] * 1536
+    far = [0.0] * 1536
+    far[0] = 10.0
+
+    ctx.add(
+        "assistant",
+        "global nearest",
+        embedding=near,
+        bot_id="support-bot",
+        session_id="other",
+        metadata={"scope": "personal"},
+    )
+    ctx.add(
+        "assistant",
+        "scoped farther",
+        embedding=far,
+        bot_id="support-bot",
+        session_id="incident-1",
+        metadata={"scope": "team", "tags": ["runbook"]},
+    )
+
+    hits = ctx.search(
+        near,
+        limit=1,
+        filters={"session_id": "incident-1", "tags": {"contains": "runbook"}},
+    )
+
+    assert len(hits) == 1
+    assert hits[0]["text"] == "scoped farther"
+    assert hits[0]["metadata"] == {"scope": "team", "tags": ["runbook"]}
 
 
 def test_lifecycle_fields_round_trip_and_default_filtering(tmp_path: Path) -> None:

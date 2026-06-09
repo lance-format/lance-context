@@ -1,18 +1,21 @@
+#![recursion_limit = "256"]
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyType};
+use pyo3::types::{PyBytes, PyDict, PyModule, PyType};
 use pyo3::IntoPyObject;
+use serde_json::Value;
 use tokio::runtime::Runtime;
 
 use lance_context::serde::CONTENT_TYPE_TEXT;
 use lance_context::{
     CompactionConfig, CompactionMetrics, CompactionStats, Context as RustContext, ContextRecord,
-    ContextStore, ContextStoreOptions, IdIndexType, LifecycleQueryOptions, SearchResult,
-    LIFECYCLE_ACTIVE,
+    ContextStore, ContextStoreOptions, IdIndexType, LifecycleQueryOptions, MetadataFilter,
+    RecordFilters, SearchResult, LIFECYCLE_ACTIVE,
 };
 
 const DEFAULT_BINARY_CONTENT_TYPE: &str = "application/octet-stream";
@@ -25,14 +28,15 @@ struct PreparedRecord {
     data_type: Option<String>,
 }
 
-struct RecordOptions {
+struct RecordInput {
+    role: String,
     data_type: Option<String>,
     embedding: Option<Vec<f32>>,
     bot_id: Option<String>,
     session_id: Option<String>,
     external_id: Option<String>,
+    metadata_json: Option<String>,
     lifecycle: LifecycleFields,
-    offset: u64,
 }
 
 #[derive(Default)]
@@ -136,6 +140,99 @@ fn compaction_config_from_dict<'py>(
     Ok(config)
 }
 
+fn metadata_from_json(metadata_json: Option<String>) -> PyResult<Option<Value>> {
+    metadata_json
+        .map(|value| serde_json::from_str(&value).map_err(to_py_err))
+        .transpose()
+}
+
+fn filters_from_json(filters_json: Option<String>) -> PyResult<Option<RecordFilters>> {
+    let Some(filters_json) = filters_json else {
+        return Ok(None);
+    };
+    let value: Value = serde_json::from_str(&filters_json).map_err(to_py_err)?;
+    let Value::Object(object) = value else {
+        return Err(PyRuntimeError::new_err("filters must be a JSON object"));
+    };
+
+    let mut filters = RecordFilters::default();
+    for (key, value) in object {
+        match key.as_str() {
+            "bot_id" => filters.bot_id = filter_string(key.as_str(), value)?,
+            "session_id" => filters.session_id = filter_string(key.as_str(), value)?,
+            "role" => filters.role = filter_string(key.as_str(), value)?,
+            "content_type" => filters.content_type = filter_string(key.as_str(), value)?,
+            "created_at" => apply_created_at_filter(&mut filters, value)?,
+            "created_at_start" | "created_after" | "created_at_gte" => {
+                filters.created_at_start = Some(parse_filter_datetime(&key, &value)?);
+            }
+            "created_at_end" | "created_before" | "created_at_lte" => {
+                filters.created_at_end = Some(parse_filter_datetime(&key, &value)?);
+            }
+            _ => {
+                let filter = match value {
+                    Value::Object(mut object)
+                        if object.len() == 1 && object.contains_key("contains") =>
+                    {
+                        MetadataFilter::Contains(object.remove("contains").unwrap())
+                    }
+                    value => MetadataFilter::Equals(value),
+                };
+                filters.metadata.insert(key, filter);
+            }
+        }
+    }
+
+    Ok(Some(filters))
+}
+
+fn filter_string(name: &str, value: Value) -> PyResult<Option<String>> {
+    match value {
+        Value::Null => Ok(None),
+        Value::String(value) => Ok(Some(value)),
+        _ => Err(PyRuntimeError::new_err(format!(
+            "filter '{name}' must be a string or null"
+        ))),
+    }
+}
+
+fn apply_created_at_filter(filters: &mut RecordFilters, value: Value) -> PyResult<()> {
+    let Value::Object(object) = value else {
+        return Err(PyRuntimeError::new_err(
+            "filter 'created_at' must be an object with gte/lte bounds",
+        ));
+    };
+
+    for (key, value) in object {
+        match key.as_str() {
+            "gte" | "start" | "after" => {
+                filters.created_at_start = Some(parse_filter_datetime(&key, &value)?);
+            }
+            "lte" | "end" | "before" => {
+                filters.created_at_end = Some(parse_filter_datetime(&key, &value)?);
+            }
+            other => {
+                return Err(PyRuntimeError::new_err(format!(
+                    "unsupported created_at filter operator '{other}'"
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_filter_datetime(name: &str, value: &Value) -> PyResult<DateTime<Utc>> {
+    let Some(value) = value.as_str() else {
+        return Err(PyRuntimeError::new_err(format!(
+            "filter '{name}' must be an ISO-8601 timestamp string"
+        )));
+    };
+    DateTime::parse_from_rfc3339(value)
+        .map(|value| value.with_timezone(&Utc))
+        .map_err(to_py_err)
+}
+
 #[pymethods]
 impl Context {
     #[classmethod]
@@ -201,7 +298,7 @@ impl Context {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (role, content, data_type = None, embedding = None, bot_id = None, session_id = None, external_id = None, expires_at = None, retention_policy = None, lifecycle_status = None, retired_at = None, retired_reason = None, supersedes_id = None, superseded_by_id = None))]
+    #[pyo3(signature = (role, content, data_type = None, embedding = None, bot_id = None, session_id = None, external_id = None, metadata_json = None, expires_at = None, retention_policy = None, lifecycle_status = None, retired_at = None, retired_reason = None, supersedes_id = None, superseded_by_id = None))]
     fn add(
         &mut self,
         py: Python<'_>,
@@ -212,6 +309,7 @@ impl Context {
         bot_id: Option<String>,
         session_id: Option<String>,
         external_id: Option<String>,
+        metadata_json: Option<String>,
         expires_at: Option<String>,
         retention_policy: Option<String>,
         lifecycle_status: Option<String>,
@@ -230,17 +328,18 @@ impl Context {
             superseded_by_id,
         };
         let prepared = self.prepare_record(
-            role.to_string(),
             content,
-            RecordOptions {
+            RecordInput {
+                role: role.to_string(),
                 data_type: data_type.map(str::to_string),
                 embedding,
                 bot_id,
                 session_id,
                 external_id,
+                metadata_json,
                 lifecycle,
-                offset: 1,
             },
+            1,
         )?;
 
         let add_res = py.allow_threads(|| {
@@ -304,19 +403,26 @@ impl Context {
         Ok(())
     }
 
-    #[pyo3(signature = (query, limit = None, include_expired = false, include_retired = false))]
+    #[pyo3(signature = (query, limit = None, filters_json = None, include_expired = false, include_retired = false))]
     fn search(
         &self,
         py: Python<'_>,
         query: Vec<f32>,
         limit: Option<usize>,
+        filters_json: Option<String>,
         include_expired: bool,
         include_retired: bool,
     ) -> PyResult<Vec<PyObject>> {
+        let filters = filters_from_json(filters_json)?;
         let options = LifecycleQueryOptions::new(include_expired, include_retired);
         let hits_res = py.allow_threads(|| {
             self.runtime
-                .block_on(self.store.search_with_options(&query, limit, options))
+                .block_on(self.store.search_filtered_with_options(
+                    &query,
+                    limit,
+                    filters.as_ref(),
+                    options,
+                ))
         });
         let hits = hits_res.map_err(to_py_err)?;
         hits.into_iter()
@@ -324,20 +430,27 @@ impl Context {
             .collect()
     }
 
-    #[pyo3(signature = (limit = None, offset = None, include_expired = false, include_retired = false))]
+    #[pyo3(signature = (limit = None, offset = None, filters_json = None, include_expired = false, include_retired = false))]
     fn list(
         &self,
         py: Python<'_>,
         limit: Option<usize>,
         offset: Option<usize>,
+        filters_json: Option<String>,
         include_expired: bool,
         include_retired: bool,
     ) -> PyResult<Vec<PyObject>> {
+        let filters = filters_from_json(filters_json)?;
         let options = LifecycleQueryOptions::new(include_expired, include_retired);
         // Release GIL during data retrieval
         let records = py.allow_threads(|| {
             self.runtime
-                .block_on(self.store.list_with_options(limit, offset, options))
+                .block_on(self.store.list_filtered_with_options(
+                    limit,
+                    offset,
+                    filters.as_ref(),
+                    options,
+                ))
                 .map_err(to_py_err)
         })?;
 
@@ -464,6 +577,8 @@ impl Context {
         let session_id = optional_item(dict, "session_id")?.map(|value| value.extract::<String>());
         let external_id =
             optional_item(dict, "external_id")?.map(|value| value.extract::<String>());
+        let metadata_json =
+            optional_item(dict, "metadata_json")?.map(|value| value.extract::<String>());
         let expires_at = optional_item(dict, "expires_at")?.map(|value| value.extract::<String>());
         let retention_policy =
             optional_item(dict, "retention_policy")?.map(|value| value.extract::<String>());
@@ -488,31 +603,43 @@ impl Context {
         };
 
         self.prepare_record(
-            role,
             &content,
-            RecordOptions {
+            RecordInput {
+                role,
                 data_type: data_type.transpose()?,
                 embedding: embedding.transpose()?,
                 bot_id: bot_id.transpose()?,
                 session_id: session_id.transpose()?,
                 external_id: external_id.transpose()?,
+                metadata_json: metadata_json.transpose()?,
                 lifecycle,
-                offset: index as u64 + 1,
             },
+            index as u64 + 1,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn prepare_record(
         &self,
-        role: String,
         content: &Bound<'_, PyAny>,
-        options: RecordOptions,
+        input: RecordInput,
+        offset: u64,
     ) -> PyResult<PreparedRecord> {
+        let RecordInput {
+            role,
+            data_type,
+            embedding,
+            bot_id,
+            session_id,
+            external_id,
+            metadata_json,
+            lifecycle,
+        } = input;
+
         let (content_type, text_payload, binary_payload, inner_content) =
             match content.extract::<&[u8]>() {
                 Ok(bytes) => (
-                    options
-                        .data_type
+                    data_type
                         .clone()
                         .unwrap_or_else(|| DEFAULT_BINARY_CONTENT_TYPE.to_string()),
                     None,
@@ -522,8 +649,7 @@ impl Context {
                 Err(_) => {
                     let content_str = content.str()?.to_string();
                     (
-                        options
-                            .data_type
+                        data_type
                             .clone()
                             .unwrap_or_else(|| CONTENT_TYPE_TEXT.to_string()),
                         Some(content_str.clone()),
@@ -533,35 +659,36 @@ impl Context {
                 }
             };
 
-        let record_id = format!("{}-{}", self.run_id, self.inner.entries() + options.offset);
+        let record_id = format!("{}-{}", self.run_id, self.inner.entries() + offset);
+        let metadata = metadata_from_json(metadata_json)?;
         Ok(PreparedRecord {
             record: ContextRecord {
                 id: record_id,
-                external_id: options.external_id,
+                external_id,
                 run_id: self.run_id.clone(),
-                bot_id: options.bot_id,
-                session_id: options.session_id,
+                bot_id,
+                session_id,
                 created_at: Utc::now(),
                 role: role.clone(),
                 state_metadata: None,
-                expires_at: options.lifecycle.expires_at,
-                retention_policy: options.lifecycle.retention_policy,
-                lifecycle_status: options
-                    .lifecycle
+                metadata,
+                expires_at: lifecycle.expires_at,
+                retention_policy: lifecycle.retention_policy,
+                lifecycle_status: lifecycle
                     .lifecycle_status
                     .unwrap_or_else(|| LIFECYCLE_ACTIVE.to_string()),
-                retired_at: options.lifecycle.retired_at,
-                retired_reason: options.lifecycle.retired_reason,
-                supersedes_id: options.lifecycle.supersedes_id,
-                superseded_by_id: options.lifecycle.superseded_by_id,
+                retired_at: lifecycle.retired_at,
+                retired_reason: lifecycle.retired_reason,
+                supersedes_id: lifecycle.supersedes_id,
+                superseded_by_id: lifecycle.superseded_by_id,
                 content_type,
                 text_payload,
                 binary_payload,
-                embedding: options.embedding,
+                embedding,
             },
             role,
             inner_content,
-            data_type: options.data_type,
+            data_type,
         })
     }
 }
@@ -647,6 +774,7 @@ fn record_to_py(py: Python<'_>, record: ContextRecord) -> PyResult<PyObject> {
         created_at,
         role,
         state_metadata,
+        metadata,
         expires_at,
         retention_policy,
         lifecycle_status,
@@ -684,6 +812,11 @@ fn record_to_py(py: Python<'_>, record: ContextRecord) -> PyResult<PyObject> {
         None => py.None().into_pyobject(py)?.unbind(),
     };
     dict.set_item("state_metadata", state_obj)?;
+    let metadata_obj: PyObject = match metadata {
+        Some(metadata) => json_value_to_py(py, &metadata)?,
+        None => py.None().into_pyobject(py)?.unbind(),
+    };
+    dict.set_item("metadata", metadata_obj)?;
     dict.set_item(
         "expires_at",
         expires_at.map(|dt| dt.to_rfc3339_opts(SecondsFormat::Micros, true)),
@@ -705,6 +838,11 @@ fn record_to_py(py: Python<'_>, record: ContextRecord) -> PyResult<PyObject> {
     }
     dict.set_item("embedding", embedding)?;
     Ok(dict.into_pyobject(py)?.unbind().into())
+}
+
+fn json_value_to_py(py: Python<'_>, value: &Value) -> PyResult<PyObject> {
+    let json = PyModule::import(py, "json")?;
+    Ok(json.call_method1("loads", (value.to_string(),))?.unbind())
 }
 
 fn to_py_err<E: std::fmt::Display>(err: E) -> PyErr {

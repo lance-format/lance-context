@@ -11,14 +11,12 @@ Key motivations inspired by the broader Lance roadmap<sup>[1](https://github.com
 - **Multimodal first** – store text, images, and structured data together, keeping the original bytes plus typed metadata.
 - **Version aware** – each append creates an immutable snapshot, enabling time-travel, branching, and auditability for long-running agents.
 - **Searchable semantics** – embeddings are managed alongside content so you can run Lance vector search without leaving the dataset.
-- **Lifecycle aware** – records can carry TTL, retention, retirement, and supersession metadata, with expired/retired rows hidden from default recall.
 - **Columnar performance** – backed by the Lance file format, giving fast analytics, compaction, and cloud-friendly storage.
 
 ## Features
 
 - Unified schema for agent messages (`ContextRecord`) with optional embeddings and metadata.
 - Automatic versioning via Lance manifests with `checkout(version)` support.
-- Query-time lifecycle filtering for expired, retired, superseded, and revoked memories.
 - Background compaction to optimize storage and read performance.
 - Remote persistence on any `object_store` backend (S3, GCS, Azure Blob, ...)
   via the generic `storage_options` dict, aligned with `lance` and `lance-graph`.
@@ -60,10 +58,46 @@ ctx.add(
     "user",
     "Where should I travel in spring?",
     external_id="conversation-2026-03-01#turn-1",
+    metadata={
+        "tenant": "example-org",
+        "scope": "travel-planning",
+        "source_uri": "chat://conversation-2026-03-01",
+        "tags": ["travel", "preference"],
+    },
 )
 print(ctx.get(external_id="conversation-2026-03-01#turn-1"))
 ctx.delete(external_id="conversation-2026-03-01#turn-1")
 assert ctx.get(external_id="conversation-2026-03-01#turn-1") is None
+
+# Scoped recall and provenance-oriented metadata
+runbook_embedding = [0.0] * 1536
+ctx.add(
+    "assistant",
+    "The runbook owner is the platform team.",
+    embedding=runbook_embedding,
+    bot_id="support-bot",
+    session_id="incident-123",
+    metadata={
+        "tenant": "example-org",
+        "scope": "team",
+        "source_uri": "docs://runbooks/service-a",
+        "tags": ["runbook", "ownership"],
+        "confidence": 0.92,
+    },
+)
+records = ctx.list(
+    filters={
+        "bot_id": "support-bot",
+        "session_id": "incident-123",
+        "scope": "team",
+        "tags": {"contains": "runbook"},
+    }
+)
+hits = ctx.search(
+    runbook_embedding,
+    limit=10,
+    filters={"tenant": "example-org", "content_type": "text/plain"},
+)
 
 from PIL import Image
 image = Image.new("RGB", (2, 2), color="teal")
@@ -86,23 +120,6 @@ ctx.add_many([
         "session_id": "runbook-import",
     },
 ])
-
-# Lifecycle metadata is stored in first-class columns. Expired, retired, and
-# superseded rows are excluded from default list/search calls, while contradicted
-# records stay visible so negative knowledge can remain a guardrail for recall.
-ctx.add(
-    "assistant",
-    "temporary session note",
-    expires_at="2026-07-01T00:00:00Z",
-    retention_policy="session",
-)
-ctx.add("system", "deployment endpoint is /v1")
-old_endpoint = ctx.list()[-1]
-ctx.add("system", "deployment endpoint is /v2", supersedes_id=old_endpoint["id"])
-ctx.add("system", "do not use the legacy parser", lifecycle_status="contradicted")
-
-visible = ctx.list()
-with_lifecycle_history = ctx.list(include_expired=True, include_retired=True)
 
 # Time-travel to prior state
 first_version = ctx.version()
@@ -189,8 +206,6 @@ let record = ContextRecord {
     id: "run-1-1".into(),
     external_id: None,
     run_id: "run-1".into(),
-    bot_id: None,
-    session_id: None,
     created_at: Utc::now(),
     role: "user".into(),
     state_metadata: Some(StateMetadata {
@@ -199,6 +214,7 @@ let record = ContextRecord {
         tokens_used: None,
         custom: None,
     }),
+    metadata: None,
     expires_at: None,
     retention_policy: None,
     lifecycle_status: "active".into(),

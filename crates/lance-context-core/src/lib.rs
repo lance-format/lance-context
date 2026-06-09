@@ -7,8 +7,8 @@ mod store;
 
 pub use context::{Context, ContextEntry, Snapshot};
 pub use record::{
-    ContextRecord, LifecycleQueryOptions, SearchResult, StateMetadata, LIFECYCLE_ACTIVE,
-    LIFECYCLE_CONTRADICTED,
+    ContextRecord, LifecycleQueryOptions, MetadataFilter, RecordFilters, SearchResult,
+    StateMetadata, LIFECYCLE_ACTIVE, LIFECYCLE_CONTRADICTED,
 };
 pub use store::{
     CompactionConfig, CompactionStats, ContextStore, ContextStoreOptions, IdIndexType,
