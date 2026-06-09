@@ -1,4 +1,5 @@
 //! Core types for the lance-context storage layer.
+#![recursion_limit = "256"]
 
 mod context;
 mod record;
