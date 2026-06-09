@@ -768,7 +768,12 @@ impl ContextStore {
     }
 
     fn records_to_batch(&self, entries: &[ContextRecord]) -> LanceResult<RecordBatch> {
-        let include_external_id = self.dataset.schema().field_path("external_id").is_ok();
+        let include_external_id = self
+            .dataset
+            .schema()
+            .field_paths()
+            .iter()
+            .any(|path| path == "external_id");
         if !include_external_id && entries.iter().any(|entry| entry.external_id.is_some()) {
             return Err(ArrowError::InvalidArgumentError(
                 "external_id requires a context dataset created with external_id support"
