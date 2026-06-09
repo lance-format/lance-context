@@ -21,6 +21,7 @@ lance-namespace = "7.0.0"
 lancedb = "0.30.0"
 lance-graph = "0.5.4"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 futures = "0.3"
 tokio = { version = "1", features = ["sync", "time"] }
 tracing = "0.1"

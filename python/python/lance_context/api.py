@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import warnings
 from datetime import datetime
 from io import BytesIO
@@ -126,6 +127,7 @@ def _normalize_record(raw: dict[str, Any]) -> dict[str, Any]:
         "embedding": raw.get("embedding"),
         "created_at": created_at,
         "state_metadata": raw.get("state_metadata"),
+        "metadata": raw.get("metadata"),
     }
 
 
@@ -143,6 +145,15 @@ _AWS_KWARG_MAP: dict[str, str] = {
     "region": "aws_region",
     "endpoint_url": "aws_endpoint_url",
 }
+
+
+def _json_dumps(value: dict[str, Any] | None, name: str) -> str | None:
+    if value is None:
+        return None
+    try:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"{name} must be JSON-serializable") from exc
 
 
 def _merge_storage_options(
@@ -352,6 +363,7 @@ class Context:
         bot_id: str | None = None,
         session_id: str | None = None,
         external_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         if content_type is not None and data_type is not None:
             raise ValueError("Specify only one of content_type or data_type")
@@ -366,6 +378,7 @@ class Context:
             bot_id,
             session_id,
             external_id,
+            _json_dumps(metadata, "metadata"),
         )
 
     def snapshot(self, label: str | None = None) -> str:
@@ -378,25 +391,36 @@ class Context:
     def checkout(self, version_id: int | str) -> None:
         self._inner.checkout(int(version_id))
 
-    def search(self, query: Any, limit: int | None = None) -> list[dict[str, Any]]:
+    def search(
+        self,
+        query: Any,
+        limit: int | None = None,
+        filters: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
         vector = _coerce_vector(query)
-        results = self._inner.search(vector, limit)
+        results = self._inner.search(vector, limit, _json_dumps(filters, "filters"))
         return [_normalize_search_hit(item) for item in results]
 
     def list(
-        self, limit: int | None = None, offset: int | None = None
+        self,
+        limit: int | None = None,
+        offset: int | None = None,
+        filters: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """Return stored entries.
 
         Args:
             limit: Maximum number of entries to return. If None, returns all.
             offset: Number of entries to skip before returning results.
+            filters: Optional equality filters for built-in fields
+                (bot_id, session_id, role, content_type), created_at range
+                filters, or metadata fields.
 
         Returns:
             List of entry dicts with keys: id, run_id, role, content_type,
-            text, binary, embedding, created_at, state_metadata.
+            text, binary, embedding, created_at, metadata, state_metadata.
         """
-        results = self._inner.list(limit, offset)
+        results = self._inner.list(limit, offset, _json_dumps(filters, "filters"))
         return [_normalize_record(item) for item in results]
 
     def get(

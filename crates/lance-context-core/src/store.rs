@@ -31,7 +31,7 @@ use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use crate::record::{ContextRecord, SearchResult, StateMetadata};
+use crate::record::{ContextRecord, RecordFilters, SearchResult, StateMetadata};
 
 /// Embedding length used for the semantic index column.
 const DEFAULT_EMBEDDING_DIM: i32 = 1536;
@@ -329,11 +329,25 @@ impl ContextStore {
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> LanceResult<Vec<ContextRecord>> {
+        self.list_filtered(limit, offset, None).await
+    }
+
+    /// List records matching filters.
+    pub async fn list_filtered(
+        &self,
+        limit: Option<usize>,
+        offset: Option<usize>,
+        filters: Option<&RecordFilters>,
+    ) -> LanceResult<Vec<ContextRecord>> {
         let scanner = self.lsm_scanner().await?;
         let mut stream = scanner.try_into_stream().await?;
         let mut results = Vec::new();
         while let Some(batch) = stream.try_next().await? {
             results.extend(batch_to_records(&batch)?);
+        }
+
+        if let Some(filters) = filters.filter(|filters| !filters.is_empty()) {
+            results.retain(|record| filters.matches(record));
         }
 
         if let Some(offset) = offset {
@@ -372,6 +386,16 @@ impl ContextStore {
         query: &[f32],
         limit: Option<usize>,
     ) -> LanceResult<Vec<SearchResult>> {
+        self.search_filtered(query, limit, None).await
+    }
+
+    /// Perform a nearest-neighbor search over stored embeddings matching filters.
+    pub async fn search_filtered(
+        &self,
+        query: &[f32],
+        limit: Option<usize>,
+        filters: Option<&RecordFilters>,
+    ) -> LanceResult<Vec<SearchResult>> {
         if query.len() != DEFAULT_EMBEDDING_DIM as usize {
             return Err(ArrowError::InvalidArgumentError(format!(
                 "query length {} does not match embedding dimension {}",
@@ -387,7 +411,7 @@ impl ContextStore {
         }
 
         let mut results: Vec<SearchResult> = self
-            .list(None, None)
+            .list_filtered(None, None, filters)
             .await?
             .into_iter()
             .filter_map(|record| {
@@ -650,10 +674,14 @@ impl ContextStore {
     /// Lance V1 blob encoding (out-of-line binary buffers). For `text_payload`,
     /// this also changes the Arrow type from `LargeUtf8` to `LargeBinary`.
     pub fn schema(blob_columns: &HashSet<String>) -> Schema {
-        Self::schema_with_options(blob_columns, true)
+        Self::schema_with_options(blob_columns, true, true)
     }
 
-    fn schema_with_options(blob_columns: &HashSet<String>, include_external_id: bool) -> Schema {
+    fn schema_with_options(
+        blob_columns: &HashSet<String>,
+        include_external_id: bool,
+        include_metadata: bool,
+    ) -> Schema {
         let mut id_metadata = HashMap::new();
         id_metadata.insert(
             "lance-schema:unenforced-primary-key".to_string(),
@@ -707,6 +735,11 @@ impl ContextStore {
                 ),
                 true,
             ),
+        ]);
+        if include_metadata {
+            fields.push(Field::new("metadata", DataType::LargeUtf8, true));
+        }
+        fields.extend([
             Field::new("content_type", DataType::Utf8, false),
             text_field,
             binary_field,
@@ -781,6 +814,18 @@ impl ContextStore {
             )
             .into());
         }
+        let include_metadata = self
+            .dataset
+            .schema()
+            .field_paths()
+            .iter()
+            .any(|path| path == "metadata");
+        if !include_metadata && entries.iter().any(|entry| entry.metadata.is_some()) {
+            return Err(ArrowError::InvalidArgumentError(
+                "metadata requires a context dataset created with metadata support".to_string(),
+            )
+            .into());
+        }
 
         let mut id_builder = StringBuilder::new();
         let mut external_id_builder = StringBuilder::new();
@@ -789,6 +834,7 @@ impl ContextStore {
         let mut session_id_builder = StringBuilder::new();
         let mut created_at_builder = TimestampMicrosecondBuilder::with_capacity(entries.len());
         let mut role_builder = StringDictionaryBuilder::<Int8Type>::new();
+        let mut metadata_builder = LargeStringBuilder::new();
         let mut content_type_builder = StringBuilder::new();
         let mut binary_builder = LargeBinaryBuilder::new();
 
@@ -831,6 +877,10 @@ impl ContextStore {
             session_id_builder.append_option(entry.session_id.as_deref());
             created_at_builder.append_value(entry.created_at.timestamp_micros());
             role_builder.append(&entry.role)?;
+            match &entry.metadata {
+                Some(metadata) => metadata_builder.append_value(metadata.to_string()),
+                None => metadata_builder.append_null(),
+            }
             content_type_builder.append_value(&entry.content_type);
 
             if text_is_blob {
@@ -924,6 +974,7 @@ impl ContextStore {
         let session_id_array: ArrayRef = Arc::new(session_id_builder.finish());
         let created_at_array: ArrayRef = Arc::new(created_at_builder.finish());
         let role_array: ArrayRef = Arc::new(role_builder.finish());
+        let metadata_array: ArrayRef = Arc::new(metadata_builder.finish());
         let content_type_array: ArrayRef = Arc::new(content_type_builder.finish());
         let text_array: ArrayRef = if text_is_blob {
             Arc::new(text_binary_builder.unwrap().finish())
@@ -937,6 +988,7 @@ impl ContextStore {
         let schema = Arc::new(Self::schema_with_options(
             &self.blob_columns,
             include_external_id,
+            include_metadata,
         ));
         let mut arrays = vec![id_array];
         if include_external_id {
@@ -949,6 +1001,11 @@ impl ContextStore {
             created_at_array,
             role_array,
             state_array,
+        ]);
+        if include_metadata {
+            arrays.push(metadata_array);
+        }
+        arrays.extend([
             content_type_array,
             text_array,
             binary_array,
@@ -981,6 +1038,7 @@ fn batch_to_records(batch: &RecordBatch) -> LanceResult<Vec<ContextRecord>> {
     let created_at_array = column_as::<TimestampMicrosecondArray>(batch, "created_at")?;
     let role_array = column_as::<DictionaryArray<Int8Type>>(batch, "role")?;
     let state_array = column_as::<StructArray>(batch, "state_metadata")?;
+    let metadata_array = column_as_optional::<LargeStringArray>(batch, "metadata");
     let content_type_array = column_as::<StringArray>(batch, "content_type")?;
     let binary_array = column_as::<LargeBinaryArray>(batch, "binary_payload")?;
     let embedding_array = column_as::<FixedSizeListArray>(batch, "embedding")?;
@@ -1142,6 +1200,19 @@ fn batch_to_records(batch: &RecordBatch) -> LanceResult<Vec<ContextRecord>> {
             }
         });
 
+        let metadata = match metadata_array {
+            Some(arr) if !arr.is_null(row) => {
+                Some(serde_json::from_str(arr.value(row)).map_err(|err| {
+                    LanceError::from(ArrowError::InvalidArgumentError(format!(
+                        "invalid metadata JSON for record {}: {}",
+                        id_array.value(row),
+                        err
+                    )))
+                })?)
+            }
+            _ => None,
+        };
+
         results.push(ContextRecord {
             id: id_array.value(row).to_string(),
             external_id: external_id_array.and_then(|arr| {
@@ -1157,6 +1228,7 @@ fn batch_to_records(batch: &RecordBatch) -> LanceResult<Vec<ContextRecord>> {
             created_at,
             role,
             state_metadata,
+            metadata,
             content_type: content_type_array.value(row).to_string(),
             text_payload,
             binary_payload,
@@ -1251,6 +1323,7 @@ mod tests {
                 tokens_used: Some(10),
                 custom: None,
             }),
+            metadata: None,
             content_type: CONTENT_TYPE_TEXT.to_string(),
             text_payload: Some(format!("payload-{id}")),
             binary_payload: None,

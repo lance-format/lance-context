@@ -5336,6 +5336,7 @@ dependencies = [
  "lance-namespace 7.0.0",
  "lancedb",
  "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",
@@ -5349,6 +5350,7 @@ dependencies = [
  "chrono",
  "lance-context",
  "pyo3",
+ "serde_json",
  "tokio",
 ]
 

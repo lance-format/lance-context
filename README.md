@@ -58,8 +58,44 @@ ctx.add(
     "user",
     "Where should I travel in spring?",
     external_id="conversation-2026-03-01#turn-1",
+    metadata={
+        "tenant": "example-org",
+        "scope": "travel-planning",
+        "source_uri": "chat://conversation-2026-03-01",
+        "tags": ["travel", "preference"],
+    },
 )
 print(ctx.get(external_id="conversation-2026-03-01#turn-1"))
+
+# Scoped recall and provenance-oriented metadata
+runbook_embedding = [0.0] * 1536
+ctx.add(
+    "assistant",
+    "The runbook owner is the platform team.",
+    embedding=runbook_embedding,
+    bot_id="support-bot",
+    session_id="incident-123",
+    metadata={
+        "tenant": "example-org",
+        "scope": "team",
+        "source_uri": "docs://runbooks/service-a",
+        "tags": ["runbook", "ownership"],
+        "confidence": 0.92,
+    },
+)
+records = ctx.list(
+    filters={
+        "bot_id": "support-bot",
+        "session_id": "incident-123",
+        "scope": "team",
+        "tags": {"contains": "runbook"},
+    }
+)
+hits = ctx.search(
+    runbook_embedding,
+    limit=10,
+    filters={"tenant": "example-org", "content_type": "text/plain"},
+)
 
 from PIL import Image
 image = Image.new("RGB", (2, 2), color="teal")
@@ -153,6 +189,7 @@ let record = ContextRecord {
         tokens_used: None,
         custom: None,
     }),
+    metadata: None,
     content_type: "text/plain".into(),
     text_payload: Some("hello world".into()),
     binary_payload: None,
