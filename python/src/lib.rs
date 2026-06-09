@@ -318,9 +318,9 @@ impl Context {
         let mut prepared = Vec::new();
         for (index, item) in records.try_iter()?.enumerate() {
             let item = item?;
-            let dict = item.downcast::<PyDict>().map_err(|_| {
-                PyTypeError::new_err(format!("records[{index}] must be a dict"))
-            })?;
+            let dict = item
+                .downcast::<PyDict>()
+                .map_err(|_| PyTypeError::new_err(format!("records[{index}] must be a dict")))?;
             prepared.push(self.prepare_record_from_dict(dict, index)?);
         }
 
@@ -330,8 +330,7 @@ impl Context {
 
         let context_records: Vec<ContextRecord> =
             prepared.iter().map(|item| item.record.clone()).collect();
-        let add_res =
-            py.allow_threads(|| self.runtime.block_on(self.store.add(&context_records)));
+        let add_res = py.allow_threads(|| self.runtime.block_on(self.store.add(&context_records)));
         add_res.map_err(to_py_err)?;
 
         for item in prepared {
@@ -487,13 +486,10 @@ impl Context {
     ) -> PyResult<PreparedRecord> {
         let role = required_item(dict, "role", index)?.extract::<String>()?;
         let content = required_item(dict, "content", index)?;
-        let data_type =
-            optional_item(dict, "data_type")?.map(|value| value.extract::<String>());
-        let embedding =
-            optional_item(dict, "embedding")?.map(|value| value.extract::<Vec<f32>>());
+        let data_type = optional_item(dict, "data_type")?.map(|value| value.extract::<String>());
+        let embedding = optional_item(dict, "embedding")?.map(|value| value.extract::<Vec<f32>>());
         let bot_id = optional_item(dict, "bot_id")?.map(|value| value.extract::<String>());
-        let session_id =
-            optional_item(dict, "session_id")?.map(|value| value.extract::<String>());
+        let session_id = optional_item(dict, "session_id")?.map(|value| value.extract::<String>());
         let external_id =
             optional_item(dict, "external_id")?.map(|value| value.extract::<String>());
         let metadata_json =
@@ -582,10 +578,7 @@ fn required_item<'py>(
     })
 }
 
-fn optional_item<'py>(
-    dict: &Bound<'py, PyDict>,
-    key: &str,
-) -> PyResult<Option<Bound<'py, PyAny>>> {
+fn optional_item<'py>(dict: &Bound<'py, PyDict>, key: &str) -> PyResult<Option<Bound<'py, PyAny>>> {
     Ok(dict.get_item(key)?.filter(|value| !value.is_none()))
 }
 
