@@ -32,6 +32,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::record::{ContextRecord, SearchResult, StateMetadata};
+use crate::serde::CONTENT_TYPE_TOMBSTONE;
 
 /// Embedding length used for the semantic index column.
 const DEFAULT_EMBEDDING_DIM: i32 = 1536;
@@ -204,6 +205,13 @@ impl ContextStore {
         }
 
         self.validate_unique_ids(entries).await?;
+        self.write_entries(entries).await
+    }
+
+    async fn write_entries(&mut self, entries: &[ContextRecord]) -> LanceResult<u64> {
+        if entries.is_empty() {
+            return Ok(self.dataset.manifest.version);
+        }
 
         // Group entries by (bot_id, session_id)
         let mut groups: HashMap<(Option<String>, Option<String>), Vec<ContextRecord>> =
@@ -252,10 +260,56 @@ impl ContextStore {
         Ok(self.dataset.manifest.version)
     }
 
+    /// Logically forget a record by internal storage id.
+    ///
+    /// This writes a tombstone with the same primary key, preserving prior
+    /// dataset versions while hiding the record from default reads.
+    pub async fn delete_by_id(&mut self, id: &str) -> LanceResult<bool> {
+        let Some(record) = self.get_by_id(id).await? else {
+            return Ok(false);
+        };
+        self.write_tombstone_for(record).await?;
+        Ok(true)
+    }
+
+    /// Logically forget a record by caller-supplied external id.
+    pub async fn delete_by_external_id(&mut self, external_id: &str) -> LanceResult<bool> {
+        let Some(record) = self.get_by_external_id(external_id).await? else {
+            return Ok(false);
+        };
+        self.write_tombstone_for(record).await?;
+        Ok(true)
+    }
+
+    async fn write_tombstone_for(&mut self, record: ContextRecord) -> LanceResult<u64> {
+        let tombstone = ContextRecord {
+            id: record.id,
+            external_id: record.external_id,
+            run_id: record.run_id,
+            bot_id: record.bot_id,
+            session_id: record.session_id,
+            created_at: Utc::now(),
+            role: record.role,
+            state_metadata: None,
+            content_type: CONTENT_TYPE_TOMBSTONE.to_string(),
+            text_payload: None,
+            binary_payload: None,
+            embedding: None,
+        };
+        self.write_entries(std::slice::from_ref(&tombstone)).await
+    }
+
     async fn validate_unique_ids(&self, entries: &[ContextRecord]) -> LanceResult<()> {
         let mut ids = HashSet::new();
         let mut external_ids = HashSet::new();
         for entry in entries {
+            if entry.is_tombstone() {
+                return Err(ArrowError::InvalidArgumentError(format!(
+                    "content_type '{}' is reserved for internal tombstones",
+                    CONTENT_TYPE_TOMBSTONE
+                ))
+                .into());
+            }
             if !ids.insert(entry.id.as_str()) {
                 return Err(ArrowError::InvalidArgumentError(format!(
                     "duplicate id '{}' in batch",
@@ -333,7 +387,11 @@ impl ContextStore {
         let mut stream = scanner.try_into_stream().await?;
         let mut results = Vec::new();
         while let Some(batch) = stream.try_next().await? {
-            results.extend(batch_to_records(&batch)?);
+            results.extend(
+                batch_to_records(&batch)?
+                    .into_iter()
+                    .filter(|record| !record.is_tombstone()),
+            );
         }
 
         if let Some(offset) = offset {
@@ -1344,6 +1402,101 @@ mod tests {
                 message.contains("external_id") && message.contains("already exists"),
                 "unexpected error message: {message}"
             );
+        });
+    }
+
+    #[test]
+    fn add_rejects_reserved_tombstone_content_type() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = ContextStore::open(&uri).await.unwrap();
+            let mut record = text_record("a", 0.0);
+            record.content_type = CONTENT_TYPE_TOMBSTONE.to_string();
+
+            let err = store.add(&[record]).await.unwrap_err();
+            let message = err.to_string();
+            assert!(
+                message.contains("reserved") && message.contains("tombstone"),
+                "unexpected error message: {message}"
+            );
+        });
+    }
+
+    #[test]
+    fn delete_by_external_id_hides_record_from_default_reads() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = ContextStore::open(&uri).await.unwrap();
+            let mut first = text_record("a", 0.0);
+            first.external_id = Some("doc-123#chunk-1".to_string());
+            let second = text_record("b", 2.0);
+            store.add(&[first.clone(), second.clone()]).await.unwrap();
+
+            assert!(store
+                .delete_by_external_id("doc-123#chunk-1")
+                .await
+                .unwrap());
+
+            assert!(store
+                .get_by_external_id("doc-123#chunk-1")
+                .await
+                .unwrap()
+                .is_none());
+            assert!(store.get_by_id(&first.id).await.unwrap().is_none());
+
+            let records = store.list(None, None).await.unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].id, second.id);
+
+            let query = make_embedding(0.0);
+            let hits = store.search(&query, Some(10)).await.unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].record.id, second.id);
+        });
+    }
+
+    #[test]
+    fn delete_missing_id_is_noop() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = ContextStore::open(&uri).await.unwrap();
+            assert!(!store.delete_by_id("missing").await.unwrap());
+            assert!(!store.delete_by_external_id("missing").await.unwrap());
+        });
+    }
+
+    #[test]
+    fn external_id_can_be_reused_after_delete() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = ContextStore::open(&uri).await.unwrap();
+            let mut first = text_record("a", 0.0);
+            first.external_id = Some("doc-123#chunk-1".to_string());
+            store.add(std::slice::from_ref(&first)).await.unwrap();
+            assert!(store
+                .delete_by_external_id("doc-123#chunk-1")
+                .await
+                .unwrap());
+
+            let mut replacement = text_record("b", 1.0);
+            replacement.external_id = first.external_id.clone();
+            store.add(std::slice::from_ref(&replacement)).await.unwrap();
+
+            let by_external_id = store
+                .get_by_external_id("doc-123#chunk-1")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(by_external_id.id, replacement.id);
+            assert_eq!(store.list(None, None).await.unwrap().len(), 1);
         });
     }
 

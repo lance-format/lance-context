@@ -316,6 +316,33 @@ impl Context {
         record.map(|record| record_to_py(py, record)).transpose()
     }
 
+    #[pyo3(signature = (id = None, external_id = None))]
+    fn delete(
+        &mut self,
+        py: Python<'_>,
+        id: Option<String>,
+        external_id: Option<String>,
+    ) -> PyResult<bool> {
+        match (id, external_id) {
+            (Some(id), None) => py.allow_threads(|| {
+                self.runtime
+                    .block_on(self.store.delete_by_id(&id))
+                    .map_err(to_py_err)
+            }),
+            (None, Some(external_id)) => py.allow_threads(|| {
+                self.runtime
+                    .block_on(self.store.delete_by_external_id(&external_id))
+                    .map_err(to_py_err)
+            }),
+            (None, None) => Err(PyRuntimeError::new_err(
+                "delete() requires either id or external_id",
+            )),
+            (Some(_), Some(_)) => Err(PyRuntimeError::new_err(
+                "delete() accepts only one of id or external_id",
+            )),
+        }
+    }
+
     #[pyo3(signature = (target_rows_per_fragment=None, materialize_deletions=None))]
     fn compact(
         &mut self,
