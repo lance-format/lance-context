@@ -27,6 +27,16 @@ struct PreparedRecord {
     data_type: Option<String>,
 }
 
+struct RecordInput {
+    role: String,
+    data_type: Option<String>,
+    embedding: Option<Vec<f32>>,
+    bot_id: Option<String>,
+    session_id: Option<String>,
+    external_id: Option<String>,
+    metadata_json: Option<String>,
+}
+
 #[pyfunction]
 fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
@@ -289,14 +299,16 @@ impl Context {
         metadata_json: Option<String>,
     ) -> PyResult<()> {
         let prepared = self.prepare_record(
-            role.to_string(),
             content,
-            data_type.map(str::to_string),
-            embedding,
-            bot_id,
-            session_id,
-            external_id,
-            metadata_json,
+            RecordInput {
+                role: role.to_string(),
+                data_type: data_type.map(str::to_string),
+                embedding,
+                bot_id,
+                session_id,
+                external_id,
+                metadata_json,
+            },
             1,
         )?;
 
@@ -496,30 +508,36 @@ impl Context {
             optional_item(dict, "metadata_json")?.map(|value| value.extract::<String>());
 
         self.prepare_record(
-            role,
             &content,
-            data_type.transpose()?,
-            embedding.transpose()?,
-            bot_id.transpose()?,
-            session_id.transpose()?,
-            external_id.transpose()?,
-            metadata_json.transpose()?,
+            RecordInput {
+                role,
+                data_type: data_type.transpose()?,
+                embedding: embedding.transpose()?,
+                bot_id: bot_id.transpose()?,
+                session_id: session_id.transpose()?,
+                external_id: external_id.transpose()?,
+                metadata_json: metadata_json.transpose()?,
+            },
             index as u64 + 1,
         )
     }
 
     fn prepare_record(
         &self,
-        role: String,
         content: &Bound<'_, PyAny>,
-        data_type: Option<String>,
-        embedding: Option<Vec<f32>>,
-        bot_id: Option<String>,
-        session_id: Option<String>,
-        external_id: Option<String>,
-        metadata_json: Option<String>,
+        input: RecordInput,
         offset: u64,
     ) -> PyResult<PreparedRecord> {
+        let RecordInput {
+            role,
+            data_type,
+            embedding,
+            bot_id,
+            session_id,
+            external_id,
+            metadata_json,
+        } = input;
+
         let (content_type, text_payload, binary_payload, inner_content) =
             match content.extract::<&[u8]>() {
                 Ok(bytes) => (
