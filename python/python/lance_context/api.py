@@ -534,17 +534,13 @@ class AsyncContext:
         self, query: Any, limit: int | None = None
     ) -> list[dict[str, Any]]:
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            None, lambda: self._sync.search(query, limit)
-        )
+        return await loop.run_in_executor(None, lambda: self._sync.search(query, limit))
 
     async def list(
         self, limit: int | None = None, offset: int | None = None
     ) -> list[dict[str, Any]]:
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            None, lambda: self._sync.list(limit, offset)
-        )
+        return await loop.run_in_executor(None, lambda: self._sync.list(limit, offset))
 
     async def compact(
         self,
