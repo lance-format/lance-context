@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyModule, PyType};
 use pyo3::IntoPyObject;
@@ -19,6 +19,13 @@ use lance_context::{
 
 const DEFAULT_BINARY_CONTENT_TYPE: &str = "application/octet-stream";
 const BINARY_PLACEHOLDER: &str = "[binary]";
+
+struct PreparedRecord {
+    record: ContextRecord,
+    role: String,
+    inner_content: String,
+    data_type: Option<String>,
+}
 
 #[pyfunction]
 fn version() -> &'static str {
@@ -281,49 +288,56 @@ impl Context {
         external_id: Option<String>,
         metadata_json: Option<String>,
     ) -> PyResult<()> {
-        let (content_type, text_payload, binary_payload, inner_content) =
-            match content.extract::<&[u8]>() {
-                Ok(bytes) => (
-                    data_type.unwrap_or(DEFAULT_BINARY_CONTENT_TYPE).to_string(),
-                    None,
-                    Some(bytes.to_vec()),
-                    BINARY_PLACEHOLDER.to_string(),
-                ),
-                Err(_) => {
-                    let content_str = content.str()?.to_string();
-                    (
-                        data_type.unwrap_or(CONTENT_TYPE_TEXT).to_string(),
-                        Some(content_str.clone()),
-                        None,
-                        content_str,
-                    )
-                }
-            };
-
-        let record_id = format!("{}-{}", self.run_id, self.inner.entries() + 1);
-        let metadata = metadata_from_json(metadata_json)?;
-        let record = ContextRecord {
-            id: record_id,
-            external_id,
-            run_id: self.run_id.clone(),
+        let prepared = self.prepare_record(
+            role.to_string(),
+            content,
+            data_type.map(str::to_string),
+            embedding,
             bot_id,
             session_id,
-            created_at: Utc::now(),
-            role: role.to_string(),
-            state_metadata: None,
-            metadata,
-            content_type,
-            text_payload,
-            binary_payload,
-            embedding,
-        };
+            external_id,
+            metadata_json,
+            1,
+        )?;
 
         let add_res = py.allow_threads(|| {
             self.runtime
-                .block_on(self.store.add(std::slice::from_ref(&record)))
+                .block_on(self.store.add(std::slice::from_ref(&prepared.record)))
         });
         add_res.map_err(to_py_err)?;
-        self.inner.add(role, &inner_content, data_type);
+        self.inner.add(
+            &prepared.role,
+            &prepared.inner_content,
+            prepared.data_type.as_deref(),
+        );
+        Ok(())
+    }
+
+    #[pyo3(signature = (records))]
+    fn add_many(&mut self, py: Python<'_>, records: &Bound<'_, PyAny>) -> PyResult<()> {
+        let mut prepared = Vec::new();
+        for (index, item) in records.try_iter()?.enumerate() {
+            let item = item?;
+            let dict = item.downcast::<PyDict>().map_err(|_| {
+                PyTypeError::new_err(format!("records[{index}] must be a dict"))
+            })?;
+            prepared.push(self.prepare_record_from_dict(dict, index)?);
+        }
+
+        if prepared.is_empty() {
+            return Ok(());
+        }
+
+        let context_records: Vec<ContextRecord> =
+            prepared.iter().map(|item| item.record.clone()).collect();
+        let add_res =
+            py.allow_threads(|| self.runtime.block_on(self.store.add(&context_records)));
+        add_res.map_err(to_py_err)?;
+
+        for item in prepared {
+            self.inner
+                .add(&item.role, &item.inner_content, item.data_type.as_deref());
+        }
         Ok(())
     }
 
@@ -463,6 +477,116 @@ impl Context {
 
         compaction_stats_to_py(py, stats)
     }
+}
+
+impl Context {
+    fn prepare_record_from_dict(
+        &self,
+        dict: &Bound<'_, PyDict>,
+        index: usize,
+    ) -> PyResult<PreparedRecord> {
+        let role = required_item(dict, "role", index)?.extract::<String>()?;
+        let content = required_item(dict, "content", index)?;
+        let data_type =
+            optional_item(dict, "data_type")?.map(|value| value.extract::<String>());
+        let embedding =
+            optional_item(dict, "embedding")?.map(|value| value.extract::<Vec<f32>>());
+        let bot_id = optional_item(dict, "bot_id")?.map(|value| value.extract::<String>());
+        let session_id =
+            optional_item(dict, "session_id")?.map(|value| value.extract::<String>());
+        let external_id =
+            optional_item(dict, "external_id")?.map(|value| value.extract::<String>());
+        let metadata_json =
+            optional_item(dict, "metadata_json")?.map(|value| value.extract::<String>());
+
+        self.prepare_record(
+            role,
+            &content,
+            data_type.transpose()?,
+            embedding.transpose()?,
+            bot_id.transpose()?,
+            session_id.transpose()?,
+            external_id.transpose()?,
+            metadata_json.transpose()?,
+            index as u64 + 1,
+        )
+    }
+
+    fn prepare_record(
+        &self,
+        role: String,
+        content: &Bound<'_, PyAny>,
+        data_type: Option<String>,
+        embedding: Option<Vec<f32>>,
+        bot_id: Option<String>,
+        session_id: Option<String>,
+        external_id: Option<String>,
+        metadata_json: Option<String>,
+        offset: u64,
+    ) -> PyResult<PreparedRecord> {
+        let (content_type, text_payload, binary_payload, inner_content) =
+            match content.extract::<&[u8]>() {
+                Ok(bytes) => (
+                    data_type
+                        .clone()
+                        .unwrap_or_else(|| DEFAULT_BINARY_CONTENT_TYPE.to_string()),
+                    None,
+                    Some(bytes.to_vec()),
+                    BINARY_PLACEHOLDER.to_string(),
+                ),
+                Err(_) => {
+                    let content_str = content.str()?.to_string();
+                    (
+                        data_type
+                            .clone()
+                            .unwrap_or_else(|| CONTENT_TYPE_TEXT.to_string()),
+                        Some(content_str.clone()),
+                        None,
+                        content_str,
+                    )
+                }
+            };
+
+        let record_id = format!("{}-{}", self.run_id, self.inner.entries() + offset);
+        let metadata = metadata_from_json(metadata_json)?;
+        Ok(PreparedRecord {
+            record: ContextRecord {
+                id: record_id,
+                external_id,
+                run_id: self.run_id.clone(),
+                bot_id,
+                session_id,
+                created_at: Utc::now(),
+                role: role.clone(),
+                state_metadata: None,
+                metadata,
+                content_type,
+                text_payload,
+                binary_payload,
+                embedding,
+            },
+            role,
+            inner_content,
+            data_type,
+        })
+    }
+}
+
+fn required_item<'py>(
+    dict: &Bound<'py, PyDict>,
+    key: &str,
+    index: usize,
+) -> PyResult<Bound<'py, PyAny>> {
+    dict.get_item(key)?.ok_or_else(|| {
+        PyRuntimeError::new_err(format!("records[{index}] is missing required key '{key}'"))
+    })
+}
+
+fn optional_item<'py>(
+    dict: &Bound<'py, PyDict>,
+    key: &str,
+) -> PyResult<Option<Bound<'py, PyAny>>> {
+    Ok(dict.get_item(key)?.filter(|value| !value.is_none()))
 }
 
 fn compaction_metrics_to_py(py: Python<'_>, metrics: CompactionMetrics) -> PyResult<PyObject> {
