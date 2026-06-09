@@ -203,6 +203,8 @@ impl ContextStore {
             return Ok(self.dataset.manifest.version);
         }
 
+        self.validate_unique_ids(entries).await?;
+
         // Group entries by (bot_id, session_id)
         let mut groups: HashMap<(Option<String>, Option<String>), Vec<ContextRecord>> =
             HashMap::new();
@@ -248,6 +250,50 @@ impl ContextStore {
         }
 
         Ok(self.dataset.manifest.version)
+    }
+
+    async fn validate_unique_ids(&self, entries: &[ContextRecord]) -> LanceResult<()> {
+        let mut ids = HashSet::new();
+        let mut external_ids = HashSet::new();
+        for entry in entries {
+            if !ids.insert(entry.id.as_str()) {
+                return Err(ArrowError::InvalidArgumentError(format!(
+                    "duplicate id '{}' in batch",
+                    entry.id
+                ))
+                .into());
+            }
+            if let Some(external_id) = &entry.external_id {
+                if !external_ids.insert(external_id.as_str()) {
+                    return Err(ArrowError::InvalidArgumentError(format!(
+                        "duplicate external_id '{}' in batch",
+                        external_id
+                    ))
+                    .into());
+                }
+            }
+        }
+
+        for record in self.list(None, None).await? {
+            if ids.contains(record.id.as_str()) {
+                return Err(ArrowError::InvalidArgumentError(format!(
+                    "id '{}' already exists",
+                    record.id
+                ))
+                .into());
+            }
+            if let Some(external_id) = record.external_id {
+                if external_ids.contains(external_id.as_str()) {
+                    return Err(ArrowError::InvalidArgumentError(format!(
+                        "external_id '{}' already exists",
+                        external_id
+                    ))
+                    .into());
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn derive_region_id(bot_id: &Option<String>, session_id: &Option<String>) -> Uuid {
@@ -297,6 +343,27 @@ impl ContextStore {
             results.truncate(limit);
         }
         Ok(results)
+    }
+
+    /// Find a record by its internal storage id.
+    pub async fn get_by_id(&self, id: &str) -> LanceResult<Option<ContextRecord>> {
+        Ok(self
+            .list(None, None)
+            .await?
+            .into_iter()
+            .find(|record| record.id == id))
+    }
+
+    /// Find a record by its caller-supplied external id.
+    pub async fn get_by_external_id(
+        &self,
+        external_id: &str,
+    ) -> LanceResult<Option<ContextRecord>> {
+        Ok(self
+            .list(None, None)
+            .await?
+            .into_iter()
+            .find(|record| record.external_id.as_deref() == Some(external_id)))
     }
 
     /// Perform a nearest-neighbor search over stored embeddings.
@@ -583,6 +650,10 @@ impl ContextStore {
     /// Lance V1 blob encoding (out-of-line binary buffers). For `text_payload`,
     /// this also changes the Arrow type from `LargeUtf8` to `LargeBinary`.
     pub fn schema(blob_columns: &HashSet<String>) -> Schema {
+        Self::schema_with_options(blob_columns, true)
+    }
+
+    fn schema_with_options(blob_columns: &HashSet<String>, include_external_id: bool) -> Schema {
         let mut id_metadata = HashMap::new();
         id_metadata.insert(
             "lance-schema:unenforced-primary-key".to_string(),
@@ -605,8 +676,11 @@ impl ContextStore {
             Field::new("binary_payload", DataType::LargeBinary, true)
         };
 
-        Schema::new(vec![
-            Field::new("id", DataType::Utf8, false).with_metadata(id_metadata),
+        let mut fields = vec![Field::new("id", DataType::Utf8, false).with_metadata(id_metadata)];
+        if include_external_id {
+            fields.push(Field::new("external_id", DataType::Utf8, true));
+        }
+        fields.extend([
             Field::new("run_id", DataType::Utf8, false),
             Field::new("bot_id", DataType::Utf8, true),
             Field::new("session_id", DataType::Utf8, true),
@@ -644,7 +718,9 @@ impl ContextStore {
                 ),
                 true,
             ),
-        ])
+        ]);
+
+        Schema::new(fields)
     }
 
     async fn load_with_options(
@@ -692,7 +768,22 @@ impl ContextStore {
     }
 
     fn records_to_batch(&self, entries: &[ContextRecord]) -> LanceResult<RecordBatch> {
+        let include_external_id = self
+            .dataset
+            .schema()
+            .field_paths()
+            .iter()
+            .any(|path| path == "external_id");
+        if !include_external_id && entries.iter().any(|entry| entry.external_id.is_some()) {
+            return Err(ArrowError::InvalidArgumentError(
+                "external_id requires a context dataset created with external_id support"
+                    .to_string(),
+            )
+            .into());
+        }
+
         let mut id_builder = StringBuilder::new();
+        let mut external_id_builder = StringBuilder::new();
         let mut run_id_builder = StringBuilder::new();
         let mut bot_id_builder = StringBuilder::new();
         let mut session_id_builder = StringBuilder::new();
@@ -734,6 +825,7 @@ impl ContextStore {
 
         for entry in entries {
             id_builder.append_value(&entry.id);
+            external_id_builder.append_option(entry.external_id.as_deref());
             run_id_builder.append_value(&entry.run_id);
             bot_id_builder.append_option(entry.bot_id.as_deref());
             session_id_builder.append_option(entry.session_id.as_deref());
@@ -826,6 +918,7 @@ impl ContextStore {
         }
 
         let id_array: ArrayRef = Arc::new(id_builder.finish());
+        let external_id_array: ArrayRef = Arc::new(external_id_builder.finish());
         let run_id_array: ArrayRef = Arc::new(run_id_builder.finish());
         let bot_id_array: ArrayRef = Arc::new(bot_id_builder.finish());
         let session_id_array: ArrayRef = Arc::new(session_id_builder.finish());
@@ -841,23 +934,27 @@ impl ContextStore {
         let state_array: ArrayRef = Arc::new(state_builder.finish());
         let embedding_array: ArrayRef = Arc::new(embedding_builder.finish());
 
-        let schema = Arc::new(Self::schema(&self.blob_columns));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                id_array,
-                run_id_array,
-                bot_id_array,
-                session_id_array,
-                created_at_array,
-                role_array,
-                state_array,
-                content_type_array,
-                text_array,
-                binary_array,
-                embedding_array,
-            ],
-        )?;
+        let schema = Arc::new(Self::schema_with_options(
+            &self.blob_columns,
+            include_external_id,
+        ));
+        let mut arrays = vec![id_array];
+        if include_external_id {
+            arrays.push(external_id_array);
+        }
+        arrays.extend([
+            run_id_array,
+            bot_id_array,
+            session_id_array,
+            created_at_array,
+            role_array,
+            state_array,
+            content_type_array,
+            text_array,
+            binary_array,
+            embedding_array,
+        ]);
+        let batch = RecordBatch::try_new(schema, arrays)?;
 
         Ok(batch)
     }
@@ -877,6 +974,7 @@ impl Drop for ContextStore {
 /// Convert a record batch to context records.
 fn batch_to_records(batch: &RecordBatch) -> LanceResult<Vec<ContextRecord>> {
     let id_array = column_as::<StringArray>(batch, "id")?;
+    let external_id_array = column_as_optional::<StringArray>(batch, "external_id");
     let run_id_array = column_as::<StringArray>(batch, "run_id")?;
     let bot_id_array = column_as_optional::<StringArray>(batch, "bot_id");
     let session_id_array = column_as_optional::<StringArray>(batch, "session_id");
@@ -1046,6 +1144,13 @@ fn batch_to_records(batch: &RecordBatch) -> LanceResult<Vec<ContextRecord>> {
 
         results.push(ContextRecord {
             id: id_array.value(row).to_string(),
+            external_id: external_id_array.and_then(|arr| {
+                if arr.is_null(row) {
+                    None
+                } else {
+                    Some(arr.value(row).to_string())
+                }
+            }),
             run_id: run_id_array.value(row).to_string(),
             bot_id,
             session_id,
@@ -1134,6 +1239,7 @@ mod tests {
     fn text_record(id: &str, embedding_pivot: f32) -> ContextRecord {
         ContextRecord {
             id: id.to_string(),
+            external_id: None,
             run_id: format!("run-{id}"),
             bot_id: None,
             session_id: None,
@@ -1187,6 +1293,55 @@ mod tests {
             let message = err.to_string();
             assert!(
                 message.contains("embedding dimension"),
+                "unexpected error message: {message}"
+            );
+        });
+    }
+
+    #[test]
+    fn external_id_roundtrips_and_supports_lookup() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = ContextStore::open(&uri).await.unwrap();
+            let mut record = text_record("a", 0.0);
+            record.external_id = Some("doc-123#chunk-1".to_string());
+            store.add(std::slice::from_ref(&record)).await.unwrap();
+
+            let by_external_id = store
+                .get_by_external_id("doc-123#chunk-1")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(by_external_id.id, record.id);
+            assert_eq!(by_external_id.external_id, record.external_id);
+
+            let by_id = store.get_by_id(&record.id).await.unwrap().unwrap();
+            assert_eq!(by_id.external_id.as_deref(), Some("doc-123#chunk-1"));
+
+            let missing = store.get_by_external_id("missing").await.unwrap();
+            assert!(missing.is_none());
+        });
+    }
+
+    #[test]
+    fn add_rejects_duplicate_external_id() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = ContextStore::open(&uri).await.unwrap();
+            let mut first = text_record("a", 0.0);
+            first.external_id = Some("doc-123#chunk-1".to_string());
+            store.add(std::slice::from_ref(&first)).await.unwrap();
+
+            let mut duplicate = text_record("b", 0.0);
+            duplicate.external_id = first.external_id.clone();
+            let err = store.add(&[duplicate]).await.unwrap_err();
+            let message = err.to_string();
+            assert!(
+                message.contains("external_id") && message.contains("already exists"),
                 "unexpected error message: {message}"
             );
         });

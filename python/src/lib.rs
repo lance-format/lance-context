@@ -179,7 +179,7 @@ impl Context {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (role, content, data_type = None, embedding = None, bot_id = None, session_id = None))]
+    #[pyo3(signature = (role, content, data_type = None, embedding = None, bot_id = None, session_id = None, external_id = None))]
     fn add(
         &mut self,
         py: Python<'_>,
@@ -189,6 +189,7 @@ impl Context {
         embedding: Option<Vec<f32>>,
         bot_id: Option<String>,
         session_id: Option<String>,
+        external_id: Option<String>,
     ) -> PyResult<()> {
         let prepared = self.prepare_record(
             role.to_string(),
@@ -197,6 +198,7 @@ impl Context {
             embedding,
             bot_id,
             session_id,
+            external_id,
             1,
         )?;
 
@@ -228,11 +230,10 @@ impl Context {
             return Ok(());
         }
 
-        let context_records: Vec<ContextRecord> = prepared
-            .iter()
-            .map(|item| item.record.clone())
-            .collect();
-        let add_res = py.allow_threads(|| self.runtime.block_on(self.store.add(&context_records)));
+        let context_records: Vec<ContextRecord> =
+            prepared.iter().map(|item| item.record.clone()).collect();
+        let add_res =
+            py.allow_threads(|| self.runtime.block_on(self.store.add(&context_records)));
         add_res.map_err(to_py_err)?;
 
         for item in prepared {
@@ -297,6 +298,39 @@ impl Context {
             .collect()
     }
 
+    #[pyo3(signature = (id = None, external_id = None))]
+    fn get(
+        &self,
+        py: Python<'_>,
+        id: Option<String>,
+        external_id: Option<String>,
+    ) -> PyResult<Option<PyObject>> {
+        let record = match (id, external_id) {
+            (Some(id), None) => py.allow_threads(|| {
+                self.runtime
+                    .block_on(self.store.get_by_id(&id))
+                    .map_err(to_py_err)
+            })?,
+            (None, Some(external_id)) => py.allow_threads(|| {
+                self.runtime
+                    .block_on(self.store.get_by_external_id(&external_id))
+                    .map_err(to_py_err)
+            })?,
+            (None, None) => {
+                return Err(PyRuntimeError::new_err(
+                    "get() requires either id or external_id",
+                ));
+            }
+            (Some(_), Some(_)) => {
+                return Err(PyRuntimeError::new_err(
+                    "get() accepts only one of id or external_id",
+                ));
+            }
+        };
+
+        record.map(|record| record_to_py(py, record)).transpose()
+    }
+
     #[pyo3(signature = (target_rows_per_fragment=None, materialize_deletions=None))]
     fn compact(
         &mut self,
@@ -348,10 +382,15 @@ impl Context {
     ) -> PyResult<PreparedRecord> {
         let role = required_item(dict, "role", index)?.extract::<String>()?;
         let content = required_item(dict, "content", index)?;
-        let data_type = optional_item(dict, "data_type")?.map(|value| value.extract::<String>());
-        let embedding = optional_item(dict, "embedding")?.map(|value| value.extract::<Vec<f32>>());
+        let data_type =
+            optional_item(dict, "data_type")?.map(|value| value.extract::<String>());
+        let embedding =
+            optional_item(dict, "embedding")?.map(|value| value.extract::<Vec<f32>>());
         let bot_id = optional_item(dict, "bot_id")?.map(|value| value.extract::<String>());
-        let session_id = optional_item(dict, "session_id")?.map(|value| value.extract::<String>());
+        let session_id =
+            optional_item(dict, "session_id")?.map(|value| value.extract::<String>());
+        let external_id =
+            optional_item(dict, "external_id")?.map(|value| value.extract::<String>());
 
         self.prepare_record(
             role,
@@ -360,6 +399,7 @@ impl Context {
             embedding.transpose()?,
             bot_id.transpose()?,
             session_id.transpose()?,
+            external_id.transpose()?,
             index as u64 + 1,
         )
     }
@@ -372,6 +412,7 @@ impl Context {
         embedding: Option<Vec<f32>>,
         bot_id: Option<String>,
         session_id: Option<String>,
+        external_id: Option<String>,
         offset: u64,
     ) -> PyResult<PreparedRecord> {
         let (content_type, text_payload, binary_payload, inner_content) =
@@ -401,6 +442,7 @@ impl Context {
         Ok(PreparedRecord {
             record: ContextRecord {
                 id: record_id,
+                external_id,
                 run_id: self.run_id.clone(),
                 bot_id,
                 session_id,
@@ -479,6 +521,7 @@ fn search_hit_to_py(py: Python<'_>, hit: SearchResult) -> PyResult<PyObject> {
 fn record_to_py(py: Python<'_>, record: ContextRecord) -> PyResult<PyObject> {
     let ContextRecord {
         id,
+        external_id,
         run_id,
         bot_id,
         session_id,
@@ -493,6 +536,7 @@ fn record_to_py(py: Python<'_>, record: ContextRecord) -> PyResult<PyObject> {
 
     let dict = PyDict::new(py);
     dict.set_item("id", id)?;
+    dict.set_item("external_id", external_id)?;
     dict.set_item("run_id", run_id)?;
     dict.set_item("bot_id", bot_id)?;
     dict.set_item("session_id", session_id)?;

@@ -116,6 +116,7 @@ def _normalize_record(raw: dict[str, Any]) -> dict[str, Any]:
         created_at = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
     return {
         "id": raw.get("id"),
+        "external_id": raw.get("external_id"),
         "run_id": raw.get("run_id"),
         "bot_id": raw.get("bot_id"),
         "session_id": raw.get("session_id"),
@@ -351,20 +352,29 @@ class Context:
         embedding: list[float] | None = None,
         bot_id: str | None = None,
         session_id: str | None = None,
+        external_id: str | None = None,
     ) -> None:
         if content_type is not None and data_type is not None:
             raise ValueError("Specify only one of content_type or data_type")
         if content_type is None:
             content_type = data_type
         payload, resolved_type = _normalize_content(content, content_type)
-        self._inner.add(role, payload, resolved_type, embedding, bot_id, session_id)
+        self._inner.add(
+            role,
+            payload,
+            resolved_type,
+            embedding,
+            bot_id,
+            session_id,
+            external_id,
+        )
 
     def add_many(self, records: Iterable[Mapping[str, Any]]) -> None:
         """Append multiple records in one storage operation.
 
         Each record accepts the same fields as :meth:`add`: ``role``,
         ``content``, optional ``content_type``/``data_type``, ``embedding``,
-        ``bot_id``, and ``session_id``.
+        ``bot_id``, ``session_id``, and ``external_id``.
         """
         normalized: list[dict[str, Any]] = []
         for index, record in enumerate(records):
@@ -393,6 +403,7 @@ class Context:
                     "embedding": record.get("embedding"),
                     "bot_id": record.get("bot_id"),
                     "session_id": record.get("session_id"),
+                    "external_id": record.get("external_id"),
                 }
             )
 
@@ -428,6 +439,17 @@ class Context:
         """
         results = self._inner.list(limit, offset)
         return [_normalize_record(item) for item in results]
+
+    def get(
+        self, *, id: str | None = None, external_id: str | None = None
+    ) -> dict[str, Any] | None:
+        """Return one entry by internal id or caller-supplied external id."""
+        if (id is None) == (external_id is None):
+            raise ValueError("Specify exactly one of id or external_id")
+        result = self._inner.get(id, external_id)
+        if result is None:
+            return None
+        return _normalize_record(result)
 
     def compact(
         self,

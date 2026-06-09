@@ -25,6 +25,7 @@ def test_add_many_appends_records_in_one_call(tmp_path: Path) -> None:
                 "content_type": "text/markdown",
                 "bot_id": "bot",
                 "session_id": "session",
+                "external_id": "doc-1#chunk-2",
             },
             {
                 "role": "tool",
@@ -41,6 +42,7 @@ def test_add_many_appends_records_in_one_call(tmp_path: Path) -> None:
     assert records[1]["content_type"] == "text/markdown"
     assert records[1]["bot_id"] == "bot"
     assert records[1]["session_id"] == "session"
+    assert records[1]["external_id"] == "doc-1#chunk-2"
     assert records[2]["binary"] == b"\x01\x02"
 
 
