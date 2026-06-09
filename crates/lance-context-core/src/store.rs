@@ -1564,7 +1564,12 @@ mod tests {
                 .unwrap();
             assert_eq!(all.len(), 3);
             let expired_roundtrip = all.iter().find(|record| record.id == expired.id).unwrap();
-            assert_eq!(expired_roundtrip.expires_at, expired.expires_at);
+            assert_eq!(
+                expired_roundtrip
+                    .expires_at
+                    .map(|value| value.timestamp_micros()),
+                expired.expires_at.map(|value| value.timestamp_micros())
+            );
             let superseded_roundtrip = all
                 .iter()
                 .find(|record| record.id == superseded.id)
