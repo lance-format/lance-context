@@ -218,7 +218,7 @@ impl Context {
         let mut prepared = Vec::new();
         for (index, item) in records.try_iter()?.enumerate() {
             let item = item?;
-            let dict = item.cast::<PyDict>().map_err(|_| {
+            let dict = item.downcast::<PyDict>().map_err(|_| {
                 PyTypeError::new_err(format!("records[{index}] must be a dict"))
             })?;
             prepared.push(self.prepare_record_from_dict(dict, index)?);
