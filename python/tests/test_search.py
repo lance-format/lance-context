@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import pytest
@@ -12,8 +12,8 @@ from lance_context.api import (
 
 class DummyInner:
     def __init__(self) -> None:
-        self.search_calls: list[tuple[list[float], int | None]] = []
-        self.list_calls: list[tuple[int | None, int | None]] = []
+        self.search_calls: list[tuple[list[float], int | None, bool, bool]] = []
+        self.list_calls: list[tuple[int | None, int | None, bool, bool]] = []
         self.get_calls: list[tuple[str | None, str | None]] = []
         self.add_calls: list[
             tuple[
@@ -26,6 +26,7 @@ class DummyInner:
                 str | None,
             ]
         ] = []
+        self.lifecycle_add_calls: list[dict[str, Any]] = []
         self.add_many_calls: list[list[dict[str, Any]]] = []
 
     def add(
@@ -37,9 +38,27 @@ class DummyInner:
         bot_id: str | None,
         session_id: str | None,
         external_id: str | None,
+        expires_at: str | None = None,
+        retention_policy: str | None = None,
+        lifecycle_status: str | None = None,
+        retired_at: str | None = None,
+        retired_reason: str | None = None,
+        supersedes_id: str | None = None,
+        superseded_by_id: str | None = None,
     ):
         self.add_calls.append(
             (role, content, data_type, embedding, bot_id, session_id, external_id)
+        )
+        self.lifecycle_add_calls.append(
+            {
+                "expires_at": expires_at,
+                "retention_policy": retention_policy,
+                "lifecycle_status": lifecycle_status,
+                "retired_at": retired_at,
+                "retired_reason": retired_reason,
+                "supersedes_id": supersedes_id,
+                "superseded_by_id": superseded_by_id,
+            }
         )
 
     def get(self, id: str | None, external_id: str | None):
@@ -51,8 +70,14 @@ class DummyInner:
     def add_many(self, records: list[dict[str, Any]]):
         self.add_many_calls.append(records)
 
-    def search(self, vector: list[float], limit: int | None):
-        self.search_calls.append((vector, limit))
+    def search(
+        self,
+        vector: list[float],
+        limit: int | None,
+        include_expired: bool = False,
+        include_retired: bool = False,
+    ):
+        self.search_calls.append((vector, limit, include_expired, include_retired))
         return [
             {
                 "id": "rec-1",
@@ -71,8 +96,14 @@ class DummyInner:
             }
         ]
 
-    def list(self, limit: int | None, offset: int | None):
-        self.list_calls.append((limit, offset))
+    def list(
+        self,
+        limit: int | None,
+        offset: int | None,
+        include_expired: bool = False,
+        include_retired: bool = False,
+    ):
+        self.list_calls.append((limit, offset, include_expired, include_retired))
         return [
             {
                 "id": "rec-1",
@@ -145,11 +176,21 @@ def test_context_search_formats_results():
 
     hits = ctx.search([0.5, 0.4], limit=3)
 
-    assert dummy.search_calls == [([0.5, 0.4], 3)]
+    assert dummy.search_calls == [([0.5, 0.4], 3, False, False)]
     assert hits[0]["id"] == "rec-1"
     assert hits[0]["text"] == "hello"
     assert hits[0]["binary"] is None
     assert isinstance(hits[0]["created_at"], datetime)
+
+
+def test_context_search_passes_lifecycle_flags():
+    ctx = Context.__new__(Context)
+    dummy = DummyInner()
+    ctx._inner = dummy  # type: ignore[attr-defined]
+
+    ctx.search([0.5, 0.4], include_expired=True, include_retired=True)
+
+    assert dummy.search_calls == [([0.5, 0.4], None, True, True)]
 
 
 def test_normalize_record_without_distance():
@@ -179,7 +220,7 @@ def test_context_list_returns_entries():
 
     entries = ctx.list(limit=10, offset=5)
 
-    assert dummy.list_calls == [(10, 5)]
+    assert dummy.list_calls == [(10, 5, False, False)]
     assert len(entries) == 2
     assert entries[0]["id"] == "rec-1"
     assert entries[0]["text"] == "hello"
@@ -188,6 +229,16 @@ def test_context_list_returns_entries():
     assert entries[1]["id"] == "rec-2"
     assert entries[1]["text"] == "world"
     assert isinstance(entries[0]["created_at"], datetime)
+
+
+def test_context_list_passes_lifecycle_flags():
+    ctx = Context.__new__(Context)
+    dummy = DummyInner()
+    ctx._inner = dummy  # type: ignore[attr-defined]
+
+    ctx.list(include_expired=True, include_retired=True)
+
+    assert dummy.list_calls == [(None, None, True, True)]
 
 
 def test_context_get_by_external_id():
@@ -241,7 +292,7 @@ def test_context_list_default_args():
 
     ctx.list()
 
-    assert dummy.list_calls == [(None, None)]
+    assert dummy.list_calls == [(None, None, False, False)]
 
 
 def test_context_add_with_embedding():
@@ -376,6 +427,46 @@ def test_context_add_with_all_options():
     assert external_id == "doc-1#chunk-1"
 
 
+def test_context_add_with_lifecycle_fields():
+    ctx = Context.__new__(Context)
+    dummy = DummyInner()
+    ctx._inner = dummy  # type: ignore[attr-defined]
+
+    expires_at = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    ctx.add(
+        "assistant",
+        "temporary session note",
+        expires_at=expires_at,
+        retention_policy="session",
+        lifecycle_status="active",
+        retired_at="2026-08-01T00:00:00Z",
+        retired_reason="policy-revoked",
+        supersedes_id="old-id",
+        superseded_by_id="new-id",
+    )
+
+    assert dummy.lifecycle_add_calls == [
+        {
+            "expires_at": "2026-07-01T00:00:00Z",
+            "retention_policy": "session",
+            "lifecycle_status": "active",
+            "retired_at": "2026-08-01T00:00:00Z",
+            "retired_reason": "policy-revoked",
+            "supersedes_id": "old-id",
+            "superseded_by_id": "new-id",
+        }
+    ]
+
+
+def test_context_add_rejects_naive_lifecycle_datetime():
+    ctx = Context.__new__(Context)
+    dummy = DummyInner()
+    ctx._inner = dummy  # type: ignore[attr-defined]
+
+    with pytest.raises(ValueError, match="timezone"):
+        ctx.add("user", "hello", expires_at=datetime(2026, 7, 1))
+
+
 def test_context_add_many_normalizes_records():
     ctx = Context.__new__(Context)
     dummy = DummyInner()
@@ -406,6 +497,13 @@ def test_context_add_many_normalizes_records():
                 "bot_id": None,
                 "session_id": None,
                 "external_id": None,
+                "expires_at": None,
+                "retention_policy": None,
+                "lifecycle_status": None,
+                "retired_at": None,
+                "retired_reason": None,
+                "supersedes_id": None,
+                "superseded_by_id": None,
             },
             {
                 "role": "assistant",
@@ -415,6 +513,13 @@ def test_context_add_many_normalizes_records():
                 "bot_id": "bot",
                 "session_id": "sess",
                 "external_id": "doc-1#chunk-2",
+                "expires_at": None,
+                "retention_policy": None,
+                "lifecycle_status": None,
+                "retired_at": None,
+                "retired_reason": None,
+                "supersedes_id": None,
+                "superseded_by_id": None,
             },
         ]
     ]
@@ -428,6 +533,33 @@ def test_context_add_many_accepts_data_type_alias():
     ctx.add_many([{"role": "system", "content": "prompt", "data_type": "text/plain"}])
 
     assert dummy.add_many_calls[0][0]["data_type"] == "text/plain"
+
+
+def test_context_add_many_passes_lifecycle_fields():
+    ctx = Context.__new__(Context)
+    dummy = DummyInner()
+    ctx._inner = dummy  # type: ignore[attr-defined]
+
+    ctx.add_many(
+        [
+            {
+                "role": "assistant",
+                "content": "temporary",
+                "expires_at": datetime(2026, 7, 1, tzinfo=timezone.utc),
+                "retention_policy": "session",
+                "lifecycle_status": "superseded",
+                "retired_reason": "replaced",
+                "superseded_by_id": "new-id",
+            }
+        ]
+    )
+
+    record = dummy.add_many_calls[0][0]
+    assert record["expires_at"] == "2026-07-01T00:00:00Z"
+    assert record["retention_policy"] == "session"
+    assert record["lifecycle_status"] == "superseded"
+    assert record["retired_reason"] == "replaced"
+    assert record["superseded_by_id"] == "new-id"
 
 
 def test_context_add_many_rejects_invalid_records():
@@ -474,3 +606,35 @@ def test_normalize_record_with_agent_and_session_id():
     assert result["bot_id"] == "support_bot"
     assert result["session_id"] == "user_88"
     assert result["external_id"] == "source-1"
+
+
+def test_normalize_record_with_lifecycle_fields():
+    result = _normalize_record(
+        {
+            "id": "rec-1",
+            "external_id": "source-1",
+            "created_at": "2024-01-01T00:00:00Z",
+            "content_type": "text/plain",
+            "text_payload": "hello",
+            "binary_payload": None,
+            "embedding": None,
+            "run_id": "run-1",
+            "role": "user",
+            "state_metadata": None,
+            "expires_at": "2026-07-01T00:00:00Z",
+            "retention_policy": "session",
+            "lifecycle_status": "superseded",
+            "retired_at": "2026-07-02T00:00:00Z",
+            "retired_reason": "replaced",
+            "supersedes_id": "old-id",
+            "superseded_by_id": "new-id",
+        }
+    )
+
+    assert isinstance(result["expires_at"], datetime)
+    assert result["retention_policy"] == "session"
+    assert result["lifecycle_status"] == "superseded"
+    assert isinstance(result["retired_at"], datetime)
+    assert result["retired_reason"] == "replaced"
+    assert result["supersedes_id"] == "old-id"
+    assert result["superseded_by_id"] == "new-id"

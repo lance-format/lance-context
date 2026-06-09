@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyType};
@@ -11,7 +11,8 @@ use tokio::runtime::Runtime;
 use lance_context::serde::CONTENT_TYPE_TEXT;
 use lance_context::{
     CompactionConfig, CompactionMetrics, CompactionStats, Context as RustContext, ContextRecord,
-    ContextStore, ContextStoreOptions, IdIndexType, SearchResult,
+    ContextStore, ContextStoreOptions, IdIndexType, LifecycleQueryOptions, SearchResult,
+    LIFECYCLE_ACTIVE,
 };
 
 const DEFAULT_BINARY_CONTENT_TYPE: &str = "application/octet-stream";
@@ -22,6 +23,27 @@ struct PreparedRecord {
     role: String,
     inner_content: String,
     data_type: Option<String>,
+}
+
+struct RecordOptions {
+    data_type: Option<String>,
+    embedding: Option<Vec<f32>>,
+    bot_id: Option<String>,
+    session_id: Option<String>,
+    external_id: Option<String>,
+    lifecycle: LifecycleFields,
+    offset: u64,
+}
+
+#[derive(Default)]
+struct LifecycleFields {
+    expires_at: Option<DateTime<Utc>>,
+    retention_policy: Option<String>,
+    lifecycle_status: Option<String>,
+    retired_at: Option<DateTime<Utc>>,
+    retired_reason: Option<String>,
+    supersedes_id: Option<String>,
+    superseded_by_id: Option<String>,
 }
 
 #[pyfunction]
@@ -179,7 +201,7 @@ impl Context {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (role, content, data_type = None, embedding = None, bot_id = None, session_id = None, external_id = None))]
+    #[pyo3(signature = (role, content, data_type = None, embedding = None, bot_id = None, session_id = None, external_id = None, expires_at = None, retention_policy = None, lifecycle_status = None, retired_at = None, retired_reason = None, supersedes_id = None, superseded_by_id = None))]
     fn add(
         &mut self,
         py: Python<'_>,
@@ -190,16 +212,35 @@ impl Context {
         bot_id: Option<String>,
         session_id: Option<String>,
         external_id: Option<String>,
+        expires_at: Option<String>,
+        retention_policy: Option<String>,
+        lifecycle_status: Option<String>,
+        retired_at: Option<String>,
+        retired_reason: Option<String>,
+        supersedes_id: Option<String>,
+        superseded_by_id: Option<String>,
     ) -> PyResult<()> {
+        let lifecycle = LifecycleFields {
+            expires_at: parse_optional_datetime(expires_at, "expires_at")?,
+            retention_policy,
+            lifecycle_status,
+            retired_at: parse_optional_datetime(retired_at, "retired_at")?,
+            retired_reason,
+            supersedes_id,
+            superseded_by_id,
+        };
         let prepared = self.prepare_record(
             role.to_string(),
             content,
-            data_type.map(str::to_string),
-            embedding,
-            bot_id,
-            session_id,
-            external_id,
-            1,
+            RecordOptions {
+                data_type: data_type.map(str::to_string),
+                embedding,
+                bot_id,
+                session_id,
+                external_id,
+                lifecycle,
+                offset: 1,
+            },
         )?;
 
         let add_res = py.allow_threads(|| {
@@ -220,9 +261,9 @@ impl Context {
         let mut prepared = Vec::new();
         for (index, item) in records.try_iter()?.enumerate() {
             let item = item?;
-            let dict = item.downcast::<PyDict>().map_err(|_| {
-                PyTypeError::new_err(format!("records[{index}] must be a dict"))
-            })?;
+            let dict = item
+                .downcast::<PyDict>()
+                .map_err(|_| PyTypeError::new_err(format!("records[{index}] must be a dict")))?;
             prepared.push(self.prepare_record_from_dict(dict, index)?);
         }
 
@@ -232,8 +273,7 @@ impl Context {
 
         let context_records: Vec<ContextRecord> =
             prepared.iter().map(|item| item.record.clone()).collect();
-        let add_res =
-            py.allow_threads(|| self.runtime.block_on(self.store.add(&context_records)));
+        let add_res = py.allow_threads(|| self.runtime.block_on(self.store.add(&context_records)));
         add_res.map_err(to_py_err)?;
 
         for item in prepared {
@@ -264,31 +304,40 @@ impl Context {
         Ok(())
     }
 
-    #[pyo3(signature = (query, limit = None))]
+    #[pyo3(signature = (query, limit = None, include_expired = false, include_retired = false))]
     fn search(
         &self,
         py: Python<'_>,
         query: Vec<f32>,
         limit: Option<usize>,
+        include_expired: bool,
+        include_retired: bool,
     ) -> PyResult<Vec<PyObject>> {
-        let hits_res = py.allow_threads(|| self.runtime.block_on(self.store.search(&query, limit)));
+        let options = LifecycleQueryOptions::new(include_expired, include_retired);
+        let hits_res = py.allow_threads(|| {
+            self.runtime
+                .block_on(self.store.search_with_options(&query, limit, options))
+        });
         let hits = hits_res.map_err(to_py_err)?;
         hits.into_iter()
             .map(|hit| search_hit_to_py(py, hit))
             .collect()
     }
 
-    #[pyo3(signature = (limit = None, offset = None))]
+    #[pyo3(signature = (limit = None, offset = None, include_expired = false, include_retired = false))]
     fn list(
         &self,
         py: Python<'_>,
         limit: Option<usize>,
         offset: Option<usize>,
+        include_expired: bool,
+        include_retired: bool,
     ) -> PyResult<Vec<PyObject>> {
+        let options = LifecycleQueryOptions::new(include_expired, include_retired);
         // Release GIL during data retrieval
         let records = py.allow_threads(|| {
             self.runtime
-                .block_on(self.store.list(limit, offset))
+                .block_on(self.store.list_with_options(limit, offset, options))
                 .map_err(to_py_err)
         })?;
 
@@ -382,25 +431,47 @@ impl Context {
     ) -> PyResult<PreparedRecord> {
         let role = required_item(dict, "role", index)?.extract::<String>()?;
         let content = required_item(dict, "content", index)?;
-        let data_type =
-            optional_item(dict, "data_type")?.map(|value| value.extract::<String>());
-        let embedding =
-            optional_item(dict, "embedding")?.map(|value| value.extract::<Vec<f32>>());
+        let data_type = optional_item(dict, "data_type")?.map(|value| value.extract::<String>());
+        let embedding = optional_item(dict, "embedding")?.map(|value| value.extract::<Vec<f32>>());
         let bot_id = optional_item(dict, "bot_id")?.map(|value| value.extract::<String>());
-        let session_id =
-            optional_item(dict, "session_id")?.map(|value| value.extract::<String>());
+        let session_id = optional_item(dict, "session_id")?.map(|value| value.extract::<String>());
         let external_id =
             optional_item(dict, "external_id")?.map(|value| value.extract::<String>());
+        let expires_at = optional_item(dict, "expires_at")?.map(|value| value.extract::<String>());
+        let retention_policy =
+            optional_item(dict, "retention_policy")?.map(|value| value.extract::<String>());
+        let lifecycle_status =
+            optional_item(dict, "lifecycle_status")?.map(|value| value.extract::<String>());
+        let retired_at = optional_item(dict, "retired_at")?.map(|value| value.extract::<String>());
+        let retired_reason =
+            optional_item(dict, "retired_reason")?.map(|value| value.extract::<String>());
+        let supersedes_id =
+            optional_item(dict, "supersedes_id")?.map(|value| value.extract::<String>());
+        let superseded_by_id =
+            optional_item(dict, "superseded_by_id")?.map(|value| value.extract::<String>());
+
+        let lifecycle = LifecycleFields {
+            expires_at: parse_optional_datetime(expires_at.transpose()?, "expires_at")?,
+            retention_policy: retention_policy.transpose()?,
+            lifecycle_status: lifecycle_status.transpose()?,
+            retired_at: parse_optional_datetime(retired_at.transpose()?, "retired_at")?,
+            retired_reason: retired_reason.transpose()?,
+            supersedes_id: supersedes_id.transpose()?,
+            superseded_by_id: superseded_by_id.transpose()?,
+        };
 
         self.prepare_record(
             role,
             &content,
-            data_type.transpose()?,
-            embedding.transpose()?,
-            bot_id.transpose()?,
-            session_id.transpose()?,
-            external_id.transpose()?,
-            index as u64 + 1,
+            RecordOptions {
+                data_type: data_type.transpose()?,
+                embedding: embedding.transpose()?,
+                bot_id: bot_id.transpose()?,
+                session_id: session_id.transpose()?,
+                external_id: external_id.transpose()?,
+                lifecycle,
+                offset: index as u64 + 1,
+            },
         )
     }
 
@@ -408,17 +479,13 @@ impl Context {
         &self,
         role: String,
         content: &Bound<'_, PyAny>,
-        data_type: Option<String>,
-        embedding: Option<Vec<f32>>,
-        bot_id: Option<String>,
-        session_id: Option<String>,
-        external_id: Option<String>,
-        offset: u64,
+        options: RecordOptions,
     ) -> PyResult<PreparedRecord> {
         let (content_type, text_payload, binary_payload, inner_content) =
             match content.extract::<&[u8]>() {
                 Ok(bytes) => (
-                    data_type
+                    options
+                        .data_type
                         .clone()
                         .unwrap_or_else(|| DEFAULT_BINARY_CONTENT_TYPE.to_string()),
                     None,
@@ -428,7 +495,8 @@ impl Context {
                 Err(_) => {
                     let content_str = content.str()?.to_string();
                     (
-                        data_type
+                        options
+                            .data_type
                             .clone()
                             .unwrap_or_else(|| CONTENT_TYPE_TEXT.to_string()),
                         Some(content_str.clone()),
@@ -438,25 +506,35 @@ impl Context {
                 }
             };
 
-        let record_id = format!("{}-{}", self.run_id, self.inner.entries() + offset);
+        let record_id = format!("{}-{}", self.run_id, self.inner.entries() + options.offset);
         Ok(PreparedRecord {
             record: ContextRecord {
                 id: record_id,
-                external_id,
+                external_id: options.external_id,
                 run_id: self.run_id.clone(),
-                bot_id,
-                session_id,
+                bot_id: options.bot_id,
+                session_id: options.session_id,
                 created_at: Utc::now(),
                 role: role.clone(),
                 state_metadata: None,
+                expires_at: options.lifecycle.expires_at,
+                retention_policy: options.lifecycle.retention_policy,
+                lifecycle_status: options
+                    .lifecycle
+                    .lifecycle_status
+                    .unwrap_or_else(|| LIFECYCLE_ACTIVE.to_string()),
+                retired_at: options.lifecycle.retired_at,
+                retired_reason: options.lifecycle.retired_reason,
+                supersedes_id: options.lifecycle.supersedes_id,
+                superseded_by_id: options.lifecycle.superseded_by_id,
                 content_type,
                 text_payload,
                 binary_payload,
-                embedding,
+                embedding: options.embedding,
             },
             role,
             inner_content,
-            data_type,
+            data_type: options.data_type,
         })
     }
 }
@@ -471,11 +549,25 @@ fn required_item<'py>(
     })
 }
 
-fn optional_item<'py>(
-    dict: &Bound<'py, PyDict>,
-    key: &str,
-) -> PyResult<Option<Bound<'py, PyAny>>> {
+fn optional_item<'py>(dict: &Bound<'py, PyDict>, key: &str) -> PyResult<Option<Bound<'py, PyAny>>> {
     Ok(dict.get_item(key)?.filter(|value| !value.is_none()))
+}
+
+fn parse_optional_datetime(
+    value: Option<String>,
+    field_name: &str,
+) -> PyResult<Option<DateTime<Utc>>> {
+    value
+        .map(|value| {
+            DateTime::parse_from_rfc3339(&value)
+                .map(|dt| dt.with_timezone(&Utc))
+                .map_err(|err| {
+                    PyTypeError::new_err(format!(
+                        "{field_name} must be an RFC3339 timestamp: {err}"
+                    ))
+                })
+        })
+        .transpose()
 }
 
 fn compaction_metrics_to_py(py: Python<'_>, metrics: CompactionMetrics) -> PyResult<PyObject> {
@@ -528,6 +620,13 @@ fn record_to_py(py: Python<'_>, record: ContextRecord) -> PyResult<PyObject> {
         created_at,
         role,
         state_metadata,
+        expires_at,
+        retention_policy,
+        lifecycle_status,
+        retired_at,
+        retired_reason,
+        supersedes_id,
+        superseded_by_id,
         content_type,
         text_payload,
         binary_payload,
@@ -558,6 +657,19 @@ fn record_to_py(py: Python<'_>, record: ContextRecord) -> PyResult<PyObject> {
         None => py.None().into_pyobject(py)?.unbind(),
     };
     dict.set_item("state_metadata", state_obj)?;
+    dict.set_item(
+        "expires_at",
+        expires_at.map(|dt| dt.to_rfc3339_opts(SecondsFormat::Micros, true)),
+    )?;
+    dict.set_item("retention_policy", retention_policy)?;
+    dict.set_item("lifecycle_status", lifecycle_status)?;
+    dict.set_item(
+        "retired_at",
+        retired_at.map(|dt| dt.to_rfc3339_opts(SecondsFormat::Micros, true)),
+    )?;
+    dict.set_item("retired_reason", retired_reason)?;
+    dict.set_item("supersedes_id", supersedes_id)?;
+    dict.set_item("superseded_by_id", superseded_by_id)?;
     dict.set_item("content_type", content_type)?;
     dict.set_item("text_payload", text_payload)?;
     match binary_payload {

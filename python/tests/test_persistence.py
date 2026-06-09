@@ -5,9 +5,10 @@ import subprocess
 import sys
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -19,9 +20,18 @@ from lance_context.api import Context  # noqa: E402
 
 lance = pytest.importorskip("lance")
 
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
 _S3_ACCESS_KEY = "test"
 _S3_SECRET_KEY = "test"
 _S3_REGION = "us-east-1"
+
+
+def _embedding(pivot: float) -> list[float]:
+    values = [0.0] * 1536
+    values[0] = pivot
+    return values
 
 
 def _free_port() -> int:
@@ -55,7 +65,7 @@ def _wait_for_moto_ready(client: Any, timeout: float = 5.0) -> None:
 
 
 @pytest.fixture(scope="module")
-def moto_endpoint() -> str:
+def moto_endpoint() -> Iterator[str]:
     pytest.importorskip("moto.server")
     boto3 = pytest.importorskip("boto3")
     from botocore.config import Config  # type: ignore[import-not-found]
@@ -154,6 +164,79 @@ def test_text_round_trip(tmp_path: Path) -> None:
     assert record["text_payload"] == "hello world"
     assert record["binary_payload"] is None
     assert record["content_type"] == "text/plain"
+
+
+def test_lifecycle_fields_round_trip_and_default_filtering(tmp_path: Path) -> None:
+    uri = tmp_path / "context.lance"
+    ctx = Context.create(str(uri))
+    now = datetime.now(timezone.utc)
+
+    ctx.add(
+        "user",
+        "active memory",
+        expires_at=now + timedelta(days=1),
+        retention_policy="long-term",
+    )
+    ctx.add("assistant", "expired trace", expires_at=now - timedelta(days=1))
+    ctx.add(
+        "system",
+        "superseded fact",
+        lifecycle_status="superseded",
+        retired_at=now,
+        retired_reason="replaced by newer fact",
+        superseded_by_id="active-id",
+    )
+    ctx.add(
+        "system",
+        "failed approach",
+        lifecycle_status="contradicted",
+        retired_reason="negative knowledge",
+    )
+
+    visible = ctx.list()
+    assert [record["text"] for record in visible] == [
+        "active memory",
+        "failed approach",
+    ]
+    assert visible[0]["retention_policy"] == "long-term"
+    assert visible[0]["lifecycle_status"] == "active"
+
+    all_records = ctx.list(include_expired=True, include_retired=True)
+    assert [record["text"] for record in all_records] == [
+        "active memory",
+        "expired trace",
+        "superseded fact",
+        "failed approach",
+    ]
+
+    expired = all_records[1]
+    assert expired["expires_at"] is not None
+    assert expired["expires_at"] < datetime.now(timezone.utc)
+
+    superseded = all_records[2]
+    assert superseded["lifecycle_status"] == "superseded"
+    assert superseded["retired_reason"] == "replaced by newer fact"
+    assert superseded["superseded_by_id"] == "active-id"
+
+
+def test_search_applies_lifecycle_filter_before_limit(tmp_path: Path) -> None:
+    uri = tmp_path / "context.lance"
+    ctx = Context.create(str(uri))
+    now = datetime.now(timezone.utc)
+
+    ctx.add("user", "active memory", embedding=_embedding(1.0))
+    ctx.add(
+        "assistant",
+        "expired but closer",
+        embedding=_embedding(0.0),
+        expires_at=now - timedelta(minutes=1),
+    )
+
+    hits = ctx.search(_embedding(0.0), limit=1)
+    assert [hit["text"] for hit in hits] == ["active memory"]
+
+    hits_with_expired = ctx.search(_embedding(0.0), limit=1, include_expired=True)
+    assert [hit["text"] for hit in hits_with_expired] == ["expired but closer"]
 
 
 def test_image_round_trip(tmp_path: Path) -> None:

@@ -11,12 +11,14 @@ Key motivations inspired by the broader Lance roadmap<sup>[1](https://github.com
 - **Multimodal first** – store text, images, and structured data together, keeping the original bytes plus typed metadata.
 - **Version aware** – each append creates an immutable snapshot, enabling time-travel, branching, and auditability for long-running agents.
 - **Searchable semantics** – embeddings are managed alongside content so you can run Lance vector search without leaving the dataset.
+- **Lifecycle aware** – records can carry TTL, retention, retirement, and supersession metadata, with expired/retired rows hidden from default recall.
 - **Columnar performance** – backed by the Lance file format, giving fast analytics, compaction, and cloud-friendly storage.
 
 ## Features
 
 - Unified schema for agent messages (`ContextRecord`) with optional embeddings and metadata.
 - Automatic versioning via Lance manifests with `checkout(version)` support.
+- Query-time lifecycle filtering for expired, retired, superseded, and revoked memories.
 - Background compaction to optimize storage and read performance.
 - Remote persistence on any `object_store` backend (S3, GCS, Azure Blob, ...)
   via the generic `storage_options` dict, aligned with `lance` and `lance-graph`.
@@ -82,6 +84,26 @@ ctx.add_many([
         "session_id": "runbook-import",
     },
 ])
+
+# Lifecycle metadata is stored in first-class columns. Expired and retired rows
+# are excluded from default list/search calls, while contradicted records stay
+# visible so negative knowledge can remain a guardrail for future recall.
+ctx.add(
+    "assistant",
+    "temporary session note",
+    expires_at="2026-07-01T00:00:00Z",
+    retention_policy="session",
+)
+ctx.add(
+    "system",
+    "older fact kept as history",
+    lifecycle_status="superseded",
+    retired_reason="replaced by newer fact",
+    superseded_by_id="new-record-id",
+)
+
+visible = ctx.list()
+with_lifecycle_history = ctx.list(include_expired=True, include_retired=True)
 
 # Time-travel to prior state
 first_version = ctx.version()
@@ -161,6 +183,8 @@ let record = ContextRecord {
     id: "run-1-1".into(),
     external_id: None,
     run_id: "run-1".into(),
+    bot_id: None,
+    session_id: None,
     created_at: Utc::now(),
     role: "user".into(),
     state_metadata: Some(StateMetadata {
@@ -169,6 +193,13 @@ let record = ContextRecord {
         tokens_used: None,
         custom: None,
     }),
+    expires_at: None,
+    retention_policy: None,
+    lifecycle_status: "active".into(),
+    retired_at: None,
+    retired_reason: None,
+    supersedes_id: None,
+    superseded_by_id: None,
     content_type: "text/plain".into(),
     text_payload: Some("hello world".into()),
     binary_payload: None,
