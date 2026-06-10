@@ -5,7 +5,6 @@ dependencies = [
     "pylance==7.0.0",
     "lancedb==0.27.1",
     "lance-namespace==0.7.7",
-    "lance-graph==0.5.4",
 ]
 description = "Multimodal, versioned context storage for agentic workflows"
 authors = [{ name = "Lance Devs", email = "dev@lancedb.com" }]
@@ -41,6 +40,7 @@ requires = ["maturin>=1.4"]
 build-backend = "maturin"
 
 [project.optional-dependencies]
+graph = ["lance-graph==0.5.4"]
 # `moto[server]` pulls in flask + flask-cors so moto.server can be launched
 # as a subprocess for the S3 integration tests.
 tests = ["pytest", "pytest-asyncio", "ruff", "moto[s3,server]", "boto3", "botocore"]

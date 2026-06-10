@@ -34,13 +34,32 @@ python/tests/              # High-level integration tests
 
 ## Getting started
 
-Install the Python package (wheel publishing coming soon):
+Install the core Python package:
 
 ```bash
 pip install lance-context
 ```
 
+The default install supports context records, metadata, persistence, and
+retrieval without installing the Python `lance-graph` package. Graph/Cypher
+integrations can opt in explicitly:
+
+```bash
+pip install "lance-context[graph]"
+```
+
 Then follow the usage examples below to create a `Context`, append entries, and time-travel through versions.
+
+### Python wheels
+
+Release builds publish source distributions plus prebuilt wheels for:
+
+- `manylinux_2_28_x86_64`
+- `manylinux_2_28_aarch64`
+- `macosx_11_0_arm64`
+
+Other platforms can still install from the source distribution when a Rust
+toolchain, maturin, and protobuf compiler are available.
 
 ## Usage
 

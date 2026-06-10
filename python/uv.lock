@@ -1058,10 +1058,9 @@ wheels = [
 
 [[package]]
 name = "lance-context"
-version = "0.2.4"
+version = "0.3.0"
 source = { editable = "." }
 dependencies = [
-    { name = "lance-graph" },
     { name = "lance-namespace" },
     { name = "lancedb" },
     { name = "pylance" },
@@ -1071,6 +1070,9 @@ dependencies = [
 dev = [
     { name = "pyright" },
     { name = "ruff" },
+]
+graph = [
+    { name = "lance-graph" },
 ]
 tests = [
     { name = "boto3" },
@@ -1085,7 +1087,7 @@ tests = [
 requires-dist = [
     { name = "boto3", marker = "extra == 'tests'" },
     { name = "botocore", marker = "extra == 'tests'" },
-    { name = "lance-graph", specifier = "==0.5.4" },
+    { name = "lance-graph", marker = "extra == 'graph'", specifier = "==0.5.4" },
     { name = "lance-namespace", specifier = "==0.7.7" },
     { name = "lancedb", specifier = "==0.27.1" },
     { name = "moto", extras = ["s3", "server"], marker = "extra == 'tests'" },
@@ -1096,7 +1098,7 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'" },
     { name = "ruff", marker = "extra == 'tests'" },
 ]
-provides-extras = ["tests", "dev"]
+provides-extras = ["graph", "tests", "dev"]
 
 [[package]]
 name = "lance-graph"
