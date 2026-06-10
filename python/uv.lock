@@ -1058,12 +1058,10 @@ wheels = [
 
 [[package]]
 name = "lance-context"
-version = "0.3.1"
+version = "0.3.2"
 source = { editable = "." }
 dependencies = [
-    { name = "lance-namespace" },
-    { name = "lancedb" },
-    { name = "pylance" },
+    { name = "pyarrow" },
 ]
 
 [package.optional-dependencies]
@@ -1074,10 +1072,18 @@ dev = [
 graph = [
     { name = "lance-graph" },
 ]
+lance-python = [
+    { name = "lance-namespace" },
+    { name = "lancedb" },
+    { name = "pylance" },
+]
 tests = [
     { name = "boto3" },
     { name = "botocore" },
+    { name = "lance-namespace" },
+    { name = "lancedb" },
     { name = "moto", extra = ["s3", "server"] },
+    { name = "pylance" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "ruff" },
@@ -1088,17 +1094,21 @@ requires-dist = [
     { name = "boto3", marker = "extra == 'tests'" },
     { name = "botocore", marker = "extra == 'tests'" },
     { name = "lance-graph", marker = "extra == 'graph'", specifier = "==0.5.4" },
-    { name = "lance-namespace", specifier = "==0.7.7" },
-    { name = "lancedb", specifier = "==0.27.1" },
+    { name = "lance-namespace", marker = "extra == 'lance-python'", specifier = ">=0.7.7,<0.8" },
+    { name = "lance-namespace", marker = "extra == 'tests'", specifier = ">=0.7.7,<0.8" },
+    { name = "lancedb", marker = "extra == 'lance-python'", specifier = "==0.27.1" },
+    { name = "lancedb", marker = "extra == 'tests'", specifier = "==0.27.1" },
     { name = "moto", extras = ["s3", "server"], marker = "extra == 'tests'" },
-    { name = "pylance", specifier = "==7.0.0" },
+    { name = "pyarrow", specifier = ">=14" },
+    { name = "pylance", marker = "extra == 'lance-python'", specifier = ">=7.0.0,<8" },
+    { name = "pylance", marker = "extra == 'tests'", specifier = ">=7.0.0,<8" },
     { name = "pyright", marker = "extra == 'dev'" },
     { name = "pytest", marker = "extra == 'tests'" },
     { name = "pytest-asyncio", marker = "extra == 'tests'" },
     { name = "ruff", marker = "extra == 'dev'" },
     { name = "ruff", marker = "extra == 'tests'" },
 ]
-provides-extras = ["graph", "tests", "dev"]
+provides-extras = ["graph", "lance-python", "tests", "dev"]
 
 [[package]]
 name = "lance-graph"

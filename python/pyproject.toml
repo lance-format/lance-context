@@ -2,9 +2,7 @@
 name = "lance-context"
 version = "0.3.2"
 dependencies = [
-    "pylance==7.0.0",
-    "lancedb==0.27.1",
-    "lance-namespace==0.7.7",
+    "pyarrow>=14",
 ]
 description = "Multimodal, versioned context storage for agentic workflows"
 authors = [{ name = "Lance Devs", email = "dev@lancedb.com" }]
@@ -41,9 +39,24 @@ build-backend = "maturin"
 
 [project.optional-dependencies]
 graph = ["lance-graph==0.5.4"]
+lance-python = [
+    "pylance>=7.0.0,<8",
+    "lance-namespace>=0.7.7,<0.8",
+    "lancedb==0.27.1",
+]
 # `moto[server]` pulls in flask + flask-cors so moto.server can be launched
 # as a subprocess for the S3 integration tests.
-tests = ["pytest", "pytest-asyncio", "ruff", "moto[s3,server]", "boto3", "botocore"]
+tests = [
+    "pytest",
+    "pytest-asyncio",
+    "ruff",
+    "moto[s3,server]",
+    "boto3",
+    "botocore",
+    "pylance>=7.0.0,<8",
+    "lance-namespace>=0.7.7,<0.8",
+    "lancedb==0.27.1",
+]
 dev = ["ruff", "pyright"]
 
 [tool.ruff]

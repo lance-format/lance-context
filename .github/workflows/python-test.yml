@@ -150,7 +150,8 @@ jobs:
         working-directory: python
         run: |
           source .venv/bin/activate
-          uv pip install dist/*.whl
+          WHEEL=$(ls dist/*.whl)
+          uv pip install "${WHEEL}[lance-python]"
 
       - name: Run tests
         working-directory: python

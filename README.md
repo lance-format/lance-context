@@ -48,6 +48,13 @@ integrations can opt in explicitly:
 pip install "lance-context[graph]"
 ```
 
+If you need direct Python-side Lance/LanceDB inspection of the datasets written
+by `lance-context`, install the Lance Python packages extra:
+
+```bash
+pip install "lance-context[lance-python]"
+```
+
 Then follow the usage examples below to create a `Context`, append entries, and time-travel through versions.
 
 ### Python wheels
