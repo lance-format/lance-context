@@ -71,7 +71,12 @@ jobs:
           target: ${{ matrix.target }}
           rust-toolchain: stable
           before-script-linux: |
-            yum install -y curl openssl-devel
+            if command -v yum >/dev/null 2>&1; then
+              yum install -y curl openssl-devel
+            elif command -v apt-get >/dev/null 2>&1; then
+              apt-get update
+              apt-get install -y curl libssl-dev ca-certificates
+            fi
             PROTOC_VERSION=25.6
             curl -LsS -o /tmp/protoc.zip "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
             python3 - <<'PY'
