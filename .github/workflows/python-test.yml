@@ -24,44 +24,21 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v4
+      - name: Build manylinux wheel (Debug Mode)
+        uses: PyO3/maturin-action@v1
         with:
-          python-version: "3.11"
-      - name: Setup Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          cache: false
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: "lance-context-deps"
-          workspaces: |
-            crates/lance-context-core
-            python
-      - name: Install dependencies
+          command: build
+          args: --out dist
+          working-directory: python
+          manylinux: "2_28"
+          target: x86_64
+          rust-toolchain: stable
+          sccache: "true"
+          before-script-linux: |
+            yum install -y openssl-devel protobuf-compiler
+      - name: Verify manylinux wheel tag
         run: |
-          sudo apt update
-          sudo apt install -y protobuf-compiler
-      - name: Install uv
-        uses: astral-sh/setup-uv@v3
-      - name: Setup sccache
-        uses: Mozilla-Actions/sccache-action@v0.0.9
-      - name: Configure sccache
-        run: echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
-      - name: Cache uv downloads
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/uv
-          key: ${{ runner.os }}-uv-${{ hashFiles('python/pyproject.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-uv-
-      - name: Build wheel (Debug Mode)
-        working-directory: python
-        run: |
-          uv venv
-          source .venv/bin/activate
-          uv pip install maturin[patchelf]
-          maturin build -o dist
+          ls python/dist/*manylinux_2_28_x86_64.whl
       - name: Upload wheel
         uses: actions/upload-artifact@v4
         with:
