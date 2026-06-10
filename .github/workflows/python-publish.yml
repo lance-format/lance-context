@@ -74,8 +74,19 @@ jobs:
             if command -v yum >/dev/null 2>&1; then
               yum install -y curl openssl-devel
             elif command -v apt-get >/dev/null 2>&1; then
-              apt-get update
-              apt-get install -y curl libssl-dev ca-certificates
+              if [ "${{ matrix.target }}" = "aarch64" ]; then
+                dpkg --add-architecture arm64
+                apt-get update
+                apt-get install -y curl ca-certificates libssl-dev:arm64
+                mkdir -p /usr/aarch64-unknown-linux-gnu/include
+                cp -a /usr/include/openssl /usr/aarch64-unknown-linux-gnu/include/
+                if [ -d /usr/include/aarch64-linux-gnu/openssl ]; then
+                  cp -a /usr/include/aarch64-linux-gnu/openssl/. /usr/aarch64-unknown-linux-gnu/include/openssl/
+                fi
+              else
+                apt-get update
+                apt-get install -y curl libssl-dev ca-certificates
+              fi
             fi
             PROTOC_VERSION=25.6
             curl -LsS -o /tmp/protoc.zip "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
