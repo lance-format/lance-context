@@ -11,8 +11,8 @@ use pyo3::IntoPyObject;
 use serde_json::Value;
 use tokio::runtime::Runtime;
 
-use lance_context::serde::CONTENT_TYPE_TEXT;
-use lance_context::{
+use lance_context_core::serde::CONTENT_TYPE_TEXT;
+use lance_context_core::{
     CompactionConfig, CompactionMetrics, CompactionStats, Context as RustContext, ContextRecord,
     ContextStore, ContextStoreOptions, IdIndexType, LifecycleQueryOptions, MetadataFilter,
     RecordFilters, SearchResult, LIFECYCLE_ACTIVE,

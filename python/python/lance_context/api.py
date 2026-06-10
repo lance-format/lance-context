@@ -744,6 +744,15 @@ class AsyncContext:
             ),
         )
 
+    async def get(
+        self, *, id: str | None = None, external_id: str | None = None
+    ) -> dict[str, Any] | None:
+        """Asynchronously retrieve a single context record by id or external_id."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, lambda: self._sync.get(id=id, external_id=external_id)
+        )
+
     async def list(
         self,
         limit: int | None = None,

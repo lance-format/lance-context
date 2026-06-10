@@ -11,7 +11,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-lance-context = { path = "../crates/lance-context" }
+lance-context-core = { path = "../crates/lance-context-core" }
 pyo3 = { version = "0.25", features = ["extension-module", "abi3-py39", "py-clone"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread"] }

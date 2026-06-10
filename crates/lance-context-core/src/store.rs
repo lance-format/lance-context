@@ -391,6 +391,21 @@ impl ContextStore {
         Ok(())
     }
 
+    /// Retrieve a single record by its unique ID.
+    pub async fn get(&self, id: &str) -> LanceResult<Option<ContextRecord>> {
+        let escaped_id = id.replace('\'', "''");
+        let mut scanner = self.dataset.scan();
+        scanner.filter(&format!("id = '{}'", escaped_id))?;
+        scanner.limit(Some(1), None)?;
+
+        let mut stream = scanner.try_into_stream().await?;
+        if let Some(batch) = stream.try_next().await? {
+            let records = batch_to_records(&batch)?;
+            return Ok(records.into_iter().next());
+        }
+        Ok(None)
+    }
+
     /// List all records in the dataset.
     pub async fn list(
         &self,

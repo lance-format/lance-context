@@ -2,6 +2,9 @@
 members = [
     "crates/lance-context-core",
     "crates/lance-context",
+    "crates/lance-context-api",
+    "crates/lance-context-server",
+    "crates/lance-context-client",
     "python",
 ]
 resolver = "2"

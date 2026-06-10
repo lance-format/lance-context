@@ -16,6 +16,7 @@ arrow-ipc = "58"
 arrow-schema = "58"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 lance = "7.0.0"
+lance-context-api = { path = "../lance-context-api" }
 lance-index = "7.0.0"
 lance-namespace = "7.0.0"
 lancedb = "0.30.0"
