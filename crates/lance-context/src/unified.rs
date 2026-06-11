@@ -125,8 +125,9 @@ impl ContextStoreApi for ContextStore {
         &self,
         query: &[f32],
         limit: Option<usize>,
+        include_relationships: bool,
     ) -> ContextResult<Vec<SearchResultDto>> {
-        dispatch_ref!(self, search, query, limit)
+        dispatch_ref!(self, search, query, limit, include_relationships)
     }
 
     fn version(&self) -> u64 {

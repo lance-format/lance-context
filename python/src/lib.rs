@@ -6,7 +6,7 @@ use std::sync::Arc;
 use chrono::{DateTime, SecondsFormat, Utc};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyModule, PyType};
+use pyo3::types::{PyBytes, PyDict, PyList, PyModule, PyType};
 use pyo3::IntoPyObject;
 use serde_json::Value;
 use tokio::runtime::Runtime;
@@ -15,7 +15,7 @@ use lance_context_core::serde::CONTENT_TYPE_TEXT;
 use lance_context_core::{
     CompactionConfig, CompactionMetrics, CompactionStats, Context as RustContext, ContextRecord,
     ContextStore, ContextStoreOptions, IdIndexType, LifecycleQueryOptions, MetadataFilter,
-    RecordFilters, SearchResult, LIFECYCLE_ACTIVE,
+    RecordFilters, Relationship, SearchResult, LIFECYCLE_ACTIVE,
 };
 
 const DEFAULT_BINARY_CONTENT_TYPE: &str = "application/octet-stream";
@@ -36,6 +36,7 @@ struct RecordInput {
     session_id: Option<String>,
     external_id: Option<String>,
     metadata_json: Option<String>,
+    relationships: Vec<Relationship>,
     lifecycle: LifecycleFields,
 }
 
@@ -144,6 +145,13 @@ fn metadata_from_json(metadata_json: Option<String>) -> PyResult<Option<Value>> 
     metadata_json
         .map(|value| serde_json::from_str(&value).map_err(to_py_err))
         .transpose()
+}
+
+fn relationships_from_json(relationships_json: Option<String>) -> PyResult<Vec<Relationship>> {
+    relationships_json
+        .map(|value| serde_json::from_str(&value).map_err(to_py_err))
+        .transpose()
+        .map(|value| value.unwrap_or_default())
 }
 
 fn filters_from_json(filters_json: Option<String>) -> PyResult<Option<RecordFilters>> {
@@ -298,7 +306,7 @@ impl Context {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (role, content, data_type = None, embedding = None, bot_id = None, session_id = None, external_id = None, metadata_json = None, expires_at = None, retention_policy = None, lifecycle_status = None, retired_at = None, retired_reason = None, supersedes_id = None, superseded_by_id = None))]
+    #[pyo3(signature = (role, content, data_type = None, embedding = None, bot_id = None, session_id = None, external_id = None, metadata_json = None, expires_at = None, retention_policy = None, lifecycle_status = None, retired_at = None, retired_reason = None, supersedes_id = None, superseded_by_id = None, relationships_json = None))]
     fn add(
         &mut self,
         py: Python<'_>,
@@ -317,6 +325,7 @@ impl Context {
         retired_reason: Option<String>,
         supersedes_id: Option<String>,
         superseded_by_id: Option<String>,
+        relationships_json: Option<String>,
     ) -> PyResult<()> {
         let lifecycle = LifecycleFields {
             expires_at: parse_optional_datetime(expires_at, "expires_at")?,
@@ -337,6 +346,7 @@ impl Context {
                 session_id,
                 external_id,
                 metadata_json,
+                relationships: relationships_from_json(relationships_json)?,
                 lifecycle,
             },
             1,
@@ -403,7 +413,8 @@ impl Context {
         Ok(())
     }
 
-    #[pyo3(signature = (query, limit = None, filters_json = None, include_expired = false, include_retired = false))]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (query, limit = None, filters_json = None, include_expired = false, include_retired = false, include_relationships = false))]
     fn search(
         &self,
         py: Python<'_>,
@@ -412,6 +423,7 @@ impl Context {
         filters_json: Option<String>,
         include_expired: bool,
         include_retired: bool,
+        include_relationships: bool,
     ) -> PyResult<Vec<PyObject>> {
         let filters = filters_from_json(filters_json)?;
         let options = LifecycleQueryOptions::new(include_expired, include_retired);
@@ -426,7 +438,7 @@ impl Context {
         });
         let hits = hits_res.map_err(to_py_err)?;
         hits.into_iter()
-            .map(|hit| search_hit_to_py(py, hit))
+            .map(|hit| search_hit_to_py(py, hit, include_relationships))
             .collect()
     }
 
@@ -451,6 +463,32 @@ impl Context {
                     filters.as_ref(),
                     options,
                 ))
+                .map_err(to_py_err)
+        })?;
+
+        records
+            .into_iter()
+            .map(|record| record_to_py(py, record))
+            .collect()
+    }
+
+    #[pyo3(signature = (target_id, relation = None, limit = None, include_expired = false, include_retired = false))]
+    fn related(
+        &self,
+        py: Python<'_>,
+        target_id: &str,
+        relation: Option<&str>,
+        limit: Option<usize>,
+        include_expired: bool,
+        include_retired: bool,
+    ) -> PyResult<Vec<PyObject>> {
+        let options = LifecycleQueryOptions::new(include_expired, include_retired);
+        let records = py.allow_threads(|| {
+            self.runtime
+                .block_on(
+                    self.store
+                        .list_related_with_options(target_id, relation, limit, options),
+                )
                 .map_err(to_py_err)
         })?;
 
@@ -520,6 +558,14 @@ impl Context {
         }
     }
 
+    fn migrate_relationships(&mut self, py: Python<'_>) -> PyResult<bool> {
+        py.allow_threads(|| {
+            self.runtime
+                .block_on(self.store.migrate_relationships_column())
+                .map_err(to_py_err)
+        })
+    }
+
     #[pyo3(signature = (target_rows_per_fragment=None, materialize_deletions=None))]
     fn compact(
         &mut self,
@@ -579,6 +625,8 @@ impl Context {
             optional_item(dict, "external_id")?.map(|value| value.extract::<String>());
         let metadata_json =
             optional_item(dict, "metadata_json")?.map(|value| value.extract::<String>());
+        let relationships_json =
+            optional_item(dict, "relationships_json")?.map(|value| value.extract::<String>());
         let expires_at = optional_item(dict, "expires_at")?.map(|value| value.extract::<String>());
         let retention_policy =
             optional_item(dict, "retention_policy")?.map(|value| value.extract::<String>());
@@ -612,6 +660,7 @@ impl Context {
                 session_id: session_id.transpose()?,
                 external_id: external_id.transpose()?,
                 metadata_json: metadata_json.transpose()?,
+                relationships: relationships_from_json(relationships_json.transpose()?)?,
                 lifecycle,
             },
             index as u64 + 1,
@@ -633,6 +682,7 @@ impl Context {
             session_id,
             external_id,
             metadata_json,
+            relationships,
             lifecycle,
         } = input;
 
@@ -672,6 +722,7 @@ impl Context {
                 role: role.clone(),
                 state_metadata: None,
                 metadata,
+                relationships,
                 expires_at: lifecycle.expires_at,
                 retention_policy: lifecycle.retention_policy,
                 lifecycle_status: lifecycle
@@ -756,8 +807,16 @@ fn new_run_id() -> String {
     )
 }
 
-fn search_hit_to_py(py: Python<'_>, hit: SearchResult) -> PyResult<PyObject> {
+fn search_hit_to_py(
+    py: Python<'_>,
+    hit: SearchResult,
+    include_relationships: bool,
+) -> PyResult<PyObject> {
     let SearchResult { record, distance } = hit;
+    let mut record = record;
+    if !include_relationships {
+        record.relationships.clear();
+    }
     let dict = record_to_py(py, record)?;
     let dict_ref = dict.downcast_bound::<PyDict>(py)?;
     dict_ref.set_item("distance", distance)?;
@@ -775,6 +834,7 @@ fn record_to_py(py: Python<'_>, record: ContextRecord) -> PyResult<PyObject> {
         role,
         state_metadata,
         metadata,
+        relationships,
         expires_at,
         retention_policy,
         lifecycle_status,
@@ -817,6 +877,7 @@ fn record_to_py(py: Python<'_>, record: ContextRecord) -> PyResult<PyObject> {
         None => py.None().into_pyobject(py)?.unbind(),
     };
     dict.set_item("metadata", metadata_obj)?;
+    dict.set_item("relationships", relationships_to_py(py, relationships)?)?;
     dict.set_item(
         "expires_at",
         expires_at.map(|dt| dt.to_rfc3339_opts(SecondsFormat::Micros, true)),
@@ -838,6 +899,18 @@ fn record_to_py(py: Python<'_>, record: ContextRecord) -> PyResult<PyObject> {
     }
     dict.set_item("embedding", embedding)?;
     Ok(dict.into_pyobject(py)?.unbind().into())
+}
+
+fn relationships_to_py(py: Python<'_>, relationships: Vec<Relationship>) -> PyResult<PyObject> {
+    let list = PyList::empty(py);
+    for relationship in relationships {
+        let dict = PyDict::new(py);
+        dict.set_item("target_id", relationship.target_id)?;
+        dict.set_item("relation", relationship.relation)?;
+        dict.set_item("weight", relationship.weight)?;
+        list.append(dict)?;
+    }
+    Ok(list.into_pyobject(py)?.unbind().into())
 }
 
 fn json_value_to_py(py: Python<'_>, value: &Value) -> PyResult<PyObject> {

@@ -5,12 +5,12 @@ pub use lance_context_core::serde;
 pub use lance_context_core::{
     CompactionConfig, CompactionMetrics, CompactionStats, Context, ContextEntry, ContextRecord,
     ContextStoreOptions, IdIndexType, LifecycleQueryOptions, MetadataFilter, RecordFilters,
-    SearchResult, Snapshot, StateMetadata, LIFECYCLE_ACTIVE, LIFECYCLE_CONTRADICTED,
+    Relationship, SearchResult, Snapshot, StateMetadata, LIFECYCLE_ACTIVE, LIFECYCLE_CONTRADICTED,
 };
 
 pub use lance_context_api::{
     AddRecordRequest, AddRecordsResponse, CompactRequest, CompactResponse, CompactStatsResponse,
-    ContextError, ContextResult, ContextStoreApi, RecordDto, SearchResultDto,
+    ContextError, ContextResult, ContextStoreApi, RecordDto, RelationshipDto, SearchResultDto,
 };
 
 #[cfg(feature = "remote")]

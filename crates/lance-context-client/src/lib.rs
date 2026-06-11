@@ -84,10 +84,12 @@ impl ContextStoreApi for RemoteContextStore {
         &self,
         query: &[f32],
         limit: Option<usize>,
+        include_relationships: bool,
     ) -> ContextResult<Vec<SearchResultDto>> {
         let req = SearchRequest {
             query: query.to_vec(),
             limit: limit.unwrap_or(10),
+            include_relationships,
         };
         let resp = self
             .client

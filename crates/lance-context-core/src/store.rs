@@ -4,13 +4,14 @@ use std::time::Duration;
 
 use arrow_array::builder::{
     FixedSizeListBuilder, Float32Builder, Int32Builder, LargeBinaryBuilder, LargeStringBuilder,
-    StringBuilder, StringDictionaryBuilder, StructBuilder, TimestampMicrosecondBuilder,
+    ListBuilder, StringBuilder, StringDictionaryBuilder, StructBuilder,
+    TimestampMicrosecondBuilder,
 };
 use arrow_array::types::Int8Type;
 use arrow_array::{
     Array, ArrayRef, DictionaryArray, FixedSizeListArray, Float32Array, Int32Array,
-    LargeBinaryArray, LargeStringArray, RecordBatch, RecordBatchIterator, StringArray, StructArray,
-    TimestampMicrosecondArray,
+    LargeBinaryArray, LargeStringArray, ListArray, RecordBatch, RecordBatchIterator, StringArray,
+    StructArray, TimestampMicrosecondArray,
 };
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Schema, TimeUnit};
 use chrono::{DateTime, Timelike, Utc};
@@ -19,6 +20,7 @@ use lance::dataset::mem_wal::{
     DatasetMemWalExt, LsmScanner, ShardManifestStore, ShardSnapshot, ShardWriterConfig,
 };
 use lance::dataset::optimize::{compact_files, CompactionMetrics, CompactionOptions};
+use lance::dataset::NewColumnTransform;
 use lance::dataset::{builder::DatasetBuilder, Dataset, WriteMode, WriteParams};
 use lance::index::DatasetIndexExt;
 use lance::io::{ObjectStoreParams, StorageOptionsAccessor};
@@ -32,7 +34,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::record::{
-    ContextRecord, LifecycleQueryOptions, RecordFilters, SearchResult, StateMetadata,
+    ContextRecord, LifecycleQueryOptions, RecordFilters, Relationship, SearchResult, StateMetadata,
     LIFECYCLE_ACTIVE,
 };
 use crate::serde::CONTENT_TYPE_TOMBSTONE;
@@ -42,6 +44,7 @@ const DEFAULT_EMBEDDING_DIM: i32 = 1536;
 const DEFAULT_SEARCH_LIMIT: usize = 10;
 const DEFAULT_MANIFEST_SCAN_BATCH_SIZE: usize = 16;
 const ID_INDEX_NAME: &str = "id_idx";
+const RELATIONSHIPS_COLUMN: &str = "relationships";
 
 /// Configuration for background compaction.
 #[derive(Debug, Clone)]
@@ -148,6 +151,45 @@ impl ContextStoreOptions {
     pub fn storage_options(&self) -> Option<HashMap<String, String>> {
         self.storage_options.clone()
     }
+}
+
+fn relationship_struct_fields() -> Vec<Field> {
+    vec![
+        Field::new("target_id", DataType::Utf8, true),
+        Field::new("relation", DataType::Utf8, true),
+        Field::new("weight", DataType::Float32, true),
+    ]
+}
+
+fn relationship_struct_data_type() -> DataType {
+    DataType::Struct(relationship_struct_fields().into())
+}
+
+fn relationship_list_item_field() -> FieldRef {
+    Arc::new(Field::new("item", relationship_struct_data_type(), true))
+}
+
+fn relationship_field() -> Field {
+    Field::new(
+        RELATIONSHIPS_COLUMN,
+        DataType::List(relationship_list_item_field()),
+        true,
+    )
+}
+
+fn relationship_struct_builder() -> StructBuilder {
+    let fields: Vec<FieldRef> = relationship_struct_fields()
+        .into_iter()
+        .map(|field| Arc::new(field) as FieldRef)
+        .collect();
+    StructBuilder::new(
+        fields,
+        vec![
+            Box::new(StringBuilder::new()),
+            Box::new(StringBuilder::new()),
+            Box::new(Float32Builder::new()),
+        ],
+    )
 }
 
 impl ContextStore {
@@ -295,6 +337,7 @@ impl ContextStore {
             role: record.role,
             state_metadata: None,
             metadata: None,
+            relationships: Vec::new(),
             expires_at: None,
             retention_policy: None,
             lifecycle_status: LIFECYCLE_ACTIVE.to_string(),
@@ -379,9 +422,33 @@ impl ContextStore {
         Uuid::new_v5(&Uuid::NAMESPACE_OID, input.as_bytes())
     }
 
+    fn has_relationships_column(&self) -> bool {
+        self.dataset
+            .schema()
+            .field_paths()
+            .iter()
+            .any(|path| path == RELATIONSHIPS_COLUMN)
+    }
+
     /// Current dataset version.
     pub fn version(&self) -> u64 {
         self.dataset.manifest.version
+    }
+
+    /// Add the relationships column to an older dataset if it is missing.
+    ///
+    /// Existing rows are stored as null in the new column and read back as an
+    /// empty relationship list.
+    pub async fn migrate_relationships_column(&mut self) -> LanceResult<bool> {
+        if self.has_relationships_column() {
+            return Ok(false);
+        }
+
+        let schema = Arc::new(Schema::new(vec![relationship_field()]));
+        self.dataset
+            .add_columns(NewColumnTransform::AllNulls(schema), None, None)
+            .await?;
+        Ok(true)
     }
 
     /// Checkout a specific dataset version.
@@ -500,6 +567,43 @@ impl ContextStore {
             .await?
             .into_iter()
             .find(|record| record.external_id.as_deref() == Some(external_id)))
+    }
+
+    /// List records that have a relationship targeting `target_id`.
+    pub async fn list_related(
+        &self,
+        target_id: &str,
+        relation: Option<&str>,
+        limit: Option<usize>,
+    ) -> LanceResult<Vec<ContextRecord>> {
+        self.list_related_with_options(target_id, relation, limit, LifecycleQueryOptions::default())
+            .await
+    }
+
+    /// List related records, applying lifecycle visibility before relationship matching.
+    pub async fn list_related_with_options(
+        &self,
+        target_id: &str,
+        relation: Option<&str>,
+        limit: Option<usize>,
+        options: LifecycleQueryOptions,
+    ) -> LanceResult<Vec<ContextRecord>> {
+        let mut results: Vec<ContextRecord> = self
+            .list_with_options(None, None, options)
+            .await?
+            .into_iter()
+            .filter(|record| {
+                record.relationships.iter().any(|relationship| {
+                    relationship.target_id == target_id
+                        && relation.is_none_or(|value| relationship.relation == value)
+                })
+            })
+            .collect();
+
+        if let Some(limit) = limit {
+            results.truncate(limit);
+        }
+        Ok(results)
     }
 
     /// Perform a nearest-neighbor search over stored embeddings.
@@ -820,13 +924,14 @@ impl ContextStore {
     /// Lance V1 blob encoding (out-of-line binary buffers). For `text_payload`,
     /// this also changes the Arrow type from `LargeUtf8` to `LargeBinary`.
     pub fn schema(blob_columns: &HashSet<String>) -> Schema {
-        Self::schema_with_options(blob_columns, true, true, true)
+        Self::schema_with_options(blob_columns, true, true, true, true)
     }
 
     fn schema_with_options(
         blob_columns: &HashSet<String>,
         include_external_id: bool,
         include_metadata: bool,
+        include_relationships: bool,
         include_lifecycle: bool,
     ) -> Schema {
         let mut id_metadata = HashMap::new();
@@ -885,6 +990,9 @@ impl ContextStore {
         ]);
         if include_metadata {
             fields.push(Field::new("metadata", DataType::LargeUtf8, true));
+        }
+        if include_relationships {
+            fields.push(relationship_field());
         }
         if include_lifecycle {
             fields.extend([
@@ -985,6 +1093,7 @@ impl ContextStore {
             .field_paths()
             .iter()
             .any(|path| path == "metadata");
+        let include_relationships = self.has_relationships_column();
         if !include_external_id && entries.iter().any(|entry| entry.external_id.is_some()) {
             return Err(ArrowError::InvalidArgumentError(
                 "external_id requires a context dataset created with external_id support"
@@ -995,6 +1104,12 @@ impl ContextStore {
         if !include_metadata && entries.iter().any(|entry| entry.metadata.is_some()) {
             return Err(ArrowError::InvalidArgumentError(
                 "metadata requires a context dataset created with metadata support".to_string(),
+            )
+            .into());
+        }
+        if !include_relationships && entries.iter().any(|entry| !entry.relationships.is_empty()) {
+            return Err(ArrowError::InvalidArgumentError(
+                "relationships require a context dataset with relationships support; run migrate_relationships_column() on older datasets".to_string(),
             )
             .into());
         }
@@ -1014,6 +1129,8 @@ impl ContextStore {
         let mut created_at_builder = TimestampMicrosecondBuilder::with_capacity(entries.len());
         let mut role_builder = StringDictionaryBuilder::<Int8Type>::new();
         let mut metadata_builder = LargeStringBuilder::new();
+        let mut relationships_builder = ListBuilder::new(relationship_struct_builder())
+            .with_field(relationship_list_item_field());
         let mut expires_at_builder = TimestampMicrosecondBuilder::with_capacity(entries.len());
         let mut retention_policy_builder = StringBuilder::new();
         let mut lifecycle_status_builder = StringBuilder::new();
@@ -1067,6 +1184,23 @@ impl ContextStore {
                 Some(metadata) => metadata_builder.append_value(metadata.to_string()),
                 None => metadata_builder.append_null(),
             }
+            for relationship in &entry.relationships {
+                let values_builder = relationships_builder.values();
+                values_builder
+                    .field_builder::<StringBuilder>(0)
+                    .unwrap()
+                    .append_value(&relationship.target_id);
+                values_builder
+                    .field_builder::<StringBuilder>(1)
+                    .unwrap()
+                    .append_value(&relationship.relation);
+                values_builder
+                    .field_builder::<Float32Builder>(2)
+                    .unwrap()
+                    .append_option(relationship.weight);
+                values_builder.append(true);
+            }
+            relationships_builder.append(true);
             expires_at_builder
                 .append_option(entry.expires_at.map(|value| value.timestamp_micros()));
             retention_policy_builder.append_option(entry.retention_policy.as_deref());
@@ -1170,6 +1304,7 @@ impl ContextStore {
         let created_at_array: ArrayRef = Arc::new(created_at_builder.finish());
         let role_array: ArrayRef = Arc::new(role_builder.finish());
         let metadata_array: ArrayRef = Arc::new(metadata_builder.finish());
+        let relationships_array: ArrayRef = Arc::new(relationships_builder.finish());
         let expires_at_array: ArrayRef = Arc::new(expires_at_builder.finish());
         let retention_policy_array: ArrayRef = Arc::new(retention_policy_builder.finish());
         let lifecycle_status_array: ArrayRef = Arc::new(lifecycle_status_builder.finish());
@@ -1187,44 +1322,55 @@ impl ContextStore {
         let state_array: ArrayRef = Arc::new(state_builder.finish());
         let embedding_array: ArrayRef = Arc::new(embedding_builder.finish());
 
-        let schema = Arc::new(Self::schema_with_options(
-            &self.blob_columns,
-            include_external_id,
-            include_metadata,
-            include_lifecycle,
-        ));
-        let mut arrays = vec![id_array];
+        let mut arrays_by_name = HashMap::from([("id".to_string(), id_array)]);
         if include_external_id {
-            arrays.push(external_id_array);
+            arrays_by_name.insert("external_id".to_string(), external_id_array);
         }
-        arrays.extend([
-            run_id_array,
-            bot_id_array,
-            session_id_array,
-            created_at_array,
-            role_array,
-            state_array,
+        arrays_by_name.extend([
+            ("run_id".to_string(), run_id_array),
+            ("bot_id".to_string(), bot_id_array),
+            ("session_id".to_string(), session_id_array),
+            ("created_at".to_string(), created_at_array),
+            ("role".to_string(), role_array),
+            ("state_metadata".to_string(), state_array),
         ]);
         if include_metadata {
-            arrays.push(metadata_array);
+            arrays_by_name.insert("metadata".to_string(), metadata_array);
+        }
+        if include_relationships {
+            arrays_by_name.insert(RELATIONSHIPS_COLUMN.to_string(), relationships_array);
         }
         if include_lifecycle {
-            arrays.extend([
-                expires_at_array,
-                retention_policy_array,
-                lifecycle_status_array,
-                retired_at_array,
-                retired_reason_array,
-                supersedes_id_array,
-                superseded_by_id_array,
+            arrays_by_name.extend([
+                ("expires_at".to_string(), expires_at_array),
+                ("retention_policy".to_string(), retention_policy_array),
+                ("lifecycle_status".to_string(), lifecycle_status_array),
+                ("retired_at".to_string(), retired_at_array),
+                ("retired_reason".to_string(), retired_reason_array),
+                ("supersedes_id".to_string(), supersedes_id_array),
+                ("superseded_by_id".to_string(), superseded_by_id_array),
             ]);
         }
-        arrays.extend([
-            content_type_array,
-            text_array,
-            binary_array,
-            embedding_array,
+        arrays_by_name.extend([
+            ("content_type".to_string(), content_type_array),
+            ("text_payload".to_string(), text_array),
+            ("binary_payload".to_string(), binary_array),
+            ("embedding".to_string(), embedding_array),
         ]);
+
+        let schema: Arc<Schema> = Arc::new(self.dataset.schema().into());
+        let arrays = schema
+            .fields()
+            .iter()
+            .map(|field| {
+                arrays_by_name.remove(field.name().as_str()).ok_or_else(|| {
+                    LanceError::from(ArrowError::InvalidArgumentError(format!(
+                        "unsupported dataset column '{}'",
+                        field.name()
+                    )))
+                })
+            })
+            .collect::<LanceResult<Vec<_>>>()?;
         let batch = RecordBatch::try_new(schema, arrays)?;
 
         Ok(batch)
@@ -1253,6 +1399,7 @@ fn batch_to_records(batch: &RecordBatch) -> LanceResult<Vec<ContextRecord>> {
     let role_array = column_as::<DictionaryArray<Int8Type>>(batch, "role")?;
     let state_array = column_as::<StructArray>(batch, "state_metadata")?;
     let metadata_array = column_as_optional::<LargeStringArray>(batch, "metadata");
+    let relationships_array = column_as_optional::<ListArray>(batch, RELATIONSHIPS_COLUMN);
     let expires_at_array = column_as_optional::<TimestampMicrosecondArray>(batch, "expires_at");
     let retention_policy_array = column_as_optional::<StringArray>(batch, "retention_policy");
     let lifecycle_status_array = column_as_optional::<StringArray>(batch, "lifecycle_status");
@@ -1427,6 +1574,10 @@ fn batch_to_records(batch: &RecordBatch) -> LanceResult<Vec<ContextRecord>> {
             }
             _ => None,
         };
+        let relationships = match relationships_array {
+            Some(arr) if !arr.is_null(row) => relationships_from_list(arr, row)?,
+            _ => Vec::new(),
+        };
         let expires_at = optional_timestamp_from_array(expires_at_array, row, "expires_at")?;
         let retention_policy = optional_string_from_array(retention_policy_array, row);
         let lifecycle_status = optional_string_from_array(lifecycle_status_array, row)
@@ -1452,6 +1603,7 @@ fn batch_to_records(batch: &RecordBatch) -> LanceResult<Vec<ContextRecord>> {
             role,
             state_metadata,
             metadata,
+            relationships,
             expires_at,
             retention_policy,
             lifecycle_status,
@@ -1485,6 +1637,78 @@ fn embedding_from_list(list: &FixedSizeListArray, row: usize) -> LanceResult<Vec
         embedding.push(float_array.value(idx));
     }
     Ok(embedding)
+}
+
+fn relationships_from_list(list: &ListArray, row: usize) -> LanceResult<Vec<Relationship>> {
+    let values = list.value(row);
+    let struct_array = values
+        .as_ref()
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .ok_or_else(|| {
+            LanceError::from(ArrowError::InvalidArgumentError(
+                "relationships column does not contain struct values".to_string(),
+            ))
+        })?;
+
+    let target_id_array = struct_array
+        .column(0)
+        .as_ref()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            LanceError::from(ArrowError::InvalidArgumentError(
+                "relationships.target_id column has unexpected data type".to_string(),
+            ))
+        })?;
+    let relation_array = struct_array
+        .column(1)
+        .as_ref()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            LanceError::from(ArrowError::InvalidArgumentError(
+                "relationships.relation column has unexpected data type".to_string(),
+            ))
+        })?;
+    let weight_array = struct_array
+        .column(2)
+        .as_ref()
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .ok_or_else(|| {
+            LanceError::from(ArrowError::InvalidArgumentError(
+                "relationships.weight column has unexpected data type".to_string(),
+            ))
+        })?;
+
+    let mut relationships = Vec::with_capacity(struct_array.len());
+    for idx in 0..struct_array.len() {
+        if struct_array.is_null(idx) {
+            continue;
+        }
+        if target_id_array.is_null(idx) {
+            return Err(LanceError::from(ArrowError::InvalidArgumentError(
+                "relationships.target_id contains null values".to_string(),
+            )));
+        }
+        if relation_array.is_null(idx) {
+            return Err(LanceError::from(ArrowError::InvalidArgumentError(
+                "relationships.relation contains null values".to_string(),
+            )));
+        }
+
+        relationships.push(Relationship {
+            target_id: target_id_array.value(idx).to_string(),
+            relation: relation_array.value(idx).to_string(),
+            weight: if weight_array.is_null(idx) {
+                None
+            } else {
+                Some(weight_array.value(idx))
+            },
+        });
+    }
+    Ok(relationships)
 }
 
 fn timestamp_from_micros(value: i64, column: &str) -> LanceResult<DateTime<Utc>> {
@@ -1587,6 +1811,7 @@ mod tests {
                 custom: None,
             }),
             metadata: None,
+            relationships: Vec::new(),
             expires_at: None,
             retention_policy: None,
             lifecycle_status: LIFECYCLE_ACTIVE.to_string(),
@@ -1771,6 +1996,112 @@ mod tests {
 
             let missing = store.get_by_external_id("missing").await.unwrap();
             assert!(missing.is_none());
+        });
+    }
+
+    #[test]
+    fn relationships_roundtrip_and_support_related_lookup() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = ContextStore::open(&uri).await.unwrap();
+            let mut related = text_record("related", 0.0);
+            related.relationships = vec![
+                Relationship {
+                    target_id: "doc-1#chunk-1".to_string(),
+                    relation: "cites".to_string(),
+                    weight: Some(0.75),
+                },
+                Relationship {
+                    target_id: "service-a".to_string(),
+                    relation: "mentions".to_string(),
+                    weight: None,
+                },
+            ];
+            let unrelated = text_record("unrelated", 1.0);
+            store.add(&[related.clone(), unrelated]).await.unwrap();
+
+            let listed = store.list(None, None).await.unwrap();
+            let roundtrip = listed
+                .iter()
+                .find(|record| record.id == related.id)
+                .unwrap();
+            assert_eq!(roundtrip.relationships, related.relationships);
+
+            let by_target = store
+                .list_related("doc-1#chunk-1", None, None)
+                .await
+                .unwrap();
+            assert_eq!(by_target.len(), 1);
+            assert_eq!(by_target[0].id, related.id);
+
+            let by_relation = store
+                .list_related("doc-1#chunk-1", Some("cites"), None)
+                .await
+                .unwrap();
+            assert_eq!(by_relation.len(), 1);
+            assert_eq!(by_relation[0].id, related.id);
+
+            let wrong_relation = store
+                .list_related("doc-1#chunk-1", Some("mentions"), None)
+                .await
+                .unwrap();
+            assert!(wrong_relation.is_empty());
+        });
+    }
+
+    #[test]
+    fn migrate_relationships_column_adds_missing_column() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let schema = Arc::new(ContextStore::schema_with_options(
+                &HashSet::new(),
+                true,
+                true,
+                false,
+                true,
+            ));
+            let empty_batch = RecordBatch::new_empty(schema.clone());
+            let batches = RecordBatchIterator::new(
+                vec![Ok::<RecordBatch, ArrowError>(empty_batch)].into_iter(),
+                schema,
+            );
+            Dataset::write(
+                batches,
+                &uri,
+                Some(WriteParams {
+                    mode: WriteMode::Create,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+            let mut store = ContextStore::open(&uri).await.unwrap();
+            assert!(!store.has_relationships_column());
+
+            let mut record = text_record("with-relationships", 0.0);
+            record.relationships.push(Relationship {
+                target_id: "target".to_string(),
+                relation: "mentions".to_string(),
+                weight: None,
+            });
+            let err = store.add(std::slice::from_ref(&record)).await.unwrap_err();
+            assert!(
+                err.to_string().contains("migrate_relationships_column"),
+                "unexpected error: {err}"
+            );
+
+            assert!(store.migrate_relationships_column().await.unwrap());
+            assert!(store.has_relationships_column());
+            assert!(!store.migrate_relationships_column().await.unwrap());
+
+            store.add(std::slice::from_ref(&record)).await.unwrap();
+            let roundtrip = store.get_by_id(&record.id).await.unwrap().unwrap();
+            assert_eq!(roundtrip.relationships, record.relationships);
         });
     }
 

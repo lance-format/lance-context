@@ -16,6 +16,8 @@ Key motivations inspired by the broader Lance roadmap<sup>[1](https://github.com
 ## Features
 
 - Unified schema for agent messages (`ContextRecord`) with optional embeddings and metadata.
+- GraphRAG-friendly `relationships` column for directed edges such as
+  `{"target_id": "...", "relation": "cites", "weight": 0.75}`.
 - Automatic versioning via Lance manifests with `checkout(version)` support.
 - Background compaction to optimize storage and read performance.
 - Remote persistence on any `object_store` backend (S3, GCS, Azure Blob, ...)
@@ -103,6 +105,14 @@ ctx.add(
     embedding=runbook_embedding,
     bot_id="support-bot",
     session_id="incident-123",
+    relationships=[
+        {
+            "target_id": "docs://runbooks/service-a",
+            "relation": "cites",
+            "weight": 0.92,
+        },
+        {"target_id": "service://service-a", "relation": "describes"},
+    ],
     metadata={
         "tenant": "example-org",
         "scope": "team",
@@ -123,7 +133,9 @@ hits = ctx.search(
     runbook_embedding,
     limit=10,
     filters={"tenant": "example-org", "content_type": "text/plain"},
+    include_relationships=True,
 )
+service_context = ctx.related("service://service-a", relation="describes")
 
 from PIL import Image
 image = Image.new("RGB", (2, 2), color="teal")
@@ -138,6 +150,9 @@ ctx.add_many([
         "content": "Chunk 1 from a runbook",
         "content_type": "text/markdown",
         "session_id": "runbook-import",
+        "relationships": [
+            {"target_id": "service://service-a", "relation": "describes"}
+        ],
     },
     {
         "role": "source",
@@ -223,7 +238,7 @@ physical cleanup policies remove them.
 ### Rust
 
 ```rust
-use lance_context::{ContextStore, ContextRecord, StateMetadata};
+use lance_context::{ContextStore, ContextRecord, Relationship, StateMetadata};
 use chrono::Utc;
 
 # tokio_test::block_on(async {
@@ -241,6 +256,11 @@ let record = ContextRecord {
         custom: None,
     }),
     metadata: None,
+    relationships: vec![Relationship {
+        target_id: "service://service-a".into(),
+        relation: "mentions".into(),
+        weight: None,
+    }],
     expires_at: None,
     retention_policy: None,
     lifecycle_status: "active".into(),

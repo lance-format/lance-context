@@ -15,11 +15,14 @@ class DummyInner:
     def __init__(self) -> None:
         self.search_calls: list[tuple[list[float], int | None, str | None]] = []
         self.search_lifecycle_calls: list[tuple[bool, bool]] = []
+        self.search_relationship_calls: list[bool] = []
         self.list_calls: list[tuple[int | None, int | None, str | None]] = []
         self.list_lifecycle_calls: list[tuple[bool, bool]] = []
+        self.related_calls: list[tuple[str, str | None, int | None, bool, bool]] = []
         self.get_calls: list[tuple[str | None, str | None]] = []
         self.delete_calls: list[tuple[str | None, str | None]] = []
         self.lifecycle_add_calls: list[dict[str, Any]] = []
+        self.relationship_add_calls: list[str | None] = []
         self.add_calls: list[
             tuple[
                 str,
@@ -51,6 +54,7 @@ class DummyInner:
         retired_reason: str | None = None,
         supersedes_id: str | None = None,
         superseded_by_id: str | None = None,
+        relationships_json: str | None = None,
     ):
         self.add_calls.append(
             (
@@ -75,6 +79,7 @@ class DummyInner:
                 "superseded_by_id": superseded_by_id,
             }
         )
+        self.relationship_add_calls.append(relationships_json)
 
     def get(self, id: str | None, external_id: str | None):
         self.get_calls.append((id, external_id))
@@ -93,34 +98,39 @@ class DummyInner:
         filters_json: str | None,
         include_expired: bool = False,
         include_retired: bool = False,
+        include_relationships: bool = False,
     ):
         self.search_calls.append((vector, limit, filters_json))
         self.search_lifecycle_calls.append((include_expired, include_retired))
-        return [
-            {
-                "id": "rec-1",
-                "external_id": "source-1",
-                "run_id": "run-1",
-                "bot_id": "support_bot",
-                "session_id": None,
-                "role": "user",
-                "content_type": "text/plain",
-                "text_payload": "hello",
-                "binary_payload": None,
-                "embedding": [0.1, 0.2],
-                "distance": 0.12,
-                "created_at": "2024-01-01T12:00:00Z",
-                "state_metadata": {"step": 1},
-                "metadata": {"scope": "team", "tags": ["runbook"]},
-                "expires_at": None,
-                "retention_policy": None,
-                "lifecycle_status": "active",
-                "retired_at": None,
-                "retired_reason": None,
-                "supersedes_id": None,
-                "superseded_by_id": None,
-            }
-        ]
+        self.search_relationship_calls.append(include_relationships)
+        hit = {
+            "id": "rec-1",
+            "external_id": "source-1",
+            "run_id": "run-1",
+            "bot_id": "support_bot",
+            "session_id": None,
+            "role": "user",
+            "content_type": "text/plain",
+            "text_payload": "hello",
+            "binary_payload": None,
+            "embedding": [0.1, 0.2],
+            "distance": 0.12,
+            "created_at": "2024-01-01T12:00:00Z",
+            "state_metadata": {"step": 1},
+            "metadata": {"scope": "team", "tags": ["runbook"]},
+            "expires_at": None,
+            "retention_policy": None,
+            "lifecycle_status": "active",
+            "retired_at": None,
+            "retired_reason": None,
+            "supersedes_id": None,
+            "superseded_by_id": None,
+        }
+        if include_relationships:
+            hit["relationships"] = [
+                {"target_id": "doc-1#chunk-1", "relation": "cites", "weight": 0.75}
+            ]
+        return [hit]
 
     def add_many(self, records: list[dict[str, Any]]):
         self.add_many_calls.append(records)
@@ -182,6 +192,23 @@ class DummyInner:
             },
         ]
 
+    def related(
+        self,
+        target_id: str,
+        relation: str | None,
+        limit: int | None,
+        include_expired: bool = False,
+        include_retired: bool = False,
+    ):
+        self.related_calls.append(
+            (target_id, relation, limit, include_expired, include_retired)
+        )
+        record = self.list(None, None, None)[0]
+        record["relationships"] = [
+            {"target_id": target_id, "relation": relation or "cites", "weight": None}
+        ]
+        return [record]
+
 
 def _only_add_call(dummy: DummyInner):
     assert len(dummy.add_calls) == 1
@@ -228,6 +255,7 @@ def test_context_search_formats_results():
     assert hits[0]["text"] == "hello"
     assert hits[0]["binary"] is None
     assert hits[0]["metadata"] == {"scope": "team", "tags": ["runbook"]}
+    assert hits[0]["relationships"] == []
     assert isinstance(hits[0]["created_at"], datetime)
 
 
@@ -253,6 +281,19 @@ def test_context_search_passes_lifecycle_flags():
     assert dummy.search_lifecycle_calls == [(True, True)]
 
 
+def test_context_search_can_include_relationships():
+    ctx = Context.__new__(Context)
+    dummy = DummyInner()
+    ctx._inner = dummy  # type: ignore[attr-defined]
+
+    hits = ctx.search([0.5, 0.4], include_relationships=True)
+
+    assert dummy.search_relationship_calls == [True]
+    assert hits[0]["relationships"] == [
+        {"target_id": "doc-1#chunk-1", "relation": "cites", "weight": 0.75}
+    ]
+
+
 def test_normalize_record_without_distance():
     result = _normalize_record(
         {
@@ -270,7 +311,32 @@ def test_normalize_record_without_distance():
     )
     assert "distance" not in result
     assert result["text"] == "hello"
+    assert result["relationships"] == []
     assert isinstance(result["created_at"], datetime)
+
+
+def test_normalize_record_with_relationships():
+    result = _normalize_record(
+        {
+            "id": "rec-1",
+            "external_id": None,
+            "created_at": "2024-01-01T00:00:00Z",
+            "content_type": "text/plain",
+            "text_payload": "hello",
+            "binary_payload": None,
+            "embedding": None,
+            "run_id": "run-1",
+            "role": "user",
+            "state_metadata": None,
+            "relationships": [
+                {"target_id": "service-a", "relation": "mentions", "weight": None}
+            ],
+        }
+    )
+
+    assert result["relationships"] == [
+        {"target_id": "service-a", "relation": "mentions", "weight": None}
+    ]
 
 
 def test_context_list_returns_entries():
@@ -303,6 +369,25 @@ def test_context_get_by_external_id():
     assert entry is not None
     assert entry["id"] == "rec-1"
     assert entry["external_id"] == "source-1"
+
+
+def test_context_related_forwards_arguments():
+    ctx = Context.__new__(Context)
+    dummy = DummyInner()
+    ctx._inner = dummy  # type: ignore[attr-defined]
+
+    related = ctx.related(
+        "doc-1#chunk-1",
+        relation="cites",
+        limit=5,
+        include_expired=True,
+        include_retired=True,
+    )
+
+    assert dummy.related_calls == [("doc-1#chunk-1", "cites", 5, True, True)]
+    assert related[0]["relationships"] == [
+        {"target_id": "doc-1#chunk-1", "relation": "cites", "weight": None}
+    ]
 
 
 def test_context_get_by_id():
@@ -617,6 +702,28 @@ def test_context_add_with_all_options():
     }
 
 
+def test_context_add_forwards_relationships():
+    ctx = Context.__new__(Context)
+    dummy = DummyInner()
+    ctx._inner = dummy  # type: ignore[attr-defined]
+
+    ctx.add(
+        "user",
+        "hello",
+        relationships=[
+            {"target_id": "doc-1#chunk-1", "relation": "cites", "weight": 0.75},
+            {"target_id": "service-a", "relation": "mentions"},
+        ],
+    )
+
+    relationships_json = dummy.relationship_add_calls[0]
+    assert relationships_json is not None
+    assert json.loads(relationships_json) == [
+        {"relation": "cites", "target_id": "doc-1#chunk-1", "weight": 0.75},
+        {"relation": "mentions", "target_id": "service-a"},
+    ]
+
+
 def test_context_add_rejects_non_json_metadata():
     ctx = Context.__new__(Context)
     dummy = DummyInner()
@@ -698,6 +805,7 @@ def test_context_add_many_normalizes_records():
                 "session_id": None,
                 "external_id": None,
                 "metadata_json": None,
+                "relationships_json": None,
                 "expires_at": None,
                 "retention_policy": None,
                 "lifecycle_status": None,
@@ -715,6 +823,7 @@ def test_context_add_many_normalizes_records():
                 "session_id": "sess",
                 "external_id": "doc-1#chunk-2",
                 "metadata_json": None,
+                "relationships_json": None,
                 "expires_at": None,
                 "retention_policy": None,
                 "lifecycle_status": None,
@@ -755,6 +864,30 @@ def test_context_add_many_forwards_metadata():
     metadata_json = dummy.add_many_calls[0][0]["metadata_json"]
     assert metadata_json is not None
     assert json.loads(metadata_json) == {"scope": "team", "tags": ["runbook"]}
+
+
+def test_context_add_many_forwards_relationships():
+    ctx = Context.__new__(Context)
+    dummy = DummyInner()
+    ctx._inner = dummy  # type: ignore[attr-defined]
+
+    ctx.add_many(
+        [
+            {
+                "role": "user",
+                "content": "hello",
+                "relationships": [
+                    {"target_id": "doc-1#chunk-1", "relation": "cites"}
+                ],
+            }
+        ]
+    )
+
+    relationships_json = dummy.add_many_calls[0][0]["relationships_json"]
+    assert relationships_json is not None
+    assert json.loads(relationships_json) == [
+        {"relation": "cites", "target_id": "doc-1#chunk-1"}
+    ]
 
 
 def test_context_add_many_passes_lifecycle_fields():

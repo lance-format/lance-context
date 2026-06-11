@@ -5,9 +5,9 @@ use axum::Json;
 use chrono::Utc;
 use lance_context_api::{
     AddRecordsRequest, AddRecordsResponse, GetRecordResponse, ListRecordsResponse, RecordDto,
-    StateMetadataDto,
+    RelationshipDto, StateMetadataDto,
 };
-use lance_context_core::{ContextRecord, StateMetadata, LIFECYCLE_ACTIVE};
+use lance_context_core::{ContextRecord, Relationship, StateMetadata, LIFECYCLE_ACTIVE};
 use uuid::Uuid;
 
 use crate::error::AppError;
@@ -53,6 +53,12 @@ pub async fn add_records(
                 custom: sm.custom.clone(),
             }),
             metadata: r.metadata.clone(),
+            relationships: r
+                .relationships
+                .iter()
+                .cloned()
+                .map(dto_to_relationship)
+                .collect(),
             expires_at: r.expires_at,
             retention_policy: r.retention_policy.clone(),
             lifecycle_status: LIFECYCLE_ACTIVE.to_string(),
@@ -152,6 +158,11 @@ pub fn record_to_dto(r: ContextRecord) -> RecordDto {
             custom: sm.custom,
         }),
         metadata: r.metadata,
+        relationships: r
+            .relationships
+            .into_iter()
+            .map(relationship_to_dto)
+            .collect(),
         expires_at: r.expires_at,
         retention_policy: r.retention_policy,
         lifecycle_status: r.lifecycle_status,
@@ -159,5 +170,21 @@ pub fn record_to_dto(r: ContextRecord) -> RecordDto {
         retired_reason: r.retired_reason,
         supersedes_id: r.supersedes_id,
         superseded_by_id: r.superseded_by_id,
+    }
+}
+
+fn dto_to_relationship(r: RelationshipDto) -> Relationship {
+    Relationship {
+        target_id: r.target_id,
+        relation: r.relation,
+        weight: r.weight,
+    }
+}
+
+fn relationship_to_dto(r: Relationship) -> RelationshipDto {
+    RelationshipDto {
+        target_id: r.target_id,
+        relation: r.relation,
+        weight: r.weight,
     }
 }

@@ -145,6 +145,7 @@ def _normalize_record(raw: dict[str, Any]) -> dict[str, Any]:
         "created_at": _normalize_timestamp(raw.get("created_at")),
         "state_metadata": raw.get("state_metadata"),
         "metadata": raw.get("metadata"),
+        "relationships": raw.get("relationships") or [],
         "expires_at": _normalize_timestamp(raw.get("expires_at")),
         "retention_policy": raw.get("retention_policy"),
         "lifecycle_status": raw.get("lifecycle_status"),
@@ -171,7 +172,7 @@ _AWS_KWARG_MAP: dict[str, str] = {
 }
 
 
-def _json_dumps(value: dict[str, Any] | None, name: str) -> str | None:
+def _json_dumps(value: Any | None, name: str) -> str | None:
     if value is None:
         return None
     try:
@@ -388,6 +389,7 @@ class Context:
         session_id: str | None = None,
         external_id: str | None = None,
         metadata: dict[str, Any] | None = None,
+        relationships: list[dict[str, Any]] | None = None,
         expires_at: datetime | str | None = None,
         retention_policy: str | None = None,
         lifecycle_status: str | None = None,
@@ -417,6 +419,7 @@ class Context:
             retired_reason,
             supersedes_id,
             superseded_by_id,
+            _json_dumps(relationships, "relationships"),
         )
 
     def add_many(self, records: Iterable[Mapping[str, Any]]) -> None:
@@ -424,8 +427,9 @@ class Context:
 
         Each record accepts the same fields as :meth:`add`: ``role``,
         ``content``, optional ``content_type``/``data_type``, ``embedding``,
-        ``bot_id``, ``session_id``, ``external_id``, ``metadata``, and
-        lifecycle fields such as ``expires_at`` and ``lifecycle_status``.
+        ``bot_id``, ``session_id``, ``external_id``, ``metadata``,
+        ``relationships``, and lifecycle fields such as ``expires_at`` and
+        ``lifecycle_status``.
         """
         normalized: list[dict[str, Any]] = []
         for index, record in enumerate(records):
@@ -456,6 +460,9 @@ class Context:
                     "session_id": record.get("session_id"),
                     "external_id": record.get("external_id"),
                     "metadata_json": _json_dumps(record.get("metadata"), "metadata"),
+                    "relationships_json": _json_dumps(
+                        record.get("relationships"), "relationships"
+                    ),
                     "expires_at": _coerce_timestamp(
                         record.get("expires_at"),
                         field_name=f"records[{index}].expires_at",
@@ -492,6 +499,7 @@ class Context:
         *,
         include_expired: bool = False,
         include_retired: bool = False,
+        include_relationships: bool = False,
     ) -> list[dict[str, Any]]:
         vector = _coerce_vector(query)
         results = self._inner.search(
@@ -500,6 +508,7 @@ class Context:
             _json_dumps(filters, "filters"),
             include_expired,
             include_retired,
+            include_relationships,
         )
         return [_normalize_search_hit(item) for item in results]
 
@@ -547,6 +556,29 @@ class Context:
         if result is None:
             return None
         return _normalize_record(result)
+
+    def related(
+        self,
+        target_id: str,
+        relation: str | None = None,
+        limit: int | None = None,
+        *,
+        include_expired: bool = False,
+        include_retired: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Return records with relationships that point at ``target_id``."""
+        results = self._inner.related(
+            target_id,
+            relation,
+            limit,
+            include_expired,
+            include_retired,
+        )
+        return [_normalize_record(item) for item in results]
+
+    def migrate_relationships(self) -> bool:
+        """Add the relationships column to an older dataset if it is missing."""
+        return bool(self._inner.migrate_relationships())
 
     def delete(self, *, id: str | None = None, external_id: str | None = None) -> bool:
         """Logically forget one entry by internal id or caller-supplied external id.
@@ -681,6 +713,7 @@ class AsyncContext:
         session_id: str | None = None,
         external_id: str | None = None,
         metadata: dict[str, Any] | None = None,
+        relationships: list[dict[str, Any]] | None = None,
         expires_at: datetime | str | None = None,
         retention_policy: str | None = None,
         lifecycle_status: str | None = None,
@@ -702,6 +735,7 @@ class AsyncContext:
                 session_id=session_id,
                 external_id=external_id,
                 metadata=metadata,
+                relationships=relationships,
                 expires_at=expires_at,
                 retention_policy=retention_policy,
                 lifecycle_status=lifecycle_status,
@@ -731,6 +765,7 @@ class AsyncContext:
         *,
         include_expired: bool = False,
         include_retired: bool = False,
+        include_relationships: bool = False,
     ) -> list[dict[str, Any]]:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
@@ -741,8 +776,34 @@ class AsyncContext:
                 filters,
                 include_expired=include_expired,
                 include_retired=include_retired,
+                include_relationships=include_relationships,
             ),
         )
+
+    async def related(
+        self,
+        target_id: str,
+        relation: str | None = None,
+        limit: int | None = None,
+        *,
+        include_expired: bool = False,
+        include_retired: bool = False,
+    ) -> list[dict[str, Any]]:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self._sync.related(
+                target_id,
+                relation,
+                limit,
+                include_expired=include_expired,
+                include_retired=include_retired,
+            ),
+        )
+
+    async def migrate_relationships(self) -> bool:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._sync.migrate_relationships)
 
     async def get(
         self, *, id: str | None = None, external_id: str | None = None

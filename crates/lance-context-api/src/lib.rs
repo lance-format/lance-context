@@ -46,6 +46,7 @@ pub trait ContextStoreApi {
         &self,
         query: &[f32],
         limit: Option<usize>,
+        include_relationships: bool,
     ) -> impl Future<Output = ContextResult<Vec<SearchResultDto>>> + Send;
 
     fn version(&self) -> u64;
@@ -104,6 +105,14 @@ pub struct StateMetadataDto {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RelationshipDto {
+    pub target_id: String,
+    pub relation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight: Option<f32>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AddRecordRequest {
     #[serde(default = "default_role")]
     pub role: String,
@@ -130,6 +139,8 @@ pub struct AddRecordRequest {
     pub state_metadata: Option<StateMetadataDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relationships: Vec<RelationshipDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -178,6 +189,8 @@ pub struct RecordDto {
     pub state_metadata: Option<StateMetadataDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relationships: Vec<RelationshipDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -216,6 +229,8 @@ pub struct SearchRequest {
     pub query: Vec<f32>,
     #[serde(default = "default_search_limit")]
     pub limit: usize,
+    #[serde(default)]
+    pub include_relationships: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -16,6 +17,15 @@ pub struct StateMetadata {
     pub custom: Option<String>,
 }
 
+/// Directed relationship from this record to another graph node.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Relationship {
+    pub target_id: String,
+    pub relation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight: Option<f32>,
+}
+
 /// User-facing representation of a context entry written to storage.
 #[derive(Debug, Clone)]
 pub struct ContextRecord {
@@ -28,6 +38,7 @@ pub struct ContextRecord {
     pub role: String,
     pub state_metadata: Option<StateMetadata>,
     pub metadata: Option<Value>,
+    pub relationships: Vec<Relationship>,
     pub expires_at: Option<DateTime<Utc>>,
     pub retention_policy: Option<String>,
     pub lifecycle_status: String,
@@ -236,6 +247,7 @@ mod tests {
                 "tags": ["runbook", "ownership"],
                 "confidence": 0.92
             })),
+            relationships: Vec::new(),
             expires_at: None,
             retention_policy: None,
             lifecycle_status: LIFECYCLE_ACTIVE.to_string(),

@@ -3,10 +3,11 @@ use uuid::Uuid;
 
 use lance_context_api::{
     AddRecordRequest, AddRecordsResponse, CompactRequest, CompactResponse, CompactStatsResponse,
-    ContextError, ContextResult, ContextStoreApi, RecordDto, SearchResultDto, StateMetadataDto,
+    ContextError, ContextResult, ContextStoreApi, RecordDto, RelationshipDto, SearchResultDto,
+    StateMetadataDto,
 };
 
-use crate::record::{ContextRecord, StateMetadata, LIFECYCLE_ACTIVE};
+use crate::record::{ContextRecord, Relationship, StateMetadata, LIFECYCLE_ACTIVE};
 use crate::store::{CompactionConfig, ContextStore};
 
 impl ContextStoreApi for ContextStore {
@@ -33,6 +34,12 @@ impl ContextStoreApi for ContextStore {
                     custom: sm.custom.clone(),
                 }),
                 metadata: r.metadata.clone(),
+                relationships: r
+                    .relationships
+                    .iter()
+                    .cloned()
+                    .map(dto_to_relationship)
+                    .collect(),
                 expires_at: r.expires_at,
                 retention_policy: r.retention_policy.clone(),
                 lifecycle_status: LIFECYCLE_ACTIVE.to_string(),
@@ -76,15 +83,21 @@ impl ContextStoreApi for ContextStore {
         &self,
         query: &[f32],
         limit: Option<usize>,
+        include_relationships: bool,
     ) -> ContextResult<Vec<SearchResultDto>> {
         let results = ContextStore::search(self, query, limit)
             .await
             .map_err(to_ctx_err)?;
         Ok(results
             .into_iter()
-            .map(|sr| SearchResultDto {
-                record: record_to_dto(sr.record),
-                distance: sr.distance,
+            .map(|mut sr| {
+                if !include_relationships {
+                    sr.record.relationships.clear();
+                }
+                SearchResultDto {
+                    record: record_to_dto(sr.record),
+                    distance: sr.distance,
+                }
             })
             .collect())
     }
@@ -136,6 +149,22 @@ impl ContextStoreApi for ContextStore {
     }
 }
 
+fn dto_to_relationship(r: RelationshipDto) -> Relationship {
+    Relationship {
+        target_id: r.target_id,
+        relation: r.relation,
+        weight: r.weight,
+    }
+}
+
+fn relationship_to_dto(r: Relationship) -> RelationshipDto {
+    RelationshipDto {
+        target_id: r.target_id,
+        relation: r.relation,
+        weight: r.weight,
+    }
+}
+
 fn record_to_dto(r: ContextRecord) -> RecordDto {
     RecordDto {
         id: r.id,
@@ -156,6 +185,11 @@ fn record_to_dto(r: ContextRecord) -> RecordDto {
             custom: sm.custom,
         }),
         metadata: r.metadata,
+        relationships: r
+            .relationships
+            .into_iter()
+            .map(relationship_to_dto)
+            .collect(),
         expires_at: r.expires_at,
         retention_policy: r.retention_policy,
         lifecycle_status: r.lifecycle_status,

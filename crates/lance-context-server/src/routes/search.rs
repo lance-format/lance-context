@@ -28,9 +28,14 @@ pub async fn search(
 
     let dtos: Vec<SearchResultDto> = results
         .into_iter()
-        .map(|sr| SearchResultDto {
-            record: record_to_dto(sr.record),
-            distance: sr.distance,
+        .map(|mut sr| {
+            if !req.include_relationships {
+                sr.record.relationships.clear();
+            }
+            SearchResultDto {
+                record: record_to_dto(sr.record),
+                distance: sr.distance,
+            }
         })
         .collect();
 
