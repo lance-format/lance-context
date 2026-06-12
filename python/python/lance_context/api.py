@@ -163,6 +163,16 @@ def _normalize_search_hit(raw: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _normalize_retrieve_hit(raw: dict[str, Any]) -> dict[str, Any]:
+    """Normalize a retrieve hit with hybrid ranking diagnostics."""
+    result = _normalize_record(raw)
+    result["score"] = raw.get("score")
+    result["vector_distance"] = raw.get("vector_distance")
+    result["text_score"] = raw.get("text_score")
+    result["matched_channels"] = list(raw.get("matched_channels") or [])
+    return result
+
+
 _AWS_KWARG_MAP: dict[str, str] = {
     "aws_access_key_id": "aws_access_key_id",
     "aws_secret_access_key": "aws_secret_access_key",
@@ -512,6 +522,36 @@ class Context:
         )
         return [_normalize_search_hit(item) for item in results]
 
+    def retrieve(
+        self,
+        *,
+        text: str | None = None,
+        vector: Any | None = None,
+        limit: int | None = None,
+        filters: dict[str, Any] | None = None,
+        include_expired: bool = False,
+        include_retired: bool = False,
+        include_relationships: bool = False,
+        fusion: str = "rrf",
+    ) -> list[dict[str, Any]]:
+        if text is None and vector is None:
+            raise ValueError("retrieve requires text or vector")
+        if fusion != "rrf":
+            raise ValueError("retrieve fusion currently supports only 'rrf'")
+
+        coerced_vector = _coerce_vector(vector) if vector is not None else None
+        results = self._inner.retrieve(
+            text,
+            coerced_vector,
+            limit,
+            _json_dumps(filters, "filters"),
+            include_expired,
+            include_retired,
+            include_relationships,
+            fusion,
+        )
+        return [_normalize_retrieve_hit(item) for item in results]
+
     def list(
         self,
         limit: int | None = None,
@@ -777,6 +817,33 @@ class AsyncContext:
                 include_expired=include_expired,
                 include_retired=include_retired,
                 include_relationships=include_relationships,
+            ),
+        )
+
+    async def retrieve(
+        self,
+        *,
+        text: str | None = None,
+        vector: Any | None = None,
+        limit: int | None = None,
+        filters: dict[str, Any] | None = None,
+        include_expired: bool = False,
+        include_retired: bool = False,
+        include_relationships: bool = False,
+        fusion: str = "rrf",
+    ) -> list[dict[str, Any]]:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self._sync.retrieve(
+                text=text,
+                vector=vector,
+                limit=limit,
+                filters=filters,
+                include_expired=include_expired,
+                include_retired=include_retired,
+                include_relationships=include_relationships,
+                fusion=fusion,
             ),
         )
 

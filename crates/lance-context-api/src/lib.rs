@@ -49,6 +49,11 @@ pub trait ContextStoreApi {
         include_relationships: bool,
     ) -> impl Future<Output = ContextResult<Vec<SearchResultDto>>> + Send;
 
+    fn retrieve(
+        &self,
+        request: &RetrieveRequest,
+    ) -> impl Future<Output = ContextResult<Vec<RetrieveResultDto>>> + Send;
+
     fn version(&self) -> u64;
 
     fn checkout(&mut self, version: u64) -> impl Future<Output = ContextResult<()>> + Send;
@@ -245,6 +250,47 @@ pub struct SearchResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Hybrid retrieval
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RetrieveRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector: Option<Vec<f32>>,
+    #[serde(default = "default_search_limit")]
+    pub limit: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filters: Option<Value>,
+    #[serde(default)]
+    pub include_expired: bool,
+    #[serde(default)]
+    pub include_retired: bool,
+    #[serde(default)]
+    pub include_relationships: bool,
+    #[serde(default = "default_retrieve_fusion")]
+    pub fusion: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RetrieveResultDto {
+    pub record: RecordDto,
+    pub score: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector_distance: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_score: Option<f32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub matched_channels: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RetrieveResponse {
+    pub results: Vec<RetrieveResultDto>,
+}
+
+// ---------------------------------------------------------------------------
 // Versioning
 // ---------------------------------------------------------------------------
 
@@ -318,6 +364,10 @@ fn default_role() -> String {
 
 fn default_search_limit() -> usize {
     10
+}
+
+fn default_retrieve_fusion() -> String {
+    "rrf".to_string()
 }
 
 fn serialize_base64_opt<S>(data: &Option<Vec<u8>>, serializer: S) -> Result<S::Ok, S::Error>

@@ -129,6 +129,16 @@ pub struct SearchResult {
     pub distance: f32,
 }
 
+/// Result returned from hybrid retrieval over context records.
+#[derive(Debug, Clone)]
+pub struct RetrieveResult {
+    pub record: ContextRecord,
+    pub score: f32,
+    pub vector_distance: Option<f32>,
+    pub text_score: Option<f32>,
+    pub matched_channels: Vec<String>,
+}
+
 /// Metadata matching operation for filtered retrieval.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MetadataFilter {
@@ -149,6 +159,42 @@ pub struct RecordFilters {
 }
 
 impl RecordFilters {
+    pub fn from_json_value(value: Value) -> Result<Self, String> {
+        let Value::Object(object) = value else {
+            return Err("filters must be a JSON object".to_string());
+        };
+
+        let mut filters = RecordFilters::default();
+        for (key, value) in object {
+            match key.as_str() {
+                "bot_id" => filters.bot_id = filter_string(key.as_str(), value)?,
+                "session_id" => filters.session_id = filter_string(key.as_str(), value)?,
+                "role" => filters.role = filter_string(key.as_str(), value)?,
+                "content_type" => filters.content_type = filter_string(key.as_str(), value)?,
+                "created_at" => apply_created_at_filter(&mut filters, value)?,
+                "created_at_start" | "created_after" | "created_at_gte" => {
+                    filters.created_at_start = Some(parse_filter_datetime(&key, &value)?);
+                }
+                "created_at_end" | "created_before" | "created_at_lte" => {
+                    filters.created_at_end = Some(parse_filter_datetime(&key, &value)?);
+                }
+                _ => {
+                    let filter = match value {
+                        Value::Object(mut object)
+                            if object.len() == 1 && object.contains_key("contains") =>
+                        {
+                            MetadataFilter::Contains(object.remove("contains").unwrap())
+                        }
+                        value => MetadataFilter::Equals(value),
+                    };
+                    filters.metadata.insert(key, filter);
+                }
+            }
+        }
+
+        Ok(filters)
+    }
+
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.bot_id.is_none()
@@ -218,6 +264,47 @@ impl RecordFilters {
     }
 }
 
+fn filter_string(name: &str, value: Value) -> Result<Option<String>, String> {
+    match value {
+        Value::Null => Ok(None),
+        Value::String(value) => Ok(Some(value)),
+        _ => Err(format!("filter '{name}' must be a string or null")),
+    }
+}
+
+fn apply_created_at_filter(filters: &mut RecordFilters, value: Value) -> Result<(), String> {
+    let Value::Object(object) = value else {
+        return Err("filter 'created_at' must be an object with gte/lte bounds".to_string());
+    };
+
+    for (key, value) in object {
+        match key.as_str() {
+            "gte" | "start" | "after" => {
+                filters.created_at_start = Some(parse_filter_datetime(&key, &value)?);
+            }
+            "lte" | "end" | "before" => {
+                filters.created_at_end = Some(parse_filter_datetime(&key, &value)?);
+            }
+            other => {
+                return Err(format!("unsupported created_at filter operator '{other}'"));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_filter_datetime(name: &str, value: &Value) -> Result<DateTime<Utc>, String> {
+    let Some(value) = value.as_str() else {
+        return Err(format!(
+            "filter '{name}' must be an ISO-8601 timestamp string"
+        ));
+    };
+    DateTime::parse_from_rfc3339(value)
+        .map(|value| value.with_timezone(&Utc))
+        .map_err(|err| err.to_string())
+}
+
 fn metadata_contains(value: &Value, expected: &Value) -> bool {
     match (value, expected) {
         (Value::Array(items), expected) => items.iter().any(|item| item == expected),
@@ -264,22 +351,19 @@ mod tests {
 
     #[test]
     fn filters_match_builtin_fields_timestamps_and_metadata() {
-        let mut filters = RecordFilters {
-            bot_id: Some("support-bot".to_string()),
-            session_id: Some("incident-1".to_string()),
-            role: Some("assistant".to_string()),
-            content_type: Some("text/plain".to_string()),
-            created_at_start: Some(Utc.with_ymd_and_hms(2026, 6, 9, 2, 0, 0).unwrap()),
-            created_at_end: Some(Utc.with_ymd_and_hms(2026, 6, 9, 4, 0, 0).unwrap()),
-            metadata: HashMap::new(),
-        };
-        filters
-            .metadata
-            .insert("scope".to_string(), MetadataFilter::Equals(json!("team")));
-        filters.metadata.insert(
-            "tags".to_string(),
-            MetadataFilter::Contains(json!("runbook")),
-        );
+        let mut filters = RecordFilters::from_json_value(json!({
+            "bot_id": "support-bot",
+            "session_id": "incident-1",
+            "role": "assistant",
+            "content_type": "text/plain",
+            "created_at": {
+                "gte": "2026-06-09T02:00:00Z",
+                "lte": "2026-06-09T04:00:00Z"
+            },
+            "scope": "team",
+            "tags": {"contains": "runbook"}
+        }))
+        .unwrap();
 
         assert!(filters.matches(&record()));
 

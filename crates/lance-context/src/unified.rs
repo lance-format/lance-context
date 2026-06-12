@@ -2,7 +2,8 @@ use std::collections::HashSet;
 
 use lance_context_api::{
     AddRecordRequest, AddRecordsResponse, CompactRequest, CompactResponse, CompactStatsResponse,
-    ContextError, ContextResult, ContextStoreApi, RecordDto, SearchResultDto,
+    ContextError, ContextResult, ContextStoreApi, RecordDto, RetrieveRequest, RetrieveResultDto,
+    SearchResultDto,
 };
 use lance_context_core::{ContextStore as LocalStore, ContextStoreOptions, IdIndexType};
 
@@ -128,6 +129,10 @@ impl ContextStoreApi for ContextStore {
         include_relationships: bool,
     ) -> ContextResult<Vec<SearchResultDto>> {
         dispatch_ref!(self, search, query, limit, include_relationships)
+    }
+
+    async fn retrieve(&self, request: &RetrieveRequest) -> ContextResult<Vec<RetrieveResultDto>> {
+        dispatch_ref!(self, retrieve, request)
     }
 
     fn version(&self) -> u64 {

@@ -289,6 +289,66 @@ def test_search_applies_filters_before_limit(tmp_path: Path) -> None:
     assert hits[0]["metadata"] == {"scope": "team", "tags": ["runbook"]}
 
 
+def test_retrieve_fuses_text_vector_and_filters(tmp_path: Path) -> None:
+    uri = tmp_path / "context.lance"
+    ctx = Context.create(str(uri))
+    near = [0.0] * 1536
+    far = [0.0] * 1536
+    far[0] = 1.0
+
+    ctx.add(
+        "assistant",
+        "general rollout risk guidance",
+        embedding=near,
+        metadata={"scope": "team", "tags": ["runbook"]},
+    )
+    ctx.add(
+        "assistant",
+        "POLICY-123 blocks service-a rollouts",
+        embedding=far,
+        metadata={"scope": "team", "tags": ["policy"]},
+    )
+    ctx.add(
+        "assistant",
+        "POLICY-123 personal note for service-a",
+        embedding=far,
+        metadata={"scope": "personal", "tags": ["policy"]},
+    )
+
+    hits = ctx.retrieve(
+        text="POLICY-123 service-a",
+        vector=near,
+        limit=2,
+        filters={"scope": "team"},
+    )
+
+    assert [hit["text"] for hit in hits] == [
+        "POLICY-123 blocks service-a rollouts",
+        "general rollout risk guidance",
+    ]
+    assert hits[0]["matched_channels"] == ["vector", "text"]
+    assert hits[0]["score"] > hits[1]["score"]
+    assert hits[0]["vector_distance"] is not None
+    assert hits[0]["text_score"] == 1.0
+    assert hits[1]["matched_channels"] == ["vector"]
+
+
+def test_retrieve_supports_text_only(tmp_path: Path) -> None:
+    uri = tmp_path / "context.lance"
+    ctx = Context.create(str(uri))
+
+    ctx.add("assistant", "The rollout owner is service-a.")
+    ctx.add("assistant", "The unrelated deployment note mentions service-b.")
+
+    hits = ctx.retrieve(text="service-a rollout", limit=1)
+
+    assert len(hits) == 1
+    assert hits[0]["text"] == "The rollout owner is service-a."
+    assert hits[0]["matched_channels"] == ["text"]
+    assert hits[0]["vector_distance"] is None
+    assert hits[0]["text_score"] == 1.0
+
+
 def test_lifecycle_fields_round_trip_and_default_filtering(tmp_path: Path) -> None:
     uri = tmp_path / "context.lance"
     ctx = Context.create(str(uri))

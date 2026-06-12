@@ -119,6 +119,25 @@ async def test_search(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_retrieve(tmp_path: Path) -> None:
+    uri = str(tmp_path / "ctx.lance")
+    ctx = await AsyncContext.create(uri)
+
+    dim = 1536
+    near = [0.0] * dim
+    far = [0.0] * dim
+    far[0] = 1.0
+
+    await ctx.add("assistant", "general rollout guidance", embedding=near)
+    await ctx.add("assistant", "POLICY-123 blocks service-a", embedding=far)
+
+    results = await ctx.retrieve(text="POLICY-123 service-a", vector=near, limit=1)
+    assert len(results) == 1
+    assert results[0]["text"] == "POLICY-123 blocks service-a"
+    assert results[0]["matched_channels"] == ["vector", "text"]
+
+
+@pytest.mark.asyncio
 async def test_metadata_filters(tmp_path: Path) -> None:
     uri = str(tmp_path / "ctx.lance")
     ctx = await AsyncContext.create(uri)

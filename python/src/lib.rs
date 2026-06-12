@@ -14,8 +14,8 @@ use tokio::runtime::Runtime;
 use lance_context_core::serde::CONTENT_TYPE_TEXT;
 use lance_context_core::{
     CompactionConfig, CompactionMetrics, CompactionStats, Context as RustContext, ContextRecord,
-    ContextStore, ContextStoreOptions, IdIndexType, LifecycleQueryOptions, MetadataFilter,
-    RecordFilters, Relationship, SearchResult, LIFECYCLE_ACTIVE,
+    ContextStore, ContextStoreOptions, IdIndexType, LifecycleQueryOptions, RecordFilters,
+    Relationship, RetrieveResult, SearchResult, LIFECYCLE_ACTIVE,
 };
 
 const DEFAULT_BINARY_CONTENT_TYPE: &str = "application/octet-stream";
@@ -159,86 +159,9 @@ fn filters_from_json(filters_json: Option<String>) -> PyResult<Option<RecordFilt
         return Ok(None);
     };
     let value: Value = serde_json::from_str(&filters_json).map_err(to_py_err)?;
-    let Value::Object(object) = value else {
-        return Err(PyRuntimeError::new_err("filters must be a JSON object"));
-    };
-
-    let mut filters = RecordFilters::default();
-    for (key, value) in object {
-        match key.as_str() {
-            "bot_id" => filters.bot_id = filter_string(key.as_str(), value)?,
-            "session_id" => filters.session_id = filter_string(key.as_str(), value)?,
-            "role" => filters.role = filter_string(key.as_str(), value)?,
-            "content_type" => filters.content_type = filter_string(key.as_str(), value)?,
-            "created_at" => apply_created_at_filter(&mut filters, value)?,
-            "created_at_start" | "created_after" | "created_at_gte" => {
-                filters.created_at_start = Some(parse_filter_datetime(&key, &value)?);
-            }
-            "created_at_end" | "created_before" | "created_at_lte" => {
-                filters.created_at_end = Some(parse_filter_datetime(&key, &value)?);
-            }
-            _ => {
-                let filter = match value {
-                    Value::Object(mut object)
-                        if object.len() == 1 && object.contains_key("contains") =>
-                    {
-                        MetadataFilter::Contains(object.remove("contains").unwrap())
-                    }
-                    value => MetadataFilter::Equals(value),
-                };
-                filters.metadata.insert(key, filter);
-            }
-        }
-    }
-
-    Ok(Some(filters))
-}
-
-fn filter_string(name: &str, value: Value) -> PyResult<Option<String>> {
-    match value {
-        Value::Null => Ok(None),
-        Value::String(value) => Ok(Some(value)),
-        _ => Err(PyRuntimeError::new_err(format!(
-            "filter '{name}' must be a string or null"
-        ))),
-    }
-}
-
-fn apply_created_at_filter(filters: &mut RecordFilters, value: Value) -> PyResult<()> {
-    let Value::Object(object) = value else {
-        return Err(PyRuntimeError::new_err(
-            "filter 'created_at' must be an object with gte/lte bounds",
-        ));
-    };
-
-    for (key, value) in object {
-        match key.as_str() {
-            "gte" | "start" | "after" => {
-                filters.created_at_start = Some(parse_filter_datetime(&key, &value)?);
-            }
-            "lte" | "end" | "before" => {
-                filters.created_at_end = Some(parse_filter_datetime(&key, &value)?);
-            }
-            other => {
-                return Err(PyRuntimeError::new_err(format!(
-                    "unsupported created_at filter operator '{other}'"
-                )));
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn parse_filter_datetime(name: &str, value: &Value) -> PyResult<DateTime<Utc>> {
-    let Some(value) = value.as_str() else {
-        return Err(PyRuntimeError::new_err(format!(
-            "filter '{name}' must be an ISO-8601 timestamp string"
-        )));
-    };
-    DateTime::parse_from_rfc3339(value)
-        .map(|value| value.with_timezone(&Utc))
-        .map_err(to_py_err)
+    RecordFilters::from_json_value(value)
+        .map(Some)
+        .map_err(PyRuntimeError::new_err)
 }
 
 #[pymethods]
@@ -439,6 +362,44 @@ impl Context {
         let hits = hits_res.map_err(to_py_err)?;
         hits.into_iter()
             .map(|hit| search_hit_to_py(py, hit, include_relationships))
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (text = None, vector = None, limit = None, filters_json = None, include_expired = false, include_retired = false, include_relationships = false, fusion = None))]
+    fn retrieve(
+        &self,
+        py: Python<'_>,
+        text: Option<String>,
+        vector: Option<Vec<f32>>,
+        limit: Option<usize>,
+        filters_json: Option<String>,
+        include_expired: bool,
+        include_retired: bool,
+        include_relationships: bool,
+        fusion: Option<String>,
+    ) -> PyResult<Vec<PyObject>> {
+        if fusion.as_deref().is_some_and(|value| value != "rrf") {
+            return Err(PyRuntimeError::new_err(
+                "retrieve fusion currently supports only 'rrf'",
+            ));
+        }
+
+        let filters = filters_from_json(filters_json)?;
+        let options = LifecycleQueryOptions::new(include_expired, include_retired);
+        let hits_res = py.allow_threads(|| {
+            self.runtime
+                .block_on(self.store.retrieve_filtered_with_options(
+                    text.as_deref(),
+                    vector.as_deref(),
+                    limit,
+                    filters.as_ref(),
+                    options,
+                ))
+        });
+        let hits = hits_res.map_err(to_py_err)?;
+        hits.into_iter()
+            .map(|hit| retrieve_hit_to_py(py, hit, include_relationships))
             .collect()
     }
 
@@ -820,6 +781,31 @@ fn search_hit_to_py(
     let dict = record_to_py(py, record)?;
     let dict_ref = dict.downcast_bound::<PyDict>(py)?;
     dict_ref.set_item("distance", distance)?;
+    Ok(dict)
+}
+
+fn retrieve_hit_to_py(
+    py: Python<'_>,
+    hit: RetrieveResult,
+    include_relationships: bool,
+) -> PyResult<PyObject> {
+    let RetrieveResult {
+        record,
+        score,
+        vector_distance,
+        text_score,
+        matched_channels,
+    } = hit;
+    let mut record = record;
+    if !include_relationships {
+        record.relationships.clear();
+    }
+    let dict = record_to_py(py, record)?;
+    let dict_ref = dict.downcast_bound::<PyDict>(py)?;
+    dict_ref.set_item("score", score)?;
+    dict_ref.set_item("vector_distance", vector_distance)?;
+    dict_ref.set_item("text_score", text_score)?;
+    dict_ref.set_item("matched_channels", matched_channels)?;
     Ok(dict)
 }
 

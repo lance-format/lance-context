@@ -137,6 +137,16 @@ hits = ctx.search(
 )
 service_context = ctx.related("service://service-a", relation="describes")
 
+# Hybrid retrieval combines lexical recall, vector recall, and existing filters
+# over the same context records.
+hybrid_hits = ctx.retrieve(
+    text="service-a runbook owner",
+    vector=runbook_embedding,
+    limit=5,
+    filters={"tenant": "example-org", "scope": "team"},
+)
+print(hybrid_hits[0]["matched_channels"], hybrid_hits[0]["score"])
+
 from PIL import Image
 image = Image.new("RGB", (2, 2), color="teal")
 ctx.add("assistant", image)

@@ -3,11 +3,14 @@ use uuid::Uuid;
 
 use lance_context_api::{
     AddRecordRequest, AddRecordsResponse, CompactRequest, CompactResponse, CompactStatsResponse,
-    ContextError, ContextResult, ContextStoreApi, RecordDto, RelationshipDto, SearchResultDto,
-    StateMetadataDto,
+    ContextError, ContextResult, ContextStoreApi, RecordDto, RelationshipDto, RetrieveRequest,
+    RetrieveResultDto, SearchResultDto, StateMetadataDto,
 };
 
-use crate::record::{ContextRecord, Relationship, StateMetadata, LIFECYCLE_ACTIVE};
+use crate::record::{
+    ContextRecord, LifecycleQueryOptions, RecordFilters, Relationship, StateMetadata,
+    LIFECYCLE_ACTIVE,
+};
 use crate::store::{CompactionConfig, ContextStore};
 
 impl ContextStoreApi for ContextStore {
@@ -97,6 +100,48 @@ impl ContextStoreApi for ContextStore {
                 SearchResultDto {
                     record: record_to_dto(sr.record),
                     distance: sr.distance,
+                }
+            })
+            .collect())
+    }
+
+    async fn retrieve(&self, request: &RetrieveRequest) -> ContextResult<Vec<RetrieveResultDto>> {
+        if request.fusion != "rrf" {
+            return Err(ContextError::InvalidRequest(
+                "retrieve fusion currently supports only 'rrf'".to_string(),
+            ));
+        }
+
+        let filters = request
+            .filters
+            .clone()
+            .map(RecordFilters::from_json_value)
+            .transpose()
+            .map_err(ContextError::InvalidRequest)?;
+        let options = LifecycleQueryOptions::new(request.include_expired, request.include_retired);
+        let results = self
+            .retrieve_filtered_with_options(
+                request.text.as_deref(),
+                request.vector.as_deref(),
+                Some(request.limit),
+                filters.as_ref(),
+                options,
+            )
+            .await
+            .map_err(to_ctx_err)?;
+
+        Ok(results
+            .into_iter()
+            .map(|mut result| {
+                if !request.include_relationships {
+                    result.record.relationships.clear();
+                }
+                RetrieveResultDto {
+                    record: record_to_dto(result.record),
+                    score: result.score,
+                    vector_distance: result.vector_distance,
+                    text_score: result.text_score,
+                    matched_channels: result.matched_channels,
                 }
             })
             .collect())

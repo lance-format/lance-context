@@ -99,6 +99,15 @@ impl ContextStoreApi for RemoteContextStore {
         Ok(resp.results)
     }
 
+    async fn retrieve(&self, request: &RetrieveRequest) -> ContextResult<Vec<RetrieveResultDto>> {
+        let resp = self
+            .client
+            .retrieve(&self.context_name, request)
+            .await
+            .map_err(to_ctx_err)?;
+        Ok(resp.results)
+    }
+
     fn version(&self) -> u64 {
         self.cached_version
     }
@@ -267,6 +276,20 @@ impl ContextClient {
         let resp = self
             .http
             .post(self.url(&format!("/contexts/{}/search", name)))
+            .json(req)
+            .send()
+            .await?;
+        Self::handle_response(resp).await
+    }
+
+    pub async fn retrieve(
+        &self,
+        name: &str,
+        req: &RetrieveRequest,
+    ) -> Result<RetrieveResponse, ClientError> {
+        let resp = self
+            .http
+            .post(self.url(&format!("/contexts/{}/retrieve", name)))
             .json(req)
             .send()
             .await?;

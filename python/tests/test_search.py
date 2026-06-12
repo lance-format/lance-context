@@ -7,6 +7,7 @@ from lance_context.api import (
     Context,
     _coerce_vector,
     _normalize_record,
+    _normalize_retrieve_hit,
     _normalize_search_hit,
 )
 
@@ -16,6 +17,18 @@ class DummyInner:
         self.search_calls: list[tuple[list[float], int | None, str | None]] = []
         self.search_lifecycle_calls: list[tuple[bool, bool]] = []
         self.search_relationship_calls: list[bool] = []
+        self.retrieve_calls: list[
+            tuple[
+                str | None,
+                list[float] | None,
+                int | None,
+                str | None,
+                bool,
+                bool,
+                bool,
+                str,
+            ]
+        ] = []
         self.list_calls: list[tuple[int | None, int | None, str | None]] = []
         self.list_lifecycle_calls: list[tuple[bool, bool]] = []
         self.related_calls: list[tuple[str, str | None, int | None, bool, bool]] = []
@@ -130,6 +143,51 @@ class DummyInner:
             hit["relationships"] = [
                 {"target_id": "doc-1#chunk-1", "relation": "cites", "weight": 0.75}
             ]
+        return [hit]
+
+    def retrieve(
+        self,
+        text: str | None,
+        vector: list[float] | None,
+        limit: int | None,
+        filters_json: str | None,
+        include_expired: bool = False,
+        include_retired: bool = False,
+        include_relationships: bool = False,
+        fusion: str = "rrf",
+    ):
+        self.retrieve_calls.append(
+            (
+                text,
+                vector,
+                limit,
+                filters_json,
+                include_expired,
+                include_retired,
+                include_relationships,
+                fusion,
+            )
+        )
+        hit = self.search(
+            vector or [0.0, 0.0],
+            limit,
+            filters_json,
+            include_expired,
+            include_retired,
+            include_relationships,
+        )[0]
+        hit.pop("distance", None)
+        hit["score"] = 0.032
+        hit["vector_distance"] = 0.12 if vector is not None else None
+        hit["text_score"] = 1.0 if text else None
+        hit["matched_channels"] = [
+            channel
+            for channel, enabled in (
+                ("vector", vector is not None),
+                ("text", text is not None),
+            )
+            if enabled
+        ]
         return [hit]
 
     def add_many(self, records: list[dict[str, Any]]):
@@ -294,6 +352,72 @@ def test_context_search_can_include_relationships():
     ]
 
 
+def test_context_retrieve_forwards_hybrid_arguments():
+    ctx = Context.__new__(Context)
+    dummy = DummyInner()
+    ctx._inner = dummy  # type: ignore[attr-defined]
+
+    hits = ctx.retrieve(
+        text="POLICY-123 service-a",
+        vector=[0.5, 0.4],
+        limit=3,
+        filters={"bot_id": "support_bot", "scope": "team"},
+        include_expired=True,
+        include_retired=True,
+        include_relationships=True,
+    )
+
+    assert dummy.retrieve_calls == [
+        (
+            "POLICY-123 service-a",
+            [0.5, 0.4],
+            3,
+            '{"bot_id":"support_bot","scope":"team"}',
+            True,
+            True,
+            True,
+            "rrf",
+        )
+    ]
+    assert hits[0]["score"] == 0.032
+    assert hits[0]["vector_distance"] == 0.12
+    assert hits[0]["text_score"] == 1.0
+    assert hits[0]["matched_channels"] == ["vector", "text"]
+    assert hits[0]["relationships"] == [
+        {"target_id": "doc-1#chunk-1", "relation": "cites", "weight": 0.75}
+    ]
+
+
+def test_context_retrieve_accepts_text_only():
+    ctx = Context.__new__(Context)
+    dummy = DummyInner()
+    ctx._inner = dummy  # type: ignore[attr-defined]
+
+    hits = ctx.retrieve(text="runbook")
+
+    assert dummy.retrieve_calls[0][0] == "runbook"
+    assert dummy.retrieve_calls[0][1] is None
+    assert hits[0]["matched_channels"] == ["text"]
+
+
+def test_context_retrieve_requires_text_or_vector():
+    ctx = Context.__new__(Context)
+    dummy = DummyInner()
+    ctx._inner = dummy  # type: ignore[attr-defined]
+
+    with pytest.raises(ValueError, match="requires text or vector"):
+        ctx.retrieve()
+
+
+def test_context_retrieve_rejects_unknown_fusion():
+    ctx = Context.__new__(Context)
+    dummy = DummyInner()
+    ctx._inner = dummy  # type: ignore[attr-defined]
+
+    with pytest.raises(ValueError, match="supports only 'rrf'"):
+        ctx.retrieve(text="runbook", fusion="weighted")
+
+
 def test_normalize_record_without_distance():
     result = _normalize_record(
         {
@@ -337,6 +461,32 @@ def test_normalize_record_with_relationships():
     assert result["relationships"] == [
         {"target_id": "service-a", "relation": "mentions", "weight": None}
     ]
+
+
+def test_normalize_retrieve_hit_with_scores():
+    result = _normalize_retrieve_hit(
+        {
+            "id": "rec-1",
+            "external_id": None,
+            "created_at": "2024-01-01T00:00:00Z",
+            "content_type": "text/plain",
+            "text_payload": "hello",
+            "binary_payload": None,
+            "embedding": None,
+            "run_id": "run-1",
+            "role": "user",
+            "state_metadata": None,
+            "score": 0.032,
+            "vector_distance": 0.12,
+            "text_score": 1.0,
+            "matched_channels": ["vector", "text"],
+        }
+    )
+
+    assert result["score"] == 0.032
+    assert result["vector_distance"] == 0.12
+    assert result["text_score"] == 1.0
+    assert result["matched_channels"] == ["vector", "text"]
 
 
 def test_context_list_returns_entries():
@@ -876,9 +1026,7 @@ def test_context_add_many_forwards_relationships():
             {
                 "role": "user",
                 "content": "hello",
-                "relationships": [
-                    {"target_id": "doc-1#chunk-1", "relation": "cites"}
-                ],
+                "relationships": [{"target_id": "doc-1#chunk-1", "relation": "cites"}],
             }
         ]
     )

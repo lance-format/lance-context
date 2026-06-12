@@ -32,6 +32,7 @@ pub fn router() -> Router<Arc<AppState>> {
             get(records::get_record),
         )
         .route("/api/v1/contexts/{name}/search", post(search::search))
+        .route("/api/v1/contexts/{name}/retrieve", post(search::retrieve))
         .route(
             "/api/v1/contexts/{name}/version",
             get(versions::get_version),

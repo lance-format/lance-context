@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,8 +35,8 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::record::{
-    ContextRecord, LifecycleQueryOptions, RecordFilters, Relationship, SearchResult, StateMetadata,
-    LIFECYCLE_ACTIVE,
+    ContextRecord, LifecycleQueryOptions, RecordFilters, Relationship, RetrieveResult,
+    SearchResult, StateMetadata, LIFECYCLE_ACTIVE,
 };
 use crate::serde::CONTENT_TYPE_TOMBSTONE;
 
@@ -43,6 +44,7 @@ use crate::serde::CONTENT_TYPE_TOMBSTONE;
 const DEFAULT_EMBEDDING_DIM: i32 = 1536;
 const DEFAULT_SEARCH_LIMIT: usize = 10;
 const DEFAULT_MANIFEST_SCAN_BATCH_SIZE: usize = 16;
+const RRF_K: f32 = 60.0;
 const ID_INDEX_NAME: &str = "id_idx";
 const RELATIONSHIPS_COLUMN: &str = "relationships";
 
@@ -646,14 +648,7 @@ impl ContextStore {
         filters: Option<&RecordFilters>,
         options: LifecycleQueryOptions,
     ) -> LanceResult<Vec<SearchResult>> {
-        if query.len() != DEFAULT_EMBEDDING_DIM as usize {
-            return Err(ArrowError::InvalidArgumentError(format!(
-                "query length {} does not match embedding dimension {}",
-                query.len(),
-                DEFAULT_EMBEDDING_DIM
-            ))
-            .into());
-        }
+        validate_query_dimension(query)?;
 
         let top_k = limit.unwrap_or(DEFAULT_SEARCH_LIMIT);
         if top_k == 0 {
@@ -670,6 +665,100 @@ impl ContextStore {
             })
             .collect();
         results.sort_by(|left, right| left.distance.total_cmp(&right.distance));
+        results.truncate(top_k);
+        Ok(results)
+    }
+
+    /// Retrieve records using optional text and vector channels, after filters and lifecycle visibility.
+    pub async fn retrieve_filtered_with_options(
+        &self,
+        text: Option<&str>,
+        vector: Option<&[f32]>,
+        limit: Option<usize>,
+        filters: Option<&RecordFilters>,
+        options: LifecycleQueryOptions,
+    ) -> LanceResult<Vec<RetrieveResult>> {
+        let text_terms = text.map(unique_query_terms).unwrap_or_default();
+        let has_text = !text_terms.is_empty();
+
+        if !has_text && vector.is_none() {
+            return Err(ArrowError::InvalidArgumentError(
+                "retrieve requires text or vector".to_string(),
+            )
+            .into());
+        }
+
+        if let Some(query) = vector {
+            validate_query_dimension(query)?;
+        }
+
+        let top_k = limit.unwrap_or(DEFAULT_SEARCH_LIMIT);
+        if top_k == 0 {
+            return Ok(Vec::new());
+        }
+
+        let records = self
+            .list_filtered_with_options(None, None, filters, options)
+            .await?;
+        let mut candidates: HashMap<String, RetrieveResult> = HashMap::new();
+
+        if let Some(query) = vector {
+            let mut vector_hits: Vec<(usize, f32)> = records
+                .iter()
+                .enumerate()
+                .filter_map(|(index, record)| {
+                    let distance = l2_distance(query, record.embedding.as_ref()?);
+                    Some((index, distance))
+                })
+                .collect();
+            vector_hits.sort_by(|left, right| {
+                left.1
+                    .total_cmp(&right.1)
+                    .then_with(|| records[left.0].id.cmp(&records[right.0].id))
+            });
+
+            for (rank, (index, distance)) in vector_hits.into_iter().enumerate() {
+                add_retrieve_channel(
+                    &mut candidates,
+                    &records[index],
+                    rank + 1,
+                    "vector",
+                    Some(distance),
+                    None,
+                );
+            }
+        }
+
+        if has_text {
+            let mut text_hits: Vec<(usize, f32)> = records
+                .iter()
+                .enumerate()
+                .filter_map(|(index, record)| {
+                    lexical_score(&text_terms, record.text_payload.as_deref())
+                        .map(|score| (index, score))
+                })
+                .collect();
+            text_hits.sort_by(|left, right| {
+                right
+                    .1
+                    .total_cmp(&left.1)
+                    .then_with(|| records[left.0].id.cmp(&records[right.0].id))
+            });
+
+            for (rank, (index, score)) in text_hits.into_iter().enumerate() {
+                add_retrieve_channel(
+                    &mut candidates,
+                    &records[index],
+                    rank + 1,
+                    "text",
+                    None,
+                    Some(score),
+                );
+            }
+        }
+
+        let mut results: Vec<RetrieveResult> = candidates.into_values().collect();
+        results.sort_by(compare_retrieve_results);
         results.truncate(top_k);
         Ok(results)
     }
@@ -1755,6 +1844,127 @@ fn l2_distance(left: &[f32], right: &[f32]) -> f32 {
         .sqrt()
 }
 
+fn validate_query_dimension(query: &[f32]) -> LanceResult<()> {
+    if query.len() != DEFAULT_EMBEDDING_DIM as usize {
+        return Err(ArrowError::InvalidArgumentError(format!(
+            "query length {} does not match embedding dimension {}",
+            query.len(),
+            DEFAULT_EMBEDDING_DIM
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+fn unique_query_terms(text: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    tokenize_for_retrieval(text)
+        .into_iter()
+        .filter(|term| seen.insert(term.clone()))
+        .collect()
+}
+
+fn tokenize_for_retrieval(text: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    let mut current = String::new();
+
+    for character in text.chars() {
+        if character.is_alphanumeric() {
+            current.extend(character.to_lowercase());
+        } else if !current.is_empty() {
+            terms.push(std::mem::take(&mut current));
+        }
+    }
+
+    if !current.is_empty() {
+        terms.push(current);
+    }
+
+    terms
+}
+
+fn lexical_score(query_terms: &[String], text: Option<&str>) -> Option<f32> {
+    let text = text?;
+    if query_terms.is_empty() {
+        return None;
+    }
+
+    let payload_terms: HashSet<String> = tokenize_for_retrieval(text).into_iter().collect();
+    if payload_terms.is_empty() {
+        return None;
+    }
+
+    let matched_terms = query_terms
+        .iter()
+        .filter(|term| payload_terms.contains(*term))
+        .count();
+    if matched_terms == 0 {
+        return None;
+    }
+
+    Some(matched_terms as f32 / query_terms.len() as f32)
+}
+
+fn add_retrieve_channel(
+    candidates: &mut HashMap<String, RetrieveResult>,
+    record: &ContextRecord,
+    rank: usize,
+    channel: &str,
+    vector_distance: Option<f32>,
+    text_score: Option<f32>,
+) {
+    let candidate = candidates
+        .entry(record.id.clone())
+        .or_insert_with(|| RetrieveResult {
+            record: record.clone(),
+            score: 0.0,
+            vector_distance: None,
+            text_score: None,
+            matched_channels: Vec::new(),
+        });
+    candidate.score += 1.0 / (RRF_K + rank as f32);
+    if let Some(distance) = vector_distance {
+        candidate.vector_distance = Some(distance);
+    }
+    if let Some(score) = text_score {
+        candidate.text_score = Some(score);
+    }
+    if !candidate
+        .matched_channels
+        .iter()
+        .any(|existing| existing == channel)
+    {
+        candidate.matched_channels.push(channel.to_string());
+    }
+}
+
+fn compare_retrieve_results(left: &RetrieveResult, right: &RetrieveResult) -> Ordering {
+    right
+        .score
+        .total_cmp(&left.score)
+        .then_with(|| compare_optional_distance(left.vector_distance, right.vector_distance))
+        .then_with(|| compare_optional_score(left.text_score, right.text_score))
+        .then_with(|| left.record.id.cmp(&right.record.id))
+}
+
+fn compare_optional_distance(left: Option<f32>, right: Option<f32>) -> Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => left.total_cmp(&right),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+fn compare_optional_score(left: Option<f32>, right: Option<f32>) -> Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => right.total_cmp(&left),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
 fn column_as<'a, A>(batch: &'a RecordBatch, name: &str) -> LanceResult<&'a A>
 where
     A: Array + 'static,
@@ -1863,6 +2073,44 @@ mod tests {
                 message.contains("embedding dimension"),
                 "unexpected error message: {message}"
             );
+        });
+    }
+
+    #[test]
+    fn retrieve_fuses_text_and_vector_channels() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = ContextStore::open(&uri).await.unwrap();
+            let mut semantic_near = text_record("semantic-near", 0.0);
+            semantic_near.text_payload = Some("general rollout risk guidance".to_string());
+            let mut exact_policy = text_record("exact-policy", 1.0);
+            exact_policy.text_payload = Some("POLICY-123 blocks service-a rollouts".to_string());
+
+            store
+                .add(&[semantic_near.clone(), exact_policy.clone()])
+                .await
+                .unwrap();
+
+            let query = make_embedding(0.0);
+            let results = store
+                .retrieve_filtered_with_options(
+                    Some("POLICY-123 service-a"),
+                    Some(&query),
+                    Some(2),
+                    None,
+                    LifecycleQueryOptions::default(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(results.len(), 2);
+            assert_eq!(results[0].record.id, exact_policy.id);
+            assert!(results[0].score > results[1].score);
+            assert!(results[0].vector_distance.is_some());
+            assert_eq!(results[0].text_score, Some(1.0));
+            assert_eq!(results[0].matched_channels, ["vector", "text"]);
         });
     }
 
