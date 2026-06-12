@@ -31,6 +31,12 @@ def _embedding(pivot: float) -> list[float]:
     return values
 
 
+def _embedding_with_dim(dim: int, pivot: float) -> list[float]:
+    values = [0.0] * dim
+    values[0] = pivot
+    return values
+
+
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -347,6 +353,26 @@ def test_retrieve_supports_text_only(tmp_path: Path) -> None:
     assert hits[0]["matched_channels"] == ["text"]
     assert hits[0]["vector_distance"] is None
     assert hits[0]["text_score"] == 1.0
+
+
+def test_custom_embedding_dimension_round_trips(tmp_path: Path) -> None:
+    uri = tmp_path / "context.lance"
+    ctx = Context.create(str(uri), embedding_dim=3)
+    near = _embedding_with_dim(3, 0.0)
+    far = _embedding_with_dim(3, 1.0)
+
+    ctx.add("assistant", "small vector near", embedding=near)
+    ctx.add("assistant", "small vector far", embedding=far)
+
+    hits = ctx.search(far, limit=1)
+    assert hits[0]["text"] == "small vector far"
+
+    reopened = Context.create(str(uri))
+    hits = reopened.search(far, limit=1)
+    assert hits[0]["text"] == "small vector far"
+
+    with pytest.raises(RuntimeError, match="embedding dimension 3"):
+        reopened.search(_embedding(1.0), limit=1)
 
 
 def test_lifecycle_fields_round_trip_and_default_filtering(tmp_path: Path) -> None:

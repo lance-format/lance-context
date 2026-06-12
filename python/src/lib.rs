@@ -167,7 +167,8 @@ fn filters_from_json(filters_json: Option<String>) -> PyResult<Option<RecordFilt
 #[pymethods]
 impl Context {
     #[classmethod]
-    #[pyo3(signature = (uri, *, storage_options=None, compaction_config=None, blob_columns=None, id_index_type=None))]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (uri, *, storage_options=None, compaction_config=None, blob_columns=None, id_index_type=None, embedding_dim=None))]
     fn create(
         _cls: &Bound<'_, PyType>,
         py: Python<'_>,
@@ -176,6 +177,7 @@ impl Context {
         compaction_config: Option<&Bound<'_, PyDict>>,
         blob_columns: Option<Vec<String>>,
         id_index_type: Option<String>,
+        embedding_dim: Option<i32>,
     ) -> PyResult<Self> {
         let runtime = Arc::new(Runtime::new().map_err(to_py_err)?);
 
@@ -196,6 +198,7 @@ impl Context {
         let options = ContextStoreOptions {
             storage_options: storage_options_from_dict(storage_options)?,
             compaction: compaction_config_from_dict(compaction_config)?,
+            embedding_dim,
             blob_columns: blob_set,
             id_index_type: id_idx,
         };

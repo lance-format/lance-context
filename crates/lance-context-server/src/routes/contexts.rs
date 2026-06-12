@@ -40,6 +40,7 @@ pub async fn create_context(
     let uri = state.context_uri(&req.name);
     let options = ContextStoreOptions {
         storage_options: req.storage_options,
+        embedding_dim: req.embedding_dim,
         blob_columns,
         id_index_type,
         ..Default::default()

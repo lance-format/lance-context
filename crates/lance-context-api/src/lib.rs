@@ -79,6 +79,8 @@ pub struct CreateContextRequest {
     pub id_index_type: Option<String>,
     #[serde(default)]
     pub blob_columns: Option<Vec<String>>,
+    #[serde(default)]
+    pub embedding_dim: Option<i32>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
