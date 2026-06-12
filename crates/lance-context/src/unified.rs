@@ -2,8 +2,8 @@ use std::collections::HashSet;
 
 use lance_context_api::{
     AddRecordRequest, AddRecordsResponse, CompactRequest, CompactResponse, CompactStatsResponse,
-    ContextError, ContextResult, ContextStoreApi, RecordDto, RetrieveRequest, RetrieveResultDto,
-    SearchResultDto,
+    ContextError, ContextResult, ContextStoreApi, DeleteRecordResponse, RecordDto, RetrieveRequest,
+    RetrieveResultDto, SearchResultDto,
 };
 use lance_context_core::{ContextStore as LocalStore, ContextStoreOptions, IdIndexType};
 
@@ -114,12 +114,46 @@ impl ContextStoreApi for ContextStore {
         dispatch_ref!(self, get, id)
     }
 
+    async fn get_by_external_id(&self, external_id: &str) -> ContextResult<Option<RecordDto>> {
+        dispatch_ref!(self, get_by_external_id, external_id)
+    }
+
+    async fn delete_by_id(&mut self, id: &str) -> ContextResult<DeleteRecordResponse> {
+        dispatch_mut!(self, delete_by_id, id)
+    }
+
+    async fn delete_by_external_id(
+        &mut self,
+        external_id: &str,
+    ) -> ContextResult<DeleteRecordResponse> {
+        dispatch_mut!(self, delete_by_external_id, external_id)
+    }
+
     async fn list(
         &self,
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> ContextResult<Vec<RecordDto>> {
         dispatch_ref!(self, list, limit, offset)
+    }
+
+    async fn related(
+        &self,
+        target_id: &str,
+        relation: Option<&str>,
+        limit: Option<usize>,
+        include_expired: bool,
+        include_retired: bool,
+    ) -> ContextResult<Vec<RecordDto>> {
+        dispatch_ref!(
+            self,
+            related,
+            target_id,
+            relation,
+            limit,
+            include_expired,
+            include_retired
+        )
     }
 
     async fn search(

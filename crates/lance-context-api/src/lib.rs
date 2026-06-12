@@ -36,10 +36,34 @@ pub trait ContextStoreApi {
 
     fn get(&self, id: &str) -> impl Future<Output = ContextResult<Option<RecordDto>>> + Send;
 
+    fn get_by_external_id(
+        &self,
+        external_id: &str,
+    ) -> impl Future<Output = ContextResult<Option<RecordDto>>> + Send;
+
+    fn delete_by_id(
+        &mut self,
+        id: &str,
+    ) -> impl Future<Output = ContextResult<DeleteRecordResponse>> + Send;
+
+    fn delete_by_external_id(
+        &mut self,
+        external_id: &str,
+    ) -> impl Future<Output = ContextResult<DeleteRecordResponse>> + Send;
+
     fn list(
         &self,
         limit: Option<usize>,
         offset: Option<usize>,
+    ) -> impl Future<Output = ContextResult<Vec<RecordDto>>> + Send;
+
+    fn related(
+        &self,
+        target_id: &str,
+        relation: Option<&str>,
+        limit: Option<usize>,
+        include_expired: bool,
+        include_retired: bool,
     ) -> impl Future<Output = ContextResult<Vec<RecordDto>>> + Send;
 
     fn search(
@@ -223,6 +247,12 @@ pub struct ListRecordsResponse {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GetRecordResponse {
     pub record: Option<RecordDto>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DeleteRecordResponse {
+    pub deleted: bool,
+    pub version: u64,
 }
 
 // ---------------------------------------------------------------------------

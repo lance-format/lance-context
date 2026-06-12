@@ -67,6 +67,38 @@ impl ContextStoreApi for RemoteContextStore {
         Ok(resp.record)
     }
 
+    async fn get_by_external_id(&self, external_id: &str) -> ContextResult<Option<RecordDto>> {
+        let resp = self
+            .client
+            .get_record_by_external_id(&self.context_name, external_id)
+            .await
+            .map_err(to_ctx_err)?;
+        Ok(resp.record)
+    }
+
+    async fn delete_by_id(&mut self, id: &str) -> ContextResult<DeleteRecordResponse> {
+        let resp = self
+            .client
+            .delete_record(&self.context_name, id)
+            .await
+            .map_err(to_ctx_err)?;
+        self.cached_version = resp.version;
+        Ok(resp)
+    }
+
+    async fn delete_by_external_id(
+        &mut self,
+        external_id: &str,
+    ) -> ContextResult<DeleteRecordResponse> {
+        let resp = self
+            .client
+            .delete_record_by_external_id(&self.context_name, external_id)
+            .await
+            .map_err(to_ctx_err)?;
+        self.cached_version = resp.version;
+        Ok(resp)
+    }
+
     async fn list(
         &self,
         limit: Option<usize>,
@@ -75,6 +107,29 @@ impl ContextStoreApi for RemoteContextStore {
         let resp = self
             .client
             .list_records(&self.context_name, limit, offset)
+            .await
+            .map_err(to_ctx_err)?;
+        Ok(resp.records)
+    }
+
+    async fn related(
+        &self,
+        target_id: &str,
+        relation: Option<&str>,
+        limit: Option<usize>,
+        include_expired: bool,
+        include_retired: bool,
+    ) -> ContextResult<Vec<RecordDto>> {
+        let resp = self
+            .client
+            .related_records(
+                &self.context_name,
+                target_id,
+                relation,
+                limit,
+                include_expired,
+                include_retired,
+            )
             .await
             .map_err(to_ctx_err)?;
         Ok(resp.records)
@@ -246,6 +301,47 @@ impl ContextClient {
         Self::handle_response(resp).await
     }
 
+    pub async fn get_record_by_external_id(
+        &self,
+        name: &str,
+        external_id: &str,
+    ) -> Result<GetRecordResponse, ClientError> {
+        let resp = self
+            .http
+            .get(self.url(&format!("/contexts/{}/records/by-external-id", name)))
+            .query(&[("external_id", external_id)])
+            .send()
+            .await?;
+        Self::handle_response(resp).await
+    }
+
+    pub async fn delete_record(
+        &self,
+        name: &str,
+        id: &str,
+    ) -> Result<DeleteRecordResponse, ClientError> {
+        let resp = self
+            .http
+            .delete(self.url(&format!("/contexts/{}/records/{}", name, id)))
+            .send()
+            .await?;
+        Self::handle_response(resp).await
+    }
+
+    pub async fn delete_record_by_external_id(
+        &self,
+        name: &str,
+        external_id: &str,
+    ) -> Result<DeleteRecordResponse, ClientError> {
+        let resp = self
+            .http
+            .delete(self.url(&format!("/contexts/{}/records", name)))
+            .query(&[("external_id", external_id)])
+            .send()
+            .await?;
+        Self::handle_response(resp).await
+    }
+
     pub async fn list_records(
         &self,
         name: &str,
@@ -265,6 +361,36 @@ impl ContextClient {
         }
 
         let resp = self.http.get(&url).send().await?;
+        Self::handle_response(resp).await
+    }
+
+    pub async fn related_records(
+        &self,
+        name: &str,
+        target_id: &str,
+        relation: Option<&str>,
+        limit: Option<usize>,
+        include_expired: bool,
+        include_retired: bool,
+    ) -> Result<ListRecordsResponse, ClientError> {
+        let mut request = self
+            .http
+            .get(self.url(&format!("/contexts/{}/records/related", name)))
+            .query(&[("target_id", target_id)]);
+        if let Some(relation) = relation {
+            request = request.query(&[("relation", relation)]);
+        }
+        if let Some(limit) = limit {
+            request = request.query(&[("limit", limit)]);
+        }
+        if include_expired {
+            request = request.query(&[("include_expired", include_expired)]);
+        }
+        if include_retired {
+            request = request.query(&[("include_retired", include_retired)]);
+        }
+
+        let resp = request.send().await?;
         Self::handle_response(resp).await
     }
 

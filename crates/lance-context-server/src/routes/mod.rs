@@ -28,8 +28,24 @@ pub fn router() -> Router<Arc<AppState>> {
             get(records::list_records),
         )
         .route(
+            "/api/v1/contexts/{name}/records",
+            delete(records::delete_record_by_external_id),
+        )
+        .route(
+            "/api/v1/contexts/{name}/records/by-external-id",
+            get(records::get_record_by_external_id),
+        )
+        .route(
+            "/api/v1/contexts/{name}/records/related",
+            get(records::related_records),
+        )
+        .route(
             "/api/v1/contexts/{name}/records/{id}",
             get(records::get_record),
+        )
+        .route(
+            "/api/v1/contexts/{name}/records/{id}",
+            delete(records::delete_record),
         )
         .route("/api/v1/contexts/{name}/search", post(search::search))
         .route("/api/v1/contexts/{name}/retrieve", post(search::retrieve))
@@ -43,4 +59,14 @@ pub fn router() -> Router<Arc<AppState>> {
             "/api/v1/contexts/{name}/compact/stats",
             get(compact::compact_stats),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn router_builds_with_record_parity_routes() {
+        let _ = router();
+    }
 }

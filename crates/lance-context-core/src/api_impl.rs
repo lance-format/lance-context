@@ -3,8 +3,8 @@ use uuid::Uuid;
 
 use lance_context_api::{
     AddRecordRequest, AddRecordsResponse, CompactRequest, CompactResponse, CompactStatsResponse,
-    ContextError, ContextResult, ContextStoreApi, RecordDto, RelationshipDto, RetrieveRequest,
-    RetrieveResultDto, SearchResultDto, StateMetadataDto,
+    ContextError, ContextResult, ContextStoreApi, DeleteRecordResponse, RecordDto, RelationshipDto,
+    RetrieveRequest, RetrieveResultDto, SearchResultDto, StateMetadataDto,
 };
 
 use crate::record::{
@@ -71,6 +71,36 @@ impl ContextStoreApi for ContextStore {
         Ok(record.map(record_to_dto))
     }
 
+    async fn get_by_external_id(&self, external_id: &str) -> ContextResult<Option<RecordDto>> {
+        let record = ContextStore::get_by_external_id(self, external_id)
+            .await
+            .map_err(to_ctx_err)?;
+        Ok(record.map(record_to_dto))
+    }
+
+    async fn delete_by_id(&mut self, id: &str) -> ContextResult<DeleteRecordResponse> {
+        let deleted = ContextStore::delete_by_id(self, id)
+            .await
+            .map_err(to_ctx_err)?;
+        Ok(DeleteRecordResponse {
+            deleted,
+            version: ContextStore::version(self),
+        })
+    }
+
+    async fn delete_by_external_id(
+        &mut self,
+        external_id: &str,
+    ) -> ContextResult<DeleteRecordResponse> {
+        let deleted = ContextStore::delete_by_external_id(self, external_id)
+            .await
+            .map_err(to_ctx_err)?;
+        Ok(DeleteRecordResponse {
+            deleted,
+            version: ContextStore::version(self),
+        })
+    }
+
     async fn list(
         &self,
         limit: Option<usize>,
@@ -79,6 +109,22 @@ impl ContextStoreApi for ContextStore {
         let records = ContextStore::list(self, limit, offset)
             .await
             .map_err(to_ctx_err)?;
+        Ok(records.into_iter().map(record_to_dto).collect())
+    }
+
+    async fn related(
+        &self,
+        target_id: &str,
+        relation: Option<&str>,
+        limit: Option<usize>,
+        include_expired: bool,
+        include_retired: bool,
+    ) -> ContextResult<Vec<RecordDto>> {
+        let options = LifecycleQueryOptions::new(include_expired, include_retired);
+        let records =
+            ContextStore::list_related_with_options(self, target_id, relation, limit, options)
+                .await
+                .map_err(to_ctx_err)?;
         Ok(records.into_iter().map(record_to_dto).collect())
     }
 
