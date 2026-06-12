@@ -37,6 +37,8 @@ requires = ["maturin>=1.4"]
 build-backend = "maturin"
 
 [project.optional-dependencies]
+openai = ["openai>=1.0"]
+sentence-transformers = ["sentence-transformers>=2.0"]
 graph = ["lance-graph==0.5.4"]
 lance-python = [
     "pylance>=7.0.0,<8",

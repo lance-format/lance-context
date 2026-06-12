@@ -10,8 +10,9 @@ from typing import Any
 
 from ._internal import Context as _Context  # pyright: ignore[reportMissingImports]
 from ._internal import version as _version  # pyright: ignore[reportMissingImports]
+from .embeddings import EmbeddingProvider, _build_provider
 
-__all__ = ["AsyncContext", "Context", "__version__"]
+__all__ = ["AsyncContext", "Context", "EmbeddingProvider", "__version__"]
 
 __version__ = _version()
 
@@ -313,6 +314,8 @@ class Context:
         id_index_type: str | None = None,
         embedding_dim: int | None = None,
         distance_metric: str | None = None,
+        # --- Embedding provider. ---
+        embedding_provider: EmbeddingProvider | dict[str, Any] | None = None,
     ) -> None:
         options = _merge_storage_options(
             storage_options,
@@ -350,6 +353,13 @@ class Context:
         else:
             self._inner = _Context.create(uri)
 
+        if isinstance(embedding_provider, dict):
+            self._embedding_provider: EmbeddingProvider | None = _build_provider(
+                embedding_provider
+            )
+        else:
+            self._embedding_provider = embedding_provider
+
     @classmethod
     def create(
         cls,
@@ -370,6 +380,7 @@ class Context:
         id_index_type: str | None = None,
         embedding_dim: int | None = None,
         distance_metric: str | None = None,
+        embedding_provider: EmbeddingProvider | dict[str, Any] | None = None,
     ) -> Context:
         return cls(
             uri,
@@ -388,6 +399,7 @@ class Context:
             id_index_type=id_index_type,
             embedding_dim=embedding_dim,
             distance_metric=distance_metric,
+            embedding_provider=embedding_provider,
         )
 
     def uri(self) -> str:
@@ -427,6 +439,9 @@ class Context:
         if content_type is None:
             content_type = data_type
         payload, resolved_type = _normalize_content(content, content_type)
+        provider = getattr(self, "_embedding_provider", None)
+        if embedding is None and provider is not None and isinstance(payload, str):
+            embedding = provider.embed_texts([payload])[0]
         self._inner.add(
             role,
             payload,
@@ -477,6 +492,9 @@ class Context:
             content_type = data_type
 
         payload, resolved_type = _normalize_content(content, content_type)
+        provider = getattr(self, "_embedding_provider", None)
+        if embedding is None and provider is not None and isinstance(payload, str):
+            embedding = provider.embed_texts([payload])[0]
         result = self._inner.upsert(
             role,
             payload,
@@ -610,14 +628,32 @@ class Context:
                 }
             )
 
+        self._auto_embed_batch(normalized)
         self._inner.add_many(normalized)
+
+    def _auto_embed_batch(self, records: list[dict[str, Any]]) -> None:
+        """Embed text records without an embedding in one provider call."""
+        provider = getattr(self, "_embedding_provider", None)
+        if provider is None:
+            return
+        indices = [
+            i
+            for i, r in enumerate(records)
+            if r.get("embedding") is None and isinstance(r.get("content"), str)
+        ]
+        if not indices:
+            return
+        texts = [records[i]["content"] for i in indices]
+        vectors = provider.embed_texts(texts)
+        for i, vec in zip(indices, vectors):
+            records[i]["embedding"] = vec
 
     def snapshot(self, label: str | None = None) -> str:
         return self._inner.snapshot(label)
 
     def fork(self, branch_name: str) -> Context:
         inner = self._inner.fork(branch_name)
-        return self._from_inner(inner)
+        return self._from_inner(inner, self._embedding_provider)
 
     def checkout(self, version_id: int | str) -> None:
         self._inner.checkout(int(version_id))
@@ -632,6 +668,9 @@ class Context:
         include_retired: bool = False,
         include_relationships: bool = False,
     ) -> list[dict[str, Any]]:
+        provider = getattr(self, "_embedding_provider", None)
+        if isinstance(query, str) and provider is not None:
+            query = provider.embed_texts([query])[0]
         vector = _coerce_vector(query)
         results = self._inner.search(
             vector,
@@ -815,9 +854,12 @@ class Context:
         )
 
     @classmethod
-    def _from_inner(cls, inner: _Context) -> Context:
+    def _from_inner(
+        cls, inner: _Context, embedding_provider: EmbeddingProvider | None = None
+    ) -> Context:
         obj = cls.__new__(cls)
         obj._inner = inner
+        obj._embedding_provider = embedding_provider
         return obj
 
 
