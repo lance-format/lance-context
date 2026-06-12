@@ -152,6 +152,45 @@ pub struct UpsertResult {
     pub version: u64,
 }
 
+/// Mutable fields that can be patched without resupplying the payload.
+#[derive(Debug, Clone, Default)]
+pub struct RecordPatch {
+    pub bot_id: Option<String>,
+    pub session_id: Option<String>,
+    pub state_metadata: Option<StateMetadata>,
+    pub metadata: Option<Value>,
+    pub relationships: Option<Vec<Relationship>>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub retention_policy: Option<String>,
+    pub lifecycle_status: Option<String>,
+    pub retired_at: Option<DateTime<Utc>>,
+    pub retired_reason: Option<String>,
+}
+
+impl RecordPatch {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.bot_id.is_none()
+            && self.session_id.is_none()
+            && self.state_metadata.is_none()
+            && self.metadata.is_none()
+            && self.relationships.is_none()
+            && self.expires_at.is_none()
+            && self.retention_policy.is_none()
+            && self.lifecycle_status.is_none()
+            && self.retired_at.is_none()
+            && self.retired_reason.is_none()
+    }
+}
+
+/// Result returned from partial record update operations.
+#[derive(Debug, Clone)]
+pub struct UpdateResult {
+    pub record: ContextRecord,
+    pub replaced_id: String,
+    pub version: u64,
+}
+
 /// Metadata matching operation for filtered retrieval.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MetadataFilter {

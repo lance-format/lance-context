@@ -5,11 +5,12 @@ use axum::Json;
 use chrono::Utc;
 use lance_context_api::{
     AddRecordsRequest, AddRecordsResponse, DeleteRecordResponse, GetRecordResponse,
-    ListRecordsResponse, RecordDto, RelationshipDto, StateMetadataDto, UpsertRecordRequest,
-    UpsertRecordResponse,
+    ListRecordsResponse, RecordDto, RecordPatchDto, RelationshipDto, StateMetadataDto,
+    UpdateRecordRequest, UpdateRecordResponse, UpsertRecordRequest, UpsertRecordResponse,
 };
 use lance_context_core::{
-    ContextRecord, LifecycleQueryOptions, Relationship, StateMetadata, LIFECYCLE_ACTIVE,
+    ContextRecord, LifecycleQueryOptions, RecordPatch, Relationship, StateMetadata,
+    LIFECYCLE_ACTIVE,
 };
 use uuid::Uuid;
 
@@ -110,6 +111,58 @@ pub async fn upsert_record(
             record: record_to_dto(result.record),
         }),
     ))
+}
+
+pub async fn update_record(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(req): Json<UpdateRecordRequest>,
+) -> Result<Json<UpdateRecordResponse>, AppError> {
+    if req.patch.is_empty() {
+        return Err(AppError::InvalidRequest(
+            "update requires at least one patch field".to_string(),
+        ));
+    }
+
+    let stores = state.stores.read().await;
+    let store_lock = stores
+        .get(&name)
+        .ok_or_else(|| AppError::NotFound(format!("Context '{}' does not exist", name)))?
+        .clone();
+    drop(stores);
+
+    let patch = patch_from_dto(&req.patch);
+    let mut store = store_lock.write().await;
+    let result = match (&req.id, &req.external_id) {
+        (Some(id), None) => store.update_by_id(id, patch).await,
+        (None, Some(external_id)) => store.update_by_external_id(external_id, patch).await,
+        (None, None) => {
+            return Err(AppError::InvalidRequest(
+                "update requires either id or external_id".to_string(),
+            ));
+        }
+        (Some(_), Some(_)) => {
+            return Err(AppError::InvalidRequest(
+                "update accepts only one of id or external_id".to_string(),
+            ));
+        }
+    }
+    .map_err(AppError::from_lance)?;
+
+    Ok(Json(match result {
+        Some(result) => UpdateRecordResponse {
+            version: result.version,
+            updated: true,
+            replaced_id: Some(result.replaced_id),
+            record: Some(record_to_dto(result.record)),
+        },
+        None => UpdateRecordResponse {
+            version: store.version(),
+            updated: false,
+            replaced_id: None,
+            record: None,
+        },
+    }))
 }
 
 pub async fn get_record(
@@ -321,6 +374,32 @@ fn relationship_to_dto(r: Relationship) -> RelationshipDto {
     }
 }
 
+fn patch_from_dto(patch: &RecordPatchDto) -> RecordPatch {
+    RecordPatch {
+        bot_id: patch.bot_id.clone(),
+        session_id: patch.session_id.clone(),
+        state_metadata: patch.state_metadata.as_ref().map(|sm| StateMetadata {
+            step: sm.step,
+            active_plan_id: sm.active_plan_id.clone(),
+            tokens_used: sm.tokens_used,
+            custom: sm.custom.clone(),
+        }),
+        metadata: patch.metadata.clone(),
+        relationships: patch.relationships.as_ref().map(|relationships| {
+            relationships
+                .iter()
+                .cloned()
+                .map(dto_to_relationship)
+                .collect()
+        }),
+        expires_at: patch.expires_at,
+        retention_policy: patch.retention_policy.clone(),
+        lifecycle_status: patch.lifecycle_status.clone(),
+        retired_at: patch.retired_at,
+        retired_reason: patch.retired_reason.clone(),
+    }
+}
+
 fn record_from_add_request(
     r: &lance_context_api::AddRecordRequest,
     id: String,
@@ -368,7 +447,10 @@ mod tests {
 
     use axum::extract::{Path, Query, State};
     use axum::Json;
-    use lance_context_api::{AddRecordRequest, AddRecordsRequest, UpsertRecordRequest};
+    use lance_context_api::{
+        AddRecordRequest, AddRecordsRequest, RecordPatchDto, UpdateRecordRequest,
+        UpsertRecordRequest,
+    };
     use lance_context_core::ContextStore;
     use tempfile::TempDir;
     use tokio::sync::RwLock;
@@ -549,6 +631,69 @@ mod tests {
             response.records[0].text_payload.as_deref(),
             Some("new value")
         );
+    }
+
+    #[tokio::test]
+    async fn update_by_external_id_patches_visible_record() {
+        let context_name = "ctx";
+        let (state, _dir) = test_state(context_name).await;
+        let external_id = "doc-123#chunk-1";
+
+        let mut record = text_record("stable value");
+        record.external_id = Some(external_id.to_string());
+        let (_, Json(add_response)) = add_records(
+            State(state.clone()),
+            Path(context_name.to_string()),
+            Json(AddRecordsRequest {
+                records: vec![record],
+            }),
+        )
+        .await
+        .unwrap();
+        let old_id = add_response.ids[0].clone();
+
+        let Json(updated) = update_record(
+            State(state.clone()),
+            Path(context_name.to_string()),
+            Json(UpdateRecordRequest {
+                id: None,
+                external_id: Some(external_id.to_string()),
+                patch: RecordPatchDto {
+                    metadata: Some(serde_json::json!({"revision": 2})),
+                    relationships: Some(vec![RelationshipDto {
+                        target_id: "doc-123".to_string(),
+                        relation: "derived_from".to_string(),
+                        weight: None,
+                    }]),
+                    ..Default::default()
+                },
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(updated.updated);
+        assert_eq!(updated.replaced_id.as_deref(), Some(old_id.as_str()));
+        let record = updated.record.unwrap();
+        assert_ne!(record.id, old_id);
+        assert_eq!(record.external_id.as_deref(), Some(external_id));
+        assert_eq!(record.text_payload.as_deref(), Some("stable value"));
+        assert_eq!(record.metadata, Some(serde_json::json!({"revision": 2})));
+        assert_eq!(record.relationships.len(), 1);
+        assert_eq!(record.supersedes_id.as_deref(), Some(old_id.as_str()));
+
+        let Json(response) = list_records(
+            State(state),
+            Path(context_name.to_string()),
+            Query(ListParams {
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.records.len(), 1);
+        assert_eq!(response.records[0].id, record.id);
     }
 
     #[tokio::test]

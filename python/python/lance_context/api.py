@@ -501,6 +501,58 @@ class Context:
             "record": _normalize_record(result["record"]),
         }
 
+    def update(
+        self,
+        *,
+        id: str | None = None,
+        external_id: str | None = None,
+        bot_id: str | None = None,
+        session_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        relationships: list[dict[str, Any]] | None = None,
+        expires_at: datetime | str | None = None,
+        retention_policy: str | None = None,
+        lifecycle_status: str | None = None,
+        retired_at: datetime | str | None = None,
+        retired_reason: str | None = None,
+    ) -> dict[str, Any]:
+        """Patch mutable fields on a visible record by id or external_id."""
+        if (id is None) == (external_id is None):
+            raise ValueError("Specify exactly one of id or external_id")
+        if (
+            bot_id is None
+            and session_id is None
+            and metadata is None
+            and relationships is None
+            and expires_at is None
+            and retention_policy is None
+            and lifecycle_status is None
+            and retired_at is None
+            and retired_reason is None
+        ):
+            raise ValueError("update requires at least one patch field")
+
+        result = self._inner.update(
+            id,
+            external_id,
+            bot_id,
+            session_id,
+            _json_dumps(metadata, "metadata"),
+            _json_dumps(relationships, "relationships"),
+            _coerce_timestamp(expires_at, field_name="expires_at"),
+            retention_policy,
+            lifecycle_status,
+            _coerce_timestamp(retired_at, field_name="retired_at"),
+            retired_reason,
+        )
+        record = result.get("record")
+        return {
+            "updated": bool(result["updated"]),
+            "replaced_id": result.get("replaced_id"),
+            "version": result["version"],
+            "record": _normalize_record(record) if record is not None else None,
+        }
+
     def add_many(self, records: Iterable[Mapping[str, Any]]) -> None:
         """Append multiple records in one storage operation.
 
@@ -895,6 +947,39 @@ class AsyncContext:
                 retired_at=retired_at,
                 retired_reason=retired_reason,
                 key=key,
+            ),
+        )
+
+    async def update(
+        self,
+        *,
+        id: str | None = None,
+        external_id: str | None = None,
+        bot_id: str | None = None,
+        session_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        relationships: list[dict[str, Any]] | None = None,
+        expires_at: datetime | str | None = None,
+        retention_policy: str | None = None,
+        lifecycle_status: str | None = None,
+        retired_at: datetime | str | None = None,
+        retired_reason: str | None = None,
+    ) -> dict[str, Any]:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self._sync.update(
+                id=id,
+                external_id=external_id,
+                bot_id=bot_id,
+                session_id=session_id,
+                metadata=metadata,
+                relationships=relationships,
+                expires_at=expires_at,
+                retention_policy=retention_policy,
+                lifecycle_status=lifecycle_status,
+                retired_at=retired_at,
+                retired_reason=retired_reason,
             ),
         )
 

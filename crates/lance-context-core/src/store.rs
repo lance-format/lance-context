@@ -35,8 +35,8 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::record::{
-    ContextRecord, LifecycleQueryOptions, RecordFilters, Relationship, RetrieveResult,
-    SearchResult, StateMetadata, UpsertResult, LIFECYCLE_ACTIVE,
+    ContextRecord, LifecycleQueryOptions, RecordFilters, RecordPatch, Relationship, RetrieveResult,
+    SearchResult, StateMetadata, UpdateResult, UpsertResult, LIFECYCLE_ACTIVE,
 };
 use crate::serde::CONTENT_TYPE_TOMBSTONE;
 
@@ -478,6 +478,123 @@ impl ContextStore {
             ))
             .into()),
         }
+    }
+
+    /// Partially update mutable fields on a visible record by internal id.
+    ///
+    /// The update is append-only: it writes a replacement record that
+    /// supersedes the current visible record, preserving the original payload
+    /// and embedding while changing only the requested patch fields.
+    pub async fn update_by_id(
+        &mut self,
+        id: &str,
+        patch: RecordPatch,
+    ) -> LanceResult<Option<UpdateResult>> {
+        if id.is_empty() {
+            return Err(ArrowError::InvalidArgumentError(
+                "update_by_id requires a non-empty id".to_string(),
+            )
+            .into());
+        }
+        let Some(existing) = self.get_by_id(id).await? else {
+            return Ok(None);
+        };
+        self.update_visible_record(existing, patch).await.map(Some)
+    }
+
+    /// Partially update mutable fields on a visible record by external id.
+    ///
+    /// Returns `Ok(None)` when no visible record currently has the external id.
+    pub async fn update_by_external_id(
+        &mut self,
+        external_id: &str,
+        patch: RecordPatch,
+    ) -> LanceResult<Option<UpdateResult>> {
+        if external_id.is_empty() {
+            return Err(ArrowError::InvalidArgumentError(
+                "update_by_external_id requires a non-empty external_id".to_string(),
+            )
+            .into());
+        }
+
+        let matches: Vec<ContextRecord> = self
+            .list(None, None)
+            .await?
+            .into_iter()
+            .filter(|existing| existing.external_id.as_deref() == Some(external_id))
+            .collect();
+
+        match matches.as_slice() {
+            [] => Ok(None),
+            [existing] => self
+                .update_visible_record(existing.clone(), patch)
+                .await
+                .map(Some),
+            _ => Err(ArrowError::InvalidArgumentError(format!(
+                "external_id '{}' matches multiple visible records",
+                external_id
+            ))
+            .into()),
+        }
+    }
+
+    async fn update_visible_record(
+        &mut self,
+        existing: ContextRecord,
+        patch: RecordPatch,
+    ) -> LanceResult<UpdateResult> {
+        if patch.is_empty() {
+            return Err(ArrowError::InvalidArgumentError(
+                "update requires at least one patch field".to_string(),
+            )
+            .into());
+        }
+
+        let mut record = existing.clone();
+        record.id = Uuid::new_v4().to_string();
+        record.run_id = Uuid::new_v4().to_string();
+        record.created_at = Utc::now();
+        record.supersedes_id = Some(existing.id.clone());
+        record.superseded_by_id = None;
+
+        if let Some(bot_id) = patch.bot_id {
+            record.bot_id = Some(bot_id);
+        }
+        if let Some(session_id) = patch.session_id {
+            record.session_id = Some(session_id);
+        }
+        if let Some(state_metadata) = patch.state_metadata {
+            record.state_metadata = Some(state_metadata);
+        }
+        if let Some(metadata) = patch.metadata {
+            record.metadata = Some(metadata);
+        }
+        if let Some(relationships) = patch.relationships {
+            record.relationships = relationships;
+        }
+        if let Some(expires_at) = patch.expires_at {
+            record.expires_at = Some(expires_at);
+        }
+        if let Some(retention_policy) = patch.retention_policy {
+            record.retention_policy = Some(retention_policy);
+        }
+        if let Some(lifecycle_status) = patch.lifecycle_status {
+            record.lifecycle_status = lifecycle_status;
+        }
+        if let Some(retired_at) = patch.retired_at {
+            record.retired_at = Some(retired_at);
+        }
+        if let Some(retired_reason) = patch.retired_reason {
+            record.retired_reason = Some(retired_reason);
+        }
+
+        self.validate_new_record_id(&record).await?;
+        let version = self.write_entries(std::slice::from_ref(&record)).await?;
+        Ok(UpdateResult {
+            record,
+            replaced_id: existing.id,
+            version,
+        })
     }
 
     async fn write_tombstone_for(&mut self, record: ContextRecord) -> LanceResult<u64> {
@@ -2729,6 +2846,70 @@ mod tests {
             assert_eq!(history.len(), 2);
             assert!(history.iter().any(|record| record.id == first.id));
             assert!(history.iter().any(|record| record.id == replacement.id));
+        });
+    }
+
+    #[test]
+    fn update_by_external_id_patches_mutable_fields_and_preserves_payload() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = ContextStore::open(&uri).await.unwrap();
+
+            let mut record = text_record("stable", 0.0);
+            record.external_id = Some("doc-123#chunk-1".to_string());
+            record.metadata = Some(serde_json::json!({"revision": 1}));
+            store.add(std::slice::from_ref(&record)).await.unwrap();
+
+            let patch = RecordPatch {
+                bot_id: Some("bot-a".to_string()),
+                session_id: Some("session-a".to_string()),
+                metadata: Some(serde_json::json!({"revision": 2, "confidence": 0.9})),
+                relationships: Some(vec![Relationship {
+                    target_id: "doc-123".to_string(),
+                    relation: "derived_from".to_string(),
+                    weight: None,
+                }]),
+                ..Default::default()
+            };
+            let updated = store
+                .update_by_external_id("doc-123#chunk-1", patch)
+                .await
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(updated.replaced_id, record.id);
+            assert_ne!(updated.record.id, record.id);
+            assert_eq!(updated.record.external_id, record.external_id);
+            assert_eq!(updated.record.text_payload, record.text_payload);
+            assert_eq!(updated.record.embedding, record.embedding);
+            assert_eq!(updated.record.bot_id.as_deref(), Some("bot-a"));
+            assert_eq!(updated.record.session_id.as_deref(), Some("session-a"));
+            assert_eq!(
+                updated.record.metadata,
+                Some(serde_json::json!({"revision": 2, "confidence": 0.9}))
+            );
+            assert_eq!(updated.record.relationships.len(), 1);
+            assert_eq!(
+                updated.record.supersedes_id.as_deref(),
+                Some(record.id.as_str())
+            );
+
+            let visible = store
+                .get_by_external_id("doc-123#chunk-1")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(visible.id, updated.record.id);
+
+            let history = store
+                .list_with_options(None, None, LifecycleQueryOptions::new(false, true))
+                .await
+                .unwrap();
+            assert_eq!(history.len(), 2);
+            assert!(history.iter().any(|item| item.id == record.id));
+            assert!(history.iter().any(|item| item.id == updated.record.id));
         });
     }
 

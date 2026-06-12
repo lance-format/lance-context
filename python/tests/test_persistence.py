@@ -511,6 +511,52 @@ def test_upsert_by_external_id_inserts_then_replaces_visible_record(
     assert [record["text"] for record in history] == ["old value", "new value"]
 
 
+def test_update_by_external_id_patches_mutable_fields_and_preserves_payload(
+    tmp_path: Path,
+) -> None:
+    uri = tmp_path / "context.lance"
+    ctx = Context.create(str(uri))
+    external_id = "doc-123#chunk-1"
+
+    ctx.add(
+        "user",
+        "stable content",
+        embedding=_embedding(0.0),
+        external_id=external_id,
+        metadata={"revision": 1},
+    )
+    original = ctx.get(external_id=external_id)
+    assert original is not None
+
+    updated = ctx.update(
+        external_id=external_id,
+        metadata={"revision": 2, "confidence": 0.9},
+        relationships=[{"target_id": "doc-123", "relation": "derived_from"}],
+    )
+
+    assert updated["updated"] is True
+    assert updated["replaced_id"] == original["id"]
+    assert updated["record"]["id"] != original["id"]
+    assert updated["record"]["external_id"] == external_id
+    assert updated["record"]["text"] == "stable content"
+    assert updated["record"]["metadata"] == {"revision": 2, "confidence": 0.9}
+    assert updated["record"]["relationships"] == [
+        {"target_id": "doc-123", "relation": "derived_from", "weight": None}
+    ]
+    assert updated["record"]["supersedes_id"] == original["id"]
+
+    visible = ctx.get(external_id=external_id)
+    assert visible is not None
+    assert visible["id"] == updated["record"]["id"]
+    assert [record["text"] for record in ctx.list()] == ["stable content"]
+
+    history = ctx.list(include_retired=True)
+    assert {record["id"] for record in history} == {
+        original["id"],
+        updated["record"]["id"],
+    }
+
+
 def test_image_round_trip(tmp_path: Path) -> None:
     Image = pytest.importorskip("PIL.Image")
     uri = tmp_path / "context.lance"

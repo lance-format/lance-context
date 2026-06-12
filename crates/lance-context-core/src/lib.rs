@@ -9,8 +9,8 @@ mod store;
 
 pub use context::{Context, ContextEntry, Snapshot};
 pub use record::{
-    ContextRecord, LifecycleQueryOptions, MetadataFilter, RecordFilters, Relationship,
-    RetrieveResult, SearchResult, StateMetadata, UpsertResult, LIFECYCLE_ACTIVE,
+    ContextRecord, LifecycleQueryOptions, MetadataFilter, RecordFilters, RecordPatch, Relationship,
+    RetrieveResult, SearchResult, StateMetadata, UpdateResult, UpsertResult, LIFECYCLE_ACTIVE,
     LIFECYCLE_CONTRADICTED,
 };
 pub use store::{

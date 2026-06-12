@@ -35,6 +35,7 @@ class DummyInner:
         self.get_calls: list[tuple[str | None, str | None]] = []
         self.delete_calls: list[tuple[str | None, str | None]] = []
         self.upsert_calls: list[dict[str, Any]] = []
+        self.update_calls: list[dict[str, Any]] = []
         self.lifecycle_add_calls: list[dict[str, Any]] = []
         self.relationship_add_calls: list[str | None] = []
         self.add_calls: list[
@@ -147,6 +148,73 @@ class DummyInner:
                 "text_payload": content if isinstance(content, str) else None,
                 "binary_payload": None,
                 "embedding": embedding,
+                "created_at": "2024-01-03T12:00:00Z",
+                "state_metadata": None,
+                "metadata": json.loads(metadata_json) if metadata_json else None,
+                "relationships": (
+                    json.loads(relationships_json) if relationships_json else []
+                ),
+                "expires_at": expires_at,
+                "retention_policy": retention_policy,
+                "lifecycle_status": lifecycle_status or "active",
+                "retired_at": retired_at,
+                "retired_reason": retired_reason,
+                "supersedes_id": "old-id",
+                "superseded_by_id": None,
+            },
+        }
+
+    def update(
+        self,
+        id: str | None,
+        external_id: str | None,
+        bot_id: str | None,
+        session_id: str | None,
+        metadata_json: str | None,
+        relationships_json: str | None,
+        expires_at: str | None,
+        retention_policy: str | None,
+        lifecycle_status: str | None,
+        retired_at: str | None,
+        retired_reason: str | None,
+    ):
+        self.update_calls.append(
+            {
+                "id": id,
+                "external_id": external_id,
+                "bot_id": bot_id,
+                "session_id": session_id,
+                "metadata_json": metadata_json,
+                "relationships_json": relationships_json,
+                "expires_at": expires_at,
+                "retention_policy": retention_policy,
+                "lifecycle_status": lifecycle_status,
+                "retired_at": retired_at,
+                "retired_reason": retired_reason,
+            }
+        )
+        if id == "missing" or external_id == "missing":
+            return {
+                "updated": False,
+                "replaced_id": None,
+                "version": 7,
+                "record": None,
+            }
+        return {
+            "updated": True,
+            "replaced_id": "old-id",
+            "version": 8,
+            "record": {
+                "id": "new-id",
+                "external_id": external_id,
+                "run_id": "run-2",
+                "bot_id": bot_id,
+                "session_id": session_id,
+                "role": "user",
+                "content_type": "text/plain",
+                "text_payload": "stable content",
+                "binary_payload": None,
+                "embedding": None,
                 "created_at": "2024-01-03T12:00:00Z",
                 "state_metadata": None,
                 "metadata": json.loads(metadata_json) if metadata_json else None,
@@ -1047,6 +1115,77 @@ def test_context_upsert_returns_operation_metadata_and_record():
     assert result["record"]["metadata"] == {"revision": 2}
     assert result["record"]["supersedes_id"] == "old-id"
     assert isinstance(result["record"]["created_at"], datetime)
+
+
+def test_context_update_requires_identifier_and_patch():
+    ctx = Context.__new__(Context)
+    dummy = DummyInner()
+    ctx._inner = dummy  # type: ignore[attr-defined]
+
+    with pytest.raises(ValueError, match="exactly one"):
+        ctx.update(metadata={"revision": 2})
+    with pytest.raises(ValueError, match="exactly one"):
+        ctx.update(id="rec-1", external_id="source-1", metadata={"revision": 2})
+    with pytest.raises(ValueError, match="at least one patch field"):
+        ctx.update(external_id="source-1")
+    assert dummy.update_calls == []
+
+
+def test_context_update_returns_operation_metadata_and_record():
+    ctx = Context.__new__(Context)
+    dummy = DummyInner()
+    ctx._inner = dummy  # type: ignore[attr-defined]
+
+    result = ctx.update(
+        external_id="source-1",
+        bot_id="bot",
+        session_id="sess",
+        metadata={"revision": 2},
+        relationships=[{"target_id": "doc-1", "relation": "updates"}],
+        expires_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
+        lifecycle_status="active",
+    )
+
+    assert dummy.update_calls == [
+        {
+            "id": None,
+            "external_id": "source-1",
+            "bot_id": "bot",
+            "session_id": "sess",
+            "metadata_json": '{"revision":2}',
+            "relationships_json": '[{"relation":"updates","target_id":"doc-1"}]',
+            "expires_at": "2026-07-01T00:00:00Z",
+            "retention_policy": None,
+            "lifecycle_status": "active",
+            "retired_at": None,
+            "retired_reason": None,
+        }
+    ]
+    assert result["updated"] is True
+    assert result["replaced_id"] == "old-id"
+    assert result["version"] == 8
+    assert result["record"]["id"] == "new-id"
+    assert result["record"]["text"] == "stable content"
+    assert result["record"]["metadata"] == {"revision": 2}
+    assert result["record"]["relationships"] == [
+        {"target_id": "doc-1", "relation": "updates"}
+    ]
+    assert result["record"]["supersedes_id"] == "old-id"
+
+
+def test_context_update_missing_record_returns_not_updated():
+    ctx = Context.__new__(Context)
+    dummy = DummyInner()
+    ctx._inner = dummy  # type: ignore[attr-defined]
+
+    result = ctx.update(external_id="missing", metadata={"revision": 2})
+
+    assert result == {
+        "updated": False,
+        "replaced_id": None,
+        "version": 7,
+        "record": None,
+    }
 
 
 def test_context_add_many_normalizes_records():
