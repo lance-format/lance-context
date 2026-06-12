@@ -48,6 +48,23 @@ def test_cosine_metric_changes_ranking(tmp_path: Path) -> None:
     assert [h["external_id"] for h in hits][0] == "aligned"
 
 
+def test_metric_persists_when_reopened_without_option(tmp_path: Path) -> None:
+    # Create with cosine, then reopen WITHOUT specifying the metric: it must be
+    # recovered from the dataset so ranking still uses cosine.
+    uri = str(tmp_path / "persist.lance")
+    _make(uri, distance_metric="cosine")
+    reopened = Context(uri)
+    hits = reopened.search(QUERY, limit=2)
+    assert [h["external_id"] for h in hits][0] == "aligned"
+
+
+def test_metric_mismatch_on_reopen_rejected(tmp_path: Path) -> None:
+    uri = str(tmp_path / "mismatch.lance")
+    _make(uri, distance_metric="cosine")
+    with pytest.raises(RuntimeError, match="distance metric"):
+        Context.create(uri, distance_metric="dot")
+
+
 def test_dot_metric_ranks_by_inner_product(tmp_path: Path) -> None:
     ctx = _make(str(tmp_path / "dot.lance"), distance_metric="dot")
     hits = ctx.search(QUERY, limit=2)

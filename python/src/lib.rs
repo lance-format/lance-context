@@ -197,8 +197,8 @@ impl Context {
         };
 
         let metric = match distance_metric.as_deref() {
-            Some(value) => DistanceMetric::parse(value).map_err(to_py_err)?,
-            None => DistanceMetric::default(),
+            Some(value) => Some(DistanceMetric::parse(value).map_err(to_py_err)?),
+            None => None,
         };
 
         let options = ContextStoreOptions {

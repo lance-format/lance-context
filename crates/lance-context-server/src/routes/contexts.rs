@@ -38,10 +38,10 @@ pub async fn create_context(
     let blob_columns: HashSet<String> = req.blob_columns.unwrap_or_default().into_iter().collect();
 
     let distance_metric = match req.distance_metric.as_deref() {
-        Some(value) => {
-            DistanceMetric::parse(value).map_err(|e| AppError::InvalidRequest(e.to_string()))?
-        }
-        None => DistanceMetric::default(),
+        Some(value) => Some(
+            DistanceMetric::parse(value).map_err(|e| AppError::InvalidRequest(e.to_string()))?,
+        ),
+        None => None,
     };
 
     let uri = state.context_uri(&req.name);

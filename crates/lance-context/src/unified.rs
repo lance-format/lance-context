@@ -44,9 +44,11 @@ impl ContextStore {
             }
         };
         let metric = match distance_metric {
-            Some(value) => DistanceMetric::parse(value)
-                .map_err(|e| ContextError::InvalidRequest(e.to_string()))?,
-            None => DistanceMetric::default(),
+            Some(value) => Some(
+                DistanceMetric::parse(value)
+                    .map_err(|e| ContextError::InvalidRequest(e.to_string()))?,
+            ),
+            None => None,
         };
         let options = ContextStoreOptions {
             storage_options,
