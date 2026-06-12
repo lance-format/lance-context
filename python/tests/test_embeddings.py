@@ -2,6 +2,7 @@
 
 Uses a stub provider so no external dependencies are needed.
 """
+
 from __future__ import annotations
 
 from typing import Any
@@ -89,8 +90,14 @@ class _DummyInner:
         include_relationships: bool = False,
     ) -> list[Any]:
         self.search_calls.append(
-            (vector, limit, filters_json,
-             include_expired, include_retired, include_relationships)
+            (
+                vector,
+                limit,
+                filters_json,
+                include_expired,
+                include_retired,
+                include_relationships,
+            )
         )
         return []
 
@@ -197,10 +204,12 @@ def test_add_binary_content_not_auto_embedded():
 def test_add_many_batch_embeds_text_records():
     provider = StubProvider()
     ctx = _ctx_with_provider(provider)
-    ctx.add_many([
-        {"role": "user", "content": "first"},
-        {"role": "assistant", "content": "second"},
-    ])
+    ctx.add_many(
+        [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "second"},
+        ]
+    )
     # Both texts sent in one provider call.
     assert provider.calls == [["first", "second"]]
     records = ctx._inner.add_many_calls[0]  # type: ignore[attr-defined]
@@ -211,10 +220,12 @@ def test_add_many_batch_embeds_text_records():
 def test_add_many_skips_records_with_manual_embedding():
     provider = StubProvider()
     ctx = _ctx_with_provider(provider)
-    ctx.add_many([
-        {"role": "user", "content": "first", "embedding": [5.0, 5.0]},
-        {"role": "assistant", "content": "second"},
-    ])
+    ctx.add_many(
+        [
+            {"role": "user", "content": "first", "embedding": [5.0, 5.0]},
+            {"role": "assistant", "content": "second"},
+        ]
+    )
     # Only the second record is sent for embedding.
     assert provider.calls == [["second"]]
     records = ctx._inner.add_many_calls[0]  # type: ignore[attr-defined]

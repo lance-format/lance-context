@@ -39,8 +39,7 @@ def _build_provider(config: dict[str, Any]) -> EmbeddingProvider:
         cls = _REGISTRY[name]
     except KeyError:
         raise ValueError(
-            f"Unknown embedding provider {name!r}. "
-            f"Available: {sorted(_REGISTRY)}"
+            f"Unknown embedding provider {name!r}. Available: {sorted(_REGISTRY)}"
         ) from None
     return cls(**kwargs)
 
