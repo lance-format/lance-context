@@ -10,7 +10,8 @@ mod store;
 pub use context::{Context, ContextEntry, Snapshot};
 pub use record::{
     ContextRecord, LifecycleQueryOptions, MetadataFilter, RecordFilters, Relationship,
-    RetrieveResult, SearchResult, StateMetadata, LIFECYCLE_ACTIVE, LIFECYCLE_CONTRADICTED,
+    RetrieveResult, SearchResult, StateMetadata, UpsertResult, LIFECYCLE_ACTIVE,
+    LIFECYCLE_CONTRADICTED,
 };
 pub use store::{
     CompactionConfig, CompactionStats, ContextStore, ContextStoreOptions, DistanceMetric,

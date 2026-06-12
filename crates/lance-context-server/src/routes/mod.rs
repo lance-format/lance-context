@@ -7,7 +7,7 @@ pub mod versions;
 
 use std::sync::Arc;
 
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::Router;
 
 use crate::state::AppState;
@@ -22,6 +22,10 @@ pub fn router() -> Router<Arc<AppState>> {
         .route(
             "/api/v1/contexts/{name}/records",
             post(records::add_records),
+        )
+        .route(
+            "/api/v1/contexts/{name}/records",
+            put(records::upsert_record),
         )
         .route(
             "/api/v1/contexts/{name}/records",

@@ -34,6 +34,7 @@ class DummyInner:
         self.related_calls: list[tuple[str, str | None, int | None, bool, bool]] = []
         self.get_calls: list[tuple[str | None, str | None]] = []
         self.delete_calls: list[tuple[str | None, str | None]] = []
+        self.upsert_calls: list[dict[str, Any]] = []
         self.lifecycle_add_calls: list[dict[str, Any]] = []
         self.relationship_add_calls: list[str | None] = []
         self.add_calls: list[
@@ -93,6 +94,74 @@ class DummyInner:
             }
         )
         self.relationship_add_calls.append(relationships_json)
+
+    def upsert(
+        self,
+        role: str,
+        content: Any,
+        data_type: str | None,
+        embedding: list[float] | None,
+        bot_id: str | None,
+        session_id: str | None,
+        external_id: str | None,
+        metadata_json: str | None,
+        expires_at: str | None = None,
+        retention_policy: str | None = None,
+        lifecycle_status: str | None = None,
+        retired_at: str | None = None,
+        retired_reason: str | None = None,
+        relationships_json: str | None = None,
+        key: str = "external_id",
+    ):
+        self.upsert_calls.append(
+            {
+                "role": role,
+                "content": content,
+                "data_type": data_type,
+                "embedding": embedding,
+                "bot_id": bot_id,
+                "session_id": session_id,
+                "external_id": external_id,
+                "metadata_json": metadata_json,
+                "expires_at": expires_at,
+                "retention_policy": retention_policy,
+                "lifecycle_status": lifecycle_status,
+                "retired_at": retired_at,
+                "retired_reason": retired_reason,
+                "relationships_json": relationships_json,
+                "key": key,
+            }
+        )
+        return {
+            "inserted": False,
+            "replaced_id": "old-id",
+            "version": 7,
+            "record": {
+                "id": "new-id",
+                "external_id": external_id,
+                "run_id": "run-2",
+                "bot_id": bot_id,
+                "session_id": session_id,
+                "role": role,
+                "content_type": data_type or "text/plain",
+                "text_payload": content if isinstance(content, str) else None,
+                "binary_payload": None,
+                "embedding": embedding,
+                "created_at": "2024-01-03T12:00:00Z",
+                "state_metadata": None,
+                "metadata": json.loads(metadata_json) if metadata_json else None,
+                "relationships": (
+                    json.loads(relationships_json) if relationships_json else []
+                ),
+                "expires_at": expires_at,
+                "retention_policy": retention_policy,
+                "lifecycle_status": lifecycle_status or "active",
+                "retired_at": retired_at,
+                "retired_reason": retired_reason,
+                "supersedes_id": "old-id",
+                "superseded_by_id": None,
+            },
+        }
 
     def get(self, id: str | None, external_id: str | None):
         self.get_calls.append((id, external_id))
@@ -922,6 +991,62 @@ def test_context_add_rejects_naive_lifecycle_datetime():
 
     with pytest.raises(ValueError, match="timezone"):
         ctx.add("user", "hello", expires_at=datetime(2026, 7, 1))
+
+
+def test_context_upsert_requires_external_id_and_supported_key():
+    ctx = Context.__new__(Context)
+    dummy = DummyInner()
+    ctx._inner = dummy  # type: ignore[attr-defined]
+
+    with pytest.raises(ValueError, match="external_id"):
+        ctx.upsert("user", "hello")
+    with pytest.raises(ValueError, match="Only key='external_id'"):
+        ctx.upsert("user", "hello", external_id="source-1", key="id")
+    assert dummy.upsert_calls == []
+
+
+def test_context_upsert_returns_operation_metadata_and_record():
+    ctx = Context.__new__(Context)
+    dummy = DummyInner()
+    ctx._inner = dummy  # type: ignore[attr-defined]
+
+    result = ctx.upsert(
+        "user",
+        "new value",
+        embedding=[0.1, 0.2],
+        external_id="source-1",
+        metadata={"revision": 2},
+        relationships=[{"target_id": "doc-1", "relation": "updates"}],
+        expires_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
+    )
+
+    assert dummy.upsert_calls == [
+        {
+            "role": "user",
+            "content": "new value",
+            "data_type": None,
+            "embedding": [0.1, 0.2],
+            "bot_id": None,
+            "session_id": None,
+            "external_id": "source-1",
+            "metadata_json": '{"revision":2}',
+            "expires_at": "2026-07-01T00:00:00Z",
+            "retention_policy": None,
+            "lifecycle_status": None,
+            "retired_at": None,
+            "retired_reason": None,
+            "relationships_json": '[{"relation":"updates","target_id":"doc-1"}]',
+            "key": "external_id",
+        }
+    ]
+    assert result["inserted"] is False
+    assert result["replaced_id"] == "old-id"
+    assert result["version"] == 7
+    assert result["record"]["id"] == "new-id"
+    assert result["record"]["text"] == "new value"
+    assert result["record"]["metadata"] == {"revision": 2}
+    assert result["record"]["supersedes_id"] == "old-id"
+    assert isinstance(result["record"]["created_at"], datetime)
 
 
 def test_context_add_many_normalizes_records():

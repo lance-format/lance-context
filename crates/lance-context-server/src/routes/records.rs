@@ -5,7 +5,8 @@ use axum::Json;
 use chrono::Utc;
 use lance_context_api::{
     AddRecordsRequest, AddRecordsResponse, DeleteRecordResponse, GetRecordResponse,
-    ListRecordsResponse, RecordDto, RelationshipDto, StateMetadataDto,
+    ListRecordsResponse, RecordDto, RelationshipDto, StateMetadataDto, UpsertRecordRequest,
+    UpsertRecordResponse,
 };
 use lance_context_core::{
     ContextRecord, LifecycleQueryOptions, Relationship, StateMetadata, LIFECYCLE_ACTIVE,
@@ -40,39 +41,7 @@ pub async fn add_records(
     for r in &req.records {
         let id = Uuid::new_v4().to_string();
         ids.push(id.clone());
-        core_records.push(ContextRecord {
-            id,
-            external_id: r.external_id.clone(),
-            run_id: run_id.clone(),
-            bot_id: r.bot_id.clone(),
-            session_id: r.session_id.clone(),
-            created_at: Utc::now(),
-            role: r.role.clone(),
-            state_metadata: r.state_metadata.as_ref().map(|sm| StateMetadata {
-                step: sm.step,
-                active_plan_id: sm.active_plan_id.clone(),
-                tokens_used: sm.tokens_used,
-                custom: sm.custom.clone(),
-            }),
-            metadata: r.metadata.clone(),
-            relationships: r
-                .relationships
-                .iter()
-                .cloned()
-                .map(dto_to_relationship)
-                .collect(),
-            expires_at: r.expires_at,
-            retention_policy: r.retention_policy.clone(),
-            lifecycle_status: LIFECYCLE_ACTIVE.to_string(),
-            retired_at: None,
-            retired_reason: None,
-            supersedes_id: r.supersedes_id.clone(),
-            superseded_by_id: None,
-            content_type: r.content_type.clone(),
-            text_payload: r.text_payload.clone(),
-            binary_payload: r.binary_payload.clone(),
-            embedding: r.embedding.clone(),
-        });
+        core_records.push(record_from_add_request(r, id, run_id.clone()));
     }
 
     let count = core_records.len();
@@ -88,6 +57,57 @@ pub async fn add_records(
             version,
             ids,
             count,
+        }),
+    ))
+}
+
+pub async fn upsert_record(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(req): Json<UpsertRecordRequest>,
+) -> Result<(axum::http::StatusCode, Json<UpsertRecordResponse>), AppError> {
+    if req.key != "external_id" {
+        return Err(AppError::InvalidRequest(format!(
+            "upsert key '{}' is not supported; use 'external_id'",
+            req.key
+        )));
+    }
+    if req.record.external_id.as_deref().is_none_or(str::is_empty) {
+        return Err(AppError::InvalidRequest(
+            "upsert requires record.external_id".to_string(),
+        ));
+    }
+
+    let stores = state.stores.read().await;
+    let store_lock = stores
+        .get(&name)
+        .ok_or_else(|| AppError::NotFound(format!("Context '{}' does not exist", name)))?
+        .clone();
+    drop(stores);
+
+    let record = record_from_add_request(
+        &req.record,
+        Uuid::new_v4().to_string(),
+        Uuid::new_v4().to_string(),
+    );
+    let mut store = store_lock.write().await;
+    let result = store
+        .upsert_by_external_id(record)
+        .await
+        .map_err(AppError::from_lance)?;
+    let status = if result.inserted {
+        axum::http::StatusCode::CREATED
+    } else {
+        axum::http::StatusCode::OK
+    };
+
+    Ok((
+        status,
+        Json(UpsertRecordResponse {
+            version: result.version,
+            inserted: result.inserted,
+            replaced_id: result.replaced_id,
+            record: record_to_dto(result.record),
         }),
     ))
 }
@@ -301,6 +321,46 @@ fn relationship_to_dto(r: Relationship) -> RelationshipDto {
     }
 }
 
+fn record_from_add_request(
+    r: &lance_context_api::AddRecordRequest,
+    id: String,
+    run_id: String,
+) -> ContextRecord {
+    ContextRecord {
+        id,
+        external_id: r.external_id.clone(),
+        run_id,
+        bot_id: r.bot_id.clone(),
+        session_id: r.session_id.clone(),
+        created_at: Utc::now(),
+        role: r.role.clone(),
+        state_metadata: r.state_metadata.as_ref().map(|sm| StateMetadata {
+            step: sm.step,
+            active_plan_id: sm.active_plan_id.clone(),
+            tokens_used: sm.tokens_used,
+            custom: sm.custom.clone(),
+        }),
+        metadata: r.metadata.clone(),
+        relationships: r
+            .relationships
+            .iter()
+            .cloned()
+            .map(dto_to_relationship)
+            .collect(),
+        expires_at: r.expires_at,
+        retention_policy: r.retention_policy.clone(),
+        lifecycle_status: LIFECYCLE_ACTIVE.to_string(),
+        retired_at: None,
+        retired_reason: None,
+        supersedes_id: r.supersedes_id.clone(),
+        superseded_by_id: None,
+        content_type: r.content_type.clone(),
+        text_payload: r.text_payload.clone(),
+        binary_payload: r.binary_payload.clone(),
+        embedding: r.embedding.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -308,7 +368,7 @@ mod tests {
 
     use axum::extract::{Path, Query, State};
     use axum::Json;
-    use lance_context_api::{AddRecordRequest, AddRecordsRequest};
+    use lance_context_api::{AddRecordRequest, AddRecordsRequest, UpsertRecordRequest};
     use lance_context_core::ContextStore;
     use tempfile::TempDir;
     use tokio::sync::RwLock;
@@ -427,6 +487,68 @@ mod tests {
                 .await
                 .unwrap();
         assert!(!second_response.deleted);
+    }
+
+    #[tokio::test]
+    async fn upsert_by_external_id_inserts_then_replaces_visible_record() {
+        let context_name = "ctx";
+        let (state, _dir) = test_state(context_name).await;
+        let external_id = "doc-123#chunk-1";
+
+        let mut first = text_record("old value");
+        first.external_id = Some(external_id.to_string());
+        let (insert_status, Json(inserted)) = upsert_record(
+            State(state.clone()),
+            Path(context_name.to_string()),
+            Json(UpsertRecordRequest {
+                record: first,
+                key: "external_id".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(insert_status, axum::http::StatusCode::CREATED);
+        assert!(inserted.inserted);
+        assert!(inserted.replaced_id.is_none());
+
+        let mut replacement = text_record("new value");
+        replacement.external_id = Some(external_id.to_string());
+        let (replace_status, Json(replaced)) = upsert_record(
+            State(state.clone()),
+            Path(context_name.to_string()),
+            Json(UpsertRecordRequest {
+                record: replacement,
+                key: "external_id".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(replace_status, axum::http::StatusCode::OK);
+        assert!(!replaced.inserted);
+        assert_eq!(
+            replaced.replaced_id.as_deref(),
+            Some(inserted.record.id.as_str())
+        );
+        assert_eq!(
+            replaced.record.supersedes_id.as_deref(),
+            Some(inserted.record.id.as_str())
+        );
+
+        let Json(response) = list_records(
+            State(state),
+            Path(context_name.to_string()),
+            Query(ListParams {
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.records.len(), 1);
+        assert_eq!(
+            response.records[0].text_payload.as_deref(),
+            Some("new value")
+        );
     }
 
     #[tokio::test]

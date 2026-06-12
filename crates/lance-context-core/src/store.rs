@@ -36,7 +36,7 @@ use uuid::Uuid;
 
 use crate::record::{
     ContextRecord, LifecycleQueryOptions, RecordFilters, Relationship, RetrieveResult,
-    SearchResult, StateMetadata, LIFECYCLE_ACTIVE,
+    SearchResult, StateMetadata, UpsertResult, LIFECYCLE_ACTIVE,
 };
 use crate::serde::CONTENT_TYPE_TOMBSTONE;
 
@@ -411,6 +411,75 @@ impl ContextStore {
         Ok(true)
     }
 
+    /// Insert a record or replace the currently-visible record with the same external id.
+    ///
+    /// Replacement is append-only: the new record keeps the same `external_id`
+    /// and gets `supersedes_id` set to the old record id. Default reads hide
+    /// the superseded record while `include_retired` reads can still inspect
+    /// both versions. Caller-supplied supersession fields are ignored because
+    /// this method manages replacement by `external_id`.
+    pub async fn upsert_by_external_id(
+        &mut self,
+        mut record: ContextRecord,
+    ) -> LanceResult<UpsertResult> {
+        let Some(external_id) = record.external_id.clone() else {
+            return Err(ArrowError::InvalidArgumentError(
+                "upsert_by_external_id requires external_id".to_string(),
+            )
+            .into());
+        };
+        if external_id.is_empty() {
+            return Err(ArrowError::InvalidArgumentError(
+                "upsert_by_external_id requires a non-empty external_id".to_string(),
+            )
+            .into());
+        }
+        if record.is_tombstone() {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "content_type '{}' is reserved for internal tombstones",
+                CONTENT_TYPE_TOMBSTONE
+            ))
+            .into());
+        }
+        record.supersedes_id = None;
+        record.superseded_by_id = None;
+        self.validate_new_record_id(&record).await?;
+
+        let matches: Vec<ContextRecord> = self
+            .list(None, None)
+            .await?
+            .into_iter()
+            .filter(|existing| existing.external_id.as_deref() == Some(external_id.as_str()))
+            .collect();
+
+        match matches.as_slice() {
+            [] => {
+                let version = self.add(std::slice::from_ref(&record)).await?;
+                Ok(UpsertResult {
+                    record,
+                    inserted: true,
+                    replaced_id: None,
+                    version,
+                })
+            }
+            [existing] => {
+                record.supersedes_id = Some(existing.id.clone());
+                let version = self.write_entries(std::slice::from_ref(&record)).await?;
+                Ok(UpsertResult {
+                    record,
+                    inserted: false,
+                    replaced_id: Some(existing.id.clone()),
+                    version,
+                })
+            }
+            _ => Err(ArrowError::InvalidArgumentError(format!(
+                "external_id '{}' matches multiple visible records",
+                external_id
+            ))
+            .into()),
+        }
+    }
+
     async fn write_tombstone_for(&mut self, record: ContextRecord) -> LanceResult<u64> {
         let tombstone = ContextRecord {
             id: record.id,
@@ -489,6 +558,22 @@ impl ContextStore {
             }
         }
 
+        Ok(())
+    }
+
+    async fn validate_new_record_id(&self, entry: &ContextRecord) -> LanceResult<()> {
+        for record in self
+            .list_with_options(None, None, LifecycleQueryOptions::new(true, true))
+            .await?
+        {
+            if record.id == entry.id {
+                return Err(ArrowError::InvalidArgumentError(format!(
+                    "id '{}' already exists",
+                    entry.id
+                ))
+                .into());
+            }
+        }
         Ok(())
     }
 
@@ -2595,6 +2680,55 @@ mod tests {
 
             let missing = store.get_by_external_id("missing").await.unwrap();
             assert!(missing.is_none());
+        });
+    }
+
+    #[test]
+    fn upsert_by_external_id_inserts_then_replaces_visible_record() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = ContextStore::open(&uri).await.unwrap();
+
+            let mut first = text_record("first", 0.0);
+            first.external_id = Some("doc-123#chunk-1".to_string());
+            let inserted = store.upsert_by_external_id(first.clone()).await.unwrap();
+            assert!(inserted.inserted);
+            assert_eq!(inserted.replaced_id, None);
+            assert_eq!(inserted.record.id, first.id);
+
+            let mut replacement = text_record("replacement", 1.0);
+            replacement.external_id = first.external_id.clone();
+            let replaced = store
+                .upsert_by_external_id(replacement.clone())
+                .await
+                .unwrap();
+            assert!(!replaced.inserted);
+            assert_eq!(replaced.replaced_id.as_deref(), Some(first.id.as_str()));
+            assert_eq!(
+                replaced.record.supersedes_id.as_deref(),
+                Some(first.id.as_str())
+            );
+
+            let visible = store.list(None, None).await.unwrap();
+            assert_eq!(visible.len(), 1);
+            assert_eq!(visible[0].id, replacement.id);
+
+            let by_external_id = store
+                .get_by_external_id("doc-123#chunk-1")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(by_external_id.id, replacement.id);
+
+            let history = store
+                .list_with_options(None, None, LifecycleQueryOptions::new(false, true))
+                .await
+                .unwrap();
+            assert_eq!(history.len(), 2);
+            assert!(history.iter().any(|record| record.id == first.id));
+            assert!(history.iter().any(|record| record.id == replacement.id));
         });
     }
 

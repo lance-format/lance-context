@@ -298,6 +298,82 @@ impl Context {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (role, content, data_type = None, embedding = None, bot_id = None, session_id = None, external_id = None, metadata_json = None, expires_at = None, retention_policy = None, lifecycle_status = None, retired_at = None, retired_reason = None, relationships_json = None, key = "external_id"))]
+    fn upsert(
+        &mut self,
+        py: Python<'_>,
+        role: &str,
+        content: &Bound<'_, PyAny>,
+        data_type: Option<&str>,
+        embedding: Option<Vec<f32>>,
+        bot_id: Option<String>,
+        session_id: Option<String>,
+        external_id: Option<String>,
+        metadata_json: Option<String>,
+        expires_at: Option<String>,
+        retention_policy: Option<String>,
+        lifecycle_status: Option<String>,
+        retired_at: Option<String>,
+        retired_reason: Option<String>,
+        relationships_json: Option<String>,
+        key: &str,
+    ) -> PyResult<PyObject> {
+        if key != "external_id" {
+            return Err(PyRuntimeError::new_err(format!(
+                "upsert key '{key}' is not supported; use 'external_id'"
+            )));
+        }
+        if external_id.as_deref().is_none_or(str::is_empty) {
+            return Err(PyRuntimeError::new_err(
+                "upsert requires external_id".to_string(),
+            ));
+        }
+
+        let lifecycle = LifecycleFields {
+            expires_at: parse_optional_datetime(expires_at, "expires_at")?,
+            retention_policy,
+            lifecycle_status,
+            retired_at: parse_optional_datetime(retired_at, "retired_at")?,
+            retired_reason,
+            supersedes_id: None,
+            superseded_by_id: None,
+        };
+        let prepared = self.prepare_record(
+            content,
+            RecordInput {
+                role: role.to_string(),
+                data_type: data_type.map(str::to_string),
+                embedding,
+                bot_id,
+                session_id,
+                external_id,
+                metadata_json,
+                relationships: relationships_from_json(relationships_json)?,
+                lifecycle,
+            },
+            1,
+        )?;
+
+        let result = py.allow_threads(|| {
+            self.runtime
+                .block_on(self.store.upsert_by_external_id(prepared.record.clone()))
+        });
+        let result = result.map_err(to_py_err)?;
+        self.inner.add(
+            &prepared.role,
+            &prepared.inner_content,
+            prepared.data_type.as_deref(),
+        );
+
+        let dict = PyDict::new(py);
+        dict.set_item("inserted", result.inserted)?;
+        dict.set_item("replaced_id", result.replaced_id)?;
+        dict.set_item("version", result.version)?;
+        dict.set_item("record", record_to_py(py, result.record)?)?;
+        Ok(dict.into_pyobject(py)?.unbind().into())
+    }
+
     #[pyo3(signature = (records))]
     fn add_many(&mut self, py: Python<'_>, records: &Bound<'_, PyAny>) -> PyResult<()> {
         let mut prepared = Vec::new();

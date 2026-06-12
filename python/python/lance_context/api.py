@@ -446,6 +446,61 @@ class Context:
             _json_dumps(relationships, "relationships"),
         )
 
+    def upsert(
+        self,
+        role: str,
+        content: Any,
+        content_type: str | None = None,
+        data_type: str | None = None,
+        embedding: list[float] | None = None,
+        bot_id: str | None = None,
+        session_id: str | None = None,
+        external_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        relationships: list[dict[str, Any]] | None = None,
+        expires_at: datetime | str | None = None,
+        retention_policy: str | None = None,
+        lifecycle_status: str | None = None,
+        retired_at: datetime | str | None = None,
+        retired_reason: str | None = None,
+        *,
+        key: str = "external_id",
+    ) -> dict[str, Any]:
+        """Insert a record, or replace the visible record with the same external_id."""
+        if content_type is not None and data_type is not None:
+            raise ValueError("Specify only one of content_type or data_type")
+        if key != "external_id":
+            raise ValueError("Only key='external_id' is currently supported")
+        if not external_id:
+            raise ValueError("upsert requires external_id")
+        if content_type is None:
+            content_type = data_type
+
+        payload, resolved_type = _normalize_content(content, content_type)
+        result = self._inner.upsert(
+            role,
+            payload,
+            resolved_type,
+            embedding,
+            bot_id,
+            session_id,
+            external_id,
+            _json_dumps(metadata, "metadata"),
+            _coerce_timestamp(expires_at, field_name="expires_at"),
+            retention_policy,
+            lifecycle_status,
+            _coerce_timestamp(retired_at, field_name="retired_at"),
+            retired_reason,
+            _json_dumps(relationships, "relationships"),
+            key,
+        )
+        return {
+            "inserted": bool(result["inserted"]),
+            "replaced_id": result.get("replaced_id"),
+            "version": result["version"],
+            "record": _normalize_record(result["record"]),
+        }
+
     def add_many(self, records: Iterable[Mapping[str, Any]]) -> None:
         """Append multiple records in one storage operation.
 
@@ -797,6 +852,49 @@ class AsyncContext:
                 retired_reason=retired_reason,
                 supersedes_id=supersedes_id,
                 superseded_by_id=superseded_by_id,
+            ),
+        )
+
+    async def upsert(
+        self,
+        role: str,
+        content: Any,
+        content_type: str | None = None,
+        data_type: str | None = None,
+        embedding: list[float] | None = None,
+        bot_id: str | None = None,
+        session_id: str | None = None,
+        external_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        relationships: list[dict[str, Any]] | None = None,
+        expires_at: datetime | str | None = None,
+        retention_policy: str | None = None,
+        lifecycle_status: str | None = None,
+        retired_at: datetime | str | None = None,
+        retired_reason: str | None = None,
+        *,
+        key: str = "external_id",
+    ) -> dict[str, Any]:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self._sync.upsert(
+                role,
+                content,
+                content_type=content_type,
+                data_type=data_type,
+                embedding=embedding,
+                bot_id=bot_id,
+                session_id=session_id,
+                external_id=external_id,
+                metadata=metadata,
+                relationships=relationships,
+                expires_at=expires_at,
+                retention_policy=retention_policy,
+                lifecycle_status=lifecycle_status,
+                retired_at=retired_at,
+                retired_reason=retired_reason,
+                key=key,
             ),
         )
 

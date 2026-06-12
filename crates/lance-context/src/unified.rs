@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use lance_context_api::{
     AddRecordRequest, AddRecordsResponse, CompactRequest, CompactResponse, CompactStatsResponse,
     ContextError, ContextResult, ContextStoreApi, DeleteRecordResponse, RecordDto, RetrieveRequest,
-    RetrieveResultDto, SearchResultDto,
+    RetrieveResultDto, SearchResultDto, UpsertRecordRequest, UpsertRecordResponse,
 };
 use lance_context_core::{
     ContextStore as LocalStore, ContextStoreOptions, DistanceMetric, IdIndexType,
@@ -117,6 +117,13 @@ macro_rules! dispatch_sync {
 impl ContextStoreApi for ContextStore {
     async fn add(&mut self, records: &[AddRecordRequest]) -> ContextResult<AddRecordsResponse> {
         dispatch_mut!(self, add, records)
+    }
+
+    async fn upsert(
+        &mut self,
+        request: &UpsertRecordRequest,
+    ) -> ContextResult<UpsertRecordResponse> {
+        dispatch_mut!(self, upsert, request)
     }
 
     async fn get(&self, id: &str) -> ContextResult<Option<RecordDto>> {

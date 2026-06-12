@@ -143,6 +143,15 @@ pub struct RetrieveResult {
     pub matched_channels: Vec<String>,
 }
 
+/// Result returned from insert-or-replace operations.
+#[derive(Debug, Clone)]
+pub struct UpsertResult {
+    pub record: ContextRecord,
+    pub inserted: bool,
+    pub replaced_id: Option<String>,
+    pub version: u64,
+}
+
 /// Metadata matching operation for filtered retrieval.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MetadataFilter {

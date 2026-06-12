@@ -472,6 +472,45 @@ def test_supersedes_pointer_hides_old_record_by_default(tmp_path: Path) -> None:
     assert history[1]["supersedes_id"] == old["id"]
 
 
+def test_upsert_by_external_id_inserts_then_replaces_visible_record(
+    tmp_path: Path,
+) -> None:
+    uri = tmp_path / "context.lance"
+    ctx = Context.create(str(uri))
+    external_id = "doc-123#chunk-1"
+
+    inserted = ctx.upsert(
+        "user",
+        "old value",
+        embedding=_embedding(0.0),
+        external_id=external_id,
+    )
+    assert inserted["inserted"] is True
+    assert inserted["replaced_id"] is None
+    old_id = inserted["record"]["id"]
+
+    replaced = ctx.upsert(
+        "user",
+        "new value",
+        embedding=_embedding(1.0),
+        external_id=external_id,
+        metadata={"revision": 2},
+    )
+    assert replaced["inserted"] is False
+    assert replaced["replaced_id"] == old_id
+    assert replaced["record"]["external_id"] == external_id
+    assert replaced["record"]["supersedes_id"] == old_id
+
+    assert ctx.get(external_id=external_id)["text"] == "new value"  # type: ignore[index]
+    assert [record["text"] for record in ctx.list()] == ["new value"]
+    assert [record["text"] for record in ctx.search(_embedding(0.0), limit=10)] == [
+        "new value"
+    ]
+
+    history = ctx.list(include_retired=True)
+    assert [record["text"] for record in history] == ["old value", "new value"]
+
+
 def test_image_round_trip(tmp_path: Path) -> None:
     Image = pytest.importorskip("PIL.Image")
     uri = tmp_path / "context.lance"

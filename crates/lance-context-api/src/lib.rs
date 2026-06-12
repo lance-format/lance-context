@@ -34,6 +34,11 @@ pub trait ContextStoreApi {
         records: &[AddRecordRequest],
     ) -> impl Future<Output = ContextResult<AddRecordsResponse>> + Send;
 
+    fn upsert(
+        &mut self,
+        request: &UpsertRecordRequest,
+    ) -> impl Future<Output = ContextResult<UpsertRecordResponse>> + Send;
+
     fn get(&self, id: &str) -> impl Future<Output = ContextResult<Option<RecordDto>>> + Send;
 
     fn get_by_external_id(
@@ -192,6 +197,22 @@ pub struct AddRecordsResponse {
     pub version: u64,
     pub ids: Vec<String>,
     pub count: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UpsertRecordRequest {
+    pub record: AddRecordRequest,
+    #[serde(default = "default_upsert_key")]
+    pub key: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UpsertRecordResponse {
+    pub version: u64,
+    pub inserted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaced_id: Option<String>,
+    pub record: RecordDto,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -394,6 +415,10 @@ fn default_content_type() -> String {
 
 fn default_role() -> String {
     "user".to_string()
+}
+
+fn default_upsert_key() -> String {
+    "external_id".to_string()
 }
 
 fn default_search_limit() -> usize {
