@@ -312,6 +312,7 @@ class Context:
         quiet_hours: list[tuple[int, int]] | None = None,
         id_index_type: str | None = None,
         embedding_dim: int | None = None,
+        distance_metric: str | None = None,
     ) -> None:
         options = _merge_storage_options(
             storage_options,
@@ -336,6 +337,7 @@ class Context:
             or compaction_config["enabled"]
             or id_index_type
             or embedding_dim is not None
+            or distance_metric
         ):
             self._inner = _Context.create(
                 uri,
@@ -343,6 +345,7 @@ class Context:
                 compaction_config=compaction_config,
                 id_index_type=id_index_type,
                 embedding_dim=embedding_dim,
+                distance_metric=distance_metric,
             )
         else:
             self._inner = _Context.create(uri)
@@ -366,6 +369,7 @@ class Context:
         quiet_hours: list[tuple[int, int]] | None = None,
         id_index_type: str | None = None,
         embedding_dim: int | None = None,
+        distance_metric: str | None = None,
     ) -> Context:
         return cls(
             uri,
@@ -383,6 +387,7 @@ class Context:
             quiet_hours=quiet_hours,
             id_index_type=id_index_type,
             embedding_dim=embedding_dim,
+            distance_metric=distance_metric,
         )
 
     def uri(self) -> str:

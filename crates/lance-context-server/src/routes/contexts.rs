@@ -4,7 +4,7 @@ use std::sync::Arc;
 use axum::extract::{Path, State};
 use axum::Json;
 use lance_context_api::{ContextInfo, CreateContextRequest, ListContextsResponse};
-use lance_context_core::{ContextStore, ContextStoreOptions, IdIndexType};
+use lance_context_core::{ContextStore, ContextStoreOptions, DistanceMetric, IdIndexType};
 use tokio::sync::RwLock;
 
 use crate::error::AppError;
@@ -37,12 +37,20 @@ pub async fn create_context(
 
     let blob_columns: HashSet<String> = req.blob_columns.unwrap_or_default().into_iter().collect();
 
+    let distance_metric = match req.distance_metric.as_deref() {
+        Some(value) => {
+            DistanceMetric::parse(value).map_err(|e| AppError::InvalidRequest(e.to_string()))?
+        }
+        None => DistanceMetric::default(),
+    };
+
     let uri = state.context_uri(&req.name);
     let options = ContextStoreOptions {
         storage_options: req.storage_options,
         embedding_dim: req.embedding_dim,
         blob_columns,
         id_index_type,
+        distance_metric,
         ..Default::default()
     };
 

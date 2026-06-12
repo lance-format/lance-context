@@ -5,7 +5,9 @@ use lance_context_api::{
     ContextError, ContextResult, ContextStoreApi, DeleteRecordResponse, RecordDto, RetrieveRequest,
     RetrieveResultDto, SearchResultDto,
 };
-use lance_context_core::{ContextStore as LocalStore, ContextStoreOptions, IdIndexType};
+use lance_context_core::{
+    ContextStore as LocalStore, ContextStoreOptions, DistanceMetric, IdIndexType,
+};
 
 #[cfg(feature = "remote")]
 use lance_context_client::RemoteContextStore;
@@ -29,6 +31,7 @@ impl ContextStore {
         storage_options: Option<std::collections::HashMap<String, String>>,
         id_index_type: Option<&str>,
         blob_columns: Option<Vec<String>>,
+        distance_metric: Option<&str>,
     ) -> Result<Self, ContextError> {
         let id_idx = match id_index_type {
             Some("btree") => IdIndexType::BTree,
@@ -40,6 +43,11 @@ impl ContextStore {
                 )));
             }
         };
+        let metric = match distance_metric {
+            Some(value) => DistanceMetric::parse(value)
+                .map_err(|e| ContextError::InvalidRequest(e.to_string()))?,
+            None => DistanceMetric::default(),
+        };
         let options = ContextStoreOptions {
             storage_options,
             blob_columns: blob_columns
@@ -47,6 +55,7 @@ impl ContextStore {
                 .into_iter()
                 .collect::<HashSet<_>>(),
             id_index_type: id_idx,
+            distance_metric: metric,
             ..Default::default()
         };
         let store = LocalStore::open_with_options(uri, options)

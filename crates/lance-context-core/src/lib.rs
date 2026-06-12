@@ -13,7 +13,8 @@ pub use record::{
     RetrieveResult, SearchResult, StateMetadata, LIFECYCLE_ACTIVE, LIFECYCLE_CONTRADICTED,
 };
 pub use store::{
-    CompactionConfig, CompactionStats, ContextStore, ContextStoreOptions, IdIndexType,
+    CompactionConfig, CompactionStats, ContextStore, ContextStoreOptions, DistanceMetric,
+    IdIndexType,
 };
 
 // Re-export CompactionMetrics from lance for Python bindings

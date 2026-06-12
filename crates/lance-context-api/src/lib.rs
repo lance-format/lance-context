@@ -105,6 +105,8 @@ pub struct CreateContextRequest {
     pub blob_columns: Option<Vec<String>>,
     #[serde(default)]
     pub embedding_dim: Option<i32>,
+    #[serde(default)]
+    pub distance_metric: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

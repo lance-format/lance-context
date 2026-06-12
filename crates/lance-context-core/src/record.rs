@@ -126,6 +126,10 @@ impl LifecycleQueryOptions {
 #[derive(Debug, Clone)]
 pub struct SearchResult {
     pub record: ContextRecord,
+    /// Distance score under the store's configured distance metric, always
+    /// ordered "smaller is better". Its scale is metric-dependent: L2 distance,
+    /// cosine distance (`1 - cosine_similarity`, in `0..=2`), or the negated dot
+    /// product for maximum-inner-product search.
     pub distance: f32,
 }
 

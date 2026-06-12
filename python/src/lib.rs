@@ -14,8 +14,8 @@ use tokio::runtime::Runtime;
 use lance_context_core::serde::CONTENT_TYPE_TEXT;
 use lance_context_core::{
     CompactionConfig, CompactionMetrics, CompactionStats, Context as RustContext, ContextRecord,
-    ContextStore, ContextStoreOptions, IdIndexType, LifecycleQueryOptions, RecordFilters,
-    Relationship, RetrieveResult, SearchResult, LIFECYCLE_ACTIVE,
+    ContextStore, ContextStoreOptions, DistanceMetric, IdIndexType, LifecycleQueryOptions,
+    RecordFilters, Relationship, RetrieveResult, SearchResult, LIFECYCLE_ACTIVE,
 };
 
 const DEFAULT_BINARY_CONTENT_TYPE: &str = "application/octet-stream";
@@ -168,7 +168,7 @@ fn filters_from_json(filters_json: Option<String>) -> PyResult<Option<RecordFilt
 impl Context {
     #[classmethod]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (uri, *, storage_options=None, compaction_config=None, blob_columns=None, id_index_type=None, embedding_dim=None))]
+    #[pyo3(signature = (uri, *, storage_options=None, compaction_config=None, blob_columns=None, id_index_type=None, embedding_dim=None, distance_metric=None))]
     fn create(
         _cls: &Bound<'_, PyType>,
         py: Python<'_>,
@@ -178,6 +178,7 @@ impl Context {
         blob_columns: Option<Vec<String>>,
         id_index_type: Option<String>,
         embedding_dim: Option<i32>,
+        distance_metric: Option<String>,
     ) -> PyResult<Self> {
         let runtime = Arc::new(Runtime::new().map_err(to_py_err)?);
 
@@ -195,12 +196,18 @@ impl Context {
             }
         };
 
+        let metric = match distance_metric.as_deref() {
+            Some(value) => DistanceMetric::parse(value).map_err(to_py_err)?,
+            None => DistanceMetric::default(),
+        };
+
         let options = ContextStoreOptions {
             storage_options: storage_options_from_dict(storage_options)?,
             compaction: compaction_config_from_dict(compaction_config)?,
             embedding_dim,
             blob_columns: blob_set,
             id_index_type: id_idx,
+            distance_metric: metric,
         };
 
         let store_res =
