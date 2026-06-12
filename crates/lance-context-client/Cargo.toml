@@ -1,6 +1,6 @@
 [package]
 name = "lance-context-client"
-version = "0.2.4"
+version = "0.4.0"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Lance Devs <dev@lancedb.com>"]
@@ -9,7 +9,7 @@ description = "Rust client for the lance-context REST API"
 keywords = ["context", "lance", "client", "api"]
 
 [dependencies]
-lance-context-api = { path = "../lance-context-api" }
+lance-context-api = { version = "0.4.0", path = "../lance-context-api" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

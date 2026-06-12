@@ -28,6 +28,21 @@ optional_value = "0"
 first_value = "0"
 
 [[tool.bumpversion.files]]
+filename = "crates/lance-context-api/Cargo.toml"
+search = 'version = "{current_version}"'
+replace = 'version = "{new_version}"'
+
+[[tool.bumpversion.files]]
+filename = "crates/lance-context-client/Cargo.toml"
+search = 'version = "{current_version}"'
+replace = 'version = "{new_version}"'
+
+[[tool.bumpversion.files]]
+filename = "crates/lance-context-server/Cargo.toml"
+search = 'version = "{current_version}"'
+replace = 'version = "{new_version}"'
+
+[[tool.bumpversion.files]]
 filename = "crates/lance-context-core/Cargo.toml"
 search = 'version = "{current_version}"'
 replace = 'version = "{new_version}"'

@@ -27,7 +27,6 @@ env:
 
 jobs:
   publish:
-    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -47,25 +46,10 @@ jobs:
 
       - uses: rui314/setup-mold@v1
 
-      - name: Publish lance-context-core
+      - name: Publish Rust crates
         uses: katyo/publish-crates@v2
         with:
           registry-token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           args: "--all-features"
-          path: crates/lance-context-core
-          dry-run: ${{ github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'dry_run') }}
-
-      - name: Wait for crates.io index
-        if: >
-          (github.event_name == 'release' && github.event.action == 'released') ||
-          (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'release')
-        run: |
-          sleep 30
-
-      - name: Publish lance-context
-        uses: katyo/publish-crates@v2
-        with:
-          registry-token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-          args: "--all-features"
-          path: crates/lance-context
+          path: .
           dry-run: ${{ github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'dry_run') }}

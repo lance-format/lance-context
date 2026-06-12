@@ -1,6 +1,6 @@
 [package]
 name = "lance-context-server"
-version = "0.2.4"
+version = "0.4.0"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Lance Devs <dev@lancedb.com>"]
@@ -13,8 +13,8 @@ name = "lance-context-server"
 path = "src/main.rs"
 
 [dependencies]
-lance-context-core = { path = "../lance-context-core" }
-lance-context-api = { path = "../lance-context-api" }
+lance-context-core = { version = "0.4.0", path = "../lance-context-core" }
+lance-context-api = { version = "0.4.0", path = "../lance-context-api" }
 axum = { version = "0.8", features = ["json"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive"] }

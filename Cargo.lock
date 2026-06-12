@@ -5378,7 +5378,7 @@ dependencies = [
 
 [[package]]
 name = "lance-context-api"
-version = "0.2.4"
+version = "0.4.0"
 dependencies = [
  "base64",
  "chrono",
@@ -5389,7 +5389,7 @@ dependencies = [
 
 [[package]]
 name = "lance-context-client"
-version = "0.2.4"
+version = "0.4.0"
 dependencies = [
  "lance-context-api",
  "reqwest 0.12.28",
@@ -5435,7 +5435,7 @@ dependencies = [
 
 [[package]]
 name = "lance-context-server"
-version = "0.2.4"
+version = "0.4.0"
 dependencies = [
  "axum",
  "chrono",
