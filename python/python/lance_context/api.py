@@ -174,6 +174,21 @@ def _normalize_retrieve_hit(raw: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _normalize_state_metadata(
+    value: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise TypeError("state_metadata must be a mapping")
+    return {
+        "step": value.get("step"),
+        "active_plan_id": value.get("active_plan_id"),
+        "tokens_used": value.get("tokens_used"),
+        "custom": value.get("custom"),
+    }
+
+
 _AWS_KWARG_MAP: dict[str, str] = {
     "aws_access_key_id": "aws_access_key_id",
     "aws_secret_access_key": "aws_secret_access_key",
@@ -424,6 +439,7 @@ class Context:
         bot_id: str | None = None,
         session_id: str | None = None,
         external_id: str | None = None,
+        state_metadata: Mapping[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
         relationships: list[dict[str, Any]] | None = None,
         expires_at: datetime | str | None = None,
@@ -450,6 +466,7 @@ class Context:
             bot_id,
             session_id,
             external_id,
+            _normalize_state_metadata(state_metadata),
             _json_dumps(metadata, "metadata"),
             _coerce_timestamp(expires_at, field_name="expires_at"),
             retention_policy,
@@ -576,9 +593,9 @@ class Context:
 
         Each record accepts the same fields as :meth:`add`: ``role``,
         ``content``, optional ``content_type``/``data_type``, ``embedding``,
-        ``bot_id``, ``session_id``, ``external_id``, ``metadata``,
-        ``relationships``, and lifecycle fields such as ``expires_at`` and
-        ``lifecycle_status``.
+        ``bot_id``, ``session_id``, ``external_id``, ``state_metadata``,
+        ``metadata``, ``relationships``, and lifecycle fields such as
+        ``expires_at`` and ``lifecycle_status``.
         """
         normalized: list[dict[str, Any]] = []
         for index, record in enumerate(records):
@@ -608,6 +625,9 @@ class Context:
                     "bot_id": record.get("bot_id"),
                     "session_id": record.get("session_id"),
                     "external_id": record.get("external_id"),
+                    "state_metadata": _normalize_state_metadata(
+                        record.get("state_metadata")
+                    ),
                     "metadata_json": _json_dumps(record.get("metadata"), "metadata"),
                     "relationships_json": _json_dumps(
                         record.get("relationships"), "relationships"
@@ -915,6 +935,7 @@ class AsyncContext:
         bot_id: str | None = None,
         session_id: str | None = None,
         external_id: str | None = None,
+        state_metadata: Mapping[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
         relationships: list[dict[str, Any]] | None = None,
         expires_at: datetime | str | None = None,
@@ -937,6 +958,7 @@ class AsyncContext:
                 bot_id=bot_id,
                 session_id=session_id,
                 external_id=external_id,
+                state_metadata=state_metadata,
                 metadata=metadata,
                 relationships=relationships,
                 expires_at=expires_at,
