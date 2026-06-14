@@ -375,7 +375,7 @@ impl Context {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (id = None, external_id = None, bot_id = None, session_id = None, metadata_json = None, relationships_json = None, expires_at = None, retention_policy = None, lifecycle_status = None, retired_at = None, retired_reason = None))]
+    #[pyo3(signature = (id = None, external_id = None, bot_id = None, session_id = None, metadata_json = None, relationships_json = None, expires_at = None, retention_policy = None, lifecycle_status = None, retired_at = None, retired_reason = None, embedding = None))]
     fn update(
         &mut self,
         py: Python<'_>,
@@ -390,6 +390,7 @@ impl Context {
         lifecycle_status: Option<String>,
         retired_at: Option<String>,
         retired_reason: Option<String>,
+        embedding: Option<Vec<f32>>,
     ) -> PyResult<PyObject> {
         let patch = RecordPatch {
             bot_id,
@@ -402,6 +403,7 @@ impl Context {
             lifecycle_status,
             retired_at: parse_optional_datetime(retired_at, "retired_at")?,
             retired_reason,
+            embedding,
         };
         if patch.is_empty() {
             return Err(PyRuntimeError::new_err(

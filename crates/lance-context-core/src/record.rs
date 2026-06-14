@@ -165,6 +165,9 @@ pub struct RecordPatch {
     pub lifecycle_status: Option<String>,
     pub retired_at: Option<DateTime<Utc>>,
     pub retired_reason: Option<String>,
+    /// Vector embedding to attach to the record. Enables deferred embedding
+    /// workflows: append raw text first, then enrich with an embedding later.
+    pub embedding: Option<Vec<f32>>,
 }
 
 impl RecordPatch {
@@ -180,6 +183,7 @@ impl RecordPatch {
             && self.lifecycle_status.is_none()
             && self.retired_at.is_none()
             && self.retired_reason.is_none()
+            && self.embedding.is_none()
     }
 }
 

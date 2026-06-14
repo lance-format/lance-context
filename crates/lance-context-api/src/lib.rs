@@ -242,6 +242,8 @@ pub struct RecordPatchDto {
     pub retired_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retired_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<Vec<f32>>,
 }
 
 impl RecordPatchDto {
@@ -257,6 +259,7 @@ impl RecordPatchDto {
             && self.lifecycle_status.is_none()
             && self.retired_at.is_none()
             && self.retired_reason.is_none()
+            && self.embedding.is_none()
     }
 }
 

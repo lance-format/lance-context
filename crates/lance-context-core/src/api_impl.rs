@@ -330,6 +330,7 @@ fn patch_from_dto(patch: &RecordPatchDto) -> RecordPatch {
         lifecycle_status: patch.lifecycle_status.clone(),
         retired_at: patch.retired_at,
         retired_reason: patch.retired_reason.clone(),
+        embedding: patch.embedding.clone(),
     }
 }
 

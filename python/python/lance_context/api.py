@@ -533,8 +533,14 @@ class Context:
         lifecycle_status: str | None = None,
         retired_at: datetime | str | None = None,
         retired_reason: str | None = None,
+        embedding: list[float] | None = None,
     ) -> dict[str, Any]:
-        """Patch mutable fields on a visible record by id or external_id."""
+        """Patch mutable fields on a visible record by id or external_id.
+
+        Pass ``embedding`` to attach or replace a record's vector after it was
+        appended without one (deferred / enrich-later ingestion). The updated
+        record participates in vector search once the embedding is set.
+        """
         if (id is None) == (external_id is None):
             raise ValueError("Specify exactly one of id or external_id")
         if (
@@ -547,6 +553,7 @@ class Context:
             and lifecycle_status is None
             and retired_at is None
             and retired_reason is None
+            and embedding is None
         ):
             raise ValueError("update requires at least one patch field")
 
@@ -562,6 +569,7 @@ class Context:
             lifecycle_status,
             _coerce_timestamp(retired_at, field_name="retired_at"),
             retired_reason,
+            embedding,
         )
         record = result.get("record")
         return {

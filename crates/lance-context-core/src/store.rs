@@ -619,6 +619,9 @@ impl ContextStore {
         if let Some(retired_reason) = patch.retired_reason {
             record.retired_reason = Some(retired_reason);
         }
+        if let Some(embedding) = patch.embedding {
+            record.embedding = Some(embedding);
+        }
 
         self.validate_new_record_id(&record).await?;
         let version = self.write_entries(std::slice::from_ref(&record)).await?;
@@ -3056,6 +3059,67 @@ mod tests {
             assert_eq!(history.len(), 2);
             assert!(history.iter().any(|item| item.id == record.id));
             assert!(history.iter().any(|item| item.id == updated.record.id));
+        });
+    }
+
+    #[test]
+    fn deferred_embedding_patch_makes_raw_record_searchable() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = ContextStore::open(&uri).await.unwrap();
+
+            // Raw-first capture: append source chunks without embeddings.
+            let mut by_ext = text_record("raw-ext", 0.0);
+            by_ext.embedding = None;
+            by_ext.external_id = Some("doc-1#chunk-1".to_string());
+            let mut by_id = text_record("raw-id", 0.0);
+            by_id.embedding = None;
+            by_id.external_id = None;
+            store.add(&[by_ext.clone(), by_id.clone()]).await.unwrap();
+
+            // Records without an embedding are invisible to vector search.
+            let query = make_embedding(1.0);
+            assert!(store.search(&query, Some(10)).await.unwrap().is_empty());
+
+            // Enrich-later: patch the embedding by external_id...
+            let enriched_ext = store
+                .update_by_external_id(
+                    "doc-1#chunk-1",
+                    RecordPatch {
+                        embedding: Some(make_embedding(1.0)),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(enriched_ext.record.embedding, Some(make_embedding(1.0)));
+            // Raw payload is carried forward onto the superseding record.
+            assert_eq!(enriched_ext.record.text_payload, by_ext.text_payload);
+
+            // ...and by internal id.
+            let enriched_id = store
+                .update_by_id(
+                    &by_id.id,
+                    RecordPatch {
+                        embedding: Some(make_embedding(0.0)),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(enriched_id.record.embedding, Some(make_embedding(0.0)));
+
+            // Both records now participate in vector search.
+            let results = store.search(&query, Some(10)).await.unwrap();
+            let ids: Vec<&str> = results.iter().map(|r| r.record.id.as_str()).collect();
+            assert!(ids.contains(&enriched_ext.record.id.as_str()));
+            assert!(ids.contains(&enriched_id.record.id.as_str()));
+            // The query matches the external_id record exactly (distance 0).
+            assert_eq!(results[0].record.id, enriched_ext.record.id);
         });
     }
 

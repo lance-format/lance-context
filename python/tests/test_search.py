@@ -177,6 +177,7 @@ class DummyInner:
         lifecycle_status: str | None,
         retired_at: str | None,
         retired_reason: str | None,
+        embedding: list[float] | None = None,
     ):
         self.update_calls.append(
             {
@@ -191,6 +192,7 @@ class DummyInner:
                 "lifecycle_status": lifecycle_status,
                 "retired_at": retired_at,
                 "retired_reason": retired_reason,
+                "embedding": embedding,
             }
         )
         if id == "missing" or external_id == "missing":
@@ -1159,6 +1161,7 @@ def test_context_update_returns_operation_metadata_and_record():
             "lifecycle_status": "active",
             "retired_at": None,
             "retired_reason": None,
+            "embedding": None,
         }
     ]
     assert result["updated"] is True
@@ -1171,6 +1174,28 @@ def test_context_update_returns_operation_metadata_and_record():
         {"target_id": "doc-1", "relation": "updates"}
     ]
     assert result["record"]["supersedes_id"] == "old-id"
+
+
+def test_context_update_forwards_embedding():
+    ctx = Context.__new__(Context)
+    dummy = DummyInner()
+    ctx._inner = dummy  # type: ignore[attr-defined]
+
+    ctx.update(external_id="source-1", embedding=[0.1, 0.2, 0.3])
+
+    assert dummy.update_calls[0]["embedding"] == [0.1, 0.2, 0.3]
+
+
+def test_context_update_accepts_embedding_only_patch():
+    ctx = Context.__new__(Context)
+    dummy = DummyInner()
+    ctx._inner = dummy  # type: ignore[attr-defined]
+
+    # An embedding is sufficient on its own; no "at least one patch field" error.
+    result = ctx.update(id="rec-1", embedding=[0.1, 0.2])
+
+    assert dummy.update_calls[0]["embedding"] == [0.1, 0.2]
+    assert result["updated"] is True
 
 
 def test_context_update_missing_record_returns_not_updated():
