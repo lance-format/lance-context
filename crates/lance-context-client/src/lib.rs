@@ -129,10 +129,27 @@ impl ContextStoreApi for RemoteContextStore {
         &self,
         limit: Option<usize>,
         offset: Option<usize>,
+        filters: Option<serde_json::Value>,
+        include_expired: bool,
+        include_retired: bool,
     ) -> ContextResult<Vec<RecordDto>> {
+        let filters = filters
+            .as_ref()
+            .map(|value| {
+                serde_json::to_string(value)
+                    .map_err(|err| ContextError::InvalidRequest(err.to_string()))
+            })
+            .transpose()?;
         let resp = self
             .client
-            .list_records(&self.context_name, limit, offset)
+            .list_records(
+                &self.context_name,
+                limit,
+                offset,
+                filters.as_deref(),
+                include_expired,
+                include_retired,
+            )
             .await
             .map_err(to_ctx_err)?;
         Ok(resp.records)
@@ -161,20 +178,10 @@ impl ContextStoreApi for RemoteContextStore {
         Ok(resp.records)
     }
 
-    async fn search(
-        &self,
-        query: &[f32],
-        limit: Option<usize>,
-        include_relationships: bool,
-    ) -> ContextResult<Vec<SearchResultDto>> {
-        let req = SearchRequest {
-            query: query.to_vec(),
-            limit: limit.unwrap_or(10),
-            include_relationships,
-        };
+    async fn search(&self, request: &SearchRequest) -> ContextResult<Vec<SearchResultDto>> {
         let resp = self
             .client
-            .search(&self.context_name, &req)
+            .search(&self.context_name, request)
             .await
             .map_err(to_ctx_err)?;
         Ok(resp.results)
@@ -401,20 +408,30 @@ impl ContextClient {
         name: &str,
         limit: Option<usize>,
         offset: Option<usize>,
+        filters: Option<&str>,
+        include_expired: bool,
+        include_retired: bool,
     ) -> Result<ListRecordsResponse, ClientError> {
-        let mut url = self.url(&format!("/contexts/{}/records", name));
-        let mut params = Vec::new();
-        if let Some(l) = limit {
-            params.push(format!("limit={}", l));
+        let mut request = self
+            .http
+            .get(self.url(&format!("/contexts/{}/records", name)));
+        if let Some(limit) = limit {
+            request = request.query(&[("limit", limit)]);
         }
-        if let Some(o) = offset {
-            params.push(format!("offset={}", o));
+        if let Some(offset) = offset {
+            request = request.query(&[("offset", offset)]);
         }
-        if !params.is_empty() {
-            url = format!("{}?{}", url, params.join("&"));
+        if let Some(filters) = filters {
+            request = request.query(&[("filters", filters)]);
+        }
+        if include_expired {
+            request = request.query(&[("include_expired", include_expired)]);
+        }
+        if include_retired {
+            request = request.query(&[("include_retired", include_retired)]);
         }
 
-        let resp = self.http.get(&url).send().await?;
+        let resp = request.send().await?;
         Self::handle_response(resp).await
     }
 

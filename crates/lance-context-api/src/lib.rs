@@ -65,6 +65,9 @@ pub trait ContextStoreApi {
         &self,
         limit: Option<usize>,
         offset: Option<usize>,
+        filters: Option<Value>,
+        include_expired: bool,
+        include_retired: bool,
     ) -> impl Future<Output = ContextResult<Vec<RecordDto>>> + Send;
 
     fn related(
@@ -78,9 +81,7 @@ pub trait ContextStoreApi {
 
     fn search(
         &self,
-        query: &[f32],
-        limit: Option<usize>,
-        include_relationships: bool,
+        request: &SearchRequest,
     ) -> impl Future<Output = ContextResult<Vec<SearchResultDto>>> + Send;
 
     fn retrieve(
@@ -357,6 +358,12 @@ pub struct SearchRequest {
     pub query: Vec<f32>,
     #[serde(default = "default_search_limit")]
     pub limit: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filters: Option<Value>,
+    #[serde(default)]
+    pub include_expired: bool,
+    #[serde(default)]
+    pub include_retired: bool,
     #[serde(default)]
     pub include_relationships: bool,
 }
@@ -518,5 +525,40 @@ where
             .map(Some)
             .map_err(serde::de::Error::custom),
         None => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_request_legacy_payload_defaults_filters_and_lifecycle() {
+        // Clients written against the pre-#89 shape send only query/limit.
+        let req: SearchRequest =
+            serde_json::from_str(r#"{"query": [0.1, 0.2], "limit": 5}"#).unwrap();
+        assert_eq!(req.query, vec![0.1, 0.2]);
+        assert_eq!(req.limit, 5);
+        assert!(req.filters.is_none());
+        assert!(!req.include_expired);
+        assert!(!req.include_retired);
+        assert!(!req.include_relationships);
+    }
+
+    #[test]
+    fn search_request_defaults_limit_when_omitted() {
+        let req: SearchRequest = serde_json::from_str(r#"{"query": [1.0]}"#).unwrap();
+        assert_eq!(req.limit, default_search_limit());
+    }
+
+    #[test]
+    fn search_request_parses_filters_and_lifecycle() {
+        let req: SearchRequest = serde_json::from_str(
+            r#"{"query": [1.0], "filters": {"tenant": "acme"}, "include_expired": true, "include_retired": true}"#,
+        )
+        .unwrap();
+        assert_eq!(req.filters, Some(serde_json::json!({"tenant": "acme"})));
+        assert!(req.include_expired);
+        assert!(req.include_retired);
     }
 }

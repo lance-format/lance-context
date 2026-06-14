@@ -9,7 +9,7 @@ use lance_context_api::{
     UpdateRecordRequest, UpdateRecordResponse, UpsertRecordRequest, UpsertRecordResponse,
 };
 use lance_context_core::{
-    ContextRecord, LifecycleQueryOptions, RecordPatch, Relationship, StateMetadata,
+    ContextRecord, LifecycleQueryOptions, RecordFilters, RecordPatch, Relationship, StateMetadata,
     LIFECYCLE_ACTIVE,
 };
 use uuid::Uuid;
@@ -255,10 +255,16 @@ pub async fn delete_record_by_external_id(
     Ok(Json(DeleteRecordResponse { deleted, version }))
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize)]
 pub struct ListParams {
     pub limit: Option<usize>,
     pub offset: Option<usize>,
+    /// JSON object encoding `RecordFilters`, URL-encoded into the query string.
+    pub filters: Option<String>,
+    #[serde(default)]
+    pub include_expired: bool,
+    #[serde(default)]
+    pub include_retired: bool,
 }
 
 pub async fn list_records(
@@ -266,6 +272,18 @@ pub async fn list_records(
     Path(name): Path<String>,
     Query(params): Query<ListParams>,
 ) -> Result<Json<ListRecordsResponse>, AppError> {
+    let filters = params
+        .filters
+        .as_deref()
+        .map(|raw| {
+            serde_json::from_str(raw)
+                .map_err(|err| AppError::InvalidRequest(format!("invalid filters JSON: {err}")))
+                .and_then(|value| {
+                    RecordFilters::from_json_value(value).map_err(AppError::InvalidRequest)
+                })
+        })
+        .transpose()?;
+
     let stores = state.stores.read().await;
     let store_lock = stores
         .get(&name)
@@ -275,7 +293,12 @@ pub async fn list_records(
 
     let store = store_lock.read().await;
     let records = store
-        .list(params.limit, params.offset)
+        .list_filtered_with_options(
+            params.limit,
+            params.offset,
+            filters.as_ref(),
+            LifecycleQueryOptions::new(params.include_expired, params.include_retired),
+        )
         .await
         .map_err(AppError::from_lance)?;
 
@@ -448,6 +471,7 @@ mod tests {
 
     use axum::extract::{Path, Query, State};
     use axum::Json;
+    use chrono::{Duration, Utc};
     use lance_context_api::{
         AddRecordRequest, AddRecordsRequest, RecordPatchDto, UpdateRecordRequest,
         UpsertRecordRequest,
@@ -623,6 +647,7 @@ mod tests {
             Query(ListParams {
                 limit: None,
                 offset: None,
+                ..Default::default()
             }),
         )
         .await
@@ -689,6 +714,7 @@ mod tests {
             Query(ListParams {
                 limit: None,
                 offset: None,
+                ..Default::default()
             }),
         )
         .await
@@ -738,5 +764,180 @@ mod tests {
             Some("record that cites the runbook")
         );
         assert_eq!(response.records[0].relationships.len(), 1);
+    }
+
+    async fn list_with(
+        state: &Arc<AppState>,
+        context_name: &str,
+        params: ListParams,
+    ) -> Vec<RecordDto> {
+        let Json(response) = list_records(
+            State(state.clone()),
+            Path(context_name.to_string()),
+            Query(params),
+        )
+        .await
+        .unwrap();
+        response.records
+    }
+
+    #[tokio::test]
+    async fn list_filters_by_metadata_and_builtin_fields() {
+        let context_name = "ctx";
+        let (state, _dir) = test_state(context_name).await;
+
+        let mut alpha = text_record("alpha");
+        alpha.metadata = Some(serde_json::json!({"tenant": "acme"}));
+        let mut bravo = text_record("bravo");
+        bravo.role = "assistant".to_string();
+        bravo.metadata = Some(serde_json::json!({"tenant": "globex"}));
+        let mut charlie = text_record("charlie");
+        charlie.metadata = Some(serde_json::json!({"tenant": "acme"}));
+        let _ = add_records(
+            State(state.clone()),
+            Path(context_name.to_string()),
+            Json(AddRecordsRequest {
+                records: vec![alpha, bravo, charlie],
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Metadata filter restricts to tenant=acme (alpha + charlie).
+        let records = list_with(
+            &state,
+            context_name,
+            ListParams {
+                filters: Some(r#"{"tenant": "acme"}"#.to_string()),
+                ..Default::default()
+            },
+        )
+        .await;
+        let texts: Vec<&str> = records
+            .iter()
+            .filter_map(|r| r.text_payload.as_deref())
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert!(texts.contains(&"alpha"));
+        assert!(texts.contains(&"charlie"));
+
+        // Built-in field filter restricts to role=assistant (bravo).
+        let records = list_with(
+            &state,
+            context_name,
+            ListParams {
+                filters: Some(r#"{"role": "assistant"}"#.to_string()),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].text_payload.as_deref(), Some("bravo"));
+    }
+
+    #[tokio::test]
+    async fn list_respects_expired_visibility() {
+        let context_name = "ctx";
+        let (state, _dir) = test_state(context_name).await;
+
+        let fresh = text_record("fresh");
+        let mut stale = text_record("stale");
+        stale.expires_at = Some(Utc::now() - Duration::hours(1));
+        let _ = add_records(
+            State(state.clone()),
+            Path(context_name.to_string()),
+            Json(AddRecordsRequest {
+                records: vec![fresh, stale],
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Default listing hides the expired record.
+        let records = list_with(&state, context_name, ListParams::default()).await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].text_payload.as_deref(), Some("fresh"));
+
+        // include_expired surfaces it.
+        let records = list_with(
+            &state,
+            context_name,
+            ListParams {
+                include_expired: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(records.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn list_respects_retired_visibility() {
+        let context_name = "ctx";
+        let (state, _dir) = test_state(context_name).await;
+
+        let mut original = text_record("v1");
+        original.external_id = Some("doc-1".to_string());
+        let (_, Json(add_response)) = add_records(
+            State(state.clone()),
+            Path(context_name.to_string()),
+            Json(AddRecordsRequest {
+                records: vec![original],
+            }),
+        )
+        .await
+        .unwrap();
+        let old_id = add_response.ids[0].clone();
+
+        let Json(updated) = update_record(
+            State(state.clone()),
+            Path(context_name.to_string()),
+            Json(UpdateRecordRequest {
+                id: None,
+                external_id: Some("doc-1".to_string()),
+                patch: RecordPatchDto {
+                    metadata: Some(serde_json::json!({"revision": 2})),
+                    ..Default::default()
+                },
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(updated.updated);
+
+        // Default listing returns only the visible successor.
+        let records = list_with(&state, context_name, ListParams::default()).await;
+        assert_eq!(records.len(), 1);
+        assert_ne!(records[0].id, old_id);
+
+        // include_retired surfaces the superseded original too.
+        let records = list_with(
+            &state,
+            context_name,
+            ListParams {
+                include_retired: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().any(|r| r.id == old_id));
+    }
+
+    #[tokio::test]
+    async fn list_rejects_invalid_filters_json() {
+        let context_name = "ctx";
+        let (state, _dir) = test_state(context_name).await;
+
+        let result = list_records(
+            State(state),
+            Path(context_name.to_string()),
+            Query(ListParams {
+                filters: Some("not json".to_string()),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert!(matches!(result, Err(AppError::InvalidRequest(_))));
     }
 }

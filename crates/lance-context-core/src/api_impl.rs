@@ -1,11 +1,13 @@
 use chrono::Utc;
+use serde_json::Value;
 use uuid::Uuid;
 
 use lance_context_api::{
     AddRecordRequest, AddRecordsResponse, CompactRequest, CompactResponse, CompactStatsResponse,
     ContextError, ContextResult, ContextStoreApi, DeleteRecordResponse, RecordDto, RecordPatchDto,
-    RelationshipDto, RetrieveRequest, RetrieveResultDto, SearchResultDto, StateMetadataDto,
-    UpdateRecordRequest, UpdateRecordResponse, UpsertRecordRequest, UpsertRecordResponse,
+    RelationshipDto, RetrieveRequest, RetrieveResultDto, SearchRequest, SearchResultDto,
+    StateMetadataDto, UpdateRecordRequest, UpdateRecordResponse, UpsertRecordRequest,
+    UpsertRecordResponse,
 };
 
 use crate::record::{
@@ -156,10 +158,24 @@ impl ContextStoreApi for ContextStore {
         &self,
         limit: Option<usize>,
         offset: Option<usize>,
+        filters: Option<Value>,
+        include_expired: bool,
+        include_retired: bool,
     ) -> ContextResult<Vec<RecordDto>> {
-        let records = ContextStore::list(self, limit, offset)
-            .await
-            .map_err(to_ctx_err)?;
+        let filters = filters
+            .map(RecordFilters::from_json_value)
+            .transpose()
+            .map_err(ContextError::InvalidRequest)?;
+        let options = LifecycleQueryOptions::new(include_expired, include_retired);
+        let records = ContextStore::list_filtered_with_options(
+            self,
+            limit,
+            offset,
+            filters.as_ref(),
+            options,
+        )
+        .await
+        .map_err(to_ctx_err)?;
         Ok(records.into_iter().map(record_to_dto).collect())
     }
 
@@ -179,19 +195,27 @@ impl ContextStoreApi for ContextStore {
         Ok(records.into_iter().map(record_to_dto).collect())
     }
 
-    async fn search(
-        &self,
-        query: &[f32],
-        limit: Option<usize>,
-        include_relationships: bool,
-    ) -> ContextResult<Vec<SearchResultDto>> {
-        let results = ContextStore::search(self, query, limit)
-            .await
-            .map_err(to_ctx_err)?;
+    async fn search(&self, request: &SearchRequest) -> ContextResult<Vec<SearchResultDto>> {
+        let filters = request
+            .filters
+            .clone()
+            .map(RecordFilters::from_json_value)
+            .transpose()
+            .map_err(ContextError::InvalidRequest)?;
+        let options = LifecycleQueryOptions::new(request.include_expired, request.include_retired);
+        let results = ContextStore::search_filtered_with_options(
+            self,
+            &request.query,
+            Some(request.limit),
+            filters.as_ref(),
+            options,
+        )
+        .await
+        .map_err(to_ctx_err)?;
         Ok(results
             .into_iter()
             .map(|mut sr| {
-                if !include_relationships {
+                if !request.include_relationships {
                     sr.record.relationships.clear();
                 }
                 SearchResultDto {
