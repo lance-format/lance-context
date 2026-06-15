@@ -1,6 +1,6 @@
 #![recursion_limit = "256"]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -13,9 +13,11 @@ use tokio::runtime::Runtime;
 
 use lance_context_core::serde::CONTENT_TYPE_TEXT;
 use lance_context_core::{
-    CompactionConfig, CompactionMetrics, CompactionStats, Context as RustContext, ContextRecord,
-    ContextStore, ContextStoreOptions, DistanceMetric, IdIndexType, LifecycleQueryOptions,
-    RecordFilters, RecordPatch, Relationship, RetrieveResult, SearchResult, LIFECYCLE_ACTIVE,
+    CompactionConfig, CompactionMetrics, CompactionStats, Context as RustContext,
+    ContextNamespace as RustContextNamespace, ContextRecord, ContextStore, ContextStoreOptions,
+    DistanceMetric, IdIndexType, LifecycleQueryOptions, PartitionInfo, PartitionSelector,
+    PartitionSpec, RecordFilters, RecordPatch, Relationship, RetrieveResult, SearchResult,
+    LIFECYCLE_ACTIVE,
 };
 
 const DEFAULT_BINARY_CONTENT_TYPE: &str = "application/octet-stream";
@@ -34,6 +36,8 @@ struct RecordInput {
     embedding: Option<Vec<f32>>,
     bot_id: Option<String>,
     session_id: Option<String>,
+    tenant: Option<String>,
+    source: Option<String>,
     external_id: Option<String>,
     metadata_json: Option<String>,
     relationships: Vec<Relationship>,
@@ -62,6 +66,12 @@ struct Context {
     store: ContextStore,
     runtime: Arc<Runtime>,
     run_id: String,
+}
+
+#[pyclass]
+struct ContextNamespace {
+    inner: RustContextNamespace,
+    runtime: Arc<Runtime>,
 }
 
 fn storage_options_from_dict<'py>(
@@ -141,6 +151,43 @@ fn compaction_config_from_dict<'py>(
     Ok(config)
 }
 
+fn context_options_from_py<'py>(
+    storage_options: Option<&Bound<'py, PyDict>>,
+    compaction_config: Option<&Bound<'py, PyDict>>,
+    blob_columns: Option<Vec<String>>,
+    id_index_type: Option<String>,
+    embedding_dim: Option<i32>,
+    distance_metric: Option<String>,
+) -> PyResult<ContextStoreOptions> {
+    let blob_set: HashSet<String> = blob_columns.unwrap_or_default().into_iter().collect();
+
+    let id_idx = match id_index_type.as_deref() {
+        Some("btree") => IdIndexType::BTree,
+        Some("zonemap") => IdIndexType::ZoneMap,
+        Some("none") | None => IdIndexType::None,
+        Some(other) => {
+            return Err(PyRuntimeError::new_err(format!(
+                "invalid id_index_type '{}': valid values are 'btree', 'zonemap'",
+                other
+            )))
+        }
+    };
+
+    let metric = match distance_metric.as_deref() {
+        Some(value) => Some(DistanceMetric::parse(value).map_err(to_py_err)?),
+        None => None,
+    };
+
+    Ok(ContextStoreOptions {
+        storage_options: storage_options_from_dict(storage_options)?,
+        compaction: compaction_config_from_dict(compaction_config)?,
+        embedding_dim,
+        blob_columns: blob_set,
+        id_index_type: id_idx,
+        distance_metric: metric,
+    })
+}
+
 fn metadata_from_json(metadata_json: Option<String>) -> PyResult<Option<Value>> {
     metadata_json
         .map(|value| serde_json::from_str(&value).map_err(to_py_err))
@@ -164,6 +211,17 @@ fn filters_from_json(filters_json: Option<String>) -> PyResult<Option<RecordFilt
         .map_err(PyRuntimeError::new_err)
 }
 
+fn selector_from_dict(dict: &Bound<'_, PyDict>) -> PyResult<PartitionSelector> {
+    let mut selector = BTreeMap::new();
+    for (key, value) in dict.iter() {
+        if value.is_none() {
+            continue;
+        }
+        selector.insert(key.extract::<String>()?, value.extract::<String>()?);
+    }
+    Ok(selector)
+}
+
 #[pymethods]
 impl Context {
     #[classmethod]
@@ -181,34 +239,14 @@ impl Context {
         distance_metric: Option<String>,
     ) -> PyResult<Self> {
         let runtime = Arc::new(Runtime::new().map_err(to_py_err)?);
-
-        let blob_set: HashSet<String> = blob_columns.unwrap_or_default().into_iter().collect();
-
-        let id_idx = match id_index_type.as_deref() {
-            Some("btree") => IdIndexType::BTree,
-            Some("zonemap") => IdIndexType::ZoneMap,
-            Some("none") | None => IdIndexType::None,
-            Some(other) => {
-                return Err(PyRuntimeError::new_err(format!(
-                    "invalid id_index_type '{}': valid values are 'btree', 'zonemap'",
-                    other
-                )))
-            }
-        };
-
-        let metric = match distance_metric.as_deref() {
-            Some(value) => Some(DistanceMetric::parse(value).map_err(to_py_err)?),
-            None => None,
-        };
-
-        let options = ContextStoreOptions {
-            storage_options: storage_options_from_dict(storage_options)?,
-            compaction: compaction_config_from_dict(compaction_config)?,
+        let options = context_options_from_py(
+            storage_options,
+            compaction_config,
+            blob_columns,
+            id_index_type,
             embedding_dim,
-            blob_columns: blob_set,
-            id_index_type: id_idx,
-            distance_metric: metric,
-        };
+            distance_metric,
+        )?;
 
         let store_res =
             py.allow_threads(|| runtime.block_on(ContextStore::open_with_options(uri, options)));
@@ -239,7 +277,7 @@ impl Context {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (role, content, data_type = None, embedding = None, bot_id = None, session_id = None, external_id = None, metadata_json = None, expires_at = None, retention_policy = None, lifecycle_status = None, retired_at = None, retired_reason = None, supersedes_id = None, superseded_by_id = None, relationships_json = None))]
+    #[pyo3(signature = (role, content, data_type = None, embedding = None, bot_id = None, session_id = None, tenant = None, source = None, external_id = None, metadata_json = None, expires_at = None, retention_policy = None, lifecycle_status = None, retired_at = None, retired_reason = None, supersedes_id = None, superseded_by_id = None, relationships_json = None))]
     fn add(
         &mut self,
         py: Python<'_>,
@@ -249,6 +287,8 @@ impl Context {
         embedding: Option<Vec<f32>>,
         bot_id: Option<String>,
         session_id: Option<String>,
+        tenant: Option<String>,
+        source: Option<String>,
         external_id: Option<String>,
         metadata_json: Option<String>,
         expires_at: Option<String>,
@@ -277,6 +317,8 @@ impl Context {
                 embedding,
                 bot_id,
                 session_id,
+                tenant,
+                source,
                 external_id,
                 metadata_json,
                 relationships: relationships_from_json(relationships_json)?,
@@ -299,7 +341,7 @@ impl Context {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (role, content, data_type = None, embedding = None, bot_id = None, session_id = None, external_id = None, metadata_json = None, expires_at = None, retention_policy = None, lifecycle_status = None, retired_at = None, retired_reason = None, relationships_json = None, key = "external_id"))]
+    #[pyo3(signature = (role, content, data_type = None, embedding = None, bot_id = None, session_id = None, tenant = None, source = None, external_id = None, metadata_json = None, expires_at = None, retention_policy = None, lifecycle_status = None, retired_at = None, retired_reason = None, relationships_json = None, key = "external_id"))]
     fn upsert(
         &mut self,
         py: Python<'_>,
@@ -309,6 +351,8 @@ impl Context {
         embedding: Option<Vec<f32>>,
         bot_id: Option<String>,
         session_id: Option<String>,
+        tenant: Option<String>,
+        source: Option<String>,
         external_id: Option<String>,
         metadata_json: Option<String>,
         expires_at: Option<String>,
@@ -347,6 +391,8 @@ impl Context {
                 embedding,
                 bot_id,
                 session_id,
+                tenant,
+                source,
                 external_id,
                 metadata_json,
                 relationships: relationships_from_json(relationships_json)?,
@@ -375,7 +421,7 @@ impl Context {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (id = None, external_id = None, bot_id = None, session_id = None, metadata_json = None, relationships_json = None, expires_at = None, retention_policy = None, lifecycle_status = None, retired_at = None, retired_reason = None))]
+    #[pyo3(signature = (id = None, external_id = None, bot_id = None, session_id = None, tenant = None, source = None, metadata_json = None, relationships_json = None, expires_at = None, retention_policy = None, lifecycle_status = None, retired_at = None, retired_reason = None))]
     fn update(
         &mut self,
         py: Python<'_>,
@@ -383,6 +429,8 @@ impl Context {
         external_id: Option<String>,
         bot_id: Option<String>,
         session_id: Option<String>,
+        tenant: Option<String>,
+        source: Option<String>,
         metadata_json: Option<String>,
         relationships_json: Option<String>,
         expires_at: Option<String>,
@@ -394,6 +442,8 @@ impl Context {
         let patch = RecordPatch {
             bot_id,
             session_id,
+            tenant,
+            source,
             state_metadata: None,
             metadata: metadata_from_json(metadata_json)?,
             relationships: relationships_patch_from_json(relationships_json)?,
@@ -728,6 +778,83 @@ impl Context {
     }
 }
 
+#[pymethods]
+impl ContextNamespace {
+    #[classmethod]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (root_uri, fields, *, storage_options=None, compaction_config=None, blob_columns=None, id_index_type=None, embedding_dim=None, distance_metric=None))]
+    fn create(
+        _cls: &Bound<'_, PyType>,
+        py: Python<'_>,
+        root_uri: &str,
+        fields: Vec<String>,
+        storage_options: Option<&Bound<'_, PyDict>>,
+        compaction_config: Option<&Bound<'_, PyDict>>,
+        blob_columns: Option<Vec<String>>,
+        id_index_type: Option<String>,
+        embedding_dim: Option<i32>,
+        distance_metric: Option<String>,
+    ) -> PyResult<Self> {
+        let runtime = Arc::new(Runtime::new().map_err(to_py_err)?);
+        let spec = PartitionSpec::new(fields).map_err(to_py_err)?;
+        let options = context_options_from_py(
+            storage_options,
+            compaction_config,
+            blob_columns,
+            id_index_type,
+            embedding_dim,
+            distance_metric,
+        )?;
+        let inner = py.allow_threads(|| {
+            runtime.block_on(RustContextNamespace::create_with_options(
+                root_uri, spec, options,
+            ))
+        });
+        Ok(Self {
+            inner: inner.map_err(to_py_err)?,
+            runtime,
+        })
+    }
+
+    fn root_uri(&self) -> &str {
+        self.inner.root_uri()
+    }
+
+    fn manifest_uri(&self) -> String {
+        self.inner.manifest_uri()
+    }
+
+    fn partition_uri(&self, selector: &Bound<'_, PyDict>) -> PyResult<String> {
+        let selector = selector_from_dict(selector)?;
+        Ok(self
+            .inner
+            .resolve_partition(&selector)
+            .map_err(to_py_err)?
+            .dataset_uri)
+    }
+
+    fn context(&self, py: Python<'_>, selector: &Bound<'_, PyDict>) -> PyResult<Context> {
+        let selector = selector_from_dict(selector)?;
+        let partition = self.inner.resolve_partition(&selector).map_err(to_py_err)?;
+        let store = py.allow_threads(|| self.runtime.block_on(self.inner.context(&selector)));
+        Ok(Context {
+            inner: RustContext::new(partition.dataset_uri),
+            store: store.map_err(to_py_err)?,
+            runtime: Arc::clone(&self.runtime),
+            run_id: new_run_id(),
+        })
+    }
+
+    fn partitions(&self, py: Python<'_>) -> PyResult<Vec<PyObject>> {
+        let partitions = py.allow_threads(|| self.runtime.block_on(self.inner.partitions()));
+        partitions
+            .map_err(to_py_err)?
+            .into_iter()
+            .map(|partition| partition_info_to_py(py, partition))
+            .collect()
+    }
+}
+
 impl Context {
     fn prepare_record_from_dict(
         &self,
@@ -740,6 +867,8 @@ impl Context {
         let embedding = optional_item(dict, "embedding")?.map(|value| value.extract::<Vec<f32>>());
         let bot_id = optional_item(dict, "bot_id")?.map(|value| value.extract::<String>());
         let session_id = optional_item(dict, "session_id")?.map(|value| value.extract::<String>());
+        let tenant = optional_item(dict, "tenant")?.map(|value| value.extract::<String>());
+        let source = optional_item(dict, "source")?.map(|value| value.extract::<String>());
         let external_id =
             optional_item(dict, "external_id")?.map(|value| value.extract::<String>());
         let metadata_json =
@@ -777,6 +906,8 @@ impl Context {
                 embedding: embedding.transpose()?,
                 bot_id: bot_id.transpose()?,
                 session_id: session_id.transpose()?,
+                tenant: tenant.transpose()?,
+                source: source.transpose()?,
                 external_id: external_id.transpose()?,
                 metadata_json: metadata_json.transpose()?,
                 relationships: relationships_from_json(relationships_json.transpose()?)?,
@@ -799,6 +930,8 @@ impl Context {
             embedding,
             bot_id,
             session_id,
+            tenant,
+            source,
             external_id,
             metadata_json,
             relationships,
@@ -837,6 +970,8 @@ impl Context {
                 run_id: self.run_id.clone(),
                 bot_id,
                 session_id,
+                tenant,
+                source,
                 created_at: Utc::now(),
                 role: role.clone(),
                 state_metadata: None,
@@ -980,6 +1115,8 @@ fn record_to_py(py: Python<'_>, record: ContextRecord) -> PyResult<PyObject> {
         run_id,
         bot_id,
         session_id,
+        tenant,
+        source,
         created_at,
         role,
         state_metadata,
@@ -1004,6 +1141,8 @@ fn record_to_py(py: Python<'_>, record: ContextRecord) -> PyResult<PyObject> {
     dict.set_item("run_id", run_id)?;
     dict.set_item("bot_id", bot_id)?;
     dict.set_item("session_id", session_id)?;
+    dict.set_item("tenant", tenant)?;
+    dict.set_item("source", source)?;
     dict.set_item(
         "created_at",
         created_at.to_rfc3339_opts(SecondsFormat::Micros, true),
@@ -1063,6 +1202,19 @@ fn relationships_to_py(py: Python<'_>, relationships: Vec<Relationship>) -> PyRe
     Ok(list.into_pyobject(py)?.unbind().into())
 }
 
+fn partition_info_to_py(py: Python<'_>, partition: PartitionInfo) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    let selector = PyDict::new(py);
+    for (key, value) in partition.selector {
+        selector.set_item(key, value)?;
+    }
+    dict.set_item("partition_id", partition.partition_id)?;
+    dict.set_item("spec_version", partition.spec_version)?;
+    dict.set_item("selector", selector)?;
+    dict.set_item("dataset_uri", partition.dataset_uri)?;
+    Ok(dict.into_pyobject(py)?.unbind().into())
+}
+
 fn json_value_to_py(py: Python<'_>, value: &Value) -> PyResult<PyObject> {
     let json = PyModule::import(py, "json")?;
     Ok(json.call_method1("loads", (value.to_string(),))?.unbind())
@@ -1076,5 +1228,6 @@ fn to_py_err<E: std::fmt::Display>(err: E) -> PyErr {
 fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(version, m)?)?;
     m.add_class::<Context>()?;
+    m.add_class::<ContextNamespace>()?;
     Ok(())
 }

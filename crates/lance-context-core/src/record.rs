@@ -34,6 +34,8 @@ pub struct ContextRecord {
     pub run_id: String,
     pub bot_id: Option<String>,
     pub session_id: Option<String>,
+    pub tenant: Option<String>,
+    pub source: Option<String>,
     pub created_at: DateTime<Utc>,
     pub role: String,
     pub state_metadata: Option<StateMetadata>,
@@ -157,6 +159,8 @@ pub struct UpsertResult {
 pub struct RecordPatch {
     pub bot_id: Option<String>,
     pub session_id: Option<String>,
+    pub tenant: Option<String>,
+    pub source: Option<String>,
     pub state_metadata: Option<StateMetadata>,
     pub metadata: Option<Value>,
     pub relationships: Option<Vec<Relationship>>,
@@ -172,6 +176,8 @@ impl RecordPatch {
     pub fn is_empty(&self) -> bool {
         self.bot_id.is_none()
             && self.session_id.is_none()
+            && self.tenant.is_none()
+            && self.source.is_none()
             && self.state_metadata.is_none()
             && self.metadata.is_none()
             && self.relationships.is_none()
@@ -203,6 +209,8 @@ pub enum MetadataFilter {
 pub struct RecordFilters {
     pub bot_id: Option<String>,
     pub session_id: Option<String>,
+    pub tenant: Option<String>,
+    pub source: Option<String>,
     pub role: Option<String>,
     pub content_type: Option<String>,
     pub created_at_start: Option<DateTime<Utc>>,
@@ -221,6 +229,8 @@ impl RecordFilters {
             match key.as_str() {
                 "bot_id" => filters.bot_id = filter_string(key.as_str(), value)?,
                 "session_id" => filters.session_id = filter_string(key.as_str(), value)?,
+                "tenant" => filters.tenant = filter_string(key.as_str(), value)?,
+                "source" => filters.source = filter_string(key.as_str(), value)?,
                 "role" => filters.role = filter_string(key.as_str(), value)?,
                 "content_type" => filters.content_type = filter_string(key.as_str(), value)?,
                 "created_at" => apply_created_at_filter(&mut filters, value)?,
@@ -251,6 +261,8 @@ impl RecordFilters {
     pub fn is_empty(&self) -> bool {
         self.bot_id.is_none()
             && self.session_id.is_none()
+            && self.tenant.is_none()
+            && self.source.is_none()
             && self.role.is_none()
             && self.content_type.is_none()
             && self.created_at_start.is_none()
@@ -272,6 +284,12 @@ impl RecordFilters {
             .as_deref()
             .is_some_and(|value| record.session_id.as_deref() != Some(value))
         {
+            return false;
+        }
+        if !matches_typed_or_metadata(record, "tenant", record.tenant.as_deref(), &self.tenant) {
+            return false;
+        }
+        if !matches_typed_or_metadata(record, "source", record.source.as_deref(), &self.source) {
             return false;
         }
         if self
@@ -365,6 +383,24 @@ fn metadata_contains(value: &Value, expected: &Value) -> bool {
     }
 }
 
+fn matches_typed_or_metadata(
+    record: &ContextRecord,
+    metadata_key: &str,
+    typed_value: Option<&str>,
+    expected: &Option<String>,
+) -> bool {
+    let Some(expected) = expected.as_deref() else {
+        return true;
+    };
+    if typed_value.is_some() {
+        return typed_value == Some(expected);
+    }
+    let Some(Value::Object(metadata)) = &record.metadata else {
+        return false;
+    };
+    metadata.get(metadata_key) == Some(&Value::String(expected.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,6 +414,8 @@ mod tests {
             run_id: "run-1".to_string(),
             bot_id: Some("support-bot".to_string()),
             session_id: Some("incident-1".to_string()),
+            tenant: Some("acme".to_string()),
+            source: Some("memory".to_string()),
             created_at: Utc.with_ymd_and_hms(2026, 6, 9, 3, 0, 0).unwrap(),
             role: "assistant".to_string(),
             state_metadata: None,
@@ -406,6 +444,8 @@ mod tests {
         let mut filters = RecordFilters::from_json_value(json!({
             "bot_id": "support-bot",
             "session_id": "incident-1",
+            "tenant": "acme",
+            "source": "memory",
             "role": "assistant",
             "content_type": "text/plain",
             "created_at": {
@@ -421,5 +461,23 @@ mod tests {
 
         filters.session_id = Some("other".to_string());
         assert!(!filters.matches(&record()));
+    }
+
+    #[test]
+    fn tenant_and_source_filters_fall_back_to_legacy_metadata() {
+        let mut record = record();
+        record.tenant = None;
+        record.source = None;
+        record.metadata = Some(json!({
+            "tenant": "acme",
+            "source": "memory"
+        }));
+
+        let filters = RecordFilters::from_json_value(json!({
+            "tenant": "acme",
+            "source": "memory"
+        }))
+        .unwrap();
+        assert!(filters.matches(&record));
     }
 }

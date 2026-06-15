@@ -595,6 +595,12 @@ impl ContextStore {
         if let Some(session_id) = patch.session_id {
             record.session_id = Some(session_id);
         }
+        if let Some(tenant) = patch.tenant {
+            record.tenant = Some(tenant);
+        }
+        if let Some(source) = patch.source {
+            record.source = Some(source);
+        }
         if let Some(state_metadata) = patch.state_metadata {
             record.state_metadata = Some(state_metadata);
         }
@@ -636,6 +642,8 @@ impl ContextStore {
             run_id: record.run_id,
             bot_id: record.bot_id,
             session_id: record.session_id,
+            tenant: record.tenant,
+            source: record.source,
             created_at: Utc::now(),
             role: record.role,
             state_metadata: None,
@@ -1389,6 +1397,8 @@ impl ContextStore {
             Field::new("run_id", DataType::Utf8, false),
             Field::new("bot_id", DataType::Utf8, true),
             Field::new("session_id", DataType::Utf8, true),
+            Field::new("tenant", DataType::Utf8, true),
+            Field::new("source", DataType::Utf8, true),
             Field::new(
                 "created_at",
                 DataType::Timestamp(TimeUnit::Microsecond, None),
@@ -1533,6 +1543,18 @@ impl ContextStore {
             .field_paths()
             .iter()
             .any(|path| path == "metadata");
+        let include_tenant = self
+            .dataset
+            .schema()
+            .field_paths()
+            .iter()
+            .any(|path| path == "tenant");
+        let include_source = self
+            .dataset
+            .schema()
+            .field_paths()
+            .iter()
+            .any(|path| path == "source");
         let include_relationships = self.has_relationships_column();
         if !include_external_id && entries.iter().any(|entry| entry.external_id.is_some()) {
             return Err(ArrowError::InvalidArgumentError(
@@ -1544,6 +1566,20 @@ impl ContextStore {
         if !include_metadata && entries.iter().any(|entry| entry.metadata.is_some()) {
             return Err(ArrowError::InvalidArgumentError(
                 "metadata requires a context dataset created with metadata support".to_string(),
+            )
+            .into());
+        }
+        if !include_tenant && entries.iter().any(|entry| entry.tenant.is_some()) {
+            return Err(ArrowError::InvalidArgumentError(
+                "tenant requires a context dataset created with partition-key column support"
+                    .to_string(),
+            )
+            .into());
+        }
+        if !include_source && entries.iter().any(|entry| entry.source.is_some()) {
+            return Err(ArrowError::InvalidArgumentError(
+                "source requires a context dataset created with partition-key column support"
+                    .to_string(),
             )
             .into());
         }
@@ -1566,6 +1602,8 @@ impl ContextStore {
         let mut run_id_builder = StringBuilder::new();
         let mut bot_id_builder = StringBuilder::new();
         let mut session_id_builder = StringBuilder::new();
+        let mut tenant_builder = StringBuilder::new();
+        let mut source_builder = StringBuilder::new();
         let mut created_at_builder = TimestampMicrosecondBuilder::with_capacity(entries.len());
         let mut role_builder = StringDictionaryBuilder::<Int8Type>::new();
         let mut metadata_builder = LargeStringBuilder::new();
@@ -1618,6 +1656,8 @@ impl ContextStore {
             run_id_builder.append_value(&entry.run_id);
             bot_id_builder.append_option(entry.bot_id.as_deref());
             session_id_builder.append_option(entry.session_id.as_deref());
+            tenant_builder.append_option(entry.tenant.as_deref());
+            source_builder.append_option(entry.source.as_deref());
             created_at_builder.append_value(entry.created_at.timestamp_micros());
             role_builder.append(&entry.role)?;
             match &entry.metadata {
@@ -1741,6 +1781,8 @@ impl ContextStore {
         let run_id_array: ArrayRef = Arc::new(run_id_builder.finish());
         let bot_id_array: ArrayRef = Arc::new(bot_id_builder.finish());
         let session_id_array: ArrayRef = Arc::new(session_id_builder.finish());
+        let tenant_array: ArrayRef = Arc::new(tenant_builder.finish());
+        let source_array: ArrayRef = Arc::new(source_builder.finish());
         let created_at_array: ArrayRef = Arc::new(created_at_builder.finish());
         let role_array: ArrayRef = Arc::new(role_builder.finish());
         let metadata_array: ArrayRef = Arc::new(metadata_builder.finish());
@@ -1774,6 +1816,12 @@ impl ContextStore {
             ("role".to_string(), role_array),
             ("state_metadata".to_string(), state_array),
         ]);
+        if include_tenant {
+            arrays_by_name.insert("tenant".to_string(), tenant_array);
+        }
+        if include_source {
+            arrays_by_name.insert("source".to_string(), source_array);
+        }
         if include_metadata {
             arrays_by_name.insert("metadata".to_string(), metadata_array);
         }
@@ -1835,6 +1883,8 @@ fn batch_to_records(batch: &RecordBatch) -> LanceResult<Vec<ContextRecord>> {
     let run_id_array = column_as::<StringArray>(batch, "run_id")?;
     let bot_id_array = column_as_optional::<StringArray>(batch, "bot_id");
     let session_id_array = column_as_optional::<StringArray>(batch, "session_id");
+    let tenant_array = column_as_optional::<StringArray>(batch, "tenant");
+    let source_array = column_as_optional::<StringArray>(batch, "source");
     let created_at_array = column_as::<TimestampMicrosecondArray>(batch, "created_at")?;
     let role_array = column_as::<DictionaryArray<Int8Type>>(batch, "role")?;
     let state_array = column_as::<StructArray>(batch, "state_metadata")?;
@@ -2002,6 +2052,22 @@ fn batch_to_records(batch: &RecordBatch) -> LanceResult<Vec<ContextRecord>> {
             }
         });
 
+        let tenant = tenant_array.and_then(|arr| {
+            if arr.is_null(row) {
+                None
+            } else {
+                Some(arr.value(row).to_string())
+            }
+        });
+
+        let source = source_array.and_then(|arr| {
+            if arr.is_null(row) {
+                None
+            } else {
+                Some(arr.value(row).to_string())
+            }
+        });
+
         let metadata = match metadata_array {
             Some(arr) if !arr.is_null(row) => {
                 Some(serde_json::from_str(arr.value(row)).map_err(|err| {
@@ -2039,6 +2105,8 @@ fn batch_to_records(batch: &RecordBatch) -> LanceResult<Vec<ContextRecord>> {
             run_id: run_id_array.value(row).to_string(),
             bot_id,
             session_id,
+            tenant,
+            source,
             created_at,
             role,
             state_metadata,
@@ -2433,6 +2501,8 @@ mod tests {
             run_id: format!("run-{id}"),
             bot_id: None,
             session_id: None,
+            tenant: None,
+            source: None,
             created_at: Utc::now(),
             role: "user".to_string(),
             state_metadata: Some(StateMetadata {

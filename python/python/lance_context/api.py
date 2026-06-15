@@ -9,10 +9,11 @@ from io import BytesIO
 from typing import Any
 
 from ._internal import Context as _Context  # pyright: ignore[reportMissingImports]
+from ._internal import ContextNamespace as _ContextNamespace  # pyright: ignore[reportMissingImports]
 from ._internal import version as _version  # pyright: ignore[reportMissingImports]
 from .embeddings import EmbeddingProvider, _build_provider
 
-__all__ = ["AsyncContext", "Context", "EmbeddingProvider", "__version__"]
+__all__ = ["AsyncContext", "Context", "ContextNamespace", "EmbeddingProvider", "__version__"]
 
 __version__ = _version()
 
@@ -138,6 +139,8 @@ def _normalize_record(raw: dict[str, Any]) -> dict[str, Any]:
         "run_id": raw.get("run_id"),
         "bot_id": raw.get("bot_id"),
         "session_id": raw.get("session_id"),
+        "tenant": raw.get("tenant"),
+        "source": raw.get("source"),
         "role": raw.get("role"),
         "content_type": raw.get("content_type"),
         "text": raw.get("text_payload"),
@@ -359,6 +362,7 @@ class Context:
             )
         else:
             self._embedding_provider = embedding_provider
+        self._default_fields: dict[str, str] = {}
 
     @classmethod
     def create(
@@ -423,6 +427,8 @@ class Context:
         embedding: list[float] | None = None,
         bot_id: str | None = None,
         session_id: str | None = None,
+        tenant: str | None = None,
+        source: str | None = None,
         external_id: str | None = None,
         metadata: dict[str, Any] | None = None,
         relationships: list[dict[str, Any]] | None = None,
@@ -442,6 +448,15 @@ class Context:
         provider = getattr(self, "_embedding_provider", None)
         if embedding is None and provider is not None and isinstance(payload, str):
             embedding = provider.embed_texts([payload])[0]
+        defaults = getattr(self, "_default_fields", {})
+        if bot_id is None:
+            bot_id = defaults.get("bot_id")
+        if session_id is None:
+            session_id = defaults.get("session_id")
+        if tenant is None:
+            tenant = defaults.get("tenant")
+        if source is None:
+            source = defaults.get("source")
         self._inner.add(
             role,
             payload,
@@ -449,6 +464,8 @@ class Context:
             embedding,
             bot_id,
             session_id,
+            tenant,
+            source,
             external_id,
             _json_dumps(metadata, "metadata"),
             _coerce_timestamp(expires_at, field_name="expires_at"),
@@ -470,6 +487,8 @@ class Context:
         embedding: list[float] | None = None,
         bot_id: str | None = None,
         session_id: str | None = None,
+        tenant: str | None = None,
+        source: str | None = None,
         external_id: str | None = None,
         metadata: dict[str, Any] | None = None,
         relationships: list[dict[str, Any]] | None = None,
@@ -495,6 +514,15 @@ class Context:
         provider = getattr(self, "_embedding_provider", None)
         if embedding is None and provider is not None and isinstance(payload, str):
             embedding = provider.embed_texts([payload])[0]
+        defaults = getattr(self, "_default_fields", {})
+        if bot_id is None:
+            bot_id = defaults.get("bot_id")
+        if session_id is None:
+            session_id = defaults.get("session_id")
+        if tenant is None:
+            tenant = defaults.get("tenant")
+        if source is None:
+            source = defaults.get("source")
         result = self._inner.upsert(
             role,
             payload,
@@ -502,6 +530,8 @@ class Context:
             embedding,
             bot_id,
             session_id,
+            tenant,
+            source,
             external_id,
             _json_dumps(metadata, "metadata"),
             _coerce_timestamp(expires_at, field_name="expires_at"),
@@ -526,6 +556,8 @@ class Context:
         external_id: str | None = None,
         bot_id: str | None = None,
         session_id: str | None = None,
+        tenant: str | None = None,
+        source: str | None = None,
         metadata: dict[str, Any] | None = None,
         relationships: list[dict[str, Any]] | None = None,
         expires_at: datetime | str | None = None,
@@ -540,6 +572,8 @@ class Context:
         if (
             bot_id is None
             and session_id is None
+            and tenant is None
+            and source is None
             and metadata is None
             and relationships is None
             and expires_at is None
@@ -555,6 +589,8 @@ class Context:
             external_id,
             bot_id,
             session_id,
+            tenant,
+            source,
             _json_dumps(metadata, "metadata"),
             _json_dumps(relationships, "relationships"),
             _coerce_timestamp(expires_at, field_name="expires_at"),
@@ -576,7 +612,7 @@ class Context:
 
         Each record accepts the same fields as :meth:`add`: ``role``,
         ``content``, optional ``content_type``/``data_type``, ``embedding``,
-        ``bot_id``, ``session_id``, ``external_id``, ``metadata``,
+        ``bot_id``, ``session_id``, ``tenant``, ``source``, ``external_id``, ``metadata``,
         ``relationships``, and lifecycle fields such as ``expires_at`` and
         ``lifecycle_status``.
         """
@@ -605,8 +641,10 @@ class Context:
                     "content": payload,
                     "data_type": resolved_type,
                     "embedding": record.get("embedding"),
-                    "bot_id": record.get("bot_id"),
-                    "session_id": record.get("session_id"),
+                    "bot_id": record.get("bot_id", getattr(self, "_default_fields", {}).get("bot_id")),
+                    "session_id": record.get("session_id", getattr(self, "_default_fields", {}).get("session_id")),
+                    "tenant": record.get("tenant", getattr(self, "_default_fields", {}).get("tenant")),
+                    "source": record.get("source", getattr(self, "_default_fields", {}).get("source")),
                     "external_id": record.get("external_id"),
                     "metadata_json": _json_dumps(record.get("metadata"), "metadata"),
                     "relationships_json": _json_dumps(
@@ -653,7 +691,7 @@ class Context:
 
     def fork(self, branch_name: str) -> Context:
         inner = self._inner.fork(branch_name)
-        return self._from_inner(inner, self._embedding_provider)
+        return self._from_inner(inner, self._embedding_provider, self._default_fields)
 
     def checkout(self, version_id: int | str) -> None:
         self._inner.checkout(int(version_id))
@@ -727,7 +765,7 @@ class Context:
             limit: Maximum number of entries to return. If None, returns all.
             offset: Number of entries to skip before returning results.
             filters: Optional equality filters for built-in fields
-                (bot_id, session_id, role, content_type), created_at range
+                (bot_id, session_id, tenant, source, role, content_type), created_at range
                 filters, or metadata fields.
             include_expired: Include records whose ``expires_at`` is in the past.
             include_retired: Include retired/superseded/revoked records.
@@ -855,12 +893,112 @@ class Context:
 
     @classmethod
     def _from_inner(
-        cls, inner: _Context, embedding_provider: EmbeddingProvider | None = None
+        cls,
+        inner: _Context,
+        embedding_provider: EmbeddingProvider | None = None,
+        default_fields: Mapping[str, str] | None = None,
     ) -> Context:
         obj = cls.__new__(cls)
         obj._inner = inner
         obj._embedding_provider = embedding_provider
+        obj._default_fields = dict(default_fields or {})
         return obj
+
+
+class ContextNamespace:
+    """Resolver for physically isolated context partitions under one namespace root."""
+
+    def __init__(
+        self,
+        root_uri: str,
+        fields: Iterable[str],
+        *,
+        storage_options: dict[str, Any] | None = None,
+        aws_access_key_id: str | None = None,
+        aws_secret_access_key: str | None = None,
+        aws_session_token: str | None = None,
+        region: str | None = None,
+        endpoint_url: str | None = None,
+        allow_http: bool = False,
+        enable_background_compaction: bool = False,
+        compaction_interval_secs: int = 300,
+        compaction_min_fragments: int = 5,
+        compaction_target_rows: int = 1_000_000,
+        quiet_hours: list[tuple[int, int]] | None = None,
+        id_index_type: str | None = None,
+        embedding_dim: int | None = None,
+        distance_metric: str | None = None,
+        embedding_provider: EmbeddingProvider | dict[str, Any] | None = None,
+    ) -> None:
+        options = _merge_storage_options(
+            storage_options,
+            aws_access_key_id=aws_access_key_id,
+            aws_secret_access_key=aws_secret_access_key,
+            aws_session_token=aws_session_token,
+            region=region,
+            endpoint_url=endpoint_url,
+            allow_http=allow_http,
+        )
+
+        compaction_config = {
+            "enabled": enable_background_compaction,
+            "check_interval_secs": compaction_interval_secs,
+            "min_fragments": compaction_min_fragments,
+            "target_rows_per_fragment": compaction_target_rows,
+            "quiet_hours": quiet_hours or [],
+        }
+
+        field_list = list(fields)
+        if (
+            options
+            or compaction_config["enabled"]
+            or id_index_type
+            or embedding_dim is not None
+            or distance_metric
+        ):
+            self._inner = _ContextNamespace.create(
+                root_uri,
+                field_list,
+                storage_options=options or None,
+                compaction_config=compaction_config,
+                id_index_type=id_index_type,
+                embedding_dim=embedding_dim,
+                distance_metric=distance_metric,
+            )
+        else:
+            self._inner = _ContextNamespace.create(root_uri, field_list)
+
+        if isinstance(embedding_provider, dict):
+            self._embedding_provider: EmbeddingProvider | None = _build_provider(
+                embedding_provider
+            )
+        else:
+            self._embedding_provider = embedding_provider
+
+    @classmethod
+    def create(
+        cls,
+        root_uri: str,
+        fields: Iterable[str],
+        **kwargs: Any,
+    ) -> ContextNamespace:
+        return cls(root_uri, fields, **kwargs)
+
+    def root_uri(self) -> str:
+        return self._inner.root_uri()
+
+    def manifest_uri(self) -> str:
+        return self._inner.manifest_uri()
+
+    def partition_uri(self, **selector: str) -> str:
+        return self._inner.partition_uri(selector)
+
+    def context(self, **selector: str) -> Context:
+        inner = self._inner.context(selector)
+        return Context._from_inner(inner, self._embedding_provider, selector)
+
+    def partitions(self) -> list[dict[str, Any]]:
+        return list(self._inner.partitions())
 
 
 class AsyncContext:
@@ -914,6 +1052,8 @@ class AsyncContext:
         embedding: list[float] | None = None,
         bot_id: str | None = None,
         session_id: str | None = None,
+        tenant: str | None = None,
+        source: str | None = None,
         external_id: str | None = None,
         metadata: dict[str, Any] | None = None,
         relationships: list[dict[str, Any]] | None = None,
@@ -936,6 +1076,8 @@ class AsyncContext:
                 embedding=embedding,
                 bot_id=bot_id,
                 session_id=session_id,
+                tenant=tenant,
+                source=source,
                 external_id=external_id,
                 metadata=metadata,
                 relationships=relationships,
@@ -958,6 +1100,8 @@ class AsyncContext:
         embedding: list[float] | None = None,
         bot_id: str | None = None,
         session_id: str | None = None,
+        tenant: str | None = None,
+        source: str | None = None,
         external_id: str | None = None,
         metadata: dict[str, Any] | None = None,
         relationships: list[dict[str, Any]] | None = None,
@@ -980,6 +1124,8 @@ class AsyncContext:
                 embedding=embedding,
                 bot_id=bot_id,
                 session_id=session_id,
+                tenant=tenant,
+                source=source,
                 external_id=external_id,
                 metadata=metadata,
                 relationships=relationships,
@@ -999,6 +1145,8 @@ class AsyncContext:
         external_id: str | None = None,
         bot_id: str | None = None,
         session_id: str | None = None,
+        tenant: str | None = None,
+        source: str | None = None,
         metadata: dict[str, Any] | None = None,
         relationships: list[dict[str, Any]] | None = None,
         expires_at: datetime | str | None = None,
@@ -1015,6 +1163,8 @@ class AsyncContext:
                 external_id=external_id,
                 bot_id=bot_id,
                 session_id=session_id,
+                tenant=tenant,
+                source=source,
                 metadata=metadata,
                 relationships=relationships,
                 expires_at=expires_at,

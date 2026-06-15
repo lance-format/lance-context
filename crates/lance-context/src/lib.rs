@@ -3,10 +3,10 @@
 // Explicit re-exports from core (no glob to avoid recursion depth overflow)
 pub use lance_context_core::serde;
 pub use lance_context_core::{
-    CompactionConfig, CompactionMetrics, CompactionStats, Context, ContextEntry, ContextRecord,
-    ContextStoreOptions, IdIndexType, LifecycleQueryOptions, MetadataFilter, RecordFilters,
-    Relationship, RetrieveResult, SearchResult, Snapshot, StateMetadata, LIFECYCLE_ACTIVE,
-    LIFECYCLE_CONTRADICTED,
+    CompactionConfig, CompactionMetrics, CompactionStats, Context, ContextEntry, ContextNamespace,
+    ContextRecord, ContextStoreOptions, IdIndexType, LifecycleQueryOptions, MetadataFilter,
+    PartitionInfo, PartitionSelector, PartitionSpec, RecordFilters, Relationship, RetrieveResult,
+    SearchResult, Snapshot, StateMetadata, LIFECYCLE_ACTIVE, LIFECYCLE_CONTRADICTED,
 };
 
 pub use lance_context_api::{

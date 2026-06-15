@@ -3,11 +3,13 @@
 
 mod api_impl;
 mod context;
+mod namespace;
 mod record;
 pub mod serde;
 mod store;
 
 pub use context::{Context, ContextEntry, Snapshot};
+pub use namespace::{ContextNamespace, PartitionInfo, PartitionSelector, PartitionSpec};
 pub use record::{
     ContextRecord, LifecycleQueryOptions, MetadataFilter, RecordFilters, RecordPatch, Relationship,
     RetrieveResult, SearchResult, StateMetadata, UpdateResult, UpsertResult, LIFECYCLE_ACTIVE,
