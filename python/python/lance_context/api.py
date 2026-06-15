@@ -9,11 +9,19 @@ from io import BytesIO
 from typing import Any
 
 from ._internal import Context as _Context  # pyright: ignore[reportMissingImports]
-from ._internal import ContextNamespace as _ContextNamespace  # pyright: ignore[reportMissingImports]
+from ._internal import (  # pyright: ignore[reportMissingImports]
+    ContextNamespace as _ContextNamespace,
+)
 from ._internal import version as _version  # pyright: ignore[reportMissingImports]
 from .embeddings import EmbeddingProvider, _build_provider
 
-__all__ = ["AsyncContext", "Context", "ContextNamespace", "EmbeddingProvider", "__version__"]
+__all__ = [
+    "AsyncContext",
+    "Context",
+    "ContextNamespace",
+    "EmbeddingProvider",
+    "__version__",
+]
 
 __version__ = _version()
 
@@ -612,9 +620,9 @@ class Context:
 
         Each record accepts the same fields as :meth:`add`: ``role``,
         ``content``, optional ``content_type``/``data_type``, ``embedding``,
-        ``bot_id``, ``session_id``, ``tenant``, ``source``, ``external_id``, ``metadata``,
-        ``relationships``, and lifecycle fields such as ``expires_at`` and
-        ``lifecycle_status``.
+        ``bot_id``, ``session_id``, ``tenant``, ``source``, ``external_id``,
+        ``metadata``, ``relationships``, and lifecycle fields such as
+        ``expires_at`` and ``lifecycle_status``.
         """
         normalized: list[dict[str, Any]] = []
         for index, record in enumerate(records):
@@ -641,10 +649,19 @@ class Context:
                     "content": payload,
                     "data_type": resolved_type,
                     "embedding": record.get("embedding"),
-                    "bot_id": record.get("bot_id", getattr(self, "_default_fields", {}).get("bot_id")),
-                    "session_id": record.get("session_id", getattr(self, "_default_fields", {}).get("session_id")),
-                    "tenant": record.get("tenant", getattr(self, "_default_fields", {}).get("tenant")),
-                    "source": record.get("source", getattr(self, "_default_fields", {}).get("source")),
+                    "bot_id": record.get(
+                        "bot_id", getattr(self, "_default_fields", {}).get("bot_id")
+                    ),
+                    "session_id": record.get(
+                        "session_id",
+                        getattr(self, "_default_fields", {}).get("session_id"),
+                    ),
+                    "tenant": record.get(
+                        "tenant", getattr(self, "_default_fields", {}).get("tenant")
+                    ),
+                    "source": record.get(
+                        "source", getattr(self, "_default_fields", {}).get("source")
+                    ),
                     "external_id": record.get("external_id"),
                     "metadata_json": _json_dumps(record.get("metadata"), "metadata"),
                     "relationships_json": _json_dumps(
@@ -765,8 +782,8 @@ class Context:
             limit: Maximum number of entries to return. If None, returns all.
             offset: Number of entries to skip before returning results.
             filters: Optional equality filters for built-in fields
-                (bot_id, session_id, tenant, source, role, content_type), created_at range
-                filters, or metadata fields.
+                (bot_id, session_id, tenant, source, role, content_type),
+                created_at range filters, or metadata fields.
             include_expired: Include records whose ``expires_at`` is in the past.
             include_retired: Include retired/superseded/revoked records.
 

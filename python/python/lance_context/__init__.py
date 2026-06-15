@@ -8,4 +8,10 @@ from .api import (  # pyright: ignore[reportMissingImports]
     __version__,
 )
 
-__all__ = ["AsyncContext", "Context", "ContextNamespace", "EmbeddingProvider", "__version__"]
+__all__ = [
+    "AsyncContext",
+    "Context",
+    "ContextNamespace",
+    "EmbeddingProvider",
+    "__version__",
+]
