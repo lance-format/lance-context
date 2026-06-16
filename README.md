@@ -172,6 +172,31 @@ ctx.add_many([
     },
 ])
 
+# Deferred embeddings: raw-first capture, enrich later.
+#
+# Bulk ingestion often needs to persist source chunks immediately and compute
+# embeddings asynchronously (large documents, rate-limited or remote embedding
+# providers). Append the raw text first with a stable external_id, then have a
+# worker patch in the embedding once it is ready. A record without an embedding
+# is durably stored but excluded from vector search until it is enriched.
+ctx.add_many([
+    {
+        "role": "source",
+        "content": "Deferred chunk",
+        "external_id": "doc-77#chunk-1",
+        "metadata": {"embedding_status": "pending"},
+    },
+])
+
+# ...later, from your own worker/queue/batch job:
+vector = [0.0] * 1536
+ctx.update(
+    external_id="doc-77#chunk-1",
+    embedding=vector,                       # attach the freshly computed vector
+    metadata={"embedding_status": "ready"},
+)
+# The enriched record now shows up in vector search and hybrid retrieve.
+
 # Time-travel to prior state
 first_version = ctx.version()
 ctx.add("assistant", "Let me fetch suggestions…")

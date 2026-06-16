@@ -5374,6 +5374,7 @@ dependencies = [
  "lance-context-api",
  "lance-context-client",
  "lance-context-core",
+ "serde_json",
 ]
 
 [[package]]

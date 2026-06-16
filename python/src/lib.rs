@@ -17,7 +17,7 @@ use lance_context_core::{
     ContextNamespace as RustContextNamespace, ContextRecord, ContextStore, ContextStoreOptions,
     DistanceMetric, IdIndexType, LifecycleQueryOptions, PartitionInfo, PartitionSelector,
     PartitionSpec, RecordFilters, RecordPatch, Relationship, RetrieveResult, SearchResult,
-    LIFECYCLE_ACTIVE,
+    StateMetadata, LIFECYCLE_ACTIVE,
 };
 
 const DEFAULT_BINARY_CONTENT_TYPE: &str = "application/octet-stream";
@@ -39,6 +39,7 @@ struct RecordInput {
     tenant: Option<String>,
     source: Option<String>,
     external_id: Option<String>,
+    state_metadata: Option<StateMetadata>,
     metadata_json: Option<String>,
     relationships: Vec<Relationship>,
     lifecycle: LifecycleFields,
@@ -277,7 +278,7 @@ impl Context {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (role, content, data_type = None, embedding = None, bot_id = None, session_id = None, tenant = None, source = None, external_id = None, metadata_json = None, expires_at = None, retention_policy = None, lifecycle_status = None, retired_at = None, retired_reason = None, supersedes_id = None, superseded_by_id = None, relationships_json = None))]
+    #[pyo3(signature = (role, content, data_type = None, embedding = None, bot_id = None, session_id = None, tenant = None, source = None, external_id = None, state_metadata = None, metadata_json = None, expires_at = None, retention_policy = None, lifecycle_status = None, retired_at = None, retired_reason = None, supersedes_id = None, superseded_by_id = None, relationships_json = None))]
     fn add(
         &mut self,
         py: Python<'_>,
@@ -290,6 +291,7 @@ impl Context {
         tenant: Option<String>,
         source: Option<String>,
         external_id: Option<String>,
+        state_metadata: Option<&Bound<'_, PyDict>>,
         metadata_json: Option<String>,
         expires_at: Option<String>,
         retention_policy: Option<String>,
@@ -320,6 +322,7 @@ impl Context {
                 tenant,
                 source,
                 external_id,
+                state_metadata: state_metadata_from_dict(state_metadata)?,
                 metadata_json,
                 relationships: relationships_from_json(relationships_json)?,
                 lifecycle,
@@ -394,6 +397,7 @@ impl Context {
                 tenant,
                 source,
                 external_id,
+                state_metadata: None,
                 metadata_json,
                 relationships: relationships_from_json(relationships_json)?,
                 lifecycle,
@@ -421,7 +425,7 @@ impl Context {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (id = None, external_id = None, bot_id = None, session_id = None, tenant = None, source = None, metadata_json = None, relationships_json = None, expires_at = None, retention_policy = None, lifecycle_status = None, retired_at = None, retired_reason = None))]
+    #[pyo3(signature = (id = None, external_id = None, bot_id = None, session_id = None, tenant = None, source = None, metadata_json = None, relationships_json = None, expires_at = None, retention_policy = None, lifecycle_status = None, retired_at = None, retired_reason = None, embedding = None))]
     fn update(
         &mut self,
         py: Python<'_>,
@@ -438,6 +442,7 @@ impl Context {
         lifecycle_status: Option<String>,
         retired_at: Option<String>,
         retired_reason: Option<String>,
+        embedding: Option<Vec<f32>>,
     ) -> PyResult<PyObject> {
         let patch = RecordPatch {
             bot_id,
@@ -452,6 +457,7 @@ impl Context {
             lifecycle_status,
             retired_at: parse_optional_datetime(retired_at, "retired_at")?,
             retired_reason,
+            embedding,
         };
         if patch.is_empty() {
             return Err(PyRuntimeError::new_err(
@@ -871,6 +877,15 @@ impl Context {
         let source = optional_item(dict, "source")?.map(|value| value.extract::<String>());
         let external_id =
             optional_item(dict, "external_id")?.map(|value| value.extract::<String>());
+        let state_metadata = match optional_item(dict, "state_metadata")? {
+            Some(value) => {
+                let metadata = value.downcast::<PyDict>().map_err(|_| {
+                    PyTypeError::new_err(format!("records[{index}].state_metadata must be a dict"))
+                })?;
+                state_metadata_from_dict(Some(metadata))?
+            }
+            None => None,
+        };
         let metadata_json =
             optional_item(dict, "metadata_json")?.map(|value| value.extract::<String>());
         let relationships_json =
@@ -909,6 +924,7 @@ impl Context {
                 tenant: tenant.transpose()?,
                 source: source.transpose()?,
                 external_id: external_id.transpose()?,
+                state_metadata,
                 metadata_json: metadata_json.transpose()?,
                 relationships: relationships_from_json(relationships_json.transpose()?)?,
                 lifecycle,
@@ -933,6 +949,7 @@ impl Context {
             tenant,
             source,
             external_id,
+            state_metadata,
             metadata_json,
             relationships,
             lifecycle,
@@ -974,7 +991,7 @@ impl Context {
                 source,
                 created_at: Utc::now(),
                 role: role.clone(),
-                state_metadata: None,
+                state_metadata,
                 metadata,
                 relationships,
                 expires_at: lifecycle.expires_at,
@@ -1010,6 +1027,27 @@ fn required_item<'py>(
 
 fn optional_item<'py>(dict: &Bound<'py, PyDict>, key: &str) -> PyResult<Option<Bound<'py, PyAny>>> {
     Ok(dict.get_item(key)?.filter(|value| !value.is_none()))
+}
+
+fn state_metadata_from_dict(dict: Option<&Bound<'_, PyDict>>) -> PyResult<Option<StateMetadata>> {
+    let Some(dict) = dict else {
+        return Ok(None);
+    };
+
+    Ok(Some(StateMetadata {
+        step: optional_item(dict, "step")?
+            .map(|value| value.extract::<i32>())
+            .transpose()?,
+        active_plan_id: optional_item(dict, "active_plan_id")?
+            .map(|value| value.extract::<String>())
+            .transpose()?,
+        tokens_used: optional_item(dict, "tokens_used")?
+            .map(|value| value.extract::<i32>())
+            .transpose()?,
+        custom: optional_item(dict, "custom")?
+            .map(|value| value.extract::<String>())
+            .transpose()?,
+    }))
 }
 
 fn relationships_patch_from_json(value: Option<String>) -> PyResult<Option<Vec<Relationship>>> {

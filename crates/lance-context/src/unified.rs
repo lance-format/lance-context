@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use lance_context_api::{
     AddRecordRequest, AddRecordsResponse, CompactRequest, CompactResponse, CompactStatsResponse,
     ContextError, ContextResult, ContextStoreApi, DeleteRecordResponse, RecordDto, RetrieveRequest,
-    RetrieveResultDto, SearchResultDto, UpdateRecordRequest, UpdateRecordResponse,
+    RetrieveResultDto, SearchRequest, SearchResultDto, UpdateRecordRequest, UpdateRecordResponse,
     UpsertRecordRequest, UpsertRecordResponse,
 };
 use lance_context_core::{
@@ -159,8 +159,19 @@ impl ContextStoreApi for ContextStore {
         &self,
         limit: Option<usize>,
         offset: Option<usize>,
+        filters: Option<serde_json::Value>,
+        include_expired: bool,
+        include_retired: bool,
     ) -> ContextResult<Vec<RecordDto>> {
-        dispatch_ref!(self, list, limit, offset)
+        dispatch_ref!(
+            self,
+            list,
+            limit,
+            offset,
+            filters,
+            include_expired,
+            include_retired
+        )
     }
 
     async fn related(
@@ -182,13 +193,8 @@ impl ContextStoreApi for ContextStore {
         )
     }
 
-    async fn search(
-        &self,
-        query: &[f32],
-        limit: Option<usize>,
-        include_relationships: bool,
-    ) -> ContextResult<Vec<SearchResultDto>> {
-        dispatch_ref!(self, search, query, limit, include_relationships)
+    async fn search(&self, request: &SearchRequest) -> ContextResult<Vec<SearchResultDto>> {
+        dispatch_ref!(self, search, request)
     }
 
     async fn retrieve(&self, request: &RetrieveRequest) -> ContextResult<Vec<RetrieveResultDto>> {

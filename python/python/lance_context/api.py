@@ -185,6 +185,21 @@ def _normalize_retrieve_hit(raw: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _normalize_state_metadata(
+    value: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise TypeError("state_metadata must be a mapping")
+    return {
+        "step": value.get("step"),
+        "active_plan_id": value.get("active_plan_id"),
+        "tokens_used": value.get("tokens_used"),
+        "custom": value.get("custom"),
+    }
+
+
 _AWS_KWARG_MAP: dict[str, str] = {
     "aws_access_key_id": "aws_access_key_id",
     "aws_secret_access_key": "aws_secret_access_key",
@@ -438,6 +453,7 @@ class Context:
         tenant: str | None = None,
         source: str | None = None,
         external_id: str | None = None,
+        state_metadata: Mapping[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
         relationships: list[dict[str, Any]] | None = None,
         expires_at: datetime | str | None = None,
@@ -475,6 +491,7 @@ class Context:
             tenant,
             source,
             external_id,
+            _normalize_state_metadata(state_metadata),
             _json_dumps(metadata, "metadata"),
             _coerce_timestamp(expires_at, field_name="expires_at"),
             retention_policy,
@@ -573,8 +590,14 @@ class Context:
         lifecycle_status: str | None = None,
         retired_at: datetime | str | None = None,
         retired_reason: str | None = None,
+        embedding: list[float] | None = None,
     ) -> dict[str, Any]:
-        """Patch mutable fields on a visible record by id or external_id."""
+        """Patch mutable fields on a visible record by id or external_id.
+
+        Pass ``embedding`` to attach or replace a record's vector after it was
+        appended without one (deferred / enrich-later ingestion). The updated
+        record participates in vector search once the embedding is set.
+        """
         if (id is None) == (external_id is None):
             raise ValueError("Specify exactly one of id or external_id")
         if (
@@ -589,6 +612,7 @@ class Context:
             and lifecycle_status is None
             and retired_at is None
             and retired_reason is None
+            and embedding is None
         ):
             raise ValueError("update requires at least one patch field")
 
@@ -606,6 +630,7 @@ class Context:
             lifecycle_status,
             _coerce_timestamp(retired_at, field_name="retired_at"),
             retired_reason,
+            embedding,
         )
         record = result.get("record")
         return {
@@ -621,6 +646,7 @@ class Context:
         Each record accepts the same fields as :meth:`add`: ``role``,
         ``content``, optional ``content_type``/``data_type``, ``embedding``,
         ``bot_id``, ``session_id``, ``tenant``, ``source``, ``external_id``,
+        ``state_metadata``,
         ``metadata``, ``relationships``, and lifecycle fields such as
         ``expires_at`` and ``lifecycle_status``.
         """
@@ -663,6 +689,9 @@ class Context:
                         "source", getattr(self, "_default_fields", {}).get("source")
                     ),
                     "external_id": record.get("external_id"),
+                    "state_metadata": _normalize_state_metadata(
+                        record.get("state_metadata")
+                    ),
                     "metadata_json": _json_dumps(record.get("metadata"), "metadata"),
                     "relationships_json": _json_dumps(
                         record.get("relationships"), "relationships"
@@ -1072,6 +1101,7 @@ class AsyncContext:
         tenant: str | None = None,
         source: str | None = None,
         external_id: str | None = None,
+        state_metadata: Mapping[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
         relationships: list[dict[str, Any]] | None = None,
         expires_at: datetime | str | None = None,
@@ -1096,6 +1126,7 @@ class AsyncContext:
                 tenant=tenant,
                 source=source,
                 external_id=external_id,
+                state_metadata=state_metadata,
                 metadata=metadata,
                 relationships=relationships,
                 expires_at=expires_at,

@@ -16,3 +16,4 @@ remote = ["lance-context-client"]
 lance-context-core = { version = "0.4.0", path = "../lance-context-core" }
 lance-context-api = { version = "0.4.0", path = "../lance-context-api" }
 lance-context-client = { version = "0.4.0", path = "../lance-context-client", optional = true }
+serde_json = "1"

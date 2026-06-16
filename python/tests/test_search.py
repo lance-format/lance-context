@@ -38,6 +38,7 @@ class DummyInner:
         self.update_calls: list[dict[str, Any]] = []
         self.lifecycle_add_calls: list[dict[str, Any]] = []
         self.relationship_add_calls: list[str | None] = []
+        self.state_metadata_add_calls: list[dict[str, Any] | None] = []
         self.add_calls: list[
             tuple[
                 str,
@@ -61,6 +62,7 @@ class DummyInner:
         bot_id: str | None,
         session_id: str | None,
         external_id: str | None,
+        state_metadata: dict[str, Any] | None,
         metadata_json: str | None,
         expires_at: str | None = None,
         retention_policy: str | None = None,
@@ -95,6 +97,7 @@ class DummyInner:
             }
         )
         self.relationship_add_calls.append(relationships_json)
+        self.state_metadata_add_calls.append(state_metadata)
 
     def upsert(
         self,
@@ -177,6 +180,7 @@ class DummyInner:
         lifecycle_status: str | None,
         retired_at: str | None,
         retired_reason: str | None,
+        embedding: list[float] | None = None,
     ):
         self.update_calls.append(
             {
@@ -191,6 +195,7 @@ class DummyInner:
                 "lifecycle_status": lifecycle_status,
                 "retired_at": retired_at,
                 "retired_reason": retired_reason,
+                "embedding": embedding,
             }
         )
         if id == "missing" or external_id == "missing":
@@ -1011,6 +1016,32 @@ def test_context_add_forwards_relationships():
     ]
 
 
+def test_context_add_forwards_state_metadata():
+    ctx = Context.__new__(Context)
+    dummy = DummyInner()
+    ctx._inner = dummy  # type: ignore[attr-defined]
+
+    ctx.add(
+        "assistant",
+        "step complete",
+        state_metadata={
+            "step": 3,
+            "active_plan_id": "plan-1",
+            "tokens_used": 128,
+            "custom": "retrieval",
+        },
+    )
+
+    assert dummy.state_metadata_add_calls == [
+        {
+            "step": 3,
+            "active_plan_id": "plan-1",
+            "tokens_used": 128,
+            "custom": "retrieval",
+        }
+    ]
+
+
 def test_context_add_rejects_non_json_metadata():
     ctx = Context.__new__(Context)
     dummy = DummyInner()
@@ -1159,6 +1190,7 @@ def test_context_update_returns_operation_metadata_and_record():
             "lifecycle_status": "active",
             "retired_at": None,
             "retired_reason": None,
+            "embedding": None,
         }
     ]
     assert result["updated"] is True
@@ -1171,6 +1203,28 @@ def test_context_update_returns_operation_metadata_and_record():
         {"target_id": "doc-1", "relation": "updates"}
     ]
     assert result["record"]["supersedes_id"] == "old-id"
+
+
+def test_context_update_forwards_embedding():
+    ctx = Context.__new__(Context)
+    dummy = DummyInner()
+    ctx._inner = dummy  # type: ignore[attr-defined]
+
+    ctx.update(external_id="source-1", embedding=[0.1, 0.2, 0.3])
+
+    assert dummy.update_calls[0]["embedding"] == [0.1, 0.2, 0.3]
+
+
+def test_context_update_accepts_embedding_only_patch():
+    ctx = Context.__new__(Context)
+    dummy = DummyInner()
+    ctx._inner = dummy  # type: ignore[attr-defined]
+
+    # An embedding is sufficient on its own; no "at least one patch field" error.
+    result = ctx.update(id="rec-1", embedding=[0.1, 0.2])
+
+    assert dummy.update_calls[0]["embedding"] == [0.1, 0.2]
+    assert result["updated"] is True
 
 
 def test_context_update_missing_record_returns_not_updated():
@@ -1218,6 +1272,7 @@ def test_context_add_many_normalizes_records():
                 "bot_id": None,
                 "session_id": None,
                 "external_id": None,
+                "state_metadata": None,
                 "metadata_json": None,
                 "relationships_json": None,
                 "expires_at": None,
@@ -1236,6 +1291,7 @@ def test_context_add_many_normalizes_records():
                 "bot_id": "bot",
                 "session_id": "sess",
                 "external_id": "doc-1#chunk-2",
+                "state_metadata": None,
                 "metadata_json": None,
                 "relationships_json": None,
                 "expires_at": None,
