@@ -12,8 +12,8 @@ from ._internal import Context as _Context  # pyright: ignore[reportMissingImpor
 from ._internal import (  # pyright: ignore[reportMissingImports]
     ContextNamespace as _ContextNamespace,
 )
-from ._internal import (
-    RemoteContext as _RemoteContext,  # pyright: ignore[reportMissingImports]
+from ._internal import (  # pyright: ignore[reportMissingImports]
+    RemoteContext as _RemoteContext,
 )
 from ._internal import version as _version  # pyright: ignore[reportMissingImports]
 from .embeddings import EmbeddingProvider, _build_provider
