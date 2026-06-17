@@ -63,6 +63,7 @@ class _DummyInner:
         bot_id: Any,
         session_id: Any,
         external_id: Any,
+        state_metadata: Any,
         metadata_json: Any,
         expires_at: Any = None,
         retention_policy: Any = None,

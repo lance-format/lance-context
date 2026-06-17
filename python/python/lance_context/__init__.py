@@ -5,6 +5,7 @@ from .api import (  # pyright: ignore[reportMissingImports]
     Context,
     ContextNamespace,
     EmbeddingProvider,
+    RemoteContext,
     __version__,
 )
 
@@ -13,5 +14,6 @@ __all__ = [
     "Context",
     "ContextNamespace",
     "EmbeddingProvider",
+    "RemoteContext",
     "__version__",
 ]

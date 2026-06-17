@@ -5427,6 +5427,8 @@ name = "lance-context-python"
 version = "0.4.0"
 dependencies = [
  "chrono",
+ "lance-context-api",
+ "lance-context-client",
  "lance-context-core",
  "openssl",
  "pyo3",

@@ -11,6 +11,12 @@ use pyo3::IntoPyObject;
 use serde_json::Value;
 use tokio::runtime::Runtime;
 
+use lance_context_api::{
+    AddRecordRequest, CompactRequest, CompactResponse, CompactStatsResponse, ContextStoreApi,
+    RecordDto, RecordPatchDto, RelationshipDto, RetrieveRequest, RetrieveResultDto, SearchRequest,
+    SearchResultDto, StateMetadataDto, UpdateRecordRequest, UpsertRecordRequest,
+};
+use lance_context_client::RemoteContextStore;
 use lance_context_core::serde::CONTENT_TYPE_TEXT;
 use lance_context_core::{
     CompactionConfig, CompactionMetrics, CompactionStats, Context as RustContext,
@@ -72,6 +78,12 @@ struct Context {
 #[pyclass]
 struct ContextNamespace {
     inner: RustContextNamespace,
+    runtime: Arc<Runtime>,
+}
+
+#[pyclass]
+struct RemoteContext {
+    store: RemoteContextStore,
     runtime: Arc<Runtime>,
 }
 
@@ -1015,6 +1027,432 @@ impl Context {
     }
 }
 
+#[pymethods]
+impl RemoteContext {
+    #[classmethod]
+    fn connect(
+        _cls: &Bound<'_, PyType>,
+        py: Python<'_>,
+        base_url: &str,
+        name: &str,
+    ) -> PyResult<Self> {
+        let runtime = Arc::new(Runtime::new().map_err(to_py_err)?);
+        let store_res =
+            py.allow_threads(|| runtime.block_on(RemoteContextStore::connect(base_url, name)));
+        let store = store_res.map_err(to_py_err)?;
+        Ok(Self { store, runtime })
+    }
+
+    fn version(&self) -> u64 {
+        self.store.version()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (role, content, data_type = None, embedding = None, bot_id = None, session_id = None, external_id = None, state_metadata = None, metadata_json = None, expires_at = None, retention_policy = None, supersedes_id = None, relationships_json = None))]
+    fn add(
+        &mut self,
+        py: Python<'_>,
+        role: &str,
+        content: &Bound<'_, PyAny>,
+        data_type: Option<&str>,
+        embedding: Option<Vec<f32>>,
+        bot_id: Option<String>,
+        session_id: Option<String>,
+        external_id: Option<String>,
+        state_metadata: Option<&Bound<'_, PyDict>>,
+        metadata_json: Option<String>,
+        expires_at: Option<String>,
+        retention_policy: Option<String>,
+        supersedes_id: Option<String>,
+        relationships_json: Option<String>,
+    ) -> PyResult<PyObject> {
+        let (content_type, text_payload, binary_payload) = content_to_payloads(content, data_type)?;
+        let req = AddRecordRequest {
+            role: role.to_string(),
+            content_type,
+            text_payload,
+            binary_payload,
+            embedding,
+            bot_id,
+            session_id,
+            external_id,
+            state_metadata: dto_state_metadata_from_dict(state_metadata)?,
+            metadata: metadata_from_json(metadata_json)?,
+            relationships: dto_relationships_from_json(relationships_json)?,
+            expires_at: parse_optional_datetime(expires_at, "expires_at")?,
+            retention_policy,
+            supersedes_id,
+            tenant: None,
+            source: None,
+        };
+        let resp = py
+            .allow_threads(|| {
+                self.runtime
+                    .block_on(self.store.add(std::slice::from_ref(&req)))
+            })
+            .map_err(to_py_err)?;
+        let dict = PyDict::new(py);
+        dict.set_item("version", resp.version)?;
+        dict.set_item("ids", resp.ids)?;
+        dict.set_item("count", resp.count)?;
+        Ok(dict.into_pyobject(py)?.unbind().into())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (role, content, data_type = None, embedding = None, bot_id = None, session_id = None, external_id = None, metadata_json = None, expires_at = None, retention_policy = None, supersedes_id = None, relationships_json = None, key = "external_id"))]
+    fn upsert(
+        &mut self,
+        py: Python<'_>,
+        role: &str,
+        content: &Bound<'_, PyAny>,
+        data_type: Option<&str>,
+        embedding: Option<Vec<f32>>,
+        bot_id: Option<String>,
+        session_id: Option<String>,
+        external_id: Option<String>,
+        metadata_json: Option<String>,
+        expires_at: Option<String>,
+        retention_policy: Option<String>,
+        supersedes_id: Option<String>,
+        relationships_json: Option<String>,
+        key: &str,
+    ) -> PyResult<PyObject> {
+        if key != "external_id" {
+            return Err(PyRuntimeError::new_err(format!(
+                "upsert key '{key}' is not supported; use 'external_id'"
+            )));
+        }
+        if external_id.as_deref().is_none_or(str::is_empty) {
+            return Err(PyRuntimeError::new_err(
+                "upsert requires external_id".to_string(),
+            ));
+        }
+
+        let (content_type, text_payload, binary_payload) = content_to_payloads(content, data_type)?;
+        let record = AddRecordRequest {
+            role: role.to_string(),
+            content_type,
+            text_payload,
+            binary_payload,
+            embedding,
+            bot_id,
+            session_id,
+            external_id,
+            state_metadata: None,
+            metadata: metadata_from_json(metadata_json)?,
+            relationships: dto_relationships_from_json(relationships_json)?,
+            expires_at: parse_optional_datetime(expires_at, "expires_at")?,
+            retention_policy,
+            supersedes_id,
+            tenant: None,
+            source: None,
+        };
+        let req = UpsertRecordRequest {
+            record,
+            key: key.to_string(),
+        };
+        let resp = py
+            .allow_threads(|| self.runtime.block_on(self.store.upsert(&req)))
+            .map_err(to_py_err)?;
+        let dict = PyDict::new(py);
+        dict.set_item("inserted", resp.inserted)?;
+        dict.set_item("replaced_id", resp.replaced_id)?;
+        dict.set_item("version", resp.version)?;
+        dict.set_item("record", dto_record_to_py(py, resp.record)?)?;
+        Ok(dict.into_pyobject(py)?.unbind().into())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (id = None, external_id = None, bot_id = None, session_id = None, metadata_json = None, relationships_json = None, expires_at = None, retention_policy = None, lifecycle_status = None, retired_at = None, retired_reason = None, embedding = None))]
+    fn update(
+        &mut self,
+        py: Python<'_>,
+        id: Option<String>,
+        external_id: Option<String>,
+        bot_id: Option<String>,
+        session_id: Option<String>,
+        metadata_json: Option<String>,
+        relationships_json: Option<String>,
+        expires_at: Option<String>,
+        retention_policy: Option<String>,
+        lifecycle_status: Option<String>,
+        retired_at: Option<String>,
+        retired_reason: Option<String>,
+        embedding: Option<Vec<f32>>,
+    ) -> PyResult<PyObject> {
+        let patch = RecordPatchDto {
+            bot_id,
+            session_id,
+            state_metadata: None,
+            metadata: metadata_from_json(metadata_json)?,
+            relationships: dto_relationships_patch_from_json(relationships_json)?,
+            expires_at: parse_optional_datetime(expires_at, "expires_at")?,
+            retention_policy,
+            lifecycle_status,
+            retired_at: parse_optional_datetime(retired_at, "retired_at")?,
+            retired_reason,
+            embedding,
+            tenant: None,
+            source: None,
+        };
+        if patch.is_empty() {
+            return Err(PyRuntimeError::new_err(
+                "update requires at least one patch field",
+            ));
+        }
+        match (id.is_some(), external_id.is_some()) {
+            (true, true) => {
+                return Err(PyRuntimeError::new_err(
+                    "update() accepts only one of id or external_id",
+                ))
+            }
+            (false, false) => {
+                return Err(PyRuntimeError::new_err(
+                    "update() requires either id or external_id",
+                ))
+            }
+            _ => {}
+        }
+
+        let req = UpdateRecordRequest {
+            id,
+            external_id,
+            patch,
+        };
+        let resp = py
+            .allow_threads(|| self.runtime.block_on(self.store.update(&req)))
+            .map_err(to_py_err)?;
+        let dict = PyDict::new(py);
+        dict.set_item("updated", resp.updated)?;
+        dict.set_item("replaced_id", resp.replaced_id)?;
+        dict.set_item("version", resp.version)?;
+        match resp.record {
+            Some(record) => dict.set_item("record", dto_record_to_py(py, record)?)?,
+            None => dict.set_item("record", py.None())?,
+        }
+        Ok(dict.into_pyobject(py)?.unbind().into())
+    }
+
+    #[pyo3(signature = (id = None, external_id = None))]
+    fn get(
+        &self,
+        py: Python<'_>,
+        id: Option<String>,
+        external_id: Option<String>,
+    ) -> PyResult<Option<PyObject>> {
+        let record = match (id, external_id) {
+            (Some(id), None) => py.allow_threads(|| {
+                self.runtime
+                    .block_on(self.store.get(&id))
+                    .map_err(to_py_err)
+            })?,
+            (None, Some(external_id)) => py.allow_threads(|| {
+                self.runtime
+                    .block_on(self.store.get_by_external_id(&external_id))
+                    .map_err(to_py_err)
+            })?,
+            (None, None) => {
+                return Err(PyRuntimeError::new_err(
+                    "get() requires either id or external_id",
+                ));
+            }
+            (Some(_), Some(_)) => {
+                return Err(PyRuntimeError::new_err(
+                    "get() accepts only one of id or external_id",
+                ));
+            }
+        };
+        record
+            .map(|record| dto_record_to_py(py, record))
+            .transpose()
+    }
+
+    #[pyo3(signature = (id = None, external_id = None))]
+    fn delete(
+        &mut self,
+        py: Python<'_>,
+        id: Option<String>,
+        external_id: Option<String>,
+    ) -> PyResult<bool> {
+        let resp = match (id, external_id) {
+            (Some(id), None) => py.allow_threads(|| {
+                self.runtime
+                    .block_on(self.store.delete_by_id(&id))
+                    .map_err(to_py_err)
+            })?,
+            (None, Some(external_id)) => py.allow_threads(|| {
+                self.runtime
+                    .block_on(self.store.delete_by_external_id(&external_id))
+                    .map_err(to_py_err)
+            })?,
+            (None, None) => {
+                return Err(PyRuntimeError::new_err(
+                    "delete() requires either id or external_id",
+                ));
+            }
+            (Some(_), Some(_)) => {
+                return Err(PyRuntimeError::new_err(
+                    "delete() accepts only one of id or external_id",
+                ));
+            }
+        };
+        Ok(resp.deleted)
+    }
+
+    #[pyo3(signature = (limit = None, offset = None, filters_json = None, include_expired = false, include_retired = false))]
+    fn list(
+        &self,
+        py: Python<'_>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+        filters_json: Option<String>,
+        include_expired: bool,
+        include_retired: bool,
+    ) -> PyResult<Vec<PyObject>> {
+        let filters = filters_value_from_json(filters_json)?;
+        let records = py.allow_threads(|| {
+            self.runtime
+                .block_on(
+                    self.store
+                        .list(limit, offset, filters, include_expired, include_retired),
+                )
+                .map_err(to_py_err)
+        })?;
+        records
+            .into_iter()
+            .map(|record| dto_record_to_py(py, record))
+            .collect()
+    }
+
+    #[pyo3(signature = (target_id, relation = None, limit = None, include_expired = false, include_retired = false))]
+    fn related(
+        &self,
+        py: Python<'_>,
+        target_id: &str,
+        relation: Option<&str>,
+        limit: Option<usize>,
+        include_expired: bool,
+        include_retired: bool,
+    ) -> PyResult<Vec<PyObject>> {
+        let records = py.allow_threads(|| {
+            self.runtime
+                .block_on(self.store.related(
+                    target_id,
+                    relation,
+                    limit,
+                    include_expired,
+                    include_retired,
+                ))
+                .map_err(to_py_err)
+        })?;
+        records
+            .into_iter()
+            .map(|record| dto_record_to_py(py, record))
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (query, limit = None, filters_json = None, include_expired = false, include_retired = false, include_relationships = false))]
+    fn search(
+        &self,
+        py: Python<'_>,
+        query: Vec<f32>,
+        limit: Option<usize>,
+        filters_json: Option<String>,
+        include_expired: bool,
+        include_retired: bool,
+        include_relationships: bool,
+    ) -> PyResult<Vec<PyObject>> {
+        let req = SearchRequest {
+            query,
+            limit: limit.unwrap_or(10),
+            filters: filters_value_from_json(filters_json)?,
+            include_expired,
+            include_retired,
+            include_relationships,
+        };
+        let hits = py
+            .allow_threads(|| self.runtime.block_on(self.store.search(&req)))
+            .map_err(to_py_err)?;
+        hits.into_iter()
+            .map(|hit| dto_search_hit_to_py(py, hit, include_relationships))
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (text = None, vector = None, limit = None, filters_json = None, include_expired = false, include_retired = false, include_relationships = false, fusion = None))]
+    fn retrieve(
+        &self,
+        py: Python<'_>,
+        text: Option<String>,
+        vector: Option<Vec<f32>>,
+        limit: Option<usize>,
+        filters_json: Option<String>,
+        include_expired: bool,
+        include_retired: bool,
+        include_relationships: bool,
+        fusion: Option<String>,
+    ) -> PyResult<Vec<PyObject>> {
+        if fusion.as_deref().is_some_and(|value| value != "rrf") {
+            return Err(PyRuntimeError::new_err(
+                "retrieve fusion currently supports only 'rrf'",
+            ));
+        }
+        let req = RetrieveRequest {
+            text,
+            vector,
+            limit: limit.unwrap_or(10),
+            filters: filters_value_from_json(filters_json)?,
+            include_expired,
+            include_retired,
+            include_relationships,
+            fusion: fusion.unwrap_or_else(|| "rrf".to_string()),
+        };
+        let hits = py
+            .allow_threads(|| self.runtime.block_on(self.store.retrieve(&req)))
+            .map_err(to_py_err)?;
+        hits.into_iter()
+            .map(|hit| dto_retrieve_hit_to_py(py, hit, include_relationships))
+            .collect()
+    }
+
+    fn checkout(&mut self, py: Python<'_>, version_id: u64) -> PyResult<()> {
+        py.allow_threads(|| {
+            self.runtime
+                .block_on(self.store.checkout(version_id))
+                .map_err(to_py_err)
+        })
+    }
+
+    #[pyo3(signature = (target_rows_per_fragment=None, materialize_deletions=None))]
+    fn compact(
+        &mut self,
+        py: Python<'_>,
+        target_rows_per_fragment: Option<usize>,
+        materialize_deletions: Option<bool>,
+    ) -> PyResult<PyObject> {
+        let options = if target_rows_per_fragment.is_some() || materialize_deletions.is_some() {
+            Some(CompactRequest {
+                target_rows_per_fragment,
+                materialize_deletions,
+            })
+        } else {
+            None
+        };
+        let resp = py
+            .allow_threads(|| self.runtime.block_on(self.store.compact(options)))
+            .map_err(to_py_err)?;
+        dto_compact_response_to_py(py, resp)
+    }
+
+    fn compaction_stats(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let stats = py
+            .allow_threads(|| self.runtime.block_on(self.store.compaction_stats()))
+            .map_err(to_py_err)?;
+        dto_compact_stats_to_py(py, stats)
+    }
+}
+
 fn required_item<'py>(
     dict: &Bound<'py, PyDict>,
     key: &str,
@@ -1262,10 +1700,242 @@ fn to_py_err<E: std::fmt::Display>(err: E) -> PyErr {
     PyRuntimeError::new_err(err.to_string())
 }
 
+fn content_to_payloads(
+    content: &Bound<'_, PyAny>,
+    data_type: Option<&str>,
+) -> PyResult<(String, Option<String>, Option<Vec<u8>>)> {
+    match content.extract::<&[u8]>() {
+        Ok(bytes) => Ok((
+            data_type
+                .map(str::to_string)
+                .unwrap_or_else(|| DEFAULT_BINARY_CONTENT_TYPE.to_string()),
+            None,
+            Some(bytes.to_vec()),
+        )),
+        Err(_) => {
+            let content_str = content.str()?.to_string();
+            Ok((
+                data_type
+                    .map(str::to_string)
+                    .unwrap_or_else(|| CONTENT_TYPE_TEXT.to_string()),
+                Some(content_str),
+                None,
+            ))
+        }
+    }
+}
+
+fn dto_state_metadata_from_dict(
+    dict: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Option<StateMetadataDto>> {
+    let Some(dict) = dict else {
+        return Ok(None);
+    };
+
+    Ok(Some(StateMetadataDto {
+        step: optional_item(dict, "step")?
+            .map(|value| value.extract::<i32>())
+            .transpose()?,
+        active_plan_id: optional_item(dict, "active_plan_id")?
+            .map(|value| value.extract::<String>())
+            .transpose()?,
+        tokens_used: optional_item(dict, "tokens_used")?
+            .map(|value| value.extract::<i32>())
+            .transpose()?,
+        custom: optional_item(dict, "custom")?
+            .map(|value| value.extract::<String>())
+            .transpose()?,
+    }))
+}
+
+fn dto_relationships_from_json(value: Option<String>) -> PyResult<Vec<RelationshipDto>> {
+    value
+        .map(|value| serde_json::from_str(&value).map_err(to_py_err))
+        .transpose()
+        .map(|value| value.unwrap_or_default())
+}
+
+fn dto_relationships_patch_from_json(
+    value: Option<String>,
+) -> PyResult<Option<Vec<RelationshipDto>>> {
+    value
+        .map(|value| serde_json::from_str::<Vec<RelationshipDto>>(&value).map_err(to_py_err))
+        .transpose()
+}
+
+fn filters_value_from_json(filters_json: Option<String>) -> PyResult<Option<Value>> {
+    filters_json
+        .map(|value| serde_json::from_str(&value).map_err(to_py_err))
+        .transpose()
+}
+
+fn dto_record_to_py(py: Python<'_>, record: RecordDto) -> PyResult<PyObject> {
+    let RecordDto {
+        id,
+        external_id,
+        run_id,
+        bot_id,
+        session_id,
+        created_at,
+        role,
+        content_type,
+        text_payload,
+        binary_payload,
+        embedding,
+        state_metadata,
+        metadata,
+        relationships,
+        expires_at,
+        retention_policy,
+        lifecycle_status,
+        retired_at,
+        retired_reason,
+        supersedes_id,
+        superseded_by_id,
+        tenant,
+        source,
+    } = record;
+
+    let dict = PyDict::new(py);
+    dict.set_item("id", id)?;
+    dict.set_item("external_id", external_id)?;
+    dict.set_item("run_id", run_id)?;
+    dict.set_item("bot_id", bot_id)?;
+    dict.set_item("session_id", session_id)?;
+    dict.set_item(
+        "created_at",
+        created_at.to_rfc3339_opts(SecondsFormat::Micros, true),
+    )?;
+    dict.set_item("role", role)?;
+
+    let state_obj: PyObject = match state_metadata {
+        Some(metadata) => {
+            let state_dict = PyDict::new(py);
+            state_dict.set_item("step", metadata.step)?;
+            state_dict.set_item("active_plan_id", metadata.active_plan_id)?;
+            state_dict.set_item("tokens_used", metadata.tokens_used)?;
+            state_dict.set_item("custom", metadata.custom)?;
+            state_dict.into_pyobject(py)?.unbind().into()
+        }
+        None => py.None().into_pyobject(py)?.unbind(),
+    };
+    dict.set_item("state_metadata", state_obj)?;
+    let metadata_obj: PyObject = match metadata {
+        Some(metadata) => json_value_to_py(py, &metadata)?,
+        None => py.None().into_pyobject(py)?.unbind(),
+    };
+    dict.set_item("metadata", metadata_obj)?;
+    dict.set_item("relationships", dto_relationships_to_py(py, relationships)?)?;
+    dict.set_item(
+        "expires_at",
+        expires_at.map(|dt| dt.to_rfc3339_opts(SecondsFormat::Micros, true)),
+    )?;
+    dict.set_item("retention_policy", retention_policy)?;
+    dict.set_item("lifecycle_status", lifecycle_status)?;
+    dict.set_item(
+        "retired_at",
+        retired_at.map(|dt| dt.to_rfc3339_opts(SecondsFormat::Micros, true)),
+    )?;
+    dict.set_item("retired_reason", retired_reason)?;
+    dict.set_item("supersedes_id", supersedes_id)?;
+    dict.set_item("superseded_by_id", superseded_by_id)?;
+    dict.set_item("tenant", tenant)?;
+    dict.set_item("source", source)?;
+    dict.set_item("content_type", content_type)?;
+    dict.set_item("text_payload", text_payload)?;
+    match binary_payload {
+        Some(payload) => dict.set_item("binary_payload", PyBytes::new(py, &payload))?,
+        None => dict.set_item("binary_payload", py.None())?,
+    }
+    dict.set_item("embedding", embedding)?;
+    Ok(dict.into_pyobject(py)?.unbind().into())
+}
+
+fn dto_relationships_to_py(
+    py: Python<'_>,
+    relationships: Vec<RelationshipDto>,
+) -> PyResult<PyObject> {
+    let list = PyList::empty(py);
+    for relationship in relationships {
+        let dict = PyDict::new(py);
+        dict.set_item("target_id", relationship.target_id)?;
+        dict.set_item("relation", relationship.relation)?;
+        dict.set_item("weight", relationship.weight)?;
+        list.append(dict)?;
+    }
+    Ok(list.into_pyobject(py)?.unbind().into())
+}
+
+fn dto_search_hit_to_py(
+    py: Python<'_>,
+    hit: SearchResultDto,
+    include_relationships: bool,
+) -> PyResult<PyObject> {
+    let SearchResultDto { record, distance } = hit;
+    let mut record = record;
+    if !include_relationships {
+        record.relationships.clear();
+    }
+    let dict = dto_record_to_py(py, record)?;
+    let dict_ref = dict.downcast_bound::<PyDict>(py)?;
+    dict_ref.set_item("distance", distance)?;
+    Ok(dict)
+}
+
+fn dto_retrieve_hit_to_py(
+    py: Python<'_>,
+    hit: RetrieveResultDto,
+    include_relationships: bool,
+) -> PyResult<PyObject> {
+    let RetrieveResultDto {
+        record,
+        score,
+        vector_distance,
+        text_score,
+        matched_channels,
+    } = hit;
+    let mut record = record;
+    if !include_relationships {
+        record.relationships.clear();
+    }
+    let dict = dto_record_to_py(py, record)?;
+    let dict_ref = dict.downcast_bound::<PyDict>(py)?;
+    dict_ref.set_item("score", score)?;
+    dict_ref.set_item("vector_distance", vector_distance)?;
+    dict_ref.set_item("text_score", text_score)?;
+    dict_ref.set_item("matched_channels", matched_channels)?;
+    Ok(dict)
+}
+
+fn dto_compact_response_to_py(py: Python<'_>, resp: CompactResponse) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("fragments_removed", resp.fragments_removed)?;
+    dict.set_item("fragments_added", resp.fragments_added)?;
+    dict.set_item("files_removed", resp.files_removed)?;
+    dict.set_item("files_added", resp.files_added)?;
+    Ok(dict.into_pyobject(py)?.unbind().into())
+}
+
+fn dto_compact_stats_to_py(py: Python<'_>, stats: CompactStatsResponse) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("total_fragments", stats.total_fragments)?;
+    dict.set_item("is_compacting", stats.is_compacting)?;
+    dict.set_item(
+        "last_compaction",
+        stats
+            .last_compaction
+            .map(|dt| dt.to_rfc3339_opts(SecondsFormat::Micros, true)),
+    )?;
+    dict.set_item("last_error", stats.last_error)?;
+    dict.set_item("total_compactions", stats.total_compactions)?;
+    Ok(dict.into_pyobject(py)?.unbind().into())
+}
+
 #[pymodule]
 fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(version, m)?)?;
     m.add_class::<Context>()?;
     m.add_class::<ContextNamespace>()?;
+    m.add_class::<RemoteContext>()?;
     Ok(())
 }
