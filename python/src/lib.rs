@@ -45,6 +45,8 @@ struct RecordInput {
     tenant: Option<String>,
     source: Option<String>,
     external_id: Option<String>,
+    run_id: Option<String>,
+    created_at: Option<DateTime<Utc>>,
     state_metadata: Option<StateMetadata>,
     metadata_json: Option<String>,
     relationships: Vec<Relationship>,
@@ -290,7 +292,7 @@ impl Context {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (role, content, data_type = None, embedding = None, bot_id = None, session_id = None, tenant = None, source = None, external_id = None, state_metadata = None, metadata_json = None, expires_at = None, retention_policy = None, lifecycle_status = None, retired_at = None, retired_reason = None, supersedes_id = None, superseded_by_id = None, relationships_json = None))]
+    #[pyo3(signature = (role, content, data_type = None, embedding = None, bot_id = None, session_id = None, tenant = None, source = None, external_id = None, run_id = None, created_at = None, state_metadata = None, metadata_json = None, expires_at = None, retention_policy = None, lifecycle_status = None, retired_at = None, retired_reason = None, supersedes_id = None, superseded_by_id = None, relationships_json = None))]
     fn add(
         &mut self,
         py: Python<'_>,
@@ -303,6 +305,8 @@ impl Context {
         tenant: Option<String>,
         source: Option<String>,
         external_id: Option<String>,
+        run_id: Option<String>,
+        created_at: Option<String>,
         state_metadata: Option<&Bound<'_, PyDict>>,
         metadata_json: Option<String>,
         expires_at: Option<String>,
@@ -334,6 +338,8 @@ impl Context {
                 tenant,
                 source,
                 external_id,
+                run_id,
+                created_at: parse_optional_datetime(created_at, "created_at")?,
                 state_metadata: state_metadata_from_dict(state_metadata)?,
                 metadata_json,
                 relationships: relationships_from_json(relationships_json)?,
@@ -356,7 +362,7 @@ impl Context {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (role, content, data_type = None, embedding = None, bot_id = None, session_id = None, tenant = None, source = None, external_id = None, metadata_json = None, expires_at = None, retention_policy = None, lifecycle_status = None, retired_at = None, retired_reason = None, relationships_json = None, key = "external_id"))]
+    #[pyo3(signature = (role, content, data_type = None, embedding = None, bot_id = None, session_id = None, tenant = None, source = None, external_id = None, run_id = None, created_at = None, state_metadata = None, metadata_json = None, expires_at = None, retention_policy = None, lifecycle_status = None, retired_at = None, retired_reason = None, relationships_json = None, key = "external_id"))]
     fn upsert(
         &mut self,
         py: Python<'_>,
@@ -369,6 +375,9 @@ impl Context {
         tenant: Option<String>,
         source: Option<String>,
         external_id: Option<String>,
+        run_id: Option<String>,
+        created_at: Option<String>,
+        state_metadata: Option<&Bound<'_, PyDict>>,
         metadata_json: Option<String>,
         expires_at: Option<String>,
         retention_policy: Option<String>,
@@ -409,7 +418,9 @@ impl Context {
                 tenant,
                 source,
                 external_id,
-                state_metadata: None,
+                run_id,
+                created_at: parse_optional_datetime(created_at, "created_at")?,
+                state_metadata: state_metadata_from_dict(state_metadata)?,
                 metadata_json,
                 relationships: relationships_from_json(relationships_json)?,
                 lifecycle,
@@ -889,6 +900,8 @@ impl Context {
         let source = optional_item(dict, "source")?.map(|value| value.extract::<String>());
         let external_id =
             optional_item(dict, "external_id")?.map(|value| value.extract::<String>());
+        let run_id = optional_item(dict, "run_id")?.map(|value| value.extract::<String>());
+        let created_at = optional_item(dict, "created_at")?.map(|value| value.extract::<String>());
         let state_metadata = match optional_item(dict, "state_metadata")? {
             Some(value) => {
                 let metadata = value.downcast::<PyDict>().map_err(|_| {
@@ -936,6 +949,8 @@ impl Context {
                 tenant: tenant.transpose()?,
                 source: source.transpose()?,
                 external_id: external_id.transpose()?,
+                run_id: run_id.transpose()?,
+                created_at: parse_optional_datetime(created_at.transpose()?, "created_at")?,
                 state_metadata,
                 metadata_json: metadata_json.transpose()?,
                 relationships: relationships_from_json(relationships_json.transpose()?)?,
@@ -961,6 +976,8 @@ impl Context {
             tenant,
             source,
             external_id,
+            run_id,
+            created_at,
             state_metadata,
             metadata_json,
             relationships,
@@ -990,18 +1007,19 @@ impl Context {
                 }
             };
 
-        let record_id = format!("{}-{}", self.run_id, self.inner.entries() + offset);
+        let record_run_id = run_id.unwrap_or_else(|| self.run_id.clone());
+        let record_id = format!("{}-{}", record_run_id, self.inner.entries() + offset);
         let metadata = metadata_from_json(metadata_json)?;
         Ok(PreparedRecord {
             record: ContextRecord {
                 id: record_id,
                 external_id,
-                run_id: self.run_id.clone(),
+                run_id: record_run_id,
                 bot_id,
                 session_id,
                 tenant,
                 source,
-                created_at: Utc::now(),
+                created_at: created_at.unwrap_or_else(Utc::now),
                 role: role.clone(),
                 state_metadata,
                 metadata,

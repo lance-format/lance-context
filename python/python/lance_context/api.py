@@ -6,7 +6,10 @@ import warnings
 from collections.abc import Iterable, Mapping
 from datetime import datetime
 from io import BytesIO
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from os import PathLike
 
 from ._internal import Context as _Context  # pyright: ignore[reportMissingImports]
 from ._internal import (  # pyright: ignore[reportMissingImports]
@@ -30,6 +33,31 @@ __all__ = [
 __version__ = _version()
 
 _ARROW_STREAM_MIME = "application/vnd.apache.arrow.stream"
+_DEFAULT_INGEST_BATCH_SIZE = 1000
+_MISSING = object()
+_INGEST_DIRECT_FIELDS = {
+    "role",
+    "content",
+    "content_type",
+    "data_type",
+    "embedding",
+    "bot_id",
+    "session_id",
+    "tenant",
+    "source",
+    "external_id",
+    "run_id",
+    "created_at",
+    "state_metadata",
+    "relationships",
+    "expires_at",
+    "retention_policy",
+    "lifecycle_status",
+    "retired_at",
+    "retired_reason",
+    "supersedes_id",
+    "superseded_by_id",
+}
 
 
 def _is_module(value: Any, prefix: str) -> bool:
@@ -274,6 +302,107 @@ def _merge_storage_options(
     return options
 
 
+def _normalize_field_map(field_map: Mapping[str, str] | None) -> dict[str, str]:
+    if field_map is None:
+        return {}
+    if not isinstance(field_map, Mapping):
+        raise TypeError("field_map must be a mapping")
+
+    normalized: dict[str, str] = {}
+    for key, value in field_map.items():
+        if not isinstance(key, str):
+            raise TypeError("field_map keys must be strings")
+        if not isinstance(value, str):
+            raise TypeError("field_map values must be strings")
+        normalized[key] = value
+    return normalized
+
+
+def _mapped_value(
+    raw: Mapping[str, Any], field_map: Mapping[str, str], field: str
+) -> Any:
+    source_field = field_map.get(field, field)
+    if source_field in raw:
+        return raw[source_field]
+    return _MISSING
+
+
+def _jsonable_mapping(value: Mapping[str, Any], *, name: str) -> dict[str, Any]:
+    normalized = dict(value)
+    _json_dumps(normalized, name)
+    return normalized
+
+
+def _normalize_ingest_record(
+    raw: Mapping[str, Any],
+    *,
+    field_map: Mapping[str, str],
+    defaults: Mapping[str, Any],
+    source: str,
+    preserve_raw: bool,
+    raw_metadata_key: str,
+    index: int,
+) -> dict[str, Any]:
+    record: dict[str, Any] = {}
+
+    for field in _INGEST_DIRECT_FIELDS:
+        value = _mapped_value(raw, field_map, field)
+        if value is not _MISSING:
+            record[field] = value
+
+    for field, value in defaults.items():
+        if field != "metadata":
+            record.setdefault(field, value)
+
+    record.setdefault("source", source)
+    record.setdefault("role", "source")
+
+    if "content" not in record:
+        raise ValueError(f"records[{index}] is missing required ingest field 'content'")
+
+    metadata: dict[str, Any] = {}
+    mapped_metadata = _mapped_value(raw, field_map, "metadata")
+    if mapped_metadata is not _MISSING:
+        if not isinstance(mapped_metadata, Mapping):
+            raise TypeError(f"records[{index}].metadata must be a mapping")
+        metadata.update(
+            _jsonable_mapping(mapped_metadata, name=f"records[{index}].metadata")
+        )
+
+    default_metadata = defaults.get("metadata")
+    if default_metadata is not None:
+        if not isinstance(default_metadata, Mapping):
+            raise TypeError("defaults['metadata'] must be a mapping")
+        merged = _jsonable_mapping(default_metadata, name="defaults['metadata']")
+        merged.update(metadata)
+        metadata = merged
+
+    if preserve_raw:
+        metadata.setdefault(
+            raw_metadata_key,
+            _jsonable_mapping(raw, name=f"records[{index}].raw"),
+        )
+
+    if metadata:
+        record["metadata"] = metadata
+
+    return record
+
+
+def _validate_ingest_defaults(defaults: Mapping[str, Any] | None) -> dict[str, Any]:
+    if defaults is None:
+        return {}
+    if not isinstance(defaults, Mapping):
+        raise TypeError("defaults must be a mapping")
+
+    normalized = dict(defaults)
+    invalid = set(normalized) - (_INGEST_DIRECT_FIELDS | {"metadata"})
+    if invalid:
+        joined = ", ".join(sorted(invalid))
+        raise ValueError(f"defaults contains unsupported record field(s): {joined}")
+    return normalized
+
+
 class Context:
     """Multimodal, versioned context store backed by Lance.
 
@@ -457,6 +586,8 @@ class Context:
         tenant: str | None = None,
         source: str | None = None,
         external_id: str | None = None,
+        run_id: str | None = None,
+        created_at: datetime | str | None = None,
         state_metadata: Mapping[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
         relationships: list[dict[str, Any]] | None = None,
@@ -495,6 +626,8 @@ class Context:
             tenant,
             source,
             external_id,
+            run_id,
+            _coerce_timestamp(created_at, field_name="created_at"),
             _normalize_state_metadata(state_metadata),
             _json_dumps(metadata, "metadata"),
             _coerce_timestamp(expires_at, field_name="expires_at"),
@@ -519,6 +652,9 @@ class Context:
         tenant: str | None = None,
         source: str | None = None,
         external_id: str | None = None,
+        run_id: str | None = None,
+        created_at: datetime | str | None = None,
+        state_metadata: Mapping[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
         relationships: list[dict[str, Any]] | None = None,
         expires_at: datetime | str | None = None,
@@ -562,6 +698,9 @@ class Context:
             tenant,
             source,
             external_id,
+            run_id,
+            _coerce_timestamp(created_at, field_name="created_at"),
+            _normalize_state_metadata(state_metadata),
             _json_dumps(metadata, "metadata"),
             _coerce_timestamp(expires_at, field_name="expires_at"),
             retention_policy,
@@ -650,7 +789,7 @@ class Context:
         Each record accepts the same fields as :meth:`add`: ``role``,
         ``content``, optional ``content_type``/``data_type``, ``embedding``,
         ``bot_id``, ``session_id``, ``tenant``, ``source``, ``external_id``,
-        ``state_metadata``,
+        ``run_id``, ``created_at``, ``state_metadata``,
         ``metadata``, ``relationships``, and lifecycle fields such as
         ``expires_at`` and ``lifecycle_status``.
         """
@@ -693,6 +832,11 @@ class Context:
                         "source", getattr(self, "_default_fields", {}).get("source")
                     ),
                     "external_id": record.get("external_id"),
+                    "run_id": record.get("run_id"),
+                    "created_at": _coerce_timestamp(
+                        record.get("created_at"),
+                        field_name=f"records[{index}].created_at",
+                    ),
                     "state_metadata": _normalize_state_metadata(
                         record.get("state_metadata")
                     ),
@@ -718,6 +862,203 @@ class Context:
 
         self._auto_embed_batch(normalized)
         self._inner.add_many(normalized)
+
+    def ingest_records(
+        self,
+        records: Iterable[Mapping[str, Any]],
+        *,
+        field_map: Mapping[str, str] | None = None,
+        defaults: Mapping[str, Any] | None = None,
+        source: str = "raw",
+        batch_size: int = _DEFAULT_INGEST_BATCH_SIZE,
+        mode: str = "append",
+        preserve_raw: bool = True,
+        raw_metadata_key: str = "raw_record",
+    ) -> dict[str, int]:
+        """Ingest raw row-like records into faithful ``ContextRecord`` entries.
+
+        ``field_map`` maps context-record fields to raw input fields, for
+        example ``{"content": "message", "external_id": "event_id"}``.
+        ``mode="append"`` batches through :meth:`add_many`; ``mode="upsert"``
+        uses each row's ``external_id`` for idempotent re-ingestion.
+        """
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        if mode not in {"append", "upsert"}:
+            raise ValueError("mode must be 'append' or 'upsert'")
+        if not source:
+            raise ValueError("source must be non-empty")
+        if not raw_metadata_key:
+            raise ValueError("raw_metadata_key must be non-empty")
+
+        normalized_field_map = _normalize_field_map(field_map)
+        normalized_defaults = _validate_ingest_defaults(defaults)
+        processed = 0
+        inserted = 0
+        updated = 0
+        batches = 0
+        batch: list[dict[str, Any]] = []
+
+        def flush() -> None:
+            nonlocal inserted, updated, batches, batch
+            if not batch:
+                return
+            if mode == "append":
+                self.add_many(batch)
+                inserted += len(batch)
+            else:
+                for record in batch:
+                    external_id = record.get("external_id")
+                    if not external_id:
+                        raise ValueError(
+                            "mode='upsert' requires external_id on every record"
+                        )
+                    result = self.upsert(
+                        record["role"],
+                        record["content"],
+                        content_type=record.get("content_type"),
+                        data_type=record.get("data_type"),
+                        embedding=record.get("embedding"),
+                        bot_id=record.get("bot_id"),
+                        session_id=record.get("session_id"),
+                        tenant=record.get("tenant"),
+                        source=record.get("source"),
+                        external_id=external_id,
+                        run_id=record.get("run_id"),
+                        created_at=record.get("created_at"),
+                        state_metadata=record.get("state_metadata"),
+                        metadata=record.get("metadata"),
+                        relationships=record.get("relationships"),
+                        expires_at=record.get("expires_at"),
+                        retention_policy=record.get("retention_policy"),
+                        lifecycle_status=record.get("lifecycle_status"),
+                        retired_at=record.get("retired_at"),
+                        retired_reason=record.get("retired_reason"),
+                    )
+                    if result["inserted"]:
+                        inserted += 1
+                    else:
+                        updated += 1
+            batches += 1
+            batch = []
+
+        for index, raw in enumerate(records):
+            if not isinstance(raw, Mapping):
+                raise TypeError(f"records[{index}] must be a mapping")
+            batch.append(
+                _normalize_ingest_record(
+                    raw,
+                    field_map=normalized_field_map,
+                    defaults=normalized_defaults,
+                    source=source,
+                    preserve_raw=preserve_raw,
+                    raw_metadata_key=raw_metadata_key,
+                    index=index,
+                )
+            )
+            processed += 1
+            if len(batch) >= batch_size:
+                flush()
+
+        flush()
+        return {
+            "processed": processed,
+            "inserted": inserted,
+            "updated": updated,
+            "batches": batches,
+        }
+
+    def ingest_jsonl(
+        self,
+        path: str | PathLike[str],
+        *,
+        field_map: Mapping[str, str] | None = None,
+        defaults: Mapping[str, Any] | None = None,
+        source: str = "raw",
+        batch_size: int = _DEFAULT_INGEST_BATCH_SIZE,
+        mode: str = "append",
+        preserve_raw: bool = True,
+        raw_metadata_key: str = "raw_record",
+    ) -> dict[str, int]:
+        """Stream-ingest newline-delimited JSON objects from ``path``."""
+
+        def iter_rows() -> Iterable[Mapping[str, Any]]:
+            with open(path, encoding="utf-8") as stream:
+                for line_number, line in enumerate(stream, start=1):
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    row = json.loads(stripped)
+                    if not isinstance(row, Mapping):
+                        raise ValueError(f"JSONL line {line_number} must be an object")
+                    yield row
+
+        return self.ingest_records(
+            iter_rows(),
+            field_map=field_map,
+            defaults=defaults,
+            source=source,
+            batch_size=batch_size,
+            mode=mode,
+            preserve_raw=preserve_raw,
+            raw_metadata_key=raw_metadata_key,
+        )
+
+    def ingest_messages(
+        self,
+        messages: Iterable[Mapping[str, Any]],
+        *,
+        session_id: str | None = None,
+        tenant: str | None = None,
+        bot_id: str | None = None,
+        external_id_prefix: str | None = None,
+        source: str = "raw",
+        batch_size: int = _DEFAULT_INGEST_BATCH_SIZE,
+        mode: str = "append",
+        metadata: Mapping[str, Any] | None = None,
+    ) -> dict[str, int]:
+        """Ingest OpenAI-style chat messages as raw context records."""
+        default_metadata = dict(metadata or {})
+
+        def iter_rows() -> Iterable[Mapping[str, Any]]:
+            for index, message in enumerate(messages):
+                if not isinstance(message, Mapping):
+                    raise TypeError(f"messages[{index}] must be a mapping")
+                content = message.get("content")
+                content_type = message.get("content_type")
+                if content is None:
+                    content = {k: v for k, v in message.items() if k != "role"}
+                    content_type = content_type or "application/json"
+                if not isinstance(content, (bytes, str)):
+                    content = json.dumps(content, sort_keys=True, separators=(",", ":"))
+                    content_type = content_type or "application/json"
+
+                row_metadata = dict(default_metadata)
+                row_metadata["raw_message"] = dict(message)
+                row: dict[str, Any] = {
+                    "role": message.get("role", "message"),
+                    "content": content,
+                    "content_type": content_type,
+                    "source": source,
+                    "metadata": row_metadata,
+                }
+                if session_id is not None:
+                    row["session_id"] = session_id
+                if tenant is not None:
+                    row["tenant"] = tenant
+                if bot_id is not None:
+                    row["bot_id"] = bot_id
+                if external_id_prefix is not None:
+                    row["external_id"] = f"{external_id_prefix}#message-{index + 1}"
+                yield row
+
+        return self.ingest_records(
+            iter_rows(),
+            batch_size=batch_size,
+            mode=mode,
+            source=source,
+            preserve_raw=False,
+        )
 
     def _auto_embed_batch(self, records: list[dict[str, Any]]) -> None:
         """Embed text records without an embedding in one provider call."""

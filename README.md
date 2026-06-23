@@ -197,6 +197,34 @@ ctx.update(
 )
 # The enriched record now shows up in vector search and hybrid retrieve.
 
+# Raw interaction-log ingestion: map raw rows into ContextRecord fields while
+# preserving the original row under metadata["raw_record"]. Use mode="upsert"
+# with stable external_id values for idempotent re-ingestion.
+ctx.ingest_jsonl(
+    "chat-log.jsonl",
+    field_map={
+        "external_id": "event_id",
+        "role": "speaker",
+        "content": "message",
+        "session_id": "conversation_id",
+        "run_id": "trace_id",
+        "created_at": "timestamp",
+    },
+    defaults={"tenant": "example-org"},
+    mode="upsert",
+    batch_size=500,
+)
+
+# OpenAI-style messages can be ingested directly as raw records.
+ctx.ingest_messages(
+    [
+        {"role": "system", "content": "Be concise."},
+        {"role": "user", "content": "What changed?"},
+    ],
+    session_id="conversation-2026-03-01",
+    external_id_prefix="conversation-2026-03-01",
+)
+
 # Time-travel to prior state
 first_version = ctx.version()
 ctx.add("assistant", "Let me fetch suggestions…")
