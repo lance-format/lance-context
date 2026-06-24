@@ -931,6 +931,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_respects_explicit_retirement() {
+        let (state, _dir) = test_state("test-ctx").await;
+        let context_name = "test-ctx";
+
+        let mut record = text_record("Explicit retire");
+        record.external_id = Some("doc-2".to_string());
+        let (_, Json(added)) = add_records(
+            State(state.clone()),
+            Path(context_name.to_string()),
+            Json(AddRecordsRequest {
+                records: vec![record],
+            }),
+        )
+        .await
+        .unwrap();
+        let target_id = added.ids[0].clone();
+
+        // Patch to retired_at
+        let updated = update_record(
+            State(state.clone()),
+            Path(context_name.to_string()),
+            Json(UpdateRecordRequest {
+                id: Some(target_id.clone()),
+                external_id: None,
+                patch: RecordPatchDto {
+                    retired_at: Some(Some(Utc::now())),
+                    ..Default::default()
+                },
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(updated.updated);
+
+        // Default listing hides retired record.
+        let records = list_with(&state, context_name, ListParams::default()).await;
+        assert_eq!(records.len(), 0);
+
+        // include_retired surfaces it.
+        let records = list_with(
+            &state,
+            context_name,
+            ListParams {
+                include_retired: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, target_id);
+    }
+
+    #[tokio::test]
+    async fn list_respects_non_active_lifecycle_status() {
+        let (state, _dir) = test_state("test-ctx").await;
+        let context_name = "test-ctx";
+
+        let mut record = text_record("Non-active");
+        record.external_id = Some("doc-3".to_string());
+        let (_, Json(added)) = add_records(
+            State(state.clone()),
+            Path(context_name.to_string()),
+            Json(AddRecordsRequest {
+                records: vec![record],
+            }),
+        )
+        .await
+        .unwrap();
+        let target_id = added.ids[0].clone();
+
+        // Patch to contradicted
+        let updated = update_record(
+            State(state.clone()),
+            Path(context_name.to_string()),
+            Json(UpdateRecordRequest {
+                id: Some(target_id.clone()),
+                external_id: None,
+                patch: RecordPatchDto {
+                    lifecycle_status: Some(Some(crate::model::LifecycleStatus::Contradicted)),
+                    ..Default::default()
+                },
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(updated.updated);
+
+        // Default listing hides contradicted record.
+        let records = list_with(&state, context_name, ListParams::default()).await;
+        assert_eq!(records.len(), 0);
+
+        // include_retired surfaces it.
+        let records = list_with(
+            &state,
+            context_name,
+            ListParams {
+                include_retired: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, target_id);
+    }
+
+    #[tokio::test]
     async fn list_rejects_invalid_filters_json() {
         let context_name = "ctx";
         let (state, _dir) = test_state(context_name).await;
