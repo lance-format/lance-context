@@ -696,19 +696,22 @@ impl ContextStore {
             }
         }
 
-        for record in self
-            .list_with_options(None, None, LifecycleQueryOptions::new(true, true))
-            .await?
-        {
-            if ids.contains(record.id.as_str()) {
+        let id_list: Vec<&str> = ids.iter().copied().collect();
+        let external_id_list: Vec<&str> = external_ids.iter().copied().collect();
+        let (existing_ids, existing_external_ids) =
+            self.find_existing_keys(&id_list, &external_id_list).await?;
+
+        // Report collisions in input order for deterministic, intuitive errors.
+        for entry in entries {
+            if existing_ids.contains(entry.id.as_str()) {
                 return Err(ArrowError::InvalidArgumentError(format!(
                     "id '{}' already exists",
-                    record.id
+                    entry.id
                 ))
                 .into());
             }
-            if let Some(external_id) = record.external_id {
-                if external_ids.contains(external_id.as_str()) {
+            if let Some(external_id) = &entry.external_id {
+                if existing_external_ids.contains(external_id.as_str()) {
                     return Err(ArrowError::InvalidArgumentError(format!(
                         "external_id '{}' already exists",
                         external_id
@@ -722,19 +725,97 @@ impl ContextStore {
     }
 
     async fn validate_new_record_id(&self, entry: &ContextRecord) -> LanceResult<()> {
-        for record in self
-            .list_with_options(None, None, LifecycleQueryOptions::new(true, true))
-            .await?
-        {
-            if record.id == entry.id {
-                return Err(ArrowError::InvalidArgumentError(format!(
-                    "id '{}' already exists",
-                    entry.id
-                ))
-                .into());
-            }
+        let id = entry.id.as_str();
+        let (existing_ids, _) = self.find_existing_keys(&[id], &[]).await?;
+        if existing_ids.contains(id) {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "id '{}' already exists",
+                entry.id
+            ))
+            .into());
         }
         Ok(())
+    }
+
+    /// Resolve which of the candidate `id` / `external_id` values already exist
+    /// among non-tombstone records.
+    ///
+    /// Unlike a full `list` + deserialize, this issues projected, filtered
+    /// scans that read only the `id` / `external_id` / `content_type` columns
+    /// for rows matching the candidate keys. When an `id` scalar index is
+    /// configured the `id` lookup is index-accelerated, so uniqueness
+    /// validation cost is bounded by the candidate batch (and index
+    /// selectivity) rather than the total number of stored records — history,
+    /// retired, expired, and superseded rows included.
+    ///
+    /// Tombstones are skipped to preserve existing behavior: a key whose only
+    /// surviving row is a tombstone is free for reuse, while a
+    /// superseded/retired/expired (non-tombstone) row still reserves its key.
+    async fn find_existing_keys(
+        &self,
+        ids: &[&str],
+        external_ids: &[&str],
+    ) -> LanceResult<(HashSet<String>, HashSet<String>)> {
+        let mut existing_ids = HashSet::new();
+        let mut existing_external_ids = HashSet::new();
+
+        let candidate_ids: HashSet<&str> = ids.iter().copied().collect();
+        let candidate_external_ids: HashSet<&str> = external_ids.iter().copied().collect();
+
+        if !candidate_ids.is_empty() {
+            let filter = format!("id IN ({})", sql_quoted_list(ids));
+            let scanner = self
+                .lsm_scanner()
+                .await?
+                .project(&["id", "content_type"])
+                .filter(&filter)?;
+            let mut stream = scanner.try_into_stream().await?;
+            while let Some(batch) = stream.try_next().await? {
+                let id_array = column_as::<StringArray>(&batch, "id")?;
+                let content_type_array = column_as::<StringArray>(&batch, "content_type")?;
+                for row in 0..batch.num_rows() {
+                    if content_type_array.value(row) == CONTENT_TYPE_TOMBSTONE {
+                        continue;
+                    }
+                    let id = id_array.value(row);
+                    if candidate_ids.contains(id) {
+                        existing_ids.insert(id.to_string());
+                    }
+                }
+            }
+        }
+
+        if !candidate_external_ids.is_empty() && self.has_external_id_column() {
+            let filter = format!("external_id IN ({})", sql_quoted_list(external_ids));
+            let scanner = self
+                .lsm_scanner()
+                .await?
+                .project(&["external_id", "content_type"])
+                .filter(&filter)?;
+            let mut stream = scanner.try_into_stream().await?;
+            while let Some(batch) = stream.try_next().await? {
+                let content_type_array = column_as::<StringArray>(&batch, "content_type")?;
+                let Some(external_id_array) =
+                    column_as_optional::<StringArray>(&batch, "external_id")
+                else {
+                    continue;
+                };
+                for row in 0..batch.num_rows() {
+                    if content_type_array.value(row) == CONTENT_TYPE_TOMBSTONE {
+                        continue;
+                    }
+                    if external_id_array.is_null(row) {
+                        continue;
+                    }
+                    let external_id = external_id_array.value(row);
+                    if candidate_external_ids.contains(external_id) {
+                        existing_external_ids.insert(external_id.to_string());
+                    }
+                }
+            }
+        }
+
+        Ok((existing_ids, existing_external_ids))
     }
 
     fn derive_region_id(bot_id: &Option<String>, session_id: &Option<String>) -> Uuid {
@@ -758,6 +839,14 @@ impl ContextStore {
             .field_paths()
             .iter()
             .any(|path| path == RELATIONSHIPS_COLUMN)
+    }
+
+    fn has_external_id_column(&self) -> bool {
+        self.dataset
+            .schema()
+            .field_paths()
+            .iter()
+            .any(|path| path == "external_id")
     }
 
     /// Current dataset version.
@@ -2478,6 +2567,17 @@ where
         .and_then(|col| col.as_ref().as_any().downcast_ref::<A>())
 }
 
+/// Render a SQL `IN (...)` value list as comma-separated quoted string
+/// literals, escaping any embedded single quotes. Callers ensure the input is
+/// non-empty before building the surrounding `IN ()` clause.
+fn sql_quoted_list(values: &[&str]) -> String {
+    values
+        .iter()
+        .map(|value| format!("'{}'", value.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3339,6 +3439,347 @@ mod tests {
                 message.contains("reserved") && message.contains("tombstone"),
                 "unexpected error message: {message}"
             );
+        });
+    }
+
+    #[test]
+    fn add_rejects_duplicate_id_against_existing() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = ContextStore::open(&uri).await.unwrap();
+            store.add(&[text_record("dup", 0.0)]).await.unwrap();
+
+            let err = store.add(&[text_record("dup", 1.0)]).await.unwrap_err();
+            let message = err.to_string();
+            assert!(
+                message.contains("id 'dup'") && message.contains("already exists"),
+                "unexpected error message: {message}"
+            );
+        });
+    }
+
+    #[test]
+    fn add_rejects_duplicate_id_within_batch() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = ContextStore::open(&uri).await.unwrap();
+            let err = store
+                .add(&[text_record("same", 0.0), text_record("same", 1.0)])
+                .await
+                .unwrap_err();
+            let message = err.to_string();
+            assert!(
+                message.contains("duplicate id 'same' in batch"),
+                "unexpected error message: {message}"
+            );
+        });
+    }
+
+    #[test]
+    fn add_rejects_duplicate_external_id_within_batch() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = ContextStore::open(&uri).await.unwrap();
+            let mut first = text_record("a", 0.0);
+            first.external_id = Some("ext".to_string());
+            let mut second = text_record("b", 1.0);
+            second.external_id = Some("ext".to_string());
+
+            let err = store.add(&[first, second]).await.unwrap_err();
+            let message = err.to_string();
+            assert!(
+                message.contains("duplicate external_id 'ext' in batch"),
+                "unexpected error message: {message}"
+            );
+        });
+    }
+
+    /// A record removed via tombstone frees its `external_id` for reuse:
+    /// validation skips tombstones, so a later insert with the same
+    /// `external_id` succeeds.
+    #[test]
+    fn add_allows_external_id_reuse_after_delete() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = ContextStore::open(&uri).await.unwrap();
+            let mut first = text_record("a", 0.0);
+            first.external_id = Some("ext".to_string());
+            store.add(std::slice::from_ref(&first)).await.unwrap();
+            assert!(store.delete_by_external_id("ext").await.unwrap());
+
+            let mut reused = text_record("b", 1.0);
+            reused.external_id = Some("ext".to_string());
+            store
+                .add(std::slice::from_ref(&reused))
+                .await
+                .expect("external_id should be reusable after delete");
+
+            let visible = store.get_by_external_id("ext").await.unwrap().unwrap();
+            assert_eq!(visible.id, reused.id);
+        });
+    }
+
+    /// A record removed via tombstone frees its `id` for reuse.
+    #[test]
+    fn add_allows_id_reuse_after_delete() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = ContextStore::open(&uri).await.unwrap();
+            let first = text_record("dup", 0.0);
+            store.add(std::slice::from_ref(&first)).await.unwrap();
+            assert!(store.delete_by_id("dup").await.unwrap());
+
+            store
+                .add(&[text_record("dup", 1.0)])
+                .await
+                .expect("id should be reusable after delete");
+
+            let visible = store.get_by_id("dup").await.unwrap().unwrap();
+            assert_eq!(visible.id, "dup");
+        });
+    }
+
+    /// A superseded (non-tombstone) record still reserves its `external_id`,
+    /// so a plain `add` with that `external_id` is rejected.
+    #[test]
+    fn add_rejects_external_id_after_supersede() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = ContextStore::open(&uri).await.unwrap();
+            let mut first = text_record("a", 0.0);
+            first.external_id = Some("ext".to_string());
+            store.upsert_by_external_id(first).await.unwrap();
+
+            let mut successor = text_record("b", 1.0);
+            successor.external_id = Some("ext".to_string());
+            store.upsert_by_external_id(successor).await.unwrap();
+
+            // The original is now superseded (non-tombstone) and still present,
+            // so its external_id is taken.
+            let mut conflict = text_record("c", 2.0);
+            conflict.external_id = Some("ext".to_string());
+            let err = store.add(&[conflict]).await.unwrap_err();
+            let message = err.to_string();
+            assert!(
+                message.contains("external_id 'ext'") && message.contains("already exists"),
+                "unexpected error message: {message}"
+            );
+        });
+    }
+
+    /// Uniqueness validation must behave identically when an `id` scalar index
+    /// is configured (the indexed-lookup path), covering both a rejected
+    /// collision and a permitted reuse-after-delete.
+    #[test]
+    fn validate_uniqueness_with_btree_index() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let options = ContextStoreOptions {
+                id_index_type: IdIndexType::BTree,
+                ..Default::default()
+            };
+            let mut store = ContextStore::open_with_options(&uri, options)
+                .await
+                .unwrap();
+
+            let mut first = text_record("idx-a", 0.0);
+            first.external_id = Some("ext".to_string());
+            store.add(std::slice::from_ref(&first)).await.unwrap();
+
+            // Duplicate id rejected via the indexed lookup.
+            let dup_id = store.add(&[text_record("idx-a", 1.0)]).await.unwrap_err();
+            assert!(
+                dup_id.to_string().contains("id 'idx-a'")
+                    && dup_id.to_string().contains("already exists")
+            );
+
+            // Duplicate external_id rejected.
+            let mut dup_ext = text_record("idx-b", 1.0);
+            dup_ext.external_id = Some("ext".to_string());
+            let dup_ext_err = store.add(&[dup_ext]).await.unwrap_err();
+            assert!(
+                dup_ext_err.to_string().contains("external_id 'ext'")
+                    && dup_ext_err.to_string().contains("already exists")
+            );
+
+            // After delete, both keys become reusable.
+            assert!(store.delete_by_id("idx-a").await.unwrap());
+            let mut reused = text_record("idx-a", 2.0);
+            reused.external_id = Some("ext".to_string());
+            store
+                .add(std::slice::from_ref(&reused))
+                .await
+                .expect("keys should be reusable after delete with index configured");
+        });
+    }
+
+    /// Validation stays correct as the store grows: a duplicate is rejected and
+    /// a fresh key accepted against a store with many historical records,
+    /// exercising the projected/filtered scan path over a larger dataset.
+    #[test]
+    fn validate_uniqueness_against_large_store() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let options = ContextStoreOptions {
+                id_index_type: IdIndexType::BTree,
+                ..Default::default()
+            };
+            let mut store = ContextStore::open_with_options(&uri, options)
+                .await
+                .unwrap();
+
+            for i in 0..300 {
+                let mut record = text_record(&format!("rec-{i}"), i as f32);
+                record.external_id = Some(format!("ext-{i}"));
+                store.add(std::slice::from_ref(&record)).await.unwrap();
+            }
+
+            // Existing id and external_id both rejected.
+            let mut dup = text_record("rec-150", 0.0);
+            dup.external_id = Some("ext-999".to_string());
+            assert!(store
+                .add(&[dup])
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("id 'rec-150'"));
+
+            let mut dup_ext = text_record("rec-new", 0.0);
+            dup_ext.external_id = Some("ext-42".to_string());
+            assert!(store
+                .add(&[dup_ext])
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("external_id 'ext-42'"));
+
+            // A fresh record still inserts cleanly.
+            let mut fresh = text_record("rec-300", 0.0);
+            fresh.external_id = Some("ext-300".to_string());
+            store.add(std::slice::from_ref(&fresh)).await.unwrap();
+            assert!(store.get_by_id("rec-300").await.unwrap().is_some());
+        });
+    }
+
+    /// Benchmark guarding against the O(N) regression: with an `id` index,
+    /// per-append validation cost should not grow proportionally to store size.
+    /// Ignored by default (timing-sensitive); run with
+    /// `cargo test -p lance-context-core -- --ignored append_cost`.
+    #[test]
+    #[ignore = "timing-sensitive benchmark; run explicitly with --ignored"]
+    fn append_cost_does_not_grow_linearly() {
+        use std::time::Instant;
+
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let options = ContextStoreOptions {
+                id_index_type: IdIndexType::BTree,
+                ..Default::default()
+            };
+            let mut store = ContextStore::open_with_options(&uri, options)
+                .await
+                .unwrap();
+
+            // Time a window of single-record appends at a given store size,
+            // compacting first so the cost reflects validation against the base
+            // table rather than accumulated MemWAL generations.
+            async fn time_window(store: &mut ContextStore, tag: &str, window: usize) -> f64 {
+                store.compact(None).await.unwrap();
+                let start = Instant::now();
+                for i in 0..window {
+                    let id = format!("{tag}-probe-{i}");
+                    store.add(&[text_record(&id, i as f32)]).await.unwrap();
+                }
+                start.elapsed().as_secs_f64() / window as f64
+            }
+
+            // Grow the store to `count` rows using batched appends (few commits)
+            // so the benchmark isolates per-call validation cost, not raw write
+            // throughput.
+            async fn seed(store: &mut ContextStore, tag: &str, count: usize) {
+                let chunk = 100;
+                let mut i = 0;
+                while i < count {
+                    let batch: Vec<ContextRecord> = (i..(i + chunk).min(count))
+                        .map(|j| text_record(&format!("{tag}-seed-{j}"), j as f32))
+                        .collect();
+                    store.add(&batch).await.unwrap();
+                    i += chunk;
+                }
+                store.compact(None).await.unwrap();
+            }
+
+            let window = 30;
+            seed(&mut store, "small", 100).await;
+            let small = time_window(&mut store, "small", window).await;
+
+            seed(&mut store, "big", 2000).await;
+            let large = time_window(&mut store, "big", window).await;
+
+            let ratio = large / small.max(f64::EPSILON);
+            eprintln!(
+                "append per-call: small={small:.6}s large={large:.6}s ratio={ratio:.2} (store grew ~20x)"
+            );
+            assert!(
+                ratio < 8.0,
+                "append cost appears to scale with store size (ratio {ratio:.2}); \
+                 expected roughly constant per-call validation"
+            );
+        });
+    }
+
+    /// `external_id` values are caller-supplied and flow into a SQL `IN (...)`
+    /// filter, so embedded single quotes must be escaped rather than break the
+    /// scan. Both insertion and duplicate detection must handle them.
+    #[test]
+    fn validation_handles_external_id_with_single_quote() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = ContextStore::open(&uri).await.unwrap();
+            let tricky = "o'brien#chunk-1";
+
+            let mut first = text_record("a", 0.0);
+            first.external_id = Some(tricky.to_string());
+            store.add(std::slice::from_ref(&first)).await.unwrap();
+
+            // Re-using the same quoted external_id is still detected as a dup.
+            let mut dup = text_record("b", 1.0);
+            dup.external_id = Some(tricky.to_string());
+            let err = store.add(&[dup]).await.unwrap_err();
+            assert!(
+                err.to_string().contains("already exists"),
+                "unexpected error message: {err}"
+            );
+
+            // A different quoted external_id inserts cleanly.
+            let mut other = text_record("c", 2.0);
+            other.external_id = Some("d'angelo#chunk-2".to_string());
+            store.add(std::slice::from_ref(&other)).await.unwrap();
+            assert!(store
+                .get_by_external_id("d'angelo#chunk-2")
+                .await
+                .unwrap()
+                .is_some());
         });
     }
 
