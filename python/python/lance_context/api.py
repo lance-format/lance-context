@@ -893,7 +893,9 @@ class Context:
             if "content" not in record:
                 raise ValueError(f"records[{index}] is missing required key 'content'")
             if not record.get("external_id"):
-                raise ValueError(f"records[{index}] is missing required key 'external_id'")
+                raise ValueError(
+                    f"records[{index}] is missing required key 'external_id'"
+                )
 
             content_type = record.get("content_type")
             data_type = record.get("data_type")
