@@ -71,6 +71,19 @@ impl ContextStoreApi for RemoteContextStore {
         Ok(resp)
     }
 
+    async fn upsert_many(
+        &mut self,
+        request: &UpsertRecordsRequest,
+    ) -> ContextResult<UpsertRecordsResponse> {
+        let resp = self
+            .client
+            .upsert_records(&self.context_name, request)
+            .await
+            .map_err(to_ctx_err)?;
+        self.cached_version = resp.version;
+        Ok(resp)
+    }
+
     async fn update(
         &mut self,
         request: &UpdateRecordRequest,
@@ -333,6 +346,20 @@ impl ContextClient {
         let resp = self
             .http
             .put(self.url(&format!("/contexts/{}/records", name)))
+            .json(req)
+            .send()
+            .await?;
+        Self::handle_response(resp).await
+    }
+
+    pub async fn upsert_records(
+        &self,
+        name: &str,
+        req: &UpsertRecordsRequest,
+    ) -> Result<UpsertRecordsResponse, ClientError> {
+        let resp = self
+            .http
+            .put(self.url(&format!("/contexts/{}/records/batch", name)))
             .json(req)
             .send()
             .await?;

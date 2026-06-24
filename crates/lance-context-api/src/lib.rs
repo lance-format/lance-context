@@ -39,6 +39,11 @@ pub trait ContextStoreApi {
         request: &UpsertRecordRequest,
     ) -> impl Future<Output = ContextResult<UpsertRecordResponse>> + Send;
 
+    fn upsert_many(
+        &mut self,
+        request: &UpsertRecordsRequest,
+    ) -> impl Future<Output = ContextResult<UpsertRecordsResponse>> + Send;
+
     fn update(
         &mut self,
         request: &UpdateRecordRequest,
@@ -223,6 +228,28 @@ pub struct UpsertRecordResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replaced_id: Option<String>,
     pub record: RecordDto,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UpsertRecordsRequest {
+    pub records: Vec<AddRecordRequest>,
+    #[serde(default = "default_upsert_key")]
+    pub key: String,
+}
+
+/// Per-record outcome of a batch upsert, in input order.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UpsertResultDto {
+    pub inserted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaced_id: Option<String>,
+    pub record: RecordDto,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UpsertRecordsResponse {
+    pub version: u64,
+    pub results: Vec<UpsertResultDto>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

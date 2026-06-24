@@ -266,6 +266,17 @@ fn relationship_struct_builder() -> StructBuilder {
     )
 }
 
+/// Per-`external_id` resolution computed in a single scan for batch upsert.
+#[derive(Default)]
+struct ExternalIdState {
+    /// Ids of currently-visible records carrying this external_id (default
+    /// lifecycle: not tombstoned/expired/retired/superseded).
+    visible_ids: Vec<String>,
+    /// Whether any non-tombstone row (visible or hidden) carries it. Mirrors
+    /// the uniqueness check `add` performs on the single-upsert insert path.
+    has_non_tombstone: bool,
+}
+
 impl ContextStore {
     /// Open an existing context dataset or create a new one with the project schema.
     pub async fn open(uri: &str) -> LanceResult<Self> {
@@ -510,6 +521,215 @@ impl ContextStore {
             ))
             .into()),
         }
+    }
+
+    /// Insert-or-replace a batch of records keyed by `external_id`, in one
+    /// logical operation.
+    ///
+    /// For each record: if a currently-visible record with the same
+    /// `external_id` exists, it is replaced append-only (the successor gets
+    /// `supersedes_id` set to the existing record id and the original is hidden
+    /// from default reads); otherwise the record is inserted. All rows are
+    /// written in a single pass, so records sharing a shard land in a single
+    /// version bump.
+    ///
+    /// Semantics (parity with [`Self::upsert_by_external_id`] and `add_many`):
+    /// - every record must carry a non-empty `external_id`;
+    /// - duplicate `id`s or `external_id`s *within* the batch are rejected;
+    /// - validation is all-or-nothing — if any record is invalid, nothing is
+    ///   written;
+    /// - caller-supplied supersession fields are ignored (replacement is
+    ///   managed by `external_id`);
+    /// - an insert whose `external_id` already exists on a non-tombstone but
+    ///   hidden record is rejected, exactly as a single insert would be.
+    ///
+    /// Existing-key resolution and `id` uniqueness validation are each done in
+    /// a single scan for the whole batch (not per record), composing with the
+    /// indexed `id` validation so a batch does not full-scan per record.
+    ///
+    /// Returns one [`UpsertResult`] per input record, in input order, all
+    /// carrying the final dataset version.
+    pub async fn upsert_many_by_external_id(
+        &mut self,
+        mut records: Vec<ContextRecord>,
+    ) -> LanceResult<Vec<UpsertResult>> {
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // 1. Per-record validation + within-batch duplicate detection.
+        let mut seen_ids: HashSet<&str> = HashSet::with_capacity(records.len());
+        let mut seen_external_ids: HashSet<&str> = HashSet::with_capacity(records.len());
+        for record in &records {
+            let Some(external_id) = record.external_id.as_deref() else {
+                return Err(ArrowError::InvalidArgumentError(
+                    "upsert_many_by_external_id requires external_id on every record".to_string(),
+                )
+                .into());
+            };
+            if external_id.is_empty() {
+                return Err(ArrowError::InvalidArgumentError(
+                    "upsert_many_by_external_id requires a non-empty external_id".to_string(),
+                )
+                .into());
+            }
+            if record.is_tombstone() {
+                return Err(ArrowError::InvalidArgumentError(format!(
+                    "content_type '{}' is reserved for internal tombstones",
+                    CONTENT_TYPE_TOMBSTONE
+                ))
+                .into());
+            }
+            if !seen_ids.insert(record.id.as_str()) {
+                return Err(ArrowError::InvalidArgumentError(format!(
+                    "duplicate id '{}' in batch",
+                    record.id
+                ))
+                .into());
+            }
+            if !seen_external_ids.insert(external_id) {
+                return Err(ArrowError::InvalidArgumentError(format!(
+                    "duplicate external_id '{}' in batch",
+                    external_id
+                ))
+                .into());
+            }
+        }
+
+        // 2. Replacement is managed here; ignore caller-supplied supersession.
+        for record in &mut records {
+            record.supersedes_id = None;
+            record.superseded_by_id = None;
+        }
+
+        // 3. id uniqueness against the store (indexed). external_id is NOT
+        //    rejected here: an existing external_id means "replace".
+        let id_list: Vec<&str> = records.iter().map(|r| r.id.as_str()).collect();
+        let (existing_ids, _) = self.find_existing_keys(&id_list, &[]).await?;
+        if let Some(record) = records
+            .iter()
+            .find(|r| existing_ids.contains(r.id.as_str()))
+        {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "id '{}' already exists",
+                record.id
+            ))
+            .into());
+        }
+
+        // 4. Resolve every external_id to its visible record (if any) in one scan.
+        let external_id_list: Vec<&str> = records
+            .iter()
+            .map(|r| r.external_id.as_deref().unwrap_or_default())
+            .collect();
+        let states = self.external_id_states(&external_id_list).await?;
+
+        // 5. Wire supersession + per-record outcomes, mirroring the single path.
+        let mut outcomes: Vec<(bool, Option<String>)> = Vec::with_capacity(records.len());
+        for record in &mut records {
+            let external_id = record.external_id.as_deref().unwrap_or_default();
+            match states.get(external_id) {
+                Some(state) if state.visible_ids.len() > 1 => {
+                    return Err(ArrowError::InvalidArgumentError(format!(
+                        "external_id '{}' matches multiple visible records",
+                        external_id
+                    ))
+                    .into());
+                }
+                Some(state) if state.visible_ids.len() == 1 => {
+                    let existing_id = state.visible_ids[0].clone();
+                    record.supersedes_id = Some(existing_id.clone());
+                    outcomes.push((false, Some(existing_id)));
+                }
+                Some(state) if state.has_non_tombstone => {
+                    // No visible record, but a hidden non-tombstone row already
+                    // holds this external_id — an insert would collide, exactly
+                    // as the single-record insert path (via `add`) rejects it.
+                    return Err(ArrowError::InvalidArgumentError(format!(
+                        "external_id '{}' already exists",
+                        external_id
+                    ))
+                    .into());
+                }
+                _ => outcomes.push((true, None)),
+            }
+        }
+
+        // 6. Single write for the whole batch.
+        let version = self.write_entries(&records).await?;
+
+        Ok(records
+            .into_iter()
+            .zip(outcomes)
+            .map(|(record, (inserted, replaced_id))| UpsertResult {
+                record,
+                inserted,
+                replaced_id,
+                version,
+            })
+            .collect())
+    }
+
+    /// Resolve, for each candidate `external_id`, the set of currently-visible
+    /// record ids and whether any non-tombstone row carries it — in a single
+    /// projected, filtered scan rather than a full dataset list.
+    ///
+    /// A record that supersedes another keeps the same `external_id`, so the
+    /// supersession relation is resolved correctly within the filtered set for
+    /// every flow that creates supersession through the public API.
+    async fn external_id_states(
+        &self,
+        external_ids: &[&str],
+    ) -> LanceResult<HashMap<String, ExternalIdState>> {
+        let mut states: HashMap<String, ExternalIdState> = HashMap::new();
+        let candidates: HashSet<&str> = external_ids
+            .iter()
+            .copied()
+            .filter(|value| !value.is_empty())
+            .collect();
+        if candidates.is_empty() {
+            return Ok(states);
+        }
+
+        let filter_values: Vec<&str> = candidates.iter().copied().collect();
+        let filter = format!("external_id IN ({})", sql_quoted_list(&filter_values));
+        let scanner = self.lsm_scanner().await?.filter(&filter)?;
+        let mut stream = scanner.try_into_stream().await?;
+        let mut rows: Vec<ContextRecord> = Vec::new();
+        while let Some(batch) = stream.try_next().await? {
+            rows.extend(batch_to_records(&batch)?);
+        }
+
+        let superseded_ids: HashSet<String> = rows
+            .iter()
+            .filter_map(|record| {
+                let supersedes_id = record.supersedes_id.as_ref()?;
+                if supersedes_id == &record.id {
+                    None
+                } else {
+                    Some(supersedes_id.clone())
+                }
+            })
+            .collect();
+
+        let options = LifecycleQueryOptions::default();
+        for record in rows {
+            let Some(external_id) = record.external_id.as_deref() else {
+                continue;
+            };
+            if !candidates.contains(external_id) {
+                continue;
+            }
+            let entry = states.entry(external_id.to_string()).or_default();
+            if !record.is_tombstone() {
+                entry.has_non_tombstone = true;
+            }
+            if options.is_visible(&record) && !superseded_ids.contains(&record.id) {
+                entry.visible_ids.push(record.id);
+            }
+        }
+
+        Ok(states)
     }
 
     /// Partially update mutable fields on a visible record by internal id.
@@ -3165,6 +3385,255 @@ mod tests {
             assert_eq!(history.len(), 2);
             assert!(history.iter().any(|record| record.id == first.id));
             assert!(history.iter().any(|record| record.id == replacement.id));
+        });
+    }
+
+    fn upsert_record(id: &str, external_id: &str, pivot: f32) -> ContextRecord {
+        let mut record = text_record(id, pivot);
+        record.external_id = Some(external_id.to_string());
+        record
+    }
+
+    #[test]
+    fn upsert_many_inserts_new_records() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = ContextStore::open(&uri).await.unwrap();
+
+            let batch = vec![
+                upsert_record("a", "ext-a", 0.0),
+                upsert_record("b", "ext-b", 1.0),
+            ];
+            let results = store.upsert_many_by_external_id(batch).await.unwrap();
+
+            assert_eq!(results.len(), 2);
+            assert!(results.iter().all(|r| r.inserted));
+            assert!(results.iter().all(|r| r.replaced_id.is_none()));
+            assert_eq!(results[0].version, results[1].version);
+
+            let visible = store.list(None, None).await.unwrap();
+            assert_eq!(visible.len(), 2);
+        });
+    }
+
+    #[test]
+    fn upsert_many_replaces_existing_and_is_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = ContextStore::open(&uri).await.unwrap();
+
+            let first = vec![
+                upsert_record("a1", "ext-a", 0.0),
+                upsert_record("b1", "ext-b", 1.0),
+            ];
+            store.upsert_many_by_external_id(first).await.unwrap();
+
+            // Re-apply with new ids: both should replace (supersede) the
+            // originals, and only the successors remain visible.
+            let second = vec![
+                upsert_record("a2", "ext-a", 2.0),
+                upsert_record("b2", "ext-b", 3.0),
+            ];
+            let results = store.upsert_many_by_external_id(second).await.unwrap();
+
+            assert!(results.iter().all(|r| !r.inserted));
+            assert_eq!(results[0].replaced_id.as_deref(), Some("a1"));
+            assert_eq!(results[1].replaced_id.as_deref(), Some("b1"));
+            assert_eq!(results[0].record.supersedes_id.as_deref(), Some("a1"));
+
+            let visible = store.list(None, None).await.unwrap();
+            assert_eq!(visible.len(), 2);
+            let visible_ids: HashSet<&str> = visible.iter().map(|r| r.id.as_str()).collect();
+            assert_eq!(
+                visible_ids,
+                HashSet::from(["a2", "b2"]),
+                "only the successors should be visible"
+            );
+
+            // Idempotent re-application again still leaves one visible per key.
+            let third = vec![
+                upsert_record("a3", "ext-a", 4.0),
+                upsert_record("b3", "ext-b", 5.0),
+            ];
+            store.upsert_many_by_external_id(third).await.unwrap();
+            assert_eq!(store.list(None, None).await.unwrap().len(), 2);
+        });
+    }
+
+    #[test]
+    fn upsert_many_handles_mixed_insert_and_replace() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = ContextStore::open(&uri).await.unwrap();
+            store
+                .upsert_many_by_external_id(vec![upsert_record("a1", "ext-a", 0.0)])
+                .await
+                .unwrap();
+
+            let batch = vec![
+                upsert_record("a2", "ext-a", 1.0), // replace
+                upsert_record("c1", "ext-c", 2.0), // insert
+            ];
+            let results = store.upsert_many_by_external_id(batch).await.unwrap();
+
+            assert_eq!(results.len(), 2);
+            assert!(!results[0].inserted);
+            assert_eq!(results[0].replaced_id.as_deref(), Some("a1"));
+            assert!(results[1].inserted);
+            assert!(results[1].replaced_id.is_none());
+
+            let visible_ids: HashSet<String> = store
+                .list(None, None)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|r| r.id)
+                .collect();
+            assert_eq!(
+                visible_ids,
+                HashSet::from(["a2".to_string(), "c1".to_string()])
+            );
+        });
+    }
+
+    #[test]
+    fn upsert_many_rejects_within_batch_duplicate_external_id() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = ContextStore::open(&uri).await.unwrap();
+            let batch = vec![
+                upsert_record("a", "dup", 0.0),
+                upsert_record("b", "dup", 1.0),
+            ];
+            let err = store.upsert_many_by_external_id(batch).await.unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("duplicate external_id 'dup' in batch"),
+                "unexpected error: {err}"
+            );
+            // Nothing was written (all-or-nothing).
+            assert_eq!(store.list(None, None).await.unwrap().len(), 0);
+        });
+    }
+
+    #[test]
+    fn upsert_many_rejects_within_batch_duplicate_id() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = ContextStore::open(&uri).await.unwrap();
+            let batch = vec![
+                upsert_record("same", "ext-a", 0.0),
+                upsert_record("same", "ext-b", 1.0),
+            ];
+            let err = store.upsert_many_by_external_id(batch).await.unwrap_err();
+            assert!(
+                err.to_string().contains("duplicate id 'same' in batch"),
+                "unexpected error: {err}"
+            );
+        });
+    }
+
+    #[test]
+    fn upsert_many_rejects_missing_external_id() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = ContextStore::open(&uri).await.unwrap();
+
+            let no_ext = vec![text_record("a", 0.0)];
+            let err = store.upsert_many_by_external_id(no_ext).await.unwrap_err();
+            assert!(err.to_string().contains("external_id"), "unexpected: {err}");
+
+            let mut empty = text_record("b", 0.0);
+            empty.external_id = Some(String::new());
+            let err = store
+                .upsert_many_by_external_id(vec![empty])
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("non-empty external_id"),
+                "unexpected: {err}"
+            );
+        });
+    }
+
+    #[test]
+    fn upsert_many_rejects_id_collision_with_store() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = ContextStore::open(&uri).await.unwrap();
+            store.add(&[text_record("taken", 0.0)]).await.unwrap();
+
+            let batch = vec![upsert_record("taken", "ext-a", 1.0)];
+            let err = store.upsert_many_by_external_id(batch).await.unwrap_err();
+            assert!(
+                err.to_string().contains("id 'taken'")
+                    && err.to_string().contains("already exists"),
+                "unexpected error: {err}"
+            );
+        });
+    }
+
+    #[test]
+    fn upsert_many_empty_batch_is_noop() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = ContextStore::open(&uri).await.unwrap();
+            let results = store.upsert_many_by_external_id(Vec::new()).await.unwrap();
+            assert!(results.is_empty());
+        });
+    }
+
+    #[test]
+    fn upsert_many_matches_single_upsert_with_btree_index() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let options = ContextStoreOptions {
+                id_index_type: IdIndexType::BTree,
+                ..Default::default()
+            };
+            let mut store = ContextStore::open_with_options(&uri, options)
+                .await
+                .unwrap();
+
+            // Seed one record via the single-record path.
+            store
+                .upsert_by_external_id(upsert_record("a1", "ext-a", 0.0))
+                .await
+                .unwrap();
+
+            // Batch replaces ext-a and inserts ext-b through the indexed path.
+            let results = store
+                .upsert_many_by_external_id(vec![
+                    upsert_record("a2", "ext-a", 1.0),
+                    upsert_record("b1", "ext-b", 2.0),
+                ])
+                .await
+                .unwrap();
+            assert_eq!(results[0].replaced_id.as_deref(), Some("a1"));
+            assert!(results[1].inserted);
+
+            assert_eq!(
+                store.get_by_external_id("ext-a").await.unwrap().unwrap().id,
+                "a2"
+            );
         });
     }
 

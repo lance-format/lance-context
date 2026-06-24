@@ -863,6 +863,106 @@ class Context:
         self._auto_embed_batch(normalized)
         self._inner.add_many(normalized)
 
+    def upsert_many(
+        self,
+        records: Iterable[Mapping[str, Any]],
+        *,
+        key: str = "external_id",
+    ) -> list[dict[str, Any]]:
+        """Insert-or-replace multiple records by ``external_id`` in one call.
+
+        Each record accepts the same fields as :meth:`add` and must include a
+        non-empty ``external_id``. For each record, the currently-visible record
+        with the same ``external_id`` is replaced (superseded); otherwise the
+        record is inserted. Duplicate ``id``/``external_id`` values within the
+        batch are rejected, and the whole batch is validated before anything is
+        written.
+
+        Returns one result mapping per input record, in order, each with
+        ``inserted``, ``replaced_id``, ``version`` and the resulting ``record``.
+        """
+        if key != "external_id":
+            raise ValueError("Only key='external_id' is currently supported")
+
+        normalized: list[dict[str, Any]] = []
+        for index, record in enumerate(records):
+            if not isinstance(record, Mapping):
+                raise TypeError(f"records[{index}] must be a mapping")
+            if "role" not in record:
+                raise ValueError(f"records[{index}] is missing required key 'role'")
+            if "content" not in record:
+                raise ValueError(f"records[{index}] is missing required key 'content'")
+            if not record.get("external_id"):
+                raise ValueError(f"records[{index}] is missing required key 'external_id'")
+
+            content_type = record.get("content_type")
+            data_type = record.get("data_type")
+            if content_type is not None and data_type is not None:
+                raise ValueError(
+                    f"records[{index}] specifies both content_type and data_type"
+                )
+            if content_type is None:
+                content_type = data_type
+
+            payload, resolved_type = _normalize_content(record["content"], content_type)
+            normalized.append(
+                {
+                    "role": record["role"],
+                    "content": payload,
+                    "data_type": resolved_type,
+                    "embedding": record.get("embedding"),
+                    "bot_id": record.get(
+                        "bot_id", getattr(self, "_default_fields", {}).get("bot_id")
+                    ),
+                    "session_id": record.get(
+                        "session_id",
+                        getattr(self, "_default_fields", {}).get("session_id"),
+                    ),
+                    "tenant": record.get(
+                        "tenant", getattr(self, "_default_fields", {}).get("tenant")
+                    ),
+                    "source": record.get(
+                        "source", getattr(self, "_default_fields", {}).get("source")
+                    ),
+                    "external_id": record.get("external_id"),
+                    "run_id": record.get("run_id"),
+                    "created_at": _coerce_timestamp(
+                        record.get("created_at"),
+                        field_name=f"records[{index}].created_at",
+                    ),
+                    "state_metadata": _normalize_state_metadata(
+                        record.get("state_metadata")
+                    ),
+                    "metadata_json": _json_dumps(record.get("metadata"), "metadata"),
+                    "relationships_json": _json_dumps(
+                        record.get("relationships"), "relationships"
+                    ),
+                    "expires_at": _coerce_timestamp(
+                        record.get("expires_at"),
+                        field_name=f"records[{index}].expires_at",
+                    ),
+                    "retention_policy": record.get("retention_policy"),
+                    "lifecycle_status": record.get("lifecycle_status"),
+                    "retired_at": _coerce_timestamp(
+                        record.get("retired_at"),
+                        field_name=f"records[{index}].retired_at",
+                    ),
+                    "retired_reason": record.get("retired_reason"),
+                }
+            )
+
+        self._auto_embed_batch(normalized)
+        results = self._inner.upsert_many(normalized, key)
+        return [
+            {
+                "inserted": bool(result["inserted"]),
+                "replaced_id": result.get("replaced_id"),
+                "version": result["version"],
+                "record": _normalize_record(result["record"]),
+            }
+            for result in results
+        ]
+
     def ingest_records(
         self,
         records: Iterable[Mapping[str, Any]],

@@ -4,7 +4,7 @@ use lance_context_api::{
     AddRecordRequest, AddRecordsResponse, CompactRequest, CompactResponse, CompactStatsResponse,
     ContextError, ContextResult, ContextStoreApi, DeleteRecordResponse, RecordDto, RetrieveRequest,
     RetrieveResultDto, SearchRequest, SearchResultDto, UpdateRecordRequest, UpdateRecordResponse,
-    UpsertRecordRequest, UpsertRecordResponse,
+    UpsertRecordRequest, UpsertRecordResponse, UpsertRecordsRequest, UpsertRecordsResponse,
 };
 use lance_context_core::{
     ContextStore as LocalStore, ContextStoreOptions, DistanceMetric, IdIndexType,
@@ -127,6 +127,13 @@ impl ContextStoreApi for ContextStore {
         request: &UpsertRecordRequest,
     ) -> ContextResult<UpsertRecordResponse> {
         dispatch_mut!(self, upsert, request)
+    }
+
+    async fn upsert_many(
+        &mut self,
+        request: &UpsertRecordsRequest,
+    ) -> ContextResult<UpsertRecordsResponse> {
+        dispatch_mut!(self, upsert_many, request)
     }
 
     async fn update(

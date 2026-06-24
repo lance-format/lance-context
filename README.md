@@ -172,6 +172,25 @@ ctx.add_many([
     },
 ])
 
+# Bulk insert-or-replace by external_id (idempotent re-ingestion). New
+# external_ids are inserted; existing ones are replaced (the previous row is
+# superseded), all in one storage operation. Returns one result per record.
+results = ctx.upsert_many([
+    {
+        "role": "source",
+        "content": "Chunk 1, revised",
+        "content_type": "text/markdown",
+        "external_id": "doc-77#chunk-1",
+    },
+    {
+        "role": "source",
+        "content": "Brand new chunk",
+        "content_type": "text/markdown",
+        "external_id": "doc-77#chunk-2",
+    },
+])
+print([(r["inserted"], r["replaced_id"]) for r in results])
+
 # Deferred embeddings: raw-first capture, enrich later.
 #
 # Bulk ingestion often needs to persist source chunks immediately and compute

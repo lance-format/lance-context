@@ -552,6 +552,68 @@ impl Context {
         Ok(())
     }
 
+    #[pyo3(signature = (records, key = "external_id"))]
+    fn upsert_many(
+        &mut self,
+        py: Python<'_>,
+        records: &Bound<'_, PyAny>,
+        key: &str,
+    ) -> PyResult<Vec<PyObject>> {
+        if key != "external_id" {
+            return Err(PyRuntimeError::new_err(format!(
+                "upsert key '{key}' is not supported; use 'external_id'"
+            )));
+        }
+
+        let mut prepared = Vec::new();
+        for (index, item) in records.try_iter()?.enumerate() {
+            let item = item?;
+            let dict = item
+                .downcast::<PyDict>()
+                .map_err(|_| PyTypeError::new_err(format!("records[{index}] must be a dict")))?;
+            let record = self.prepare_record_from_dict(dict, index)?;
+            if record
+                .record
+                .external_id
+                .as_deref()
+                .is_none_or(str::is_empty)
+            {
+                return Err(PyRuntimeError::new_err(format!(
+                    "upsert_many requires external_id (records[{index}])"
+                )));
+            }
+            prepared.push(record);
+        }
+
+        if prepared.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let context_records: Vec<ContextRecord> =
+            prepared.iter().map(|item| item.record.clone()).collect();
+        let results = py.allow_threads(|| {
+            self.runtime
+                .block_on(self.store.upsert_many_by_external_id(context_records))
+        });
+        let results = results.map_err(to_py_err)?;
+
+        for item in &prepared {
+            self.inner
+                .add(&item.role, &item.inner_content, item.data_type.as_deref());
+        }
+
+        let mut out = Vec::with_capacity(results.len());
+        for result in results {
+            let dict = PyDict::new(py);
+            dict.set_item("inserted", result.inserted)?;
+            dict.set_item("replaced_id", result.replaced_id)?;
+            dict.set_item("version", result.version)?;
+            dict.set_item("record", record_to_py(py, result.record)?)?;
+            out.push(dict.into_pyobject(py)?.unbind().into());
+        }
+        Ok(out)
+    }
+
     #[pyo3(signature = (label = None))]
     fn snapshot(&mut self, label: Option<&str>) -> String {
         self.inner.snapshot(label)

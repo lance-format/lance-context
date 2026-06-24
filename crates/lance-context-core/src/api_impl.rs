@@ -7,7 +7,7 @@ use lance_context_api::{
     ContextError, ContextResult, ContextStoreApi, DeleteRecordResponse, RecordDto, RecordPatchDto,
     RelationshipDto, RetrieveRequest, RetrieveResultDto, SearchRequest, SearchResultDto,
     StateMetadataDto, UpdateRecordRequest, UpdateRecordResponse, UpsertRecordRequest,
-    UpsertRecordResponse,
+    UpsertRecordResponse, UpsertRecordsRequest, UpsertRecordsResponse, UpsertResultDto,
 };
 
 use crate::record::{
@@ -71,6 +71,57 @@ impl ContextStoreApi for ContextStore {
             inserted: result.inserted,
             replaced_id: result.replaced_id,
             record: record_to_dto(result.record),
+        })
+    }
+
+    async fn upsert_many(
+        &mut self,
+        request: &UpsertRecordsRequest,
+    ) -> ContextResult<UpsertRecordsResponse> {
+        if request.key != "external_id" {
+            return Err(ContextError::InvalidRequest(format!(
+                "upsert key '{}' is not supported; use 'external_id'",
+                request.key
+            )));
+        }
+        if request.records.is_empty() {
+            return Err(ContextError::InvalidRequest(
+                "upsert_many requires at least one record".to_string(),
+            ));
+        }
+        for (index, record) in request.records.iter().enumerate() {
+            if record.external_id.as_deref().is_none_or(str::is_empty) {
+                return Err(ContextError::InvalidRequest(format!(
+                    "upsert_many requires record.external_id (records[{index}])"
+                )));
+            }
+        }
+
+        let core_records: Vec<ContextRecord> = request
+            .records
+            .iter()
+            .map(|r| {
+                record_from_add_request(r, Uuid::new_v4().to_string(), Uuid::new_v4().to_string())
+            })
+            .collect();
+
+        let results = ContextStore::upsert_many_by_external_id(self, core_records)
+            .await
+            .map_err(to_ctx_err)?;
+        let version = results
+            .last()
+            .map(|r| r.version)
+            .unwrap_or_else(|| ContextStore::version(self));
+        Ok(UpsertRecordsResponse {
+            version,
+            results: results
+                .into_iter()
+                .map(|r| UpsertResultDto {
+                    inserted: r.inserted,
+                    replaced_id: r.replaced_id,
+                    record: record_to_dto(r.record),
+                })
+                .collect(),
         })
     }
 

@@ -7,6 +7,7 @@ use lance_context_api::{
     AddRecordsRequest, AddRecordsResponse, DeleteRecordResponse, GetRecordResponse,
     ListRecordsResponse, RecordDto, RecordPatchDto, RelationshipDto, StateMetadataDto,
     UpdateRecordRequest, UpdateRecordResponse, UpsertRecordRequest, UpsertRecordResponse,
+    UpsertRecordsRequest, UpsertRecordsResponse, UpsertResultDto,
 };
 use lance_context_core::{
     ContextRecord, LifecycleQueryOptions, RecordFilters, RecordPatch, Relationship, StateMetadata,
@@ -109,6 +110,69 @@ pub async fn upsert_record(
             inserted: result.inserted,
             replaced_id: result.replaced_id,
             record: record_to_dto(result.record),
+        }),
+    ))
+}
+
+pub async fn upsert_records(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(req): Json<UpsertRecordsRequest>,
+) -> Result<(axum::http::StatusCode, Json<UpsertRecordsResponse>), AppError> {
+    if req.key != "external_id" {
+        return Err(AppError::InvalidRequest(format!(
+            "upsert key '{}' is not supported; use 'external_id'",
+            req.key
+        )));
+    }
+    if req.records.is_empty() {
+        return Err(AppError::InvalidRequest(
+            "records array must not be empty".to_string(),
+        ));
+    }
+    for (index, record) in req.records.iter().enumerate() {
+        if record.external_id.as_deref().is_none_or(str::is_empty) {
+            return Err(AppError::InvalidRequest(format!(
+                "upsert requires record.external_id (records[{index}])"
+            )));
+        }
+    }
+
+    let stores = state.stores.read().await;
+    let store_lock = stores
+        .get(&name)
+        .ok_or_else(|| AppError::NotFound(format!("Context '{}' does not exist", name)))?
+        .clone();
+    drop(stores);
+
+    let core_records: Vec<ContextRecord> = req
+        .records
+        .iter()
+        .map(|r| record_from_add_request(r, Uuid::new_v4().to_string(), Uuid::new_v4().to_string()))
+        .collect();
+
+    let mut store = store_lock.write().await;
+    let results = store
+        .upsert_many_by_external_id(core_records)
+        .await
+        .map_err(AppError::from_lance)?;
+    let version = results
+        .last()
+        .map(|r| r.version)
+        .unwrap_or_else(|| store.version());
+
+    Ok((
+        axum::http::StatusCode::OK,
+        Json(UpsertRecordsResponse {
+            version,
+            results: results
+                .into_iter()
+                .map(|r| UpsertResultDto {
+                    inserted: r.inserted,
+                    replaced_id: r.replaced_id,
+                    record: record_to_dto(r.record),
+                })
+                .collect(),
         }),
     ))
 }
@@ -480,7 +544,7 @@ mod tests {
     use chrono::{Duration, Utc};
     use lance_context_api::{
         AddRecordRequest, AddRecordsRequest, RecordPatchDto, UpdateRecordRequest,
-        UpsertRecordRequest,
+        UpsertRecordRequest, UpsertRecordsRequest,
     };
     use lance_context_core::ContextStore;
     use tempfile::TempDir;
@@ -663,6 +727,114 @@ mod tests {
             response.records[0].text_payload.as_deref(),
             Some("new value")
         );
+    }
+
+    #[tokio::test]
+    async fn upsert_records_batch_inserts_and_replaces() {
+        let context_name = "ctx";
+        let (state, _dir) = test_state(context_name).await;
+
+        let mut a = text_record("a-old");
+        a.external_id = Some("ext-a".to_string());
+        let mut b = text_record("b-value");
+        b.external_id = Some("ext-b".to_string());
+
+        // First batch: two inserts.
+        let (status, Json(first)) = upsert_records(
+            State(state.clone()),
+            Path(context_name.to_string()),
+            Json(UpsertRecordsRequest {
+                records: vec![a, b],
+                key: "external_id".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(first.results.len(), 2);
+        assert!(first.results.iter().all(|r| r.inserted));
+        let a_id = first.results[0].record.id.clone();
+
+        // Second batch: replace ext-a, insert ext-c.
+        let mut a_new = text_record("a-new");
+        a_new.external_id = Some("ext-a".to_string());
+        let mut c = text_record("c-value");
+        c.external_id = Some("ext-c".to_string());
+        let (_, Json(second)) = upsert_records(
+            State(state.clone()),
+            Path(context_name.to_string()),
+            Json(UpsertRecordsRequest {
+                records: vec![a_new, c],
+                key: "external_id".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(!second.results[0].inserted);
+        assert_eq!(
+            second.results[0].replaced_id.as_deref(),
+            Some(a_id.as_str())
+        );
+        assert!(second.results[1].inserted);
+
+        // ext-a now resolves to the replacement; three external_ids visible.
+        let Json(after) = get_record_by_external_id(
+            State(state.clone()),
+            Path(context_name.to_string()),
+            Query(ExternalIdParams {
+                external_id: "ext-a".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(after.record.unwrap().text_payload.as_deref(), Some("a-new"));
+
+        let Json(listed) = list_records(
+            State(state),
+            Path(context_name.to_string()),
+            Query(ListParams {
+                limit: None,
+                offset: None,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(listed.records.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn upsert_records_batch_rejects_empty() {
+        let context_name = "ctx";
+        let (state, _dir) = test_state(context_name).await;
+        let err = upsert_records(
+            State(state),
+            Path(context_name.to_string()),
+            Json(UpsertRecordsRequest {
+                records: vec![],
+                key: "external_id".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AppError::InvalidRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn upsert_records_batch_requires_external_id() {
+        let context_name = "ctx";
+        let (state, _dir) = test_state(context_name).await;
+        let err = upsert_records(
+            State(state),
+            Path(context_name.to_string()),
+            Json(UpsertRecordsRequest {
+                records: vec![text_record("no external id")],
+                key: "external_id".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AppError::InvalidRequest(_)));
     }
 
     #[tokio::test]

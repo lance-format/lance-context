@@ -28,6 +28,10 @@ pub fn router() -> Router<Arc<AppState>> {
             put(records::upsert_record),
         )
         .route(
+            "/api/v1/contexts/{name}/records/batch",
+            put(records::upsert_records),
+        )
+        .route(
             "/api/v1/contexts/{name}/records",
             patch(records::update_record),
         )
