@@ -21,9 +21,9 @@ use lance_context_core::serde::CONTENT_TYPE_TEXT;
 use lance_context_core::{
     CompactionConfig, CompactionMetrics, CompactionStats, Context as RustContext,
     ContextNamespace as RustContextNamespace, ContextRecord, ContextStore, ContextStoreOptions,
-    DistanceMetric, IdIndexType, LifecycleQueryOptions, PartitionInfo, PartitionSelector,
-    PartitionSpec, RecordFilters, RecordPatch, Relationship, RetrieveResult, SearchResult,
-    StateMetadata, LIFECYCLE_ACTIVE,
+    DistanceMetric, ExportConfig, ExportTask, GroupBy, IdIndexType, LifecycleQueryOptions,
+    PartitionInfo, PartitionSelector, PartitionSpec, PreferenceForm, RecordFilters, RecordPatch,
+    Relationship, RetrieveResult, SearchResult, StateMetadata, LIFECYCLE_ACTIVE,
 };
 
 const DEFAULT_BINARY_CONTENT_TYPE: &str = "application/octet-stream";
@@ -224,6 +224,78 @@ fn filters_from_json(filters_json: Option<String>) -> PyResult<Option<RecordFilt
     RecordFilters::from_json_value(value)
         .map(Some)
         .map_err(PyRuntimeError::new_err)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn export_config(
+    task: &str,
+    group_by: &str,
+    preference_form: &str,
+    filters_json: Option<String>,
+    dedup_threshold: Option<f32>,
+    decontaminate_against: Option<Vec<Vec<f32>>>,
+    decontaminate_threshold: Option<f32>,
+    min_reward: Option<f64>,
+    version: Option<u64>,
+    include_expired: bool,
+    include_retired: bool,
+) -> PyResult<ExportConfig> {
+    let task = match task {
+        "sft" => ExportTask::Sft,
+        "preference" => ExportTask::Preference,
+        "rollout" => ExportTask::Rollout,
+        other => {
+            return Err(PyRuntimeError::new_err(format!(
+                "invalid export task '{other}'; use 'sft', 'preference', or 'rollout'"
+            )));
+        }
+    };
+    let group_by = match group_by {
+        "session_id" => GroupBy::SessionId,
+        "run_id" => GroupBy::RunId,
+        "tenant" => GroupBy::Tenant,
+        "source" => GroupBy::Source,
+        "bot_id" => GroupBy::BotId,
+        "none" => GroupBy::None,
+        "external_id_prefix" => GroupBy::ExternalIdPrefix("#".to_string()),
+        other if other.starts_with("external_id_prefix:") => {
+            GroupBy::ExternalIdPrefix(other["external_id_prefix:".len()..].to_string())
+        }
+        other => {
+            return Err(PyRuntimeError::new_err(format!(
+                "invalid group_by '{other}'"
+            )));
+        }
+    };
+    let preference_form = match preference_form {
+        "paired" => PreferenceForm::Paired,
+        "unpaired" => PreferenceForm::Unpaired,
+        "ranked" => PreferenceForm::Ranked,
+        other => {
+            return Err(PyRuntimeError::new_err(format!(
+                "invalid preference_form '{other}'; use 'paired', 'unpaired', or 'ranked'"
+            )));
+        }
+    };
+    let filters_summary = filters_json
+        .as_ref()
+        .map(|raw| serde_json::from_str::<Value>(raw))
+        .transpose()
+        .map_err(to_py_err)?;
+
+    Ok(ExportConfig {
+        task,
+        group_by,
+        preference_form,
+        filters: filters_from_json(filters_json)?,
+        lifecycle: LifecycleQueryOptions::new(include_expired, include_retired),
+        dedup_threshold,
+        decontaminate_against: decontaminate_against.unwrap_or_default(),
+        decontaminate_threshold,
+        min_reward,
+        version,
+        filters_summary,
+    })
 }
 
 fn selector_from_dict(dict: &Bound<'_, PyDict>) -> PyResult<PartitionSelector> {
@@ -638,6 +710,46 @@ impl Context {
         hits.into_iter()
             .map(|hit| retrieve_hit_to_py(py, hit, include_relationships))
             .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (output_path, task = "sft", group_by = "session_id", preference_form = "paired", filters_json = None, dedup_threshold = None, decontaminate_against = None, decontaminate_threshold = None, min_reward = None, version = None, include_expired = false, include_retired = false))]
+    fn export_training(
+        &mut self,
+        py: Python<'_>,
+        output_path: &str,
+        task: &str,
+        group_by: &str,
+        preference_form: &str,
+        filters_json: Option<String>,
+        dedup_threshold: Option<f32>,
+        decontaminate_against: Option<Vec<Vec<f32>>>,
+        decontaminate_threshold: Option<f32>,
+        min_reward: Option<f64>,
+        version: Option<u64>,
+        include_expired: bool,
+        include_retired: bool,
+    ) -> PyResult<String> {
+        let config = export_config(
+            task,
+            group_by,
+            preference_form,
+            filters_json,
+            dedup_threshold,
+            decontaminate_against,
+            decontaminate_threshold,
+            min_reward,
+            version,
+            include_expired,
+            include_retired,
+        )?;
+        let manifest = py
+            .allow_threads(|| {
+                self.runtime
+                    .block_on(self.store.export_training(&config, output_path))
+            })
+            .map_err(to_py_err)?;
+        serde_json::to_string(&manifest).map_err(to_py_err)
     }
 
     #[pyo3(signature = (limit = None, offset = None, filters_json = None, include_expired = false, include_retired = false))]

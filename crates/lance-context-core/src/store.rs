@@ -360,6 +360,12 @@ impl ContextStore {
         self.embedding_dim
     }
 
+    /// URI of the underlying Lance dataset.
+    #[must_use]
+    pub fn uri(&self) -> &str {
+        self.dataset.uri()
+    }
+
     /// Append context records to the store and return the new dataset version.
     pub async fn add(&mut self, entries: &[ContextRecord]) -> LanceResult<u64> {
         if entries.is_empty() {

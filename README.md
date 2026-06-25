@@ -232,6 +232,28 @@ ctx.checkout(first_version)
 
 print("Entries after checkout:", ctx.entries())
 
+# Curate stored records into a trainable dataset and export it as JSONL plus a
+# reproducible manifest. Curation (lifecycle-correct filtering, semantic dedup,
+# decontamination against a holdout set, reward thresholding) runs before
+# export; reward/preference signals are read from each record's `metadata`
+# (`reward`, `reward_source`, `group_id`, `label`, `rank`).
+#
+# SFT, grouped by session into conversations (rejection-sampling via min_reward):
+manifest = ctx.export_training(
+    "training/sft.jsonl",
+    task="sft",
+    group_by="session_id",
+    filters={"tenant": "acme", "source": "memory"},
+    min_reward=0.7,            # keep only high-reward completions
+    dedup_threshold=0.02,      # collapse near-duplicates (cosine)
+    version=ctx.version(),     # pin for reproducibility
+)
+print("SFT examples:", manifest["counts"]["examples"])
+
+# Preference (DPO paired / KTO unpaired / judge-ranked) and RL rollout shapes:
+ctx.export_training("training/pref.jsonl", task="preference", preference_form="paired")
+ctx.export_training("training/rollout.jsonl", task="rollout")  # GRPO/RLVR groups
+
 # Remote persistence on any object_store backend uses a generic `storage_options`
 # dict, matching the conventions used by `lance` and `lance-graph`.
 #

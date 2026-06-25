@@ -1141,6 +1141,60 @@ class Context:
         )
         return [_normalize_retrieve_hit(item) for item in results]
 
+    def export_training(
+        self,
+        output_path: str,
+        *,
+        task: str = "sft",
+        format: str = "jsonl",
+        group_by: str = "session_id",
+        preference_form: str = "paired",
+        filters: dict[str, Any] | None = None,
+        dedup_threshold: float | None = None,
+        decontaminate_against: list[list[float]] | None = None,
+        decontaminate_threshold: float | None = None,
+        min_reward: float | None = None,
+        version: int | None = None,
+        include_expired: bool = False,
+        include_retired: bool = False,
+    ) -> dict[str, Any]:
+        """Curate stored records and export a trainable dataset to JSONL.
+
+        Writes one JSON object per line to ``output_path`` (plus a sibling
+        ``<output_path>.manifest.json``) and returns the manifest dict.
+
+        ``task`` selects the shape: ``"sft"`` (ordered messages; pass
+        ``min_reward`` for rejection-sampling / Best-of-N), ``"preference"``
+        (set ``preference_form`` to ``"paired"`` for DPO-style chosen/rejected,
+        ``"unpaired"`` for KTO binary labels, or ``"ranked"`` for N-way judge
+        rankings), or ``"rollout"`` (RL groups with per-response reward).
+
+        Curation runs before export: lifecycle-correct filtering (drops
+        tombstoned/expired/retired/superseded/contradicted), optional
+        ``min_reward`` thresholding, semantic ``dedup_threshold`` (cosine), and
+        ``decontaminate_against`` a holdout-embedding set. Reward / preference
+        signals are read from each record's ``metadata`` (``reward``,
+        ``reward_source``, ``group_id``, ``label``, ``rank``). Pass ``version``
+        to pin the export to a dataset version for reproducibility.
+        """
+        if format != "jsonl":
+            raise ValueError("export format currently supports only 'jsonl'")
+        manifest_json = self._inner.export_training(
+            output_path,
+            task,
+            group_by,
+            preference_form,
+            _json_dumps(filters, "filters"),
+            dedup_threshold,
+            decontaminate_against,
+            decontaminate_threshold,
+            min_reward,
+            int(version) if version is not None else None,
+            include_expired,
+            include_retired,
+        )
+        return json.loads(manifest_json)
+
     def list(
         self,
         limit: int | None = None,
