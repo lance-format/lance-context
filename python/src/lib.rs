@@ -23,7 +23,7 @@ use lance_context_core::{
     ContextNamespace as RustContextNamespace, ContextRecord, ContextStore, ContextStoreOptions,
     DistanceMetric, ExportConfig, ExportTask, GroupBy, IdIndexType, LifecycleQueryOptions,
     PartitionInfo, PartitionSelector, PartitionSpec, PreferenceForm, RecordFilters, RecordPatch,
-    Relationship, RetrieveResult, SearchResult, StateMetadata, LIFECYCLE_ACTIVE,
+    Relationship, RetrieveResult, SearchResult, SplitConfig, StateMetadata, LIFECYCLE_ACTIVE,
 };
 
 const DEFAULT_BINARY_CONTENT_TYPE: &str = "application/octet-stream";
@@ -239,6 +239,9 @@ fn export_config(
     version: Option<u64>,
     include_expired: bool,
     include_retired: bool,
+    split_eval_fraction: Option<f64>,
+    split_by: Option<String>,
+    split_seed: Option<u64>,
 ) -> PyResult<ExportConfig> {
     let task = match task {
         "sft" => ExportTask::Sft,
@@ -250,23 +253,7 @@ fn export_config(
             )));
         }
     };
-    let group_by = match group_by {
-        "session_id" => GroupBy::SessionId,
-        "run_id" => GroupBy::RunId,
-        "tenant" => GroupBy::Tenant,
-        "source" => GroupBy::Source,
-        "bot_id" => GroupBy::BotId,
-        "none" => GroupBy::None,
-        "external_id_prefix" => GroupBy::ExternalIdPrefix("#".to_string()),
-        other if other.starts_with("external_id_prefix:") => {
-            GroupBy::ExternalIdPrefix(other["external_id_prefix:".len()..].to_string())
-        }
-        other => {
-            return Err(PyRuntimeError::new_err(format!(
-                "invalid group_by '{other}'"
-            )));
-        }
-    };
+    let group_by = parse_group_by(group_by)?;
     let preference_form = match preference_form {
         "paired" => PreferenceForm::Paired,
         "unpaired" => PreferenceForm::Unpaired,
@@ -282,6 +269,17 @@ fn export_config(
         .map(|raw| serde_json::from_str::<Value>(raw))
         .transpose()
         .map_err(to_py_err)?;
+    let split = match split_eval_fraction {
+        Some(eval_fraction) => Some(SplitConfig {
+            eval_fraction,
+            by: match split_by {
+                Some(by) => parse_group_by(&by)?,
+                None => GroupBy::SessionId,
+            },
+            seed: split_seed.unwrap_or(0),
+        }),
+        None => None,
+    };
 
     Ok(ExportConfig {
         task,
@@ -295,6 +293,27 @@ fn export_config(
         min_reward,
         version,
         filters_summary,
+        split,
+    })
+}
+
+fn parse_group_by(group_by: &str) -> PyResult<GroupBy> {
+    Ok(match group_by {
+        "session_id" => GroupBy::SessionId,
+        "run_id" => GroupBy::RunId,
+        "tenant" => GroupBy::Tenant,
+        "source" => GroupBy::Source,
+        "bot_id" => GroupBy::BotId,
+        "none" => GroupBy::None,
+        "external_id_prefix" => GroupBy::ExternalIdPrefix("#".to_string()),
+        other if other.starts_with("external_id_prefix:") => {
+            GroupBy::ExternalIdPrefix(other["external_id_prefix:".len()..].to_string())
+        }
+        other => {
+            return Err(PyRuntimeError::new_err(format!(
+                "invalid group_by '{other}'"
+            )));
+        }
     })
 }
 
@@ -775,7 +794,7 @@ impl Context {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (output_path, task = "sft", group_by = "session_id", preference_form = "paired", filters_json = None, dedup_threshold = None, decontaminate_against = None, decontaminate_threshold = None, min_reward = None, version = None, include_expired = false, include_retired = false))]
+    #[pyo3(signature = (output_path, task = "sft", group_by = "session_id", preference_form = "paired", filters_json = None, dedup_threshold = None, decontaminate_against = None, decontaminate_threshold = None, min_reward = None, version = None, include_expired = false, include_retired = false, split_eval_fraction = None, split_by = None, split_seed = None))]
     fn export_training(
         &mut self,
         py: Python<'_>,
@@ -791,6 +810,9 @@ impl Context {
         version: Option<u64>,
         include_expired: bool,
         include_retired: bool,
+        split_eval_fraction: Option<f64>,
+        split_by: Option<String>,
+        split_seed: Option<u64>,
     ) -> PyResult<String> {
         let config = export_config(
             task,
@@ -804,6 +826,9 @@ impl Context {
             version,
             include_expired,
             include_retired,
+            split_eval_fraction,
+            split_by,
+            split_seed,
         )?;
         let manifest = py
             .allow_threads(|| {

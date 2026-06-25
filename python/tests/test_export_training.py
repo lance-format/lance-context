@@ -133,3 +133,54 @@ def test_export_reproducible(tmp_path: Path) -> None:
     ctx.export_training(str(first), task="sft")
     ctx.export_training(str(second), task="sft")
     assert first.read_text() == second.read_text()
+
+
+def test_export_train_eval_split(tmp_path: Path) -> None:
+    ctx = Context.create(str(tmp_path / "ctx.lance"))
+    for s in range(20):
+        ctx.add("user", f"q{s}", session_id=f"s{s}")
+        ctx.add("assistant", f"a{s}", session_id=f"s{s}")
+
+    base = tmp_path / "cut.jsonl"
+    manifest = ctx.export_training(
+        str(base),
+        task="sft",
+        group_by="session_id",
+        split={"eval_fraction": 0.3, "by": "session_id", "seed": 42},
+    )
+
+    train = tmp_path / "cut.train.jsonl"
+    eval_ = tmp_path / "cut.eval.jsonl"
+    assert train.exists() and eval_.exists()
+    assert manifest["split"]["side"] == "train"
+    assert manifest["split"]["seed"] == 42
+
+    def sessions(path: Path) -> set[str]:
+        return {
+            json.loads(line)["provenance"]["session_id"]
+            for line in path.read_text().splitlines()
+            if line.strip()
+        }
+
+    train_sessions = sessions(train)
+    eval_sessions = sessions(eval_)
+    assert train_sessions and eval_sessions
+    assert train_sessions.isdisjoint(eval_sessions)  # group-disjoint
+    assert len(train_sessions) + len(eval_sessions) == 20
+
+
+def test_export_split_is_deterministic(tmp_path: Path) -> None:
+    ctx = Context.create(str(tmp_path / "ctx.lance"))
+    for s in range(10):
+        ctx.add("user", f"q{s}", session_id=f"s{s}")
+
+    split = {"eval_fraction": 0.5, "by": "session_id", "seed": 7}
+    ctx.export_training(str(tmp_path / "a.jsonl"), task="sft", split=split)
+    ctx.export_training(str(tmp_path / "b.jsonl"), task="sft", split=split)
+
+    assert (tmp_path / "a.eval.jsonl").read_text() == (
+        tmp_path / "b.eval.jsonl"
+    ).read_text()
+    assert (tmp_path / "a.train.jsonl").read_text() == (
+        tmp_path / "b.train.jsonl"
+    ).read_text()

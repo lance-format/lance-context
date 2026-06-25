@@ -1259,6 +1259,7 @@ class Context:
         version: int | None = None,
         include_expired: bool = False,
         include_retired: bool = False,
+        split: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Curate stored records and export a trainable dataset to JSONL.
 
@@ -1278,9 +1279,23 @@ class Context:
         signals are read from each record's ``metadata`` (``reward``,
         ``reward_source``, ``group_id``, ``label``, ``rank``). Pass ``version``
         to pin the export to a dataset version for reproducibility.
+
+        Pass ``split={"eval_fraction": 0.1, "by": "session_id", "seed": 42}``
+        to write group-disjoint, reproducible ``<path>.train.jsonl`` and
+        ``<path>.eval.jsonl`` outputs (each with its own manifest) instead of a
+        single file; the returned manifest is the train side.
         """
         if format != "jsonl":
             raise ValueError("export format currently supports only 'jsonl'")
+        split_eval_fraction = None
+        split_by = None
+        split_seed = None
+        if split is not None:
+            if "eval_fraction" not in split:
+                raise ValueError("split requires 'eval_fraction'")
+            split_eval_fraction = float(split["eval_fraction"])
+            split_by = split.get("by")
+            split_seed = int(split["seed"]) if split.get("seed") is not None else None
         manifest_json = self._inner.export_training(
             output_path,
             task,
@@ -1294,6 +1309,9 @@ class Context:
             int(version) if version is not None else None,
             include_expired,
             include_retired,
+            split_eval_fraction,
+            split_by,
+            split_seed,
         )
         return json.loads(manifest_json)
 

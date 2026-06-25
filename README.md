@@ -273,6 +273,15 @@ print("SFT examples:", manifest["counts"]["examples"])
 ctx.export_training("training/pref.jsonl", task="preference", preference_form="paired")
 ctx.export_training("training/rollout.jsonl", task="rollout")  # GRPO/RLVR groups
 
+# Reproducible, group-disjoint train/eval split (no session leaks across the
+# boundary; same seed reproduces the partition). Writes sft.train.jsonl +
+# sft.eval.jsonl, each with its own manifest.
+ctx.export_training(
+    "training/sft.jsonl",
+    task="sft",
+    split={"eval_fraction": 0.1, "by": "session_id", "seed": 42},
+)
+
 # Remote persistence on any object_store backend uses a generic `storage_options`
 # dict, matching the conventions used by `lance` and `lance-graph`.
 #

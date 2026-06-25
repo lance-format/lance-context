@@ -13,7 +13,7 @@ pub use context::{Context, ContextEntry, Snapshot};
 pub use export::{
     ExportConfig, ExportCounts, ExportManifest, ExportTask, GroupBy, Message, PreferenceExample,
     PreferenceForm, Provenance, RankedCandidate, RolloutExample, RolloutResponse, SftExample,
-    EXPORT_SCHEMA_VERSION,
+    SplitConfig, SplitManifest, EXPORT_SCHEMA_VERSION,
 };
 pub use namespace::{ContextNamespace, PartitionInfo, PartitionSelector, PartitionSpec};
 pub use record::{

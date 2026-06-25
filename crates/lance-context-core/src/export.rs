@@ -129,6 +129,30 @@ impl GroupBy {
     }
 }
 
+/// Reproducible train/eval split configuration.
+///
+/// Each record is assigned to train or eval by a stable hash of its `by`
+/// grouping key plus `seed`, so no group (e.g. session) spans both sides and
+/// the same `seed` reproduces the identical partition.
+#[derive(Clone)]
+pub struct SplitConfig {
+    /// Fraction of groups assigned to the eval side, in `0.0..=1.0`.
+    pub eval_fraction: f64,
+    /// Grouping key the split is disjoint on (defaults to `session_id`).
+    pub by: GroupBy,
+    pub seed: u64,
+}
+
+impl Default for SplitConfig {
+    fn default() -> Self {
+        Self {
+            eval_fraction: 0.1,
+            by: GroupBy::SessionId,
+            seed: 0,
+        }
+    }
+}
+
 /// Curation + export configuration.
 #[derive(Clone)]
 pub struct ExportConfig {
@@ -152,6 +176,8 @@ pub struct ExportConfig {
     pub version: Option<u64>,
     /// Optional JSON summary of the applied selectors, recorded in the manifest.
     pub filters_summary: Option<Value>,
+    /// When set, write group-disjoint `train` / `eval` outputs instead of one.
+    pub split: Option<SplitConfig>,
 }
 
 impl Default for ExportConfig {
@@ -168,6 +194,7 @@ impl Default for ExportConfig {
             min_reward: None,
             version: None,
             filters_summary: None,
+            split: None,
         }
     }
 }
@@ -276,6 +303,19 @@ pub struct ExportCounts {
     pub examples: usize,
 }
 
+/// Records which side of a train/eval split an output is, and the parameters
+/// needed to reproduce the partition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SplitManifest {
+    /// `"train"` or `"eval"`.
+    pub side: String,
+    pub eval_fraction: f64,
+    pub by: String,
+    pub seed: u64,
+    /// Path of the complementary (other side's) output.
+    pub complement_path: String,
+}
+
 /// Reproducible description of an export, written next to the JSONL output.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportManifest {
@@ -294,6 +334,8 @@ pub struct ExportManifest {
     pub decontaminate_threshold: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub min_reward: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub split: Option<SplitManifest>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub created_at_start: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -742,6 +784,116 @@ fn summarize_groups(
     (start, end, ids)
 }
 
+/// Stable 64-bit FNV-1a hash of `seed` + `key`, used for reproducible,
+/// platform-independent split assignment.
+fn stable_hash(seed: u64, key: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mix = |hash: &mut u64, byte: u8| {
+        *hash ^= u64::from(byte);
+        *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    };
+    for byte in seed.to_le_bytes() {
+        mix(&mut hash, byte);
+    }
+    for byte in key.as_bytes() {
+        mix(&mut hash, *byte);
+    }
+    hash
+}
+
+/// Map a group key to a stable fraction in `0.0..1.0`.
+fn split_fraction(seed: u64, key: &str) -> f64 {
+    // FNV-1a alone has biased high bits; run the MurmurHash3 fmix64 finalizer
+    // for good avalanche before taking the top 53 bits.
+    let mut hash = stable_hash(seed, key);
+    hash ^= hash >> 33;
+    hash = hash.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    hash ^= hash >> 33;
+    hash = hash.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    hash ^= hash >> 33;
+    (hash >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// Derive `train` / `eval` output paths by inserting the side before the final
+/// extension (e.g. `cut.jsonl` -> `cut.train.jsonl`).
+fn split_paths(output_path: &str) -> (String, String) {
+    let slash = output_path.rfind('/').map_or(0, |i| i + 1);
+    match output_path[slash..].rfind('.') {
+        Some(rel_dot) => {
+            let dot = slash + rel_dot;
+            let (stem, ext) = output_path.split_at(dot);
+            (format!("{stem}.train{ext}"), format!("{stem}.eval{ext}"))
+        }
+        None => (
+            format!("{output_path}.train"),
+            format!("{output_path}.eval"),
+        ),
+    }
+}
+
+/// Group `records`, write the task-shaped JSONL to `output_path`, write the
+/// sibling manifest, and return it.
+#[allow(clippy::too_many_arguments)]
+fn emit_export(
+    records: Vec<ContextRecord>,
+    config: &ExportConfig,
+    context_uri: &str,
+    version: u64,
+    mut counts: ExportCounts,
+    output_path: &str,
+    split: Option<SplitManifest>,
+) -> LanceResult<ExportManifest> {
+    let groups = group_records(records, &config.group_by);
+    let (created_at_start, created_at_end, source_record_ids) = summarize_groups(&groups);
+
+    let file = std::fs::File::create(output_path)?;
+    let mut writer = BufWriter::new(file);
+    let examples = match config.task {
+        ExportTask::Sft => write_sft(&groups, &mut writer, context_uri, version)?,
+        ExportTask::Preference => write_preference(
+            &groups,
+            &mut writer,
+            config.preference_form,
+            config.min_reward,
+            context_uri,
+            version,
+        )?,
+        ExportTask::Rollout => write_rollout(&groups, &mut writer, context_uri, version)?,
+    };
+    writer.flush()?;
+    counts.examples = examples;
+
+    let manifest = ExportManifest {
+        context_uri: context_uri.to_string(),
+        version,
+        task: config.task.as_str().to_string(),
+        group_by: config.group_by.label(),
+        schema_version: EXPORT_SCHEMA_VERSION.to_string(),
+        preference_form: matches!(config.task, ExportTask::Preference).then(|| {
+            match config.preference_form {
+                PreferenceForm::Paired => "paired",
+                PreferenceForm::Unpaired => "unpaired",
+                PreferenceForm::Ranked => "ranked",
+            }
+            .to_string()
+        }),
+        filters: config.filters_summary.clone(),
+        dedup_threshold: config.dedup_threshold,
+        decontaminate_threshold: config.decontaminate_threshold,
+        min_reward: config.min_reward,
+        split,
+        created_at_start,
+        created_at_end,
+        source_record_ids,
+        counts,
+    };
+
+    let manifest_json =
+        serde_json::to_string_pretty(&manifest).map_err(|err| LanceError::io(err.to_string()))?;
+    std::fs::write(format!("{output_path}.manifest.json"), manifest_json)?;
+    Ok(manifest)
+}
+
 impl ContextStore {
     /// Curate stored records and export them as task-shaped JSONL plus a
     /// sibling `<output_path>.manifest.json`, returning the manifest.
@@ -788,56 +940,65 @@ impl ContextStore {
                 config.lifecycle.clone(),
             )
             .await?;
-        let (curated, mut counts) = curate(records, config);
-        let groups = group_records(curated, &config.group_by);
-        let (created_at_start, created_at_end, source_record_ids) = summarize_groups(&groups);
+        let (curated, counts) = curate(records, config);
 
-        let file = std::fs::File::create(output_path)?;
-        let mut writer = BufWriter::new(file);
-        let examples = match config.task {
-            ExportTask::Sft => write_sft(&groups, &mut writer, &context_uri, version)?,
-            ExportTask::Preference => write_preference(
-                &groups,
-                &mut writer,
-                config.preference_form,
-                config.min_reward,
+        let Some(split) = &config.split else {
+            return emit_export(
+                curated,
+                config,
                 &context_uri,
                 version,
-            )?,
-            ExportTask::Rollout => write_rollout(&groups, &mut writer, &context_uri, version)?,
+                counts,
+                output_path,
+                None,
+            );
         };
-        writer.flush()?;
-        counts.examples = examples;
 
-        let manifest = ExportManifest {
-            context_uri,
+        // Group-disjoint, reproducible partition: a record's side is decided by
+        // a stable hash of its `split.by` key, so no group spans both sides.
+        let (train_path, eval_path) = split_paths(output_path);
+        let mut train_records = Vec::new();
+        let mut eval_records = Vec::new();
+        for record in curated {
+            let key = split.by.key(&record);
+            if split_fraction(split.seed, &key) < split.eval_fraction {
+                eval_records.push(record);
+            } else {
+                train_records.push(record);
+            }
+        }
+
+        let train_manifest = emit_export(
+            train_records,
+            config,
+            &context_uri,
             version,
-            task: config.task.as_str().to_string(),
-            group_by: config.group_by.label(),
-            schema_version: EXPORT_SCHEMA_VERSION.to_string(),
-            preference_form: matches!(config.task, ExportTask::Preference).then(|| {
-                match config.preference_form {
-                    PreferenceForm::Paired => "paired",
-                    PreferenceForm::Unpaired => "unpaired",
-                    PreferenceForm::Ranked => "ranked",
-                }
-                .to_string()
-            }),
-            filters: config.filters_summary.clone(),
-            dedup_threshold: config.dedup_threshold,
-            decontaminate_threshold: config.decontaminate_threshold,
-            min_reward: config.min_reward,
-            created_at_start,
-            created_at_end,
-            source_record_ids,
             counts,
-        };
-
-        let manifest_json = serde_json::to_string_pretty(&manifest)
-            .map_err(|err| LanceError::io(err.to_string()))?;
-        std::fs::write(format!("{output_path}.manifest.json"), manifest_json)?;
-
-        Ok(manifest)
+            &train_path,
+            Some(SplitManifest {
+                side: "train".to_string(),
+                eval_fraction: split.eval_fraction,
+                by: split.by.label(),
+                seed: split.seed,
+                complement_path: eval_path.clone(),
+            }),
+        )?;
+        emit_export(
+            eval_records,
+            config,
+            &context_uri,
+            version,
+            counts,
+            &eval_path,
+            Some(SplitManifest {
+                side: "eval".to_string(),
+                eval_fraction: split.eval_fraction,
+                by: split.by.label(),
+                seed: split.seed,
+                complement_path: train_path.clone(),
+            }),
+        )?;
+        Ok(train_manifest)
     }
 }
 
@@ -1359,6 +1520,153 @@ mod tests {
             // doc-7 (2 turns) + doc-8 (1 turn) => 2 examples.
             assert_eq!(lines.len(), 2);
             assert_eq!(lines[0]["messages"].as_array().unwrap().len(), 2);
+        });
+    }
+
+    fn session_ids(path: &str) -> std::collections::HashSet<String> {
+        read_lines(path)
+            .iter()
+            .filter_map(|line| {
+                line["provenance"]["session_id"]
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn split_is_deterministic_and_group_disjoint() {
+        let dir = TempDir::new().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = open_store(&dir).await;
+            let mut records = Vec::new();
+            for s in 0..10 {
+                let mut user = rec(&format!("u{s}"), "user", "q", s * 2);
+                user.session_id = Some(format!("s{s}"));
+                let mut asst = rec(&format!("a{s}"), "assistant", "r", s * 2 + 1);
+                asst.session_id = Some(format!("s{s}"));
+                records.push(user);
+                records.push(asst);
+            }
+            store.add(&records).await.unwrap();
+
+            let config = ExportConfig {
+                task: ExportTask::Sft,
+                group_by: GroupBy::SessionId,
+                split: Some(SplitConfig {
+                    eval_fraction: 0.5,
+                    by: GroupBy::SessionId,
+                    seed: 42,
+                }),
+                ..Default::default()
+            };
+
+            let base1 = dir.path().join("a.jsonl").to_string_lossy().to_string();
+            let base2 = dir.path().join("b.jsonl").to_string_lossy().to_string();
+            store.export_training(&config, &base1).await.unwrap();
+            store.export_training(&config, &base2).await.unwrap();
+
+            let (train1, eval1) = split_paths(&base1);
+            let (train2, eval2) = split_paths(&base2);
+
+            // Determinism: identical partition across runs with the same seed.
+            assert_eq!(
+                std::fs::read_to_string(&train1).unwrap(),
+                std::fs::read_to_string(&train2).unwrap()
+            );
+            assert_eq!(
+                std::fs::read_to_string(&eval1).unwrap(),
+                std::fs::read_to_string(&eval2).unwrap()
+            );
+
+            // Group-disjoint: no session appears on both sides.
+            let train_sessions = session_ids(&train1);
+            let eval_sessions = session_ids(&eval1);
+            assert!(!train_sessions.is_empty() && !eval_sessions.is_empty());
+            assert!(train_sessions.is_disjoint(&eval_sessions));
+            assert_eq!(train_sessions.len() + eval_sessions.len(), 10);
+        });
+    }
+
+    #[test]
+    fn split_fraction_is_approximately_respected() {
+        let dir = TempDir::new().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = open_store(&dir).await;
+            let mut records = Vec::new();
+            for s in 0..200 {
+                let mut r = rec(&format!("r{s}"), "user", "q", s);
+                r.session_id = Some(format!("s{s}"));
+                records.push(r);
+            }
+            store.add(&records).await.unwrap();
+
+            let config = ExportConfig {
+                task: ExportTask::Sft,
+                group_by: GroupBy::SessionId,
+                split: Some(SplitConfig {
+                    eval_fraction: 0.25,
+                    by: GroupBy::SessionId,
+                    seed: 7,
+                }),
+                ..Default::default()
+            };
+            let base = dir.path().join("c.jsonl").to_string_lossy().to_string();
+            store.export_training(&config, &base).await.unwrap();
+
+            let (train, eval) = split_paths(&base);
+            let eval_count = read_lines(&eval).len();
+            let train_count = read_lines(&train).len();
+            assert_eq!(train_count + eval_count, 200);
+            let fraction = eval_count as f64 / 200.0;
+            assert!(
+                (fraction - 0.25).abs() < 0.1,
+                "eval fraction {fraction} too far from 0.25"
+            );
+        });
+    }
+
+    #[test]
+    fn split_manifests_record_params_and_complement() {
+        let dir = TempDir::new().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = open_store(&dir).await;
+            let mut a = rec("a", "user", "x", 1);
+            a.session_id = Some("s1".to_string());
+            let mut b = rec("b", "user", "y", 2);
+            b.session_id = Some("s2".to_string());
+            store.add(&[a, b]).await.unwrap();
+
+            let config = ExportConfig {
+                task: ExportTask::Sft,
+                group_by: GroupBy::SessionId,
+                split: Some(SplitConfig {
+                    eval_fraction: 0.5,
+                    by: GroupBy::SessionId,
+                    seed: 99,
+                }),
+                ..Default::default()
+            };
+            let base = dir.path().join("d.jsonl").to_string_lossy().to_string();
+            store.export_training(&config, &base).await.unwrap();
+
+            let (train, eval) = split_paths(&base);
+            assert!(std::fs::metadata(&train).is_ok());
+            assert!(std::fs::metadata(&eval).is_ok());
+
+            let train_manifest = read_manifest(&train);
+            let split = train_manifest.split.unwrap();
+            assert_eq!(split.side, "train");
+            assert_eq!(split.seed, 99);
+            assert_eq!(split.eval_fraction, 0.5);
+            assert_eq!(split.by, "session_id");
+            assert_eq!(split.complement_path, eval);
+
+            let eval_manifest = read_manifest(&eval);
+            assert_eq!(eval_manifest.split.unwrap().side, "eval");
         });
     }
 }
