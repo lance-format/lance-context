@@ -3,6 +3,7 @@
 
 mod api_impl;
 mod context;
+mod eval;
 mod export;
 mod namespace;
 mod record;
@@ -10,6 +11,10 @@ pub mod serde;
 mod store;
 
 pub use context::{Context, ContextEntry, Snapshot};
+pub use eval::{
+    AbReport, EvalConfig, EvalQuery, EvalQuerySet, EvalReport, MetricScores, QueryEval,
+    RelevanceLabel, RetrievalMode,
+};
 pub use export::{
     ExportConfig, ExportCounts, ExportManifest, ExportTask, GroupBy, Message, PreferenceExample,
     PreferenceForm, Provenance, RankedCandidate, RolloutExample, RolloutResponse, SftExample,

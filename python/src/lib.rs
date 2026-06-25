@@ -21,9 +21,10 @@ use lance_context_core::serde::CONTENT_TYPE_TEXT;
 use lance_context_core::{
     CompactionConfig, CompactionMetrics, CompactionStats, Context as RustContext,
     ContextNamespace as RustContextNamespace, ContextRecord, ContextStore, ContextStoreOptions,
-    DistanceMetric, ExportConfig, ExportTask, GroupBy, IdIndexType, LifecycleQueryOptions,
-    PartitionInfo, PartitionSelector, PartitionSpec, PreferenceForm, RecordFilters, RecordPatch,
-    Relationship, RetrieveResult, SearchResult, SplitConfig, StateMetadata, LIFECYCLE_ACTIVE,
+    DistanceMetric, EvalConfig, EvalQuerySet, ExportConfig, ExportTask, GroupBy, IdIndexType,
+    LifecycleQueryOptions, PartitionInfo, PartitionSelector, PartitionSpec, PreferenceForm,
+    RecordFilters, RecordPatch, Relationship, RetrievalMode, RetrieveResult, SearchResult,
+    SplitConfig, StateMetadata, LIFECYCLE_ACTIVE,
 };
 
 const DEFAULT_BINARY_CONTENT_TYPE: &str = "application/octet-stream";
@@ -314,6 +315,30 @@ fn parse_group_by(group_by: &str) -> PyResult<GroupBy> {
                 "invalid group_by '{other}'"
             )));
         }
+    })
+}
+
+fn eval_config(
+    k: usize,
+    mode: &str,
+    filters_json: Option<String>,
+    include_expired: bool,
+    include_retired: bool,
+) -> PyResult<EvalConfig> {
+    let mode = match mode {
+        "vector" => RetrievalMode::Vector,
+        "hybrid" => RetrievalMode::Hybrid,
+        other => {
+            return Err(PyRuntimeError::new_err(format!(
+                "invalid eval mode '{other}'; use 'vector' or 'hybrid'"
+            )));
+        }
+    };
+    Ok(EvalConfig {
+        k,
+        mode,
+        filters: filters_from_json(filters_json)?,
+        lifecycle: LifecycleQueryOptions::new(include_expired, include_retired),
     })
 }
 
@@ -837,6 +862,58 @@ impl Context {
             })
             .map_err(to_py_err)?;
         serde_json::to_string(&manifest).map_err(to_py_err)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (query_set_json, k = 10, mode = "vector", filters_json = None, include_expired = false, include_retired = false))]
+    fn evaluate(
+        &self,
+        py: Python<'_>,
+        query_set_json: &str,
+        k: usize,
+        mode: &str,
+        filters_json: Option<String>,
+        include_expired: bool,
+        include_retired: bool,
+    ) -> PyResult<String> {
+        let query_set: EvalQuerySet = serde_json::from_str(query_set_json).map_err(to_py_err)?;
+        let config = eval_config(k, mode, filters_json, include_expired, include_retired)?;
+        let report = py
+            .allow_threads(|| {
+                self.runtime
+                    .block_on(self.store.evaluate(&query_set, &config))
+            })
+            .map_err(to_py_err)?;
+        serde_json::to_string(&report).map_err(to_py_err)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (query_set_json, baseline_version, candidate_version, k = 10, mode = "vector", filters_json = None, include_expired = false, include_retired = false))]
+    fn evaluate_versions(
+        &mut self,
+        py: Python<'_>,
+        query_set_json: &str,
+        baseline_version: u64,
+        candidate_version: u64,
+        k: usize,
+        mode: &str,
+        filters_json: Option<String>,
+        include_expired: bool,
+        include_retired: bool,
+    ) -> PyResult<String> {
+        let query_set: EvalQuerySet = serde_json::from_str(query_set_json).map_err(to_py_err)?;
+        let config = eval_config(k, mode, filters_json, include_expired, include_retired)?;
+        let report = py
+            .allow_threads(|| {
+                self.runtime.block_on(self.store.evaluate_versions(
+                    &query_set,
+                    &config,
+                    baseline_version,
+                    candidate_version,
+                ))
+            })
+            .map_err(to_py_err)?;
+        serde_json::to_string(&report).map_err(to_py_err)
     }
 
     #[pyo3(signature = (limit = None, offset = None, filters_json = None, include_expired = false, include_retired = false))]

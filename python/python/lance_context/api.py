@@ -1315,6 +1315,77 @@ class Context:
         )
         return json.loads(manifest_json)
 
+    def evaluate(
+        self,
+        queries: Iterable[Mapping[str, Any]],
+        *,
+        query_set_id: str = "eval",
+        k: int = 10,
+        mode: str = "vector",
+        filters: dict[str, Any] | None = None,
+        include_expired: bool = False,
+        include_retired: bool = False,
+    ) -> dict[str, Any]:
+        """Evaluate retrieval quality against a labeled query set.
+
+        Each query is a mapping with ``query_id``, an optional ``text`` and/or
+        ``vector`` channel, and ``relevant`` — a list of ``{"external_id": ...,
+        "grade": <float, default 1.0>}`` labels. ``mode`` selects ``"vector"``
+        (search) or ``"hybrid"`` (retrieve).
+
+        Returns a report dict with ``aggregate`` metrics (``recall``,
+        ``precision``, ``mrr``, ``ndcg``, ``hit_rate``), a ``per_query``
+        breakdown, and a manifest (``query_set_id``, ``version``, ``k``,
+        ``mode``, ``distance_metric``) for reproducibility.
+        """
+        query_set = json.dumps(
+            {"id": query_set_id, "queries": [dict(query) for query in queries]}
+        )
+        report_json = self._inner.evaluate(
+            query_set,
+            k,
+            mode,
+            _json_dumps(filters, "filters"),
+            include_expired,
+            include_retired,
+        )
+        return json.loads(report_json)
+
+    def evaluate_versions(
+        self,
+        queries: Iterable[Mapping[str, Any]],
+        baseline_version: int,
+        candidate_version: int,
+        *,
+        query_set_id: str = "eval",
+        k: int = 10,
+        mode: str = "vector",
+        filters: dict[str, Any] | None = None,
+        include_expired: bool = False,
+        include_retired: bool = False,
+    ) -> dict[str, Any]:
+        """A/B the same query set across two dataset versions.
+
+        Runs :meth:`evaluate` at ``baseline_version`` and ``candidate_version``
+        (via time-travel checkout) and returns ``{"baseline", "candidate",
+        "deltas"}`` where ``deltas`` is ``candidate - baseline`` per metric. The
+        context is restored to its current version before returning.
+        """
+        query_set = json.dumps(
+            {"id": query_set_id, "queries": [dict(query) for query in queries]}
+        )
+        report_json = self._inner.evaluate_versions(
+            query_set,
+            int(baseline_version),
+            int(candidate_version),
+            k,
+            mode,
+            _json_dumps(filters, "filters"),
+            include_expired,
+            include_retired,
+        )
+        return json.loads(report_json)
+
     def list(
         self,
         limit: int | None = None,

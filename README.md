@@ -251,6 +251,7 @@ ctx.checkout(first_version)
 
 print("Entries after checkout:", ctx.entries())
 
+<<<<<<< HEAD
 # Curate stored records into a trainable dataset and export it as JSONL plus a
 # reproducible manifest. Curation (lifecycle-correct filtering, semantic dedup,
 # decontamination against a holdout set, reward thresholding) runs before
@@ -281,6 +282,29 @@ ctx.export_training(
     task="sft",
     split={"eval_fraction": 0.1, "by": "session_id", "seed": 42},
 )
+
+# Measure retrieval quality against a labeled query set. Each query lists the
+# relevant records by stable external_id (with optional graded relevance), and
+# the report carries recall@k / precision@k / MRR / nDCG@k / hit-rate plus a
+# manifest (version, k, mode, distance_metric) for reproducibility.
+report = ctx.evaluate(
+    [
+        {
+            "query_id": "q1",
+            "vector": query_embedding,            # vector channel
+            "relevant": [{"external_id": "doc-77#chunk-1", "grade": 1.0}],
+        },
+    ],
+    k=10,
+    mode="vector",                                # or "hybrid" for text+vector
+)
+print("recall@10:", report["aggregate"]["recall"])
+
+# A/B the same query set across two dataset versions (regression detection that
+# a stateless vector DB can't do) and read per-metric deltas.
+ab = ctx.evaluate_versions(query_set, baseline_version, candidate_version, k=10)
+print("nDCG delta:", ab["deltas"]["ndcg"])
+
 
 # Remote persistence on any object_store backend uses a generic `storage_options`
 # dict, matching the conventions used by `lance` and `lance-graph`.

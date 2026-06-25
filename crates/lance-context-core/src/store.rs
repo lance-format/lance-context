@@ -377,6 +377,12 @@ impl ContextStore {
         self.dataset.uri()
     }
 
+    /// Distance metric this context ranks vector-search results with.
+    #[must_use]
+    pub fn distance_metric(&self) -> DistanceMetric {
+        self.distance_metric
+    }
+
     /// Append context records to the store and return the new dataset version.
     pub async fn add(&mut self, entries: &[ContextRecord]) -> LanceResult<u64> {
         if entries.is_empty() {
