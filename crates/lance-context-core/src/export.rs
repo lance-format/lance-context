@@ -29,7 +29,7 @@
 //! tombstoned/expired/retired/superseded) and additionally drops
 //! `contradicted` records.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{BufWriter, Write};
 
 use chrono::{DateTime, Utc};
@@ -178,6 +178,8 @@ pub struct ExportConfig {
     pub filters_summary: Option<Value>,
     /// When set, write group-disjoint `train` / `eval` outputs instead of one.
     pub split: Option<SplitConfig>,
+    /// When `true`, also write a `<output_path>.stats.json` dataset report.
+    pub emit_stats: bool,
 }
 
 impl Default for ExportConfig {
@@ -195,6 +197,7 @@ impl Default for ExportConfig {
             version: None,
             filters_summary: None,
             split: None,
+            emit_stats: false,
         }
     }
 }
@@ -342,6 +345,85 @@ pub struct ExportManifest {
     pub created_at_end: Option<DateTime<Utc>>,
     pub source_record_ids: Vec<String>,
     pub counts: ExportCounts,
+}
+
+/// Numeric distribution summary.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Distribution {
+    pub count: usize,
+    pub min: f64,
+    pub median: f64,
+    pub p95: f64,
+    pub max: f64,
+    pub mean: f64,
+}
+
+impl Distribution {
+    fn from_sorted(mut values: Vec<f64>) -> Option<Self> {
+        if values.is_empty() {
+            return None;
+        }
+        values.sort_by(f64::total_cmp);
+        let count = values.len();
+        let sum: f64 = values.iter().sum();
+        let percentile = |p: f64| {
+            let idx = ((p * (count - 1) as f64).round() as usize).min(count - 1);
+            values[idx]
+        };
+        Some(Self {
+            count,
+            min: values[0],
+            median: percentile(0.5),
+            p95: percentile(0.95),
+            max: values[count - 1],
+            mean: sum / count as f64,
+        })
+    }
+}
+
+/// Token-length statistics and which source produced them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenStats {
+    #[serde(flatten)]
+    pub distribution: Distribution,
+    /// `"tokens_used"`, `"length_proxy"`, or `"mixed"`.
+    pub source: String,
+}
+
+/// Source records excluded during curation, by reason.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct ExcludedCounts {
+    pub lifecycle: usize,
+    pub reward_threshold: usize,
+    pub dedup: usize,
+    pub decontaminate: usize,
+}
+
+/// Auditable dataset statistics for one export output, written to
+/// `<output_path>.stats.json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportStats {
+    pub task: String,
+    pub examples: usize,
+    pub num_groups: usize,
+    /// Record counts by `role`.
+    pub by_role: BTreeMap<String, usize>,
+    /// Record counts by `source` (`"__none__"` when absent).
+    pub by_source: BTreeMap<String, usize>,
+    /// Record counts by `tenant` (`"__none__"` when absent).
+    pub by_tenant: BTreeMap<String, usize>,
+    pub records_per_group: Distribution,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tokens: Option<TokenStats>,
+    pub excluded: ExcludedCounts,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub preference_form: Option<String>,
+    /// Reward distribution over records carrying `metadata.reward`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub reward: Option<Distribution>,
+    /// Counts by `metadata.reward_source`.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
+    pub reward_sources: BTreeMap<String, usize>,
 }
 
 // ----- metadata helpers -----------------------------------------------------
@@ -891,7 +973,124 @@ fn emit_export(
     let manifest_json =
         serde_json::to_string_pretty(&manifest).map_err(|err| LanceError::io(err.to_string()))?;
     std::fs::write(format!("{output_path}.manifest.json"), manifest_json)?;
+
+    if config.emit_stats {
+        let stats = compute_stats(&groups, &counts, examples, config);
+        let stats_json =
+            serde_json::to_string_pretty(&stats).map_err(|err| LanceError::io(err.to_string()))?;
+        std::fs::write(format!("{output_path}.stats.json"), stats_json)?;
+    }
+
     Ok(manifest)
+}
+
+/// Compute the dataset statistics report for one export output.
+fn compute_stats(
+    groups: &[Group],
+    counts: &ExportCounts,
+    examples: usize,
+    config: &ExportConfig,
+) -> ExportStats {
+    let mut by_role: BTreeMap<String, usize> = BTreeMap::new();
+    let mut by_source: BTreeMap<String, usize> = BTreeMap::new();
+    let mut by_tenant: BTreeMap<String, usize> = BTreeMap::new();
+    let mut token_values: Vec<f64> = Vec::new();
+    let mut used_tokens_used = false;
+    let mut used_fallback = false;
+    let mut reward_values: Vec<f64> = Vec::new();
+    let mut reward_sources: BTreeMap<String, usize> = BTreeMap::new();
+    let mut records_per_group: Vec<f64> = Vec::new();
+
+    for group in groups {
+        records_per_group.push(group.records.len() as f64);
+        for record in &group.records {
+            *by_role.entry(record.role.clone()).or_insert(0) += 1;
+            *by_source
+                .entry(
+                    record
+                        .source
+                        .clone()
+                        .unwrap_or_else(|| "__none__".to_string()),
+                )
+                .or_insert(0) += 1;
+            *by_tenant
+                .entry(
+                    record
+                        .tenant
+                        .clone()
+                        .unwrap_or_else(|| "__none__".to_string()),
+                )
+                .or_insert(0) += 1;
+
+            match record.state_metadata.as_ref().and_then(|m| m.tokens_used) {
+                Some(tokens) if tokens >= 0 => {
+                    token_values.push(f64::from(tokens));
+                    used_tokens_used = true;
+                }
+                _ => {
+                    // Fallback proxy: whitespace-delimited word count of content.
+                    let proxy = record
+                        .text_payload
+                        .as_deref()
+                        .map_or(0, |text| text.split_whitespace().count());
+                    token_values.push(proxy as f64);
+                    used_fallback = true;
+                }
+            }
+
+            if let Some(reward) = record_reward(record) {
+                reward_values.push(reward);
+            }
+            if let Some(source) = record_reward_source(record) {
+                *reward_sources.entry(source).or_insert(0) += 1;
+            }
+        }
+    }
+
+    let tokens = Distribution::from_sorted(token_values).map(|distribution| TokenStats {
+        distribution,
+        source: match (used_tokens_used, used_fallback) {
+            (true, true) => "mixed",
+            (true, false) => "tokens_used",
+            _ => "length_proxy",
+        }
+        .to_string(),
+    });
+
+    let excluded = ExcludedCounts {
+        lifecycle: counts.input_records.saturating_sub(counts.after_lifecycle),
+        reward_threshold: counts
+            .after_lifecycle
+            .saturating_sub(counts.after_reward_filter),
+        dedup: counts
+            .after_reward_filter
+            .saturating_sub(counts.after_dedup),
+        decontaminate: counts
+            .after_dedup
+            .saturating_sub(counts.after_decontaminate),
+    };
+
+    ExportStats {
+        task: config.task.as_str().to_string(),
+        examples,
+        num_groups: groups.len(),
+        by_role,
+        by_source,
+        by_tenant,
+        records_per_group: Distribution::from_sorted(records_per_group).unwrap_or_default(),
+        tokens,
+        excluded,
+        preference_form: matches!(config.task, ExportTask::Preference).then(|| {
+            match config.preference_form {
+                PreferenceForm::Paired => "paired",
+                PreferenceForm::Unpaired => "unpaired",
+                PreferenceForm::Ranked => "ranked",
+            }
+            .to_string()
+        }),
+        reward: Distribution::from_sorted(reward_values),
+        reward_sources,
+    }
 }
 
 impl ContextStore {
@@ -1667,6 +1866,152 @@ mod tests {
 
             let eval_manifest = read_manifest(&eval);
             assert_eq!(eval_manifest.split.unwrap().side, "eval");
+        });
+    }
+
+    fn read_stats(path: &str) -> ExportStats {
+        let raw = std::fs::read_to_string(format!("{path}.stats.json")).unwrap();
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    #[test]
+    fn stats_report_counts_roles_tokens_and_exclusions() {
+        let dir = TempDir::new().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = open_store(&dir).await;
+            let mut user = rec("u", "user", "hello there", 1);
+            user.source = Some("memory".to_string());
+            user.tenant = Some("acme".to_string());
+            user.state_metadata = Some(crate::record::StateMetadata {
+                tokens_used: Some(5),
+                ..Default::default()
+            });
+            let mut asst = rec("a", "assistant", "hi", 2);
+            asst.source = Some("memory".to_string());
+            asst.tenant = Some("acme".to_string());
+            asst.state_metadata = Some(crate::record::StateMetadata {
+                tokens_used: Some(11),
+                ..Default::default()
+            });
+            // a contradicted record that curation excludes by lifecycle
+            let mut dropped = rec("d", "user", "nope", 3);
+            dropped.session_id = Some("other".to_string());
+            dropped.lifecycle_status = LIFECYCLE_CONTRADICTED.to_string();
+            store.add(&[user, asst, dropped]).await.unwrap();
+
+            let out = out_path(&dir);
+            store
+                .export_training(
+                    &ExportConfig {
+                        task: ExportTask::Sft,
+                        group_by: GroupBy::SessionId,
+                        emit_stats: true,
+                        ..Default::default()
+                    },
+                    &out,
+                )
+                .await
+                .unwrap();
+
+            let stats = read_stats(&out);
+            assert_eq!(stats.task, "sft");
+            assert_eq!(stats.examples, 1);
+            assert_eq!(stats.num_groups, 1);
+            assert_eq!(stats.by_role.get("user"), Some(&1));
+            assert_eq!(stats.by_role.get("assistant"), Some(&1));
+            assert_eq!(stats.by_source.get("memory"), Some(&2));
+            assert_eq!(stats.by_tenant.get("acme"), Some(&2));
+            assert_eq!(stats.excluded.lifecycle, 1, "contradicted record excluded");
+
+            let tokens = stats.tokens.unwrap();
+            assert_eq!(tokens.source, "tokens_used");
+            assert_eq!(tokens.distribution.count, 2);
+            assert_eq!(tokens.distribution.min, 5.0);
+            assert_eq!(tokens.distribution.max, 11.0);
+            assert_eq!(tokens.distribution.mean, 8.0);
+        });
+    }
+
+    #[test]
+    fn stats_token_fallback_uses_length_proxy() {
+        let dir = TempDir::new().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = open_store(&dir).await;
+            // no state_metadata -> fallback to whitespace word count
+            store
+                .add(&[rec("u", "user", "one two three four", 1)])
+                .await
+                .unwrap();
+
+            let out = out_path(&dir);
+            store
+                .export_training(
+                    &ExportConfig {
+                        emit_stats: true,
+                        ..Default::default()
+                    },
+                    &out,
+                )
+                .await
+                .unwrap();
+
+            let tokens = read_stats(&out).tokens.unwrap();
+            assert_eq!(tokens.source, "length_proxy");
+            assert_eq!(tokens.distribution.max, 4.0);
+        });
+    }
+
+    #[test]
+    fn stats_report_reward_distribution_for_rollout() {
+        let dir = TempDir::new().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = open_store(&dir).await;
+            let prompt = rec("p", "user", "solve", 1);
+            let mut r1 = rec("r1", "assistant", "a1", 2);
+            r1.metadata = Some(json!({"reward": 1.0, "reward_source": "verifier"}));
+            let mut r2 = rec("r2", "assistant", "a2", 3);
+            r2.metadata = Some(json!({"reward": 0.0, "reward_source": "verifier"}));
+            store.add(&[prompt, r1, r2]).await.unwrap();
+
+            let out = out_path(&dir);
+            store
+                .export_training(
+                    &ExportConfig {
+                        task: ExportTask::Rollout,
+                        group_by: GroupBy::SessionId,
+                        emit_stats: true,
+                        ..Default::default()
+                    },
+                    &out,
+                )
+                .await
+                .unwrap();
+
+            let stats = read_stats(&out);
+            let reward = stats.reward.unwrap();
+            assert_eq!(reward.count, 2);
+            assert_eq!(reward.min, 0.0);
+            assert_eq!(reward.max, 1.0);
+            assert_eq!(stats.reward_sources.get("verifier"), Some(&2));
+        });
+    }
+
+    #[test]
+    fn stats_not_written_without_flag() {
+        let dir = TempDir::new().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = open_store(&dir).await;
+            store.add(&[rec("u", "user", "hi", 1)]).await.unwrap();
+            let out = out_path(&dir);
+            store
+                .export_training(&ExportConfig::default(), &out)
+                .await
+                .unwrap();
+            assert!(std::fs::metadata(format!("{out}.stats.json")).is_err());
         });
     }
 }

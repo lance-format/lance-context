@@ -266,6 +266,7 @@ manifest = ctx.export_training(
     min_reward=0.7,            # keep only high-reward completions
     dedup_threshold=0.02,      # collapse near-duplicates (cosine)
     version=ctx.version(),     # pin for reproducibility
+    emit_stats=True,           # also write sft.jsonl.stats.json (counts, tokens, exclusions)
 )
 print("SFT examples:", manifest["counts"]["examples"])
 

@@ -184,3 +184,30 @@ def test_export_split_is_deterministic(tmp_path: Path) -> None:
     assert (tmp_path / "a.train.jsonl").read_text() == (
         tmp_path / "b.train.jsonl"
     ).read_text()
+
+
+def test_export_emits_stats_report(tmp_path: Path) -> None:
+    ctx = Context.create(str(tmp_path / "ctx.lance"))
+    ctx.add("user", "hello there friend", session_id="s1", source="memory")
+    ctx.add("assistant", "hi", session_id="s1", source="memory")
+
+    out = tmp_path / "sft.jsonl"
+    ctx.export_training(str(out), task="sft", emit_stats=True)
+
+    stats_path = tmp_path / "sft.jsonl.stats.json"
+    assert stats_path.exists()
+    stats = json.loads(stats_path.read_text())
+    assert stats["examples"] == 1
+    assert stats["by_role"]["user"] == 1
+    assert stats["by_role"]["assistant"] == 1
+    assert stats["by_source"]["memory"] == 2
+    assert stats["tokens"]["source"] == "length_proxy"
+    assert stats["tokens"]["max"] == 3.0  # "hello there friend"
+
+
+def test_export_no_stats_without_flag(tmp_path: Path) -> None:
+    ctx = Context.create(str(tmp_path / "ctx.lance"))
+    ctx.add("user", "hi", session_id="s1")
+    out = tmp_path / "sft.jsonl"
+    ctx.export_training(str(out), task="sft")
+    assert not (tmp_path / "sft.jsonl.stats.json").exists()

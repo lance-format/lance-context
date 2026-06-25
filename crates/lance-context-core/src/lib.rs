@@ -11,9 +11,10 @@ mod store;
 
 pub use context::{Context, ContextEntry, Snapshot};
 pub use export::{
-    ExportConfig, ExportCounts, ExportManifest, ExportTask, GroupBy, Message, PreferenceExample,
-    PreferenceForm, Provenance, RankedCandidate, RolloutExample, RolloutResponse, SftExample,
-    SplitConfig, SplitManifest, EXPORT_SCHEMA_VERSION,
+    Distribution, ExcludedCounts, ExportConfig, ExportCounts, ExportManifest, ExportStats,
+    ExportTask, GroupBy, Message, PreferenceExample, PreferenceForm, Provenance, RankedCandidate,
+    RolloutExample, RolloutResponse, SftExample, SplitConfig, SplitManifest, TokenStats,
+    EXPORT_SCHEMA_VERSION,
 };
 pub use namespace::{ContextNamespace, PartitionInfo, PartitionSelector, PartitionSpec};
 pub use record::{

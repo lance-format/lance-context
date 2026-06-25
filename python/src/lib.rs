@@ -294,6 +294,7 @@ fn export_config(
         version,
         filters_summary,
         split,
+        emit_stats: false,
     })
 }
 
@@ -794,7 +795,7 @@ impl Context {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (output_path, task = "sft", group_by = "session_id", preference_form = "paired", filters_json = None, dedup_threshold = None, decontaminate_against = None, decontaminate_threshold = None, min_reward = None, version = None, include_expired = false, include_retired = false, split_eval_fraction = None, split_by = None, split_seed = None))]
+    #[pyo3(signature = (output_path, task = "sft", group_by = "session_id", preference_form = "paired", filters_json = None, dedup_threshold = None, decontaminate_against = None, decontaminate_threshold = None, min_reward = None, version = None, include_expired = false, include_retired = false, split_eval_fraction = None, split_by = None, split_seed = None, emit_stats = false))]
     fn export_training(
         &mut self,
         py: Python<'_>,
@@ -813,8 +814,9 @@ impl Context {
         split_eval_fraction: Option<f64>,
         split_by: Option<String>,
         split_seed: Option<u64>,
+        emit_stats: bool,
     ) -> PyResult<String> {
-        let config = export_config(
+        let mut config = export_config(
             task,
             group_by,
             preference_form,
@@ -830,6 +832,7 @@ impl Context {
             split_by,
             split_seed,
         )?;
+        config.emit_stats = emit_stats;
         let manifest = py
             .allow_threads(|| {
                 self.runtime

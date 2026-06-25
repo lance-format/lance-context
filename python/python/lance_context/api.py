@@ -1260,6 +1260,7 @@ class Context:
         include_expired: bool = False,
         include_retired: bool = False,
         split: dict[str, Any] | None = None,
+        emit_stats: bool = False,
     ) -> dict[str, Any]:
         """Curate stored records and export a trainable dataset to JSONL.
 
@@ -1280,10 +1281,15 @@ class Context:
         ``reward_source``, ``group_id``, ``label``, ``rank``). Pass ``version``
         to pin the export to a dataset version for reproducibility.
 
-        Pass ``split={"eval_fraction": 0.1, "by": "session_id", "seed": 42}``
+        Pass         ``split={"eval_fraction": 0.1, "by": "session_id", "seed": 42}``
         to write group-disjoint, reproducible ``<path>.train.jsonl`` and
         ``<path>.eval.jsonl`` outputs (each with its own manifest) instead of a
         single file; the returned manifest is the train side.
+
+        Pass ``emit_stats=True`` to also write a ``<output_path>.stats.json``
+        dataset report (example/role/source/tenant counts, token-length
+        distribution, per-group counts, curation exclusions by reason, and
+        reward distribution).
         """
         if format != "jsonl":
             raise ValueError("export format currently supports only 'jsonl'")
@@ -1312,6 +1318,7 @@ class Context:
             split_eval_fraction,
             split_by,
             split_seed,
+            emit_stats,
         )
         return json.loads(manifest_json)
 
