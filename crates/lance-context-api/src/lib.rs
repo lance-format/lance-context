@@ -176,6 +176,14 @@ pub struct AddRecordRequest {
         deserialize_with = "deserialize_base64_opt"
     )]
     pub binary_payload: Option<Vec<u8>>,
+    /// Typed reference to a payload object stored outside the dataset
+    /// (e.g. `gs://bucket/prefix/<id>`). Distinct from inline `binary_payload`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_size: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_checksum: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding: Option<Vec<f32>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -280,6 +288,12 @@ pub struct RecordPatchDto {
     pub retired_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding: Option<Vec<f32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_size: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_checksum: Option<String>,
 }
 
 impl RecordPatchDto {
@@ -298,6 +312,9 @@ impl RecordPatchDto {
             && self.retired_at.is_none()
             && self.retired_reason.is_none()
             && self.embedding.is_none()
+            && self.payload_uri.is_none()
+            && self.payload_size.is_none()
+            && self.payload_checksum.is_none()
     }
 }
 
@@ -347,6 +364,12 @@ pub struct RecordDto {
         deserialize_with = "deserialize_base64_opt"
     )]
     pub binary_payload: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_size: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_checksum: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding: Option<Vec<f32>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -601,5 +624,60 @@ mod tests {
         assert_eq!(req.filters, Some(serde_json::json!({"tenant": "acme"})));
         assert!(req.include_expired);
         assert!(req.include_retired);
+    }
+
+    #[test]
+    fn add_request_omits_payload_reference_when_absent() {
+        // Records without an external reference must not emit the new keys, so
+        // older servers/clients keep round-tripping unchanged.
+        let req = AddRecordRequest {
+            role: "user".to_string(),
+            content_type: "text/plain".to_string(),
+            text_payload: Some("hi".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains("payload_uri"));
+        assert!(!json.contains("payload_size"));
+        assert!(!json.contains("payload_checksum"));
+    }
+
+    #[test]
+    fn add_request_roundtrips_payload_reference() {
+        let req = AddRecordRequest {
+            role: "user".to_string(),
+            content_type: "image/png".to_string(),
+            payload_uri: Some("gs://bucket/prefix/obj.png".to_string()),
+            payload_size: Some(2048),
+            payload_checksum: Some("sha256:abc".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: AddRecordRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.payload_uri.as_deref(),
+            Some("gs://bucket/prefix/obj.png")
+        );
+        assert_eq!(back.payload_size, Some(2048));
+        assert_eq!(back.payload_checksum.as_deref(), Some("sha256:abc"));
+    }
+
+    #[test]
+    fn record_dto_decodes_payload_reference_and_legacy_shape() {
+        // New shape with a reference.
+        let dto: RecordDto = serde_json::from_str(
+            r#"{"id":"r1","run_id":"run","created_at":"2026-06-27T00:00:00Z","role":"user","content_type":"image/png","lifecycle_status":"active","payload_uri":"s3://b/obj","payload_size":10}"#,
+        )
+        .unwrap();
+        assert_eq!(dto.payload_uri.as_deref(), Some("s3://b/obj"));
+        assert_eq!(dto.payload_size, Some(10));
+        assert_eq!(dto.payload_checksum, None);
+
+        // Legacy shape lacking the reference fields still decodes.
+        let legacy: RecordDto = serde_json::from_str(
+            r#"{"id":"r1","run_id":"run","created_at":"2026-06-27T00:00:00Z","role":"user","content_type":"text/plain","lifecycle_status":"active"}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.payload_uri, None);
     }
 }

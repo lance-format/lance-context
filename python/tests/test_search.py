@@ -61,7 +61,11 @@ class DummyInner:
         embedding: list[float] | None,
         bot_id: str | None,
         session_id: str | None,
+        tenant: str | None,
+        source: str | None,
         external_id: str | None,
+        run_id: str | None,
+        created_at: str | None,
         state_metadata: dict[str, Any] | None,
         metadata_json: str | None,
         expires_at: str | None = None,
@@ -72,6 +76,9 @@ class DummyInner:
         supersedes_id: str | None = None,
         superseded_by_id: str | None = None,
         relationships_json: str | None = None,
+        payload_uri: str | None = None,
+        payload_size: int | None = None,
+        payload_checksum: str | None = None,
     ):
         self.add_calls.append(
             (
@@ -107,7 +114,12 @@ class DummyInner:
         embedding: list[float] | None,
         bot_id: str | None,
         session_id: str | None,
+        tenant: str | None,
+        source: str | None,
         external_id: str | None,
+        run_id: str | None,
+        created_at: str | None,
+        state_metadata: dict[str, Any] | None,
         metadata_json: str | None,
         expires_at: str | None = None,
         retention_policy: str | None = None,
@@ -115,6 +127,9 @@ class DummyInner:
         retired_at: str | None = None,
         retired_reason: str | None = None,
         relationships_json: str | None = None,
+        payload_uri: str | None = None,
+        payload_size: int | None = None,
+        payload_checksum: str | None = None,
         key: str = "external_id",
     ):
         self.upsert_calls.append(
@@ -173,6 +188,8 @@ class DummyInner:
         external_id: str | None,
         bot_id: str | None,
         session_id: str | None,
+        tenant: str | None,
+        source: str | None,
         metadata_json: str | None,
         relationships_json: str | None,
         expires_at: str | None,
@@ -181,6 +198,9 @@ class DummyInner:
         retired_at: str | None,
         retired_reason: str | None,
         embedding: list[float] | None = None,
+        payload_uri: str | None = None,
+        payload_size: int | None = None,
+        payload_checksum: str | None = None,
     ):
         self.update_calls.append(
             {
@@ -1271,7 +1291,11 @@ def test_context_add_many_normalizes_records():
                 "embedding": None,
                 "bot_id": None,
                 "session_id": None,
+                "tenant": None,
+                "source": None,
                 "external_id": None,
+                "run_id": None,
+                "created_at": None,
                 "state_metadata": None,
                 "metadata_json": None,
                 "relationships_json": None,
@@ -1282,6 +1306,9 @@ def test_context_add_many_normalizes_records():
                 "retired_reason": None,
                 "supersedes_id": None,
                 "superseded_by_id": None,
+                "payload_uri": None,
+                "payload_size": None,
+                "payload_checksum": None,
             },
             {
                 "role": "assistant",
@@ -1290,7 +1317,11 @@ def test_context_add_many_normalizes_records():
                 "embedding": [0.1, 0.2],
                 "bot_id": "bot",
                 "session_id": "sess",
+                "tenant": None,
+                "source": None,
                 "external_id": "doc-1#chunk-2",
+                "run_id": None,
+                "created_at": None,
                 "state_metadata": None,
                 "metadata_json": None,
                 "relationships_json": None,
@@ -1301,6 +1332,9 @@ def test_context_add_many_normalizes_records():
                 "retired_reason": None,
                 "supersedes_id": None,
                 "superseded_by_id": None,
+                "payload_uri": None,
+                "payload_size": None,
+                "payload_checksum": None,
             },
         ]
     ]

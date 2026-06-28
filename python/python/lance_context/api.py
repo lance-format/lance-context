@@ -57,6 +57,9 @@ _INGEST_DIRECT_FIELDS = {
     "retired_reason",
     "supersedes_id",
     "superseded_by_id",
+    "payload_uri",
+    "payload_size",
+    "payload_checksum",
 }
 
 
@@ -185,6 +188,9 @@ def _normalize_record(raw: dict[str, Any]) -> dict[str, Any]:
         "content_type": raw.get("content_type"),
         "text": raw.get("text_payload"),
         "binary": raw.get("binary_payload"),
+        "payload_uri": raw.get("payload_uri"),
+        "payload_size": raw.get("payload_size"),
+        "payload_checksum": raw.get("payload_checksum"),
         "embedding": raw.get("embedding"),
         "created_at": _normalize_timestamp(raw.get("created_at")),
         "state_metadata": raw.get("state_metadata"),
@@ -598,6 +604,9 @@ class Context:
         retired_reason: str | None = None,
         supersedes_id: str | None = None,
         superseded_by_id: str | None = None,
+        payload_uri: str | None = None,
+        payload_size: int | None = None,
+        payload_checksum: str | None = None,
     ) -> None:
         if content_type is not None and data_type is not None:
             raise ValueError("Specify only one of content_type or data_type")
@@ -641,6 +650,9 @@ class Context:
             supersedes_id,
             superseded_by_id,
             _json_dumps(relationships, "relationships"),
+            payload_uri,
+            payload_size,
+            payload_checksum,
         )
 
     def upsert(
@@ -665,6 +677,9 @@ class Context:
         lifecycle_status: str | None = None,
         retired_at: datetime | str | None = None,
         retired_reason: str | None = None,
+        payload_uri: str | None = None,
+        payload_size: int | None = None,
+        payload_checksum: str | None = None,
         *,
         key: str = "external_id",
     ) -> dict[str, Any]:
@@ -714,6 +729,9 @@ class Context:
             _coerce_timestamp(retired_at, field_name="retired_at"),
             retired_reason,
             _json_dumps(relationships, "relationships"),
+            payload_uri,
+            payload_size,
+            payload_checksum,
             key,
         )
         return {
@@ -740,12 +758,18 @@ class Context:
         retired_at: datetime | str | None = None,
         retired_reason: str | None = None,
         embedding: list[float] | None = None,
+        payload_uri: str | None = None,
+        payload_size: int | None = None,
+        payload_checksum: str | None = None,
     ) -> dict[str, Any]:
         """Patch mutable fields on a visible record by id or external_id.
 
         Pass ``embedding`` to attach or replace a record's vector after it was
         appended without one (deferred / enrich-later ingestion). The updated
         record participates in vector search once the embedding is set.
+
+        Pass ``payload_uri`` (with optional ``payload_size`` / ``payload_checksum``)
+        to attach an external media reference after the record was created.
         """
         if (id is None) == (external_id is None):
             raise ValueError("Specify exactly one of id or external_id")
@@ -762,6 +786,9 @@ class Context:
             and retired_at is None
             and retired_reason is None
             and embedding is None
+            and payload_uri is None
+            and payload_size is None
+            and payload_checksum is None
         ):
             raise ValueError("update requires at least one patch field")
 
@@ -780,6 +807,9 @@ class Context:
             _coerce_timestamp(retired_at, field_name="retired_at"),
             retired_reason,
             embedding,
+            payload_uri,
+            payload_size,
+            payload_checksum,
         )
         record = result.get("record")
         return {
@@ -863,6 +893,9 @@ class Context:
                     "retired_reason": record.get("retired_reason"),
                     "supersedes_id": record.get("supersedes_id"),
                     "superseded_by_id": record.get("superseded_by_id"),
+                    "payload_uri": record.get("payload_uri"),
+                    "payload_size": record.get("payload_size"),
+                    "payload_checksum": record.get("payload_checksum"),
                 }
             )
 
@@ -956,6 +989,9 @@ class Context:
                         field_name=f"records[{index}].retired_at",
                     ),
                     "retired_reason": record.get("retired_reason"),
+                    "payload_uri": record.get("payload_uri"),
+                    "payload_size": record.get("payload_size"),
+                    "payload_checksum": record.get("payload_checksum"),
                 }
             )
 
@@ -1490,6 +1526,26 @@ class Context:
             return None
         return _normalize_record(result)
 
+    def fetch_payload(self, id: str) -> bytes | None:
+        """Resolve a record's external ``payload_uri`` to its bytes on demand.
+
+        Reads the referenced object (``gs://``/``s3://``/local) using the
+        context's configured ``storage_options``, so large media can live in
+        object storage while ``get``/``list``/``search`` return only the
+        reference. Returns ``None`` if no record with ``id`` exists; raises if
+        the record carries no external payload reference.
+        """
+        return self._inner.fetch_payload(id)
+
+    def put_payload(self, uri: str, data: bytes) -> int:
+        """Offload ``data`` to an object at ``uri`` using the context's
+        ``storage_options``; returns the number of bytes written.
+
+        Pair with ``add(..., payload_uri=uri)`` to store large media outside the
+        dataset and reference it from a record.
+        """
+        return int(self._inner.put_payload(uri, data))
+
     def related(
         self,
         target_id: str,
@@ -1760,6 +1816,9 @@ class AsyncContext:
         retired_reason: str | None = None,
         supersedes_id: str | None = None,
         superseded_by_id: str | None = None,
+        payload_uri: str | None = None,
+        payload_size: int | None = None,
+        payload_checksum: str | None = None,
     ) -> None:
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(
@@ -1785,6 +1844,9 @@ class AsyncContext:
                 retired_reason=retired_reason,
                 supersedes_id=supersedes_id,
                 superseded_by_id=superseded_by_id,
+                payload_uri=payload_uri,
+                payload_size=payload_size,
+                payload_checksum=payload_checksum,
             ),
         )
 
@@ -1967,6 +2029,18 @@ class AsyncContext:
             None, lambda: self._sync.get(id=id, external_id=external_id)
         )
 
+    async def fetch_payload(self, id: str) -> bytes | None:
+        """Asynchronously resolve a record's external ``payload_uri`` to bytes."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, lambda: self._sync.fetch_payload(id))
+
+    async def put_payload(self, uri: str, data: bytes) -> int:
+        """Asynchronously offload ``data`` to an object at ``uri``."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, lambda: self._sync.put_payload(uri, data)
+        )
+
     async def list(
         self,
         limit: int | None = None,
@@ -2050,6 +2124,9 @@ class RemoteContext:
         retention_policy: str | None = None,
         supersedes_id: str | None = None,
         relationships: Iterable[Mapping[str, Any]] | None = None,
+        payload_uri: str | None = None,
+        payload_size: int | None = None,
+        payload_checksum: str | None = None,
     ) -> dict[str, Any]:
         """Add a record to the remote context."""
         payload, data_type = _normalize_content(content, content_type)
@@ -2077,6 +2154,9 @@ class RemoteContext:
                 retention_policy=retention_policy,
                 supersedes_id=supersedes_id,
                 relationships_json=rel_json,
+                payload_uri=payload_uri,
+                payload_size=payload_size,
+                payload_checksum=payload_checksum,
             ),
         )
 
@@ -2095,6 +2175,9 @@ class RemoteContext:
         retention_policy: str | None = None,
         supersedes_id: str | None = None,
         relationships: Iterable[Mapping[str, Any]] | None = None,
+        payload_uri: str | None = None,
+        payload_size: int | None = None,
+        payload_checksum: str | None = None,
         key: str = "external_id",
     ) -> dict[str, Any]:
         """Upsert a record by external_id."""
@@ -2121,6 +2204,9 @@ class RemoteContext:
                 retention_policy=retention_policy,
                 supersedes_id=supersedes_id,
                 relationships_json=rel_json,
+                payload_uri=payload_uri,
+                payload_size=payload_size,
+                payload_checksum=payload_checksum,
                 key=key,
             ),
         )
@@ -2142,6 +2228,9 @@ class RemoteContext:
         retired_at: datetime | str | None = None,
         retired_reason: str | None = None,
         embedding: Iterable[float] | None = None,
+        payload_uri: str | None = None,
+        payload_size: int | None = None,
+        payload_checksum: str | None = None,
     ) -> dict[str, Any]:
         """Update a record by id or external_id."""
         meta_json = _json_dumps(metadata, "metadata")
@@ -2167,6 +2256,9 @@ class RemoteContext:
                 retired_at=ret,
                 retired_reason=retired_reason,
                 embedding=emb,
+                payload_uri=payload_uri,
+                payload_size=payload_size,
+                payload_checksum=payload_checksum,
             ),
         )
         if result.get("record") is not None:
@@ -2186,6 +2278,16 @@ class RemoteContext:
             lambda: self._sync.get(id=id, external_id=external_id),
         )
         return _normalize_record(result) if result is not None else None
+
+    async def fetch_payload(self, id: str) -> bytes:
+        """Resolve a record's external ``payload_uri`` to its bytes via the
+        remote server, which reads from object storage using the context's
+        ``storage_options``."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self._sync.fetch_payload(id),
+        )
 
     async def delete(
         self,

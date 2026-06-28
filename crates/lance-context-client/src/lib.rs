@@ -42,6 +42,15 @@ impl RemoteContextStore {
             cached_version: info.version,
         })
     }
+
+    /// Resolve a record's external payload reference to its raw bytes via the
+    /// server. Errors if no such record or the record has no external reference.
+    pub async fn fetch_payload(&self, id: &str) -> ContextResult<Vec<u8>> {
+        self.client
+            .fetch_record_payload(&self.context_name, id)
+            .await
+            .map_err(to_ctx_err)
+    }
 }
 
 impl ContextStoreApi for RemoteContextStore {
@@ -401,6 +410,22 @@ impl ContextClient {
             .send()
             .await?;
         Self::handle_response(resp).await
+    }
+
+    /// Resolve a record's external payload reference to its raw bytes via the
+    /// server, which fetches from object storage using the context's
+    /// `storage_options`. Returns the raw payload bytes on success.
+    pub async fn fetch_record_payload(&self, name: &str, id: &str) -> Result<Vec<u8>, ClientError> {
+        let resp = self
+            .http
+            .get(self.url(&format!("/contexts/{}/records/{}/payload", name, id)))
+            .send()
+            .await?;
+        if resp.status().is_success() {
+            Ok(resp.bytes().await?.to_vec())
+        } else {
+            Err(Self::extract_error(resp).await)
+        }
     }
 
     pub async fn delete_record(

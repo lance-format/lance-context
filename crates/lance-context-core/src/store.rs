@@ -4,13 +4,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow_array::builder::{
-    FixedSizeListBuilder, Float32Builder, Int32Builder, LargeBinaryBuilder, LargeStringBuilder,
-    ListBuilder, StringBuilder, StringDictionaryBuilder, StructBuilder,
+    FixedSizeListBuilder, Float32Builder, Int32Builder, Int64Builder, LargeBinaryBuilder,
+    LargeStringBuilder, ListBuilder, StringBuilder, StringDictionaryBuilder, StructBuilder,
     TimestampMicrosecondBuilder,
 };
 use arrow_array::types::Int8Type;
 use arrow_array::{
-    Array, ArrayRef, DictionaryArray, FixedSizeListArray, Float32Array, Int32Array,
+    Array, ArrayRef, DictionaryArray, FixedSizeListArray, Float32Array, Int32Array, Int64Array,
     LargeBinaryArray, LargeStringArray, ListArray, RecordBatch, RecordBatchIterator, StringArray,
     StructArray, TimestampMicrosecondArray,
 };
@@ -24,7 +24,7 @@ use lance::dataset::optimize::{compact_files, CompactionMetrics, CompactionOptio
 use lance::dataset::NewColumnTransform;
 use lance::dataset::{builder::DatasetBuilder, Dataset, WriteMode, WriteParams};
 use lance::index::DatasetIndexExt;
-use lance::io::{ObjectStoreParams, StorageOptionsAccessor};
+use lance::io::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry, StorageOptionsAccessor};
 use lance::{Error as LanceError, Result as LanceResult};
 use lance_index::mem_wal::MEM_WAL_INDEX_NAME;
 use lance_index::scalar::ScalarIndexParams;
@@ -196,6 +196,10 @@ pub struct ContextStore {
     id_index_type: IdIndexType,
     embedding_dim: i32,
     distance_metric: DistanceMetric,
+    /// Object-store configuration used to resolve external payload references
+    /// (see [`ContextStore::fetch_payload`]). Reuses the same options the
+    /// dataset was opened with so referenced media can live in the same bucket.
+    storage_options: Option<HashMap<String, String>>,
 }
 
 /// Additional configuration when opening a [`ContextStore`].
@@ -358,7 +362,7 @@ impl ContextStore {
             Err(LanceError::DatasetNotFound { .. }) => {
                 let dataset = Self::create_with_options(
                     uri,
-                    storage_options,
+                    storage_options.clone(),
                     &blob_columns,
                     requested_embedding_dim,
                     options.distance_metric.unwrap_or_default(),
@@ -403,6 +407,7 @@ impl ContextStore {
             id_index_type: options.id_index_type,
             embedding_dim,
             distance_metric,
+            storage_options,
         };
 
         // Ensure id index if configured
@@ -492,6 +497,63 @@ impl ContextStore {
         }
 
         Ok(self.dataset.manifest.version)
+    }
+
+    /// Resolve a record's external payload reference to its bytes on demand.
+    ///
+    /// Records may carry a typed [`ContextRecord::payload_uri`] pointing at media
+    /// stored outside the dataset (e.g. `gs://bucket/prefix/<id>`); `list`/`search`
+    /// return that reference without materializing the bytes. This opt-in fetch
+    /// resolves them using the context's configured `storage_options`, so it works
+    /// for `gs://`, `s3://`, and local paths through the same object-store path the
+    /// dataset itself uses.
+    ///
+    /// Returns `Ok(None)` if no record with `id` exists. Returns an error if the
+    /// record exists but carries no external payload reference.
+    // TODO(#115): offer a signed-URL variant (`fetch_payload_url`) where the
+    // backend supports presigning, instead of always streaming the bytes back.
+    pub async fn fetch_payload(&self, id: &str) -> LanceResult<Option<Vec<u8>>> {
+        // Use the list-backed accessor so freshly written (MemWAL-buffered) rows
+        // and lifecycle visibility are handled exactly like every other read.
+        let Some(record) = self.get_by_id(id).await? else {
+            return Ok(None);
+        };
+        let Some(uri) = record.payload_uri.as_deref() else {
+            return Err(LanceError::from(ArrowError::InvalidArgumentError(format!(
+                "record '{id}' has no external payload reference to fetch"
+            ))));
+        };
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        let (store, path) =
+            ObjectStore::from_uri_and_params(registry, uri, &self.payload_store_params()).await?;
+        let bytes = store.read_one_all(&path).await?;
+        Ok(Some(bytes.to_vec()))
+    }
+
+    /// Offload caller-provided bytes to an object at `uri` using the context's
+    /// configured `storage_options`, returning the number of bytes written.
+    ///
+    /// Pairs with [`ContextStore::fetch_payload`]: write the media object here,
+    /// then `add` a record whose `payload_uri` points at `uri`. Inline
+    /// [`ContextRecord::binary_payload`] remains the small-payload path.
+    pub async fn put_payload(&self, uri: &str, bytes: &[u8]) -> LanceResult<u64> {
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        let (store, path) =
+            ObjectStore::from_uri_and_params(registry, uri, &self.payload_store_params()).await?;
+        store.put(&path, bytes).await?;
+        Ok(bytes.len() as u64)
+    }
+
+    /// Object-store parameters threading the context's `storage_options` so the
+    /// same credentials/endpoint apply when resolving external payload URIs.
+    fn payload_store_params(&self) -> ObjectStoreParams {
+        let mut params = ObjectStoreParams::default();
+        if let Some(options) = &self.storage_options {
+            params.storage_options_accessor = Some(Arc::new(
+                StorageOptionsAccessor::with_static_options(options.clone()),
+            ));
+        }
+        params
     }
 
     /// Logically forget a record by internal storage id.
@@ -909,6 +971,15 @@ impl ContextStore {
         if let Some(embedding) = patch.embedding {
             record.embedding = Some(embedding);
         }
+        if let Some(payload_uri) = patch.payload_uri {
+            record.payload_uri = Some(payload_uri);
+        }
+        if let Some(payload_size) = patch.payload_size {
+            record.payload_size = Some(payload_size);
+        }
+        if let Some(payload_checksum) = patch.payload_checksum {
+            record.payload_checksum = Some(payload_checksum);
+        }
 
         self.validate_new_record_id(&record).await?;
         let version = self.write_entries(std::slice::from_ref(&record)).await?;
@@ -943,6 +1014,9 @@ impl ContextStore {
             content_type: CONTENT_TYPE_TOMBSTONE.to_string(),
             text_payload: None,
             binary_payload: None,
+            payload_uri: None,
+            payload_size: None,
+            payload_checksum: None,
             embedding: None,
         };
         self.write_entries(std::slice::from_ref(&tombstone)).await
@@ -1821,17 +1895,20 @@ impl ContextStore {
             true,
             true,
             true,
+            true,
             embedding_dim,
             DistanceMetric::default(),
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn schema_with_options(
         blob_columns: &HashSet<String>,
         include_external_id: bool,
         include_metadata: bool,
         include_relationships: bool,
         include_lifecycle: bool,
+        include_external_reference: bool,
         embedding_dim: i32,
         distance_metric: DistanceMetric,
     ) -> Schema {
@@ -1920,15 +1997,22 @@ impl ContextStore {
             Field::new("content_type", DataType::Utf8, false),
             text_field,
             binary_field,
-            Field::new(
-                "embedding",
-                DataType::FixedSizeList(
-                    Arc::new(Field::new("item", DataType::Float32, true)),
-                    embedding_dim,
-                ),
-                true,
-            ),
         ]);
+        if include_external_reference {
+            fields.extend([
+                Field::new("payload_uri", DataType::Utf8, true),
+                Field::new("payload_size", DataType::Int64, true),
+                Field::new("payload_checksum", DataType::Utf8, true),
+            ]);
+        }
+        fields.push(Field::new(
+            "embedding",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                embedding_dim,
+            ),
+            true,
+        ));
 
         let schema_metadata = HashMap::from([(
             DISTANCE_METRIC_METADATA_KEY.to_string(),
@@ -1961,6 +2045,7 @@ impl ContextStore {
     ) -> LanceResult<Dataset> {
         let schema = Arc::new(Self::schema_with_options(
             blob_columns,
+            true,
             true,
             true,
             true,
@@ -2023,6 +2108,12 @@ impl ContextStore {
             .field_paths()
             .iter()
             .any(|path| path == "source");
+        let include_external_reference = self
+            .dataset
+            .schema()
+            .field_paths()
+            .iter()
+            .any(|path| path == "payload_uri");
         let include_relationships = self.has_relationships_column();
         if !include_external_id && entries.iter().any(|entry| entry.external_id.is_some()) {
             return Err(ArrowError::InvalidArgumentError(
@@ -2057,6 +2148,18 @@ impl ContextStore {
             )
             .into());
         }
+        if !include_external_reference
+            && entries.iter().any(|entry| {
+                entry.payload_uri.is_some()
+                    || entry.payload_size.is_some()
+                    || entry.payload_checksum.is_some()
+            })
+        {
+            return Err(ArrowError::InvalidArgumentError(
+                "external payload references require a context dataset created with external-reference support".to_string(),
+            )
+            .into());
+        }
         if !include_lifecycle && entries.iter().any(ContextRecord::has_non_default_lifecycle) {
             return Err(ArrowError::InvalidArgumentError(
                 "lifecycle fields require a context dataset created with lifecycle support"
@@ -2086,6 +2189,9 @@ impl ContextStore {
         let mut superseded_by_id_builder = StringBuilder::new();
         let mut content_type_builder = StringBuilder::new();
         let mut binary_builder = LargeBinaryBuilder::new();
+        let mut payload_uri_builder = StringBuilder::new();
+        let mut payload_size_builder = Int64Builder::new();
+        let mut payload_checksum_builder = StringBuilder::new();
 
         let text_is_blob = self.blob_columns.contains("text_payload");
         let mut text_string_builder = if !text_is_blob {
@@ -2180,6 +2286,10 @@ impl ContextStore {
                 None => binary_builder.append_null(),
             }
 
+            payload_uri_builder.append_option(entry.payload_uri.as_deref());
+            payload_size_builder.append_option(entry.payload_size);
+            payload_checksum_builder.append_option(entry.payload_checksum.as_deref());
+
             if let Some(metadata) = &entry.state_metadata {
                 state_builder
                     .field_builder::<Int32Builder>(0)
@@ -2269,6 +2379,9 @@ impl ContextStore {
             Arc::new(text_string_builder.unwrap().finish())
         };
         let binary_array: ArrayRef = Arc::new(binary_builder.finish());
+        let payload_uri_array: ArrayRef = Arc::new(payload_uri_builder.finish());
+        let payload_size_array: ArrayRef = Arc::new(payload_size_builder.finish());
+        let payload_checksum_array: ArrayRef = Arc::new(payload_checksum_builder.finish());
         let state_array: ArrayRef = Arc::new(state_builder.finish());
         let embedding_array: ArrayRef = Arc::new(embedding_builder.finish());
 
@@ -2313,6 +2426,13 @@ impl ContextStore {
             ("binary_payload".to_string(), binary_array),
             ("embedding".to_string(), embedding_array),
         ]);
+        if include_external_reference {
+            arrays_by_name.extend([
+                ("payload_uri".to_string(), payload_uri_array),
+                ("payload_size".to_string(), payload_size_array),
+                ("payload_checksum".to_string(), payload_checksum_array),
+            ]);
+        }
 
         let schema: Arc<Schema> = Arc::new(self.dataset.schema().into());
         let arrays = schema
@@ -2367,6 +2487,9 @@ fn batch_to_records(batch: &RecordBatch) -> LanceResult<Vec<ContextRecord>> {
     let superseded_by_id_array = column_as_optional::<StringArray>(batch, "superseded_by_id");
     let content_type_array = column_as::<StringArray>(batch, "content_type")?;
     let binary_array = column_as_optional::<LargeBinaryArray>(batch, "binary_payload");
+    let payload_uri_array = column_as_optional::<StringArray>(batch, "payload_uri");
+    let payload_size_array = column_as_optional::<Int64Array>(batch, "payload_size");
+    let payload_checksum_array = column_as_optional::<StringArray>(batch, "payload_checksum");
     let embedding_array = column_as_optional::<FixedSizeListArray>(batch, "embedding");
 
     // `text_payload` may be projected out, or stored as LargeBinary (blob) or LargeUtf8.
@@ -2559,6 +2682,15 @@ fn batch_to_records(batch: &RecordBatch) -> LanceResult<Vec<ContextRecord>> {
         let retired_reason = optional_string_from_array(retired_reason_array, row);
         let supersedes_id = optional_string_from_array(supersedes_id_array, row);
         let superseded_by_id = optional_string_from_array(superseded_by_id_array, row);
+        let payload_uri = optional_string_from_array(payload_uri_array, row);
+        let payload_size = payload_size_array.and_then(|arr| {
+            if arr.is_null(row) {
+                None
+            } else {
+                Some(arr.value(row))
+            }
+        });
+        let payload_checksum = optional_string_from_array(payload_checksum_array, row);
 
         results.push(ContextRecord {
             id: id_array.value(row).to_string(),
@@ -2589,6 +2721,9 @@ fn batch_to_records(batch: &RecordBatch) -> LanceResult<Vec<ContextRecord>> {
             content_type: content_type_array.value(row).to_string(),
             text_payload,
             binary_payload,
+            payload_uri,
+            payload_size,
+            payload_checksum,
             embedding,
         });
     }
@@ -3001,8 +3136,73 @@ mod tests {
             content_type: CONTENT_TYPE_TEXT.to_string(),
             text_payload: Some(format!("payload-{id}")),
             binary_payload: None,
+            payload_uri: None,
+            payload_size: None,
+            payload_checksum: None,
             embedding: Some(make_embedding(embedding_pivot)),
         }
+    }
+
+    #[test]
+    fn external_payload_reference_roundtrips_add_list_and_fetch() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let media_dir = TempDir::new().unwrap();
+        let object_uri = media_dir
+            .path()
+            .join("media-001.bin")
+            .to_string_lossy()
+            .to_string();
+        let payload = b"\x89PNG\r\n\x1a\n external media bytes".to_vec();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = ContextStore::open(&uri).await.unwrap();
+
+            // Offload bytes to the object store, then reference them by URI.
+            let written = store.put_payload(&object_uri, &payload).await.unwrap();
+            assert_eq!(written, payload.len() as u64);
+
+            let mut record = text_record("media-001", 0.5);
+            record.content_type = "image/png".to_string();
+            record.text_payload = None;
+            record.payload_uri = Some(object_uri.clone());
+            record.payload_size = Some(payload.len() as i64);
+            record.payload_checksum = Some("sha256:deadbeef".to_string());
+            store.add(std::slice::from_ref(&record)).await.unwrap();
+
+            // list returns the reference without materializing the bytes.
+            let listed = store.list(None, None).await.unwrap();
+            assert_eq!(listed.len(), 1);
+            let listed = &listed[0];
+            assert_eq!(listed.payload_uri.as_deref(), Some(object_uri.as_str()));
+            assert_eq!(listed.payload_size, Some(payload.len() as i64));
+            assert_eq!(listed.payload_checksum.as_deref(), Some("sha256:deadbeef"));
+            assert_eq!(listed.binary_payload, None);
+
+            // opt-in fetch resolves the bytes via the context's storage path.
+            let fetched = store.fetch_payload(&record.id).await.unwrap();
+            assert_eq!(fetched, Some(payload.clone()));
+        });
+    }
+
+    #[test]
+    fn fetch_payload_handles_missing_record_and_missing_reference() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = ContextStore::open(&uri).await.unwrap();
+
+            // Unknown id resolves to None rather than erroring.
+            assert_eq!(store.fetch_payload("does-not-exist").await.unwrap(), None);
+
+            // A record without an external reference is an error to fetch.
+            let record = text_record("inline-1", 0.1);
+            store.add(std::slice::from_ref(&record)).await.unwrap();
+            let err = store.fetch_payload(&record.id).await.unwrap_err();
+            assert!(err.to_string().contains("no external payload reference"));
+        });
     }
 
     #[test]
@@ -3980,6 +4180,7 @@ mod tests {
                 true,
                 true,
                 false,
+                true,
                 true,
                 DEFAULT_EMBEDDING_DIM,
                 DistanceMetric::default(),

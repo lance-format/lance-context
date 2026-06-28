@@ -168,6 +168,23 @@ ctx.add("assistant", image)
 
 print("Current version:", ctx.version())
 
+# External media references: keep large media in object storage (GCS/S3/local)
+# and reference it from a record by a typed URI, instead of inlining the bytes.
+object_uri = "gs://my-bucket/media/diagram-001.png"
+ctx.put_payload(object_uri, image_bytes)  # offload bytes via the context's storage_options
+ctx.add(
+    "assistant",
+    "incident timeline diagram",  # inline caption; the media stays in the bucket
+    content_type="image/png",
+    external_id="diagram-001",
+    payload_uri=object_uri,
+    payload_size=len(image_bytes),
+)
+# list/search/get return the reference without fetching the bytes; resolve on demand:
+record = ctx.get(external_id="diagram-001")
+media_bytes = ctx.fetch_payload(record["id"])
+
+
 # Batch append source chunks in one storage operation
 ctx.add_many([
     {
@@ -424,6 +441,9 @@ let record = ContextRecord {
     content_type: "text/plain".into(),
     text_payload: Some("hello world".into()),
     binary_payload: None,
+    payload_uri: None,
+    payload_size: None,
+    payload_checksum: None,
     embedding: None,
 };
 store.add(&[record]).await?;
@@ -446,6 +466,7 @@ We are tracking future enhancements as GitHub issues:
 - ~~[Support standard storage_options / GCS](https://github.com/lance-format/lance-context/issues/45)~~ ✅ **Implemented**
 - [Add relationship column for GraphRAG workflows](https://github.com/lance-format/lance-context/issues/15)
 - ~~[Background compaction for Lance fragments](https://github.com/lance-format/lance-context/issues/16)~~ ✅ **Implemented**
+- ~~[External media references — store large media in object storage by typed URI](https://github.com/lance-format/lance-context/issues/115)~~ ✅ **Implemented**
 
 Contributions are welcome—feel free to comment on the issues above or open your own proposals.
 

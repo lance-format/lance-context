@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
+use axum::body::Body;
 use axum::extract::{Path, Query, State};
+use axum::http::header;
+use axum::response::Response;
 use axum::Json;
 use chrono::Utc;
 use lance_context_api::{
@@ -248,6 +251,51 @@ pub async fn get_record(
     }))
 }
 
+/// Resolve a record's external payload reference to its raw bytes.
+///
+/// Returns the bytes with the record's `content_type` (defaulting to
+/// `application/octet-stream`). `404` if no such record; `400` if the record
+/// carries no external payload reference.
+pub async fn fetch_payload(
+    State(state): State<Arc<AppState>>,
+    Path((name, id)): Path<(String, String)>,
+) -> Result<Response, AppError> {
+    let stores = state.stores.read().await;
+    let store_lock = stores
+        .get(&name)
+        .ok_or_else(|| AppError::NotFound(format!("Context '{}' does not exist", name)))?
+        .clone();
+    drop(stores);
+
+    let store = store_lock.read().await;
+    let record = store
+        .get_by_id(&id)
+        .await
+        .map_err(AppError::from_lance)?
+        .ok_or_else(|| AppError::NotFound(format!("Record '{}' does not exist", id)))?;
+    if record.payload_uri.is_none() {
+        return Err(AppError::InvalidRequest(format!(
+            "record '{}' has no external payload reference to fetch",
+            id
+        )));
+    }
+    let bytes = store
+        .fetch_payload(&id)
+        .await
+        .map_err(AppError::from_lance)?
+        .ok_or_else(|| AppError::NotFound(format!("Record '{}' does not exist", id)))?;
+
+    let content_type = if record.content_type.is_empty() {
+        "application/octet-stream".to_string()
+    } else {
+        record.content_type
+    };
+    Response::builder()
+        .header(header::CONTENT_TYPE, content_type)
+        .body(Body::from(bytes))
+        .map_err(|err| AppError::Internal(err.to_string()))
+}
+
 #[derive(serde::Deserialize)]
 pub struct ExternalIdParams {
     pub external_id: String,
@@ -424,6 +472,9 @@ pub fn record_to_dto(r: ContextRecord) -> RecordDto {
         content_type: r.content_type,
         text_payload: r.text_payload,
         binary_payload: r.binary_payload,
+        payload_uri: r.payload_uri,
+        payload_size: r.payload_size,
+        payload_checksum: r.payload_checksum,
         embedding: r.embedding,
         state_metadata: r.state_metadata.map(|sm| StateMetadataDto {
             step: sm.step,
@@ -489,6 +540,9 @@ fn patch_from_dto(patch: &RecordPatchDto) -> RecordPatch {
         retired_at: patch.retired_at,
         retired_reason: patch.retired_reason.clone(),
         embedding: patch.embedding.clone(),
+        payload_uri: patch.payload_uri.clone(),
+        payload_size: patch.payload_size,
+        payload_checksum: patch.payload_checksum.clone(),
     }
 }
 
@@ -530,6 +584,9 @@ fn record_from_add_request(
         content_type: r.content_type.clone(),
         text_payload: r.text_payload.clone(),
         binary_payload: r.binary_payload.clone(),
+        payload_uri: r.payload_uri.clone(),
+        payload_size: r.payload_size,
+        payload_checksum: r.payload_checksum.clone(),
         embedding: r.embedding.clone(),
     }
 }
@@ -577,6 +634,81 @@ mod tests {
             text_payload: Some(text.to_string()),
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn fetch_payload_returns_bytes_404_and_400() {
+        let context_name = "ctx";
+        let (state, dir) = test_state(context_name).await;
+        let object_uri = dir.path().join("media.bin").to_string_lossy().to_string();
+        let payload = b"external media bytes".to_vec();
+
+        // Offload the object through the store's object-store path.
+        {
+            let stores = state.stores.read().await;
+            let store = stores.get(context_name).unwrap().read().await;
+            store.put_payload(&object_uri, &payload).await.unwrap();
+        }
+
+        // Add a record that references the object instead of inlining bytes.
+        let record = AddRecordRequest {
+            role: "user".to_string(),
+            content_type: "image/png".to_string(),
+            payload_uri: Some(object_uri.clone()),
+            payload_size: Some(payload.len() as i64),
+            ..Default::default()
+        };
+        let (_, Json(add_response)) = add_records(
+            State(state.clone()),
+            Path(context_name.to_string()),
+            Json(AddRecordsRequest {
+                records: vec![record],
+            }),
+        )
+        .await
+        .unwrap();
+        let id = add_response.ids[0].clone();
+
+        // The payload endpoint streams the resolved bytes with the content type.
+        let resp = fetch_payload(
+            State(state.clone()),
+            Path((context_name.to_string(), id.clone())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/png"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), payload.as_slice());
+
+        // Unknown id -> 404.
+        let missing = fetch_payload(
+            State(state.clone()),
+            Path((context_name.to_string(), "does-not-exist".to_string())),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(missing, AppError::NotFound(_)));
+
+        // Record without an external reference -> 400.
+        let (_, Json(inline)) = add_records(
+            State(state.clone()),
+            Path(context_name.to_string()),
+            Json(AddRecordsRequest {
+                records: vec![text_record("inline only")],
+            }),
+        )
+        .await
+        .unwrap();
+        let inline_id = inline.ids[0].clone();
+        let no_ref = fetch_payload(State(state), Path((context_name.to_string(), inline_id)))
+            .await
+            .unwrap_err();
+        assert!(matches!(no_ref, AppError::InvalidRequest(_)));
     }
 
     #[tokio::test]

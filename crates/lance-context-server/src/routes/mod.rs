@@ -59,6 +59,10 @@ pub fn router() -> Router<Arc<AppState>> {
             "/api/v1/contexts/{name}/records/{id}",
             delete(records::delete_record),
         )
+        .route(
+            "/api/v1/contexts/{name}/records/{id}/payload",
+            get(records::fetch_payload),
+        )
         .route("/api/v1/contexts/{name}/search", post(search::search))
         .route("/api/v1/contexts/{name}/retrieve", post(search::retrieve))
         .route(

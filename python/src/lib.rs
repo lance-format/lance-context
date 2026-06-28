@@ -52,6 +52,9 @@ struct RecordInput {
     metadata_json: Option<String>,
     relationships: Vec<Relationship>,
     lifecycle: LifecycleFields,
+    payload_uri: Option<String>,
+    payload_size: Option<i64>,
+    payload_checksum: Option<String>,
 }
 
 #[derive(Default)]
@@ -409,7 +412,7 @@ impl Context {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (role, content, data_type = None, embedding = None, bot_id = None, session_id = None, tenant = None, source = None, external_id = None, run_id = None, created_at = None, state_metadata = None, metadata_json = None, expires_at = None, retention_policy = None, lifecycle_status = None, retired_at = None, retired_reason = None, supersedes_id = None, superseded_by_id = None, relationships_json = None))]
+    #[pyo3(signature = (role, content, data_type = None, embedding = None, bot_id = None, session_id = None, tenant = None, source = None, external_id = None, run_id = None, created_at = None, state_metadata = None, metadata_json = None, expires_at = None, retention_policy = None, lifecycle_status = None, retired_at = None, retired_reason = None, supersedes_id = None, superseded_by_id = None, relationships_json = None, payload_uri = None, payload_size = None, payload_checksum = None))]
     fn add(
         &mut self,
         py: Python<'_>,
@@ -434,6 +437,9 @@ impl Context {
         supersedes_id: Option<String>,
         superseded_by_id: Option<String>,
         relationships_json: Option<String>,
+        payload_uri: Option<String>,
+        payload_size: Option<i64>,
+        payload_checksum: Option<String>,
     ) -> PyResult<()> {
         let lifecycle = LifecycleFields {
             expires_at: parse_optional_datetime(expires_at, "expires_at")?,
@@ -461,6 +467,9 @@ impl Context {
                 metadata_json,
                 relationships: relationships_from_json(relationships_json)?,
                 lifecycle,
+                payload_uri,
+                payload_size,
+                payload_checksum,
             },
             1,
         )?;
@@ -479,7 +488,7 @@ impl Context {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (role, content, data_type = None, embedding = None, bot_id = None, session_id = None, tenant = None, source = None, external_id = None, run_id = None, created_at = None, state_metadata = None, metadata_json = None, expires_at = None, retention_policy = None, lifecycle_status = None, retired_at = None, retired_reason = None, relationships_json = None, key = "external_id"))]
+    #[pyo3(signature = (role, content, data_type = None, embedding = None, bot_id = None, session_id = None, tenant = None, source = None, external_id = None, run_id = None, created_at = None, state_metadata = None, metadata_json = None, expires_at = None, retention_policy = None, lifecycle_status = None, retired_at = None, retired_reason = None, relationships_json = None, payload_uri = None, payload_size = None, payload_checksum = None, key = "external_id"))]
     fn upsert(
         &mut self,
         py: Python<'_>,
@@ -502,6 +511,9 @@ impl Context {
         retired_at: Option<String>,
         retired_reason: Option<String>,
         relationships_json: Option<String>,
+        payload_uri: Option<String>,
+        payload_size: Option<i64>,
+        payload_checksum: Option<String>,
         key: &str,
     ) -> PyResult<PyObject> {
         if key != "external_id" {
@@ -541,6 +553,9 @@ impl Context {
                 metadata_json,
                 relationships: relationships_from_json(relationships_json)?,
                 lifecycle,
+                payload_uri,
+                payload_size,
+                payload_checksum,
             },
             1,
         )?;
@@ -565,7 +580,7 @@ impl Context {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (id = None, external_id = None, bot_id = None, session_id = None, tenant = None, source = None, metadata_json = None, relationships_json = None, expires_at = None, retention_policy = None, lifecycle_status = None, retired_at = None, retired_reason = None, embedding = None))]
+    #[pyo3(signature = (id = None, external_id = None, bot_id = None, session_id = None, tenant = None, source = None, metadata_json = None, relationships_json = None, expires_at = None, retention_policy = None, lifecycle_status = None, retired_at = None, retired_reason = None, embedding = None, payload_uri = None, payload_size = None, payload_checksum = None))]
     fn update(
         &mut self,
         py: Python<'_>,
@@ -583,6 +598,9 @@ impl Context {
         retired_at: Option<String>,
         retired_reason: Option<String>,
         embedding: Option<Vec<f32>>,
+        payload_uri: Option<String>,
+        payload_size: Option<i64>,
+        payload_checksum: Option<String>,
     ) -> PyResult<PyObject> {
         let patch = RecordPatch {
             bot_id,
@@ -598,6 +616,9 @@ impl Context {
             retired_at: parse_optional_datetime(retired_at, "retired_at")?,
             retired_reason,
             embedding,
+            payload_uri,
+            payload_size,
+            payload_checksum,
         };
         if patch.is_empty() {
             return Err(PyRuntimeError::new_err(
@@ -1033,6 +1054,32 @@ impl Context {
         record.map(|record| record_to_py(py, record)).transpose()
     }
 
+    /// Resolve a record's external payload reference to its bytes on demand,
+    /// using the context's configured ``storage_options``. Returns ``None`` if
+    /// no record with ``id`` exists; raises if the record has no external
+    /// payload reference.
+    #[pyo3(signature = (id))]
+    fn fetch_payload(&self, py: Python<'_>, id: &str) -> PyResult<Option<Py<PyBytes>>> {
+        let bytes = py.allow_threads(|| {
+            self.runtime
+                .block_on(self.store.fetch_payload(id))
+                .map_err(to_py_err)
+        })?;
+        Ok(bytes.map(|bytes| PyBytes::new(py, &bytes).unbind()))
+    }
+
+    /// Offload caller-provided bytes to an object at ``uri`` using the context's
+    /// configured ``storage_options``; returns the number of bytes written.
+    /// Pair with a subsequent ``add(..., payload_uri=uri)``.
+    #[pyo3(signature = (uri, data))]
+    fn put_payload(&self, py: Python<'_>, uri: &str, data: &[u8]) -> PyResult<u64> {
+        py.allow_threads(|| {
+            self.runtime
+                .block_on(self.store.put_payload(uri, data))
+                .map_err(to_py_err)
+        })
+    }
+
     #[pyo3(signature = (id = None, external_id = None))]
     fn delete(
         &mut self,
@@ -1231,6 +1278,11 @@ impl Context {
             optional_item(dict, "supersedes_id")?.map(|value| value.extract::<String>());
         let superseded_by_id =
             optional_item(dict, "superseded_by_id")?.map(|value| value.extract::<String>());
+        let payload_uri =
+            optional_item(dict, "payload_uri")?.map(|value| value.extract::<String>());
+        let payload_size = optional_item(dict, "payload_size")?.map(|value| value.extract::<i64>());
+        let payload_checksum =
+            optional_item(dict, "payload_checksum")?.map(|value| value.extract::<String>());
 
         let lifecycle = LifecycleFields {
             expires_at: parse_optional_datetime(expires_at.transpose()?, "expires_at")?,
@@ -1259,6 +1311,9 @@ impl Context {
                 metadata_json: metadata_json.transpose()?,
                 relationships: relationships_from_json(relationships_json.transpose()?)?,
                 lifecycle,
+                payload_uri: payload_uri.transpose()?,
+                payload_size: payload_size.transpose()?,
+                payload_checksum: payload_checksum.transpose()?,
             },
             index as u64 + 1,
         )
@@ -1286,6 +1341,9 @@ impl Context {
             metadata_json,
             relationships,
             lifecycle,
+            payload_uri,
+            payload_size,
+            payload_checksum,
         } = input;
 
         let (content_type, text_payload, binary_payload, inner_content) =
@@ -1340,6 +1398,9 @@ impl Context {
                 content_type,
                 text_payload,
                 binary_payload,
+                payload_uri,
+                payload_size,
+                payload_checksum,
                 embedding,
             },
             role,
@@ -1370,7 +1431,7 @@ impl RemoteContext {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (role, content, data_type = None, embedding = None, bot_id = None, session_id = None, external_id = None, state_metadata = None, metadata_json = None, expires_at = None, retention_policy = None, supersedes_id = None, relationships_json = None))]
+    #[pyo3(signature = (role, content, data_type = None, embedding = None, bot_id = None, session_id = None, external_id = None, state_metadata = None, metadata_json = None, expires_at = None, retention_policy = None, supersedes_id = None, relationships_json = None, payload_uri = None, payload_size = None, payload_checksum = None))]
     fn add(
         &mut self,
         py: Python<'_>,
@@ -1387,6 +1448,9 @@ impl RemoteContext {
         retention_policy: Option<String>,
         supersedes_id: Option<String>,
         relationships_json: Option<String>,
+        payload_uri: Option<String>,
+        payload_size: Option<i64>,
+        payload_checksum: Option<String>,
     ) -> PyResult<PyObject> {
         let (content_type, text_payload, binary_payload) = content_to_payloads(content, data_type)?;
         let req = AddRecordRequest {
@@ -1394,6 +1458,9 @@ impl RemoteContext {
             content_type,
             text_payload,
             binary_payload,
+            payload_uri,
+            payload_size,
+            payload_checksum,
             embedding,
             bot_id,
             session_id,
@@ -1421,7 +1488,7 @@ impl RemoteContext {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (role, content, data_type = None, embedding = None, bot_id = None, session_id = None, external_id = None, metadata_json = None, expires_at = None, retention_policy = None, supersedes_id = None, relationships_json = None, key = "external_id"))]
+    #[pyo3(signature = (role, content, data_type = None, embedding = None, bot_id = None, session_id = None, external_id = None, metadata_json = None, expires_at = None, retention_policy = None, supersedes_id = None, relationships_json = None, payload_uri = None, payload_size = None, payload_checksum = None, key = "external_id"))]
     fn upsert(
         &mut self,
         py: Python<'_>,
@@ -1437,6 +1504,9 @@ impl RemoteContext {
         retention_policy: Option<String>,
         supersedes_id: Option<String>,
         relationships_json: Option<String>,
+        payload_uri: Option<String>,
+        payload_size: Option<i64>,
+        payload_checksum: Option<String>,
         key: &str,
     ) -> PyResult<PyObject> {
         if key != "external_id" {
@@ -1456,6 +1526,9 @@ impl RemoteContext {
             content_type,
             text_payload,
             binary_payload,
+            payload_uri,
+            payload_size,
+            payload_checksum,
             embedding,
             bot_id,
             session_id,
@@ -1485,7 +1558,7 @@ impl RemoteContext {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (id = None, external_id = None, bot_id = None, session_id = None, metadata_json = None, relationships_json = None, expires_at = None, retention_policy = None, lifecycle_status = None, retired_at = None, retired_reason = None, embedding = None))]
+    #[pyo3(signature = (id = None, external_id = None, bot_id = None, session_id = None, metadata_json = None, relationships_json = None, expires_at = None, retention_policy = None, lifecycle_status = None, retired_at = None, retired_reason = None, embedding = None, payload_uri = None, payload_size = None, payload_checksum = None))]
     fn update(
         &mut self,
         py: Python<'_>,
@@ -1501,6 +1574,9 @@ impl RemoteContext {
         retired_at: Option<String>,
         retired_reason: Option<String>,
         embedding: Option<Vec<f32>>,
+        payload_uri: Option<String>,
+        payload_size: Option<i64>,
+        payload_checksum: Option<String>,
     ) -> PyResult<PyObject> {
         let patch = RecordPatchDto {
             bot_id,
@@ -1516,6 +1592,9 @@ impl RemoteContext {
             embedding,
             tenant: None,
             source: None,
+            payload_uri,
+            payload_size,
+            payload_checksum,
         };
         if patch.is_empty() {
             return Err(PyRuntimeError::new_err(
@@ -1587,6 +1666,18 @@ impl RemoteContext {
         record
             .map(|record| dto_record_to_py(py, record))
             .transpose()
+    }
+
+    /// Resolve a record's external payload reference to its bytes via the server,
+    /// which fetches from object storage using the context's ``storage_options``.
+    #[pyo3(signature = (id))]
+    fn fetch_payload(&self, py: Python<'_>, id: &str) -> PyResult<Py<PyBytes>> {
+        let bytes = py.allow_threads(|| {
+            self.runtime
+                .block_on(self.store.fetch_payload(id))
+                .map_err(to_py_err)
+        })?;
+        Ok(PyBytes::new(py, &bytes).unbind())
     }
 
     #[pyo3(signature = (id = None, external_id = None))]
@@ -1930,6 +2021,9 @@ fn record_to_py(py: Python<'_>, record: ContextRecord) -> PyResult<PyObject> {
         content_type,
         text_payload,
         binary_payload,
+        payload_uri,
+        payload_size,
+        payload_checksum,
         embedding,
     } = record;
 
@@ -1984,6 +2078,9 @@ fn record_to_py(py: Python<'_>, record: ContextRecord) -> PyResult<PyObject> {
         Some(payload) => dict.set_item("binary_payload", PyBytes::new(py, &payload))?,
         None => dict.set_item("binary_payload", py.None())?,
     }
+    dict.set_item("payload_uri", payload_uri)?;
+    dict.set_item("payload_size", payload_size)?;
+    dict.set_item("payload_checksum", payload_checksum)?;
     dict.set_item("embedding", embedding)?;
     Ok(dict.into_pyobject(py)?.unbind().into())
 }
@@ -2103,6 +2200,9 @@ fn dto_record_to_py(py: Python<'_>, record: RecordDto) -> PyResult<PyObject> {
         content_type,
         text_payload,
         binary_payload,
+        payload_uri,
+        payload_size,
+        payload_checksum,
         embedding,
         state_metadata,
         metadata,
@@ -2169,6 +2269,9 @@ fn dto_record_to_py(py: Python<'_>, record: RecordDto) -> PyResult<PyObject> {
         Some(payload) => dict.set_item("binary_payload", PyBytes::new(py, &payload))?,
         None => dict.set_item("binary_payload", py.None())?,
     }
+    dict.set_item("payload_uri", payload_uri)?;
+    dict.set_item("payload_size", payload_size)?;
+    dict.set_item("payload_checksum", payload_checksum)?;
     dict.set_item("embedding", embedding)?;
     Ok(dict.into_pyobject(py)?.unbind().into())
 }

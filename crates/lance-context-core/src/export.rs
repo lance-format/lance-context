@@ -1249,6 +1249,9 @@ mod tests {
             content_type: "text/plain".to_string(),
             text_payload: Some(text.to_string()),
             binary_payload: None,
+            payload_uri: None,
+            payload_size: None,
+            payload_checksum: None,
             embedding: None,
         }
     }

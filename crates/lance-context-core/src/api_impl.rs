@@ -408,6 +408,9 @@ fn patch_from_dto(patch: &RecordPatchDto) -> RecordPatch {
         retired_at: patch.retired_at,
         retired_reason: patch.retired_reason.clone(),
         embedding: patch.embedding.clone(),
+        payload_uri: patch.payload_uri.clone(),
+        payload_size: patch.payload_size,
+        payload_checksum: patch.payload_checksum.clone(),
     }
 }
 
@@ -445,6 +448,9 @@ fn record_from_add_request(r: &AddRecordRequest, id: String, run_id: String) -> 
         content_type: r.content_type.clone(),
         text_payload: r.text_payload.clone(),
         binary_payload: r.binary_payload.clone(),
+        payload_uri: r.payload_uri.clone(),
+        payload_size: r.payload_size,
+        payload_checksum: r.payload_checksum.clone(),
         embedding: r.embedding.clone(),
     }
 }
@@ -463,6 +469,9 @@ fn record_to_dto(r: ContextRecord) -> RecordDto {
         content_type: r.content_type,
         text_payload: r.text_payload,
         binary_payload: r.binary_payload,
+        payload_uri: r.payload_uri,
+        payload_size: r.payload_size,
+        payload_checksum: r.payload_checksum,
         embedding: r.embedding,
         state_metadata: r.state_metadata.map(|sm| StateMetadataDto {
             step: sm.step,

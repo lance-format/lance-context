@@ -51,6 +51,16 @@ pub struct ContextRecord {
     pub content_type: String,
     pub text_payload: Option<String>,
     pub binary_payload: Option<Vec<u8>>,
+    /// Typed reference to a payload object stored outside the Lance dataset
+    /// (e.g. `gs://bucket/prefix/<id>`). Large media lives in object storage and
+    /// is fetched on demand via [`ContextStore::fetch_payload`], leaving the
+    /// dataset to hold only metadata, embeddings, and the reference. Distinct
+    /// from inline [`Self::binary_payload`], which stays the small-payload path.
+    pub payload_uri: Option<String>,
+    /// Size in bytes of the externally-referenced payload, when known.
+    pub payload_size: Option<i64>,
+    /// Caller-supplied checksum of the externally-referenced payload, when known.
+    pub payload_checksum: Option<String>,
     pub embedding: Option<Vec<f32>>,
 }
 
@@ -172,6 +182,11 @@ pub struct RecordPatch {
     /// Vector embedding to attach to the record. Enables deferred embedding
     /// workflows: append raw text first, then enrich with an embedding later.
     pub embedding: Option<Vec<f32>>,
+    /// External payload reference to attach to the record. Enables attaching a
+    /// `gs://…`/`s3://…` media reference after the record was first created.
+    pub payload_uri: Option<String>,
+    pub payload_size: Option<i64>,
+    pub payload_checksum: Option<String>,
 }
 
 impl RecordPatch {
@@ -190,6 +205,9 @@ impl RecordPatch {
             && self.retired_at.is_none()
             && self.retired_reason.is_none()
             && self.embedding.is_none()
+            && self.payload_uri.is_none()
+            && self.payload_size.is_none()
+            && self.payload_checksum.is_none()
     }
 }
 
@@ -439,6 +457,9 @@ mod tests {
             content_type: "text/plain".to_string(),
             text_payload: Some("hello".to_string()),
             binary_payload: None,
+            payload_uri: None,
+            payload_size: None,
+            payload_checksum: None,
             embedding: None,
         }
     }
