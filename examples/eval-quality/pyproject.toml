@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lance-context-eval-quality"
+version = "0.1.0"
+description = "Measure retrieval quality with the lance-context eval harness."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["lance-context>=0.5.1"]
+
+[project.scripts]
+eval-quality = "eval_quality.main:main"

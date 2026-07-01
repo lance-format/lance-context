@@ -1,0 +1,8 @@
+{"query_id": "q-auth-lockout", "text": "unlock my account after failed login attempts", "relevant": [{"external_id": "kb-auth-login", "grade": 2.0}, {"external_id": "kb-auth-oauth", "grade": 1.0}]}
+{"query_id": "q-auth-sso", "text": "enable single sign-on with Okta", "relevant": [{"external_id": "kb-auth-oauth", "grade": 2.0}]}
+{"query_id": "q-auth-token", "text": "my api token expired and requests return 401", "relevant": [{"external_id": "kb-auth-token", "grade": 2.0}]}
+{"query_id": "q-billing-refund", "text": "how do I request a refund to my payment method", "relevant": [{"external_id": "kb-billing-refund", "grade": 2.0}, {"external_id": "kb-billing-payment", "grade": 1.0}]}
+{"query_id": "q-billing-invoice", "text": "download my monthly invoice as a pdf", "relevant": [{"external_id": "kb-billing-invoice", "grade": 2.0}]}
+{"query_id": "q-deploy-rollback", "text": "roll back a bad release deployment", "relevant": [{"external_id": "kb-deploy-rollback", "grade": 2.0}, {"external_id": "kb-deploy-canary", "grade": 2.0}, {"external_id": "kb-deploy-release", "grade": 1.0}]}
+{"query_id": "q-storage-encryption", "text": "encrypt objects in a storage bucket", "relevant": [{"external_id": "kb-storage-encryption", "grade": 2.0}, {"external_id": "kb-storage-lifecycle", "grade": 1.0}]}
+{"query_id": "q-storage-upload", "text": "upload large files to a bucket", "relevant": [{"external_id": "kb-storage-upload", "grade": 2.0}]}

@@ -59,6 +59,16 @@ pip install "lance-context[lance-python]"
 
 Then follow the usage examples below to create a `Context`, append entries, and time-travel through versions.
 
+### Examples
+
+Prefer learning by running code? The [`examples/`](./examples) directory has
+self-contained, runnable projects — start with
+[`pypi-basic`](./examples/pypi-basic) for a 5-minute quickstart, then
+[`multi-session`](./examples/multi-session) (concurrent multi-bot writes),
+[`eval-quality`](./examples/eval-quality) (measuring retrieval quality), and
+[`mcp-claude-code`](./examples/mcp-claude-code) (serving a store over MCP). See
+the [examples index](./examples/README.md) for the full list.
+
 ### Python wheels
 
 Release builds publish source distributions plus prebuilt wheels for:
