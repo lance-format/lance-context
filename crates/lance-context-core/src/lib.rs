@@ -7,6 +7,8 @@ mod eval;
 mod export;
 mod namespace;
 mod record;
+mod rollout;
+mod rollout_store;
 pub mod serde;
 mod store;
 
@@ -22,6 +24,10 @@ pub use export::{
     EXPORT_SCHEMA_VERSION,
 };
 pub use namespace::{ContextNamespace, PartitionInfo, PartitionSelector, PartitionSpec};
+pub use rollout::{
+    RolloutRecord, ROLE_ARTIFACT, ROLE_ASSISTANT, ROLE_GRADE, ROLE_TOOL,
+};
+pub use rollout_store::{rollout_schema, RolloutStore, RolloutStoreOptions};
 pub use record::{
     ContextRecord, LifecycleQueryOptions, MetadataFilter, RecordFilters, RecordPatch, Relationship,
     RetrieveResult, SearchResult, StateMetadata, UpdateResult, UpsertResult, LIFECYCLE_ACTIVE,

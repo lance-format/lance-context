@@ -46,7 +46,7 @@ const DEFAULT_SEARCH_LIMIT: usize = 10;
 const DEFAULT_MANIFEST_SCAN_BATCH_SIZE: usize = 16;
 const RRF_K: f32 = 60.0;
 const ID_INDEX_NAME: &str = "id_idx";
-const RELATIONSHIPS_COLUMN: &str = "relationships";
+pub(crate) const RELATIONSHIPS_COLUMN: &str = "relationships";
 /// Schema-metadata key under which the configured [`DistanceMetric`] is persisted
 /// so it round-trips on `open` without being re-specified by the caller.
 const DISTANCE_METRIC_METADATA_KEY: &str = "lance-context:distance_metric";
@@ -243,11 +243,11 @@ fn relationship_struct_data_type() -> DataType {
     DataType::Struct(relationship_struct_fields().into())
 }
 
-fn relationship_list_item_field() -> FieldRef {
+pub(crate) fn relationship_list_item_field() -> FieldRef {
     Arc::new(Field::new("item", relationship_struct_data_type(), true))
 }
 
-fn relationship_field() -> Field {
+pub(crate) fn relationship_field() -> Field {
     Field::new(
         RELATIONSHIPS_COLUMN,
         DataType::List(relationship_list_item_field()),
@@ -255,7 +255,7 @@ fn relationship_field() -> Field {
     )
 }
 
-fn relationship_struct_builder() -> StructBuilder {
+pub(crate) fn relationship_struct_builder() -> StructBuilder {
     let fields: Vec<FieldRef> = relationship_struct_fields()
         .into_iter()
         .map(|field| Arc::new(field) as FieldRef)
@@ -2749,7 +2749,7 @@ fn embedding_from_list(list: &FixedSizeListArray, row: usize) -> LanceResult<Vec
     Ok(embedding)
 }
 
-fn relationships_from_list(list: &ListArray, row: usize) -> LanceResult<Vec<Relationship>> {
+pub(crate) fn relationships_from_list(list: &ListArray, row: usize) -> LanceResult<Vec<Relationship>> {
     let values = list.value(row);
     let struct_array = values
         .as_ref()
@@ -2821,7 +2821,7 @@ fn relationships_from_list(list: &ListArray, row: usize) -> LanceResult<Vec<Rela
     Ok(relationships)
 }
 
-fn timestamp_from_micros(value: i64, column: &str) -> LanceResult<DateTime<Utc>> {
+pub(crate) fn timestamp_from_micros(value: i64, column: &str) -> LanceResult<DateTime<Utc>> {
     DateTime::from_timestamp_micros(value).ok_or_else(|| {
         LanceError::from(ArrowError::InvalidArgumentError(format!(
             "invalid timestamp value {value} in column '{column}'"
@@ -3052,7 +3052,7 @@ fn dot_distance(left: &[f32], right: &[f32]) -> f32 {
     -dot_product(left, right)
 }
 
-fn column_as<'a, A>(batch: &'a RecordBatch, name: &str) -> LanceResult<&'a A>
+pub(crate) fn column_as<'a, A>(batch: &'a RecordBatch, name: &str) -> LanceResult<&'a A>
 where
     A: Array + 'static,
 {
@@ -3068,7 +3068,7 @@ where
     })
 }
 
-fn column_as_optional<'a, A>(batch: &'a RecordBatch, name: &str) -> Option<&'a A>
+pub(crate) fn column_as_optional<'a, A>(batch: &'a RecordBatch, name: &str) -> Option<&'a A>
 where
     A: Array + 'static,
 {
