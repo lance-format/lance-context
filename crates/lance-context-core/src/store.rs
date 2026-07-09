@@ -2749,7 +2749,10 @@ fn embedding_from_list(list: &FixedSizeListArray, row: usize) -> LanceResult<Vec
     Ok(embedding)
 }
 
-pub(crate) fn relationships_from_list(list: &ListArray, row: usize) -> LanceResult<Vec<Relationship>> {
+pub(crate) fn relationships_from_list(
+    list: &ListArray,
+    row: usize,
+) -> LanceResult<Vec<Relationship>> {
     let values = list.value(row);
     let struct_array = values
         .as_ref()

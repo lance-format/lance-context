@@ -28,8 +28,8 @@ use arrow_array::{
 };
 use arrow_schema::{ArrowError, DataType, Field, Schema, TimeUnit};
 use futures::TryStreamExt;
-use lance::datatypes::BlobHandling;
 use lance::dataset::{builder::DatasetBuilder, Dataset, WriteMode, WriteParams};
+use lance::datatypes::BlobHandling;
 use lance::io::{ObjectStoreParams, StorageOptionsAccessor};
 use lance::{Error as LanceError, Result as LanceResult};
 
@@ -78,10 +78,7 @@ impl RolloutStore {
     }
 
     /// Open a rollout dataset with explicit storage and blob configuration.
-    pub async fn open_with_options(
-        uri: &str,
-        options: RolloutStoreOptions,
-    ) -> LanceResult<Self> {
+    pub async fn open_with_options(uri: &str, options: RolloutStoreOptions) -> LanceResult<Self> {
         for col in &options.blob_columns {
             if !VALID_ROLLOUT_BLOB_COLUMNS.contains(&col.as_str()) {
                 return Err(LanceError::from(ArrowError::InvalidArgumentError(format!(
@@ -135,8 +132,10 @@ impl RolloutStore {
 
         let batch = self.records_to_batch(records)?;
         let schema = batch.schema();
-        let batches =
-            RecordBatchIterator::new(vec![Ok::<RecordBatch, ArrowError>(batch)].into_iter(), schema);
+        let batches = RecordBatchIterator::new(
+            vec![Ok::<RecordBatch, ArrowError>(batch)].into_iter(),
+            schema,
+        );
 
         let mut params = WriteParams {
             mode: WriteMode::Append,
@@ -332,8 +331,14 @@ impl RolloutStore {
             append_i32_list(&mut output_tokens_builder, record.output_tokens.as_deref());
             num_input_tokens_builder.append_option(record.num_input_tokens);
             num_output_tokens_builder.append_option(record.num_output_tokens);
-            append_f32_list(&mut output_logprobs_builder, record.output_logprobs.as_deref());
-            append_f32_list(&mut input_logprobs_builder, record.input_logprobs.as_deref());
+            append_f32_list(
+                &mut output_logprobs_builder,
+                record.output_logprobs.as_deref(),
+            );
+            append_f32_list(
+                &mut input_logprobs_builder,
+                record.input_logprobs.as_deref(),
+            );
             append_f32_list(&mut ref_logprobs_builder, record.ref_logprobs.as_deref());
             append_i8_list(&mut loss_mask_builder, record.loss_mask.as_deref());
             advantage_builder.append_option(record.advantage);
@@ -377,15 +382,24 @@ impl RolloutStore {
 
         let mut arrays_by_name: HashMap<String, ArrayRef> = HashMap::new();
         arrays_by_name.insert("id".to_string(), Arc::new(id_builder.finish()));
-        arrays_by_name.insert("rollout_id".to_string(), Arc::new(rollout_id_builder.finish()));
-        arrays_by_name.insert("problem_id".to_string(), Arc::new(problem_id_builder.finish()));
+        arrays_by_name.insert(
+            "rollout_id".to_string(),
+            Arc::new(rollout_id_builder.finish()),
+        );
+        arrays_by_name.insert(
+            "problem_id".to_string(),
+            Arc::new(problem_id_builder.finish()),
+        );
         arrays_by_name.insert("dataset".to_string(), Arc::new(dataset_builder.finish()));
         arrays_by_name.insert(
             "sequence_order".to_string(),
             Arc::new(sequence_order_builder.finish()),
         );
         arrays_by_name.insert("role".to_string(), Arc::new(role_builder.finish()));
-        arrays_by_name.insert("created_at".to_string(), Arc::new(created_at_builder.finish()));
+        arrays_by_name.insert(
+            "created_at".to_string(),
+            Arc::new(created_at_builder.finish()),
+        );
         arrays_by_name.insert("content".to_string(), Arc::new(content_builder.finish()));
         arrays_by_name.insert(
             "content_type".to_string(),
@@ -419,11 +433,23 @@ impl RolloutStore {
             "ref_logprobs".to_string(),
             Arc::new(ref_logprobs_builder.finish()),
         );
-        arrays_by_name.insert("loss_mask".to_string(), Arc::new(loss_mask_builder.finish()));
-        arrays_by_name.insert("advantage".to_string(), Arc::new(advantage_builder.finish()));
+        arrays_by_name.insert(
+            "loss_mask".to_string(),
+            Arc::new(loss_mask_builder.finish()),
+        );
+        arrays_by_name.insert(
+            "advantage".to_string(),
+            Arc::new(advantage_builder.finish()),
+        );
         arrays_by_name.insert("reward".to_string(), Arc::new(reward_builder.finish()));
-        arrays_by_name.insert("raw_reward".to_string(), Arc::new(raw_reward_builder.finish()));
-        arrays_by_name.insert("grader_id".to_string(), Arc::new(grader_id_builder.finish()));
+        arrays_by_name.insert(
+            "raw_reward".to_string(),
+            Arc::new(raw_reward_builder.finish()),
+        );
+        arrays_by_name.insert(
+            "grader_id".to_string(),
+            Arc::new(grader_id_builder.finish()),
+        );
         arrays_by_name.insert("score".to_string(), Arc::new(score_builder.finish()));
         arrays_by_name.insert(
             "include_in_training".to_string(),
@@ -618,7 +644,8 @@ fn batch_to_rollout_records(batch: &RecordBatch) -> LanceResult<Vec<RolloutRecor
     let raw_reward_array = column_as_optional::<Float32Array>(batch, "raw_reward");
     let grader_id_array = column_as_optional::<StringArray>(batch, "grader_id");
     let score_array = column_as_optional::<Float32Array>(batch, "score");
-    let include_in_training_array = column_as_optional::<BooleanArray>(batch, "include_in_training");
+    let include_in_training_array =
+        column_as_optional::<BooleanArray>(batch, "include_in_training");
     let exclude_reason_array = column_as_optional::<StringArray>(batch, "exclude_reason");
     let policy_version_array = column_as_optional::<StringArray>(batch, "policy_version");
     let relationships_array = column_as_optional::<ListArray>(batch, RELATIONSHIPS_COLUMN);
@@ -646,7 +673,9 @@ fn batch_to_rollout_records(batch: &RecordBatch) -> LanceResult<Vec<RolloutRecor
                     "role column contains null values".to_string(),
                 )));
             }
-            values.value(role_array.keys().value(row) as usize).to_string()
+            values
+                .value(role_array.keys().value(row) as usize)
+                .to_string()
         };
 
         let metadata = match metadata_array {
@@ -762,11 +791,14 @@ fn optional_i32_list(array: Option<&ListArray>, row: usize) -> LanceResult<Optio
     match array {
         Some(arr) if !arr.is_null(row) => {
             let values = arr.value(row);
-            let typed = values.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
-                LanceError::from(ArrowError::InvalidArgumentError(
-                    "token list column does not contain int32 values".to_string(),
-                ))
-            })?;
+            let typed = values
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| {
+                    LanceError::from(ArrowError::InvalidArgumentError(
+                        "token list column does not contain int32 values".to_string(),
+                    ))
+                })?;
             Ok(Some((0..typed.len()).map(|i| typed.value(i)).collect()))
         }
         _ => Ok(None),
@@ -777,11 +809,14 @@ fn optional_f32_list(array: Option<&ListArray>, row: usize) -> LanceResult<Optio
     match array {
         Some(arr) if !arr.is_null(row) => {
             let values = arr.value(row);
-            let typed = values.as_any().downcast_ref::<Float32Array>().ok_or_else(|| {
-                LanceError::from(ArrowError::InvalidArgumentError(
-                    "logprob list column does not contain float32 values".to_string(),
-                ))
-            })?;
+            let typed = values
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| {
+                    LanceError::from(ArrowError::InvalidArgumentError(
+                        "logprob list column does not contain float32 values".to_string(),
+                    ))
+                })?;
             Ok(Some((0..typed.len()).map(|i| typed.value(i)).collect()))
         }
         _ => Ok(None),

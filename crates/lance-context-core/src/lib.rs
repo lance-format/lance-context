@@ -24,15 +24,13 @@ pub use export::{
     EXPORT_SCHEMA_VERSION,
 };
 pub use namespace::{ContextNamespace, PartitionInfo, PartitionSelector, PartitionSpec};
-pub use rollout::{
-    RolloutRecord, ROLE_ARTIFACT, ROLE_ASSISTANT, ROLE_GRADE, ROLE_TOOL,
-};
-pub use rollout_store::{rollout_schema, RolloutStore, RolloutStoreOptions};
 pub use record::{
     ContextRecord, LifecycleQueryOptions, MetadataFilter, RecordFilters, RecordPatch, Relationship,
     RetrieveResult, SearchResult, StateMetadata, UpdateResult, UpsertResult, LIFECYCLE_ACTIVE,
     LIFECYCLE_CONTRADICTED,
 };
+pub use rollout::{RolloutRecord, ROLE_ARTIFACT, ROLE_ASSISTANT, ROLE_GRADE, ROLE_TOOL};
+pub use rollout_store::{rollout_schema, RolloutStore, RolloutStoreOptions};
 pub use store::{
     CompactionConfig, CompactionStats, ContextStore, ContextStoreOptions, DistanceMetric,
     IdIndexType, ReadProjection,
