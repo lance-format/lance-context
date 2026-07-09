@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -36,18 +36,10 @@ pub async fn create_rollout_store(
     }
     drop(stores);
 
-    // `None` keeps the default blob offload of `binary_payload`; an explicit
-    // empty list stores it inline.
-    let blob_columns: HashSet<String> = req
-        .blob_columns
-        .unwrap_or_else(|| vec!["binary_payload".to_string()])
-        .into_iter()
-        .collect();
-
     let uri = state.rollout_uri(&req.name);
     let options = RolloutStoreOptions {
         storage_options: req.storage_options,
-        blob_columns,
+        shard_id: state.instance_id.clone(),
     };
 
     let store = RolloutStore::open_with_options(&uri, options)
@@ -341,7 +333,7 @@ pub async fn get_rollout(
     }))
 }
 
-/// Materialize a rollout row's offloaded `binary_payload` bytes. The artifact
+/// Materialize a rollout row's `binary_payload` bytes. The artifact
 /// bytes are opaque, so they stream as `application/octet-stream`. `404` when
 /// the row is absent or carries no payload.
 pub async fn fetch_rollout_blob(
@@ -512,13 +504,13 @@ mod tests {
             stores: RwLock::new(HashMap::new()),
             rollout_stores: RwLock::new(HashMap::new()),
             base_path: dir.path().to_path_buf(),
+            instance_id: None,
         });
         let (_status, _info) = create_rollout_store(
             State(state.clone()),
             Json(CreateRolloutStoreRequest {
                 name: "rl".to_string(),
                 storage_options: None,
-                blob_columns: None,
             }),
         )
         .await
@@ -575,7 +567,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn add_rollouts_json_inlines_and_offloads_blob() {
+    async fn add_rollouts_json_projects_blob_out_but_fetch_materializes() {
         let (state, _dir) = rollout_state().await;
         let payload = b"artifact-bytes".to_vec();
         let mut record = record_with_size("r0", Some(payload.len() as i64));
@@ -596,7 +588,7 @@ mod tests {
         assert_eq!(resp.count, 1);
         assert_eq!(resp.ids, vec!["r0".to_string()]);
 
-        // A plain get reads the offloaded column back as None...
+        // A plain get projects the binary column out, reading it back as None...
         let Json(got) = get_rollout(
             State(state.clone()),
             Path(("rl".to_string(), "r0".to_string())),

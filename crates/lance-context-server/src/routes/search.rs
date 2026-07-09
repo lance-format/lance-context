@@ -157,6 +157,7 @@ mod tests {
             stores: RwLock::new(stores),
             rollout_stores: RwLock::new(HashMap::new()),
             base_path: dir.path().to_path_buf(),
+            instance_id: None,
         });
         (state, dir)
     }

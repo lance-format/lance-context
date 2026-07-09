@@ -574,8 +574,6 @@ pub struct CreateRolloutStoreRequest {
     pub name: String,
     #[serde(default)]
     pub storage_options: Option<std::collections::HashMap<String, String>>,
-    #[serde(default)]
-    pub blob_columns: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
