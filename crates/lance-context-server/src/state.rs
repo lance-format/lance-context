@@ -11,14 +11,20 @@ pub struct AppState {
     pub stores: RwLock<HashMap<String, Arc<RwLock<ContextStore>>>>,
     pub rollout_stores: RwLock<HashMap<String, Arc<RwLock<RolloutStore>>>>,
     pub base_path: PathBuf,
+    /// Stable identity of this server instance, used as the MemWAL shard key for
+    /// rollout writes so each instance owns exactly one shard. `None` falls back
+    /// to a single shared shard (single-instance deployments only).
+    pub instance_id: Option<String>,
 }
 
 impl AppState {
     pub fn new(config: ServerConfig) -> Self {
+        let instance_id = config.resolved_instance_id();
         Self {
             stores: RwLock::new(HashMap::new()),
             rollout_stores: RwLock::new(HashMap::new()),
             base_path: PathBuf::from(&config.data_dir),
+            instance_id,
         }
     }
 

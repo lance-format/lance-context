@@ -3,16 +3,48 @@
 //! [`RolloutStore`] is a second, independent first-class store alongside
 //! [`crate::store::ContextStore`]. It owns its own Lance dataset and Arrow
 //! schema (see [`crate::rollout::RolloutRecord`] and spec §5) but reuses the
-//! schema-agnostic infrastructure: native dataset versioning, blob v2 payload
-//! offload, and the relationship graph.
+//! schema-agnostic infrastructure: MemWAL ingest and the relationship graph.
 //!
-//! Unlike `ContextStore`, the v1 write path is a plain atomic
-//! [`Dataset::append`] — no MemWAL region grouping (that machinery is specific
-//! to conversation `bot_id`/`session_id` sharding). Rollout writes still get
-//! native versioning (`checkout`), blob offload, and relationships, all at the
-//! schema level.
+//! # Artifact bytes are stored inline, not blob-v2 offloaded
+//!
+//! `binary_payload` holds artifact bytes (spec §6) as a plain inline
+//! `LargeBinary` column, *not* a blob-v2 offloaded column. Rollout reads go
+//! exclusively through the MemWAL LSM scanner
+//! ([`RolloutStore::lsm_scanner`]), which has no blob-materialization step: a
+//! blob-v2 (`lance-encoding:blob`) column reads back as `None` through it, so
+//! [`RolloutStore::get_blob`] could never return the bytes. Inline storage is
+//! therefore the only encoding that round-trips. To keep the "learner doesn't
+//! pay for artifacts" property (spec §2), list-style scans project the column
+//! out (see [`RolloutStore::list`]) rather than relying on physical offload.
+//!
+//! # Distributed writes: server-id sharding
+//!
+//! High fan-in rollout ingest (spec §2: thousands of workers) is served by
+//! writing through Lance's **MemWAL** rather than a plain [`Dataset::append`].
+//! Each REST server instance owns exactly one MemWAL shard, keyed by its
+//! server/instance id (see [`RolloutStoreOptions::shard_id`]). Because a shard
+//! has a single active writer per instance and no two instances share a shard,
+//! the MemWAL epoch-fencing invariant holds *by construction* — there is never
+//! a write war, no matter how a load balancer spreads worker requests across
+//! instances. See `specs/rollout-deployment.md`.
+//!
+//! `MemWAL close-per-append` makes each write durable on object storage before
+//! `add` returns, and the read path ([`RolloutStore::lsm_scanner`]) rebuilds
+//! purely from object storage (base table ∪ every shard's flushed
+//! generations). So any instance reads every instance's writes — reads are not
+//! pinned to the writer node.
+//!
+//! # Reproducibility without `checkout`
+//!
+//! MemWAL writes land in a separate `_mem_wal/` manifest namespace and do not
+//! bump the base dataset version, so per-`add` [`RolloutStore::checkout`] no
+//! longer isolates a single append (it did under the old atomic-append path).
+//! This is intentional: rollout rows are **append-only and immutable**, so "the
+//! exact rollouts that trained checkpoint N" is a *filter over immutable rows*
+//! (e.g. by `policy_version`), not a table snapshot — reproducible because the
+//! rows never change. `checkout` remains available for base-table time-travel.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::builder::{
@@ -28,10 +60,15 @@ use arrow_array::{
 };
 use arrow_schema::{ArrowError, DataType, Field, Schema, TimeUnit};
 use futures::TryStreamExt;
+use lance::dataset::mem_wal::{
+    DatasetMemWalExt, LsmScanner, ShardManifestStore, ShardSnapshot, ShardWriterConfig,
+};
 use lance::dataset::{builder::DatasetBuilder, Dataset, WriteMode, WriteParams};
-use lance::datatypes::BlobHandling;
+use lance::index::DatasetIndexExt;
 use lance::io::{ObjectStoreParams, StorageOptionsAccessor};
 use lance::{Error as LanceError, Result as LanceResult};
+use lance_index::mem_wal::MEM_WAL_INDEX_NAME;
+use uuid::Uuid;
 
 use crate::rollout::RolloutRecord;
 use crate::store::{
@@ -40,68 +77,57 @@ use crate::store::{
     RELATIONSHIPS_COLUMN,
 };
 
-/// Blob v2 columns permitted on a rollout dataset. `binary_payload` holds
-/// artifact bytes offloaded to independent files (spec §6).
-const VALID_ROLLOUT_BLOB_COLUMNS: &[&str] = &["binary_payload"];
+/// Number of shard manifest files to scan per batch when discovering the latest
+/// shard state (mirrors the constant used by `ContextStore`).
+const DEFAULT_MANIFEST_SCAN_BATCH_SIZE: usize = 16;
 
 /// Configuration for opening a [`RolloutStore`].
 #[derive(Debug, Clone, Default)]
 pub struct RolloutStoreOptions {
     /// Object-store credentials/config (e.g. S3), forwarded to Lance.
     pub storage_options: Option<HashMap<String, String>>,
-    /// Columns physically offloaded via blob v2. Only `binary_payload` is valid.
-    /// Empty means `binary_payload` is stored inline (no offload).
-    pub blob_columns: HashSet<String>,
+    /// Stable identity of the writing server instance (e.g. a StatefulSet
+    /// ordinal hostname like `rollout-0`). Rollout writes go to the MemWAL
+    /// shard derived from this id, so each instance owns exactly one shard and
+    /// no two instances ever contend for the same shard. `None` falls back to a
+    /// single fixed shard (`"default"`), which is correct for single-instance
+    /// deployments but must be set per-instance when running multiple writers.
+    /// See `specs/rollout-deployment.md`.
+    pub shard_id: Option<String>,
 }
 
 /// A Lance-backed store for RL rollout trajectories.
 pub struct RolloutStore {
     dataset: Dataset,
-    storage_options: Option<HashMap<String, String>>,
-    blob_columns: HashSet<String>,
+    /// MemWAL shard this instance writes to (derived from `shard_id`).
+    write_shard: Uuid,
 }
 
 impl RolloutStore {
-    /// Open an existing rollout dataset or create a new one, defaulting
-    /// `binary_payload` to a blob v2 (offloaded) column.
+    /// Open an existing rollout dataset or create a new one with default
+    /// options (`binary_payload` stored inline; see [`RolloutStoreOptions`]).
+    ///
+    /// Uses the fallback single-shard identity; for a multi-instance deployment
+    /// open with [`RolloutStoreOptions::shard_id`] set per instance.
     pub async fn open(uri: &str) -> LanceResult<Self> {
-        let mut blob_columns = HashSet::new();
-        blob_columns.insert("binary_payload".to_string());
-        Self::open_with_options(
-            uri,
-            RolloutStoreOptions {
-                storage_options: None,
-                blob_columns,
-            },
-        )
-        .await
+        Self::open_with_options(uri, RolloutStoreOptions::default()).await
     }
 
-    /// Open a rollout dataset with explicit storage and blob configuration.
+    /// Open a rollout dataset with explicit storage and shard configuration.
     pub async fn open_with_options(uri: &str, options: RolloutStoreOptions) -> LanceResult<Self> {
-        for col in &options.blob_columns {
-            if !VALID_ROLLOUT_BLOB_COLUMNS.contains(&col.as_str()) {
-                return Err(LanceError::from(ArrowError::InvalidArgumentError(format!(
-                    "invalid rollout blob column '{}': valid columns are {:?}",
-                    col, VALID_ROLLOUT_BLOB_COLUMNS
-                ))));
-            }
-        }
-
         let storage_options = options.storage_options.clone();
-        let blob_columns = options.blob_columns.clone();
+        let write_shard = derive_shard_id(options.shard_id.as_deref());
         let dataset = match Self::load_with_options(uri, storage_options.clone()).await {
             Ok(dataset) => dataset,
             Err(LanceError::DatasetNotFound { .. }) => {
-                Self::create_with_options(uri, storage_options.clone(), &blob_columns).await?
+                Self::create_with_options(uri, storage_options.clone()).await?
             }
             Err(err) => return Err(err),
         };
 
         Ok(Self {
             dataset,
-            storage_options,
-            blob_columns,
+            write_shard,
         })
     }
 
@@ -124,43 +150,72 @@ impl RolloutStore {
         Ok(())
     }
 
-    /// Append rollout rows in one atomic write; returns the new dataset version.
+    /// Append rollout rows through this instance's MemWAL shard; returns the
+    /// current base dataset version.
+    ///
+    /// The write is routed to the shard derived from the configured
+    /// `shard_id`, so concurrent appends from other server instances (each
+    /// owning a distinct shard) never contend. `close`-per-append flushes the
+    /// rows to object storage before returning, so they are immediately visible
+    /// to reads on any instance (see [`Self::lsm_scanner`]).
+    ///
+    /// The returned value is the base dataset version, which MemWAL appends do
+    /// **not** advance; it is retained for API compatibility, not as a per-append
+    /// snapshot handle (see the module docs on reproducibility).
     pub async fn add(&mut self, records: &[RolloutRecord]) -> LanceResult<u64> {
         if records.is_empty() {
             return Ok(self.dataset.manifest.version);
         }
 
         let batch = self.records_to_batch(records)?;
-        let schema = batch.schema();
-        let batches = RecordBatchIterator::new(
-            vec![Ok::<RecordBatch, ArrowError>(batch)].into_iter(),
-            schema,
-        );
 
-        let mut params = WriteParams {
-            mode: WriteMode::Append,
+        self.ensure_mem_wal().await?;
+
+        let config = ShardWriterConfig {
+            shard_id: self.write_shard,
             ..Default::default()
         };
-        if let Some(options) = &self.storage_options {
-            params.store_params = Some(ObjectStoreParams {
-                storage_options_accessor: Some(Arc::new(
-                    StorageOptionsAccessor::with_static_options(options.clone()),
-                )),
-                ..Default::default()
-            });
-        }
+        let writer = self
+            .dataset
+            .mem_wal_writer(self.write_shard, config)
+            .await?;
+        writer.put(vec![batch]).await?;
+        writer.close().await?;
 
-        self.dataset.append(batches, Some(params)).await?;
         Ok(self.dataset.manifest.version)
     }
 
-    /// List rollout rows in storage order.
+    /// Initialize the (unsharded) MemWAL index on first write, exactly once.
+    /// Subsequent writes see the index already present and skip this. The shard
+    /// a write targets is chosen by the writer (`shard_id`), independent of the
+    /// index's declared sharding strategy.
+    async fn ensure_mem_wal(&mut self) -> LanceResult<()> {
+        let indices = self.dataset.load_indices().await?;
+        let has_mem_wal = indices.iter().any(|i| i.name == MEM_WAL_INDEX_NAME);
+        if !has_mem_wal {
+            self.dataset
+                .initialize_mem_wal()
+                .unsharded()
+                .execute()
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// List rollout rows (base table ∪ every instance's flushed MemWAL rows).
+    ///
+    /// `binary_payload` is projected out so artifact bytes are never
+    /// materialized on a list scan (spec §2); fetch them on demand via
+    /// [`Self::get_blob`]. Ordering is not guaranteed to match append order
+    /// because the LSM read path dedups by `id` across generations.
     pub async fn list(
         &self,
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> LanceResult<Vec<RolloutRecord>> {
-        let scanner = self.dataset.scan();
+        let columns = self.non_blob_columns();
+        let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+        let scanner = self.lsm_scanner().await?.project(&refs);
         let mut stream = scanner.try_into_stream().await?;
         let mut results = Vec::new();
         while let Some(batch) = stream.try_next().await? {
@@ -176,37 +231,41 @@ impl RolloutStore {
         Ok(results)
     }
 
-    /// Retrieve a single rollout row by its unique id.
+    /// Retrieve a single rollout row by its unique id, including any freshly
+    /// appended (MemWAL-flushed) row on any instance. `binary_payload` is
+    /// projected out (fetch bytes via [`Self::get_blob`]).
     pub async fn get_by_id(&self, id: &str) -> LanceResult<Option<RolloutRecord>> {
         let escaped_id = id.replace('\'', "''");
-        let mut scanner = self.dataset.scan();
-        scanner.filter(&format!("id = '{}'", escaped_id))?;
-        scanner.limit(Some(1), None)?;
-
+        let columns = self.non_blob_columns();
+        let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+        let scanner = self
+            .lsm_scanner()
+            .await?
+            .project(&refs)
+            .filter(&format!("id = '{}'", escaped_id))?;
         let mut stream = scanner.try_into_stream().await?;
-        if let Some(batch) = stream.try_next().await? {
-            return Ok(batch_to_rollout_records(&batch)?.into_iter().next());
+        while let Some(batch) = stream.try_next().await? {
+            for record in batch_to_rollout_records(&batch)? {
+                if record.id == id {
+                    return Ok(Some(record));
+                }
+            }
         }
         Ok(None)
     }
 
     /// Fetch a single artifact row's `binary_payload` bytes on demand.
     ///
-    /// When `binary_payload` is offloaded via blob v2 (the default, see
-    /// [`RolloutStore::open`]), a normal scan returns the column as a
-    /// description and [`RolloutRecord::binary_payload`] reads back as `None`.
-    /// This method forces byte materialization with
-    /// [`BlobHandling::AllBinary`]. Returns `None` if the row or its payload is
-    /// absent.
+    /// `list`/`get_by_id` project `binary_payload` out, so it reads back as
+    /// `None` there. This method projects it in and reads the inline bytes
+    /// directly. Returns `None` if the row or its payload is absent.
     pub async fn get_blob(&self, id: &str) -> LanceResult<Option<Vec<u8>>> {
         let escaped_id = id.replace('\'', "''");
-        let mut scanner = self.dataset.scan();
-        scanner.project(&["id", "binary_payload"])?;
-        scanner.filter(&format!("id = '{}'", escaped_id))?;
-        if self.blob_columns.contains("binary_payload") {
-            scanner.blob_handling(BlobHandling::AllBinary);
-        }
-
+        let scanner = self
+            .lsm_scanner()
+            .await?
+            .project(&["id", "binary_payload"])
+            .filter(&format!("id = '{}'", escaped_id))?;
         let mut stream = scanner.try_into_stream().await?;
         while let Some(batch) = stream.try_next().await? {
             let id_array = column_as::<StringArray>(&batch, "id")?;
@@ -221,6 +280,56 @@ impl RolloutStore {
             }
         }
         Ok(None)
+    }
+
+    /// Top-level column names excluding `binary_payload`, so list-style scans
+    /// never materialize artifact bytes.
+    fn non_blob_columns(&self) -> Vec<String> {
+        self.dataset
+            .schema()
+            .fields
+            .iter()
+            .map(|field| field.name.clone())
+            .filter(|name| name != "binary_payload")
+            .collect()
+    }
+
+    /// Build an LSM scanner over the base table unioned with every shard's
+    /// flushed MemWAL generations, discovered from object storage. Because the
+    /// snapshot is rebuilt from shard manifests on each call, one instance sees
+    /// every other instance's flushed appends — reads are not pinned to the
+    /// writing instance. Deduplicates by `id`.
+    async fn lsm_scanner(&self) -> LanceResult<LsmScanner> {
+        let object_store = self.dataset.object_store(None).await?;
+        let branch_location = self.dataset.branch_location();
+        let shard_ids = self.dataset.list_mem_wal_latest_shard_ids().await?;
+
+        let mut shard_snapshots = Vec::with_capacity(shard_ids.len());
+        for shard_id in shard_ids {
+            let manifest_store = ShardManifestStore::new(
+                object_store.clone(),
+                &branch_location.path,
+                shard_id,
+                DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
+            );
+            let Some(manifest) = manifest_store.read_latest().await? else {
+                continue;
+            };
+
+            let mut snapshot = ShardSnapshot::new(shard_id)
+                .with_spec_id(manifest.shard_spec_id)
+                .with_current_generation(manifest.current_generation);
+            for flushed in manifest.flushed_generations {
+                snapshot = snapshot.with_flushed_generation(flushed.generation, flushed.path);
+            }
+            shard_snapshots.push(snapshot);
+        }
+
+        Ok(LsmScanner::new(
+            Arc::new(self.dataset.clone()),
+            shard_snapshots,
+            vec!["id".to_string()],
+        ))
     }
 
     async fn load_with_options(
@@ -240,9 +349,8 @@ impl RolloutStore {
     async fn create_with_options(
         uri: &str,
         storage_options: Option<HashMap<String, String>>,
-        blob_columns: &HashSet<String>,
     ) -> LanceResult<Dataset> {
-        let schema = Arc::new(rollout_schema(blob_columns));
+        let schema = Arc::new(rollout_schema());
         let empty_batch = RecordBatch::new_empty(schema.clone());
         let batches = RecordBatchIterator::new(
             vec![Ok::<RecordBatch, ArrowError>(empty_batch)].into_iter(),
@@ -503,24 +611,31 @@ impl RolloutStore {
     }
 }
 
-/// Arrow schema for a rollout dataset (spec §5). `binary_payload` is marked as a
-/// blob v2 column when present in `blob_columns`, so its bytes sink to an
-/// independent file and column scans skip them.
+/// Derive the MemWAL shard UUID a server instance writes to from its stable
+/// instance id. Deterministic (UUID v5), so the same instance id always maps to
+/// the same shard across restarts and reopens — the losing/gaining semantics of
+/// StatefulSet rescheduling therefore keep writing the same physical shard.
+/// `None` maps to a single fixed `"default"` shard for single-instance use.
 #[must_use]
-pub fn rollout_schema(blob_columns: &HashSet<String>) -> Schema {
+pub fn derive_shard_id(instance_id: Option<&str>) -> Uuid {
+    let input = instance_id.unwrap_or("default");
+    Uuid::new_v5(&Uuid::NAMESPACE_OID, input.as_bytes())
+}
+
+/// Arrow schema for a rollout dataset (spec §5). `binary_payload` is a plain
+/// inline `LargeBinary` column: rollout reads go through the MemWAL LSM scanner,
+/// which has no blob-materialization step, so a blob-v2 offloaded column would
+/// read back as `None`. List-style scans project the column out instead (see
+/// [`RolloutStore::list`]).
+#[must_use]
+pub fn rollout_schema() -> Schema {
     let mut id_metadata = HashMap::new();
     id_metadata.insert(
         "lance-schema:unenforced-primary-key".to_string(),
         "true".to_string(),
     );
 
-    let binary_field = if blob_columns.contains("binary_payload") {
-        let mut metadata = HashMap::new();
-        metadata.insert("lance-encoding:blob".to_string(), "true".to_string());
-        Field::new("binary_payload", DataType::LargeBinary, true).with_metadata(metadata)
-    } else {
-        Field::new("binary_payload", DataType::LargeBinary, true)
-    };
+    let binary_field = Field::new("binary_payload", DataType::LargeBinary, true);
 
     let fields = vec![
         // Identity & grouping.
@@ -953,8 +1068,8 @@ mod tests {
             assert_eq!(a.relation, e.relation);
             assert_eq!(a.weight, e.weight);
         }
-        // `binary_payload` is offloaded via blob v2, so `list`/`get_by_id`
-        // scans read it back as `None` (byte materialization is verified
+        // `binary_payload` is projected out of `list`/`get_by_id` scans, so
+        // they read it back as `None` (byte materialization is verified
         // separately through `get_blob`). The inline sidecar columns still
         // round-trip.
         assert_eq!(actual.payload_size, expected.payload_size);
@@ -973,18 +1088,24 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let mut store = RolloutStore::open(&uri).await.unwrap();
-            let version = store
+            // MemWAL appends land in the `_mem_wal` namespace and do not advance
+            // the base dataset version; `add` returns it unchanged.
+            store
                 .add(&[assistant.clone(), artifact.clone()])
                 .await
                 .unwrap();
-            assert!(version > 1, "append should advance the dataset version");
 
+            // The LSM read path dedups by `id` across generations and does not
+            // guarantee append order, so look rows up by id rather than by
+            // position.
             let listed = store.list(None, None).await.unwrap();
             assert_eq!(listed.len(), 2);
-            assert_records_eq(&listed[0], &assistant);
-            assert_records_eq(&listed[1], &artifact);
-            // Offloaded blob column is not materialized by a plain scan.
-            assert_eq!(listed[1].binary_payload, None);
+            let listed_assistant = listed.iter().find(|r| r.id == "row-0").unwrap();
+            let listed_artifact = listed.iter().find(|r| r.id == "row-1").unwrap();
+            assert_records_eq(listed_assistant, &assistant);
+            assert_records_eq(listed_artifact, &artifact);
+            // Offloaded blob column is projected out of a list scan.
+            assert_eq!(listed_artifact.binary_payload, None);
 
             let fetched = store.get_by_id("row-1").await.unwrap().unwrap();
             assert_records_eq(&fetched, &artifact);
@@ -1002,7 +1123,13 @@ mod tests {
     }
 
     #[test]
-    fn checkout_recovers_earlier_version() {
+    fn appends_accumulate_and_are_immutable() {
+        // MemWAL appends are append-only: successive `add`s accumulate, and a
+        // row is never mutated. Reproducing "the rollouts that trained
+        // checkpoint N" is therefore a filter over immutable rows (here, by id),
+        // not a per-append table snapshot — so this replaces the old
+        // `checkout_recovers_earlier_version` test, whose per-add snapshot
+        // semantics MemWAL intentionally drops.
         let dir = TempDir::new().unwrap();
         let uri = dir.path().to_string_lossy().to_string();
 
@@ -1012,20 +1139,59 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let mut store = RolloutStore::open(&uri).await.unwrap();
-            let first_version = store.add(&[artifact]).await.unwrap();
+            store.add(std::slice::from_ref(&artifact)).await.unwrap();
+
+            // A second append accumulates rather than replacing the first.
             store.add(&[assistant_record("row-1")]).await.unwrap();
             assert_eq!(store.list(None, None).await.unwrap().len(), 2);
 
-            store.checkout(first_version).await.unwrap();
-            let recovered = store.list(None, None).await.unwrap();
-            assert_eq!(recovered.len(), 1);
-            assert_eq!(recovered[0].id, "row-0");
-
-            // Blob offload survives version checkout: the artifact bytes
-            // written in the earlier version are still materializable after
-            // rewinding the dataset to it.
+            // The first-appended row is still present and unchanged after the
+            // later append (immutability), and its inline artifact bytes remain
+            // materializable.
+            let recovered = store.get_by_id("row-0").await.unwrap().unwrap();
+            assert_records_eq(&recovered, &artifact);
             let blob = store.get_blob("row-0").await.unwrap();
             assert_eq!(blob.as_deref(), Some(&artifact_bytes[..]));
+        });
+    }
+
+    #[test]
+    fn distinct_shards_share_one_dataset() {
+        // Two instances writing distinct shards of the same dataset both
+        // contribute to reads, and neither fences the other. This models the
+        // server-id sharding deployment: a load balancer may route appends to
+        // either instance, and every reader sees the union.
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let options = |shard: &str| RolloutStoreOptions {
+                storage_options: None,
+                shard_id: Some(shard.to_string()),
+            };
+
+            let mut instance_a = RolloutStore::open_with_options(&uri, options("rollout-0"))
+                .await
+                .unwrap();
+            instance_a.add(&[assistant_record("a-0")]).await.unwrap();
+
+            let mut instance_b = RolloutStore::open_with_options(&uri, options("rollout-1"))
+                .await
+                .unwrap();
+            instance_b.add(&[assistant_record("b-0")]).await.unwrap();
+
+            // Distinct instance ids derive distinct shards.
+            assert_ne!(
+                derive_shard_id(Some("rollout-0")),
+                derive_shard_id(Some("rollout-1"))
+            );
+
+            // Either instance's reader sees both shards' rows.
+            let seen = instance_b.list(None, None).await.unwrap();
+            assert_eq!(seen.len(), 2);
+            assert!(seen.iter().any(|r| r.id == "a-0"));
+            assert!(seen.iter().any(|r| r.id == "b-0"));
         });
     }
 }

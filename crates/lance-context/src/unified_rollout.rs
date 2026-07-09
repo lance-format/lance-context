@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use lance_context_api::{
     AddRolloutRequest, AddRolloutsResponse, ContextError, ContextResult, RolloutRecordDto,
     RolloutStoreApi,
@@ -29,17 +27,13 @@ impl RolloutStore {
     pub async fn open_with_options(
         uri: &str,
         storage_options: Option<std::collections::HashMap<String, String>>,
-        blob_columns: Option<Vec<String>>,
     ) -> Result<Self, ContextError> {
-        // `None` keeps the default blob offload of `binary_payload`; an explicit
-        // list (including empty) is taken verbatim.
-        let blob_columns: HashSet<String> = match blob_columns {
-            Some(cols) => cols.into_iter().collect(),
-            None => std::iter::once("binary_payload".to_string()).collect(),
-        };
         let options = RolloutStoreOptions {
             storage_options,
-            blob_columns,
+            // Embedded single-process use writes to the fallback shard. A
+            // multi-writer embedded deployment should thread a per-writer id
+            // through here (see `RolloutStoreOptions::shard_id`).
+            shard_id: None,
         };
         let store = LocalStore::open_with_options(uri, options)
             .await
