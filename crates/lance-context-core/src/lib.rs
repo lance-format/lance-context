@@ -7,6 +7,8 @@ mod eval;
 mod export;
 mod namespace;
 mod record;
+mod rollout;
+mod rollout_store;
 pub mod serde;
 mod store;
 
@@ -27,6 +29,8 @@ pub use record::{
     RetrieveResult, SearchResult, StateMetadata, UpdateResult, UpsertResult, LIFECYCLE_ACTIVE,
     LIFECYCLE_CONTRADICTED,
 };
+pub use rollout::{RolloutRecord, ROLE_ARTIFACT, ROLE_ASSISTANT, ROLE_GRADE, ROLE_TOOL};
+pub use rollout_store::{rollout_schema, RolloutStore, RolloutStoreOptions};
 pub use store::{
     CompactionConfig, CompactionStats, ContextStore, ContextStoreOptions, DistanceMetric,
     IdIndexType, ReadProjection,
