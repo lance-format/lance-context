@@ -175,7 +175,10 @@ impl RolloutStore {
             shard_id: self.write_shard,
             ..Default::default()
         };
-        let writer = self.dataset.mem_wal_writer(self.write_shard, config).await?;
+        let writer = self
+            .dataset
+            .mem_wal_writer(self.write_shard, config)
+            .await?;
         writer.put(vec![batch]).await?;
         writer.close().await?;
 
@@ -190,7 +193,11 @@ impl RolloutStore {
         let indices = self.dataset.load_indices().await?;
         let has_mem_wal = indices.iter().any(|i| i.name == MEM_WAL_INDEX_NAME);
         if !has_mem_wal {
-            self.dataset.initialize_mem_wal().unsharded().execute().await?;
+            self.dataset
+                .initialize_mem_wal()
+                .unsharded()
+                .execute()
+                .await?;
         }
         Ok(())
     }
