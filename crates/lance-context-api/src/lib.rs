@@ -135,8 +135,7 @@ pub trait RolloutStoreApi {
 
     /// Materialize a single artifact row's offloaded `binary_payload` bytes.
     /// Returns `None` when the row or its payload is absent.
-    fn get_blob(&self, id: &str)
-        -> impl Future<Output = ContextResult<Option<Vec<u8>>>> + Send;
+    fn get_blob(&self, id: &str) -> impl Future<Output = ContextResult<Option<Vec<u8>>>> + Send;
 
     fn version(&self) -> u64;
 

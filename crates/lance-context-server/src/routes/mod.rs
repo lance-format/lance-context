@@ -79,10 +79,7 @@ pub fn router() -> Router<Arc<AppState>> {
         )
         .route("/api/v1/rollouts", post(rollouts::create_rollout_store))
         .route("/api/v1/rollouts", get(rollouts::list_rollout_stores))
-        .route(
-            "/api/v1/rollouts/{name}",
-            get(rollouts::get_rollout_store),
-        )
+        .route("/api/v1/rollouts/{name}", get(rollouts::get_rollout_store))
         .route(
             "/api/v1/rollouts/{name}",
             delete(rollouts::delete_rollout_store),

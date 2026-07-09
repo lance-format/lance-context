@@ -182,8 +182,10 @@ pub async fn add_rollouts(
     drop(stores);
 
     let ids: Vec<String> = records.iter().map(|r| r.id.clone()).collect();
-    let core_records: Vec<RolloutRecord> =
-        records.iter().map(rollout_record_from_add_request).collect();
+    let core_records: Vec<RolloutRecord> = records
+        .iter()
+        .map(rollout_record_from_add_request)
+        .collect();
     let count = core_records.len();
 
     let mut store = store_lock.write().await;
@@ -595,17 +597,23 @@ mod tests {
         assert_eq!(resp.ids, vec!["r0".to_string()]);
 
         // A plain get reads the offloaded column back as None...
-        let Json(got) = get_rollout(State(state.clone()), Path(("rl".to_string(), "r0".to_string())))
-            .await
-            .unwrap();
+        let Json(got) = get_rollout(
+            State(state.clone()),
+            Path(("rl".to_string(), "r0".to_string())),
+        )
+        .await
+        .unwrap();
         let dto = got.record.expect("row present");
         assert_eq!(dto.payload_size, Some(payload.len() as i64));
         assert!(dto.binary_payload.is_none());
 
         // ...but the blob endpoint materializes the bytes.
-        let resp = fetch_rollout_blob(State(state.clone()), Path(("rl".to_string(), "r0".to_string())))
-            .await
-            .unwrap();
+        let resp = fetch_rollout_blob(
+            State(state.clone()),
+            Path(("rl".to_string(), "r0".to_string())),
+        )
+        .await
+        .unwrap();
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -628,9 +636,12 @@ mod tests {
         assert_eq!(status, StatusCode::CREATED);
         assert_eq!(resp.count, 1);
 
-        let resp = fetch_rollout_blob(State(state.clone()), Path(("rl".to_string(), "r0".to_string())))
-            .await
-            .unwrap();
+        let resp = fetch_rollout_blob(
+            State(state.clone()),
+            Path(("rl".to_string(), "r0".to_string())),
+        )
+        .await
+        .unwrap();
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -722,9 +733,13 @@ mod tests {
     async fn add_rollouts_rejects_empty_records() {
         let (state, _dir) = rollout_state().await;
         let body = serde_json::to_vec(&AddRolloutsRequest { records: vec![] }).unwrap();
-        let err = add_rollouts(State(state.clone()), Path("rl".to_string()), json_request(body))
-            .await
-            .unwrap_err();
+        let err = add_rollouts(
+            State(state.clone()),
+            Path("rl".to_string()),
+            json_request(body),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, AppError::InvalidRequest(_)));
     }
 }
