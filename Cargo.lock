@@ -5370,7 +5370,7 @@ dependencies = [
 
 [[package]]
 name = "lance-context"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "lance-context-api",
  "lance-context-client",
@@ -5380,7 +5380,7 @@ dependencies = [
 
 [[package]]
 name = "lance-context-api"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "base64",
  "chrono",
@@ -5391,7 +5391,7 @@ dependencies = [
 
 [[package]]
 name = "lance-context-client"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "lance-context-api",
  "reqwest 0.12.28",
@@ -5402,7 +5402,7 @@ dependencies = [
 
 [[package]]
 name = "lance-context-core"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "arrow-array 58.3.0",
  "arrow-ipc 58.3.0",
@@ -5425,7 +5425,7 @@ dependencies = [
 
 [[package]]
 name = "lance-context-python"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "chrono",
  "lance-context-api",
@@ -5439,7 +5439,7 @@ dependencies = [
 
 [[package]]
 name = "lance-context-server"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "axum",
  "chrono",

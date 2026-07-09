@@ -1,6 +1,6 @@
 [package]
 name = "lance-context-python"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
 authors = ["Lance Devs <dev@lancedb.com>"]
 publish = false
