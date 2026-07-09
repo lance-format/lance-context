@@ -3,9 +3,10 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use lance_context_api::{
-    AddRecordRequest, AddRecordsResponse, CompactRequest, CompactResponse, CompactStatsResponse,
-    ContextError, ContextResult, ContextStoreApi, DeleteRecordResponse, RecordDto, RecordPatchDto,
-    RelationshipDto, RetrieveRequest, RetrieveResultDto, SearchRequest, SearchResultDto,
+    AddRecordRequest, AddRecordsResponse, AddRolloutRequest, AddRolloutsResponse, CompactRequest,
+    CompactResponse, CompactStatsResponse, ContextError, ContextResult, ContextStoreApi,
+    DeleteRecordResponse, RecordDto, RecordPatchDto, RelationshipDto, RetrieveRequest,
+    RetrieveResultDto, RolloutRecordDto, RolloutStoreApi, SearchRequest, SearchResultDto,
     StateMetadataDto, UpdateRecordRequest, UpdateRecordResponse, UpsertRecordRequest,
     UpsertRecordResponse, UpsertRecordsRequest, UpsertRecordsResponse, UpsertResultDto,
 };
@@ -14,6 +15,8 @@ use crate::record::{
     ContextRecord, LifecycleQueryOptions, RecordFilters, RecordPatch, Relationship, StateMetadata,
     LIFECYCLE_ACTIVE,
 };
+use crate::rollout::RolloutRecord;
+use crate::rollout_store::RolloutStore;
 use crate::store::{CompactionConfig, ContextStore};
 
 impl ContextStoreApi for ContextStore {
@@ -363,6 +366,138 @@ impl ContextStoreApi for ContextStore {
             last_error: stats.last_error,
             total_compactions: stats.total_compactions,
         })
+    }
+}
+
+impl RolloutStoreApi for RolloutStore {
+    async fn add(&mut self, records: &[AddRolloutRequest]) -> ContextResult<AddRolloutsResponse> {
+        let mut ids = Vec::with_capacity(records.len());
+        let mut core_records = Vec::with_capacity(records.len());
+        for r in records {
+            ids.push(r.id.clone());
+            core_records.push(rollout_record_from_add_request(r));
+        }
+
+        let count = core_records.len();
+        let version = RolloutStore::add(self, &core_records)
+            .await
+            .map_err(to_ctx_err)?;
+        Ok(AddRolloutsResponse {
+            version,
+            ids,
+            count,
+        })
+    }
+
+    async fn list(
+        &self,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> ContextResult<Vec<RolloutRecordDto>> {
+        let records = RolloutStore::list(self, limit, offset)
+            .await
+            .map_err(to_ctx_err)?;
+        Ok(records.into_iter().map(rollout_record_to_dto).collect())
+    }
+
+    async fn get(&self, id: &str) -> ContextResult<Option<RolloutRecordDto>> {
+        let record = RolloutStore::get_by_id(self, id)
+            .await
+            .map_err(to_ctx_err)?;
+        Ok(record.map(rollout_record_to_dto))
+    }
+
+    async fn get_blob(&self, id: &str) -> ContextResult<Option<Vec<u8>>> {
+        RolloutStore::get_blob(self, id).await.map_err(to_ctx_err)
+    }
+
+    fn version(&self) -> u64 {
+        RolloutStore::version(self)
+    }
+
+    async fn checkout(&mut self, version: u64) -> ContextResult<()> {
+        RolloutStore::checkout(self, version)
+            .await
+            .map_err(to_ctx_err)
+    }
+}
+
+fn rollout_record_from_add_request(r: &AddRolloutRequest) -> RolloutRecord {
+    RolloutRecord {
+        id: r.id.clone(),
+        rollout_id: r.rollout_id.clone(),
+        problem_id: r.problem_id.clone().unwrap_or_else(|| r.rollout_id.clone()),
+        dataset: r.dataset.clone(),
+        sequence_order: r.sequence_order,
+        role: r.role.clone(),
+        created_at: r.created_at.unwrap_or_else(Utc::now),
+        content: r.content.clone(),
+        content_type: r.content_type.clone(),
+        input_tokens: r.input_tokens.clone(),
+        output_tokens: r.output_tokens.clone(),
+        num_input_tokens: r.num_input_tokens,
+        num_output_tokens: r.num_output_tokens,
+        output_logprobs: r.output_logprobs.clone(),
+        input_logprobs: r.input_logprobs.clone(),
+        ref_logprobs: r.ref_logprobs.clone(),
+        loss_mask: r.loss_mask.clone(),
+        advantage: r.advantage,
+        reward: r.reward,
+        raw_reward: r.raw_reward,
+        grader_id: r.grader_id.clone(),
+        score: r.score,
+        include_in_training: r.include_in_training,
+        exclude_reason: r.exclude_reason.clone(),
+        policy_version: r.policy_version.clone(),
+        relationships: r
+            .relationships
+            .iter()
+            .cloned()
+            .map(dto_to_relationship)
+            .collect(),
+        binary_payload: r.binary_payload.clone(),
+        payload_size: r.payload_size,
+        payload_checksum: r.payload_checksum.clone(),
+        metadata: r.metadata.clone(),
+    }
+}
+
+fn rollout_record_to_dto(r: RolloutRecord) -> RolloutRecordDto {
+    RolloutRecordDto {
+        id: r.id,
+        rollout_id: r.rollout_id,
+        problem_id: r.problem_id,
+        dataset: r.dataset,
+        sequence_order: r.sequence_order,
+        role: r.role,
+        created_at: r.created_at,
+        content: r.content,
+        content_type: r.content_type,
+        input_tokens: r.input_tokens,
+        output_tokens: r.output_tokens,
+        num_input_tokens: r.num_input_tokens,
+        num_output_tokens: r.num_output_tokens,
+        output_logprobs: r.output_logprobs,
+        input_logprobs: r.input_logprobs,
+        ref_logprobs: r.ref_logprobs,
+        loss_mask: r.loss_mask,
+        advantage: r.advantage,
+        reward: r.reward,
+        raw_reward: r.raw_reward,
+        grader_id: r.grader_id,
+        score: r.score,
+        include_in_training: r.include_in_training,
+        exclude_reason: r.exclude_reason,
+        policy_version: r.policy_version,
+        relationships: r
+            .relationships
+            .into_iter()
+            .map(relationship_to_dto)
+            .collect(),
+        binary_payload: r.binary_payload,
+        payload_size: r.payload_size,
+        payload_checksum: r.payload_checksum,
+        metadata: r.metadata,
     }
 }
 

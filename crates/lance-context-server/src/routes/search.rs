@@ -155,6 +155,7 @@ mod tests {
         stores.insert(CTX.to_string(), Arc::new(RwLock::new(store)));
         let state = Arc::new(AppState {
             stores: RwLock::new(stores),
+            rollout_stores: RwLock::new(HashMap::new()),
             base_path: dir.path().to_path_buf(),
         });
         (state, dir)
