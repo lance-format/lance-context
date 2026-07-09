@@ -2,11 +2,13 @@ pub mod compact;
 pub mod contexts;
 pub mod health;
 pub mod records;
+pub mod rollouts;
 pub mod search;
 pub mod versions;
 
 use std::sync::Arc;
 
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{delete, get, patch, post, put};
 use axum::Router;
 
@@ -74,6 +76,34 @@ pub fn router() -> Router<Arc<AppState>> {
         .route(
             "/api/v1/contexts/{name}/compact/stats",
             get(compact::compact_stats),
+        )
+        .route("/api/v1/rollouts", post(rollouts::create_rollout_store))
+        .route("/api/v1/rollouts", get(rollouts::list_rollout_stores))
+        .route("/api/v1/rollouts/{name}", get(rollouts::get_rollout_store))
+        .route(
+            "/api/v1/rollouts/{name}",
+            delete(rollouts::delete_rollout_store),
+        )
+        .route(
+            "/api/v1/rollouts/{name}/records",
+            post(rollouts::add_rollouts)
+                .layer(DefaultBodyLimit::max(rollouts::MAX_ROLLOUT_UPLOAD_BYTES)),
+        )
+        .route(
+            "/api/v1/rollouts/{name}/records",
+            get(rollouts::list_rollouts),
+        )
+        .route(
+            "/api/v1/rollouts/{name}/records/{id}",
+            get(rollouts::get_rollout),
+        )
+        .route(
+            "/api/v1/rollouts/{name}/records/{id}/blob",
+            get(rollouts::fetch_rollout_blob),
+        )
+        .route(
+            "/api/v1/rollouts/{name}/checkout",
+            post(rollouts::checkout_rollout),
         )
 }
 

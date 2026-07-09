@@ -107,6 +107,42 @@ pub trait ContextStoreApi {
 }
 
 // ---------------------------------------------------------------------------
+// Rollout trait
+// ---------------------------------------------------------------------------
+
+/// Remote-capable surface of a rollout store — the subset of `RolloutStore`
+/// operations that cross a process boundary. A rollout store is far smaller than
+/// a context store: append, read, and version, with no upsert/search/compaction.
+///
+/// Artifact bytes (`binary_payload`) travel inline as base64 in JSON or, for
+/// large payloads on the batch endpoint, as raw multipart parts. By the time a
+/// call reaches this trait the bytes are already materialized in memory, so the
+/// signatures are transport-agnostic.
+pub trait RolloutStoreApi {
+    fn add(
+        &mut self,
+        records: &[AddRolloutRequest],
+    ) -> impl Future<Output = ContextResult<AddRolloutsResponse>> + Send;
+
+    fn list(
+        &self,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> impl Future<Output = ContextResult<Vec<RolloutRecordDto>>> + Send;
+
+    fn get(&self, id: &str)
+        -> impl Future<Output = ContextResult<Option<RolloutRecordDto>>> + Send;
+
+    /// Materialize a single artifact row's offloaded `binary_payload` bytes.
+    /// Returns `None` when the row or its payload is absent.
+    fn get_blob(&self, id: &str) -> impl Future<Output = ContextResult<Option<Vec<u8>>>> + Send;
+
+    fn version(&self) -> u64;
+
+    fn checkout(&mut self, version: u64) -> impl Future<Output = ContextResult<()>> + Send;
+}
+
+// ---------------------------------------------------------------------------
 // Context lifecycle
 // ---------------------------------------------------------------------------
 
@@ -530,6 +566,198 @@ pub struct CompactStatsResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Rollout lifecycle
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreateRolloutStoreRequest {
+    pub name: String,
+    #[serde(default)]
+    pub storage_options: Option<std::collections::HashMap<String, String>>,
+    #[serde(default)]
+    pub blob_columns: Option<Vec<String>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RolloutStoreInfo {
+    pub name: String,
+    pub uri: String,
+    pub version: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ListRolloutStoresResponse {
+    pub stores: Vec<RolloutStoreInfo>,
+}
+
+// ---------------------------------------------------------------------------
+// Rollout records
+// ---------------------------------------------------------------------------
+
+/// One rollout row to append. Unlike [`AddRecordRequest`], `id` is
+/// client-supplied: rollout rows carry externally-meaningful identity (a
+/// trajectory row from a harness). Because those ids are opaque and may repeat,
+/// the multipart upload path matches raw binary parts to records by their
+/// zero-based index in the `records` array, not by `id`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AddRolloutRequest {
+    pub id: String,
+    pub rollout_id: String,
+    /// Defaults to `rollout_id` server-side when omitted (non-grouped rollouts).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub problem_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dataset: Option<String>,
+    #[serde(default)]
+    pub sequence_order: i32,
+    #[serde(default = "default_rollout_role")]
+    pub role: String,
+    /// Defaults to the server's current time when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default = "default_content_type")]
+    pub content_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<Vec<i32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<Vec<i32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_input_tokens: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_output_tokens: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_logprobs: Option<Vec<f32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_logprobs: Option<Vec<f32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_logprobs: Option<Vec<f32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loss_mask: Option<Vec<i8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advantage: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reward: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_reward: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grader_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_in_training: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclude_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relationships: Vec<RelationshipDto>,
+    /// Inline artifact bytes. On the batch endpoint, large payloads may instead
+    /// travel as a raw multipart part named for this record's zero-based index
+    /// in the `records` array, avoiding base64 inflation.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_base64_opt",
+        deserialize_with = "deserialize_base64_opt"
+    )]
+    pub binary_payload: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_size: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_checksum: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AddRolloutsRequest {
+    pub records: Vec<AddRolloutRequest>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AddRolloutsResponse {
+    pub version: u64,
+    pub ids: Vec<String>,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RolloutRecordDto {
+    pub id: String,
+    pub rollout_id: String,
+    pub problem_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dataset: Option<String>,
+    pub sequence_order: i32,
+    pub role: String,
+    pub created_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    pub content_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<Vec<i32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<Vec<i32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_input_tokens: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_output_tokens: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_logprobs: Option<Vec<f32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_logprobs: Option<Vec<f32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_logprobs: Option<Vec<f32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loss_mask: Option<Vec<i8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advantage: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reward: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_reward: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grader_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_in_training: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclude_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relationships: Vec<RelationshipDto>,
+    /// Present only when materialized on demand (`get_blob`); a plain list/get
+    /// scan reads the offloaded column back as `None`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_base64_opt",
+        deserialize_with = "deserialize_base64_opt"
+    )]
+    pub binary_payload: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_size: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_checksum: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ListRolloutsResponse {
+    pub records: Vec<RolloutRecordDto>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GetRolloutResponse {
+    pub record: Option<RolloutRecordDto>,
+}
+
+// ---------------------------------------------------------------------------
 // Error
 // ---------------------------------------------------------------------------
 
@@ -554,6 +782,10 @@ fn default_content_type() -> String {
 
 fn default_role() -> String {
     "user".to_string()
+}
+
+fn default_rollout_role() -> String {
+    "assistant".to_string()
 }
 
 fn default_upsert_key() -> String {

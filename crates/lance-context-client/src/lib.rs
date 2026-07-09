@@ -251,6 +251,97 @@ impl ContextStoreApi for RemoteContextStore {
     }
 }
 
+pub struct RemoteRolloutStore {
+    client: ContextClient,
+    store_name: String,
+    cached_version: u64,
+}
+
+impl RemoteRolloutStore {
+    pub async fn connect(base_url: &str, store_name: &str) -> Result<Self, ClientError> {
+        let client = ContextClient::new(base_url);
+        let info = client.get_rollout_store(store_name).await?;
+        Ok(Self {
+            client,
+            store_name: store_name.to_string(),
+            cached_version: info.version,
+        })
+    }
+
+    pub async fn connect_or_create(
+        base_url: &str,
+        req: &CreateRolloutStoreRequest,
+    ) -> Result<Self, ClientError> {
+        let client = ContextClient::new(base_url);
+        let info = match client.get_rollout_store(&req.name).await {
+            Ok(info) => info,
+            Err(ClientError::Api { status: 404, .. }) => client.create_rollout_store(req).await?,
+            Err(e) => return Err(e),
+        };
+        Ok(Self {
+            client,
+            store_name: req.name.clone(),
+            cached_version: info.version,
+        })
+    }
+}
+
+impl RolloutStoreApi for RemoteRolloutStore {
+    async fn add(&mut self, records: &[AddRolloutRequest]) -> ContextResult<AddRolloutsResponse> {
+        let resp = self
+            .client
+            .add_rollouts(&self.store_name, records)
+            .await
+            .map_err(to_ctx_err)?;
+        self.cached_version = resp.version;
+        Ok(resp)
+    }
+
+    async fn list(
+        &self,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> ContextResult<Vec<RolloutRecordDto>> {
+        let resp = self
+            .client
+            .list_rollouts(&self.store_name, limit, offset)
+            .await
+            .map_err(to_ctx_err)?;
+        Ok(resp.records)
+    }
+
+    async fn get(&self, id: &str) -> ContextResult<Option<RolloutRecordDto>> {
+        let resp = self
+            .client
+            .get_rollout(&self.store_name, id)
+            .await
+            .map_err(to_ctx_err)?;
+        Ok(resp.record)
+    }
+
+    async fn get_blob(&self, id: &str) -> ContextResult<Option<Vec<u8>>> {
+        self.client
+            .fetch_rollout_blob(&self.store_name, id)
+            .await
+            .map_err(to_ctx_err)
+    }
+
+    fn version(&self) -> u64 {
+        self.cached_version
+    }
+
+    async fn checkout(&mut self, version: u64) -> ContextResult<()> {
+        let req = CheckoutRequest { version };
+        let resp = self
+            .client
+            .checkout_rollout(&self.store_name, &req)
+            .await
+            .map_err(to_ctx_err)?;
+        self.cached_version = resp.version;
+        Ok(())
+    }
+}
+
 fn to_ctx_err(err: ClientError) -> ContextError {
     match err {
         ClientError::Api {
@@ -276,6 +367,7 @@ fn to_ctx_err(err: ClientError) -> ContextError {
         } => ContextError::InvalidRequest(message),
         ClientError::Api { message, .. } => ContextError::Internal(message),
         ClientError::Http(e) => ContextError::Internal(e.to_string()),
+        ClientError::Serialize(e) => ContextError::InvalidRequest(e.to_string()),
     }
 }
 
@@ -586,6 +678,161 @@ impl ContextClient {
         let resp = self
             .http
             .get(self.url(&format!("/contexts/{}/compact/stats", name)))
+            .send()
+            .await?;
+        Self::handle_response(resp).await
+    }
+
+    pub async fn create_rollout_store(
+        &self,
+        req: &CreateRolloutStoreRequest,
+    ) -> Result<RolloutStoreInfo, ClientError> {
+        let resp = self
+            .http
+            .post(self.url("/rollouts"))
+            .json(req)
+            .send()
+            .await?;
+        Self::handle_response(resp).await
+    }
+
+    pub async fn list_rollout_stores(&self) -> Result<ListRolloutStoresResponse, ClientError> {
+        let resp = self.http.get(self.url("/rollouts")).send().await?;
+        Self::handle_response(resp).await
+    }
+
+    pub async fn get_rollout_store(&self, name: &str) -> Result<RolloutStoreInfo, ClientError> {
+        let resp = self
+            .http
+            .get(self.url(&format!("/rollouts/{}", name)))
+            .send()
+            .await?;
+        Self::handle_response(resp).await
+    }
+
+    pub async fn delete_rollout_store(&self, name: &str) -> Result<(), ClientError> {
+        let resp = self
+            .http
+            .delete(self.url(&format!("/rollouts/{}", name)))
+            .send()
+            .await?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(Self::extract_error(resp).await)
+        }
+    }
+
+    /// Append rollout rows. When any record carries `binary_payload`, the request
+    /// is sent as `multipart/form-data`: the first part, `metadata`, holds the
+    /// records array with each `binary_payload` stripped to null; each record that
+    /// carries a blob then contributes one raw binary part named for that record's
+    /// zero-based index in the metadata array (`"0"`, `"1"`, ...). Naming by index
+    /// keeps part names round-trip safe (record ids may contain arbitrary bytes and
+    /// are not unique). The `metadata` part is sent first so the server can parse
+    /// the manifest before matching binary parts. When no record carries bytes, a
+    /// plain JSON body is sent instead.
+    pub async fn add_rollouts(
+        &self,
+        name: &str,
+        records: &[AddRolloutRequest],
+    ) -> Result<AddRolloutsResponse, ClientError> {
+        let url = self.url(&format!("/rollouts/{}/records", name));
+        let has_blob = records.iter().any(|r| r.binary_payload.is_some());
+
+        let resp = if has_blob {
+            let stripped: Vec<AddRolloutRequest> = records
+                .iter()
+                .map(|r| {
+                    let mut without_bytes = r.clone();
+                    without_bytes.binary_payload = None;
+                    without_bytes
+                })
+                .collect();
+            let metadata = serde_json::to_string(&AddRolloutsRequest { records: stripped })?;
+
+            // metadata must be the first part: multer parses parts sequentially and
+            // the server needs the manifest before it can match binary parts by index.
+            let mut form = reqwest::multipart::Form::new().text("metadata", metadata);
+            for (idx, r) in records.iter().enumerate() {
+                if let Some(bytes) = &r.binary_payload {
+                    let part = reqwest::multipart::Part::bytes(bytes.clone())
+                        .mime_str("application/octet-stream")?;
+                    form = form.part(idx.to_string(), part);
+                }
+            }
+            self.http.post(url).multipart(form).send().await?
+        } else {
+            let req = AddRolloutsRequest {
+                records: records.to_vec(),
+            };
+            self.http.post(url).json(&req).send().await?
+        };
+        Self::handle_response(resp).await
+    }
+
+    pub async fn list_rollouts(
+        &self,
+        name: &str,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> Result<ListRolloutsResponse, ClientError> {
+        let mut request = self
+            .http
+            .get(self.url(&format!("/rollouts/{}/records", name)));
+        if let Some(limit) = limit {
+            request = request.query(&[("limit", limit)]);
+        }
+        if let Some(offset) = offset {
+            request = request.query(&[("offset", offset)]);
+        }
+        let resp = request.send().await?;
+        Self::handle_response(resp).await
+    }
+
+    pub async fn get_rollout(
+        &self,
+        name: &str,
+        id: &str,
+    ) -> Result<GetRolloutResponse, ClientError> {
+        let resp = self
+            .http
+            .get(self.url(&format!("/rollouts/{}/records/{}", name, id)))
+            .send()
+            .await?;
+        Self::handle_response(resp).await
+    }
+
+    /// Materialize a single artifact row's offloaded `binary_payload` bytes.
+    /// Returns `None` when the row or its payload is absent (server 404).
+    pub async fn fetch_rollout_blob(
+        &self,
+        name: &str,
+        id: &str,
+    ) -> Result<Option<Vec<u8>>, ClientError> {
+        let resp = self
+            .http
+            .get(self.url(&format!("/rollouts/{}/records/{}/blob", name, id)))
+            .send()
+            .await?;
+        if resp.status().is_success() {
+            Ok(Some(resp.bytes().await?.to_vec()))
+        } else if resp.status().as_u16() == 404 {
+            Ok(None)
+        } else {
+            Err(Self::extract_error(resp).await)
+        }
+    }
+
+    pub async fn checkout_rollout(
+        &self,
+        name: &str,
+        req: &CheckoutRequest,
+    ) -> Result<VersionResponse, ClientError> {
+        let resp = self
+            .http
+            .post(self.url(&format!("/rollouts/{}/checkout", name)))
+            .json(req)
             .send()
             .await?;
         Self::handle_response(resp).await
