@@ -84,8 +84,16 @@ pub struct RolloutRecord {
     pub binary_payload: Option<Vec<u8>>,
     pub payload_size: Option<i64>,
     pub payload_checksum: Option<String>,
+    /// User-defined semantic category of an artifact, e.g.
+    /// `"excel_grade_screenshot"`. Orthogonal to `content_type`, which is the
+    /// transport/media type (e.g. `"image/png"`): `content_type` says how to
+    /// decode the bytes, `artifact_type` says what the artifact *means*. A
+    /// first-class column so it can be filtered / grouped-by / projected
+    /// without materializing the free-form `metadata` JSON.
+    pub artifact_type: Option<String>,
     /// Harness metadata — the open-ended escape hatch, for genuinely
-    /// unstructured fields only (e.g. an artifact's `filename` / `artifact_type`).
+    /// unstructured fields only (e.g. an artifact's `filename`). Semantic
+    /// categories that you filter/group-by belong in `artifact_type` instead.
     pub metadata: Option<Value>,
 }
 

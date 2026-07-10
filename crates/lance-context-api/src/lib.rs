@@ -666,6 +666,8 @@ pub struct AddRolloutRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload_checksum: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Value>,
 }
 
@@ -741,6 +743,10 @@ pub struct RolloutRecordDto {
     pub payload_size: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload_checksum: Option<String>,
+    /// User-defined semantic artifact category (e.g. `"excel_grade_screenshot"`),
+    /// orthogonal to `content_type`. A first-class, filterable column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Value>,
 }
