@@ -443,6 +443,7 @@ fn rollout_record_from_add_request(r: &AddRolloutRequest) -> RolloutRecord {
         binary_payload: r.binary_payload.clone(),
         payload_size: r.payload_size,
         payload_checksum: r.payload_checksum.clone(),
+        artifact_type: r.artifact_type.clone(),
         metadata: r.metadata.clone(),
     }
 }
@@ -482,6 +483,7 @@ fn rollout_record_to_dto(r: RolloutRecord) -> RolloutRecordDto {
         binary_payload: r.binary_payload,
         payload_size: r.payload_size,
         payload_checksum: r.payload_checksum,
+        artifact_type: r.artifact_type,
         metadata: r.metadata,
     }
 }

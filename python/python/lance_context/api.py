@@ -2458,9 +2458,16 @@ def _rollout_record_to_native(record: Mapping[str, Any]) -> dict[str, Any]:
     """Normalize one rollout record dict for the JSON FFI boundary.
 
     Accepts ``binary_payload`` as raw ``bytes``/``bytearray`` and base64-encodes
-    it (the DTO's JSON representation), leaving everything else untouched.
+    it (the DTO's JSON representation). If ``id`` is missing/empty, a UUID4 is
+    generated. Everything else is left untouched.
     """
     out = dict(record)
+    # `id` is required by the store; if the caller omits it (or passes an empty
+    # value) generate a UUID4 so users never have to mint ids by hand.
+    if not out.get("id"):
+        import uuid
+
+        out["id"] = str(uuid.uuid4())
     blob = out.get(_ROLLOUT_BLOB_FIELD)
     if isinstance(blob, (bytes, bytearray)):
         import base64

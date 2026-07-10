@@ -423,6 +423,7 @@ impl RolloutStore {
         let mut binary_payload_builder = LargeBinaryBuilder::new();
         let mut payload_size_builder = Int64Builder::new();
         let mut payload_checksum_builder = StringBuilder::new();
+        let mut artifact_type_builder = StringBuilder::new();
         let mut metadata_builder = LargeStringBuilder::new();
 
         for record in records {
@@ -482,6 +483,7 @@ impl RolloutStore {
             }
             payload_size_builder.append_option(record.payload_size);
             payload_checksum_builder.append_option(record.payload_checksum.as_deref());
+            artifact_type_builder.append_option(record.artifact_type.as_deref());
             match &record.metadata {
                 Some(metadata) => metadata_builder.append_value(metadata.to_string()),
                 None => metadata_builder.append_null(),
@@ -589,6 +591,10 @@ impl RolloutStore {
             "payload_checksum".to_string(),
             Arc::new(payload_checksum_builder.finish()),
         );
+        arrays_by_name.insert(
+            "artifact_type".to_string(),
+            Arc::new(artifact_type_builder.finish()),
+        );
         if include_metadata {
             arrays_by_name.insert("metadata".to_string(), Arc::new(metadata_builder.finish()));
         }
@@ -682,6 +688,7 @@ pub fn rollout_schema() -> Schema {
         binary_field,
         Field::new("payload_size", DataType::Int64, true),
         Field::new("payload_checksum", DataType::Utf8, true),
+        Field::new("artifact_type", DataType::Utf8, true),
         Field::new("metadata", DataType::LargeUtf8, true),
     ];
 
@@ -767,6 +774,7 @@ fn batch_to_rollout_records(batch: &RecordBatch) -> LanceResult<Vec<RolloutRecor
     let binary_payload_array = column_as_optional::<LargeBinaryArray>(batch, "binary_payload");
     let payload_size_array = column_as_optional::<Int64Array>(batch, "payload_size");
     let payload_checksum_array = column_as_optional::<StringArray>(batch, "payload_checksum");
+    let artifact_type_array = column_as_optional::<StringArray>(batch, "artifact_type");
     let metadata_array = column_as_optional::<LargeStringArray>(batch, "metadata");
 
     let mut results = Vec::with_capacity(batch.num_rows());
@@ -855,6 +863,7 @@ fn batch_to_rollout_records(batch: &RecordBatch) -> LanceResult<Vec<RolloutRecor
                 }
             }),
             payload_checksum: optional_string(payload_checksum_array, row),
+            artifact_type: optional_string(artifact_type_array, row),
             metadata,
         });
     }
@@ -997,6 +1006,7 @@ mod tests {
             binary_payload: None,
             payload_size: None,
             payload_checksum: None,
+            artifact_type: None,
             metadata: Some(json!({"harness": "verifiers"})),
         }
     }
@@ -1032,7 +1042,8 @@ mod tests {
             binary_payload: Some(bytes.to_vec()),
             payload_size: Some(bytes.len() as i64),
             payload_checksum: Some("sha256:cafef00d".to_string()),
-            metadata: Some(json!({"filename": "trace.bin", "artifact_type": "trace"})),
+            artifact_type: Some("excel_grade_screenshot".to_string()),
+            metadata: Some(json!({"filename": "trace.bin"})),
         }
     }
 
@@ -1074,6 +1085,7 @@ mod tests {
         // round-trip.
         assert_eq!(actual.payload_size, expected.payload_size);
         assert_eq!(actual.payload_checksum, expected.payload_checksum);
+        assert_eq!(actual.artifact_type, expected.artifact_type);
         assert_eq!(actual.metadata, expected.metadata);
     }
 
