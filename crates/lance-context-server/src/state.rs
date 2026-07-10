@@ -15,6 +15,9 @@ pub struct AppState {
     /// rollout writes so each instance owns exactly one shard. `None` falls back
     /// to a single shared shard (single-instance deployments only).
     pub instance_id: Option<String>,
+    /// Count-triggered self-merge threshold for rollout MemWAL shards; `0`
+    /// disables it. See `RolloutStoreOptions::merge_after_generations`.
+    pub rollout_merge_after_generations: usize,
 }
 
 impl AppState {
@@ -25,6 +28,7 @@ impl AppState {
             rollout_stores: RwLock::new(HashMap::new()),
             base_path: PathBuf::from(&config.data_dir),
             instance_id,
+            rollout_merge_after_generations: config.rollout_merge_after_generations,
         }
     }
 

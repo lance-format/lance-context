@@ -40,6 +40,8 @@ pub async fn create_rollout_store(
     let options = RolloutStoreOptions {
         storage_options: req.storage_options,
         shard_id: state.instance_id.clone(),
+        merge_after_generations: (state.rollout_merge_after_generations > 0)
+            .then_some(state.rollout_merge_after_generations),
     };
 
     let store = RolloutStore::open_with_options(&uri, options)
@@ -505,6 +507,7 @@ mod tests {
             rollout_stores: RwLock::new(HashMap::new()),
             base_path: dir.path().to_path_buf(),
             instance_id: None,
+            rollout_merge_after_generations: 0,
         });
         let (_status, _info) = create_rollout_store(
             State(state.clone()),

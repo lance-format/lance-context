@@ -67,7 +67,7 @@ use lance::dataset::{builder::DatasetBuilder, Dataset, WriteMode, WriteParams};
 use lance::index::DatasetIndexExt;
 use lance::io::{ObjectStoreParams, StorageOptionsAccessor};
 use lance::{Error as LanceError, Result as LanceResult};
-use lance_index::mem_wal::MEM_WAL_INDEX_NAME;
+use lance_index::mem_wal::{ShardManifest, MEM_WAL_INDEX_NAME};
 use uuid::Uuid;
 
 use crate::rollout::RolloutRecord;
@@ -94,6 +94,23 @@ pub struct RolloutStoreOptions {
     /// deployments but must be set per-instance when running multiple writers.
     /// See `specs/rollout-deployment.md`.
     pub shard_id: Option<String>,
+    /// Count-triggered self-merge threshold. After an append flushes a new
+    /// generation, if this instance's own shard has accumulated at least this
+    /// many un-merged flushed generations, `add` synchronously merges them into
+    /// the base table and drains the shard's `flushed_generations` back to empty
+    /// (see [`RolloutStore::merge_own_shard`]). This bounds read amplification:
+    /// without it, `_mem_wal/{shard}/` generations accumulate forever and every
+    /// read unions all of them (spec §6).
+    ///
+    /// The merge runs on the instance that owns the shard, reusing its own
+    /// writer epoch, so it never fences a concurrent writer — each instance
+    /// merges only the shard it writes. It is synchronous, so the append that
+    /// crosses the threshold pays the merge latency (a periodic tail-latency
+    /// spike; see the deployment doc).
+    ///
+    /// `None` or `0` disables self-merge (the 0.6.0 behavior: generations
+    /// accumulate and are unioned at read time).
+    pub merge_after_generations: Option<usize>,
 }
 
 /// A Lance-backed store for RL rollout trajectories.
@@ -101,6 +118,12 @@ pub struct RolloutStore {
     dataset: Dataset,
     /// MemWAL shard this instance writes to (derived from `shard_id`).
     write_shard: Uuid,
+    /// Object-store options, retained so a self-merge can re-append flushed
+    /// generation data into the base table with the same credentials.
+    storage_options: Option<HashMap<String, String>>,
+    /// Self-merge threshold; see [`RolloutStoreOptions::merge_after_generations`].
+    /// `0` (or `None` normalized to 0) disables it.
+    merge_after_generations: usize,
 }
 
 impl RolloutStore {
@@ -128,6 +151,8 @@ impl RolloutStore {
         Ok(Self {
             dataset,
             write_shard,
+            storage_options,
+            merge_after_generations: options.merge_after_generations.unwrap_or(0),
         })
     }
 
@@ -182,7 +207,125 @@ impl RolloutStore {
         writer.put(vec![batch]).await?;
         writer.close().await?;
 
+        // Count-triggered self-merge: if this instance's shard has accumulated
+        // enough un-merged flushed generations, fold them into the base table
+        // now (spec §6). Bounds read amplification. Runs on the shard's own
+        // owner so it never fences a concurrent writer.
+        if self.merge_after_generations > 0 {
+            self.maybe_merge_own_shard().await?;
+        }
+
         Ok(self.dataset.manifest.version)
+    }
+
+    /// If this instance's own shard has at least `merge_after_generations`
+    /// flushed generations, merge them into the base table. No-op otherwise.
+    async fn maybe_merge_own_shard(&mut self) -> LanceResult<()> {
+        let object_store = self.dataset.object_store(None).await?;
+        let branch_location = self.dataset.branch_location();
+        let manifest_store = ShardManifestStore::new(
+            object_store,
+            &branch_location.path,
+            self.write_shard,
+            DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
+        );
+        let Some(manifest) = manifest_store.read_latest().await? else {
+            return Ok(());
+        };
+        if manifest.flushed_generations.len() < self.merge_after_generations {
+            return Ok(());
+        }
+        self.merge_own_shard(&manifest_store, &manifest).await
+    }
+
+    /// Fold this instance's flushed MemWAL generations into the base table and
+    /// drain them from the shard manifest.
+    ///
+    /// This is the "external compactor" path that Lance's MemWAL LSM design
+    /// anticipates: each flushed generation at `_mem_wal/{shard}/{path}` is a
+    /// self-contained Lance dataset. We read every generation's rows, append
+    /// them to the base table (`Dataset::append`), then `commit_update` the
+    /// shard manifest to set `flushed_generations` back to empty — leaving
+    /// `replay_after_wal_entry_position` untouched so a reopened writer does
+    /// not re-replay already-merged WAL entries.
+    ///
+    /// # Safety of the epoch claim
+    ///
+    /// `claim_epoch` bumps the shard's writer epoch, which would fence any
+    /// *other* live writer of this shard. That is safe here precisely because
+    /// each instance merges only the shard it owns and writes: there is no
+    /// other live writer of `self.write_shard` to fence. After the merge this
+    /// instance's next `add` opens a fresh `mem_wal_writer`, which re-claims
+    /// the (now-current) epoch.
+    ///
+    /// Rollout rows are immutable and de-duplicated by `id` at read time, so
+    /// even if a crash interrupts the sequence (data appended to base but
+    /// manifest not yet drained), a subsequent read simply sees the rows via
+    /// both the base table and the still-listed generation and de-dups them —
+    /// no double counting. The next merge attempt then drains the manifest.
+    async fn merge_own_shard(
+        &mut self,
+        manifest_store: &ShardManifestStore,
+        manifest: &ShardManifest,
+    ) -> LanceResult<()> {
+        if manifest.flushed_generations.is_empty() {
+            return Ok(());
+        }
+
+        // Resolve each flushed generation to its absolute dataset path and read
+        // all its rows into memory.
+        let base_uri = self.dataset.uri().trim_end_matches('/').to_string();
+        let mut batches: Vec<RecordBatch> = Vec::new();
+        for flushed in &manifest.flushed_generations {
+            let gen_uri = format!(
+                "{}/_mem_wal/{}/{}",
+                base_uri, self.write_shard, flushed.path
+            );
+            let gen_dataset =
+                Self::load_with_options(&gen_uri, self.storage_options.clone()).await?;
+            let mut stream = gen_dataset.scan().try_into_stream().await?;
+            while let Some(batch) = stream.try_next().await? {
+                if batch.num_rows() > 0 {
+                    batches.push(batch);
+                }
+            }
+        }
+
+        // Append the merged rows to the base table.
+        if !batches.is_empty() {
+            let schema = Arc::new(rollout_schema());
+            let reader = RecordBatchIterator::new(
+                batches.into_iter().map(Ok::<RecordBatch, ArrowError>),
+                schema,
+            );
+            let mut params = WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            };
+            if let Some(options) = &self.storage_options {
+                params.store_params = Some(ObjectStoreParams {
+                    storage_options_accessor: Some(Arc::new(
+                        StorageOptionsAccessor::with_static_options(options.clone()),
+                    )),
+                    ..Default::default()
+                });
+            }
+            self.dataset.append(reader, Some(params)).await?;
+        }
+
+        // Drain the flushed generations from the shard manifest. Claim the
+        // shard's epoch (safe: we own it) and commit a manifest that keeps
+        // everything except the now-merged generations.
+        let (epoch, _) = manifest_store.claim_epoch(manifest.shard_spec_id).await?;
+        manifest_store
+            .commit_update(epoch, |current| ShardManifest {
+                version: current.version + 1,
+                flushed_generations: vec![],
+                ..current.clone()
+            })
+            .await?;
+
+        Ok(())
     }
 
     /// Initialize the (unsharded) MemWAL index on first write, exactly once.
@@ -1169,6 +1312,7 @@ mod tests {
             let options = |shard: &str| RolloutStoreOptions {
                 storage_options: None,
                 shard_id: Some(shard.to_string()),
+                merge_after_generations: None,
             };
 
             let mut instance_a = RolloutStore::open_with_options(&uri, options("rollout-0"))
@@ -1192,6 +1336,228 @@ mod tests {
             assert_eq!(seen.len(), 2);
             assert!(seen.iter().any(|r| r.id == "a-0"));
             assert!(seen.iter().any(|r| r.id == "b-0"));
+        });
+    }
+
+    /// Read the number of un-merged flushed generations recorded for a store's
+    /// own write shard. Used by merge tests to assert the manifest drains.
+    async fn flushed_generation_count(store: &RolloutStore) -> usize {
+        let object_store = store.dataset.object_store(None).await.unwrap();
+        let branch_location = store.dataset.branch_location();
+        let manifest_store = ShardManifestStore::new(
+            object_store,
+            &branch_location.path,
+            store.write_shard,
+            DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
+        );
+        manifest_store
+            .read_latest()
+            .await
+            .unwrap()
+            .map(|m| m.flushed_generations.len())
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn below_threshold_no_merge() {
+        // With a threshold of 3, two appends must NOT trigger a merge: the
+        // flushed generations stay in `_mem_wal/` and the base table version
+        // does not advance from appends.
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    storage_options: None,
+                    shard_id: Some("rollout-0".to_string()),
+                    merge_after_generations: Some(3),
+                },
+            )
+            .await
+            .unwrap();
+
+            store.add(&[assistant_record("a-0")]).await.unwrap();
+            store.add(&[assistant_record("a-1")]).await.unwrap();
+
+            // Two generations accumulated, threshold (3) not reached: no merge.
+            assert_eq!(flushed_generation_count(&store).await, 2);
+            // All rows still readable via the LSM union.
+            assert_eq!(store.list(None, None).await.unwrap().len(), 2);
+        });
+    }
+
+    #[test]
+    fn merge_at_threshold_drains_shard_and_preserves_reads() {
+        // At the threshold, `add` folds the shard's flushed generations into
+        // the base table and drains `flushed_generations` to empty. Reads still
+        // return every row exactly once (base ∪ empty shard, dedup by id), and
+        // inline artifact bytes remain fetchable after the merge.
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let artifact_bytes = b"\x00\x01\x02merged-trace";
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    storage_options: None,
+                    shard_id: Some("rollout-0".to_string()),
+                    merge_after_generations: Some(3),
+                },
+            )
+            .await
+            .unwrap();
+
+            store.add(&[assistant_record("a-0")]).await.unwrap();
+            store.add(&[assistant_record("a-1")]).await.unwrap();
+            // The third append reaches the threshold and triggers the merge.
+            store
+                .add(&[artifact_record("a-2", artifact_bytes)])
+                .await
+                .unwrap();
+
+            // Shard drained: no un-merged generations remain.
+            assert_eq!(flushed_generation_count(&store).await, 0);
+
+            // Every row is still present exactly once (no duplication despite
+            // the base table now holding what the shard used to).
+            let listed = store.list(None, None).await.unwrap();
+            assert_eq!(listed.len(), 3);
+            let mut ids: Vec<_> = listed.iter().map(|r| r.id.clone()).collect();
+            ids.sort();
+            assert_eq!(ids, vec!["a-0", "a-1", "a-2"]);
+
+            // Point lookup and inline artifact bytes survive the merge into base.
+            let fetched = store.get_by_id("a-2").await.unwrap().unwrap();
+            assert!(fetched.is_artifact());
+            assert_eq!(
+                store.get_blob("a-2").await.unwrap().as_deref(),
+                Some(&artifact_bytes[..])
+            );
+        });
+    }
+
+    #[test]
+    fn merge_is_visible_to_a_fresh_reader_instance() {
+        // After a merge folds rows into the base table and drains the shard, a
+        // freshly opened store (new process / reader) that re-reads manifests
+        // from object storage sees exactly the merged rows — proving the data
+        // truly landed in the base table, not just this handle's memory.
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            {
+                let mut store = RolloutStore::open_with_options(
+                    &uri,
+                    RolloutStoreOptions {
+                        storage_options: None,
+                        shard_id: Some("rollout-0".to_string()),
+                        merge_after_generations: Some(2),
+                    },
+                )
+                .await
+                .unwrap();
+                store.add(&[assistant_record("a-0")]).await.unwrap();
+                store.add(&[assistant_record("a-1")]).await.unwrap();
+                assert_eq!(flushed_generation_count(&store).await, 0);
+            }
+
+            // A brand-new reader opens the same dataset.
+            let reader = RolloutStore::open(&uri).await.unwrap();
+            let listed = reader.list(None, None).await.unwrap();
+            assert_eq!(listed.len(), 2);
+            assert!(listed.iter().any(|r| r.id == "a-0"));
+            assert!(listed.iter().any(|r| r.id == "a-1"));
+        });
+    }
+
+    /// Micro-benchmark (run with `cargo test -- --ignored --nocapture
+    /// bench_merge_read_amplification`): quantifies the read-amplification that
+    /// self-merge removes. Appends N generations, times a `list` scan over the
+    /// accumulated `_mem_wal/` generations, then merges them into the base
+    /// table and times an equivalent scan. Also reports the tail latency of the
+    /// single append that triggers the merge.
+    #[test]
+    #[ignore = "benchmark; run explicitly with --ignored --nocapture"]
+    fn bench_merge_read_amplification() {
+        use std::time::Instant;
+
+        const N: usize = 200;
+        const READ_ITERS: usize = 20;
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            // --- Un-merged: accumulate N generations, never merge. ---
+            let dir_no_merge = TempDir::new().unwrap();
+            let uri = dir_no_merge.path().to_string_lossy().to_string();
+            let mut store = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    storage_options: None,
+                    shard_id: Some("rollout-0".to_string()),
+                    merge_after_generations: None, // disabled
+                },
+            )
+            .await
+            .unwrap();
+            for i in 0..N {
+                store
+                    .add(&[assistant_record(&format!("row-{i}"))])
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(flushed_generation_count(&store).await, N);
+
+            let start = Instant::now();
+            for _ in 0..READ_ITERS {
+                let rows = store.list(None, None).await.unwrap();
+                assert_eq!(rows.len(), N);
+            }
+            let unmerged_read = start.elapsed() / READ_ITERS as u32;
+
+            // --- Merged: same N rows, but self-merge folds each batch into
+            // base as soon as it lands (threshold 1). ---
+            let dir_merge = TempDir::new().unwrap();
+            let uri_m = dir_merge.path().to_string_lossy().to_string();
+            let mut merge_store = RolloutStore::open_with_options(
+                &uri_m,
+                RolloutStoreOptions {
+                    storage_options: None,
+                    shard_id: Some("rollout-0".to_string()),
+                    merge_after_generations: Some(1),
+                },
+            )
+            .await
+            .unwrap();
+            let mut max_add = std::time::Duration::ZERO;
+            for i in 0..N {
+                let t = Instant::now();
+                merge_store
+                    .add(&[assistant_record(&format!("row-{i}"))])
+                    .await
+                    .unwrap();
+                max_add = max_add.max(t.elapsed());
+            }
+            assert_eq!(flushed_generation_count(&merge_store).await, 0);
+
+            let start = Instant::now();
+            for _ in 0..READ_ITERS {
+                let rows = merge_store.list(None, None).await.unwrap();
+                assert_eq!(rows.len(), N);
+            }
+            let merged_read = start.elapsed() / READ_ITERS as u32;
+
+            println!("\n=== merge read-amplification benchmark (N={N} generations) ===");
+            println!("  list scan, {N} un-merged generations : {unmerged_read:?}");
+            println!("  list scan, merged into base table     : {merged_read:?}");
+            println!(
+                "  read speedup from merge               : {:.1}x",
+                unmerged_read.as_secs_f64() / merged_read.as_secs_f64().max(1e-9)
+            );
+            println!("  slowest single add() (merge on every append) : {max_add:?}");
         });
     }
 }

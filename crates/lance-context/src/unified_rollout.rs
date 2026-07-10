@@ -34,6 +34,10 @@ impl RolloutStore {
             // multi-writer embedded deployment should thread a per-writer id
             // through here (see `RolloutStoreOptions::shard_id`).
             shard_id: None,
+            // Embedded use accumulates generations and unions at read time; a
+            // caller that wants count-triggered self-merge opens the core
+            // `RolloutStore` directly with `merge_after_generations` set.
+            merge_after_generations: None,
         };
         let store = LocalStore::open_with_options(uri, options)
             .await

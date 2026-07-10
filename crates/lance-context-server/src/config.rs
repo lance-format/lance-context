@@ -23,6 +23,16 @@ pub struct ServerConfig {
     /// only safe for a single-instance deployment.
     #[arg(long, env = "INSTANCE_ID")]
     pub instance_id: Option<String>,
+
+    /// Count-triggered self-merge threshold for rollout MemWAL shards. After an
+    /// append flushes a new generation, if this instance's shard has at least
+    /// this many un-merged flushed generations, the append synchronously folds
+    /// them into the base table and drains the shard (see
+    /// `specs/rollout-deployment.md`). This bounds read amplification. `0`
+    /// (the default) disables self-merge — generations accumulate and are
+    /// unioned at read time.
+    #[arg(long, env = "ROLLOUT_MERGE_AFTER_GENERATIONS", default_value = "0")]
+    pub rollout_merge_after_generations: usize,
 }
 
 impl ServerConfig {

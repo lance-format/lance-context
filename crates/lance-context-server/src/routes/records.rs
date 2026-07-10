@@ -625,6 +625,7 @@ mod tests {
             rollout_stores: RwLock::new(HashMap::new()),
             base_path: dir.path().to_path_buf(),
             instance_id: None,
+            rollout_merge_after_generations: 0,
         });
         (state, dir)
     }
