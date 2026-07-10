@@ -158,7 +158,34 @@ Every append is flushed before `add` returns and every flushed generation is rec
 | **Scale down** (`replicas: 6 → 4`) | Retired pods stop writing. Their already-flushed shard generations remain in object storage and are still read (the shard manifest persists). The shard simply receives no new appends. | ✅ |
 | **Two writers, one id** (misconfig: same `INSTANCE_ID` on two pods, or several `default`s) | Both target one shard; MemWAL epoch-fencing lets one win and fails the other. Appends error. | ❌ Avoid — see §2. |
 
-There is no compaction/merge step to coordinate: rollout rows are append-only (§7), so shards accumulate independently and are unioned at read time.
+### 6.1 Bounding read amplification: count-triggered self-merge
+
+By default (`--rollout-merge-after-generations 0`) there is no compaction step: rollout rows are append-only (§7), so each `add` leaves a new flushed generation in `_mem_wal/{shard}/` and every read unions all of them. That is correct, but read cost grows linearly with the number of un-merged generations — a shard that has absorbed thousands of appends makes every `list`/`get` open thousands of generation datasets.
+
+To bound this, an instance can **merge its own shard back into the base table** on a size trigger. Set `--rollout-merge-after-generations N` (env `ROLLOUT_MERGE_AFTER_GENERATIONS`, or `RolloutStoreOptions::merge_after_generations`). After an append flushes a generation, if this instance's shard has accumulated ≥ N un-merged generations, the same `add` call synchronously:
+
+1. reads every flushed generation (each is a self-contained Lance dataset under `_mem_wal/{shard}/`),
+2. appends their rows to the **base table** (`Dataset::append`), and
+3. `commit_update`s the shard manifest to drain `flushed_generations` back to empty — leaving `replay_after_wal_entry_position` untouched, so a reopened writer never re-replays already-merged WAL entries.
+
+This is the "external compactor" path that Lance's MemWAL LSM design explicitly anticipates. Two properties make it safe under the §2 deployment model:
+
+- **No fencing of peers.** The merge `claim_epoch`s the shard, which bumps its writer epoch — but each instance merges *only the shard it writes*, and that shard has no other live writer to fence (§3). The next `add` on this instance simply re-claims the now-current epoch.
+- **Crash-safe by immutability.** Rollout rows are immutable and de-duplicated by `id` at read time. If a crash lands between step 2 and step 3 (rows in base, manifest not yet drained), a reader sees the rows via *both* the base table and the still-listed generation and de-dups them — no double counting. The next merge attempt drains the manifest.
+
+**Trade-off — synchronous tail latency.** The merge runs inline, so the single append that crosses the threshold pays the full merge cost while the other N−1 appends stay fast. Choose N to amortize that spike: larger N ⇒ rarer but heavier merges and higher steady-state read amplification; smaller N ⇒ smoother reads but a merge cost folded into more appends. `N = 0` keeps the pure-accumulation 0.6.0 behavior.
+
+**Measured impact.** A micro-benchmark (`bench_merge_read_amplification`, single-row appends, local FS, release build) shows how sharply read cost grows with un-merged generations:
+
+| Read (`list` scan of 200 rows) | Latency |
+|---|---|
+| over **200 un-merged generations** | ~654 ms |
+| after **merge into the base table** | ~50 ms |
+| **speedup** | **~13×** |
+
+The merge itself was cheap here — the slowest single `add` (which folded the shard on every append at `N=1`) was ~20 ms. The read amplification is the real cost accumulation avoids; the exact ratio grows with generation count.
+
+> This is *self-merge*, not a coordinator: no cronjob, no admin endpoint, no cross-instance lock. A load balancer can keep spraying appends across instances; each instance independently keeps its own shard compact.
 
 ---
 
@@ -193,4 +220,5 @@ From a client's perspective the behavior is unchanged: metadata scans are cheap,
 - [ ] Ensure each instance has a **distinct stable id** — `INSTANCE_ID` from `metadata.name`, or rely on the pod `HOSTNAME`. Never reuse an id across live instances.
 - [ ] Front the pods with an ordinary round-robin **Service / LB**; no session affinity or consistent hashing required.
 - [ ] Size **replicas** to the ingest fan-in; scale up/down freely (§6).
+- [ ] For long-running ingest, set **`--rollout-merge-after-generations N`** so each instance folds its own shard back into the base table and read cost stays bounded (§6.1). Leave `0` only for short-lived or low-volume stores.
 - [ ] Reproduce training sets by **filtering immutable rows** (e.g. `policy_version`), not by `checkout` (§7).
