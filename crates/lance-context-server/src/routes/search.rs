@@ -296,6 +296,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_respects_explicit_retirement() {
+        let (state, _dir) = test_state().await;
+
+        let mut record = embedded_record("Explicit retire", [1.0, 0.0, 0.0]);
+        record.external_id = Some("doc-2".to_string());
+        add(&state, vec![record]).await;
+
+        // Explicitly stamp retired_at via an update patch. The successor record
+        // stays `active` but carries the retirement timestamp, so
+        // `is_hidden_by_lifecycle` hides it from default queries.
+        let Json(updated) = update_record(
+            State(state.clone()),
+            Path(CTX.to_string()),
+            Json(UpdateRecordRequest {
+                id: None,
+                external_id: Some("doc-2".to_string()),
+                patch: RecordPatchDto {
+                    retired_at: Some(Utc::now()),
+                    ..Default::default()
+                },
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(updated.updated);
+
+        // Default search hides the explicitly-retired record (both the
+        // superseded original and the retired successor are non-visible).
+        let results = run_search(&state, search_for([1.0, 0.0, 0.0])).await;
+        assert_eq!(results.len(), 0);
+
+        // include_retired surfaces the retired successor.
+        let mut req = search_for([1.0, 0.0, 0.0]);
+        req.include_retired = true;
+        let results = run_search(&state, req).await;
+        assert!(results.iter().any(|r| r.record.text_payload.as_deref()
+            == Some("Explicit retire")
+            && r.record.retired_at.is_some()));
+    }
+
+    #[tokio::test]
+    async fn search_respects_non_active_lifecycle_status() {
+        let (state, _dir) = test_state().await;
+
+        let mut record = embedded_record("Non-active", [1.0, 0.0, 0.0]);
+        record.external_id = Some("doc-3".to_string());
+        add(&state, vec![record]).await;
+
+        // Move the record to a hidden lifecycle status. `contradicted` is
+        // treated as visible by `is_hidden_by_lifecycle`, so use `superseded`
+        // to exercise the non-active hidden branch.
+        let Json(updated) = update_record(
+            State(state.clone()),
+            Path(CTX.to_string()),
+            Json(UpdateRecordRequest {
+                id: None,
+                external_id: Some("doc-3".to_string()),
+                patch: RecordPatchDto {
+                    lifecycle_status: Some("superseded".to_string()),
+                    ..Default::default()
+                },
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(updated.updated);
+
+        // Default search hides the non-active record.
+        let results = run_search(&state, search_for([1.0, 0.0, 0.0])).await;
+        assert_eq!(results.len(), 0);
+
+        // include_retired surfaces it.
+        let mut req = search_for([1.0, 0.0, 0.0]);
+        req.include_retired = true;
+        let results = run_search(&state, req).await;
+        assert!(results
+            .iter()
+            .any(|r| r.record.text_payload.as_deref() == Some("Non-active")));
+    }
+
+    #[tokio::test]
     async fn search_include_relationships_toggles_relationship_payload() {
         let (state, _dir) = test_state().await;
 
