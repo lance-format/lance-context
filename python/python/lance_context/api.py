@@ -18,6 +18,9 @@ from ._internal import (  # pyright: ignore[reportMissingImports]
 from ._internal import (  # pyright: ignore[reportMissingImports]
     RemoteContext as _RemoteContext,
 )
+from ._internal import (  # pyright: ignore[reportMissingImports]
+    RolloutStore as _RolloutStore,
+)
 from ._internal import version as _version  # pyright: ignore[reportMissingImports]
 from .embeddings import EmbeddingProvider, _build_provider, supports_media
 
@@ -27,6 +30,8 @@ __all__ = [
     "ContextNamespace",
     "EmbeddingProvider",
     "RemoteContext",
+    "RemoteRolloutStore",
+    "RolloutStore",
     "__version__",
 ]
 
@@ -2438,3 +2443,229 @@ class RemoteContext:
 
     def __repr__(self) -> str:
         return f"RemoteContext(version={self._sync.version()})"
+
+
+# ---------------------------------------------------------------------------
+# Rollout stores
+# ---------------------------------------------------------------------------
+
+# Fields that carry raw artifact bytes; the native layer marshals records as
+# JSON with these base64-encoded, so the wrapper encodes on the way in.
+_ROLLOUT_BLOB_FIELD = "binary_payload"
+
+
+def _rollout_record_to_native(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize one rollout record dict for the JSON FFI boundary.
+
+    Accepts ``binary_payload`` as raw ``bytes``/``bytearray`` and base64-encodes
+    it (the DTO's JSON representation), leaving everything else untouched.
+    """
+    out = dict(record)
+    blob = out.get(_ROLLOUT_BLOB_FIELD)
+    if isinstance(blob, (bytes, bytearray)):
+        import base64
+
+        out[_ROLLOUT_BLOB_FIELD] = base64.b64encode(bytes(blob)).decode("ascii")
+    return out
+
+
+def _rollout_records_to_json(
+    records: Mapping[str, Any] | Iterable[Mapping[str, Any]],
+) -> str:
+    # `records` is either a single mapping or an iterable of mappings. Because a
+    # Mapping is itself Iterable, static narrowing of the union is ambiguous, so
+    # branch on the concrete runtime type via a local typed as Any.
+    raw: Any = records
+    if isinstance(raw, Mapping):
+        payload = [_rollout_record_to_native(raw)]
+    else:
+        payload = [_rollout_record_to_native(r) for r in raw]
+    if not payload:
+        raise ValueError("records must not be empty")
+    return json.dumps(payload)
+
+
+def _rollout_record_from_json(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Decode a rollout record dict coming back from the native layer.
+
+    ``binary_payload``, when present, arrives base64-encoded; decode it to raw
+    ``bytes`` so callers get bytes back from ``get``/``list`` if it was
+    materialized.
+    """
+    out = dict(record)
+    blob = out.get(_ROLLOUT_BLOB_FIELD)
+    if isinstance(blob, str):
+        import base64
+
+        out[_ROLLOUT_BLOB_FIELD] = base64.b64decode(blob)
+    return out
+
+
+class RolloutStore:
+    """Synchronous store for RL rollout trajectories.
+
+    Open an embedded dataset with :meth:`open`, or talk to a remote
+    ``lance-context-server`` with :meth:`connect` / :meth:`connect_or_create`.
+
+    Records are plain dicts matching the rollout schema (``id``, ``rollout_id``,
+    ``reward``, ``binary_payload`` as raw ``bytes``, ...). Only ``id`` and
+    ``rollout_id`` are required; every other field is optional.
+    """
+
+    def __init__(self, sync_store: _RolloutStore) -> None:
+        self._sync = sync_store
+
+    @classmethod
+    def open(
+        cls,
+        uri: str,
+        *,
+        storage_options: Mapping[str, str] | None = None,
+    ) -> "RolloutStore":
+        """Open (or create) an embedded rollout dataset at ``uri``."""
+        opts = dict(storage_options) if storage_options else None
+        return cls(_RolloutStore.open(uri, opts))
+
+    @classmethod
+    def connect(cls, base_url: str, name: str) -> "RolloutStore":
+        """Connect to an existing rollout store on a remote server."""
+        return cls(_RolloutStore.connect(base_url, name))
+
+    @classmethod
+    def connect_or_create(
+        cls,
+        base_url: str,
+        name: str,
+        *,
+        storage_options: Mapping[str, str] | None = None,
+    ) -> "RolloutStore":
+        """Connect to a remote rollout store, creating it if absent."""
+        opts = dict(storage_options) if storage_options else None
+        return cls(_RolloutStore.connect_or_create(base_url, name, opts))
+
+    def version(self) -> int:
+        """Return the current base-table version."""
+        return self._sync.version()
+
+    def add(
+        self,
+        records: Mapping[str, Any] | Iterable[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        """Append one record (dict) or many (iterable of dicts)."""
+        return self._sync.add(_rollout_records_to_json(records))
+
+    def add_one(self, **fields: Any) -> dict[str, Any]:
+        """Append a single record given as keyword arguments."""
+        return self.add(fields)
+
+    def list(
+        self,
+        limit: int | None = None,
+        offset: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """List rollout rows (artifact bytes projected out; fetch via
+        :meth:`get_blob`)."""
+        raw = self._sync.list(limit, offset)
+        return [_rollout_record_from_json(r) for r in json.loads(raw)]
+
+    def get(self, id: str) -> dict[str, Any] | None:
+        """Fetch a single rollout row by id, or ``None``."""
+        raw = self._sync.get(id)
+        if raw is None:
+            return None
+        return _rollout_record_from_json(json.loads(raw))
+
+    def get_blob(self, id: str) -> bytes | None:
+        """Fetch a single artifact row's inline bytes on demand, or ``None``."""
+        return self._sync.get_blob(id)
+
+    def checkout(self, version: int) -> None:
+        """Checkout a base-table version (base-table time travel only)."""
+        self._sync.checkout(version)
+
+    def __repr__(self) -> str:
+        return f"RolloutStore(version={self._sync.version()})"
+
+
+class RemoteRolloutStore:
+    """Async wrapper around a remote rollout store over HTTP.
+
+    Mirrors :class:`RolloutStore` but runs the blocking calls in an executor so
+    they can be awaited. Every method matches its sync counterpart.
+    """
+
+    def __init__(self, sync_store: _RolloutStore) -> None:
+        self._sync = sync_store
+
+    @classmethod
+    async def connect(cls, base_url: str, name: str) -> "RemoteRolloutStore":
+        """Connect to an existing remote rollout store."""
+        loop = asyncio.get_running_loop()
+        sync_store = await loop.run_in_executor(
+            None, lambda: _RolloutStore.connect(base_url, name)
+        )
+        return cls(sync_store)
+
+    @classmethod
+    async def connect_or_create(
+        cls,
+        base_url: str,
+        name: str,
+        *,
+        storage_options: Mapping[str, str] | None = None,
+    ) -> "RemoteRolloutStore":
+        """Connect to a remote rollout store, creating it if absent."""
+        opts = dict(storage_options) if storage_options else None
+        loop = asyncio.get_running_loop()
+        sync_store = await loop.run_in_executor(
+            None, lambda: _RolloutStore.connect_or_create(base_url, name, opts)
+        )
+        return cls(sync_store)
+
+    def version(self) -> int:
+        """Return the current version (cached, sync)."""
+        return self._sync.version()
+
+    async def add(
+        self,
+        records: Mapping[str, Any] | Iterable[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        """Append one record (dict) or many (iterable of dicts)."""
+        payload = _rollout_records_to_json(records)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, lambda: self._sync.add(payload))
+
+    async def add_one(self, **fields: Any) -> dict[str, Any]:
+        """Append a single record given as keyword arguments."""
+        return await self.add(fields)
+
+    async def list(
+        self,
+        limit: int | None = None,
+        offset: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """List rollout rows (artifact bytes projected out)."""
+        loop = asyncio.get_running_loop()
+        raw = await loop.run_in_executor(None, lambda: self._sync.list(limit, offset))
+        return [_rollout_record_from_json(r) for r in json.loads(raw)]
+
+    async def get(self, id: str) -> dict[str, Any] | None:
+        """Fetch a single rollout row by id, or ``None``."""
+        loop = asyncio.get_running_loop()
+        raw = await loop.run_in_executor(None, lambda: self._sync.get(id))
+        if raw is None:
+            return None
+        return _rollout_record_from_json(json.loads(raw))
+
+    async def get_blob(self, id: str) -> bytes | None:
+        """Fetch a single artifact row's bytes on demand, or ``None``."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, lambda: self._sync.get_blob(id))
+
+    async def checkout(self, version: int) -> None:
+        """Checkout a base-table version (base-table time travel only)."""
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, lambda: self._sync.checkout(version))
+
+    def __repr__(self) -> str:
+        return f"RemoteRolloutStore(version={self._sync.version()})"

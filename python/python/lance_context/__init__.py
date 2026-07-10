@@ -6,6 +6,8 @@ from .api import (  # pyright: ignore[reportMissingImports]
     ContextNamespace,
     EmbeddingProvider,
     RemoteContext,
+    RemoteRolloutStore,
+    RolloutStore,
     __version__,
 )
 from .embeddings import (  # pyright: ignore[reportMissingImports]
@@ -19,5 +21,7 @@ __all__ = [
     "EmbeddingProvider",
     "MultiModalEmbeddingProvider",
     "RemoteContext",
+    "RemoteRolloutStore",
+    "RolloutStore",
     "__version__",
 ]

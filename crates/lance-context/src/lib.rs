@@ -12,9 +12,9 @@ pub use lance_context_core::{
 pub use lance_context_api::{
     AddRecordRequest, AddRecordsResponse, AddRolloutRequest, AddRolloutsResponse, CompactRequest,
     CompactResponse, CompactStatsResponse, ContextError, ContextResult, ContextStoreApi,
-    DeleteRecordResponse, RecordDto, RelationshipDto, RetrieveRequest, RetrieveResponse,
-    RetrieveResultDto, RolloutRecordDto, RolloutStoreApi, SearchResultDto, UpsertRecordRequest,
-    UpsertRecordResponse,
+    CreateRolloutStoreRequest, DeleteRecordResponse, RecordDto, RelationshipDto, RetrieveRequest,
+    RetrieveResponse, RetrieveResultDto, RolloutRecordDto, RolloutStoreApi, SearchResultDto,
+    UpsertRecordRequest, UpsertRecordResponse,
 };
 
 #[cfg(feature = "remote")]

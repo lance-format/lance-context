@@ -11,6 +11,10 @@ use pyo3::IntoPyObject;
 use serde_json::Value;
 use tokio::runtime::Runtime;
 
+use lance_context::{
+    AddRolloutRequest, CreateRolloutStoreRequest, RolloutRecordDto,
+    RolloutStore as UnifiedRolloutStore, RolloutStoreApi,
+};
 use lance_context_api::{
     AddRecordRequest, CompactRequest, CompactResponse, CompactStatsResponse, ContextStoreApi,
     RecordDto, RecordPatchDto, RelationshipDto, RetrieveRequest, RetrieveResultDto, SearchRequest,
@@ -2356,11 +2360,166 @@ fn dto_compact_stats_to_py(py: Python<'_>, stats: CompactStatsResponse) -> PyRes
     Ok(dict.into_pyobject(py)?.unbind().into())
 }
 
+// ---------------------------------------------------------------------------
+// Rollout store binding (local + remote via the unified enum)
+// ---------------------------------------------------------------------------
+
+/// A rollout store, either an embedded Lance dataset (`open`) or a handle to a
+/// remote `lance-context-server` (`connect` / `connect_or_create`).
+///
+/// Rollout rows carry ~35 fields, so records cross the FFI boundary as JSON
+/// (a `records_json` array of objects matching `AddRolloutRequest`), and read
+/// results come back as a JSON array string. The Python wrapper in `api.py`
+/// hides this and exposes dict/list ergonomics.
+#[pyclass]
+struct RolloutStore {
+    store: UnifiedRolloutStore,
+    runtime: Arc<Runtime>,
+}
+
+impl RolloutStore {
+    fn from_store(store: UnifiedRolloutStore, runtime: Arc<Runtime>) -> Self {
+        Self { store, runtime }
+    }
+}
+
+#[pymethods]
+impl RolloutStore {
+    /// Open (or create) an embedded rollout dataset at `uri`.
+    #[classmethod]
+    #[pyo3(signature = (uri, storage_options = None))]
+    fn open(
+        _cls: &Bound<'_, PyType>,
+        py: Python<'_>,
+        uri: &str,
+        storage_options: Option<HashMap<String, String>>,
+    ) -> PyResult<Self> {
+        let runtime = Arc::new(Runtime::new().map_err(to_py_err)?);
+        let store_res = py.allow_threads(|| {
+            runtime.block_on(UnifiedRolloutStore::open_with_options(uri, storage_options))
+        });
+        let store = store_res.map_err(to_py_err)?;
+        Ok(Self::from_store(store, runtime))
+    }
+
+    /// Connect to an existing rollout store on a remote server.
+    #[classmethod]
+    fn connect(
+        _cls: &Bound<'_, PyType>,
+        py: Python<'_>,
+        base_url: &str,
+        name: &str,
+    ) -> PyResult<Self> {
+        let runtime = Arc::new(Runtime::new().map_err(to_py_err)?);
+        let store_res =
+            py.allow_threads(|| runtime.block_on(UnifiedRolloutStore::connect(base_url, name)));
+        let store = store_res.map_err(to_py_err)?;
+        Ok(Self::from_store(store, runtime))
+    }
+
+    /// Connect to a remote rollout store, creating it if it does not exist.
+    #[classmethod]
+    #[pyo3(signature = (base_url, name, storage_options = None))]
+    fn connect_or_create(
+        _cls: &Bound<'_, PyType>,
+        py: Python<'_>,
+        base_url: &str,
+        name: &str,
+        storage_options: Option<HashMap<String, String>>,
+    ) -> PyResult<Self> {
+        let req = CreateRolloutStoreRequest {
+            name: name.to_string(),
+            storage_options,
+        };
+        let runtime = Arc::new(Runtime::new().map_err(to_py_err)?);
+        let store_res = py.allow_threads(|| {
+            runtime.block_on(UnifiedRolloutStore::connect_or_create(base_url, &req))
+        });
+        let store = store_res.map_err(to_py_err)?;
+        Ok(Self::from_store(store, runtime))
+    }
+
+    /// Current store version (base dataset version).
+    fn version(&self) -> u64 {
+        self.store.version()
+    }
+
+    /// Append rollout rows given as a JSON array of `AddRolloutRequest` objects.
+    /// Returns a dict `{version, ids, count}`.
+    fn add(&mut self, py: Python<'_>, records_json: &str) -> PyResult<PyObject> {
+        let records: Vec<AddRolloutRequest> = serde_json::from_str(records_json)
+            .map_err(|e| PyRuntimeError::new_err(format!("invalid records JSON: {e}")))?;
+        if records.is_empty() {
+            return Err(PyRuntimeError::new_err(
+                "records must not be empty".to_string(),
+            ));
+        }
+        let resp = py
+            .allow_threads(|| self.runtime.block_on(self.store.add(&records)))
+            .map_err(to_py_err)?;
+        let dict = PyDict::new(py);
+        dict.set_item("version", resp.version)?;
+        dict.set_item("ids", resp.ids)?;
+        dict.set_item("count", resp.count)?;
+        Ok(dict.into_pyobject(py)?.unbind().into())
+    }
+
+    /// List rollout rows (artifact bytes projected out). Returns a JSON array
+    /// string of records for the Python wrapper to parse into dicts.
+    #[pyo3(signature = (limit = None, offset = None))]
+    fn list(
+        &self,
+        py: Python<'_>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> PyResult<String> {
+        let records = py
+            .allow_threads(|| self.runtime.block_on(self.store.list(limit, offset)))
+            .map_err(to_py_err)?;
+        rollout_records_to_json(&records)
+    }
+
+    /// Fetch a single rollout row by id, or `None`. Returns a JSON object
+    /// string (artifact bytes projected out).
+    fn get(&self, py: Python<'_>, id: &str) -> PyResult<Option<String>> {
+        let record = py
+            .allow_threads(|| self.runtime.block_on(self.store.get(id)))
+            .map_err(to_py_err)?;
+        match record {
+            Some(r) => Ok(Some(rollout_record_to_json(&r)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Fetch a single artifact row's inline bytes on demand, or `None`.
+    fn get_blob(&self, py: Python<'_>, id: &str) -> PyResult<Option<Py<PyBytes>>> {
+        let bytes = py
+            .allow_threads(|| self.runtime.block_on(self.store.get_blob(id)))
+            .map_err(to_py_err)?;
+        Ok(bytes.map(|b| PyBytes::new(py, &b).unbind()))
+    }
+
+    /// Checkout a base-table version (time travel over the base table only).
+    fn checkout(&mut self, py: Python<'_>, version: u64) -> PyResult<()> {
+        py.allow_threads(|| self.runtime.block_on(self.store.checkout(version)))
+            .map_err(to_py_err)
+    }
+}
+
+fn rollout_records_to_json(records: &[RolloutRecordDto]) -> PyResult<String> {
+    serde_json::to_string(records).map_err(to_py_err)
+}
+
+fn rollout_record_to_json(record: &RolloutRecordDto) -> PyResult<String> {
+    serde_json::to_string(record).map_err(to_py_err)
+}
+
 #[pymodule]
 fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(version, m)?)?;
     m.add_class::<Context>()?;
     m.add_class::<ContextNamespace>()?;
     m.add_class::<RemoteContext>()?;
+    m.add_class::<RolloutStore>()?;
     Ok(())
 }

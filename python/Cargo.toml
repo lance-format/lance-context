@@ -11,6 +11,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+lance-context = { path = "../crates/lance-context", features = ["remote"] }
 lance-context-api = { path = "../crates/lance-context-api" }
 lance-context-client = { path = "../crates/lance-context-client" }
 lance-context-core = { path = "../crates/lance-context-core" }
