@@ -26,11 +26,11 @@ from .embeddings import EmbeddingProvider, _build_provider, supports_media
 
 __all__ = [
     "AsyncContext",
+    "AsyncRolloutStore",
     "Context",
     "ContextNamespace",
     "EmbeddingProvider",
     "RemoteContext",
-    "RemoteRolloutStore",
     "RolloutStore",
     "__version__",
 ]
@@ -2594,18 +2594,20 @@ class RolloutStore:
         return f"RolloutStore(version={self._sync.version()})"
 
 
-class RemoteRolloutStore:
-    """Async wrapper around a remote rollout store over HTTP.
+class AsyncRolloutStore:
+    """Async wrapper around a rollout store, for use from asyncio code.
 
     Mirrors :class:`RolloutStore` but runs the blocking calls in an executor so
-    they can be awaited. Every method matches its sync counterpart.
+    they can be awaited without blocking the event loop. Every method matches
+    its sync counterpart. This is the interface RL generation workers and the
+    learner use when talking to a remote ``lance-context-server`` over HTTP.
     """
 
     def __init__(self, sync_store: _RolloutStore) -> None:
         self._sync = sync_store
 
     @classmethod
-    async def connect(cls, base_url: str, name: str) -> "RemoteRolloutStore":
+    async def connect(cls, base_url: str, name: str) -> "AsyncRolloutStore":
         """Connect to an existing remote rollout store."""
         loop = asyncio.get_running_loop()
         sync_store = await loop.run_in_executor(
@@ -2620,7 +2622,7 @@ class RemoteRolloutStore:
         name: str,
         *,
         storage_options: Mapping[str, str] | None = None,
-    ) -> "RemoteRolloutStore":
+    ) -> "AsyncRolloutStore":
         """Connect to a remote rollout store, creating it if absent."""
         opts = dict(storage_options) if storage_options else None
         loop = asyncio.get_running_loop()
@@ -2675,4 +2677,4 @@ class RemoteRolloutStore:
         await loop.run_in_executor(None, lambda: self._sync.checkout(version))
 
     def __repr__(self) -> str:
-        return f"RemoteRolloutStore(version={self._sync.version()})"
+        return f"AsyncRolloutStore(version={self._sync.version()})"
