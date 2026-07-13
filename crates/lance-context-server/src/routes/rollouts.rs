@@ -42,6 +42,9 @@ pub async fn create_rollout_store(
         shard_id: state.instance_id.clone(),
         merge_after_generations: (state.rollout_merge_after_generations > 0)
             .then_some(state.rollout_merge_after_generations),
+        cleanup_interval_secs: (state.rollout_cleanup_interval_secs > 0)
+            .then_some(state.rollout_cleanup_interval_secs),
+        cleanup_min_generations: Some(state.rollout_cleanup_min_generations),
     };
 
     let store = RolloutStore::open_with_options(&uri, options)
@@ -49,8 +52,14 @@ pub async fn create_rollout_store(
         .map_err(AppError::from_lance)?;
     let version = store.version();
 
+    let store = Arc::new(RwLock::new(store));
+    // Start the periodic per-shard WAL-cleanup timer (no-op when the interval is
+    // disabled). The handle is detached: it is aborted when the store is dropped
+    // on delete, and otherwise runs for the server's lifetime.
+    let _cleanup = RolloutStore::spawn_periodic_cleanup(store.clone());
+
     let mut stores = state.rollout_stores.write().await;
-    stores.insert(req.name.clone(), Arc::new(RwLock::new(store)));
+    stores.insert(req.name.clone(), store);
 
     Ok((
         StatusCode::CREATED,
