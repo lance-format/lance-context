@@ -17,8 +17,8 @@ one).
 ## Why use it
 
 - **Two use cases, one engine.** A `Context` store for agent memory and a
-  `RolloutStore` for RL rollouts. Same storage format, same versioning, same
-  cloud backends.
+  `RolloutStore` (a purpose-built **RolloutDB**) for RL rollouts. Same storage
+  format, same versioning, same cloud backends.
 - **Multimodal.** Store text, images, and binary blobs next to their embeddings
   and typed metadata — the raw bytes are kept, not just a pointer.
 - **Search built in.** Run vector search, full-text search, or hybrid retrieval
@@ -67,12 +67,14 @@ ctx.checkout(v)  # the second message is no longer visible
 hybrid (text + vector) retrieval, batch ingestion, and object-storage backends.
 See [`examples/`](./examples) for runnable projects.
 
-### 2. RL rollouts
+### 2. RL rollouts (a "RolloutDB")
 
 Store training trajectories — one row per step (an assistant turn, a tool call,
 a grade, or an artifact). Only `id` and `rollout_id` are required; everything
 else (tokens, logprobs, rewards, advantages) is optional and filled in as your
-pipeline computes it.
+pipeline computes it. We call this shape a **RolloutDB**: a versioned,
+columnar store purpose-built for RL rollout data, the same way a vector DB is
+built for embeddings.
 
 ```python
 from lance_context import RolloutStore
