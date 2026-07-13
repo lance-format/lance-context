@@ -159,6 +159,8 @@ mod tests {
             base_path: dir.path().to_path_buf(),
             instance_id: None,
             rollout_merge_after_generations: 0,
+            rollout_cleanup_interval_secs: 0,
+            rollout_cleanup_min_generations: 1,
         });
         (state, dir)
     }

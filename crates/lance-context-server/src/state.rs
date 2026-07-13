@@ -18,6 +18,12 @@ pub struct AppState {
     /// Count-triggered self-merge threshold for rollout MemWAL shards; `0`
     /// disables it. See `RolloutStoreOptions::merge_after_generations`.
     pub rollout_merge_after_generations: usize,
+    /// Periodic per-shard WAL-cleanup interval in seconds; `0` disables the
+    /// background timer. See `RolloutStoreOptions::cleanup_interval_secs`.
+    pub rollout_cleanup_interval_secs: u64,
+    /// Minimum flushed generations before a periodic cleanup tick merges. See
+    /// `RolloutStoreOptions::cleanup_min_generations`.
+    pub rollout_cleanup_min_generations: usize,
 }
 
 impl AppState {
@@ -29,6 +35,8 @@ impl AppState {
             base_path: PathBuf::from(&config.data_dir),
             instance_id,
             rollout_merge_after_generations: config.rollout_merge_after_generations,
+            rollout_cleanup_interval_secs: config.rollout_cleanup_interval_secs,
+            rollout_cleanup_min_generations: config.rollout_cleanup_min_generations,
         }
     }
 

@@ -44,7 +44,7 @@
 //! (e.g. by `policy_version`), not a table snapshot — reproducible because the
 //! rows never change. `checkout` remains available for base-table time-travel.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::builder::{
@@ -68,6 +68,8 @@ use lance::index::DatasetIndexExt;
 use lance::io::{ObjectStoreParams, StorageOptionsAccessor};
 use lance::{Error as LanceError, Result as LanceResult};
 use lance_index::mem_wal::{ShardManifest, MEM_WAL_INDEX_NAME};
+use tokio::task::JoinHandle;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::rollout::RolloutRecord;
@@ -111,6 +113,28 @@ pub struct RolloutStoreOptions {
     /// `None` or `0` disables self-merge (the 0.6.0 behavior: generations
     /// accumulate and are unioned at read time).
     pub merge_after_generations: Option<usize>,
+    /// Interval, in seconds, for the periodic per-shard WAL cleanup task. When
+    /// set (and non-zero), a background timer wakes up every `interval` seconds
+    /// and folds this instance's flushed MemWAL generations into the base table
+    /// — the *time* half of the "time + count" trigger. It complements the
+    /// synchronous, count-triggered [`Self::merge_after_generations`]: even a
+    /// low-traffic shard that never crosses the count threshold still gets its
+    /// generations reclaimed on a timer, so read amplification stays bounded and
+    /// object storage does not accumulate stale generation datasets.
+    ///
+    /// The cleanup runs on the shard's own owner (reusing its writer epoch), so
+    /// it never fences a concurrent writer — exactly like the count-triggered
+    /// merge. `None` or `0` disables the periodic task.
+    ///
+    /// Spawn the task with [`RolloutStore::spawn_periodic_cleanup`] once the
+    /// store is behind an `Arc<RwLock<_>>` (the server's ownership model).
+    pub cleanup_interval_secs: Option<u64>,
+    /// The *count* half of the periodic cleanup trigger: the timer only merges
+    /// when this instance's shard has at least this many flushed generations,
+    /// skipping the pass otherwise (avoids rewriting the base table to reclaim a
+    /// single small generation). `None` defaults to `1` (clean up whenever any
+    /// generation is present on a tick).
+    pub cleanup_min_generations: Option<usize>,
 }
 
 /// A Lance-backed store for RL rollout trajectories.
@@ -124,6 +148,13 @@ pub struct RolloutStore {
     /// Self-merge threshold; see [`RolloutStoreOptions::merge_after_generations`].
     /// `0` (or `None` normalized to 0) disables it.
     merge_after_generations: usize,
+    /// Periodic-cleanup interval in seconds; `0` disables the timer. See
+    /// [`RolloutStoreOptions::cleanup_interval_secs`].
+    cleanup_interval_secs: u64,
+    /// Minimum flushed generations before a periodic-cleanup tick merges.
+    /// Normalized to at least `1`. See
+    /// [`RolloutStoreOptions::cleanup_min_generations`].
+    cleanup_min_generations: usize,
 }
 
 impl RolloutStore {
@@ -153,6 +184,8 @@ impl RolloutStore {
             write_shard,
             storage_options,
             merge_after_generations: options.merge_after_generations.unwrap_or(0),
+            cleanup_interval_secs: options.cleanup_interval_secs.unwrap_or(0),
+            cleanup_min_generations: options.cleanup_min_generations.unwrap_or(1).max(1),
         })
     }
 
@@ -221,6 +254,22 @@ impl RolloutStore {
     /// If this instance's own shard has at least `merge_after_generations`
     /// flushed generations, merge them into the base table. No-op otherwise.
     async fn maybe_merge_own_shard(&mut self) -> LanceResult<()> {
+        self.merge_own_shard_if_ready(self.merge_after_generations)
+            .await
+            .map(|_| ())
+    }
+
+    /// Merge this instance's flushed MemWAL generations into the base table when
+    /// the shard has accumulated at least `threshold` of them. Returns the
+    /// number of generations reclaimed (`0` if the threshold was not met or the
+    /// shard has no manifest yet).
+    ///
+    /// This is the shared core of both triggers: the synchronous count trigger
+    /// in [`Self::add`] (with `threshold = merge_after_generations`) and the
+    /// periodic timer in [`Self::spawn_periodic_cleanup`] (with
+    /// `threshold = cleanup_min_generations`). Both merge only the shard this
+    /// instance owns and writes, so the epoch claim never fences another writer.
+    async fn merge_own_shard_if_ready(&mut self, threshold: usize) -> LanceResult<usize> {
         let object_store = self.dataset.object_store(None).await?;
         let branch_location = self.dataset.branch_location();
         let manifest_store = ShardManifestStore::new(
@@ -230,12 +279,91 @@ impl RolloutStore {
             DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
         );
         let Some(manifest) = manifest_store.read_latest().await? else {
-            return Ok(());
+            return Ok(0);
         };
-        if manifest.flushed_generations.len() < self.merge_after_generations {
-            return Ok(());
+        let pending = manifest.flushed_generations.len();
+        if pending == 0 || pending < threshold.max(1) {
+            return Ok(0);
         }
-        self.merge_own_shard(&manifest_store, &manifest).await
+        self.merge_own_shard(&manifest_store, &manifest).await?;
+        Ok(pending)
+    }
+
+    /// Run one periodic WAL-cleanup pass over this instance's own shard: fold any
+    /// flushed generations into the base table once at least
+    /// `cleanup_min_generations` have accumulated. Returns the number of
+    /// generations reclaimed (`0` if below the threshold or nothing pending).
+    ///
+    /// Exposed for callers that drive cleanup on their own schedule instead of
+    /// (or in addition to) the built-in timer from
+    /// [`Self::spawn_periodic_cleanup`]. Like every merge path here it operates
+    /// only on the shard this instance owns, so it is safe to call concurrently
+    /// with this instance's own appends but must not target another instance's
+    /// shard.
+    pub async fn cleanup_own_shard(&mut self) -> LanceResult<usize> {
+        self.merge_own_shard_if_ready(self.cleanup_min_generations)
+            .await
+    }
+
+    /// Spawn a background timer that periodically reclaims this instance's
+    /// flushed MemWAL generations into the base table (the *time* trigger).
+    ///
+    /// Every `cleanup_interval_secs` seconds the task acquires the write lock and
+    /// calls [`Self::cleanup_own_shard`], which merges only when at least
+    /// `cleanup_min_generations` are pending. This bounds read amplification and
+    /// reclaims stale generation datasets even on shards that never cross the
+    /// synchronous count threshold ([`RolloutStoreOptions::merge_after_generations`]).
+    ///
+    /// Returns `None` (spawning nothing) when `cleanup_interval_secs` is `0`
+    /// (disabled). Otherwise returns the task handle.
+    ///
+    /// The task holds only a [`std::sync::Weak`] reference to the store, so it
+    /// never keeps a deleted store alive: once the caller drops the last strong
+    /// `Arc` (e.g. the server removes it from its store map on delete), the next
+    /// tick fails to upgrade and the loop exits on its own. `abort`ing the
+    /// returned handle also stops it immediately.
+    pub fn spawn_periodic_cleanup(store: Arc<tokio::sync::RwLock<Self>>) -> Option<JoinHandle<()>> {
+        let interval_secs = {
+            // Read the interval without holding the lock across the await loop.
+            let guard = store.try_read().ok()?;
+            guard.cleanup_interval_secs
+        };
+        if interval_secs == 0 {
+            return None;
+        }
+
+        let weak = Arc::downgrade(&store);
+        Some(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+            // Skip the immediate first tick so we don't merge the instant the
+            // task starts; wait a full interval before the first pass.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                // Stop once the store has been dropped by its owner.
+                let Some(store) = weak.upgrade() else {
+                    return;
+                };
+                let mut guard = store.write().await;
+                match guard.cleanup_own_shard().await {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        info!(
+                            shard = %guard.write_shard,
+                            reclaimed = n,
+                            "periodic WAL cleanup merged flushed generations"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            shard = %guard.write_shard,
+                            error = %e,
+                            "periodic WAL cleanup failed"
+                        );
+                    }
+                }
+            }
+        }))
     }
 
     /// Fold this instance's flushed MemWAL generations into the base table and
@@ -245,9 +373,21 @@ impl RolloutStore {
     /// anticipates: each flushed generation at `_mem_wal/{shard}/{path}` is a
     /// self-contained Lance dataset. We read every generation's rows, append
     /// them to the base table (`Dataset::append`), then `commit_update` the
-    /// shard manifest to set `flushed_generations` back to empty — leaving
+    /// shard manifest to remove *exactly the generations we merged* — leaving
     /// `replay_after_wal_entry_position` untouched so a reopened writer does
     /// not re-replay already-merged WAL entries.
+    ///
+    /// # Concurrency: surgical drain, not blanket clear
+    ///
+    /// The drain removes only the generation ids this call actually merged,
+    /// retaining any generation that appears in the manifest afterwards. Under
+    /// the single-writer-per-shard model this instance is the only writer, so in
+    /// practice nothing new lands during a merge — but not depending on that is
+    /// what keeps the drain correct: a blanket `flushed_generations = []` would
+    /// silently discard any generation flushed between reading the manifest and
+    /// committing the drain, *without merging it* (data loss). `commit_update`
+    /// re-reads the latest manifest and applies this closure to it, so the
+    /// retain filter runs against the current state, not the stale snapshot.
     ///
     /// # Safety of the epoch claim
     ///
@@ -273,8 +413,10 @@ impl RolloutStore {
         }
 
         // Resolve each flushed generation to its absolute dataset path and read
-        // all its rows into memory.
+        // all its rows into memory. Record which generation ids we merge so the
+        // drain can remove exactly these and nothing else.
         let base_uri = self.dataset.uri().trim_end_matches('/').to_string();
+        let mut merged_generations: HashSet<u64> = HashSet::new();
         let mut batches: Vec<RecordBatch> = Vec::new();
         for flushed in &manifest.flushed_generations {
             let gen_uri = format!(
@@ -289,6 +431,7 @@ impl RolloutStore {
                     batches.push(batch);
                 }
             }
+            merged_generations.insert(flushed.generation);
         }
 
         // Append the merged rows to the base table.
@@ -313,14 +456,22 @@ impl RolloutStore {
             self.dataset.append(reader, Some(params)).await?;
         }
 
-        // Drain the flushed generations from the shard manifest. Claim the
-        // shard's epoch (safe: we own it) and commit a manifest that keeps
-        // everything except the now-merged generations.
+        // Drain the merged generations from the shard manifest. Claim the
+        // shard's epoch (safe: we own it) and commit a manifest that retains
+        // every generation except the ones we just folded into the base table.
+        // Removing only the merged ids (rather than clearing the vec) is what
+        // makes this safe against a generation that lands after we read the
+        // manifest: it is preserved for the next merge instead of being dropped.
         let (epoch, _) = manifest_store.claim_epoch(manifest.shard_spec_id).await?;
         manifest_store
             .commit_update(epoch, |current| ShardManifest {
                 version: current.version + 1,
-                flushed_generations: vec![],
+                flushed_generations: current
+                    .flushed_generations
+                    .iter()
+                    .filter(|fg| !merged_generations.contains(&fg.generation))
+                    .cloned()
+                    .collect(),
                 ..current.clone()
             })
             .await?;
@@ -332,17 +483,48 @@ impl RolloutStore {
     /// Subsequent writes see the index already present and skip this. The shard
     /// a write targets is chosen by the writer (`shard_id`), independent of the
     /// index's declared sharding strategy.
+    ///
+    /// # Concurrent first-writers
+    ///
+    /// `initialize_mem_wal` commits a `CreateIndex` transaction, and Lance treats
+    /// two concurrent `CreateIndex` commits as a hard conflict (not an
+    /// auto-retried one): when two instances take their very first write at the
+    /// same time, both observe no index, both try to create it, and the loser
+    /// gets `RetryableCommitConflict`. That is benign here — the winner created
+    /// exactly the index we wanted — so we reload and treat "index now present"
+    /// as success rather than surfacing the conflict to the caller. Any other
+    /// error propagates.
     async fn ensure_mem_wal(&mut self) -> LanceResult<()> {
-        let indices = self.dataset.load_indices().await?;
-        let has_mem_wal = indices.iter().any(|i| i.name == MEM_WAL_INDEX_NAME);
-        if !has_mem_wal {
-            self.dataset
-                .initialize_mem_wal()
-                .unsharded()
-                .execute()
-                .await?;
+        if self.mem_wal_index_present().await? {
+            return Ok(());
         }
-        Ok(())
+        match self
+            .dataset
+            .initialize_mem_wal()
+            .unsharded()
+            .execute()
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                // A concurrent first-writer may have created the index between
+                // our check and our commit. Reload and accept it if so.
+                let uri = self.dataset.uri().to_string();
+                self.dataset = Self::load_with_options(&uri, self.storage_options.clone()).await?;
+                if self.mem_wal_index_present().await? {
+                    Ok(())
+                } else {
+                    Err(err)
+                }
+            }
+        }
+    }
+
+    /// Whether the MemWAL index has been initialized on the current dataset
+    /// handle.
+    async fn mem_wal_index_present(&self) -> LanceResult<bool> {
+        let indices = self.dataset.load_indices().await?;
+        Ok(indices.iter().any(|i| i.name == MEM_WAL_INDEX_NAME))
     }
 
     /// List rollout rows (base table ∪ every instance's flushed MemWAL rows).
@@ -1325,6 +1507,7 @@ mod tests {
                 storage_options: None,
                 shard_id: Some(shard.to_string()),
                 merge_after_generations: None,
+                ..Default::default()
             };
 
             let mut instance_a = RolloutStore::open_with_options(&uri, options("rollout-0"))
@@ -1385,6 +1568,7 @@ mod tests {
                     storage_options: None,
                     shard_id: Some("rollout-0".to_string()),
                     merge_after_generations: Some(3),
+                    ..Default::default()
                 },
             )
             .await
@@ -1417,6 +1601,7 @@ mod tests {
                     storage_options: None,
                     shard_id: Some("rollout-0".to_string()),
                     merge_after_generations: Some(3),
+                    ..Default::default()
                 },
             )
             .await
@@ -1468,6 +1653,7 @@ mod tests {
                         storage_options: None,
                         shard_id: Some("rollout-0".to_string()),
                         merge_after_generations: Some(2),
+                        ..Default::default()
                     },
                 )
                 .await
@@ -1483,6 +1669,267 @@ mod tests {
             assert_eq!(listed.len(), 2);
             assert!(listed.iter().any(|r| r.id == "a-0"));
             assert!(listed.iter().any(|r| r.id == "a-1"));
+        });
+    }
+
+    #[test]
+    fn cleanup_own_shard_merges_only_at_min_generations() {
+        // The periodic-cleanup entry point (`cleanup_own_shard`) is the time
+        // trigger's per-pass body. With count self-merge disabled, generations
+        // accumulate; a cleanup pass below `cleanup_min_generations` is a no-op,
+        // and one at/above the threshold drains the shard into the base table.
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    storage_options: None,
+                    shard_id: Some("rollout-0".to_string()),
+                    merge_after_generations: None, // count trigger off
+                    cleanup_min_generations: Some(2),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+            store.add(&[assistant_record("a-0")]).await.unwrap();
+            // One generation pending, below min (2): cleanup is a no-op.
+            assert_eq!(store.cleanup_own_shard().await.unwrap(), 0);
+            assert_eq!(flushed_generation_count(&store).await, 1);
+
+            store.add(&[assistant_record("a-1")]).await.unwrap();
+            // Two generations pending, at min: cleanup merges both.
+            assert_eq!(store.cleanup_own_shard().await.unwrap(), 2);
+            assert_eq!(flushed_generation_count(&store).await, 0);
+
+            // Rows survive the merge, readable exactly once.
+            let listed = store.list(None, None).await.unwrap();
+            assert_eq!(listed.len(), 2);
+
+            // Nothing pending: a further pass reclaims nothing.
+            assert_eq!(store.cleanup_own_shard().await.unwrap(), 0);
+        });
+    }
+
+    #[test]
+    fn spawn_periodic_cleanup_reclaims_on_a_timer() {
+        // The background timer folds accumulated generations into the base table
+        // without any count-triggered append. A short interval lets the test
+        // observe one cleanup pass drain the shard.
+        use std::time::Duration;
+        use tokio::sync::RwLock;
+
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let store = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    storage_options: None,
+                    shard_id: Some("rollout-0".to_string()),
+                    merge_after_generations: None, // only the timer merges
+                    cleanup_interval_secs: Some(1),
+                    cleanup_min_generations: Some(1),
+                },
+            )
+            .await
+            .unwrap();
+            let store = Arc::new(RwLock::new(store));
+
+            // Accumulate generations that no count trigger will reclaim.
+            {
+                let mut guard = store.write().await;
+                guard.add(&[assistant_record("a-0")]).await.unwrap();
+                guard.add(&[assistant_record("a-1")]).await.unwrap();
+                assert_eq!(flushed_generation_count(&guard).await, 2);
+            }
+
+            let handle =
+                RolloutStore::spawn_periodic_cleanup(store.clone()).expect("timer enabled");
+
+            // Wait for at least one tick (interval 1s, first tick skipped) to run
+            // the cleanup pass and drain the shard.
+            let drained = async {
+                loop {
+                    {
+                        let guard = store.read().await;
+                        if flushed_generation_count(&guard).await == 0 {
+                            return true;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            };
+            let ok = tokio::time::timeout(Duration::from_secs(10), drained)
+                .await
+                .unwrap_or(false);
+            handle.abort();
+            assert!(ok, "periodic cleanup did not drain the shard in time");
+
+            let guard = store.read().await;
+            assert_eq!(guard.list(None, None).await.unwrap().len(), 2);
+        });
+    }
+
+    #[test]
+    fn concurrent_merges_from_two_shards_into_one_base_table() {
+        // Case 2 of the concurrency hardening: two instances (distinct shards)
+        // fold their flushed generations into the SAME base table at the same
+        // time. Lance's optimistic concurrency retries the second append on the
+        // latest version (Append vs Append is non-conflicting), so no commit is
+        // lost. Each instance drains only its own shard manifest. Afterwards
+        // every row is present exactly once and both shards are empty.
+        use tokio::sync::RwLock;
+
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let make = |shard: &str| {
+                let uri = uri.clone();
+                let shard = shard.to_string();
+                async move {
+                    RolloutStore::open_with_options(
+                        &uri,
+                        RolloutStoreOptions {
+                            storage_options: None,
+                            shard_id: Some(shard),
+                            cleanup_min_generations: Some(1),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap()
+                }
+            };
+
+            // Two instances, each accumulates a few generations on its own shard.
+            let mut a = make("rollout-0").await;
+            let mut b = make("rollout-1").await;
+            for i in 0..4 {
+                a.add(&[assistant_record(&format!("a-{i}"))]).await.unwrap();
+                b.add(&[assistant_record(&format!("b-{i}"))]).await.unwrap();
+            }
+            assert_eq!(flushed_generation_count(&a).await, 4);
+            assert_eq!(flushed_generation_count(&b).await, 4);
+
+            let a = Arc::new(RwLock::new(a));
+            let b = Arc::new(RwLock::new(b));
+
+            // Both merge into the shared base table concurrently.
+            let (ra, rb) = tokio::join!(
+                async {
+                    let mut g = a.write().await;
+                    g.cleanup_own_shard().await
+                },
+                async {
+                    let mut g = b.write().await;
+                    g.cleanup_own_shard().await
+                },
+            );
+            assert_eq!(ra.unwrap(), 4);
+            assert_eq!(rb.unwrap(), 4);
+
+            // Both shards drained; a fresh reader sees all 8 rows exactly once.
+            assert_eq!(flushed_generation_count(&*a.read().await).await, 0);
+            assert_eq!(flushed_generation_count(&*b.read().await).await, 0);
+
+            let reader = RolloutStore::open(&uri).await.unwrap();
+            let listed = reader.list(None, None).await.unwrap();
+            let mut ids: Vec<_> = listed.iter().map(|r| r.id.clone()).collect();
+            ids.sort();
+            let expected: Vec<String> = (0..4)
+                .flat_map(|i| [format!("a-{i}"), format!("b-{i}")])
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            assert_eq!(ids, expected);
+            assert_eq!(listed.len(), 8);
+        });
+    }
+
+    #[test]
+    fn merge_drains_only_merged_generations() {
+        // Regression guard for the surgical drain: the manifest commit removes
+        // exactly the generations that were merged, so if a generation were to
+        // appear that wasn't part of this merge it would be retained, not
+        // silently discarded. We assert the row count is conserved end to end:
+        // every appended row is readable exactly once after a merge, proving no
+        // generation was dropped without being folded into the base table.
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    storage_options: None,
+                    shard_id: Some("rollout-0".to_string()),
+                    cleanup_min_generations: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+            for i in 0..3 {
+                store
+                    .add(&[assistant_record(&format!("g-{i}"))])
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(flushed_generation_count(&store).await, 3);
+
+            // Merge all three. Surgical drain removes exactly generations {merged}.
+            assert_eq!(store.cleanup_own_shard().await.unwrap(), 3);
+            assert_eq!(flushed_generation_count(&store).await, 0);
+
+            // Append a fourth AFTER the drain: it forms a new generation that the
+            // prior merge must not have wiped. A second merge folds just that one.
+            store.add(&[assistant_record("g-3")]).await.unwrap();
+            assert_eq!(flushed_generation_count(&store).await, 1);
+            assert_eq!(store.cleanup_own_shard().await.unwrap(), 1);
+
+            // All four rows conserved, each exactly once.
+            let listed = store.list(None, None).await.unwrap();
+            let mut ids: Vec<_> = listed.iter().map(|r| r.id.clone()).collect();
+            ids.sort();
+            assert_eq!(ids, vec!["g-0", "g-1", "g-2", "g-3"]);
+        });
+    }
+
+    #[test]
+    fn spawn_periodic_cleanup_disabled_returns_none() {
+        // With `cleanup_interval_secs` unset (0), no timer task is spawned.
+        use tokio::sync::RwLock;
+
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let store = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    storage_options: None,
+                    shard_id: Some("rollout-0".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let store = Arc::new(RwLock::new(store));
+            assert!(RolloutStore::spawn_periodic_cleanup(store).is_none());
         });
     }
 
@@ -1511,6 +1958,7 @@ mod tests {
                     storage_options: None,
                     shard_id: Some("rollout-0".to_string()),
                     merge_after_generations: None, // disabled
+                    ..Default::default()
                 },
             )
             .await
@@ -1540,6 +1988,7 @@ mod tests {
                     storage_options: None,
                     shard_id: Some("rollout-0".to_string()),
                     merge_after_generations: Some(1),
+                    ..Default::default()
                 },
             )
             .await
