@@ -334,8 +334,7 @@ impl RolloutStore {
 
         let weak = Arc::downgrade(&store);
         Some(tokio::spawn(async move {
-            let mut ticker =
-                tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
             // Skip the immediate first tick so we don't merge the instant the
             // task starts; wait a full interval before the first pass.
             ticker.tick().await;
@@ -510,11 +509,8 @@ impl RolloutStore {
             Err(err) => {
                 // A concurrent first-writer may have created the index between
                 // our check and our commit. Reload and accept it if so.
-                self.dataset = Self::load_with_options(
-                    &self.dataset.uri().to_string(),
-                    self.storage_options.clone(),
-                )
-                .await?;
+                let uri = self.dataset.uri().to_string();
+                self.dataset = Self::load_with_options(&uri, self.storage_options.clone()).await?;
                 if self.mem_wal_index_present().await? {
                     Ok(())
                 } else {
@@ -1741,7 +1737,6 @@ mod tests {
                     merge_after_generations: None, // only the timer merges
                     cleanup_interval_secs: Some(1),
                     cleanup_min_generations: Some(1),
-                    ..Default::default()
                 },
             )
             .await
@@ -1756,8 +1751,8 @@ mod tests {
                 assert_eq!(flushed_generation_count(&guard).await, 2);
             }
 
-            let handle = RolloutStore::spawn_periodic_cleanup(store.clone())
-                .expect("timer enabled");
+            let handle =
+                RolloutStore::spawn_periodic_cleanup(store.clone()).expect("timer enabled");
 
             // Wait for at least one tick (interval 1s, first tick skipped) to run
             // the cleanup pass and drain the shard.
@@ -1889,7 +1884,10 @@ mod tests {
             .unwrap();
 
             for i in 0..3 {
-                store.add(&[assistant_record(&format!("g-{i}"))]).await.unwrap();
+                store
+                    .add(&[assistant_record(&format!("g-{i}"))])
+                    .await
+                    .unwrap();
             }
             assert_eq!(flushed_generation_count(&store).await, 3);
 
