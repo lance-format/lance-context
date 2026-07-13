@@ -1,7 +1,7 @@
 """Remote (HTTP) rollout store tests.
 
 Spins up a real `lance-context-server` subprocess and drives it through the
-async `RemoteRolloutStore` wrapper — the path RL generation workers and the
+async `AsyncRolloutStore` wrapper — the path RL generation workers and the
 learner use in a deployed setup. Skips gracefully if the server binary has not
 been built (e.g. a pure-Python CI job).
 """
@@ -18,7 +18,7 @@ import urllib.request
 from pathlib import Path
 
 import pytest
-from lance_context import RemoteRolloutStore
+from lance_context import AsyncRolloutStore
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SERVER_BIN = _REPO_ROOT / "target" / "debug" / "lance-context-server"
@@ -76,7 +76,7 @@ def server():
 
 def test_remote_roundtrip(server):
     async def run():
-        store = await RemoteRolloutStore.connect_or_create(server, "rl-run-1")
+        store = await AsyncRolloutStore.connect_or_create(server, "rl-run-1")
 
         resp = await store.add(
             [
@@ -119,12 +119,12 @@ def test_remote_roundtrip(server):
 
 def test_remote_add_one_and_connect(server):
     async def run():
-        store = await RemoteRolloutStore.connect_or_create(server, "rl-run-2")
+        store = await AsyncRolloutStore.connect_or_create(server, "rl-run-2")
         await store.add_one(id="only", rollout_id="traj-9", reward=0.5)
 
         # A second connection sees the first's flushed write (durable, no
         # read affinity).
-        reader = await RemoteRolloutStore.connect(server, "rl-run-2")
+        reader = await AsyncRolloutStore.connect(server, "rl-run-2")
         rows = await reader.list()
         assert [r["id"] for r in rows] == ["only"]
 

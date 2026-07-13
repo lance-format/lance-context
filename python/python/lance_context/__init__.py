@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from .api import (  # pyright: ignore[reportMissingImports]
     AsyncContext,
+    AsyncRolloutStore,
     Context,
     ContextNamespace,
     EmbeddingProvider,
     RemoteContext,
-    RemoteRolloutStore,
     RolloutStore,
     __version__,
 )
@@ -16,12 +16,12 @@ from .embeddings import (  # pyright: ignore[reportMissingImports]
 
 __all__ = [
     "AsyncContext",
+    "AsyncRolloutStore",
     "Context",
     "ContextNamespace",
     "EmbeddingProvider",
     "MultiModalEmbeddingProvider",
     "RemoteContext",
-    "RemoteRolloutStore",
     "RolloutStore",
     "__version__",
 ]
