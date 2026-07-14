@@ -1,16 +1,38 @@
-use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
-use lance_context_core::{ContextStore, ContextStoreOptions, RolloutStore, RolloutStoreOptions};
-use tokio::sync::RwLock;
+use lance_context_core::{
+    ContextStore, ContextStoreOptions, RolloutRegistry, RolloutStore, RolloutStoreOptions,
+};
+use lru::LruCache;
+use tokio::sync::{Mutex, RwLock};
+use tokio::task::JoinHandle;
 
 use crate::config::ServerConfig;
 use crate::error::AppError;
 
+/// Default upper bound on resident rollout-store handles when the config does
+/// not specify one. Sized for peak *concurrent* experiments, not the total
+/// number of experiments (which may be hundreds of thousands).
+pub const DEFAULT_ROLLOUT_CACHE_CAPACITY: usize = 2000;
+
 pub struct AppState {
-    pub stores: RwLock<HashMap<String, Arc<RwLock<ContextStore>>>>,
-    pub rollout_stores: RwLock<HashMap<String, Arc<RwLock<RolloutStore>>>>,
+    pub stores: RwLock<std::collections::HashMap<String, Arc<RwLock<ContextStore>>>>,
+    /// Bounded LRU of resident rollout-store handles.
+    ///
+    /// With one physical dataset per experiment, the deployment may hold
+    /// hundreds of thousands of stores; keeping them all resident would exhaust
+    /// memory and (formerly) spawn one background timer each. This cache bounds
+    /// residency: on overflow the least-recently-used handle is evicted and its
+    /// `Arc<RwLock<RolloutStore>>` dropped. Existence is tracked durably by
+    /// [`Self::rollout_registry`], not by membership in this cache.
+    pub rollout_stores: Mutex<LruCache<String, Arc<RwLock<RolloutStore>>>>,
+    /// Durable directory of which rollout stores exist. Consulted on a cache
+    /// miss (existence check) and to back the list endpoint. Guarded by a lock
+    /// because mutations take `&mut`.
+    pub rollout_registry: RwLock<RolloutRegistry>,
     pub base_path: PathBuf,
     /// Stable identity of this server instance, used as the MemWAL shard key for
     /// rollout writes so each instance owns exactly one shard. `None` falls back
@@ -20,7 +42,7 @@ pub struct AppState {
     /// disables it. See `RolloutStoreOptions::merge_after_generations`.
     pub rollout_merge_after_generations: usize,
     /// Periodic per-shard WAL-cleanup interval in seconds; `0` disables the
-    /// background timer. See `RolloutStoreOptions::cleanup_interval_secs`.
+    /// global sweeper. See [`Self::spawn_global_sweeper`].
     pub rollout_cleanup_interval_secs: u64,
     /// Minimum flushed generations before a periodic cleanup tick merges. See
     /// `RolloutStoreOptions::cleanup_min_generations`.
@@ -28,17 +50,30 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(config: ServerConfig) -> Self {
+    /// Build the shared server state, opening (or creating) the rollout registry
+    /// under `data_dir`. Async because opening the registry touches storage.
+    pub async fn new(config: ServerConfig) -> Result<Self, AppError> {
         let instance_id = config.resolved_instance_id();
-        Self {
-            stores: RwLock::new(HashMap::new()),
-            rollout_stores: RwLock::new(HashMap::new()),
-            base_path: PathBuf::from(&config.data_dir),
+        let base_path = PathBuf::from(&config.data_dir);
+        let registry_uri = base_path
+            .join("_registry.rollout.lance")
+            .to_string_lossy()
+            .to_string();
+        let registry = RolloutRegistry::open_or_create(&registry_uri, None)
+            .await
+            .map_err(AppError::from_lance)?;
+        let capacity = NonZeroUsize::new(config.rollout_cache_capacity)
+            .unwrap_or_else(|| NonZeroUsize::new(DEFAULT_ROLLOUT_CACHE_CAPACITY).unwrap());
+        Ok(Self {
+            stores: RwLock::new(std::collections::HashMap::new()),
+            rollout_stores: Mutex::new(LruCache::new(capacity)),
+            rollout_registry: RwLock::new(registry),
+            base_path,
             instance_id,
             rollout_merge_after_generations: config.rollout_merge_after_generations,
             rollout_cleanup_interval_secs: config.rollout_cleanup_interval_secs,
             rollout_cleanup_min_generations: config.rollout_cleanup_min_generations,
-        }
+        })
     }
 
     pub fn context_uri(&self, name: &str) -> String {
@@ -46,6 +81,41 @@ impl AppState {
             .join(format!("{}.lance", name))
             .to_string_lossy()
             .to_string()
+    }
+
+    /// Build a default-configured `AppState` rooted at `base_path`, for tests.
+    /// Opens a fresh registry under the directory; cleanup interval disabled.
+    #[cfg(test)]
+    pub async fn new_for_test(base_path: PathBuf) -> Self {
+        Self::new_for_test_with_instance(base_path, None).await
+    }
+
+    /// Like [`Self::new_for_test`] but with an explicit MemWAL instance id, so a
+    /// second in-process "instance" can present its own shard.
+    #[cfg(test)]
+    pub async fn new_for_test_with_instance(
+        base_path: PathBuf,
+        instance_id: Option<String>,
+    ) -> Self {
+        let registry_uri = base_path
+            .join("_registry.rollout.lance")
+            .to_string_lossy()
+            .to_string();
+        let registry = RolloutRegistry::open_or_create(&registry_uri, None)
+            .await
+            .expect("open test registry");
+        Self {
+            stores: RwLock::new(std::collections::HashMap::new()),
+            rollout_stores: Mutex::new(LruCache::new(
+                NonZeroUsize::new(DEFAULT_ROLLOUT_CACHE_CAPACITY).unwrap(),
+            )),
+            rollout_registry: RwLock::new(registry),
+            base_path,
+            instance_id,
+            rollout_merge_after_generations: 0,
+            rollout_cleanup_interval_secs: 0,
+            rollout_cleanup_min_generations: 1,
+        }
     }
 
     /// Rollout datasets live under a distinct `.rollout.lance` suffix so a
@@ -58,33 +128,10 @@ impl AppState {
             .to_string()
     }
 
-    /// Look up a rollout store by name, lazily loading it from object storage on
-    /// a local cache miss.
-    ///
-    /// The server caches each opened store in this process's memory. In a
-    /// multi-replica deployment a store `create`d on pod A only enters A's map,
-    /// so a read/write that the load balancer routes to pod B would otherwise
-    /// 404 even though the dataset exists on shared object storage. This helper
-    /// closes that gap: on a miss it *loads* (never creates — see
-    /// [`RolloutStore::open_existing_with_options`], which returns a
-    /// `DatasetNotFound`/404 for a genuinely-absent store rather than silently
-    /// materializing an empty table) and caches the handle for subsequent hits.
-    pub async fn get_or_open_rollout_store(
-        &self,
-        name: &str,
-    ) -> Result<Arc<RwLock<RolloutStore>>, AppError> {
-        // Fast path: already cached in this process.
-        if let Some(store) = self.rollout_stores.read().await.get(name) {
-            return Ok(store.clone());
-        }
-
-        // Slow path: load from object storage WITHOUT holding the map lock, so a
-        // slow open does not block other stores' requests.
-        let uri = self.rollout_uri(name);
-        let options = RolloutStoreOptions {
+    fn rollout_store_options(&self) -> RolloutStoreOptions {
+        RolloutStoreOptions {
             // No request body on the read path: object-store credentials come
-            // from the pod's workload-identity environment, exactly as they do
-            // for the `create` route in production.
+            // from the pod's workload-identity environment.
             storage_options: None,
             shard_id: self.instance_id.clone(),
             merge_after_generations: (self.rollout_merge_after_generations > 0)
@@ -92,22 +139,104 @@ impl AppState {
             cleanup_interval_secs: (self.rollout_cleanup_interval_secs > 0)
                 .then_some(self.rollout_cleanup_interval_secs),
             cleanup_min_generations: Some(self.rollout_cleanup_min_generations),
-        };
-        let opened = RolloutStore::open_existing_with_options(&uri, options)
+        }
+    }
+
+    /// Record that a rollout store exists, in both the durable registry and the
+    /// in-memory LRU. Called by the create route after the dataset is written.
+    pub async fn register_rollout(
+        &self,
+        name: &str,
+        uri: &str,
+        store: Arc<RwLock<RolloutStore>>,
+    ) -> Result<(), AppError> {
+        self.rollout_registry
+            .write()
+            .await
+            .upsert(name, uri)
+            .await
+            .map_err(AppError::from_lance)?;
+        // Insertion may evict the LRU's least-recently-used entry; dropping the
+        // returned handle releases it (no per-store timer to abort — cleanup is
+        // now global).
+        self.rollout_stores
+            .lock()
+            .await
+            .put(name.to_string(), store);
+        Ok(())
+    }
+
+    /// Remove a rollout store from the durable registry and evict any resident
+    /// handle. Returns whether the store existed.
+    pub async fn unregister_rollout(&self, name: &str) -> Result<bool, AppError> {
+        let existed = self
+            .rollout_registry
+            .read()
+            .await
+            .contains(name)
+            .await
+            .map_err(AppError::from_lance)?;
+        if !existed {
+            return Ok(false);
+        }
+        self.rollout_registry
+            .write()
+            .await
+            .remove(name)
+            .await
+            .map_err(AppError::from_lance)?;
+        self.rollout_stores.lock().await.pop(name);
+        Ok(true)
+    }
+
+    /// Look up a rollout store by name, lazily loading it from object storage on
+    /// a local cache miss.
+    ///
+    /// Unlike the previous implementation, a cache miss is **not** a 404: the
+    /// bounded LRU may have evicted a store that still exists. Existence is
+    /// resolved against the durable [`RolloutRegistry`]; only a store absent
+    /// from the registry yields [`AppError::NotFound`]. This closes the
+    /// multi-replica gap (create on pod A, read on pod B) *and* the
+    /// eviction-induced false-404 that per-experiment partitioning introduces.
+    pub async fn get_or_open_rollout_store(
+        &self,
+        name: &str,
+    ) -> Result<Arc<RwLock<RolloutStore>>, AppError> {
+        // Fast path: resident in this process's LRU (updates recency).
+        if let Some(store) = self.rollout_stores.lock().await.get(name) {
+            return Ok(store.clone());
+        }
+
+        // Existence is the registry's job, not the cache's.
+        let exists = self
+            .rollout_registry
+            .read()
+            .await
+            .contains(name)
+            .await
+            .map_err(AppError::from_lance)?;
+        if !exists {
+            return Err(AppError::NotFound(format!(
+                "Rollout store '{}' does not exist",
+                name
+            )));
+        }
+
+        // Load from storage WITHOUT holding the LRU lock, so a slow open does
+        // not block other stores' requests.
+        let uri = self.rollout_uri(name);
+        let opened = RolloutStore::open_existing_with_options(&uri, self.rollout_store_options())
             .await
             .map_err(AppError::from_lance)?;
         let opened = Arc::new(RwLock::new(opened));
 
-        // Insert under the write lock, re-checking for a store another request
-        // may have opened concurrently while we were loading.
-        let mut stores = self.rollout_stores.write().await;
-        if let Some(existing) = stores.get(name) {
+        // Insert under the lock, re-checking for a store another request may
+        // have opened concurrently while we were loading.
+        let mut cache = self.rollout_stores.lock().await;
+        if let Some(existing) = cache.get(name) {
             return Ok(existing.clone());
         }
-        // A lazily-opened store must also get the background WAL-cleanup timer
-        // that the `create` route starts, or these stores would never merge.
-        let _cleanup = RolloutStore::spawn_periodic_cleanup(opened.clone());
-        stores.insert(name.to_string(), opened.clone());
+        cache.put(name.to_string(), opened.clone());
         Ok(opened)
     }
 
@@ -124,9 +253,6 @@ impl AppState {
         }
 
         let uri = self.context_uri(name);
-        // Load-only: existing schema (embedding dim, blob columns, distance
-        // metric) is read from the persisted dataset, so no create-time options
-        // are needed. Credentials come from the pod environment.
         let opened = ContextStore::open_existing_with_options(&uri, ContextStoreOptions::default())
             .await
             .map_err(AppError::from_lance)?;
@@ -138,5 +264,98 @@ impl AppState {
         }
         stores.insert(name.to_string(), opened.clone());
         Ok(opened)
+    }
+
+    /// Spawn the single, process-wide WAL-cleanup sweeper.
+    ///
+    /// This replaces the former one-timer-per-store model, which does not scale
+    /// to hundreds of thousands of per-experiment datasets. On each tick the
+    /// sweeper snapshots the *resident* rollout stores (those in the LRU) and
+    /// folds each one's flushed MemWAL generations into its base table, guarding
+    /// every pass with a timeout so a wedged store cannot stall the sweeper (see
+    /// [`RolloutStore::cleanup_own_shard`] and the timeout added in the periodic
+    /// cleanup hardening).
+    ///
+    /// Cold stores (evicted from the LRU) are not swept: having no new writes,
+    /// they accumulate no new generations, and are swept again the moment a
+    /// request re-opens them. Returns `None` when the interval is `0`.
+    pub fn spawn_global_sweeper(self: &Arc<Self>) -> Option<JoinHandle<()>> {
+        let interval_secs = self.rollout_cleanup_interval_secs;
+        if interval_secs == 0 {
+            return None;
+        }
+        let interval = Duration::from_secs(interval_secs);
+        // Abandon any single pass that outruns five intervals (min 30s) so one
+        // stuck store cannot wedge cleanup for every other store.
+        let pass_timeout = interval.saturating_mul(5).max(Duration::from_secs(30));
+        let weak = Arc::downgrade(self);
+        Some(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.tick().await; // skip the immediate first tick
+            loop {
+                ticker.tick().await;
+                let Some(state) = weak.upgrade() else {
+                    return;
+                };
+                // Snapshot resident stores without holding the LRU lock across
+                // the awaits below.
+                let resident: Vec<(String, Arc<RwLock<RolloutStore>>)> = {
+                    let cache = state.rollout_stores.lock().await;
+                    cache
+                        .iter()
+                        .map(|(name, store)| (name.clone(), store.clone()))
+                        .collect()
+                };
+                for (name, store) in resident {
+                    let mut guard = store.write().await;
+                    match tokio::time::timeout(pass_timeout, guard.cleanup_own_shard()).await {
+                        Ok(Ok(0)) => {}
+                        Ok(Ok(n)) => tracing::info!(
+                            store = %name,
+                            reclaimed = n,
+                            "global sweeper merged flushed generations"
+                        ),
+                        Ok(Err(e)) => tracing::warn!(
+                            store = %name,
+                            error = %e,
+                            "global sweeper WAL cleanup failed"
+                        ),
+                        Err(_elapsed) => tracing::warn!(
+                            store = %name,
+                            "global sweeper WAL cleanup timed out; abandoning this store this tick"
+                        ),
+                    }
+                }
+            }
+        }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    async fn state_with_interval(dir: &TempDir, secs: u64) -> Arc<AppState> {
+        let mut state = AppState::new_for_test(dir.path().to_path_buf()).await;
+        state.rollout_cleanup_interval_secs = secs;
+        Arc::new(state)
+    }
+
+    /// The sweeper is a single detached task, gated on the cleanup interval:
+    /// spawned when non-zero, `None` when disabled. This is the whole-process
+    /// replacement for the former one-timer-per-store model.
+    #[tokio::test]
+    async fn global_sweeper_is_gated_on_interval() {
+        let dir = TempDir::new().unwrap();
+        let disabled = state_with_interval(&dir, 0).await;
+        assert!(disabled.spawn_global_sweeper().is_none());
+
+        let dir2 = TempDir::new().unwrap();
+        let enabled = state_with_interval(&dir2, 3600).await;
+        let handle = enabled
+            .spawn_global_sweeper()
+            .expect("sweeper spawns when interval > 0");
+        handle.abort();
     }
 }

@@ -5447,6 +5447,7 @@ dependencies = [
  "clap",
  "lance-context-api",
  "lance-context-core",
+ "lru",
  "serde",
  "serde_json",
  "tempfile",

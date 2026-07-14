@@ -538,7 +538,6 @@ fn record_from_add_request(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::sync::Arc;
 
     use axum::extract::{Path, Query, State};
@@ -563,17 +562,12 @@ mod tests {
             .to_string_lossy()
             .to_string();
         let store = ContextStore::open(&uri).await.unwrap();
-        let mut stores = HashMap::new();
-        stores.insert(context_name.to_string(), Arc::new(RwLock::new(store)));
-        let state = Arc::new(AppState {
-            stores: RwLock::new(stores),
-            rollout_stores: RwLock::new(HashMap::new()),
-            base_path: dir.path().to_path_buf(),
-            instance_id: None,
-            rollout_merge_after_generations: 0,
-            rollout_cleanup_interval_secs: 0,
-            rollout_cleanup_min_generations: 1,
-        });
+        let state = Arc::new(AppState::new_for_test(dir.path().to_path_buf()).await);
+        state
+            .stores
+            .write()
+            .await
+            .insert(context_name.to_string(), Arc::new(RwLock::new(store)));
         (state, dir)
     }
 
@@ -1220,15 +1214,7 @@ mod tests {
         .expect("write on instance A");
 
         // Instance B: fresh AppState over the same data dir, empty cache.
-        let state_b = Arc::new(AppState {
-            stores: RwLock::new(HashMap::new()),
-            rollout_stores: RwLock::new(HashMap::new()),
-            base_path: dir.path().to_path_buf(),
-            instance_id: None,
-            rollout_merge_after_generations: 0,
-            rollout_cleanup_interval_secs: 0,
-            rollout_cleanup_min_generations: 1,
-        });
+        let state_b = Arc::new(AppState::new_for_test(dir.path().to_path_buf()).await);
 
         let Json(list) = list_records(
             State(state_b.clone()),

@@ -580,7 +580,12 @@ pub struct CreateRolloutStoreRequest {
 pub struct RolloutStoreInfo {
     pub name: String,
     pub uri: String,
-    pub version: u64,
+    /// Dataset version. `None` in list responses, which are served from the
+    /// durable registry without opening each dataset (a store may not be
+    /// resident in memory). Single-store lookups (`get`/`create`) always
+    /// populate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

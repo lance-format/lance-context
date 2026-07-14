@@ -264,7 +264,7 @@ impl RemoteRolloutStore {
         Ok(Self {
             client,
             store_name: store_name.to_string(),
-            cached_version: info.version,
+            cached_version: info.version.unwrap_or(0),
         })
     }
 
@@ -281,7 +281,7 @@ impl RemoteRolloutStore {
         Ok(Self {
             client,
             store_name: req.name.clone(),
-            cached_version: info.version,
+            cached_version: info.version.unwrap_or(0),
         })
     }
 }

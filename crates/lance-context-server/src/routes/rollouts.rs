@@ -30,14 +30,20 @@ pub async fn create_rollout_store(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateRolloutStoreRequest>,
 ) -> Result<(StatusCode, Json<RolloutStoreInfo>), AppError> {
-    let stores = state.rollout_stores.read().await;
-    if stores.contains_key(&req.name) {
+    // Existence is tracked durably in the registry, not by cache membership.
+    if state
+        .rollout_registry
+        .read()
+        .await
+        .contains(&req.name)
+        .await
+        .map_err(AppError::from_lance)?
+    {
         return Err(AppError::AlreadyExists(format!(
             "Rollout store '{}' already exists",
             req.name
         )));
     }
-    drop(stores);
 
     let uri = state.rollout_uri(&req.name);
     let options = RolloutStoreOptions {
@@ -56,40 +62,44 @@ pub async fn create_rollout_store(
     let version = store.version();
 
     let store = Arc::new(RwLock::new(store));
-    // Start the periodic per-shard WAL-cleanup timer (no-op when the interval is
-    // disabled). The handle is detached: it is aborted when the store is dropped
-    // on delete, and otherwise runs for the server's lifetime.
-    let _cleanup = RolloutStore::spawn_periodic_cleanup(store.clone());
-
-    let mut stores = state.rollout_stores.write().await;
-    stores.insert(req.name.clone(), store);
+    // Record in the durable registry and the LRU. WAL cleanup is handled by the
+    // single process-wide sweeper (see `AppState::spawn_global_sweeper`), so no
+    // per-store timer is started here.
+    state.register_rollout(&req.name, &uri, store).await?;
 
     Ok((
         StatusCode::CREATED,
         Json(RolloutStoreInfo {
             name: req.name,
             uri,
-            version,
+            version: Some(version),
         }),
     ))
 }
 
 pub async fn list_rollout_stores(
     State(state): State<Arc<AppState>>,
-) -> Json<ListRolloutStoresResponse> {
-    let stores = state.rollout_stores.read().await;
-    let mut out = Vec::with_capacity(stores.len());
+) -> Result<Json<ListRolloutStoresResponse>, AppError> {
+    // Served from the durable registry so it enumerates *all* stores, not just
+    // those currently resident in the LRU. `version` is omitted here to avoid
+    // opening every dataset.
+    let entries = state
+        .rollout_registry
+        .read()
+        .await
+        .list()
+        .await
+        .map_err(AppError::from_lance)?;
+    let out = entries
+        .into_iter()
+        .map(|entry| RolloutStoreInfo {
+            name: entry.name,
+            uri: entry.uri,
+            version: None,
+        })
+        .collect();
 
-    for (name, store_lock) in stores.iter() {
-        let store = store_lock.read().await;
-        out.push(RolloutStoreInfo {
-            name: name.clone(),
-            uri: state.rollout_uri(name),
-            version: store.version(),
-        });
-    }
-
-    Json(ListRolloutStoresResponse { stores: out })
+    Ok(Json(ListRolloutStoresResponse { stores: out }))
 }
 
 pub async fn get_rollout_store(
@@ -102,7 +112,7 @@ pub async fn get_rollout_store(
     Ok(Json(RolloutStoreInfo {
         name: name.clone(),
         uri: state.rollout_uri(&name),
-        version: store.version(),
+        version: Some(store.version()),
     }))
 }
 
@@ -110,8 +120,9 @@ pub async fn delete_rollout_store(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    let mut stores = state.rollout_stores.write().await;
-    if stores.remove(&name).is_none() {
+    // Removes from the durable registry and evicts any resident handle; 404 when
+    // the store is not registered.
+    if !state.unregister_rollout(&name).await? {
         return Err(AppError::NotFound(format!(
             "Rollout store '{}' does not exist",
             name
@@ -532,27 +543,17 @@ fn rollout_record_to_dto(r: RolloutRecord) -> RolloutRecordDto {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::sync::Arc;
 
     use lance_context_api::CreateRolloutStoreRequest;
     use tempfile::TempDir;
-    use tokio::sync::RwLock;
 
     use super::*;
     use crate::state::AppState;
 
     async fn rollout_state() -> (Arc<AppState>, TempDir) {
         let dir = TempDir::new().unwrap();
-        let state = Arc::new(AppState {
-            stores: RwLock::new(HashMap::new()),
-            rollout_stores: RwLock::new(HashMap::new()),
-            base_path: dir.path().to_path_buf(),
-            instance_id: None,
-            rollout_merge_after_generations: 0,
-            rollout_cleanup_interval_secs: 0,
-            rollout_cleanup_min_generations: 1,
-        });
+        let state = Arc::new(AppState::new_for_test(dir.path().to_path_buf()).await);
         let (_status, _info) = create_rollout_store(
             State(state.clone()),
             Json(CreateRolloutStoreRequest {
@@ -803,15 +804,13 @@ mod tests {
 
         // Pod B: a fresh AppState over the SAME data dir, with an empty cache and
         // a different instance id (its own shard). It never saw the `create`.
-        let state_b = Arc::new(AppState {
-            stores: RwLock::new(HashMap::new()),
-            rollout_stores: RwLock::new(HashMap::new()),
-            base_path: dir.path().to_path_buf(),
-            instance_id: Some("rollout-1".to_string()),
-            rollout_merge_after_generations: 0,
-            rollout_cleanup_interval_secs: 0,
-            rollout_cleanup_min_generations: 1,
-        });
+        let state_b = Arc::new(
+            AppState::new_for_test_with_instance(
+                dir.path().to_path_buf(),
+                Some("rollout-1".to_string()),
+            )
+            .await,
+        );
 
         // Read routed to B must lazily open the store, not 404.
         let Json(list) = list_rollouts(
@@ -852,5 +851,84 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, AppError::NotFound(_)));
+    }
+
+    /// With a capacity-1 LRU, creating a second store must evict the first — but
+    /// the evicted store is still reachable, transparently reopened from storage
+    /// via the durable registry, not falsely 404'd.
+    #[tokio::test]
+    async fn evicted_store_is_transparently_reopened() {
+        let dir = TempDir::new().unwrap();
+        // Force a capacity-1 cache so the second create evicts the first.
+        let mut state = AppState::new_for_test(dir.path().to_path_buf()).await;
+        state.rollout_stores =
+            tokio::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(1).unwrap()));
+        let state = Arc::new(state);
+
+        for name in ["exp-a", "exp-b"] {
+            let _ = create_rollout_store(
+                State(state.clone()),
+                Json(CreateRolloutStoreRequest {
+                    name: name.to_string(),
+                    storage_options: None,
+                }),
+            )
+            .await
+            .expect("create");
+        }
+
+        // exp-a was evicted (cache holds only exp-b now), yet a lookup succeeds.
+        assert_eq!(state.rollout_stores.lock().await.len(), 1);
+        let info = get_rollout_store(State(state.clone()), Path("exp-a".to_string()))
+            .await
+            .expect("evicted store reopens instead of 404");
+        assert_eq!(info.name, "exp-a");
+    }
+
+    /// `list` is served from the durable registry, so it enumerates every store
+    /// that exists — including ones evicted from (or never resident in) the LRU.
+    #[tokio::test]
+    async fn list_enumerates_all_registered_stores() {
+        let dir = TempDir::new().unwrap();
+        let mut state = AppState::new_for_test(dir.path().to_path_buf()).await;
+        state.rollout_stores =
+            tokio::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(1).unwrap()));
+        let state = Arc::new(state);
+
+        for name in ["e0", "e1", "e2"] {
+            let _ = create_rollout_store(
+                State(state.clone()),
+                Json(CreateRolloutStoreRequest {
+                    name: name.to_string(),
+                    storage_options: None,
+                }),
+            )
+            .await
+            .expect("create");
+        }
+        // Only one store is resident, but list must return all three.
+        assert_eq!(state.rollout_stores.lock().await.len(), 1);
+        let Json(listed) = list_rollout_stores(State(state.clone()))
+            .await
+            .expect("list");
+        let mut names: Vec<String> = listed.stores.into_iter().map(|s| s.name).collect();
+        names.sort();
+        assert_eq!(names, vec!["e0", "e1", "e2"]);
+    }
+
+    /// Delete removes the store from the durable registry, so a subsequent read
+    /// 404s and it no longer appears in `list`.
+    #[tokio::test]
+    async fn delete_unregisters_store() {
+        let (state, _dir) = rollout_state().await;
+        delete_rollout_store(State(state.clone()), Path("rl".to_string()))
+            .await
+            .expect("delete");
+        let err = get_rollout_store(State(state.clone()), Path("rl".to_string()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::NotFound(_)));
+        let Json(listed) = list_rollout_stores(State(state.clone())).await.unwrap();
+        assert!(listed.stores.is_empty());
     }
 }
