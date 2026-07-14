@@ -8,11 +8,14 @@ use axum::response::Response;
 use axum::Json;
 use chrono::Utc;
 use lance_context_api::{
-    AddRolloutRequest, AddRolloutsRequest, AddRolloutsResponse, CheckoutRequest,
-    CreateRolloutStoreRequest, GetRolloutResponse, ListRolloutStoresResponse, ListRolloutsResponse,
-    RelationshipDto, RolloutRecordDto, RolloutStoreInfo, VersionResponse,
+    AddRolloutRequest, AddRolloutsRequest, AddRolloutsResponse, CheckoutRequest, CompactRequest,
+    CompactResponse, CompactStatsResponse, CreateRolloutStoreRequest, GetRolloutResponse,
+    ListRolloutStoresResponse, ListRolloutsResponse, RelationshipDto, RolloutRecordDto,
+    RolloutStoreInfo, VersionResponse,
 };
-use lance_context_core::{Relationship, RolloutRecord, RolloutStore, RolloutStoreOptions};
+use lance_context_core::{
+    CompactionConfig, Relationship, RolloutRecord, RolloutStore, RolloutStoreOptions,
+};
 use tokio::sync::RwLock;
 
 use crate::error::AppError;
@@ -391,6 +394,72 @@ pub async fn checkout_rollout(
 
     Ok(Json(VersionResponse {
         version: store.version(),
+    }))
+}
+
+/// Compact the rollout store's base table (fold small fragments produced by WAL
+/// merges into larger ones).
+///
+/// Intended to be driven by an external scheduler (cron / k8s CronJob) from a
+/// single caller — not every worker — since two concurrent base-table rewrites
+/// conflict and waste work. Safe to run while workers append or WAL-merge.
+pub async fn compact_rollout(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(req): Json<CompactRequest>,
+) -> Result<Json<CompactResponse>, AppError> {
+    let stores = state.rollout_stores.read().await;
+    let store_lock = stores
+        .get(&name)
+        .ok_or_else(|| AppError::NotFound(format!("Rollout store '{}' does not exist", name)))?
+        .clone();
+    drop(stores);
+
+    let config = if req.target_rows_per_fragment.is_some() || req.materialize_deletions.is_some() {
+        let mut c = CompactionConfig::default();
+        if let Some(v) = req.target_rows_per_fragment {
+            c.target_rows_per_fragment = v;
+        }
+        if let Some(v) = req.materialize_deletions {
+            c.materialize_deletions = v;
+        }
+        Some(c)
+    } else {
+        None
+    };
+
+    let mut store = store_lock.write().await;
+    let metrics = store.compact(config).await.map_err(AppError::from_lance)?;
+
+    Ok(Json(CompactResponse {
+        fragments_removed: metrics.fragments_removed,
+        fragments_added: metrics.fragments_added,
+        files_removed: metrics.files_removed,
+        files_added: metrics.files_added,
+    }))
+}
+
+/// Base-table compaction statistics for a rollout store.
+pub async fn compact_rollout_stats(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<CompactStatsResponse>, AppError> {
+    let stores = state.rollout_stores.read().await;
+    let store_lock = stores
+        .get(&name)
+        .ok_or_else(|| AppError::NotFound(format!("Rollout store '{}' does not exist", name)))?
+        .clone();
+    drop(stores);
+
+    let store = store_lock.read().await;
+    let stats = store.compaction_stats();
+
+    Ok(Json(CompactStatsResponse {
+        total_fragments: stats.total_fragments,
+        is_compacting: stats.is_compacting,
+        last_compaction: stats.last_compaction,
+        last_error: stats.last_error,
+        total_compactions: stats.total_compactions,
     }))
 }
 
