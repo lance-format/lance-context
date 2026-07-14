@@ -59,10 +59,12 @@ use arrow_array::{
     StringArray, TimestampMicrosecondArray,
 };
 use arrow_schema::{ArrowError, DataType, Field, Schema, TimeUnit};
+use chrono::{DateTime, Utc};
 use futures::TryStreamExt;
 use lance::dataset::mem_wal::{
     DatasetMemWalExt, LsmScanner, ShardManifestStore, ShardSnapshot, ShardWriterConfig,
 };
+use lance::dataset::optimize::{compact_files, CompactionMetrics, CompactionOptions};
 use lance::dataset::{builder::DatasetBuilder, Dataset, WriteMode, WriteParams};
 use lance::index::DatasetIndexExt;
 use lance::io::{ObjectStoreParams, StorageOptionsAccessor};
@@ -75,8 +77,8 @@ use uuid::Uuid;
 use crate::rollout::RolloutRecord;
 use crate::store::{
     column_as, column_as_optional, relationship_field, relationship_list_item_field,
-    relationship_struct_builder, relationships_from_list, timestamp_from_micros,
-    RELATIONSHIPS_COLUMN,
+    relationship_struct_builder, relationships_from_list, timestamp_from_micros, CompactionConfig,
+    CompactionStats, RELATIONSHIPS_COLUMN,
 };
 
 /// Number of shard manifest files to scan per batch when discovering the latest
@@ -155,6 +157,12 @@ pub struct RolloutStore {
     /// Normalized to at least `1`. See
     /// [`RolloutStoreOptions::cleanup_min_generations`].
     cleanup_min_generations: usize,
+    /// Timestamp of the last successful [`Self::compact`] on this handle.
+    last_compaction: Option<DateTime<Utc>>,
+    /// Number of successful compactions performed by this handle.
+    total_compactions: u64,
+    /// Error message from the most recent failed compaction on this handle.
+    last_compaction_error: Option<String>,
 }
 
 impl RolloutStore {
@@ -186,6 +194,9 @@ impl RolloutStore {
             merge_after_generations: options.merge_after_generations.unwrap_or(0),
             cleanup_interval_secs: options.cleanup_interval_secs.unwrap_or(0),
             cleanup_min_generations: options.cleanup_min_generations.unwrap_or(1).max(1),
+            last_compaction: None,
+            total_compactions: 0,
+            last_compaction_error: None,
         })
     }
 
@@ -477,6 +488,109 @@ impl RolloutStore {
             .await?;
 
         Ok(())
+    }
+
+    /// Compact the base table's small fragments into larger ones.
+    ///
+    /// Every WAL merge ([`Self::merge_own_shard`]) `append`s a new fragment to
+    /// the base table, so a long-running store accumulates many small fragments
+    /// that slow scans. This folds them together via Lance's `compact_files`,
+    /// exactly like [`crate::store::ContextStore::compact`].
+    ///
+    /// # Distributed use: run from ONE compactor, not every worker
+    ///
+    /// Unlike WAL merge — where each worker touches only its own shard and can
+    /// never contend — compaction rewrites the *shared* base table. Lance treats
+    /// two concurrent `Rewrite` commits as a retryable conflict (one wins, the
+    /// other must redo its work), so N workers each compacting the same table
+    /// degenerates into a thundering herd of wasted rewrites. This method is
+    /// therefore intended to be driven by a *single* external trigger (a cron
+    /// job, a k8s CronJob, or one designated instance) rather than a per-worker
+    /// background timer. It is safe to call while other workers are appending or
+    /// WAL-merging: `Append` vs `Rewrite` is non-conflicting in Lance's matrix,
+    /// so a concurrent append simply rebases on the compaction (or vice-versa).
+    ///
+    /// Returns the Lance [`CompactionMetrics`] (fragments/files added & removed).
+    pub async fn compact(
+        &mut self,
+        options: Option<CompactionConfig>,
+    ) -> LanceResult<CompactionMetrics> {
+        let config = options.unwrap_or_default();
+
+        let lance_options = CompactionOptions {
+            target_rows_per_fragment: config.target_rows_per_fragment,
+            max_rows_per_group: config.max_rows_per_group,
+            materialize_deletions: config.materialize_deletions,
+            materialize_deletions_threshold: config.materialize_deletions_threshold,
+            num_threads: config.num_threads,
+            // The rollout base table carries a MemWAL index, which is fieldless
+            // (it tracks shard/generation bookkeeping, not a data column). Lance's
+            // inline index remap panics on a fieldless index ("An index existed
+            // with no fields"), so defer remapping: compaction records a
+            // fragment-reuse index and remaps lazily instead of touching the
+            // MemWAL index during the rewrite.
+            defer_index_remap: true,
+            ..Default::default()
+        };
+
+        match compact_files(&mut self.dataset, lance_options, None).await {
+            Ok(metrics) => {
+                // Reload the handle so the caller (and subsequent reads on this
+                // instance) observe the compacted version.
+                let uri = self.dataset.uri().to_string();
+                self.dataset = Self::load_with_options(&uri, self.storage_options.clone()).await?;
+                self.last_compaction = Some(Utc::now());
+                self.total_compactions += 1;
+                self.last_compaction_error = None;
+                info!(
+                    fragments_removed = metrics.fragments_removed,
+                    fragments_added = metrics.fragments_added,
+                    "rollout base-table compaction completed"
+                );
+                Ok(metrics)
+            }
+            Err(e) => {
+                warn!(error = %e, "rollout base-table compaction failed");
+                self.last_compaction_error = Some(e.to_string());
+                Err(e)
+            }
+        }
+    }
+
+    /// Whether the base table has accumulated at least `min_fragments`
+    /// fragments (and is thus worth compacting). Quiet-hours gating from
+    /// [`CompactionConfig`] is honored so an external scheduler can pass the
+    /// same config it would pass to [`Self::compact`].
+    pub fn should_compact(&self, config: &CompactionConfig) -> bool {
+        if self.dataset.count_fragments() < config.min_fragments {
+            return false;
+        }
+        if !config.quiet_hours.is_empty() {
+            use chrono::Timelike;
+            let hour = Utc::now().hour() as u8;
+            for (start, end) in &config.quiet_hours {
+                if hour >= *start && hour < *end {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Current compaction statistics for the base table.
+    ///
+    /// `is_compacting` is always `false`: compaction here runs synchronously
+    /// under the caller's `&mut self` (there is no background compactor thread),
+    /// so a stats read cannot observe an in-flight compaction on this handle.
+    #[must_use]
+    pub fn compaction_stats(&self) -> CompactionStats {
+        CompactionStats {
+            total_fragments: self.dataset.count_fragments(),
+            is_compacting: false,
+            last_compaction: self.last_compaction,
+            last_error: self.last_compaction_error.clone(),
+            total_compactions: self.total_compactions,
+        }
     }
 
     /// Initialize the (unsharded) MemWAL index on first write, exactly once.
@@ -1551,6 +1665,183 @@ mod tests {
             .unwrap()
             .map(|m| m.flushed_generations.len())
             .unwrap_or(0)
+    }
+
+    #[test]
+    fn compact_reduces_fragments_and_preserves_reads() {
+        // Each WAL merge appends a fragment to the base table, so several merges
+        // leave many small fragments. compact() folds them into fewer fragments
+        // while every row stays readable exactly once and inline artifact bytes
+        // remain fetchable.
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let artifact_bytes = b"\x00\x01\x02compacted";
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    storage_options: None,
+                    shard_id: Some("rollout-0".to_string()),
+                    // Merge every append into base so each forms its own fragment.
+                    merge_after_generations: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+            for i in 0..6 {
+                store
+                    .add(&[assistant_record(&format!("a-{i}"))])
+                    .await
+                    .unwrap();
+            }
+            store
+                .add(&[artifact_record("a-6", artifact_bytes)])
+                .await
+                .unwrap();
+
+            let before = store.dataset.count_fragments();
+            assert!(before > 1, "expected several fragments, got {before}");
+            assert!(store.should_compact(&CompactionConfig {
+                min_fragments: 2,
+                ..CompactionConfig::default()
+            }));
+
+            let metrics = store.compact(None).await.unwrap();
+            assert!(metrics.fragments_removed > 0);
+
+            let after = store.dataset.count_fragments();
+            assert!(
+                after < before,
+                "compaction should reduce fragments: {before} -> {after}"
+            );
+
+            // All rows conserved, each exactly once.
+            let listed = store.list(None, None).await.unwrap();
+            assert_eq!(listed.len(), 7);
+            let mut ids: Vec<_> = listed.iter().map(|r| r.id.clone()).collect();
+            ids.sort();
+            assert_eq!(ids, vec!["a-0", "a-1", "a-2", "a-3", "a-4", "a-5", "a-6"]);
+            // Inline artifact bytes survive compaction.
+            assert_eq!(
+                store.get_blob("a-6").await.unwrap().as_deref(),
+                Some(&artifact_bytes[..])
+            );
+
+            // Stats reflect the successful compaction.
+            let stats = store.compaction_stats();
+            assert_eq!(stats.total_compactions, 1);
+            assert!(stats.last_compaction.is_some());
+            assert!(stats.last_error.is_none());
+        });
+    }
+
+    #[test]
+    fn should_compact_respects_min_fragments() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    storage_options: None,
+                    shard_id: Some("rollout-0".to_string()),
+                    merge_after_generations: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            store.add(&[assistant_record("a-0")]).await.unwrap();
+
+            let frags = store.dataset.count_fragments();
+            // A threshold above the current fragment count says "don't compact".
+            assert!(!store.should_compact(&CompactionConfig {
+                min_fragments: frags + 1,
+                ..CompactionConfig::default()
+            }));
+            // At/below it says "compact".
+            assert!(store.should_compact(&CompactionConfig {
+                min_fragments: frags,
+                ..CompactionConfig::default()
+            }));
+        });
+    }
+
+    #[test]
+    fn compact_composes_with_concurrent_wal_merge() {
+        // A base-table compaction (Rewrite) and a WAL merge (Append) are
+        // non-conflicting in Lance's commit matrix: running them concurrently
+        // must not fail, and no rows are lost. Instance A compacts while
+        // instance B (a different shard) merges its own generations into the
+        // same base table.
+        use tokio::sync::RwLock;
+
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            // Seed the base table via A with several fragments to compact.
+            let mut a = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    storage_options: None,
+                    shard_id: Some("rollout-0".to_string()),
+                    merge_after_generations: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            for i in 0..5 {
+                a.add(&[assistant_record(&format!("a-{i}"))]).await.unwrap();
+            }
+
+            // B accumulates its own shard's generations (not yet merged).
+            let mut b = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    storage_options: None,
+                    shard_id: Some("rollout-1".to_string()),
+                    cleanup_min_generations: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            for i in 0..3 {
+                b.add(&[assistant_record(&format!("b-{i}"))]).await.unwrap();
+            }
+
+            let a = Arc::new(RwLock::new(a));
+            let b = Arc::new(RwLock::new(b));
+
+            // A compacts the base table; B merges its shard into it — concurrently.
+            let (ca, mb) = tokio::join!(
+                async {
+                    let mut g = a.write().await;
+                    g.compact(None).await
+                },
+                async {
+                    let mut g = b.write().await;
+                    g.cleanup_own_shard().await
+                },
+            );
+            ca.expect("compaction should not fail against a concurrent append");
+            assert_eq!(mb.expect("wal merge should not fail"), 3);
+
+            // A fresh reader sees all 8 rows exactly once.
+            let reader = RolloutStore::open(&uri).await.unwrap();
+            let listed = reader.list(None, None).await.unwrap();
+            assert_eq!(listed.len(), 8);
+        });
     }
 
     #[test]

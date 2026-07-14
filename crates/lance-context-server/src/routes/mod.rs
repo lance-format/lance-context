@@ -105,6 +105,14 @@ pub fn router() -> Router<Arc<AppState>> {
             "/api/v1/rollouts/{name}/checkout",
             post(rollouts::checkout_rollout),
         )
+        .route(
+            "/api/v1/rollouts/{name}/compact",
+            post(rollouts::compact_rollout),
+        )
+        .route(
+            "/api/v1/rollouts/{name}/compact/stats",
+            get(rollouts::compact_rollout_stats),
+        )
 }
 
 #[cfg(test)]
