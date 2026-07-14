@@ -337,7 +337,31 @@ impl ContextStore {
     }
 
     /// Open a dataset with explicit object store configuration (e.g. S3 credentials).
+    /// Creates the dataset if it does not exist.
     pub async fn open_with_options(uri: &str, options: ContextStoreOptions) -> LanceResult<Self> {
+        Self::open_inner(uri, options, true).await
+    }
+
+    /// Open an **existing** context dataset. Unlike [`Self::open_with_options`],
+    /// this does **not** create the dataset when it is absent — it returns the
+    /// underlying [`LanceError::DatasetNotFound`] instead.
+    ///
+    /// Used by the server's lazy cache-fill path: a cache miss must load a store
+    /// that genuinely exists on object storage. Create-on-absence would silently
+    /// materialize an empty context for a mistyped name, masking the 404. Store
+    /// creation goes exclusively through [`Self::open_with_options`].
+    pub async fn open_existing_with_options(
+        uri: &str,
+        options: ContextStoreOptions,
+    ) -> LanceResult<Self> {
+        Self::open_inner(uri, options, false).await
+    }
+
+    async fn open_inner(
+        uri: &str,
+        options: ContextStoreOptions,
+        create_if_missing: bool,
+    ) -> LanceResult<Self> {
         // Validate blob_columns
         for col in &options.blob_columns {
             if !VALID_BLOB_COLUMNS.contains(&col.as_str()) {
@@ -359,7 +383,7 @@ impl ContextStore {
         let blob_columns = options.blob_columns.clone();
         let (dataset, created) = match Self::load_with_options(uri, storage_options.clone()).await {
             Ok(dataset) => (dataset, false),
-            Err(LanceError::DatasetNotFound { .. }) => {
+            Err(LanceError::DatasetNotFound { .. }) if create_if_missing => {
                 let dataset = Self::create_with_options(
                     uri,
                     storage_options.clone(),

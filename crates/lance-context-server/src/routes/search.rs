@@ -24,12 +24,7 @@ pub async fn search(
         .transpose()
         .map_err(AppError::InvalidRequest)?;
 
-    let stores = state.stores.read().await;
-    let store_lock = stores
-        .get(&name)
-        .ok_or_else(|| AppError::NotFound(format!("Context '{}' does not exist", name)))?
-        .clone();
-    drop(stores);
+    let store_lock = state.get_or_open_context_store(&name).await?;
 
     let store = store_lock.read().await;
     let results = store
@@ -76,12 +71,7 @@ pub async fn retrieve(
         .transpose()
         .map_err(AppError::InvalidRequest)?;
 
-    let stores = state.stores.read().await;
-    let store_lock = stores
-        .get(&name)
-        .ok_or_else(|| AppError::NotFound(format!("Context '{}' does not exist", name)))?
-        .clone();
-    drop(stores);
+    let store_lock = state.get_or_open_context_store(&name).await?;
 
     let store = store_lock.read().await;
     let results = store

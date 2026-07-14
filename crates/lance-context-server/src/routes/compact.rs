@@ -13,12 +13,7 @@ pub async fn compact(
     Path(name): Path<String>,
     Json(req): Json<CompactRequest>,
 ) -> Result<Json<CompactResponse>, AppError> {
-    let stores = state.stores.read().await;
-    let store_lock = stores
-        .get(&name)
-        .ok_or_else(|| AppError::NotFound(format!("Context '{}' does not exist", name)))?
-        .clone();
-    drop(stores);
+    let store_lock = state.get_or_open_context_store(&name).await?;
 
     let config = if req.target_rows_per_fragment.is_some() || req.materialize_deletions.is_some() {
         let mut c = CompactionConfig::default();
@@ -48,12 +43,7 @@ pub async fn compact_stats(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<Json<CompactStatsResponse>, AppError> {
-    let stores = state.stores.read().await;
-    let store_lock = stores
-        .get(&name)
-        .ok_or_else(|| AppError::NotFound(format!("Context '{}' does not exist", name)))?
-        .clone();
-    drop(stores);
+    let store_lock = state.get_or_open_context_store(&name).await?;
 
     let store = store_lock.read().await;
     let stats = store

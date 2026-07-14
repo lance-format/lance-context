@@ -176,12 +176,37 @@ impl RolloutStore {
     }
 
     /// Open a rollout dataset with explicit storage and shard configuration.
+    /// Creates the dataset if it does not exist.
     pub async fn open_with_options(uri: &str, options: RolloutStoreOptions) -> LanceResult<Self> {
+        Self::open_inner(uri, options, true).await
+    }
+
+    /// Open an **existing** rollout dataset. Unlike [`Self::open_with_options`],
+    /// this does **not** create the dataset when it is absent — it returns the
+    /// underlying [`LanceError::DatasetNotFound`] instead.
+    ///
+    /// This is the read/write path used by the server's lazy cache-fill: a
+    /// cache miss must load a store that genuinely exists on object storage
+    /// (create-on-absence would silently materialize an empty table for a
+    /// mistyped name, masking the 404). Store creation goes exclusively through
+    /// [`Self::open_with_options`] on the explicit `create` route.
+    pub async fn open_existing_with_options(
+        uri: &str,
+        options: RolloutStoreOptions,
+    ) -> LanceResult<Self> {
+        Self::open_inner(uri, options, false).await
+    }
+
+    async fn open_inner(
+        uri: &str,
+        options: RolloutStoreOptions,
+        create_if_missing: bool,
+    ) -> LanceResult<Self> {
         let storage_options = options.storage_options.clone();
         let write_shard = derive_shard_id(options.shard_id.as_deref());
         let dataset = match Self::load_with_options(uri, storage_options.clone()).await {
             Ok(dataset) => dataset,
-            Err(LanceError::DatasetNotFound { .. }) => {
+            Err(LanceError::DatasetNotFound { .. }) if create_if_missing => {
                 Self::create_with_options(uri, storage_options.clone()).await?
             }
             Err(err) => return Err(err),
