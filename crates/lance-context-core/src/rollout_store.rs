@@ -85,6 +85,24 @@ use crate::store::{
 /// shard state (mirrors the constant used by `ContextStore`).
 const DEFAULT_MANIFEST_SCAN_BATCH_SIZE: usize = 16;
 
+/// Cheap, read-only observability snapshot of a rollout store's base table.
+///
+/// Produced by [`RolloutStore::observe`] from dataset metadata (no full scan).
+/// Consumed by the control-plane stats scanner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RolloutObservation {
+    /// Logical row count of the base table (fragment metadata, cheap).
+    pub row_count: i64,
+    /// Number of fragments in the base table.
+    pub fragment_count: i64,
+    /// Current base dataset manifest version.
+    pub version: u64,
+    /// Manifest timestamp, Unix milliseconds — when the base table last changed.
+    pub last_updated: i64,
+    /// Flushed MemWAL generations pending merge for this instance's shard.
+    pub pending_wal_generations: i64,
+}
+
 /// Configuration for opening a [`RolloutStore`].
 #[derive(Debug, Clone, Default)]
 pub struct RolloutStoreOptions {
@@ -630,6 +648,48 @@ impl RolloutStore {
             }
         }
         true
+    }
+
+    /// Number of flushed MemWAL generations pending merge into the base table
+    /// for this instance's own shard. `0` when the shard has no manifest yet.
+    ///
+    /// Read-only: unlike [`Self::cleanup_own_shard`] it never merges. Used by the
+    /// control-plane stats scanner to surface read-amplification pressure.
+    pub async fn pending_wal_generations(&self) -> LanceResult<usize> {
+        let object_store = self.dataset.object_store(None).await?;
+        let branch_location = self.dataset.branch_location();
+        let manifest_store = ShardManifestStore::new(
+            object_store,
+            &branch_location.path,
+            self.write_shard,
+            DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
+        );
+        match manifest_store.read_latest().await? {
+            Some(manifest) => Ok(manifest.flushed_generations.len()),
+            None => Ok(0),
+        }
+    }
+
+    /// Snapshot cheap, read-only observability metrics for the base table.
+    ///
+    /// All fields come from dataset metadata (manifest + fragment counts), not a
+    /// full table scan: `row_count` and `fragment_count` read fragment metadata,
+    /// `version`/`last_updated` come from the manifest. `pending_wal_generations`
+    /// reads this instance's shard manifest. Intended for the control-plane stats
+    /// scanner, which opens each store read-only and records the result.
+    pub async fn observe(&self) -> LanceResult<RolloutObservation> {
+        let row_count = self.dataset.count_rows(None).await? as i64;
+        let fragment_count = self.dataset.count_fragments() as i64;
+        let version = self.dataset.manifest.version;
+        let last_updated = self.dataset.manifest.timestamp().timestamp_millis();
+        let pending_wal_generations = self.pending_wal_generations().await? as i64;
+        Ok(RolloutObservation {
+            row_count,
+            fragment_count,
+            version,
+            last_updated,
+            pending_wal_generations,
+        })
     }
 
     /// Current compaction statistics for the base table.
@@ -1625,6 +1685,33 @@ mod tests {
 
             assert!(store.get_by_id("missing").await.unwrap().is_none());
             assert_eq!(store.get_blob("missing").await.unwrap(), None);
+        });
+    }
+
+    #[test]
+    fn observe_reports_cheap_metrics() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open(&uri).await.unwrap();
+            // Empty store: no rows, no pending generations.
+            let obs = store.observe().await.unwrap();
+            assert_eq!(obs.row_count, 0);
+            assert_eq!(obs.pending_wal_generations, 0);
+
+            store
+                .add(&[assistant_record("a"), assistant_record("b")])
+                .await
+                .unwrap();
+
+            // Two MemWAL-appended rows are visible via the LSM read path; the
+            // base table itself has not been merged, so they surface as a
+            // pending flushed generation rather than base rows.
+            let obs = store.observe().await.unwrap();
+            assert!(obs.fragment_count >= 0);
+            assert!(obs.pending_wal_generations >= 1);
+            assert!(obs.last_updated > 0);
         });
     }
 
