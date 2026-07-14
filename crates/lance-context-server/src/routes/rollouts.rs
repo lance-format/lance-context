@@ -33,7 +33,7 @@ pub async fn create_rollout_store(
     // Existence is tracked durably in the registry, not by cache membership.
     if state
         .rollout_registry
-        .read()
+        .write()
         .await
         .contains(&req.name)
         .await
@@ -85,7 +85,7 @@ pub async fn list_rollout_stores(
     // opening every dataset.
     let entries = state
         .rollout_registry
-        .read()
+        .write()
         .await
         .list()
         .await

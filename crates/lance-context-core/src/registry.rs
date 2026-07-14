@@ -41,9 +41,10 @@ pub struct RegistryEntry {
 
 /// Durable directory of rollout stores, backed by a single Lance dataset.
 ///
-/// All mutations (`upsert`, `remove`) take `&mut self` and are expected to be
-/// serialized by the caller (the server wraps this in a lock), so the registry
-/// itself does no internal locking. Reads (`list`, `contains`) take `&self`.
+/// All operations take `&mut self` because Lance dataset handles are snapshots:
+/// reads and writes first check out the latest manifest so commits made by
+/// another process are visible. Callers are expected to serialize access (the
+/// server and master wrap this in a lock).
 pub struct RolloutRegistry {
     dataset: Dataset,
     uri: String,
@@ -132,6 +133,7 @@ impl RolloutRegistry {
     /// `create` retried after a crash (dataset on disk, registry row possibly
     /// present) converges to exactly one row. Callers must serialize mutations.
     pub async fn upsert(&mut self, name: &str, uri: &str) -> LanceResult<()> {
+        self.reload().await?;
         self.delete_row(name).await?;
         let schema = Arc::new(registry_schema());
         let batch = RecordBatch::try_new(
@@ -150,6 +152,7 @@ impl RolloutRegistry {
 
     /// Remove the directory entry for `name`, if present. No-op when absent.
     pub async fn remove(&mut self, name: &str) -> LanceResult<()> {
+        self.reload().await?;
         self.delete_row(name).await
     }
 
@@ -161,8 +164,14 @@ impl RolloutRegistry {
         Ok(())
     }
 
-    /// Whether a store named `name` exists in the directory.
-    pub async fn contains(&self, name: &str) -> LanceResult<bool> {
+    /// Refresh this handle to the registry's latest committed version.
+    pub async fn reload(&mut self) -> LanceResult<()> {
+        self.dataset.checkout_latest().await
+    }
+
+    /// Whether a store named `name` exists in the latest registry version.
+    pub async fn contains(&mut self, name: &str) -> LanceResult<bool> {
+        self.reload().await?;
         let escaped = name.replace('\'', "''");
         let mut scanner = self.dataset.scan();
         scanner.project(&["name"])?;
@@ -177,10 +186,12 @@ impl RolloutRegistry {
         Ok(false)
     }
 
-    /// All directory entries, ordered as stored (unspecified). The registry is a
-    /// narrow three-column table, so even hundreds of thousands of rows scan
-    /// quickly; pagination can be layered on later if needed.
-    pub async fn list(&self) -> LanceResult<Vec<RegistryEntry>> {
+    /// All directory entries from the latest registry version, ordered as
+    /// stored (unspecified). The registry is a narrow three-column table, so
+    /// even hundreds of thousands of rows scan quickly; pagination can be
+    /// layered on later if needed.
+    pub async fn list(&mut self) -> LanceResult<Vec<RegistryEntry>> {
+        self.reload().await?;
         let mut scanner = self.dataset.scan();
         scanner.project(&["name", "uri", "created_at"])?;
         let mut stream = scanner.try_into_stream().await?;
@@ -304,7 +315,22 @@ mod tests {
                 .unwrap();
         }
         // Reopen the same path: the entry must still be present.
-        let reg = new_registry(&dir).await;
+        let mut reg = new_registry(&dir).await;
         assert!(reg.contains("persist").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn reads_see_commits_from_another_handle() {
+        let dir = TempDir::new().unwrap();
+        let mut reader = new_registry(&dir).await;
+        let mut writer = new_registry(&dir).await;
+
+        writer
+            .upsert("external", "/data/external.rollout.lance")
+            .await
+            .unwrap();
+
+        assert!(reader.contains("external").await.unwrap());
+        assert_eq!(reader.list().await.unwrap()[0].name, "external");
     }
 }

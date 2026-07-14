@@ -31,7 +31,8 @@ pub struct AppState {
     pub rollout_stores: Mutex<LruCache<String, Arc<RwLock<RolloutStore>>>>,
     /// Durable directory of which rollout stores exist. Consulted on a cache
     /// miss (existence check) and to back the list endpoint. Guarded by a lock
-    /// because mutations take `&mut`.
+    /// because every operation refreshes the snapshot and therefore takes
+    /// `&mut`.
     pub rollout_registry: RwLock<RolloutRegistry>,
     pub base_path: PathBuf,
     /// Stable identity of this server instance, used as the MemWAL shard key for
@@ -171,7 +172,7 @@ impl AppState {
     pub async fn unregister_rollout(&self, name: &str) -> Result<bool, AppError> {
         let existed = self
             .rollout_registry
-            .read()
+            .write()
             .await
             .contains(name)
             .await
@@ -212,7 +213,7 @@ impl AppState {
         // Existence is the registry's job, not the cache's.
         let exists = self
             .rollout_registry
-            .read()
+            .write()
             .await
             .contains(name)
             .await
