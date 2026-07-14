@@ -22,6 +22,9 @@ from ._internal import (  # pyright: ignore[reportMissingImports]
     RolloutStore as _RolloutStore,
 )
 from ._internal import version as _version  # pyright: ignore[reportMissingImports]
+from ._internal import (  # pyright: ignore[reportMissingImports]
+    generate_id as _generate_id,
+)
 from .embeddings import EmbeddingProvider, _build_provider, supports_media
 
 __all__ = [
@@ -33,9 +36,19 @@ __all__ = [
     "RemoteContext",
     "RolloutStore",
     "__version__",
+    "generate_id",
 ]
 
 __version__ = _version()
+
+
+def generate_id() -> str:
+    """Generate a new time-ordered id (UUIDv7) as a string.
+
+    Ids sort roughly in creation order, making them a good default primary key
+    for append-heavy tables such as the rollout store.
+    """
+    return _generate_id()
 
 _ARROW_STREAM_MIME = "application/vnd.apache.arrow.stream"
 _DEFAULT_INGEST_BATCH_SIZE = 1000

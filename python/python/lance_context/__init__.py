@@ -9,6 +9,7 @@ from .api import (  # pyright: ignore[reportMissingImports]
     RemoteContext,
     RolloutStore,
     __version__,
+    generate_id,
 )
 from .embeddings import (  # pyright: ignore[reportMissingImports]
     MultiModalEmbeddingProvider,
@@ -24,4 +25,5 @@ __all__ = [
     "RemoteContext",
     "RolloutStore",
     "__version__",
+    "generate_id",
 ]

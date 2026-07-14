@@ -77,6 +77,15 @@ fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+/// Generate a new time-ordered id (UUIDv7) as a string.
+///
+/// Ids sort roughly in creation order, making them a good default primary key
+/// for append-heavy tables such as the rollout store.
+#[pyfunction]
+fn generate_id() -> String {
+    lance_context_core::generate_id()
+}
+
 #[pyclass]
 struct Context {
     inner: RustContext,
@@ -2517,6 +2526,7 @@ fn rollout_record_to_json(record: &RolloutRecordDto) -> PyResult<String> {
 #[pymodule]
 fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(version, m)?)?;
+    m.add_function(wrap_pyfunction!(generate_id, m)?)?;
     m.add_class::<Context>()?;
     m.add_class::<ContextNamespace>()?;
     m.add_class::<RemoteContext>()?;

@@ -5,6 +5,7 @@ mod api_impl;
 mod context;
 mod eval;
 mod export;
+mod id;
 mod namespace;
 mod record;
 mod rollout;
@@ -23,6 +24,7 @@ pub use export::{
     RolloutExample, RolloutResponse, SftExample, SplitConfig, SplitManifest, TokenStats,
     EXPORT_SCHEMA_VERSION,
 };
+pub use id::{generate_id, new_uuid};
 pub use namespace::{ContextNamespace, PartitionInfo, PartitionSelector, PartitionSpec};
 pub use record::{
     ContextRecord, LifecycleQueryOptions, MetadataFilter, RecordFilters, RecordPatch, Relationship,
