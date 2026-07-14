@@ -17,7 +17,7 @@
 //!
 //! It deliberately holds only cheap directory metadata, never rollout rows.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::{Int64Array, RecordBatch, RecordBatchIterator, StringArray};
@@ -148,6 +148,51 @@ impl RolloutRegistry {
         let params = Self::write_params(WriteMode::Append, self.storage_options.clone());
         self.dataset.append(reader, Some(params)).await?;
         Ok(())
+    }
+
+    /// Insert every entry whose name is not already registered in one append.
+    ///
+    /// This is intended for migration/backfill jobs where many pre-existing
+    /// rollout datasets need directory entries. Existing rows are left
+    /// unchanged, duplicate names in `entries` are ignored, and the return
+    /// value is the number of rows inserted.
+    pub async fn insert_missing(&mut self, entries: &[(String, String)]) -> LanceResult<usize> {
+        if entries.is_empty() {
+            return Ok(0);
+        }
+
+        self.reload().await?;
+        let mut known: HashSet<String> = self
+            .list()
+            .await?
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        let missing: Vec<&(String, String)> = entries
+            .iter()
+            .filter(|(name, _)| known.insert(name.clone()))
+            .collect();
+        if missing.is_empty() {
+            return Ok(0);
+        }
+
+        let schema = Arc::new(registry_schema());
+        let created_at = Utc::now().timestamp_millis();
+        let names: Vec<&str> = missing.iter().map(|(name, _)| name.as_str()).collect();
+        let uris: Vec<&str> = missing.iter().map(|(_, uri)| uri.as_str()).collect();
+        let created = vec![created_at; missing.len()];
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(names)),
+                Arc::new(StringArray::from(uris)),
+                Arc::new(Int64Array::from(created)),
+            ],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema);
+        let params = Self::write_params(WriteMode::Append, self.storage_options.clone());
+        self.dataset.append(reader, Some(params)).await?;
+        Ok(missing.len())
     }
 
     /// Remove the directory entry for `name`, if present. No-op when absent.
@@ -332,5 +377,36 @@ mod tests {
 
         assert!(reader.contains("external").await.unwrap());
         assert_eq!(reader.list().await.unwrap()[0].name, "external");
+    }
+
+    #[tokio::test]
+    async fn insert_missing_batches_new_entries() {
+        let dir = TempDir::new().unwrap();
+        let mut reg = new_registry(&dir).await;
+        reg.upsert("existing", "/data/existing.rollout.lance")
+            .await
+            .unwrap();
+
+        let entries = vec![
+            (
+                "existing".to_string(),
+                "/other/existing.rollout.lance".to_string(),
+            ),
+            ("new-a".to_string(), "/data/new-a.rollout.lance".to_string()),
+            ("new-b".to_string(), "/data/new-b.rollout.lance".to_string()),
+            (
+                "new-a".to_string(),
+                "/duplicate/new-a.rollout.lance".to_string(),
+            ),
+        ];
+        assert_eq!(reg.insert_missing(&entries).await.unwrap(), 2);
+        assert_eq!(reg.insert_missing(&entries).await.unwrap(), 0);
+
+        let mut listed = reg.list().await.unwrap();
+        listed.sort_by(|a, b| a.name.cmp(&b.name));
+        assert_eq!(listed.len(), 3);
+        assert_eq!(listed[0].uri, "/data/existing.rollout.lance");
+        assert_eq!(listed[1].uri, "/data/new-a.rollout.lance");
+        assert_eq!(listed[2].uri, "/data/new-b.rollout.lance");
     }
 }
