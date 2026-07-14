@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/lance-context-core",
+    "crates/lance-context-metrics",
     "crates/lance-context",
     "crates/lance-context-api",
     "crates/lance-context-server",

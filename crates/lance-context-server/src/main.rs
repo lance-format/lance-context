@@ -45,8 +45,15 @@ async fn main() {
     // the last `Arc<AppState>` is dropped.
     let _sweeper = state.spawn_global_sweeper();
 
+    // Install the Prometheus recorder once, before any metrics are emitted.
+    let metrics_handle = lance_context_metrics::install_recorder();
+
     let app = routes::router()
         .with_state(state)
+        .merge(lance_context_metrics::metrics_router(metrics_handle))
+        .layer(axum::middleware::from_fn(
+            lance_context_metrics::http_metrics_layer,
+        ))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive());
 

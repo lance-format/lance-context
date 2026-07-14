@@ -49,12 +49,16 @@ pub async fn enqueue(state: &Arc<MasterState>, name: &str) -> CompactJobStatus {
         .insert(name.to_string(), CompactJobStatus::Queued);
     // Unbounded send only fails if the receiver was dropped (scheduler gone).
     let _ = state.compact_tx.send(name.to_string());
+    metrics::counter!("master_compaction_enqueued_total").increment(1);
+    metrics::gauge!("master_compaction_queue_depth").increment(1.0);
     CompactJobStatus::Queued
 }
 
 /// Compact one experiment now (serial, on the scheduler task). Updates the job
 /// status map and the stats table's compaction counters on success.
 async fn run_compaction(state: &Arc<MasterState>, name: &str) {
+    // This job is leaving the queue and entering execution.
+    metrics::gauge!("master_compaction_queue_depth").decrement(1.0);
     state
         .jobs
         .lock()
@@ -65,6 +69,7 @@ async fn run_compaction(state: &Arc<MasterState>, name: &str) {
     let config = compaction_config(state);
     let opts = RolloutStoreOptions::default();
 
+    let compact_start = std::time::Instant::now();
     let status = match RolloutStore::open_existing_with_options(&uri, opts).await {
         Ok(mut store) => match store.compact(Some(config)).await {
             Ok(metrics) => {
@@ -82,6 +87,15 @@ async fn run_compaction(state: &Arc<MasterState>, name: &str) {
             error: e.to_string(),
         },
     };
+
+    metrics::histogram!("master_compaction_duration_seconds")
+        .record(compact_start.elapsed().as_secs_f64());
+    let result = if matches!(status, CompactJobStatus::Done { .. }) {
+        "success"
+    } else {
+        "failed"
+    };
+    metrics::counter!("master_compactions_total", "result" => result).increment(1);
 
     if let CompactJobStatus::Failed { error } = &status {
         tracing::warn!(store = %name, error = %error, "compaction failed");

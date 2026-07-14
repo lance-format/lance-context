@@ -46,6 +46,9 @@ async fn main() {
     // Single serial compaction worker (+ optional periodic auto-sweep).
     let _scheduler = scheduler::spawn_scheduler(&state);
 
+    // Install the Prometheus recorder once, before any metrics are emitted.
+    let metrics_handle = lance_context_metrics::install_recorder();
+
     let mut app = Router::new().nest("/api/v1", routes::api_router());
 
     // Serve the built UI (SPA) as a fallback when a `--ui-dir` is configured.
@@ -57,6 +60,10 @@ async fn main() {
 
     let app = app
         .with_state(state)
+        .merge(lance_context_metrics::metrics_router(metrics_handle))
+        .layer(axum::middleware::from_fn(
+            lance_context_metrics::http_metrics_layer,
+        ))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive());
 
