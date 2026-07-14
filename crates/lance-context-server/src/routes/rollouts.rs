@@ -203,6 +203,9 @@ pub async fn add_rollouts(
         .await
         .map_err(AppError::from_lance)?;
 
+    metrics::counter!("rollout_appends_total").increment(1);
+    metrics::counter!("rollout_records_appended_total").increment(count as u64);
+
     Ok((
         StatusCode::CREATED,
         Json(AddRolloutsResponse {
@@ -407,7 +410,20 @@ pub async fn compact_rollout(
     };
 
     let mut store = store_lock.write().await;
-    let metrics = store.compact(config).await.map_err(AppError::from_lance)?;
+    let compact_start = std::time::Instant::now();
+    let compact_result = store.compact(config).await;
+    ::metrics::histogram!("rollout_compaction_duration_seconds")
+        .record(compact_start.elapsed().as_secs_f64());
+    let metrics = match compact_result {
+        Ok(m) => {
+            ::metrics::counter!("rollout_compactions_total", "result" => "success").increment(1);
+            m
+        }
+        Err(e) => {
+            ::metrics::counter!("rollout_compactions_total", "result" => "failed").increment(1);
+            return Err(AppError::from_lance(e));
+        }
+    };
 
     Ok(Json(CompactResponse {
         fragments_removed: metrics.fragments_removed,

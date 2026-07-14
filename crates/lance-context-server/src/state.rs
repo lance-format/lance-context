@@ -204,8 +204,10 @@ impl AppState {
     ) -> Result<Arc<RwLock<RolloutStore>>, AppError> {
         // Fast path: resident in this process's LRU (updates recency).
         if let Some(store) = self.rollout_stores.lock().await.get(name) {
+            metrics::counter!("rollout_store_cache_hits_total").increment(1);
             return Ok(store.clone());
         }
+        metrics::counter!("rollout_store_cache_misses_total").increment(1);
 
         // Existence is the registry's job, not the cache's.
         let exists = self
@@ -237,6 +239,7 @@ impl AppState {
             return Ok(existing.clone());
         }
         cache.put(name.to_string(), opened.clone());
+        metrics::gauge!("rollout_stores_resident").set(cache.len() as f64);
         Ok(opened)
     }
 
@@ -310,20 +313,34 @@ impl AppState {
                     let mut guard = store.write().await;
                     match tokio::time::timeout(pass_timeout, guard.cleanup_own_shard()).await {
                         Ok(Ok(0)) => {}
-                        Ok(Ok(n)) => tracing::info!(
-                            store = %name,
-                            reclaimed = n,
-                            "global sweeper merged flushed generations"
-                        ),
-                        Ok(Err(e)) => tracing::warn!(
-                            store = %name,
-                            error = %e,
-                            "global sweeper WAL cleanup failed"
-                        ),
-                        Err(_elapsed) => tracing::warn!(
-                            store = %name,
-                            "global sweeper WAL cleanup timed out; abandoning this store this tick"
-                        ),
+                        Ok(Ok(n)) => {
+                            metrics::counter!("rollout_wal_cleanup_total", "result" => "merged")
+                                .increment(1);
+                            metrics::counter!("rollout_wal_generations_reclaimed_total")
+                                .increment(n as u64);
+                            tracing::info!(
+                                store = %name,
+                                reclaimed = n,
+                                "global sweeper merged flushed generations"
+                            )
+                        }
+                        Ok(Err(e)) => {
+                            metrics::counter!("rollout_wal_cleanup_total", "result" => "failed")
+                                .increment(1);
+                            tracing::warn!(
+                                store = %name,
+                                error = %e,
+                                "global sweeper WAL cleanup failed"
+                            )
+                        }
+                        Err(_elapsed) => {
+                            metrics::counter!("rollout_wal_cleanup_total", "result" => "timeout")
+                                .increment(1);
+                            tracing::warn!(
+                                store = %name,
+                                "global sweeper WAL cleanup timed out; abandoning this store this tick"
+                            )
+                        }
                     }
                 }
             }

@@ -26,6 +26,7 @@ const OBSERVE_TIMEOUT: Duration = Duration::from_secs(30);
 /// for experiments no longer in the registry. Returns the number of
 /// experiments successfully observed.
 pub async fn scan_once(state: &Arc<MasterState>) -> lance::Result<usize> {
+    let scan_start = std::time::Instant::now();
     let entries = state.registry.read().await.list().await?;
     let live: HashSet<String> = entries.iter().map(|e| e.name.clone()).collect();
     let concurrency = state.config.scan_concurrency.max(1);
@@ -53,13 +54,25 @@ pub async fn scan_once(state: &Arc<MasterState>) -> lance::Result<usize> {
     }
     // Drop stats rows for experiments removed from the registry.
     let existing = stats.list(None, usize::MAX, 0).await?;
+    let mut total_rows: i64 = 0;
+    let mut total_fragments: i64 = 0;
+    let mut live_count: usize = 0;
     for row in existing {
         if !live.contains(&row.name) {
             if let Err(e) = stats.remove(&row.name).await {
                 tracing::warn!(store = %row.name, error = %e, "stats reconcile-remove failed");
             }
+        } else {
+            live_count += 1;
+            total_rows += row.row_count;
+            total_fragments += row.fragment_count;
         }
     }
+
+    metrics::histogram!("master_scan_duration_seconds").record(scan_start.elapsed().as_secs_f64());
+    metrics::gauge!("master_experiments_total").set(live_count as f64);
+    metrics::gauge!("master_rollout_rows_total").set(total_rows as f64);
+    metrics::gauge!("master_rollout_fragments_total").set(total_fragments as f64);
     Ok(count)
 }
 
