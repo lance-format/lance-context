@@ -3,14 +3,18 @@
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 
-use lance_context_api::{ExperimentDetail, ExperimentListResponse, ExperimentSummary};
+use lance_context_api::{
+    CompactJobStatus, ExperimentDetail, ExperimentListResponse, ExperimentSummary,
+};
 
 use crate::error::MasterError;
 use crate::scanner;
+use crate::scheduler;
 use crate::state::MasterState;
 
 /// Query params for the experiment listing.
@@ -101,11 +105,53 @@ pub async fn rescan(
     Ok(Json(serde_json::json!({ "scanned": n })))
 }
 
+/// `POST /api/v1/experiments/{name}/compact` — enqueue a manual compaction.
+/// Returns 202 Accepted with the (possibly de-duped) job status.
+pub async fn compact_experiment(
+    State(state): State<Arc<MasterState>>,
+    Path(name): Path<String>,
+) -> Result<(StatusCode, Json<CompactJobStatus>), MasterError> {
+    // Only enqueue known experiments.
+    let exists = state
+        .registry
+        .read()
+        .await
+        .contains(&name)
+        .await
+        .map_err(MasterError::from_lance)?;
+    if !exists {
+        return Err(MasterError::NotFound(format!(
+            "experiment '{}' does not exist",
+            name
+        )));
+    }
+    let status = scheduler::enqueue(&state, &name).await;
+    Ok((StatusCode::ACCEPTED, Json(status)))
+}
+
+/// `GET /api/v1/experiments/{name}/compact/status` — latest compaction job
+/// state for an experiment (`None` when never requested).
+pub async fn compact_status(
+    State(state): State<Arc<MasterState>>,
+    Path(name): Path<String>,
+) -> Json<CompactJobStatus> {
+    let status = state
+        .jobs
+        .lock()
+        .await
+        .get(&name)
+        .cloned()
+        .unwrap_or(CompactJobStatus::None);
+    Json(status)
+}
+
 /// Build the admin API router (mounted under `/api/v1`).
 pub fn api_router() -> Router<Arc<MasterState>> {
     Router::new()
         .route("/experiments", get(list_experiments))
         .route("/experiments/{name}", get(get_experiment))
+        .route("/experiments/{name}/compact", post(compact_experiment))
+        .route("/experiments/{name}/compact/status", get(compact_status))
         .route("/rescan", post(rescan))
 }
 

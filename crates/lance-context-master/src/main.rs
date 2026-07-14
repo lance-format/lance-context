@@ -9,6 +9,7 @@ use tracing_subscriber::EnvFilter;
 use lance_context_master::config::MasterConfig;
 use lance_context_master::routes;
 use lance_context_master::scanner;
+use lance_context_master::scheduler;
 use lance_context_master::state::MasterState;
 
 #[tokio::main]
@@ -41,6 +42,9 @@ async fn main() {
 
     // Background stats scanner (detached; stops when the last Arc drops).
     let _scanner = scanner::spawn_scanner(&state);
+
+    // Single serial compaction worker (+ optional periodic auto-sweep).
+    let _scheduler = scheduler::spawn_scheduler(&state);
 
     let mut app = Router::new().nest("/api/v1", routes::api_router());
 
