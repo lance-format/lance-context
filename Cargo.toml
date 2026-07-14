@@ -4,6 +4,7 @@ members = [
     "crates/lance-context",
     "crates/lance-context-api",
     "crates/lance-context-server",
+    "crates/lance-context-master",
     "crates/lance-context-client",
     "python",
 ]

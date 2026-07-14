@@ -833,6 +833,71 @@ where
     }
 }
 
+// ---------------------------------------------------------------------------
+// Master control-plane DTOs
+// ---------------------------------------------------------------------------
+
+/// One row of the control-plane experiment listing, backed by the master's
+/// periodically-refreshed stats table.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExperimentSummary {
+    /// Logical experiment / rollout-store name (unique key).
+    pub name: String,
+    /// Physical dataset URI.
+    pub uri: String,
+    /// Base-table logical row count as of the last scan.
+    pub row_count: i64,
+    /// Base-table fragment count as of the last scan.
+    pub fragment_count: i64,
+    /// Base-table manifest timestamp, Unix milliseconds.
+    pub last_updated: i64,
+    /// Flushed MemWAL generations pending merge as of the last scan.
+    pub pending_wal_generations: i64,
+    /// Timestamp of the last successful compaction, Unix ms, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_compaction: Option<i64>,
+    /// Total compactions the master has driven for this experiment.
+    pub total_compactions: i64,
+    /// When the master last scanned this experiment, Unix milliseconds.
+    pub scanned_at: i64,
+}
+
+/// Detailed view of a single experiment. Currently the same shape as
+/// [`ExperimentSummary`]; a distinct type leaves room for detail-only fields.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExperimentDetail {
+    #[serde(flatten)]
+    pub summary: ExperimentSummary,
+}
+
+/// Paginated experiment listing.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExperimentListResponse {
+    pub experiments: Vec<ExperimentSummary>,
+    /// Total number of experiments matching the (optional) search filter,
+    /// ignoring pagination.
+    pub total: i64,
+}
+
+/// State of a manual or automatic compaction job for one experiment.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "state")]
+pub enum CompactJobStatus {
+    /// Queued but not yet started.
+    Queued,
+    /// Currently running.
+    Running,
+    /// Finished successfully.
+    Done {
+        fragments_removed: usize,
+        fragments_added: usize,
+    },
+    /// Failed with an error message.
+    Failed { error: String },
+    /// No compaction has been requested for this experiment.
+    None,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

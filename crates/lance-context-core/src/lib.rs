@@ -34,7 +34,7 @@ pub use record::{
 };
 pub use registry::{RegistryEntry, RolloutRegistry};
 pub use rollout::{RolloutRecord, ROLE_ARTIFACT, ROLE_ASSISTANT, ROLE_GRADE, ROLE_TOOL};
-pub use rollout_store::{rollout_schema, RolloutStore, RolloutStoreOptions};
+pub use rollout_store::{rollout_schema, RolloutObservation, RolloutStore, RolloutStoreOptions};
 pub use store::{
     CompactionConfig, CompactionStats, ContextStore, ContextStoreOptions, DistanceMetric,
     IdIndexType, ReadProjection,
