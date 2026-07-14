@@ -8,6 +8,7 @@ mod export;
 mod id;
 mod namespace;
 mod record;
+mod registry;
 mod rollout;
 mod rollout_store;
 pub mod serde;
@@ -31,6 +32,7 @@ pub use record::{
     RetrieveResult, SearchResult, StateMetadata, UpdateResult, UpsertResult, LIFECYCLE_ACTIVE,
     LIFECYCLE_CONTRADICTED,
 };
+pub use registry::{RegistryEntry, RolloutRegistry};
 pub use rollout::{RolloutRecord, ROLE_ARTIFACT, ROLE_ASSISTANT, ROLE_GRADE, ROLE_TOOL};
 pub use rollout_store::{rollout_schema, RolloutStore, RolloutStoreOptions};
 pub use store::{

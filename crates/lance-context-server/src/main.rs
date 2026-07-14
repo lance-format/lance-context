@@ -32,7 +32,18 @@ async fn main() {
         std::process::exit(1);
     }
 
-    let state = Arc::new(AppState::new(config));
+    let state = match AppState::new(config).await {
+        Ok(state) => Arc::new(state),
+        Err(e) => {
+            tracing::error!("Failed to initialize server state: {:?}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // Single process-wide WAL-cleanup sweeper (replaces one timer per store).
+    // The handle is detached: it runs for the server's lifetime and stops when
+    // the last `Arc<AppState>` is dropped.
+    let _sweeper = state.spawn_global_sweeper();
 
     let app = routes::router()
         .with_state(state)

@@ -50,6 +50,15 @@ pub struct ServerConfig {
     /// set. Defaults to `1` (clean up whenever any generation is present).
     #[arg(long, env = "ROLLOUT_CLEANUP_MIN_GENERATIONS", default_value = "1")]
     pub rollout_cleanup_min_generations: usize,
+
+    /// Upper bound on the number of resident rollout-store handles kept in
+    /// memory (an LRU). With one physical dataset per experiment a deployment
+    /// may hold hundreds of thousands of stores; this bounds how many stay open
+    /// at once. Size it for peak *concurrent* experiments, not the total count.
+    /// Evicted stores are transparently reopened on the next request. `0` falls
+    /// back to the built-in default.
+    #[arg(long, env = "ROLLOUT_CACHE_CAPACITY", default_value = "2000")]
+    pub rollout_cache_capacity: usize,
 }
 
 impl ServerConfig {
