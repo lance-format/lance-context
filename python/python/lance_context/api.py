@@ -21,10 +21,10 @@ from ._internal import (  # pyright: ignore[reportMissingImports]
 from ._internal import (  # pyright: ignore[reportMissingImports]
     RolloutStore as _RolloutStore,
 )
-from ._internal import version as _version  # pyright: ignore[reportMissingImports]
 from ._internal import (  # pyright: ignore[reportMissingImports]
     generate_id as _generate_id,
 )
+from ._internal import version as _version  # pyright: ignore[reportMissingImports]
 from .embeddings import EmbeddingProvider, _build_provider, supports_media
 
 __all__ = [
@@ -49,6 +49,7 @@ def generate_id() -> str:
     for append-heavy tables such as the rollout store.
     """
     return _generate_id()
+
 
 _ARROW_STREAM_MIME = "application/vnd.apache.arrow.stream"
 _DEFAULT_INGEST_BATCH_SIZE = 1000
