@@ -96,10 +96,7 @@ pub async fn get_rollout_store(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<Json<RolloutStoreInfo>, AppError> {
-    let stores = state.rollout_stores.read().await;
-    let store_lock = stores
-        .get(&name)
-        .ok_or_else(|| AppError::NotFound(format!("Rollout store '{}' does not exist", name)))?;
+    let store_lock = state.get_or_open_rollout_store(&name).await?;
     let store = store_lock.read().await;
 
     Ok(Json(RolloutStoreInfo {
@@ -180,12 +177,7 @@ pub async fn add_rollouts(
         ));
     }
 
-    let stores = state.rollout_stores.read().await;
-    let store_lock = stores
-        .get(&name)
-        .ok_or_else(|| AppError::NotFound(format!("Rollout store '{}' does not exist", name)))?
-        .clone();
-    drop(stores);
+    let store_lock = state.get_or_open_rollout_store(&name).await?;
 
     let ids: Vec<String> = records.iter().map(|r| r.id.clone()).collect();
     let core_records: Vec<RolloutRecord> = records
@@ -310,12 +302,7 @@ pub async fn list_rollouts(
     Path(name): Path<String>,
     Query(params): Query<RolloutListParams>,
 ) -> Result<Json<ListRolloutsResponse>, AppError> {
-    let stores = state.rollout_stores.read().await;
-    let store_lock = stores
-        .get(&name)
-        .ok_or_else(|| AppError::NotFound(format!("Rollout store '{}' does not exist", name)))?
-        .clone();
-    drop(stores);
+    let store_lock = state.get_or_open_rollout_store(&name).await?;
 
     let store = store_lock.read().await;
     let records = store
@@ -332,12 +319,7 @@ pub async fn get_rollout(
     State(state): State<Arc<AppState>>,
     Path((name, id)): Path<(String, String)>,
 ) -> Result<Json<GetRolloutResponse>, AppError> {
-    let stores = state.rollout_stores.read().await;
-    let store_lock = stores
-        .get(&name)
-        .ok_or_else(|| AppError::NotFound(format!("Rollout store '{}' does not exist", name)))?
-        .clone();
-    drop(stores);
+    let store_lock = state.get_or_open_rollout_store(&name).await?;
 
     let store = store_lock.read().await;
     let record = store.get_by_id(&id).await.map_err(AppError::from_lance)?;
@@ -354,12 +336,7 @@ pub async fn fetch_rollout_blob(
     State(state): State<Arc<AppState>>,
     Path((name, id)): Path<(String, String)>,
 ) -> Result<Response, AppError> {
-    let stores = state.rollout_stores.read().await;
-    let store_lock = stores
-        .get(&name)
-        .ok_or_else(|| AppError::NotFound(format!("Rollout store '{}' does not exist", name)))?
-        .clone();
-    drop(stores);
+    let store_lock = state.get_or_open_rollout_store(&name).await?;
 
     let store = store_lock.read().await;
     let bytes = store
@@ -379,12 +356,7 @@ pub async fn checkout_rollout(
     Path(name): Path<String>,
     Json(req): Json<CheckoutRequest>,
 ) -> Result<Json<VersionResponse>, AppError> {
-    let stores = state.rollout_stores.read().await;
-    let store_lock = stores
-        .get(&name)
-        .ok_or_else(|| AppError::NotFound(format!("Rollout store '{}' does not exist", name)))?
-        .clone();
-    drop(stores);
+    let store_lock = state.get_or_open_rollout_store(&name).await?;
 
     let mut store = store_lock.write().await;
     store
@@ -408,12 +380,7 @@ pub async fn compact_rollout(
     Path(name): Path<String>,
     Json(req): Json<CompactRequest>,
 ) -> Result<Json<CompactResponse>, AppError> {
-    let stores = state.rollout_stores.read().await;
-    let store_lock = stores
-        .get(&name)
-        .ok_or_else(|| AppError::NotFound(format!("Rollout store '{}' does not exist", name)))?
-        .clone();
-    drop(stores);
+    let store_lock = state.get_or_open_rollout_store(&name).await?;
 
     let config = if req.target_rows_per_fragment.is_some() || req.materialize_deletions.is_some() {
         let mut c = CompactionConfig::default();
@@ -444,12 +411,7 @@ pub async fn compact_rollout_stats(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<Json<CompactStatsResponse>, AppError> {
-    let stores = state.rollout_stores.read().await;
-    let store_lock = stores
-        .get(&name)
-        .ok_or_else(|| AppError::NotFound(format!("Rollout store '{}' does not exist", name)))?
-        .clone();
-    drop(stores);
+    let store_lock = state.get_or_open_rollout_store(&name).await?;
 
     let store = store_lock.read().await;
     let stats = store.compaction_stats();
@@ -818,5 +780,77 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, AppError::InvalidRequest(_)));
+    }
+
+    /// A second server instance (distinct in-memory cache, shared data dir)
+    /// that never `create`d the store must still serve reads/writes for it by
+    /// lazily loading from storage — the multi-replica 404 regression.
+    #[tokio::test]
+    async fn second_instance_lazily_opens_store_created_elsewhere() {
+        // Pod A: create the store and write a row.
+        let (state_a, dir) = rollout_state().await;
+        let body = serde_json::to_vec(&AddRolloutsRequest {
+            records: vec![record_with_size("r0", None)],
+        })
+        .unwrap();
+        let _ = add_rollouts(
+            State(state_a.clone()),
+            Path("rl".to_string()),
+            json_request(body),
+        )
+        .await
+        .expect("write on instance A");
+
+        // Pod B: a fresh AppState over the SAME data dir, with an empty cache and
+        // a different instance id (its own shard). It never saw the `create`.
+        let state_b = Arc::new(AppState {
+            stores: RwLock::new(HashMap::new()),
+            rollout_stores: RwLock::new(HashMap::new()),
+            base_path: dir.path().to_path_buf(),
+            instance_id: Some("rollout-1".to_string()),
+            rollout_merge_after_generations: 0,
+            rollout_cleanup_interval_secs: 0,
+            rollout_cleanup_min_generations: 1,
+        });
+
+        // Read routed to B must lazily open the store, not 404.
+        let Json(list) = list_rollouts(
+            State(state_b.clone()),
+            Path("rl".to_string()),
+            Query(RolloutListParams::default()),
+        )
+        .await
+        .expect("instance B lazily opens the store instead of 404");
+        assert_eq!(list.records.len(), 1);
+        assert_eq!(list.records[0].id, "r0");
+
+        // And a write on B lands in the same dataset (visible back on A).
+        let body = serde_json::to_vec(&AddRolloutsRequest {
+            records: vec![record_with_size("r1", None)],
+        })
+        .unwrap();
+        let _ = add_rollouts(
+            State(state_b.clone()),
+            Path("rl".to_string()),
+            json_request(body),
+        )
+        .await
+        .expect("write on instance B");
+        assert_eq!(count_rollouts(&state_a).await, 2);
+    }
+
+    /// A read for a store that was never created anywhere must still 404 — lazy
+    /// open must not silently materialize an empty dataset for a bad name.
+    #[tokio::test]
+    async fn read_of_nonexistent_store_still_404s() {
+        let (state, _dir) = rollout_state().await;
+        let err = list_rollouts(
+            State(state.clone()),
+            Path("no-such-store".to_string()),
+            Query(RolloutListParams::default()),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AppError::NotFound(_)));
     }
 }

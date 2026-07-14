@@ -11,12 +11,7 @@ pub async fn get_version(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<Json<VersionResponse>, AppError> {
-    let stores = state.stores.read().await;
-    let store_lock = stores
-        .get(&name)
-        .ok_or_else(|| AppError::NotFound(format!("Context '{}' does not exist", name)))?
-        .clone();
-    drop(stores);
+    let store_lock = state.get_or_open_context_store(&name).await?;
 
     let store = store_lock.read().await;
     Ok(Json(VersionResponse {
@@ -29,12 +24,7 @@ pub async fn checkout(
     Path(name): Path<String>,
     Json(req): Json<CheckoutRequest>,
 ) -> Result<Json<VersionResponse>, AppError> {
-    let stores = state.stores.read().await;
-    let store_lock = stores
-        .get(&name)
-        .ok_or_else(|| AppError::NotFound(format!("Context '{}' does not exist", name)))?
-        .clone();
-    drop(stores);
+    let store_lock = state.get_or_open_context_store(&name).await?;
 
     let mut store = store_lock.write().await;
     store

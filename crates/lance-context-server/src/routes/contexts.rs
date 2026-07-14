@@ -93,10 +93,7 @@ pub async fn get_context(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<Json<ContextInfo>, AppError> {
-    let stores = state.stores.read().await;
-    let store_lock = stores
-        .get(&name)
-        .ok_or_else(|| AppError::NotFound(format!("Context '{}' does not exist", name)))?;
+    let store_lock = state.get_or_open_context_store(&name).await?;
     let store = store_lock.read().await;
 
     Ok(Json(ContextInfo {

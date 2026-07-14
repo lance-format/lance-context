@@ -32,12 +32,7 @@ pub async fn add_records(
         ));
     }
 
-    let stores = state.stores.read().await;
-    let store_lock = stores
-        .get(&name)
-        .ok_or_else(|| AppError::NotFound(format!("Context '{}' does not exist", name)))?
-        .clone();
-    drop(stores);
+    let store_lock = state.get_or_open_context_store(&name).await?;
 
     let run_id = Uuid::new_v4().to_string();
     let mut ids = Vec::with_capacity(req.records.len());
@@ -83,12 +78,7 @@ pub async fn upsert_record(
         ));
     }
 
-    let stores = state.stores.read().await;
-    let store_lock = stores
-        .get(&name)
-        .ok_or_else(|| AppError::NotFound(format!("Context '{}' does not exist", name)))?
-        .clone();
-    drop(stores);
+    let store_lock = state.get_or_open_context_store(&name).await?;
 
     let record = record_from_add_request(
         &req.record,
@@ -141,12 +131,7 @@ pub async fn upsert_records(
         }
     }
 
-    let stores = state.stores.read().await;
-    let store_lock = stores
-        .get(&name)
-        .ok_or_else(|| AppError::NotFound(format!("Context '{}' does not exist", name)))?
-        .clone();
-    drop(stores);
+    let store_lock = state.get_or_open_context_store(&name).await?;
 
     let core_records: Vec<ContextRecord> = req
         .records
@@ -191,12 +176,7 @@ pub async fn update_record(
         ));
     }
 
-    let stores = state.stores.read().await;
-    let store_lock = stores
-        .get(&name)
-        .ok_or_else(|| AppError::NotFound(format!("Context '{}' does not exist", name)))?
-        .clone();
-    drop(stores);
+    let store_lock = state.get_or_open_context_store(&name).await?;
 
     let patch = patch_from_dto(&req.patch);
     let mut store = store_lock.write().await;
@@ -236,12 +216,7 @@ pub async fn get_record(
     State(state): State<Arc<AppState>>,
     Path((name, id)): Path<(String, String)>,
 ) -> Result<Json<GetRecordResponse>, AppError> {
-    let stores = state.stores.read().await;
-    let store_lock = stores
-        .get(&name)
-        .ok_or_else(|| AppError::NotFound(format!("Context '{}' does not exist", name)))?
-        .clone();
-    drop(stores);
+    let store_lock = state.get_or_open_context_store(&name).await?;
 
     let store = store_lock.read().await;
     let record = store.get(&id).await.map_err(AppError::from_lance)?;
@@ -260,12 +235,7 @@ pub async fn fetch_payload(
     State(state): State<Arc<AppState>>,
     Path((name, id)): Path<(String, String)>,
 ) -> Result<Response, AppError> {
-    let stores = state.stores.read().await;
-    let store_lock = stores
-        .get(&name)
-        .ok_or_else(|| AppError::NotFound(format!("Context '{}' does not exist", name)))?
-        .clone();
-    drop(stores);
+    let store_lock = state.get_or_open_context_store(&name).await?;
 
     let store = store_lock.read().await;
     let record = store
@@ -306,12 +276,7 @@ pub async fn get_record_by_external_id(
     Path(name): Path<String>,
     Query(params): Query<ExternalIdParams>,
 ) -> Result<Json<GetRecordResponse>, AppError> {
-    let stores = state.stores.read().await;
-    let store_lock = stores
-        .get(&name)
-        .ok_or_else(|| AppError::NotFound(format!("Context '{}' does not exist", name)))?
-        .clone();
-    drop(stores);
+    let store_lock = state.get_or_open_context_store(&name).await?;
 
     let store = store_lock.read().await;
     let record = store
@@ -328,12 +293,7 @@ pub async fn delete_record(
     State(state): State<Arc<AppState>>,
     Path((name, id)): Path<(String, String)>,
 ) -> Result<Json<DeleteRecordResponse>, AppError> {
-    let stores = state.stores.read().await;
-    let store_lock = stores
-        .get(&name)
-        .ok_or_else(|| AppError::NotFound(format!("Context '{}' does not exist", name)))?
-        .clone();
-    drop(stores);
+    let store_lock = state.get_or_open_context_store(&name).await?;
 
     let mut store = store_lock.write().await;
     let deleted = store
@@ -350,12 +310,7 @@ pub async fn delete_record_by_external_id(
     Path(name): Path<String>,
     Query(params): Query<ExternalIdParams>,
 ) -> Result<Json<DeleteRecordResponse>, AppError> {
-    let stores = state.stores.read().await;
-    let store_lock = stores
-        .get(&name)
-        .ok_or_else(|| AppError::NotFound(format!("Context '{}' does not exist", name)))?
-        .clone();
-    drop(stores);
+    let store_lock = state.get_or_open_context_store(&name).await?;
 
     let mut store = store_lock.write().await;
     let deleted = store
@@ -396,12 +351,7 @@ pub async fn list_records(
         })
         .transpose()?;
 
-    let stores = state.stores.read().await;
-    let store_lock = stores
-        .get(&name)
-        .ok_or_else(|| AppError::NotFound(format!("Context '{}' does not exist", name)))?
-        .clone();
-    drop(stores);
+    let store_lock = state.get_or_open_context_store(&name).await?;
 
     let store = store_lock.read().await;
     let records = store
@@ -435,12 +385,7 @@ pub async fn related_records(
     Path(name): Path<String>,
     Query(params): Query<RelatedParams>,
 ) -> Result<Json<ListRecordsResponse>, AppError> {
-    let stores = state.stores.read().await;
-    let store_lock = stores
-        .get(&name)
-        .ok_or_else(|| AppError::NotFound(format!("Context '{}' does not exist", name)))?
-        .clone();
-    drop(stores);
+    let store_lock = state.get_or_open_context_store(&name).await?;
 
     let store = store_lock.read().await;
     let records = store
@@ -1254,5 +1199,54 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(AppError::InvalidRequest(_))));
+    }
+
+    /// A second server instance (empty cache, shared data dir) must lazily open
+    /// a context created elsewhere instead of 404ing — the multi-replica bug.
+    #[tokio::test]
+    async fn second_instance_lazily_opens_context_created_elsewhere() {
+        let context_name = "ctx";
+        let (state_a, dir) = test_state(context_name).await;
+
+        // Instance A writes a record.
+        let _ = add_records(
+            State(state_a.clone()),
+            Path(context_name.to_string()),
+            Json(AddRecordsRequest {
+                records: vec![text_record("hello")],
+            }),
+        )
+        .await
+        .expect("write on instance A");
+
+        // Instance B: fresh AppState over the same data dir, empty cache.
+        let state_b = Arc::new(AppState {
+            stores: RwLock::new(HashMap::new()),
+            rollout_stores: RwLock::new(HashMap::new()),
+            base_path: dir.path().to_path_buf(),
+            instance_id: None,
+            rollout_merge_after_generations: 0,
+            rollout_cleanup_interval_secs: 0,
+            rollout_cleanup_min_generations: 1,
+        });
+
+        let Json(list) = list_records(
+            State(state_b.clone()),
+            Path(context_name.to_string()),
+            Query(ListParams::default()),
+        )
+        .await
+        .expect("instance B lazily opens the context instead of 404");
+        assert_eq!(list.records.len(), 1);
+
+        // Reading a context that was never created anywhere still 404s.
+        let err = list_records(
+            State(state_b),
+            Path("no-such-context".to_string()),
+            Query(ListParams::default()),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AppError::NotFound(_)));
     }
 }
