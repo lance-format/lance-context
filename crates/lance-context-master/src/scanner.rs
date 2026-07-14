@@ -27,7 +27,7 @@ const OBSERVE_TIMEOUT: Duration = Duration::from_secs(30);
 /// experiments successfully observed.
 pub async fn scan_once(state: &Arc<MasterState>) -> lance::Result<usize> {
     let scan_start = std::time::Instant::now();
-    let entries = state.registry.read().await.list().await?;
+    let entries = state.registry.write().await.list().await?;
     let live: HashSet<String> = entries.iter().map(|e| e.name.clone()).collect();
     let concurrency = state.config.scan_concurrency.max(1);
 

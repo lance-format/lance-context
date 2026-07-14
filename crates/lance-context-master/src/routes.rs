@@ -68,7 +68,7 @@ pub async fn get_experiment(
         // side effect, then read it back.
         let entries = state
             .registry
-            .read()
+            .write()
             .await
             .list()
             .await
@@ -114,7 +114,7 @@ pub async fn compact_experiment(
     // Only enqueue known experiments.
     let exists = state
         .registry
-        .read()
+        .write()
         .await
         .contains(&name)
         .await
@@ -159,7 +159,7 @@ pub fn api_router() -> Router<Arc<MasterState>> {
 mod tests {
     use super::*;
     use crate::config::MasterConfig;
-    use lance_context_core::RolloutStore;
+    use lance_context_core::{RolloutRegistry, RolloutStore};
     use tempfile::TempDir;
 
     fn test_config(dir: &TempDir) -> MasterConfig {
@@ -227,6 +227,26 @@ mod tests {
         .unwrap();
         assert_eq!(one.total, 1);
         assert_eq!(one.experiments[0].name, "exp-1");
+    }
+
+    #[tokio::test]
+    async fn scan_sees_registry_commits_from_another_handle() {
+        let dir = TempDir::new().unwrap();
+        let state = MasterState::new(test_config(&dir)).await.unwrap();
+        let name = "external";
+        let uri = state.rollout_uri(name);
+        RolloutStore::open(&uri).await.unwrap();
+
+        let registry_uri = dir.path().join("_registry.rollout.lance");
+        let mut worker_registry =
+            RolloutRegistry::open_or_create(registry_uri.to_str().unwrap(), None)
+                .await
+                .unwrap();
+        worker_registry.upsert(name, &uri).await.unwrap();
+
+        let scanned = scanner::scan_once(&state).await.unwrap();
+        assert_eq!(scanned, 1);
+        assert!(state.stats.lock().await.get(name).await.unwrap().is_some());
     }
 
     #[tokio::test]
