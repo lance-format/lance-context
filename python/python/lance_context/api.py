@@ -2583,10 +2583,15 @@ class RolloutStore:
         self,
         limit: int | None = None,
         offset: int | None = None,
+        filters: Mapping[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
-        """List rollout rows (artifact bytes projected out; fetch via
-        :meth:`get_blob`)."""
-        raw = self._sync.list(limit, offset)
+        """List rollout rows matching exact field filters.
+
+        Supported filter keys are ``rollout_id``, ``problem_id``,
+        ``policy_version``, ``role``, ``include_in_training``, and
+        ``artifact_type``. Artifact bytes remain projected out.
+        """
+        raw = self._sync.list(limit, offset, _json_dumps(filters, "filters"))
         return [_rollout_record_from_json(r) for r in json.loads(raw)]
 
     def get(self, id: str) -> dict[str, Any] | None:
@@ -2666,10 +2671,14 @@ class AsyncRolloutStore:
         self,
         limit: int | None = None,
         offset: int | None = None,
+        filters: Mapping[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
-        """List rollout rows (artifact bytes projected out)."""
+        """List rollout rows matching exact field filters."""
+        filters_json = _json_dumps(filters, "filters")
         loop = asyncio.get_running_loop()
-        raw = await loop.run_in_executor(None, lambda: self._sync.list(limit, offset))
+        raw = await loop.run_in_executor(
+            None, lambda: self._sync.list(limit, offset, filters_json)
+        )
         return [_rollout_record_from_json(r) for r in json.loads(raw)]
 
     async def get(self, id: str) -> dict[str, Any] | None:

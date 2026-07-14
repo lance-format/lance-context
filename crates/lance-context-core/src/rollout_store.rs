@@ -74,7 +74,7 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::rollout::RolloutRecord;
+use crate::rollout::{RolloutFilters, RolloutRecord};
 use crate::store::{
     column_as, column_as_optional, relationship_field, relationship_list_item_field,
     relationship_struct_builder, relationships_from_list, timestamp_from_micros, CompactionConfig,
@@ -767,20 +767,39 @@ impl RolloutStore {
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> LanceResult<Vec<RolloutRecord>> {
+        self.list_filtered(limit, offset, None).await
+    }
+
+    /// List rollout rows matching exact field filters.
+    ///
+    /// The filter is pushed into every LSM source before merge and
+    /// deduplication. Rollout rows are immutable by id, so filtering each
+    /// generation cannot reveal an older state of a mutable record.
+    pub async fn list_filtered(
+        &self,
+        limit: Option<usize>,
+        offset: Option<usize>,
+        filters: Option<&RolloutFilters>,
+    ) -> LanceResult<Vec<RolloutRecord>> {
         let columns = self.non_blob_columns();
         let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
-        let scanner = self.lsm_scanner().await?.project(&refs);
+        let mut scanner = self.lsm_scanner().await?.project(&refs);
+        if let Some(predicate) = filters.and_then(RolloutFilters::predicate) {
+            scanner = scanner.filter(&predicate)?;
+        }
+        let post_scan_offset = if limit.is_none() { offset } else { None };
+        if let Some(limit) = limit {
+            scanner = scanner.limit(limit, offset);
+        }
+
         let mut stream = scanner.try_into_stream().await?;
         let mut results = Vec::new();
         while let Some(batch) = stream.try_next().await? {
             results.extend(batch_to_rollout_records(&batch)?);
         }
 
-        if let Some(offset) = offset {
+        if let Some(offset) = post_scan_offset {
             results = results.into_iter().skip(offset).collect();
-        }
-        if let Some(limit) = limit {
-            results.truncate(limit);
         }
         Ok(results)
     }
@@ -1520,7 +1539,7 @@ fn optional_i8_list(array: Option<&ListArray>, row: usize) -> LanceResult<Option
 mod tests {
     use super::*;
     use crate::record::Relationship;
-    use crate::rollout::{ROLE_ARTIFACT, ROLE_ASSISTANT};
+    use crate::rollout::{RolloutFilters, ROLE_ARTIFACT, ROLE_ASSISTANT};
     use chrono::{TimeZone, Utc};
     use serde_json::json;
     use tempfile::TempDir;
@@ -1712,6 +1731,88 @@ mod tests {
             assert!(obs.fragment_count >= 0);
             assert!(obs.pending_wal_generations >= 1);
             assert!(obs.last_updated > 0);
+        });
+    }
+
+    #[test]
+    fn filtered_list_matches_fields_before_pagination() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open(&uri).await.unwrap();
+
+            let mut first = assistant_record("row-a");
+            first.rollout_id = "traj-a".to_string();
+            first.problem_id = "problem-a".to_string();
+            first.policy_version = Some("ckpt-1".to_string());
+            first.include_in_training = Some(true);
+
+            let mut second = assistant_record("row-b");
+            second.rollout_id = "traj-b".to_string();
+            second.problem_id = "problem-b".to_string();
+            second.policy_version = Some("ckpt-2".to_string());
+            second.include_in_training = Some(false);
+
+            let mut artifact = artifact_record("row-c", b"bytes");
+            artifact.rollout_id = "traj-b".to_string();
+            artifact.problem_id = "problem-b".to_string();
+            artifact.policy_version = Some("ckpt-2".to_string());
+            artifact.include_in_training = Some(false);
+
+            store.add(&[first, second, artifact]).await.unwrap();
+
+            let filters = RolloutFilters {
+                policy_version: Some("ckpt-2".to_string()),
+                include_in_training: Some(false),
+                ..Default::default()
+            };
+            let all = store
+                .list_filtered(None, None, Some(&filters))
+                .await
+                .unwrap();
+            assert_eq!(all.len(), 2);
+            assert!(all
+                .iter()
+                .all(|row| row.policy_version.as_deref() == Some("ckpt-2")));
+            assert!(all.iter().all(|row| row.include_in_training == Some(false)));
+
+            let page = store
+                .list_filtered(Some(1), Some(1), Some(&filters))
+                .await
+                .unwrap();
+            assert_eq!(page.len(), 1);
+            assert_eq!(page[0].policy_version.as_deref(), Some("ckpt-2"));
+        });
+    }
+
+    #[test]
+    fn filtered_list_supports_dictionary_and_nullable_string_columns() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open(&uri).await.unwrap();
+            store
+                .add(&[
+                    assistant_record("assistant"),
+                    artifact_record("artifact", b"bytes"),
+                ])
+                .await
+                .unwrap();
+
+            let filters = RolloutFilters {
+                role: Some(ROLE_ARTIFACT.to_string()),
+                artifact_type: Some("excel_grade_screenshot".to_string()),
+                ..Default::default()
+            };
+            let rows = store
+                .list_filtered(None, None, Some(&filters))
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].id, "artifact");
+            assert!(rows[0].binary_payload.is_none());
         });
     }
 

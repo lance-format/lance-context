@@ -9,6 +9,71 @@ pub const ROLE_TOOL: &str = "tool";
 pub const ROLE_GRADE: &str = "grade";
 pub const ROLE_ARTIFACT: &str = "artifact";
 
+/// Exact-match filters supported by rollout list queries.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RolloutFilters {
+    pub rollout_id: Option<String>,
+    pub problem_id: Option<String>,
+    pub policy_version: Option<String>,
+    pub role: Option<String>,
+    pub include_in_training: Option<bool>,
+    pub artifact_type: Option<String>,
+}
+
+impl RolloutFilters {
+    pub fn from_json_value(value: Value) -> Result<Self, String> {
+        let Value::Object(object) = value else {
+            return Err("rollout filters must be a JSON object".to_string());
+        };
+
+        let mut filters = Self::default();
+        for (key, value) in object {
+            match key.as_str() {
+                "rollout_id" => filters.rollout_id = Some(filter_string(&key, value)?),
+                "problem_id" => filters.problem_id = Some(filter_string(&key, value)?),
+                "policy_version" => {
+                    filters.policy_version = Some(filter_string(&key, value)?);
+                }
+                "role" => filters.role = Some(filter_string(&key, value)?),
+                "include_in_training" => {
+                    filters.include_in_training = Some(value.as_bool().ok_or_else(|| {
+                        "rollout filter 'include_in_training' must be a boolean".to_string()
+                    })?);
+                }
+                "artifact_type" => filters.artifact_type = Some(filter_string(&key, value)?),
+                _ => return Err(format!("unsupported rollout filter '{key}'")),
+            }
+        }
+        Ok(filters)
+    }
+
+    pub(crate) fn predicate(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        push_string_predicate(&mut parts, "rollout_id", self.rollout_id.as_deref());
+        push_string_predicate(&mut parts, "problem_id", self.problem_id.as_deref());
+        push_string_predicate(&mut parts, "policy_version", self.policy_version.as_deref());
+        push_string_predicate(&mut parts, "role", self.role.as_deref());
+        if let Some(value) = self.include_in_training {
+            parts.push(format!("include_in_training = {value}"));
+        }
+        push_string_predicate(&mut parts, "artifact_type", self.artifact_type.as_deref());
+        (!parts.is_empty()).then(|| parts.join(" AND "))
+    }
+}
+
+fn filter_string(name: &str, value: Value) -> Result<String, String> {
+    value
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| format!("rollout filter '{name}' must be a string"))
+}
+
+fn push_string_predicate(parts: &mut Vec<String>, column: &str, value: Option<&str>) {
+    if let Some(value) = value {
+        parts.push(format!("{column} = '{}'", value.replace('\'', "''")));
+    }
+}
+
 /// One row of a reinforcement-learning rollout dataset.
 ///
 /// A row is one message in a trajectory — an assistant turn, a tool call, a
@@ -102,5 +167,56 @@ impl RolloutRecord {
     #[must_use]
     pub fn is_artifact(&self) -> bool {
         self.role == ROLE_ARTIFACT
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn rollout_filters_parse_supported_fields() {
+        let filters = RolloutFilters::from_json_value(json!({
+            "rollout_id": "traj-1",
+            "problem_id": "problem-7",
+            "policy_version": "ckpt-42",
+            "role": "assistant",
+            "include_in_training": false,
+            "artifact_type": "screenshot"
+        }))
+        .unwrap();
+
+        assert_eq!(filters.rollout_id.as_deref(), Some("traj-1"));
+        assert_eq!(filters.problem_id.as_deref(), Some("problem-7"));
+        assert_eq!(filters.policy_version.as_deref(), Some("ckpt-42"));
+        assert_eq!(filters.role.as_deref(), Some("assistant"));
+        assert_eq!(filters.include_in_training, Some(false));
+        assert_eq!(filters.artifact_type.as_deref(), Some("screenshot"));
+    }
+
+    #[test]
+    fn rollout_filters_reject_unknown_and_wrong_types() {
+        assert!(RolloutFilters::from_json_value(json!({"reward": 1.0})).is_err());
+        assert!(RolloutFilters::from_json_value(json!({"policy_version": 42})).is_err());
+        assert!(RolloutFilters::from_json_value(json!({"include_in_training": "yes"})).is_err());
+        assert!(RolloutFilters::from_json_value(json!([])).is_err());
+    }
+
+    #[test]
+    fn rollout_filter_predicate_escapes_strings_and_fields() {
+        let filters = RolloutFilters {
+            policy_version: Some("worker's-ckpt".to_string()),
+            role: Some("assistant".to_string()),
+            include_in_training: Some(true),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            filters.predicate().as_deref(),
+            Some(
+                "policy_version = 'worker''s-ckpt' AND role = 'assistant' AND include_in_training = true"
+            )
+        );
     }
 }

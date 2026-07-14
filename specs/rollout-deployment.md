@@ -196,6 +196,13 @@ Rollout rows are **append-only and immutable** — no updates, no deletes. This 
 - MemWAL appends land in the `_mem_wal/` namespace and **do not advance the base dataset version.** So a per-`add` `checkout(version)` no longer isolates a single append the way plain `Dataset::append` did. `RolloutStore::add` still returns the base version, but for API compatibility only — not as a per-append snapshot handle.
 - Reproducibility is instead a **filter over immutable rows** — e.g. `policy_version = 'ckpt-N'`, or an explicit set of `rollout_id`s recorded by the trainer. This is correct precisely *because* the rows never change: the same filter always selects the same bytes.
 
+```python
+rows = await store.list(filters={
+    "policy_version": "ckpt-N",
+    "include_in_training": True,
+})
+```
+
 `checkout` remains available for base-table time travel, but is not the mechanism for per-checkpoint rollout reproducibility. (See schema-design §3 and §7 — and note that `learner_iteration` is likewise a column, not a dataset version.)
 
 ---

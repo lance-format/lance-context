@@ -113,6 +113,15 @@ impl RolloutStoreApi for RolloutStore {
         dispatch_ref!(self, list, limit, offset)
     }
 
+    async fn list_filtered(
+        &self,
+        limit: Option<usize>,
+        offset: Option<usize>,
+        filters: Option<serde_json::Value>,
+    ) -> ContextResult<Vec<RolloutRecordDto>> {
+        dispatch_ref!(self, list_filtered, limit, offset, filters)
+    }
+
     async fn get(&self, id: &str) -> ContextResult<Option<RolloutRecordDto>> {
         dispatch_ref!(self, get, id)
     }

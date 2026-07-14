@@ -127,3 +127,55 @@ def test_reopen_sees_prior_rows(store_uri):
     rows = reopened.list()
     assert len(rows) == 1
     assert rows[0]["id"] == "row-0"
+
+
+def test_list_filters_before_pagination(store_uri):
+    store = RolloutStore.open(store_uri)
+    store.add(
+        [
+            {
+                "id": "row-a",
+                "rollout_id": "traj-a",
+                "problem_id": "problem-a",
+                "policy_version": "ckpt-1",
+                "role": "assistant",
+                "include_in_training": True,
+            },
+            {
+                "id": "row-b",
+                "rollout_id": "traj-b",
+                "problem_id": "problem-b",
+                "policy_version": "ckpt-2",
+                "role": "assistant",
+                "include_in_training": False,
+            },
+            {
+                "id": "row-c",
+                "rollout_id": "traj-b",
+                "problem_id": "problem-b",
+                "policy_version": "ckpt-2",
+                "role": "artifact",
+                "artifact_type": "screenshot",
+                "include_in_training": False,
+            },
+        ]
+    )
+
+    rows = store.list(
+        filters={"policy_version": "ckpt-2", "include_in_training": False}
+    )
+    assert {row["id"] for row in rows} == {"row-b", "row-c"}
+
+    page = store.list(
+        limit=1,
+        offset=1,
+        filters={"policy_version": "ckpt-2", "include_in_training": False},
+    )
+    assert len(page) == 1
+    assert page[0]["policy_version"] == "ckpt-2"
+
+
+def test_list_rejects_invalid_filter_fields(store_uri):
+    store = RolloutStore.open(store_uri)
+    with pytest.raises(RuntimeError, match="unsupported rollout filter"):
+        store.list(filters={"reward": 1.0})

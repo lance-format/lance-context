@@ -129,3 +129,33 @@ def test_remote_add_one_and_connect(server):
         assert [r["id"] for r in rows] == ["only"]
 
     asyncio.run(run())
+
+
+def test_remote_filtered_list(server):
+    async def run():
+        store = await AsyncRolloutStore.connect_or_create(server, "rl-filtered")
+        await store.add(
+            [
+                {
+                    "id": "row-7",
+                    "rollout_id": "traj-7",
+                    "role": "assistant",
+                    "policy_version": "ckpt-7",
+                    "include_in_training": True,
+                },
+                {
+                    "id": "row-8",
+                    "rollout_id": "traj-8",
+                    "role": "assistant",
+                    "policy_version": "ckpt-8",
+                    "include_in_training": True,
+                },
+            ]
+        )
+
+        rows = await store.list(
+            filters={"policy_version": "ckpt-7", "include_in_training": True}
+        )
+        assert [row["id"] for row in rows] == ["row-7"]
+
+    asyncio.run(run())
