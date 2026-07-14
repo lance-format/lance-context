@@ -328,6 +328,11 @@ impl RolloutStore {
     /// Returns `None` (spawning nothing) when `cleanup_interval_secs` is `0`
     /// (disabled). Otherwise returns the task handle.
     ///
+    /// Each pass is wrapped in a [`tokio::time::timeout`] (several intervals,
+    /// floored at 30s). A single stuck object-store call therefore cannot wedge
+    /// the store: the timeout releases the write lock and the loop retries on the
+    /// next tick instead of blocking every read/write behind a hung merge.
+    ///
     /// The task holds only a [`std::sync::Weak`] reference to the store, so it
     /// never keeps a deleted store alive: once the caller drops the last strong
     /// `Arc` (e.g. the server removes it from its store map on delete), the next
@@ -345,7 +350,21 @@ impl RolloutStore {
 
         let weak = Arc::downgrade(&store);
         Some(tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+            let interval = std::time::Duration::from_secs(interval_secs);
+            // Bound how long a single cleanup pass may run before we give up on
+            // it. Without this, a hung object-store call inside
+            // `cleanup_own_shard` would never return: `tokio::time::interval`
+            // fires serially (it will not start the next tick until the current
+            // pass completes), and the pass holds the store's write lock the
+            // whole time — so one stuck I/O would wedge both the cleanup timer
+            // and every read/write on this store, permanently. `timeout` caps
+            // the pass, releases the write lock, and lets the next tick retry.
+            // Sized generously (several intervals, floor 30s) so a merely slow —
+            // not hung — merge is not aborted mid-flight.
+            let pass_timeout = interval
+                .saturating_mul(5)
+                .max(std::time::Duration::from_secs(30));
+            let mut ticker = tokio::time::interval(interval);
             // Skip the immediate first tick so we don't merge the instant the
             // task starts; wait a full interval before the first pass.
             ticker.tick().await;
@@ -356,20 +375,31 @@ impl RolloutStore {
                     return;
                 };
                 let mut guard = store.write().await;
-                match guard.cleanup_own_shard().await {
-                    Ok(0) => {}
-                    Ok(n) => {
+                match tokio::time::timeout(pass_timeout, guard.cleanup_own_shard()).await {
+                    Ok(Ok(0)) => {}
+                    Ok(Ok(n)) => {
                         info!(
                             shard = %guard.write_shard,
                             reclaimed = n,
                             "periodic WAL cleanup merged flushed generations"
                         );
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         warn!(
                             shard = %guard.write_shard,
                             error = %e,
                             "periodic WAL cleanup failed"
+                        );
+                    }
+                    Err(_elapsed) => {
+                        // The pass exceeded `pass_timeout`; abandon it so the
+                        // write lock is released (dropping `guard` below) and the
+                        // shard can be retried on the next tick rather than
+                        // wedging the store behind a hung call.
+                        warn!(
+                            shard = %guard.write_shard,
+                            timeout_secs = pass_timeout.as_secs(),
+                            "periodic WAL cleanup timed out; abandoning this pass and retrying next tick"
                         );
                     }
                 }
