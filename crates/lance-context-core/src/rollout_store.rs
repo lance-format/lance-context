@@ -152,13 +152,13 @@ pub struct RolloutStoreOptions {
     ///
     /// Spawn the task with [`RolloutStore::spawn_periodic_cleanup`] once the
     /// store is behind an `Arc<RwLock<_>>` (the server's ownership model).
+    ///
+    /// The two triggers are a strict **OR**: whichever fires first merges. The
+    /// time trigger is *not* gated by any generation count — once the interval
+    /// elapses, every pending generation is folded into the base table even if
+    /// the count trigger's threshold was never crossed. (A pass with nothing
+    /// pending is a no-op.)
     pub cleanup_interval_secs: Option<u64>,
-    /// The *count* half of the periodic cleanup trigger: the timer only merges
-    /// when this instance's shard has at least this many flushed generations,
-    /// skipping the pass otherwise (avoids rewriting the base table to reclaim a
-    /// single small generation). `None` defaults to `1` (clean up whenever any
-    /// generation is present on a tick).
-    pub cleanup_min_generations: Option<usize>,
 }
 
 /// A Lance-backed store for RL rollout trajectories.
@@ -175,10 +175,6 @@ pub struct RolloutStore {
     /// Periodic-cleanup interval in seconds; `0` disables the timer. See
     /// [`RolloutStoreOptions::cleanup_interval_secs`].
     cleanup_interval_secs: u64,
-    /// Minimum flushed generations before a periodic-cleanup tick merges.
-    /// Normalized to at least `1`. See
-    /// [`RolloutStoreOptions::cleanup_min_generations`].
-    cleanup_min_generations: usize,
     /// Timestamp of the last successful [`Self::compact`] on this handle.
     last_compaction: Option<DateTime<Utc>>,
     /// Number of successful compactions performed by this handle.
@@ -240,7 +236,6 @@ impl RolloutStore {
             storage_options,
             merge_after_generations: options.merge_after_generations.unwrap_or(0),
             cleanup_interval_secs: options.cleanup_interval_secs.unwrap_or(0),
-            cleanup_min_generations: options.cleanup_min_generations.unwrap_or(1).max(1),
             last_compaction: None,
             total_compactions: 0,
             last_compaction_error: None,
@@ -324,9 +319,10 @@ impl RolloutStore {
     ///
     /// This is the shared core of both triggers: the synchronous count trigger
     /// in [`Self::add`] (with `threshold = merge_after_generations`) and the
-    /// periodic timer in [`Self::spawn_periodic_cleanup`] (with
-    /// `threshold = cleanup_min_generations`). Both merge only the shard this
-    /// instance owns and writes, so the epoch claim never fences another writer.
+    /// periodic timer in [`Self::spawn_periodic_cleanup`] (with `threshold = 1`,
+    /// i.e. merge whatever is pending once the interval elapses). Both merge only
+    /// the shard this instance owns and writes, so the epoch claim never fences
+    /// another writer.
     async fn merge_own_shard_if_ready(&mut self, threshold: usize) -> LanceResult<usize> {
         let object_store = self.dataset.object_store(None).await?;
         let branch_location = self.dataset.branch_location();
@@ -347,10 +343,13 @@ impl RolloutStore {
         Ok(pending)
     }
 
-    /// Run one periodic WAL-cleanup pass over this instance's own shard: fold any
-    /// flushed generations into the base table once at least
-    /// `cleanup_min_generations` have accumulated. Returns the number of
-    /// generations reclaimed (`0` if below the threshold or nothing pending).
+    /// Run one periodic WAL-cleanup pass over this instance's own shard: fold
+    /// **every** flushed generation into the base table. This is the *time* half
+    /// of the "time OR count" trigger, so it is deliberately *not* gated by any
+    /// generation-count threshold: once the interval elapses, whatever is pending
+    /// gets merged even if the count trigger
+    /// ([`RolloutStoreOptions::merge_after_generations`]) never fired. Returns the
+    /// number of generations reclaimed (`0` only when nothing was pending).
     ///
     /// Exposed for callers that drive cleanup on their own schedule instead of
     /// (or in addition to) the built-in timer from
@@ -359,18 +358,21 @@ impl RolloutStore {
     /// with this instance's own appends but must not target another instance's
     /// shard.
     pub async fn cleanup_own_shard(&mut self) -> LanceResult<usize> {
-        self.merge_own_shard_if_ready(self.cleanup_min_generations)
-            .await
+        // Threshold `1`: merge whenever at least one generation is pending. The
+        // time trigger must not depend on the count threshold — that is what
+        // makes the two triggers a true OR.
+        self.merge_own_shard_if_ready(1).await
     }
 
     /// Spawn a background timer that periodically reclaims this instance's
     /// flushed MemWAL generations into the base table (the *time* trigger).
     ///
     /// Every `cleanup_interval_secs` seconds the task acquires the write lock and
-    /// calls [`Self::cleanup_own_shard`], which merges only when at least
-    /// `cleanup_min_generations` are pending. This bounds read amplification and
-    /// reclaims stale generation datasets even on shards that never cross the
-    /// synchronous count threshold ([`RolloutStoreOptions::merge_after_generations`]).
+    /// calls [`Self::cleanup_own_shard`], which merges whatever generations are
+    /// pending (no count threshold — time and count are a strict OR). This bounds
+    /// read amplification and reclaims stale generation datasets even on shards
+    /// that never cross the synchronous count threshold
+    /// ([`RolloutStoreOptions::merge_after_generations`]).
     ///
     /// Returns `None` (spawning nothing) when `cleanup_interval_secs` is `0`
     /// (disabled). Otherwise returns the task handle.
@@ -2022,7 +2024,6 @@ mod tests {
                 RolloutStoreOptions {
                     storage_options: None,
                     shard_id: Some("rollout-1".to_string()),
-                    cleanup_min_generations: Some(1),
                     ..Default::default()
                 },
             )
@@ -2176,11 +2177,12 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_own_shard_merges_only_at_min_generations() {
+    fn cleanup_own_shard_merges_whatever_is_pending() {
         // The periodic-cleanup entry point (`cleanup_own_shard`) is the time
-        // trigger's per-pass body. With count self-merge disabled, generations
-        // accumulate; a cleanup pass below `cleanup_min_generations` is a no-op,
-        // and one at/above the threshold drains the shard into the base table.
+        // trigger's per-pass body. Time and count are a strict OR, so the time
+        // trigger is NOT gated by any generation count: with count self-merge
+        // disabled, a single pending generation is merged the moment the pass
+        // runs. A pass with nothing pending is a no-op.
         let dir = TempDir::new().unwrap();
         let uri = dir.path().to_string_lossy().to_string();
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -2191,7 +2193,6 @@ mod tests {
                     storage_options: None,
                     shard_id: Some("rollout-0".to_string()),
                     merge_after_generations: None, // count trigger off
-                    cleanup_min_generations: Some(2),
                     ..Default::default()
                 },
             )
@@ -2199,13 +2200,14 @@ mod tests {
             .unwrap();
 
             store.add(&[assistant_record("a-0")]).await.unwrap();
-            // One generation pending, below min (2): cleanup is a no-op.
-            assert_eq!(store.cleanup_own_shard().await.unwrap(), 0);
-            assert_eq!(flushed_generation_count(&store).await, 1);
+            // One generation pending: the time trigger merges it immediately —
+            // it does not wait for a count threshold.
+            assert_eq!(store.cleanup_own_shard().await.unwrap(), 1);
+            assert_eq!(flushed_generation_count(&store).await, 0);
 
             store.add(&[assistant_record("a-1")]).await.unwrap();
-            // Two generations pending, at min: cleanup merges both.
-            assert_eq!(store.cleanup_own_shard().await.unwrap(), 2);
+            // Next generation is likewise merged on the following pass.
+            assert_eq!(store.cleanup_own_shard().await.unwrap(), 1);
             assert_eq!(flushed_generation_count(&store).await, 0);
 
             // Rows survive the merge, readable exactly once.
@@ -2239,7 +2241,6 @@ mod tests {
                     shard_id: Some("rollout-0".to_string()),
                     merge_after_generations: None, // only the timer merges
                     cleanup_interval_secs: Some(1),
-                    cleanup_min_generations: Some(1),
                 },
             )
             .await
@@ -2308,7 +2309,6 @@ mod tests {
                         RolloutStoreOptions {
                             storage_options: None,
                             shard_id: Some(shard),
-                            cleanup_min_generations: Some(1),
                             ..Default::default()
                         },
                     )
@@ -2379,7 +2379,6 @@ mod tests {
                 RolloutStoreOptions {
                     storage_options: None,
                     shard_id: Some("rollout-0".to_string()),
-                    cleanup_min_generations: Some(1),
                     ..Default::default()
                 },
             )

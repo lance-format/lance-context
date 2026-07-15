@@ -54,7 +54,6 @@ pub async fn create_rollout_store(
             .then_some(state.rollout_merge_after_generations),
         cleanup_interval_secs: (state.rollout_cleanup_interval_secs > 0)
             .then_some(state.rollout_cleanup_interval_secs),
-        cleanup_min_generations: Some(state.rollout_cleanup_min_generations),
     };
 
     let store = RolloutStore::open_with_options(&uri, options)

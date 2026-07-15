@@ -47,9 +47,6 @@ pub struct AppState {
     /// Periodic per-shard WAL-cleanup interval in seconds; `0` disables the
     /// global sweeper. See [`Self::spawn_global_sweeper`].
     pub rollout_cleanup_interval_secs: u64,
-    /// Minimum flushed generations before a periodic cleanup tick merges. See
-    /// `RolloutStoreOptions::cleanup_min_generations`.
-    pub rollout_cleanup_min_generations: usize,
 }
 
 impl AppState {
@@ -72,7 +69,6 @@ impl AppState {
             instance_id,
             rollout_merge_after_generations: config.rollout_merge_after_generations,
             rollout_cleanup_interval_secs: config.rollout_cleanup_interval_secs,
-            rollout_cleanup_min_generations: config.rollout_cleanup_min_generations,
         })
     }
 
@@ -109,7 +105,6 @@ impl AppState {
             instance_id,
             rollout_merge_after_generations: 0,
             rollout_cleanup_interval_secs: 0,
-            rollout_cleanup_min_generations: 1,
         }
     }
 
@@ -130,7 +125,6 @@ impl AppState {
                 .then_some(self.rollout_merge_after_generations),
             cleanup_interval_secs: (self.rollout_cleanup_interval_secs > 0)
                 .then_some(self.rollout_cleanup_interval_secs),
-            cleanup_min_generations: Some(self.rollout_cleanup_min_generations),
         }
     }
 
