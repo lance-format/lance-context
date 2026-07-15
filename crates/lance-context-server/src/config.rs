@@ -37,19 +37,13 @@ pub struct ServerConfig {
     /// Interval, in seconds, for the periodic per-shard WAL cleanup task. When
     /// non-zero, each rollout store spawns a background timer that folds this
     /// instance's flushed MemWAL generations into the base table on a schedule —
-    /// the *time* half of the "time + count" trigger, complementing
-    /// `--rollout-merge-after-generations`. It reclaims stale generations even on
-    /// low-traffic shards that never cross the count threshold. `0` (the default)
-    /// disables the timer.
+    /// the *time* half of the "time OR count" trigger, complementing
+    /// `--rollout-merge-after-generations`. Whichever fires first merges: the
+    /// timer reclaims whatever is pending regardless of count, so stale
+    /// generations are folded in even on low-traffic shards that never cross the
+    /// count threshold. `0` (the default) disables the timer.
     #[arg(long, env = "ROLLOUT_CLEANUP_INTERVAL_SECS", default_value = "0")]
     pub rollout_cleanup_interval_secs: u64,
-
-    /// Minimum flushed generations a periodic cleanup tick requires before it
-    /// merges (avoids rewriting the base table to reclaim a single small
-    /// generation). Only meaningful when `--rollout-cleanup-interval-secs` is
-    /// set. Defaults to `1` (clean up whenever any generation is present).
-    #[arg(long, env = "ROLLOUT_CLEANUP_MIN_GENERATIONS", default_value = "1")]
-    pub rollout_cleanup_min_generations: usize,
 
     /// Upper bound on the number of resident rollout-store handles kept in
     /// memory (an LRU). With one physical dataset per experiment a deployment

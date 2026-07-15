@@ -17,7 +17,7 @@
 //!
 //! It deliberately holds only cheap directory metadata, never rollout rows.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::{Int64Array, RecordBatch, RecordBatchIterator, StringArray};
@@ -41,9 +41,10 @@ pub struct RegistryEntry {
 
 /// Durable directory of rollout stores, backed by a single Lance dataset.
 ///
-/// All mutations (`upsert`, `remove`) take `&mut self` and are expected to be
-/// serialized by the caller (the server wraps this in a lock), so the registry
-/// itself does no internal locking. Reads (`list`, `contains`) take `&self`.
+/// All operations take `&mut self` because Lance dataset handles are snapshots:
+/// reads and writes first check out the latest manifest so commits made by
+/// another process are visible. Callers are expected to serialize access (the
+/// server and master wrap this in a lock).
 pub struct RolloutRegistry {
     dataset: Dataset,
     uri: String,
@@ -132,6 +133,7 @@ impl RolloutRegistry {
     /// `create` retried after a crash (dataset on disk, registry row possibly
     /// present) converges to exactly one row. Callers must serialize mutations.
     pub async fn upsert(&mut self, name: &str, uri: &str) -> LanceResult<()> {
+        self.reload().await?;
         self.delete_row(name).await?;
         let schema = Arc::new(registry_schema());
         let batch = RecordBatch::try_new(
@@ -148,8 +150,54 @@ impl RolloutRegistry {
         Ok(())
     }
 
+    /// Insert every entry whose name is not already registered in one append.
+    ///
+    /// This is intended for migration/backfill jobs where many pre-existing
+    /// rollout datasets need directory entries. Existing rows are left
+    /// unchanged, duplicate names in `entries` are ignored, and the return
+    /// value is the number of rows inserted.
+    pub async fn insert_missing(&mut self, entries: &[(String, String)]) -> LanceResult<usize> {
+        if entries.is_empty() {
+            return Ok(0);
+        }
+
+        self.reload().await?;
+        let mut known: HashSet<String> = self
+            .list()
+            .await?
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        let missing: Vec<&(String, String)> = entries
+            .iter()
+            .filter(|(name, _)| known.insert(name.clone()))
+            .collect();
+        if missing.is_empty() {
+            return Ok(0);
+        }
+
+        let schema = Arc::new(registry_schema());
+        let created_at = Utc::now().timestamp_millis();
+        let names: Vec<&str> = missing.iter().map(|(name, _)| name.as_str()).collect();
+        let uris: Vec<&str> = missing.iter().map(|(_, uri)| uri.as_str()).collect();
+        let created = vec![created_at; missing.len()];
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(names)),
+                Arc::new(StringArray::from(uris)),
+                Arc::new(Int64Array::from(created)),
+            ],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema);
+        let params = Self::write_params(WriteMode::Append, self.storage_options.clone());
+        self.dataset.append(reader, Some(params)).await?;
+        Ok(missing.len())
+    }
+
     /// Remove the directory entry for `name`, if present. No-op when absent.
     pub async fn remove(&mut self, name: &str) -> LanceResult<()> {
+        self.reload().await?;
         self.delete_row(name).await
     }
 
@@ -161,8 +209,14 @@ impl RolloutRegistry {
         Ok(())
     }
 
-    /// Whether a store named `name` exists in the directory.
-    pub async fn contains(&self, name: &str) -> LanceResult<bool> {
+    /// Refresh this handle to the registry's latest committed version.
+    pub async fn reload(&mut self) -> LanceResult<()> {
+        self.dataset.checkout_latest().await
+    }
+
+    /// Whether a store named `name` exists in the latest registry version.
+    pub async fn contains(&mut self, name: &str) -> LanceResult<bool> {
+        self.reload().await?;
         let escaped = name.replace('\'', "''");
         let mut scanner = self.dataset.scan();
         scanner.project(&["name"])?;
@@ -177,10 +231,62 @@ impl RolloutRegistry {
         Ok(false)
     }
 
-    /// All directory entries, ordered as stored (unspecified). The registry is a
-    /// narrow three-column table, so even hundreds of thousands of rows scan
-    /// quickly; pagination can be layered on later if needed.
-    pub async fn list(&self) -> LanceResult<Vec<RegistryEntry>> {
+    /// Return one directory entry from the latest registry version.
+    pub async fn get(&mut self, name: &str) -> LanceResult<Option<RegistryEntry>> {
+        self.reload().await?;
+        let escaped = name.replace('\'', "''");
+        let mut scanner = self.dataset.scan();
+        scanner.project(&["name", "uri", "created_at"])?;
+        scanner.filter(&format!("name = '{}'", escaped))?;
+        scanner.limit(Some(1), None)?;
+        let mut stream = scanner.try_into_stream().await?;
+        let Some(batch) = stream.try_next().await? else {
+            return Ok(None);
+        };
+        if batch.num_rows() == 0 {
+            return Ok(None);
+        }
+
+        let names = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| {
+                LanceError::from(ArrowError::InvalidArgumentError(
+                    "registry 'name' column is not Utf8".into(),
+                ))
+            })?;
+        let uris = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| {
+                LanceError::from(ArrowError::InvalidArgumentError(
+                    "registry 'uri' column is not Utf8".into(),
+                ))
+            })?;
+        let created = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| {
+                LanceError::from(ArrowError::InvalidArgumentError(
+                    "registry 'created_at' column is not Int64".into(),
+                ))
+            })?;
+        Ok(Some(RegistryEntry {
+            name: names.value(0).to_string(),
+            uri: uris.value(0).to_string(),
+            created_at: created.value(0),
+        }))
+    }
+
+    /// All directory entries from the latest registry version, ordered as
+    /// stored (unspecified). The registry is a narrow three-column table, so
+    /// even hundreds of thousands of rows scan quickly; pagination can be
+    /// layered on later if needed.
+    pub async fn list(&mut self) -> LanceResult<Vec<RegistryEntry>> {
+        self.reload().await?;
         let mut scanner = self.dataset.scan();
         scanner.project(&["name", "uri", "created_at"])?;
         let mut stream = scanner.try_into_stream().await?;
@@ -269,6 +375,11 @@ mod tests {
             .await
             .unwrap();
         assert!(reg.contains("exp-b").await.unwrap());
+        assert_eq!(
+            reg.get("exp-b").await.unwrap().unwrap().uri,
+            "/data/exp-b.rollout.lance"
+        );
+        assert!(reg.get("missing").await.unwrap().is_none());
         reg.remove("exp-b").await.unwrap();
         assert!(!reg.contains("exp-b").await.unwrap());
         assert!(reg.list().await.unwrap().is_empty());
@@ -304,7 +415,53 @@ mod tests {
                 .unwrap();
         }
         // Reopen the same path: the entry must still be present.
-        let reg = new_registry(&dir).await;
+        let mut reg = new_registry(&dir).await;
         assert!(reg.contains("persist").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn reads_see_commits_from_another_handle() {
+        let dir = TempDir::new().unwrap();
+        let mut reader = new_registry(&dir).await;
+        let mut writer = new_registry(&dir).await;
+
+        writer
+            .upsert("external", "/data/external.rollout.lance")
+            .await
+            .unwrap();
+
+        assert!(reader.contains("external").await.unwrap());
+        assert_eq!(reader.list().await.unwrap()[0].name, "external");
+    }
+
+    #[tokio::test]
+    async fn insert_missing_batches_new_entries() {
+        let dir = TempDir::new().unwrap();
+        let mut reg = new_registry(&dir).await;
+        reg.upsert("existing", "/data/existing.rollout.lance")
+            .await
+            .unwrap();
+
+        let entries = vec![
+            (
+                "existing".to_string(),
+                "/other/existing.rollout.lance".to_string(),
+            ),
+            ("new-a".to_string(), "/data/new-a.rollout.lance".to_string()),
+            ("new-b".to_string(), "/data/new-b.rollout.lance".to_string()),
+            (
+                "new-a".to_string(),
+                "/duplicate/new-a.rollout.lance".to_string(),
+            ),
+        ];
+        assert_eq!(reg.insert_missing(&entries).await.unwrap(), 2);
+        assert_eq!(reg.insert_missing(&entries).await.unwrap(), 0);
+
+        let mut listed = reg.list().await.unwrap();
+        listed.sort_by(|a, b| a.name.cmp(&b.name));
+        assert_eq!(listed.len(), 3);
+        assert_eq!(listed[0].uri, "/data/existing.rollout.lance");
+        assert_eq!(listed[1].uri, "/data/new-a.rollout.lance");
+        assert_eq!(listed[2].uri, "/data/new-b.rollout.lance");
     }
 }

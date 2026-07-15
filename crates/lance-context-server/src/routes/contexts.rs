@@ -14,6 +14,7 @@ pub async fn create_context(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateContextRequest>,
 ) -> Result<(axum::http::StatusCode, Json<ContextInfo>), AppError> {
+    AppState::validate_name(&req.name)?;
     let stores = state.stores.read().await;
     if stores.contains_key(&req.name) {
         return Err(AppError::AlreadyExists(format!(
@@ -107,6 +108,7 @@ pub async fn delete_context(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<axum::http::StatusCode, AppError> {
+    AppState::validate_name(&name)?;
     let mut stores = state.stores.write().await;
     if stores.remove(&name).is_none() {
         return Err(AppError::NotFound(format!(
@@ -121,4 +123,47 @@ pub async fn delete_context(
     }
 
     Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn create_request(name: &str) -> CreateContextRequest {
+        CreateContextRequest {
+            name: name.to_string(),
+            storage_options: None,
+            id_index_type: None,
+            blob_columns: None,
+            embedding_dim: None,
+            distance_metric: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn create_rejects_names_that_are_not_portable_path_segments() {
+        let dir = TempDir::new().unwrap();
+        let state = Arc::new(AppState::new_for_test(dir.path().to_path_buf()).await);
+
+        for name in ["../escape", "nested/store", r"nested\store", "_registry"] {
+            let err = create_context(State(state.clone()), Json(create_request(name)))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, AppError::InvalidRequest(_)), "{name}");
+        }
+        assert!(state.stores.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn open_rejects_invalid_context_names_before_storage_access() {
+        let dir = TempDir::new().unwrap();
+        let state = AppState::new_for_test(dir.path().to_path_buf()).await;
+
+        let err = match state.get_or_open_context_store("../escape").await {
+            Ok(_) => panic!("invalid name unexpectedly opened"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, AppError::InvalidRequest(_)));
+    }
 }

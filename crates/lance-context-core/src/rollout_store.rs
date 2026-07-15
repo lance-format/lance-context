@@ -60,7 +60,7 @@ use arrow_array::{
 };
 use arrow_schema::{ArrowError, DataType, Field, Schema, TimeUnit};
 use chrono::{DateTime, Utc};
-use futures::TryStreamExt;
+use futures::{stream, StreamExt, TryStreamExt};
 use lance::dataset::mem_wal::{
     DatasetMemWalExt, LsmScanner, ShardManifestStore, ShardSnapshot, ShardWriterConfig,
 };
@@ -70,11 +70,14 @@ use lance::index::DatasetIndexExt;
 use lance::io::{ObjectStoreParams, StorageOptionsAccessor};
 use lance::{Error as LanceError, Result as LanceResult};
 use lance_index::mem_wal::{ShardManifest, MEM_WAL_INDEX_NAME};
+use lance_index::scalar::ScalarIndexParams;
+use lance_index::IndexType;
+use serde_json::Value;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::rollout::{RolloutFilters, RolloutRecord};
+use crate::rollout::RolloutRecord;
 use crate::store::{
     column_as, column_as_optional, relationship_field, relationship_list_item_field,
     relationship_struct_builder, relationships_from_list, timestamp_from_micros, CompactionConfig,
@@ -85,13 +88,21 @@ use crate::store::{
 /// shard state (mirrors the constant used by `ContextStore`).
 const DEFAULT_MANIFEST_SCAN_BATCH_SIZE: usize = 16;
 
-/// Cheap, read-only observability snapshot of a rollout store's base table.
+/// Maximum number of shard manifests or flushed-generation datasets opened
+/// concurrently while collecting observability metrics.
+const DEFAULT_OBSERVE_CONCURRENCY: usize = 16;
+
+/// Name of the scalar index on the base table's `id` column. Kept in sync with
+/// `ContextStore`'s `ID_INDEX_NAME` so both tables index `id` under one name.
+const ROLLOUT_ID_INDEX_NAME: &str = "id_idx";
+
+/// Read-only observability snapshot of a rollout store.
 ///
-/// Produced by [`RolloutStore::observe`] from dataset metadata (no full scan).
+/// Produced by [`RolloutStore::observe`] from base-table and MemWAL metadata.
 /// Consumed by the control-plane stats scanner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RolloutObservation {
-    /// Logical row count of the base table (fragment metadata, cheap).
+    /// Logical row count across the base table and every flushed MemWAL shard.
     pub row_count: i64,
     /// Number of fragments in the base table.
     pub fragment_count: i64,
@@ -99,8 +110,83 @@ pub struct RolloutObservation {
     pub version: u64,
     /// Manifest timestamp, Unix milliseconds — when the base table last changed.
     pub last_updated: i64,
-    /// Flushed MemWAL generations pending merge for this instance's shard.
+    /// Flushed MemWAL generations pending merge across all shards.
     pub pending_wal_generations: i64,
+}
+
+/// Exact-match filters for rollout record browsing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RolloutFilters {
+    pub id: Option<String>,
+    pub rollout_id: Option<String>,
+    pub problem_id: Option<String>,
+    pub dataset: Option<String>,
+    pub role: Option<String>,
+    pub content_type: Option<String>,
+    pub policy_version: Option<String>,
+    pub artifact_type: Option<String>,
+    pub include_in_training: Option<bool>,
+}
+
+impl RolloutFilters {
+    pub fn from_json_value(value: Value) -> Result<Self, String> {
+        let Value::Object(object) = value else {
+            return Err("rollout filters must be a JSON object".to_string());
+        };
+
+        let mut filters = Self::default();
+        for (key, value) in object {
+            let string_value = || {
+                value
+                    .as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("rollout filter '{key}' must be a string"))
+            };
+            match key.as_str() {
+                "rollout_id" => filters.rollout_id = Some(string_value()?),
+                "problem_id" => filters.problem_id = Some(string_value()?),
+                "policy_version" => filters.policy_version = Some(string_value()?),
+                "role" => filters.role = Some(string_value()?),
+                "include_in_training" => {
+                    filters.include_in_training = Some(value.as_bool().ok_or_else(|| {
+                        "rollout filter 'include_in_training' must be a boolean".to_string()
+                    })?);
+                }
+                "artifact_type" => filters.artifact_type = Some(string_value()?),
+                _ => return Err(format!("unsupported rollout filter '{key}'")),
+            }
+        }
+        Ok(filters)
+    }
+
+    fn expression(&self) -> Option<String> {
+        let mut clauses = Vec::new();
+        for (column, value) in [
+            ("id", self.id.as_deref()),
+            ("rollout_id", self.rollout_id.as_deref()),
+            ("problem_id", self.problem_id.as_deref()),
+            ("dataset", self.dataset.as_deref()),
+            ("role", self.role.as_deref()),
+            ("content_type", self.content_type.as_deref()),
+            ("policy_version", self.policy_version.as_deref()),
+            ("artifact_type", self.artifact_type.as_deref()),
+        ] {
+            if let Some(value) = value.filter(|value| !value.is_empty()) {
+                clauses.push(format!("{column} = '{}'", value.replace('\'', "''")));
+            }
+        }
+        if let Some(value) = self.include_in_training {
+            clauses.push(format!("include_in_training = {value}"));
+        }
+        (!clauses.is_empty()).then(|| clauses.join(" AND "))
+    }
+}
+
+/// One server-side paginated rollout query result.
+#[derive(Debug, Clone)]
+pub struct RolloutPage {
+    pub records: Vec<RolloutRecord>,
+    pub has_more: bool,
 }
 
 /// Configuration for opening a [`RolloutStore`].
@@ -148,13 +234,13 @@ pub struct RolloutStoreOptions {
     ///
     /// Spawn the task with [`RolloutStore::spawn_periodic_cleanup`] once the
     /// store is behind an `Arc<RwLock<_>>` (the server's ownership model).
+    ///
+    /// The two triggers are a strict **OR**: whichever fires first merges. The
+    /// time trigger is *not* gated by any generation count — once the interval
+    /// elapses, every pending generation is folded into the base table even if
+    /// the count trigger's threshold was never crossed. (A pass with nothing
+    /// pending is a no-op.)
     pub cleanup_interval_secs: Option<u64>,
-    /// The *count* half of the periodic cleanup trigger: the timer only merges
-    /// when this instance's shard has at least this many flushed generations,
-    /// skipping the pass otherwise (avoids rewriting the base table to reclaim a
-    /// single small generation). `None` defaults to `1` (clean up whenever any
-    /// generation is present on a tick).
-    pub cleanup_min_generations: Option<usize>,
 }
 
 /// A Lance-backed store for RL rollout trajectories.
@@ -171,10 +257,6 @@ pub struct RolloutStore {
     /// Periodic-cleanup interval in seconds; `0` disables the timer. See
     /// [`RolloutStoreOptions::cleanup_interval_secs`].
     cleanup_interval_secs: u64,
-    /// Minimum flushed generations before a periodic-cleanup tick merges.
-    /// Normalized to at least `1`. See
-    /// [`RolloutStoreOptions::cleanup_min_generations`].
-    cleanup_min_generations: usize,
     /// Timestamp of the last successful [`Self::compact`] on this handle.
     last_compaction: Option<DateTime<Utc>>,
     /// Number of successful compactions performed by this handle.
@@ -236,7 +318,6 @@ impl RolloutStore {
             storage_options,
             merge_after_generations: options.merge_after_generations.unwrap_or(0),
             cleanup_interval_secs: options.cleanup_interval_secs.unwrap_or(0),
-            cleanup_min_generations: options.cleanup_min_generations.unwrap_or(1).max(1),
             last_compaction: None,
             total_compactions: 0,
             last_compaction_error: None,
@@ -320,9 +401,10 @@ impl RolloutStore {
     ///
     /// This is the shared core of both triggers: the synchronous count trigger
     /// in [`Self::add`] (with `threshold = merge_after_generations`) and the
-    /// periodic timer in [`Self::spawn_periodic_cleanup`] (with
-    /// `threshold = cleanup_min_generations`). Both merge only the shard this
-    /// instance owns and writes, so the epoch claim never fences another writer.
+    /// periodic timer in [`Self::spawn_periodic_cleanup`] (with `threshold = 1`,
+    /// i.e. merge whatever is pending once the interval elapses). Both merge only
+    /// the shard this instance owns and writes, so the epoch claim never fences
+    /// another writer.
     async fn merge_own_shard_if_ready(&mut self, threshold: usize) -> LanceResult<usize> {
         let object_store = self.dataset.object_store(None).await?;
         let branch_location = self.dataset.branch_location();
@@ -343,10 +425,13 @@ impl RolloutStore {
         Ok(pending)
     }
 
-    /// Run one periodic WAL-cleanup pass over this instance's own shard: fold any
-    /// flushed generations into the base table once at least
-    /// `cleanup_min_generations` have accumulated. Returns the number of
-    /// generations reclaimed (`0` if below the threshold or nothing pending).
+    /// Run one periodic WAL-cleanup pass over this instance's own shard: fold
+    /// **every** flushed generation into the base table. This is the *time* half
+    /// of the "time OR count" trigger, so it is deliberately *not* gated by any
+    /// generation-count threshold: once the interval elapses, whatever is pending
+    /// gets merged even if the count trigger
+    /// ([`RolloutStoreOptions::merge_after_generations`]) never fired. Returns the
+    /// number of generations reclaimed (`0` only when nothing was pending).
     ///
     /// Exposed for callers that drive cleanup on their own schedule instead of
     /// (or in addition to) the built-in timer from
@@ -355,18 +440,21 @@ impl RolloutStore {
     /// with this instance's own appends but must not target another instance's
     /// shard.
     pub async fn cleanup_own_shard(&mut self) -> LanceResult<usize> {
-        self.merge_own_shard_if_ready(self.cleanup_min_generations)
-            .await
+        // Threshold `1`: merge whenever at least one generation is pending. The
+        // time trigger must not depend on the count threshold — that is what
+        // makes the two triggers a true OR.
+        self.merge_own_shard_if_ready(1).await
     }
 
     /// Spawn a background timer that periodically reclaims this instance's
     /// flushed MemWAL generations into the base table (the *time* trigger).
     ///
     /// Every `cleanup_interval_secs` seconds the task acquires the write lock and
-    /// calls [`Self::cleanup_own_shard`], which merges only when at least
-    /// `cleanup_min_generations` are pending. This bounds read amplification and
-    /// reclaims stale generation datasets even on shards that never cross the
-    /// synchronous count threshold ([`RolloutStoreOptions::merge_after_generations`]).
+    /// calls [`Self::cleanup_own_shard`], which merges whatever generations are
+    /// pending (no count threshold — time and count are a strict OR). This bounds
+    /// read amplification and reclaims stale generation datasets even on shards
+    /// that never cross the synchronous count threshold
+    /// ([`RolloutStoreOptions::merge_after_generations`]).
     ///
     /// Returns `None` (spawning nothing) when `cleanup_interval_secs` is `0`
     /// (disabled). Otherwise returns the task handle.
@@ -501,6 +589,9 @@ impl RolloutStore {
         // drain can remove exactly these and nothing else.
         let base_uri = self.dataset.uri().trim_end_matches('/').to_string();
         let mut merged_generations: HashSet<u64> = HashSet::new();
+        // Remember each merged generation's on-storage folder name so we can
+        // delete the blob directory after the manifest drain (see below).
+        let mut merged_paths: Vec<String> = Vec::new();
         let mut batches: Vec<RecordBatch> = Vec::new();
         for flushed in &manifest.flushed_generations {
             let gen_uri = format!(
@@ -516,6 +607,7 @@ impl RolloutStore {
                 }
             }
             merged_generations.insert(flushed.generation);
+            merged_paths.push(flushed.path.clone());
         }
 
         // Append the merged rows to the base table.
@@ -559,6 +651,40 @@ impl RolloutStore {
                 ..current.clone()
             })
             .await?;
+
+        // Delete the merged generations' blob directories now that no manifest
+        // references them. Ordering matters: the drain above already removed
+        // these ids from `flushed_generations`, so a reader can no longer resolve
+        // them — deleting the data second (never before) keeps the sequence
+        // crash-safe. If the process dies between the drain and here, the rows
+        // are already in the base table and the manifest no longer lists these
+        // generations, so nothing reads them; they simply become storage that a
+        // sweep can reclaim later.
+        //
+        // Best-effort: a delete failure must NOT fail the merge — the merge has
+        // logically succeeded (data appended, manifest drained). A failed delete
+        // only leaks one directory, which the same reclamation path handles.
+        // Skipping this deletion is exactly the historical storage leak: every
+        // merged generation left its `_mem_wal/{shard}/{gen}/` directory behind
+        // forever.
+        let object_store = self.dataset.object_store(None).await?;
+        let branch_path = self.dataset.branch_location().path.clone();
+        for path in &merged_paths {
+            let gen_dir = branch_path
+                .clone()
+                .join("_mem_wal")
+                .join(self.write_shard.to_string().as_str())
+                .join(path.as_str());
+            if let Err(err) = object_store.remove_dir_all(gen_dir.clone()).await {
+                tracing::warn!(
+                    shard = %self.write_shard,
+                    generation_path = %path,
+                    error = %err,
+                    "failed to delete merged MemWAL generation directory; \
+                     it will remain until reclaimed"
+                );
+            }
+        }
 
         Ok(())
     }
@@ -630,6 +756,37 @@ impl RolloutStore {
         }
     }
 
+    /// Build a ZoneMap scalar index on the base table's `id` column.
+    ///
+    /// `id` is the rollout table's (unenforced) primary key, so a lightweight
+    /// per-fragment min/max index accelerates id point-lookups and range scans
+    /// on the already-flushed base table. `replace(true)` makes this idempotent:
+    /// re-running simply rebuilds the index in place.
+    ///
+    /// # MemWAL interaction
+    ///
+    /// The rollout base table carries a fieldless MemWAL index, and Lance's
+    /// MemWAL does not *maintain* ZoneMap indices across WAL flushes (it only
+    /// keeps the indices named in `maintained_indexes`). That does not affect
+    /// correctness here: rollout rows are immutable and de-duplicated by `id` at
+    /// read time, so the ZoneMap only ever needs to describe the base table's
+    /// already-merged fragments — rows still living in unmerged WAL generations
+    /// are found by the normal full scan of those generations. Creating the
+    /// index is therefore safe alongside an existing MemWAL index.
+    pub async fn create_id_zonemap_index(&mut self) -> LanceResult<()> {
+        info!("Creating ZoneMap index on rollout id column");
+        self.dataset
+            .create_index_builder(&["id"], IndexType::ZoneMap, &ScalarIndexParams::default())
+            .name(ROLLOUT_ID_INDEX_NAME.to_string())
+            .replace(true)
+            .await?;
+        // Reload the handle so subsequent reads on this instance observe the
+        // new index (mirrors the reload done after `compact`).
+        let uri = self.dataset.uri().to_string();
+        self.dataset = Self::load_with_options(&uri, self.storage_options.clone()).await?;
+        Ok(())
+    }
+
     /// Whether the base table has accumulated at least `min_fragments`
     /// fragments (and is thus worth compacting). Quiet-hours gating from
     /// [`CompactionConfig`] is honored so an external scheduler can pass the
@@ -651,38 +808,42 @@ impl RolloutStore {
     }
 
     /// Number of flushed MemWAL generations pending merge into the base table
-    /// for this instance's own shard. `0` when the shard has no manifest yet.
+    /// across all shards. `0` when no shard has a manifest yet.
     ///
     /// Read-only: unlike [`Self::cleanup_own_shard`] it never merges. Used by the
     /// control-plane stats scanner to surface read-amplification pressure.
     pub async fn pending_wal_generations(&self) -> LanceResult<usize> {
-        let object_store = self.dataset.object_store(None).await?;
-        let branch_location = self.dataset.branch_location();
-        let manifest_store = ShardManifestStore::new(
-            object_store,
-            &branch_location.path,
-            self.write_shard,
-            DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
-        );
-        match manifest_store.read_latest().await? {
-            Some(manifest) => Ok(manifest.flushed_generations.len()),
-            None => Ok(0),
-        }
+        Ok(self
+            .wal_shard_snapshots()
+            .await?
+            .iter()
+            .map(|snapshot| snapshot.flushed_generations.len())
+            .sum())
     }
 
-    /// Snapshot cheap, read-only observability metrics for the base table.
+    /// Snapshot read-only observability metrics for the rollout store.
     ///
-    /// All fields come from dataset metadata (manifest + fragment counts), not a
-    /// full table scan: `row_count` and `fragment_count` read fragment metadata,
-    /// `version`/`last_updated` come from the manifest. `pending_wal_generations`
-    /// reads this instance's shard manifest. Intended for the control-plane stats
-    /// scanner, which opens each store read-only and records the result.
+    /// `row_count` combines base-table fragment metadata with row counts from
+    /// every flushed generation in every MemWAL shard. Generation datasets are
+    /// opened concurrently and counted from their fragment metadata; rollout
+    /// IDs are append-only, so summing those immutable generations preserves the
+    /// store's logical row count without scanning payload columns.
+    ///
+    /// `fragment_count` intentionally remains the base-table fragment count:
+    /// master-driven compaction only rewrites the shared base table, while each
+    /// writer owns and merges its own WAL shard.
     pub async fn observe(&self) -> LanceResult<RolloutObservation> {
-        let row_count = self.dataset.count_rows(None).await? as i64;
+        let shard_snapshots = self.wal_shard_snapshots().await?;
+        let base_rows = self.dataset.count_rows(None).await? as u64;
+        let pending_rows = self.pending_wal_rows(&shard_snapshots).await?;
+        let row_count = (base_rows + pending_rows) as i64;
         let fragment_count = self.dataset.count_fragments() as i64;
         let version = self.dataset.manifest.version;
         let last_updated = self.dataset.manifest.timestamp().timestamp_millis();
-        let pending_wal_generations = self.pending_wal_generations().await? as i64;
+        let pending_wal_generations = shard_snapshots
+            .iter()
+            .map(|snapshot| snapshot.flushed_generations.len() as i64)
+            .sum();
         Ok(RolloutObservation {
             row_count,
             fragment_count,
@@ -767,7 +928,7 @@ impl RolloutStore {
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> LanceResult<Vec<RolloutRecord>> {
-        self.list_filtered(limit, offset, None).await
+        self.list_with_filters(limit, offset, None).await
     }
 
     /// List rollout rows matching exact field filters.
@@ -775,7 +936,7 @@ impl RolloutStore {
     /// The filter is pushed into every LSM source before merge and
     /// deduplication. Rollout rows are immutable by id, so filtering each
     /// generation cannot reveal an older state of a mutable record.
-    pub async fn list_filtered(
+    pub async fn list_with_filters(
         &self,
         limit: Option<usize>,
         offset: Option<usize>,
@@ -784,7 +945,7 @@ impl RolloutStore {
         let columns = self.non_blob_columns();
         let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
         let mut scanner = self.lsm_scanner().await?.project(&refs);
-        if let Some(predicate) = filters.and_then(RolloutFilters::predicate) {
+        if let Some(predicate) = filters.and_then(RolloutFilters::expression) {
             scanner = scanner.filter(&predicate)?;
         }
         let post_scan_offset = if limit.is_none() { offset } else { None };
@@ -802,6 +963,40 @@ impl RolloutStore {
             results = results.into_iter().skip(offset).collect();
         }
         Ok(results)
+    }
+
+    /// Filter and page rollout rows in the LSM execution plan.
+    ///
+    /// Reads one row beyond the requested page to report `has_more`, avoiding
+    /// an unbounded full-table count on every UI request. Artifact bytes are
+    /// projected out, matching [`Self::list`].
+    pub async fn list_filtered(
+        &self,
+        filters: &RolloutFilters,
+        limit: usize,
+        offset: usize,
+    ) -> LanceResult<RolloutPage> {
+        let shard_snapshots = self.wal_shard_snapshots().await?;
+        let filter = filters.expression();
+
+        let columns = self.non_blob_columns();
+        let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+        let mut page_scanner = self
+            .lsm_scanner_with_snapshots(shard_snapshots)
+            .project(&refs);
+        if let Some(filter) = &filter {
+            page_scanner = page_scanner.filter(filter)?;
+        }
+        page_scanner = page_scanner.limit(limit.saturating_add(1), Some(offset));
+
+        let mut stream = page_scanner.try_into_stream().await?;
+        let mut records = Vec::new();
+        while let Some(batch) = stream.try_next().await? {
+            records.extend(batch_to_rollout_records(&batch)?);
+        }
+        let has_more = records.len() > limit;
+        records.truncate(limit);
+        Ok(RolloutPage { records, has_more })
     }
 
     /// Retrieve a single rollout row by its unique id, including any freshly
@@ -873,36 +1068,93 @@ impl RolloutStore {
     /// every other instance's flushed appends — reads are not pinned to the
     /// writing instance. Deduplicates by `id`.
     async fn lsm_scanner(&self) -> LanceResult<LsmScanner> {
-        let object_store = self.dataset.object_store(None).await?;
-        let branch_location = self.dataset.branch_location();
-        let shard_ids = self.dataset.list_mem_wal_latest_shard_ids().await?;
+        let shard_snapshots = self.wal_shard_snapshots().await?;
 
-        let mut shard_snapshots = Vec::with_capacity(shard_ids.len());
-        for shard_id in shard_ids {
-            let manifest_store = ShardManifestStore::new(
-                object_store.clone(),
-                &branch_location.path,
-                shard_id,
-                DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
-            );
-            let Some(manifest) = manifest_store.read_latest().await? else {
-                continue;
-            };
+        Ok(self.lsm_scanner_with_snapshots(shard_snapshots))
+    }
 
-            let mut snapshot = ShardSnapshot::new(shard_id)
-                .with_spec_id(manifest.shard_spec_id)
-                .with_current_generation(manifest.current_generation);
-            for flushed in manifest.flushed_generations {
-                snapshot = snapshot.with_flushed_generation(flushed.generation, flushed.path);
-            }
-            shard_snapshots.push(snapshot);
-        }
-
-        Ok(LsmScanner::new(
+    fn lsm_scanner_with_snapshots(&self, shard_snapshots: Vec<ShardSnapshot>) -> LsmScanner {
+        LsmScanner::new(
             Arc::new(self.dataset.clone()),
             shard_snapshots,
             vec!["id".to_string()],
-        ))
+        )
+    }
+
+    /// Read the latest manifest for every MemWAL shard. Manifest reads are
+    /// bounded-concurrent so stores with many writer instances do not pay one
+    /// object-store round trip per shard serially.
+    async fn wal_shard_snapshots(&self) -> LanceResult<Vec<ShardSnapshot>> {
+        let object_store = self.dataset.object_store(None).await?;
+        let branch_path = self.dataset.branch_location().path.clone();
+        let shard_ids = self.dataset.list_mem_wal_latest_shard_ids().await?;
+
+        let snapshots: Vec<Option<ShardSnapshot>> = stream::iter(shard_ids)
+            .map(|shard_id| {
+                let object_store = object_store.clone();
+                let branch_path = branch_path.clone();
+                async move {
+                    let manifest_store = ShardManifestStore::new(
+                        object_store,
+                        &branch_path,
+                        shard_id,
+                        DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
+                    );
+                    let Some(manifest) = manifest_store.read_latest().await? else {
+                        return Ok(None);
+                    };
+
+                    let mut snapshot = ShardSnapshot::new(shard_id)
+                        .with_spec_id(manifest.shard_spec_id)
+                        .with_current_generation(manifest.current_generation);
+                    for flushed in manifest.flushed_generations {
+                        snapshot =
+                            snapshot.with_flushed_generation(flushed.generation, flushed.path);
+                    }
+                    Ok::<_, LanceError>(Some(snapshot))
+                }
+            })
+            .buffer_unordered(DEFAULT_OBSERVE_CONCURRENCY)
+            .try_collect()
+            .await?;
+
+        Ok(snapshots.into_iter().flatten().collect())
+    }
+
+    /// Count rows in all immutable flushed-generation datasets using metadata
+    /// reads rather than a payload scan.
+    async fn pending_wal_rows(&self, snapshots: &[ShardSnapshot]) -> LanceResult<u64> {
+        let base_uri = self.dataset.uri().trim_end_matches('/').to_string();
+        let generation_paths: Vec<String> = snapshots
+            .iter()
+            .flat_map(|snapshot| {
+                snapshot.flushed_generations.iter().map(|generation| {
+                    format!(
+                        "{base_uri}/_mem_wal/{}/{}",
+                        snapshot.shard_id, generation.path
+                    )
+                })
+            })
+            .collect();
+        let session = self.dataset.session();
+        let storage_options = self.storage_options.clone();
+
+        stream::iter(generation_paths)
+            .map(|path| {
+                let session = session.clone();
+                let storage_options = storage_options.clone();
+                async move {
+                    let mut builder = DatasetBuilder::from_uri(&path).with_session(session);
+                    if let Some(options) = storage_options {
+                        builder = builder.with_storage_options(options);
+                    }
+                    let dataset = builder.load().await?;
+                    Ok::<_, LanceError>(dataset.count_rows(None).await? as u64)
+                }
+            })
+            .buffer_unordered(DEFAULT_OBSERVE_CONCURRENCY)
+            .try_fold(0_u64, |total, rows| async move { Ok(total + rows) })
+            .await
     }
 
     async fn load_with_options(
@@ -1539,10 +1791,55 @@ fn optional_i8_list(array: Option<&ListArray>, row: usize) -> LanceResult<Option
 mod tests {
     use super::*;
     use crate::record::Relationship;
-    use crate::rollout::{RolloutFilters, ROLE_ARTIFACT, ROLE_ASSISTANT};
+    use crate::rollout::{ROLE_ARTIFACT, ROLE_ASSISTANT};
     use chrono::{TimeZone, Utc};
     use serde_json::json;
     use tempfile::TempDir;
+
+    #[test]
+    fn rollout_filters_parse_supported_fields() {
+        let filters = RolloutFilters::from_json_value(json!({
+            "rollout_id": "traj-1",
+            "problem_id": "problem-7",
+            "policy_version": "ckpt-42",
+            "role": "assistant",
+            "include_in_training": false,
+            "artifact_type": "screenshot"
+        }))
+        .unwrap();
+
+        assert_eq!(filters.rollout_id.as_deref(), Some("traj-1"));
+        assert_eq!(filters.problem_id.as_deref(), Some("problem-7"));
+        assert_eq!(filters.policy_version.as_deref(), Some("ckpt-42"));
+        assert_eq!(filters.role.as_deref(), Some("assistant"));
+        assert_eq!(filters.include_in_training, Some(false));
+        assert_eq!(filters.artifact_type.as_deref(), Some("screenshot"));
+    }
+
+    #[test]
+    fn rollout_filters_reject_unknown_and_wrong_types() {
+        assert!(RolloutFilters::from_json_value(json!({"reward": 1.0})).is_err());
+        assert!(RolloutFilters::from_json_value(json!({"policy_version": 42})).is_err());
+        assert!(RolloutFilters::from_json_value(json!({"include_in_training": "yes"})).is_err());
+        assert!(RolloutFilters::from_json_value(json!([])).is_err());
+    }
+
+    #[test]
+    fn rollout_filter_expression_escapes_strings_and_fields() {
+        let filters = RolloutFilters {
+            policy_version: Some("worker's-ckpt".to_string()),
+            role: Some("assistant".to_string()),
+            include_in_training: Some(true),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            filters.expression().as_deref(),
+            Some(
+                "role = 'assistant' AND policy_version = 'worker''s-ckpt' AND include_in_training = true"
+            )
+        );
+    }
 
     fn assistant_record(id: &str) -> RolloutRecord {
         RolloutRecord {
@@ -1730,6 +2027,7 @@ mod tests {
             let obs = store.observe().await.unwrap();
             assert!(obs.fragment_count >= 0);
             assert!(obs.pending_wal_generations >= 1);
+            assert_eq!(obs.row_count, 2);
             assert!(obs.last_updated > 0);
         });
     }
@@ -1768,7 +2066,7 @@ mod tests {
                 ..Default::default()
             };
             let all = store
-                .list_filtered(None, None, Some(&filters))
+                .list_with_filters(None, None, Some(&filters))
                 .await
                 .unwrap();
             assert_eq!(all.len(), 2);
@@ -1778,7 +2076,7 @@ mod tests {
             assert!(all.iter().all(|row| row.include_in_training == Some(false)));
 
             let page = store
-                .list_filtered(Some(1), Some(1), Some(&filters))
+                .list_with_filters(Some(1), Some(1), Some(&filters))
                 .await
                 .unwrap();
             assert_eq!(page.len(), 1);
@@ -1807,7 +2105,7 @@ mod tests {
                 ..Default::default()
             };
             let rows = store
-                .list_filtered(None, None, Some(&filters))
+                .list_with_filters(None, None, Some(&filters))
                 .await
                 .unwrap();
             assert_eq!(rows.len(), 1);
@@ -1888,6 +2186,81 @@ mod tests {
             assert_eq!(seen.len(), 2);
             assert!(seen.iter().any(|r| r.id == "a-0"));
             assert!(seen.iter().any(|r| r.id == "b-0"));
+
+            // Observability is independent of the reader's own write shard:
+            // both shards contribute rows and pending generations.
+            let reader = RolloutStore::open(&uri).await.unwrap();
+            let obs = reader.observe().await.unwrap();
+            assert_eq!(obs.row_count, 2);
+            assert_eq!(obs.pending_wal_generations, 2);
+            assert_eq!(obs.fragment_count, 0);
+        });
+    }
+
+    #[test]
+    fn filtered_listing_pages_across_shards_and_escapes_values() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let options = |shard: &str| RolloutStoreOptions {
+                shard_id: Some(shard.to_string()),
+                ..Default::default()
+            };
+            let mut instance_a = RolloutStore::open_with_options(&uri, options("filter-a"))
+                .await
+                .unwrap();
+            let mut quoted = assistant_record("row-'quoted");
+            quoted.rollout_id = "rollout-alpha".to_string();
+            quoted.policy_version = Some("policy-a".to_string());
+            instance_a
+                .add(&[quoted, assistant_record("row-a")])
+                .await
+                .unwrap();
+
+            let mut instance_b = RolloutStore::open_with_options(&uri, options("filter-b"))
+                .await
+                .unwrap();
+            let artifact = artifact_record("row-b", b"blob");
+            instance_b.add(&[artifact]).await.unwrap();
+
+            let reader = RolloutStore::open(&uri).await.unwrap();
+            let quoted_page = reader
+                .list_filtered(
+                    &RolloutFilters {
+                        id: Some("row-'quoted".to_string()),
+                        ..Default::default()
+                    },
+                    25,
+                    0,
+                )
+                .await
+                .unwrap();
+            assert!(!quoted_page.has_more);
+            assert_eq!(quoted_page.records[0].id, "row-'quoted");
+
+            let policy_page = reader
+                .list_filtered(
+                    &RolloutFilters {
+                        rollout_id: Some("rollout-alpha".to_string()),
+                        role: Some(ROLE_ASSISTANT.to_string()),
+                        policy_version: Some("policy-a".to_string()),
+                        ..Default::default()
+                    },
+                    25,
+                    0,
+                )
+                .await
+                .unwrap();
+            assert!(!policy_page.has_more);
+            assert_eq!(policy_page.records[0].id, "row-'quoted");
+
+            let page = reader
+                .list_filtered(&RolloutFilters::default(), 1, 1)
+                .await
+                .unwrap();
+            assert!(page.has_more);
+            assert_eq!(page.records.len(), 1);
         });
     }
 
@@ -2053,7 +2426,6 @@ mod tests {
                 RolloutStoreOptions {
                     storage_options: None,
                     shard_id: Some("rollout-1".to_string()),
-                    cleanup_min_generations: Some(1),
                     ..Default::default()
                 },
             )
@@ -2207,11 +2579,12 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_own_shard_merges_only_at_min_generations() {
+    fn cleanup_own_shard_merges_whatever_is_pending() {
         // The periodic-cleanup entry point (`cleanup_own_shard`) is the time
-        // trigger's per-pass body. With count self-merge disabled, generations
-        // accumulate; a cleanup pass below `cleanup_min_generations` is a no-op,
-        // and one at/above the threshold drains the shard into the base table.
+        // trigger's per-pass body. Time and count are a strict OR, so the time
+        // trigger is NOT gated by any generation count: with count self-merge
+        // disabled, a single pending generation is merged the moment the pass
+        // runs. A pass with nothing pending is a no-op.
         let dir = TempDir::new().unwrap();
         let uri = dir.path().to_string_lossy().to_string();
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -2222,7 +2595,6 @@ mod tests {
                     storage_options: None,
                     shard_id: Some("rollout-0".to_string()),
                     merge_after_generations: None, // count trigger off
-                    cleanup_min_generations: Some(2),
                     ..Default::default()
                 },
             )
@@ -2230,13 +2602,14 @@ mod tests {
             .unwrap();
 
             store.add(&[assistant_record("a-0")]).await.unwrap();
-            // One generation pending, below min (2): cleanup is a no-op.
-            assert_eq!(store.cleanup_own_shard().await.unwrap(), 0);
-            assert_eq!(flushed_generation_count(&store).await, 1);
+            // One generation pending: the time trigger merges it immediately —
+            // it does not wait for a count threshold.
+            assert_eq!(store.cleanup_own_shard().await.unwrap(), 1);
+            assert_eq!(flushed_generation_count(&store).await, 0);
 
             store.add(&[assistant_record("a-1")]).await.unwrap();
-            // Two generations pending, at min: cleanup merges both.
-            assert_eq!(store.cleanup_own_shard().await.unwrap(), 2);
+            // Next generation is likewise merged on the following pass.
+            assert_eq!(store.cleanup_own_shard().await.unwrap(), 1);
             assert_eq!(flushed_generation_count(&store).await, 0);
 
             // Rows survive the merge, readable exactly once.
@@ -2245,6 +2618,45 @@ mod tests {
 
             // Nothing pending: a further pass reclaims nothing.
             assert_eq!(store.cleanup_own_shard().await.unwrap(), 0);
+        });
+    }
+
+    #[test]
+    fn create_id_zonemap_index_builds_and_is_idempotent() {
+        // Building the ZoneMap index on `id` must succeed even though the
+        // rollout table also carries a (fieldless) MemWAL index, and calling it
+        // twice must not error (replace(true) rebuilds in place).
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open(&uri).await.unwrap();
+            // Add rows and fold them into the base table so there is data (and a
+            // MemWAL index) present when we build the scalar index.
+            store.add(&[assistant_record("a-0")]).await.unwrap();
+            store.add(&[assistant_record("a-1")]).await.unwrap();
+            store.cleanup_own_shard().await.unwrap();
+
+            store.create_id_zonemap_index().await.unwrap();
+            let has_id_index = |s: &RolloutStore| {
+                let dataset = s.dataset.clone();
+                async move {
+                    dataset
+                        .load_indices()
+                        .await
+                        .unwrap()
+                        .iter()
+                        .any(|i| i.name == ROLLOUT_ID_INDEX_NAME)
+                }
+            };
+            assert!(has_id_index(&store).await, "id index should exist");
+
+            // Idempotent: a second build replaces in place without erroring.
+            store.create_id_zonemap_index().await.unwrap();
+            assert!(has_id_index(&store).await, "id index should still exist");
+
+            // Rows remain readable exactly once after indexing.
+            assert_eq!(store.list(None, None).await.unwrap().len(), 2);
         });
     }
 
@@ -2270,7 +2682,6 @@ mod tests {
                     shard_id: Some("rollout-0".to_string()),
                     merge_after_generations: None, // only the timer merges
                     cleanup_interval_secs: Some(1),
-                    cleanup_min_generations: Some(1),
                 },
             )
             .await
@@ -2339,7 +2750,6 @@ mod tests {
                         RolloutStoreOptions {
                             storage_options: None,
                             shard_id: Some(shard),
-                            cleanup_min_generations: Some(1),
                             ..Default::default()
                         },
                     )
@@ -2410,7 +2820,6 @@ mod tests {
                 RolloutStoreOptions {
                     storage_options: None,
                     shard_id: Some("rollout-0".to_string()),
-                    cleanup_min_generations: Some(1),
                     ..Default::default()
                 },
             )

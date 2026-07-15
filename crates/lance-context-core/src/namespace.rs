@@ -11,6 +11,7 @@ use lance::io::{ObjectStoreParams, StorageOptionsAccessor};
 use lance::{Error as LanceError, Result as LanceResult};
 use uuid::Uuid;
 
+use crate::storage::join_uri;
 use crate::store::{ContextStore, ContextStoreOptions};
 
 const MANIFEST_TABLE_NAME: &str = "__manifest";
@@ -430,14 +431,6 @@ fn normalize_root_uri(root_uri: String) -> LanceResult<String> {
         return Ok(root_uri.to_string());
     }
     Ok(root_uri.trim_end_matches('/').to_string())
-}
-
-fn join_uri(root_uri: &str, child: &str) -> String {
-    if root_uri == "/" {
-        format!("/{child}")
-    } else {
-        format!("{root_uri}/{child}")
-    }
 }
 
 fn invalid_input(message: impl Into<String>) -> LanceError {

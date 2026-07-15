@@ -15,8 +15,8 @@ use crate::record::{
     ContextRecord, LifecycleQueryOptions, RecordFilters, RecordPatch, Relationship, StateMetadata,
     LIFECYCLE_ACTIVE,
 };
-use crate::rollout::{RolloutFilters, RolloutRecord};
-use crate::rollout_store::RolloutStore;
+use crate::rollout::RolloutRecord;
+use crate::rollout_store::{RolloutFilters, RolloutStore};
 use crate::store::{CompactionConfig, ContextStore};
 
 impl ContextStoreApi for ContextStore {
@@ -410,7 +410,7 @@ impl RolloutStoreApi for RolloutStore {
             .map(RolloutFilters::from_json_value)
             .transpose()
             .map_err(ContextError::InvalidRequest)?;
-        let records = RolloutStore::list_filtered(self, limit, offset, filters.as_ref())
+        let records = RolloutStore::list_with_filters(self, limit, offset, filters.as_ref())
             .await
             .map_err(to_ctx_err)?;
         Ok(records.into_iter().map(rollout_record_to_dto).collect())
@@ -479,7 +479,8 @@ fn rollout_record_from_add_request(r: &AddRolloutRequest) -> RolloutRecord {
     }
 }
 
-fn rollout_record_to_dto(r: RolloutRecord) -> RolloutRecordDto {
+#[must_use]
+pub fn rollout_record_to_dto(r: RolloutRecord) -> RolloutRecordDto {
     RolloutRecordDto {
         id: r.id,
         rollout_id: r.rollout_id,

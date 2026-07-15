@@ -12,8 +12,10 @@ mod registry;
 mod rollout;
 mod rollout_store;
 pub mod serde;
+mod storage;
 mod store;
 
+pub use api_impl::rollout_record_to_dto;
 pub use context::{Context, ContextEntry, Snapshot};
 pub use eval::{
     AbReport, EvalConfig, EvalQuery, EvalQuerySet, EvalReport, MetricScores, QueryEval,
@@ -33,10 +35,12 @@ pub use record::{
     LIFECYCLE_CONTRADICTED,
 };
 pub use registry::{RegistryEntry, RolloutRegistry};
-pub use rollout::{
-    RolloutFilters, RolloutRecord, ROLE_ARTIFACT, ROLE_ASSISTANT, ROLE_GRADE, ROLE_TOOL,
+pub use rollout::{RolloutRecord, ROLE_ARTIFACT, ROLE_ASSISTANT, ROLE_GRADE, ROLE_TOOL};
+pub use rollout_store::{
+    rollout_schema, RolloutFilters, RolloutObservation, RolloutPage, RolloutStore,
+    RolloutStoreOptions,
 };
-pub use rollout_store::{rollout_schema, RolloutObservation, RolloutStore, RolloutStoreOptions};
+pub use storage::{create_local_dir_if_needed, join_uri, validate_store_name, MAX_STORE_NAME_LEN};
 pub use store::{
     CompactionConfig, CompactionStats, ContextStore, ContextStoreOptions, DistanceMetric,
     IdIndexType, ReadProjection,
