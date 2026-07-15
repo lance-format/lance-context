@@ -1,19 +1,29 @@
-//! Centralized compaction scheduler.
+//! Unified task scheduler.
 //!
-//! Compaction rewrites fragments (`Rewrite` in Lance's conflict matrix). Two
-//! concurrent `Rewrite`s on the same dataset conflict, so compaction must have a
-//! **single serial driver**. This module is that driver: one background task
-//! drains a single queue, so automatic sweeps and manual API triggers share the
-//! same serial execution path and can never overlap. `Rewrite` vs the
-//! data-plane's `Append` is non-conflicting, so this runs safely alongside live
-//! ingest.
+//! The master runs a single scheduler that drains one queue with **bounded
+//! concurrency**. It executes two kinds of task ([`TaskKind`]):
+//!
+//! - **Compact** — rewrites an experiment's base-table fragments. Two `Rewrite`s
+//!   on the *same* dataset conflict in Lance's conflict matrix, so compaction of
+//!   one experiment is serialized against itself via a per-name in-flight gate
+//!   ([`MasterState::inflight_compacts`]). Distinct experiments compact
+//!   concurrently. `Rewrite` vs the data-plane's `Append` is non-conflicting, so
+//!   this runs safely alongside live ingest.
+//! - **MergeWal** — folds flushed MemWAL generations back into the base table.
+//!   The master cannot do this itself without fencing the live shard writer, so
+//!   it fans out to every configured worker endpoint and each worker merges its
+//!   own shard (`POST /api/v1/internal/merge-wal/{name}`).
+//!
+//! Each task runs in its own `tokio::spawn`, so one task's failure never affects
+//! another. A global [`Semaphore`] bounds how many run at once.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
-use lance_context_api::CompactJobStatus;
-use lance_context_core::{CompactionConfig, RolloutStore, RolloutStoreOptions};
+use lance_context_api::{TaskKind, TaskRecord, TaskState};
+use lance_context_core::{generate_id, CompactionConfig, RolloutStore, RolloutStoreOptions};
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
 use crate::state::MasterState;
@@ -29,78 +39,204 @@ pub fn compaction_config(state: &MasterState) -> CompactionConfig {
     }
 }
 
-/// Enqueue an experiment for compaction and mark it `Queued`. De-dupes: if a
-/// job for `name` is already queued or running, this is a no-op returning the
-/// existing status.
-pub async fn enqueue(state: &Arc<MasterState>, name: &str) -> CompactJobStatus {
-    {
-        let jobs = state.jobs.lock().await;
-        if matches!(
-            jobs.get(name),
-            Some(CompactJobStatus::Queued) | Some(CompactJobStatus::Running)
-        ) {
-            return jobs.get(name).cloned().unwrap();
-        }
-    }
-    state
-        .jobs
-        .lock()
-        .await
-        .insert(name.to_string(), CompactJobStatus::Queued);
-    // Unbounded send only fails if the receiver was dropped (scheduler gone).
-    let _ = state.compact_tx.send(name.to_string());
-    metrics::counter!("master_compaction_enqueued_total").increment(1);
-    metrics::gauge!("master_compaction_queue_depth").increment(1.0);
-    CompactJobStatus::Queued
+/// Current Unix-millisecond timestamp.
+fn now_ms() -> i64 {
+    Utc::now().timestamp_millis()
 }
 
-/// Compact one experiment now (serial, on the scheduler task). Updates the job
-/// status map and the stats table's compaction counters on success.
-async fn run_compaction(state: &Arc<MasterState>, name: &str) {
-    // This job is leaving the queue and entering execution.
-    metrics::gauge!("master_compaction_queue_depth").decrement(1.0);
+fn kind_label(kind: TaskKind) -> &'static str {
+    match kind {
+        TaskKind::Compact => "compact",
+        TaskKind::MergeWal => "merge_wal",
+    }
+}
+
+/// Enqueue a task and return its record. For [`TaskKind::Compact`] this de-dupes
+/// against an existing non-terminal task for the same target: if one is already
+/// `Queued` or `Running`, its record is returned unchanged and nothing new is
+/// enqueued. `MergeWal` tasks are not de-duped (each fan-out is independent).
+pub async fn enqueue(state: &Arc<MasterState>, kind: TaskKind, target: &str) -> TaskRecord {
+    if matches!(kind, TaskKind::Compact) {
+        let tasks = state.tasks.lock().await;
+        if let Some(existing) = tasks.values().find(|t| {
+            t.kind == TaskKind::Compact
+                && t.target == target
+                && matches!(t.state, TaskState::Queued | TaskState::Running)
+        }) {
+            return existing.clone();
+        }
+    }
+
+    let record = TaskRecord {
+        id: generate_id(),
+        kind,
+        target: target.to_string(),
+        state: TaskState::Queued,
+        error: None,
+        detail: None,
+        enqueued_at: now_ms(),
+        started_at: None,
+        finished_at: None,
+    };
     state
-        .jobs
+        .tasks
         .lock()
         .await
-        .insert(name.to_string(), CompactJobStatus::Running);
+        .insert(record.id.clone(), record.clone());
+    // Unbounded send only fails if the receiver was dropped (scheduler gone).
+    let _ = state.task_tx.send(record.id.clone());
+    metrics::counter!("master_task_enqueued_total", "kind" => kind_label(kind)).increment(1);
+    metrics::gauge!("master_task_queue_depth").increment(1.0);
+    record
+}
 
+/// Mutate a task record in place under the lock, if it still exists.
+async fn update_task(state: &Arc<MasterState>, id: &str, f: impl FnOnce(&mut TaskRecord)) {
+    if let Some(rec) = state.tasks.lock().await.get_mut(id) {
+        f(rec);
+    }
+}
+
+/// Execute one task by id: dispatch on its kind, recording lifecycle timestamps
+/// and the terminal state.
+async fn run_task(state: &Arc<MasterState>, id: String) {
+    metrics::gauge!("master_task_queue_depth").decrement(1.0);
+
+    let Some(task) = state.tasks.lock().await.get(&id).cloned() else {
+        return; // task vanished (should not happen)
+    };
+    update_task(state, &id, |t| {
+        t.state = TaskState::Running;
+        t.started_at = Some(now_ms());
+    })
+    .await;
+
+    let started = std::time::Instant::now();
+    let outcome = match task.kind {
+        TaskKind::Compact => run_compaction(state, &task.target).await,
+        TaskKind::MergeWal => run_merge_wal(state, &task.target).await,
+    };
+
+    metrics::histogram!("master_task_duration_seconds", "kind" => kind_label(task.kind))
+        .record(started.elapsed().as_secs_f64());
+    let result = if outcome.is_ok() { "success" } else { "failed" };
+    metrics::counter!("master_tasks_total", "kind" => kind_label(task.kind), "result" => result)
+        .increment(1);
+
+    update_task(state, &id, |t| {
+        t.finished_at = Some(now_ms());
+        match outcome {
+            Ok(detail) => {
+                t.state = TaskState::Done;
+                t.detail = Some(detail);
+            }
+            Err(error) => {
+                tracing::warn!(task = %id, target = %t.target, error = %error, "task failed");
+                t.state = TaskState::Failed;
+                t.error = Some(error);
+            }
+        }
+    })
+    .await;
+}
+
+/// Compact one experiment. Serialized per experiment via the in-flight gate so
+/// two `Rewrite`s on the same dataset never race. Returns a human-readable
+/// outcome summary on success.
+async fn run_compaction(state: &Arc<MasterState>, name: &str) -> Result<String, String> {
+    // Per-name serial gate: refuse if a compaction for this experiment is
+    // already running. (De-dup at enqueue makes this rare, but the gate is the
+    // real guarantee against concurrent Rewrites.)
+    {
+        let mut inflight = state.inflight_compacts.lock().await;
+        if !inflight.insert(name.to_string()) {
+            return Err(format!("a compaction for '{name}' is already in progress"));
+        }
+    }
+    // Ensure the gate is released no matter how the inner call exits.
+    let result = compact_inner(state, name).await;
+    state.inflight_compacts.lock().await.remove(name);
+    result
+}
+
+async fn compact_inner(state: &Arc<MasterState>, name: &str) -> Result<String, String> {
     let uri = state.rollout_uri(name);
     let config = compaction_config(state);
     let opts = RolloutStoreOptions::default();
 
-    let compact_start = std::time::Instant::now();
-    let status = match RolloutStore::open_existing_with_options(&uri, opts).await {
-        Ok(mut store) => match store.compact(Some(config)).await {
-            Ok(metrics) => {
-                update_stats_after_compaction(state, name, &store).await;
-                CompactJobStatus::Done {
-                    fragments_removed: metrics.fragments_removed,
-                    fragments_added: metrics.fragments_added,
-                }
-            }
-            Err(e) => CompactJobStatus::Failed {
-                error: e.to_string(),
-            },
-        },
-        Err(e) => CompactJobStatus::Failed {
-            error: e.to_string(),
-        },
-    };
+    let mut store = RolloutStore::open_existing_with_options(&uri, opts)
+        .await
+        .map_err(|e| e.to_string())?;
+    let metrics = store
+        .compact(Some(config))
+        .await
+        .map_err(|e| e.to_string())?;
+    update_stats_after_compaction(state, name, &store).await;
+    Ok(format!(
+        "removed {} / added {} fragments",
+        metrics.fragments_removed, metrics.fragments_added
+    ))
+}
 
-    metrics::histogram!("master_compaction_duration_seconds")
-        .record(compact_start.elapsed().as_secs_f64());
-    let result = if matches!(status, CompactJobStatus::Done { .. }) {
-        "success"
-    } else {
-        "failed"
-    };
-    metrics::counter!("master_compactions_total", "result" => result).increment(1);
+/// Shape of the worker's merge-wal response (`{ "reclaimed": n }`).
+#[derive(serde::Deserialize)]
+struct MergeWalReply {
+    reclaimed: usize,
+}
 
-    if let CompactJobStatus::Failed { error } = &status {
-        tracing::warn!(store = %name, error = %error, "compaction failed");
+/// Fan a WAL-merge out to every configured worker endpoint. Each worker merges
+/// its own shard; a worker that owns no data for `name` reports 0 (or 404, which
+/// we tolerate). Succeeds if at least one endpoint responded; fails only when
+/// there are no endpoints or every one errored.
+async fn run_merge_wal(state: &Arc<MasterState>, name: &str) -> Result<String, String> {
+    let endpoints = &state.config.worker_endpoints;
+    if endpoints.is_empty() {
+        return Err("no worker endpoints configured (--worker-endpoints)".to_string());
     }
-    state.jobs.lock().await.insert(name.to_string(), status);
+
+    let calls = endpoints.iter().map(|ep| {
+        let http = state.http.clone();
+        let url = format!(
+            "{}/api/v1/internal/merge-wal/{}",
+            ep.trim_end_matches('/'),
+            name
+        );
+        async move {
+            let resp = http.post(&url).send().await.map_err(|e| e.to_string())?;
+            let status = resp.status();
+            if status == reqwest::StatusCode::NOT_FOUND {
+                // This worker owns no shard for `name`; treat as 0 reclaimed.
+                return Ok::<usize, String>(0);
+            }
+            if !status.is_success() {
+                return Err(format!("{url}: HTTP {status}"));
+            }
+            let body: MergeWalReply = resp.json().await.map_err(|e| e.to_string())?;
+            Ok(body.reclaimed)
+        }
+    });
+
+    let results = futures::future::join_all(calls).await;
+    let total_workers = results.len();
+    let mut reclaimed = 0usize;
+    let mut ok_workers = 0usize;
+    let mut last_err = None;
+    for r in results {
+        match r {
+            Ok(n) => {
+                reclaimed += n;
+                ok_workers += 1;
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+
+    if ok_workers == 0 {
+        return Err(last_err.unwrap_or_else(|| "all workers failed".to_string()));
+    }
+    Ok(format!(
+        "merged {reclaimed} generations across {ok_workers}/{total_workers} workers"
+    ))
 }
 
 /// Refresh the stats row for `name` after a successful compaction: re-observe
@@ -134,8 +270,9 @@ async fn update_stats_after_compaction(state: &Arc<MasterState>, name: &str, sto
     }
 }
 
-/// Enqueue every experiment whose fragment count is at or above the configured
-/// threshold, honoring quiet hours. Reads candidates from the stats table.
+/// Enqueue a `Compact` task for every experiment whose fragment count is at or
+/// above the configured threshold, honoring quiet hours. Reads candidates from
+/// the stats table.
 pub async fn sweep_candidates(state: &Arc<MasterState>) -> lance::Result<usize> {
     let config = compaction_config(state);
     // Quiet-hours gate applies to the whole sweep.
@@ -146,7 +283,7 @@ pub async fn sweep_candidates(state: &Arc<MasterState>) -> lance::Result<usize> 
     let mut queued = 0;
     for row in rows {
         if row.fragment_count as usize >= config.min_fragments {
-            enqueue(state, &row.name).await;
+            enqueue(state, TaskKind::Compact, &row.name).await;
             queued += 1;
         }
     }
@@ -165,13 +302,13 @@ fn in_quiet_hours(config: &CompactionConfig) -> bool {
         .any(|(start, end)| hour >= *start && hour < *end)
 }
 
-/// Spawn the single serial compaction worker plus (optionally) the periodic
-/// auto-sweep. The worker owns the queue receiver and processes one experiment
-/// at a time. Returns the worker handle. Panics if called twice (receiver
-/// already taken).
+/// Spawn the scheduler dispatcher plus (optionally) the periodic auto-sweep. The
+/// dispatcher owns the queue receiver and runs up to `task_concurrency` tasks at
+/// once, each in its own detached task. Returns the dispatcher handle. Panics if
+/// called twice (receiver already taken).
 pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
     let mut rx = state
-        .compact_rx
+        .task_rx
         .try_lock()
         .expect("scheduler: state lock")
         .take()
@@ -195,10 +332,22 @@ pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
         });
     }
 
-    let worker_state = state.clone();
+    let concurrency = state.config.task_concurrency.max(1);
+    let sem = Arc::new(Semaphore::new(concurrency));
+    let dispatch_state = state.clone();
     tokio::spawn(async move {
-        while let Some(name) = rx.recv().await {
-            run_compaction(&worker_state, &name).await;
+        while let Some(id) = rx.recv().await {
+            // Acquire a slot before spawning so at most `concurrency` run at once.
+            let permit = sem
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("semaphore never closed");
+            let st = dispatch_state.clone();
+            tokio::spawn(async move {
+                run_task(&st, id).await;
+                drop(permit);
+            });
         }
     })
 }
@@ -220,12 +369,27 @@ mod tests {
             // Low threshold so a handful of appends crosses it.
             min_fragments: 2,
             target_rows_per_fragment: 1_048_576,
+            worker_endpoints: vec![],
+            task_concurrency: 4,
             ui_dir: None,
         }
     }
 
-    /// Manual enqueue -> serial worker compacts -> job reaches Done and the
-    /// stats table records a compaction.
+    /// Wait until the task reaches a terminal state, returning its final record.
+    async fn await_terminal(state: &Arc<MasterState>, id: &str) -> TaskRecord {
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if let Some(t) = state.tasks.lock().await.get(id) {
+                if matches!(t.state, TaskState::Done | TaskState::Failed) {
+                    return t.clone();
+                }
+            }
+        }
+        panic!("task {id} did not reach a terminal state");
+    }
+
+    /// Manual enqueue -> dispatcher compacts -> task reaches Done and the stats
+    /// table records a compaction.
     #[tokio::test]
     async fn manual_compaction_runs_and_updates_stats() {
         let dir = TempDir::new().unwrap();
@@ -238,7 +402,7 @@ mod tests {
         {
             let mut store = RolloutStore::open(&uri).await.unwrap();
             for i in 0..4 {
-                let rec = crate::scheduler::tests::rollout_record(&format!("r{i}"));
+                let rec = rollout_record(&format!("r{i}"));
                 store.add(&[rec]).await.unwrap();
                 store.cleanup_own_shard().await.unwrap();
             }
@@ -253,27 +417,9 @@ mod tests {
         // Seed a stats row so post-compaction upsert has a prior counter.
         crate::scanner::scan_once(&state).await.unwrap();
 
-        enqueue(&state, name).await;
-
-        // Wait for the worker to reach a terminal state.
-        let mut done = None;
-        for _ in 0..50 {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            if let Some(s) = state.jobs.lock().await.get(name) {
-                if matches!(
-                    s,
-                    CompactJobStatus::Done { .. } | CompactJobStatus::Failed { .. }
-                ) {
-                    done = Some(s.clone());
-                    break;
-                }
-            }
-        }
-        let status = done.expect("job reached terminal state");
-        assert!(
-            matches!(status, CompactJobStatus::Done { .. }),
-            "expected Done, got {status:?}"
-        );
+        let rec = enqueue(&state, TaskKind::Compact, name).await;
+        let status = await_terminal(&state, &rec.id).await;
+        assert_eq!(status.state, TaskState::Done, "got {status:?}");
 
         let row = state.stats.lock().await.get(name).await.unwrap().unwrap();
         assert_eq!(row.total_compactions, 1);
@@ -282,22 +428,71 @@ mod tests {
         worker.abort();
     }
 
+    /// Enqueuing the same experiment twice while queued de-dupes to one task.
     #[tokio::test]
-    async fn enqueue_dedupes_queued_jobs() {
+    async fn enqueue_dedupes_queued_compactions() {
         let dir = TempDir::new().unwrap();
         let state = MasterState::new(config(&dir)).await.unwrap();
-        // Do NOT spawn the worker, so jobs stay Queued.
-        let s1 = enqueue(&state, "x").await;
-        let s2 = enqueue(&state, "x").await;
-        assert!(matches!(s1, CompactJobStatus::Queued));
-        assert!(matches!(s2, CompactJobStatus::Queued));
-        // Only one message should be in the channel; drain and count.
-        let mut rx = state.compact_rx.lock().await.take().unwrap();
+        // Do NOT spawn the dispatcher, so the first task stays Queued.
+        let a = enqueue(&state, TaskKind::Compact, "x").await;
+        let b = enqueue(&state, TaskKind::Compact, "x").await;
+        assert_eq!(a.id, b.id, "second enqueue returns the same task");
+        // Only one task in the map, one message on the queue.
+        assert_eq!(state.tasks.lock().await.len(), 1);
+        let mut rx = state.task_rx.lock().await.take().unwrap();
         let mut n = 0;
         while rx.try_recv().is_ok() {
             n += 1;
         }
         assert_eq!(n, 1);
+    }
+
+    /// A MergeWal task with no configured endpoints fails fast with a clear msg.
+    #[tokio::test]
+    async fn merge_wal_without_endpoints_fails() {
+        let dir = TempDir::new().unwrap();
+        let state = MasterState::new(config(&dir)).await.unwrap();
+        let worker = spawn_scheduler(&state);
+        let rec = enqueue(&state, TaskKind::MergeWal, "exp").await;
+        let status = await_terminal(&state, &rec.id).await;
+        assert_eq!(status.state, TaskState::Failed);
+        assert!(status.error.unwrap().contains("worker endpoints"));
+        worker.abort();
+    }
+
+    /// MergeWal fans out to every configured worker endpoint and sums the
+    /// reclaimed counts. Uses a tiny in-process stub server per "worker".
+    #[tokio::test]
+    async fn merge_wal_broadcasts_and_sums_reclaimed() {
+        use axum::{routing::post, Json, Router};
+
+        // A stub worker that always reports `reclaimed` for any merge call.
+        async fn spawn_stub(reclaimed: usize) -> String {
+            let app = Router::new().route(
+                "/api/v1/internal/merge-wal/{name}",
+                post(move || async move { Json(serde_json::json!({ "reclaimed": reclaimed })) }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            format!("http://{addr}")
+        }
+
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.worker_endpoints = vec![spawn_stub(3).await, spawn_stub(2).await];
+        let state = MasterState::new(cfg).await.unwrap();
+        let worker = spawn_scheduler(&state);
+
+        let rec = enqueue(&state, TaskKind::MergeWal, "exp").await;
+        let status = await_terminal(&state, &rec.id).await;
+        assert_eq!(status.state, TaskState::Done, "got {status:?}");
+        let detail = status.detail.unwrap();
+        assert!(detail.contains("merged 5 generations"), "detail: {detail}");
+        assert!(detail.contains("2/2 workers"), "detail: {detail}");
+        worker.abort();
     }
 
     /// Minimal rollout record builder for tests (the core struct has no

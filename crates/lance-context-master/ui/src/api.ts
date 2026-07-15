@@ -25,6 +25,31 @@ export type CompactJobStatus =
   | { state: "failed"; error: string }
   | { state: "none" };
 
+// Unified scheduler task DTOs (mirror `TaskRecord` etc. in `lance-context-api`).
+export type TaskKind = "compact" | "merge_wal";
+export type TaskState = "queued" | "running" | "done" | "failed";
+
+export interface TaskRecord {
+  id: string;
+  kind: TaskKind;
+  target: string;
+  state: TaskState;
+  error?: string | null;
+  detail?: string | null;
+  enqueued_at: number;
+  started_at?: number | null;
+  finished_at?: number | null;
+}
+
+export interface TaskListResponse {
+  tasks: TaskRecord[];
+}
+
+export interface EnqueueTaskRequest {
+  kind: TaskKind;
+  target: string;
+}
+
 const API = "/api/v1";
 
 async function json<T>(res: Response): Promise<T> {
@@ -66,5 +91,23 @@ export async function triggerCompaction(name: string): Promise<CompactJobStatus>
 export async function compactionStatus(name: string): Promise<CompactJobStatus> {
   return json(
     await fetch(`${API}/experiments/${encodeURIComponent(name)}/compact/status`),
+  );
+}
+
+export async function listTasks(): Promise<TaskListResponse> {
+  return json(await fetch(`${API}/tasks`));
+}
+
+export async function getTask(id: string): Promise<TaskRecord> {
+  return json(await fetch(`${API}/tasks/${encodeURIComponent(id)}`));
+}
+
+export async function enqueueTask(req: EnqueueTaskRequest): Promise<TaskRecord> {
+  return json(
+    await fetch(`${API}/tasks`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(req),
+    }),
   );
 }

@@ -902,6 +902,78 @@ pub enum CompactJobStatus {
     None,
 }
 
+// ---------------------------------------------------------------------------
+// Unified task scheduler (master control-plane)
+// ---------------------------------------------------------------------------
+
+/// The kind of work a scheduled task performs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskKind {
+    /// Compact an experiment's base table (rewrites fragments; runs on the
+    /// master, serialized per experiment because two `Rewrite`s conflict).
+    Compact,
+    /// Fold flushed MemWAL generations back into the base table. The master
+    /// cannot do this directly without fencing the live shard writer, so this
+    /// task fans out to the configured worker endpoints and each worker merges
+    /// its own shard.
+    MergeWal,
+}
+
+/// Lifecycle state of a scheduled task, generalized from [`CompactJobStatus`]
+/// so it applies uniformly to every [`TaskKind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskState {
+    /// Accepted and waiting for a scheduler slot.
+    Queued,
+    /// Currently executing.
+    Running,
+    /// Finished successfully.
+    Done,
+    /// Finished with an error (see [`TaskRecord::error`]).
+    Failed,
+}
+
+/// One unit of scheduled work plus its lifecycle, as surfaced to the queue UI.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskRecord {
+    /// Time-ordered unique id (UUIDv7).
+    pub id: String,
+    pub kind: TaskKind,
+    /// Experiment / rollout-store name this task acts on.
+    pub target: String,
+    pub state: TaskState,
+    /// Error message when `state == Failed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Human-readable outcome summary when `state == Done`
+    /// (e.g. `"removed 3 / added 1 fragments"` or `"merged 4 gens on 2/3 workers"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// When the task was enqueued, Unix milliseconds.
+    pub enqueued_at: i64,
+    /// When execution began, Unix milliseconds, if started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<i64>,
+    /// When the task reached a terminal state, Unix milliseconds, if finished.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<i64>,
+}
+
+/// Request body for `POST /api/v1/tasks`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnqueueTaskRequest {
+    pub kind: TaskKind,
+    pub target: String,
+}
+
+/// Response for `GET /api/v1/tasks`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskListResponse {
+    pub tasks: Vec<TaskRecord>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -989,5 +1061,55 @@ mod tests {
         )
         .unwrap();
         assert_eq!(legacy.payload_uri, None);
+    }
+
+    #[test]
+    fn task_record_roundtrips_and_omits_empty_optionals() {
+        let queued = TaskRecord {
+            id: "0190-abc".to_string(),
+            kind: TaskKind::MergeWal,
+            target: "exp-1".to_string(),
+            state: TaskState::Queued,
+            error: None,
+            detail: None,
+            enqueued_at: 1_700_000_000_000,
+            started_at: None,
+            finished_at: None,
+        };
+        let json = serde_json::to_string(&queued).unwrap();
+        // snake_case tags for the enums.
+        assert!(json.contains(r#""kind":"merge_wal""#));
+        assert!(json.contains(r#""state":"queued""#));
+        // Absent optionals are not serialized.
+        assert!(!json.contains("error"));
+        assert!(!json.contains("started_at"));
+        assert!(!json.contains("finished_at"));
+        let back: TaskRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, queued);
+    }
+
+    #[test]
+    fn task_record_done_and_failed_carry_details() {
+        let done = TaskRecord {
+            id: "id".to_string(),
+            kind: TaskKind::Compact,
+            target: "exp".to_string(),
+            state: TaskState::Done,
+            error: None,
+            detail: Some("removed 3 / added 1 fragments".to_string()),
+            enqueued_at: 1,
+            started_at: Some(2),
+            finished_at: Some(3),
+        };
+        let back: TaskRecord = serde_json::from_str(&serde_json::to_string(&done).unwrap()).unwrap();
+        assert_eq!(back, done);
+    }
+
+    #[test]
+    fn enqueue_task_request_parses_snake_case_kind() {
+        let req: EnqueueTaskRequest =
+            serde_json::from_str(r#"{"kind":"compact","target":"exp-7"}"#).unwrap();
+        assert_eq!(req.kind, TaskKind::Compact);
+        assert_eq!(req.target, "exp-7");
     }
 }

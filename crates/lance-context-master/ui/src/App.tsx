@@ -2,11 +2,15 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import {
   compactionStatus,
+  enqueueTask,
   getExperiment,
   listExperiments,
+  listTasks,
   triggerCompaction,
   type CompactJobStatus,
   type ExperimentSummary,
+  type TaskRecord,
+  type TaskState,
 } from "./api";
 import { useUiStore } from "./store";
 
@@ -236,6 +240,7 @@ function Drawer({ name }: { name: string }) {
 
         <div className="drawer__actions">
           <CompactButton name={name} variant="accent" />
+          <MergeWalButton name={name} />
         </div>
       </aside>
     </>
@@ -256,14 +261,120 @@ function StatCard({ label, value, unit }: { label: string; value: string; unit?:
   );
 }
 
+/* ---- task queue view ----------------------------------------------------- */
+
+/** Generic state pill for a scheduler task (queued/running/done/failed). */
+function TaskStatePill({ state, title }: { state: TaskState; title?: string }) {
+  const cls =
+    state === "queued"
+      ? "pill--queued"
+      : state === "running"
+        ? "pill--running"
+        : state === "done"
+          ? "pill--done"
+          : "pill--failed";
+  return (
+    <span className={`pill ${cls}`} title={title}>
+      <span className="pill__dot" />
+      {state}
+    </span>
+  );
+}
+
+function taskDuration(t: TaskRecord): string {
+  const end = t.finished_at ?? Date.now();
+  const start = t.started_at ?? t.enqueued_at;
+  if (!start) return "—";
+  const s = Math.max(0, Math.round((end - start) / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  return `${m}m ${s % 60}s`;
+}
+
+/** "Merge WAL" trigger — enqueues a merge_wal task for one experiment. */
+function MergeWalButton({ name }: { name: string }) {
+  const qc = useQueryClient();
+  const setView = useUiStore((s) => s.setView);
+  const trigger = useMutation({
+    mutationFn: () => enqueueTask({ kind: "merge_wal", target: name }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["tasks"] });
+      setView("tasks");
+    },
+  });
+  return (
+    <button
+      className="btn btn--ghost"
+      onClick={() => trigger.mutate()}
+      disabled={trigger.isPending}
+    >
+      {trigger.isPending ? "Merging…" : "Merge WAL"}
+    </button>
+  );
+}
+
+function TaskQueue() {
+  const tasks = useQuery({
+    queryKey: ["tasks"],
+    queryFn: () => listTasks(),
+    refetchInterval: 1000,
+  });
+  const rows = tasks.data?.tasks ?? [];
+  const active = rows.filter((t) => t.state === "queued" || t.state === "running").length;
+
+  return (
+    <>
+      <div className="stats">
+        <StatCard label="Tasks" value={fmtInt(rows.length)} />
+        <StatCard label="Active" value={fmtInt(active)} />
+      </div>
+      <div className="table-wrap">
+        {tasks.isError && <div className="error">{String(tasks.error)}</div>}
+        {!tasks.isError && (
+          <table className="grid">
+            <thead>
+              <tr>
+                <th>Kind</th>
+                <th>Target</th>
+                <th>State</th>
+                <th>Detail</th>
+                <th className="num">Duration</th>
+                <th>Enqueued</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((t) => (
+                <tr key={t.id}>
+                  <td>{t.kind}</td>
+                  <td>{t.target}</td>
+                  <td>
+                    <TaskStatePill state={t.state} title={t.error ?? undefined} />
+                  </td>
+                  <td className="muted">{t.detail ?? t.error ?? "—"}</td>
+                  <td className="num">{taskDuration(t)}</td>
+                  <td className="muted">{relTime(t.enqueued_at)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+        {!tasks.isLoading && !tasks.isError && rows.length === 0 && (
+          <div className="empty">No tasks in the queue.</div>
+        )}
+      </div>
+    </>
+  );
+}
+
 /* ---- app ----------------------------------------------------------------- */
 
 export function App() {
-  const { search, page, pageSize, selected, setSearch, setPage } = useUiStore();
+  const { view, search, page, pageSize, selected, setView, setSearch, setPage } = useUiStore();
   const list = useQuery({
     queryKey: ["experiments", search, page, pageSize],
     queryFn: () => listExperiments(search, pageSize, page * pageSize),
     placeholderData: (prev) => prev,
+    enabled: view === "experiments",
   });
 
   const total = list.data?.total ?? 0;
@@ -284,13 +395,31 @@ export function App() {
           <span className="brand__sub">control plane</span>
         </div>
         <div className="topbar__spacer" />
+        <nav className="tabs">
+          <button
+            className={`tab ${view === "experiments" ? "tab--active" : ""}`}
+            onClick={() => setView("experiments")}
+          >
+            Experiments
+          </button>
+          <button
+            className={`tab ${view === "tasks" ? "tab--active" : ""}`}
+            onClick={() => setView("tasks")}
+          >
+            Task Queue
+          </button>
+        </nav>
         <div className="live">
           <span className="live__dot" />
           {list.isFetching ? "syncing" : "live"}
         </div>
       </header>
 
-      <div className="stats">
+      {view === "tasks" ? (
+        <TaskQueue />
+      ) : (
+        <>
+          <div className="stats">
         <StatCard label="Experiments" value={fmtInt(total)} />
         <StatCard label="Rows (page)" value={fmtCompact(pageRows)} />
         <StatCard label="Fragments (page)" value={fmtCompact(pageFrags)} />
@@ -363,6 +492,8 @@ export function App() {
             Next →
           </button>
         </div>
+      )}
+        </>
       )}
 
       {selected && <Drawer name={selected} />}
