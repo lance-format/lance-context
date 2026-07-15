@@ -654,6 +654,7 @@ function Drawer({ name }: { name: string }) {
           <div className="drawer__actions">
             <CompactButton name={name} variant="accent" />
             <MergeWalButton name={name} />
+            <IndexIdButton name={name} />
           </div>
         )}
       </aside>
@@ -723,6 +724,28 @@ function MergeWalButton({ name }: { name: string }) {
       disabled={trigger.isPending}
     >
       {trigger.isPending ? "Merging…" : "Merge WAL"}
+    </button>
+  );
+}
+
+/** "Index id" trigger — enqueues an index_id task (build ZoneMap on id). */
+function IndexIdButton({ name }: { name: string }) {
+  const qc = useQueryClient();
+  const setView = useUiStore((s) => s.setView);
+  const trigger = useMutation({
+    mutationFn: () => enqueueTask({ kind: "index_id", target: name }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["tasks"] });
+      setView("tasks");
+    },
+  });
+  return (
+    <button
+      className="btn btn--ghost"
+      onClick={() => trigger.mutate()}
+      disabled={trigger.isPending}
+    >
+      {trigger.isPending ? "Indexing…" : "Index id"}
     </button>
   );
 }

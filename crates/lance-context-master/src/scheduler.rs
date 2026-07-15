@@ -3,19 +3,23 @@
 //! The master runs a single scheduler that drains one durable queue with
 //! **bounded concurrency**. Task records are written to RocksDB before they
 //! enter the in-memory dispatch channel; queued and interrupted tasks are
-//! reloaded after a master restart. It executes two kinds of task
+//! reloaded after a master restart. It executes three kinds of task
 //! ([`TaskKind`]):
 //!
 //! - **Compact** — rewrites an experiment's base-table fragments. Two `Rewrite`s
 //!   on the *same* dataset conflict in Lance's conflict matrix, so compaction of
-//!   one experiment is serialized against itself via a per-name in-flight gate
-//!   ([`MasterState::inflight_compacts`]). Distinct experiments compact
-//!   concurrently. `Rewrite` vs the data-plane's `Append` is non-conflicting, so
-//!   this runs safely alongside live ingest.
+//!   one experiment is serialized against itself (and against `IndexId`) via a
+//!   per-name in-flight gate ([`MasterState::inflight_dataset_writes`]). Distinct
+//!   experiments compact concurrently. `Rewrite` vs the data-plane's `Append` is
+//!   non-conflicting, so this runs safely alongside live ingest.
 //! - **MergeWal** — folds flushed MemWAL generations back into the base table.
 //!   The master cannot do this itself without fencing the live shard writer, so
 //!   it fans out to every configured worker endpoint and each worker merges its
 //!   own shard (`POST /api/v1/internal/merge-wal/{name}`).
+//! - **IndexId** — builds a ZoneMap scalar index on the base table's `id` column
+//!   (runs locally on the master). It commits a `CreateIndex`, which can conflict
+//!   with a concurrent `Compact` `Rewrite` on the same dataset, so it shares the
+//!   per-name in-flight gate with `Compact`.
 //!
 //! Each task runs in its own `tokio::spawn`, so one task's failure never affects
 //! another. A global [`Semaphore`] bounds how many run at once.
@@ -51,22 +55,24 @@ fn kind_label(kind: TaskKind) -> &'static str {
     match kind {
         TaskKind::Compact => "compact",
         TaskKind::MergeWal => "merge_wal",
+        TaskKind::IndexId => "index_id",
     }
 }
 
-/// Enqueue a task and return its record. For [`TaskKind::Compact`] this de-dupes
-/// against an existing non-terminal task for the same target: if one is already
-/// `Queued` or `Running`, its record is returned unchanged and nothing new is
-/// enqueued. `MergeWal` tasks are not de-duped (each fan-out is independent).
+/// Enqueue a task and return its record. For [`TaskKind::Compact`] and
+/// [`TaskKind::IndexId`] this de-dupes against an existing non-terminal task for
+/// the same target: if one is already `Queued` or `Running`, its record is
+/// returned unchanged and nothing new is enqueued. `MergeWal` tasks are not
+/// de-duped (each fan-out is independent).
 pub async fn enqueue(
     state: &Arc<MasterState>,
     kind: TaskKind,
     target: &str,
 ) -> lance::Result<TaskRecord> {
     let mut tasks = state.tasks.lock().await;
-    if matches!(kind, TaskKind::Compact) {
+    if matches!(kind, TaskKind::Compact | TaskKind::IndexId) {
         if let Some(existing) = tasks.values().find(|t| {
-            t.kind == TaskKind::Compact
+            t.kind == kind
                 && t.target == target
                 && matches!(t.state, TaskState::Queued | TaskState::Running)
         }) {
@@ -158,6 +164,7 @@ async fn run_task(state: &Arc<MasterState>, id: String) {
     let outcome = match task.kind {
         TaskKind::Compact => run_compaction(state, &task.target).await,
         TaskKind::MergeWal => run_merge_wal(state, &task.target).await,
+        TaskKind::IndexId => run_index_id(state, &task.target).await,
     };
 
     metrics::histogram!("master_task_duration_seconds", "kind" => kind_label(task.kind))
@@ -186,23 +193,57 @@ async fn run_task(state: &Arc<MasterState>, id: String) {
     });
 }
 
-/// Compact one experiment. Serialized per experiment via the in-flight gate so
-/// two `Rewrite`s on the same dataset never race. Returns a human-readable
-/// outcome summary on success.
+/// Compact one experiment. Serialized per experiment via the shared base-table
+/// write gate so two `Rewrite`s (or a `Rewrite` racing a `CreateIndex`) on the
+/// same dataset never conflict. Returns a human-readable outcome summary on
+/// success.
 async fn run_compaction(state: &Arc<MasterState>, name: &str) -> Result<String, String> {
-    // Per-name serial gate: refuse if a compaction for this experiment is
-    // already running. (De-dup at enqueue makes this rare, but the gate is the
-    // real guarantee against concurrent Rewrites.)
+    // Per-name serial gate: refuse if another base-table write for this
+    // experiment is already running. (De-dup at enqueue makes this rare, but
+    // the gate is the real guarantee against conflicting commits.)
     {
-        let mut inflight = state.inflight_compacts.lock().await;
+        let mut inflight = state.inflight_dataset_writes.lock().await;
         if !inflight.insert(name.to_string()) {
-            return Err(format!("a compaction for '{name}' is already in progress"));
+            return Err(format!(
+                "a base-table write for '{name}' is already in progress"
+            ));
         }
     }
     // Ensure the gate is released no matter how the inner call exits.
     let result = compact_inner(state, name).await;
-    state.inflight_compacts.lock().await.remove(name);
+    state.inflight_dataset_writes.lock().await.remove(name);
     result
+}
+
+/// Build a ZoneMap scalar index on one experiment's `id` column. Shares the
+/// per-name base-table write gate with [`run_compaction`] so an `IndexId` and a
+/// `Compact` for the same experiment never commit concurrently (`CreateIndex`
+/// vs `Rewrite` can conflict). Distinct experiments index concurrently.
+async fn run_index_id(state: &Arc<MasterState>, name: &str) -> Result<String, String> {
+    {
+        let mut inflight = state.inflight_dataset_writes.lock().await;
+        if !inflight.insert(name.to_string()) {
+            return Err(format!(
+                "a base-table write for '{name}' is already in progress"
+            ));
+        }
+    }
+    let result = index_id_inner(state, name).await;
+    state.inflight_dataset_writes.lock().await.remove(name);
+    result
+}
+
+async fn index_id_inner(state: &Arc<MasterState>, name: &str) -> Result<String, String> {
+    let uri = state.rollout_uri(name);
+    let opts = RolloutStoreOptions::default();
+    let mut store = RolloutStore::open_existing_with_options(&uri, opts)
+        .await
+        .map_err(|e| e.to_string())?;
+    store
+        .create_id_zonemap_index()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok("built zonemap index on id".to_string())
 }
 
 async fn compact_inner(state: &Arc<MasterState>, name: &str) -> Result<String, String> {
@@ -498,6 +539,40 @@ mod tests {
         let row = state.stats.lock().await.get(name).await.unwrap().unwrap();
         assert_eq!(row.total_compactions, 1);
         assert!(row.last_compaction >= 0);
+
+        worker.abort();
+    }
+
+    /// Manual enqueue of an `IndexId` task -> dispatcher builds the ZoneMap
+    /// index -> task reaches Done with the expected detail summary.
+    #[tokio::test]
+    async fn index_id_task_builds_index_and_reaches_done() {
+        let dir = TempDir::new().unwrap();
+        let state = MasterState::new(config(&dir)).await.unwrap();
+        let worker = spawn_scheduler(&state);
+
+        let name = "exp";
+        let uri = state.rollout_uri(name);
+        {
+            let mut store = RolloutStore::open(&uri).await.unwrap();
+            for i in 0..3 {
+                let rec = rollout_record(&format!("r{i}"));
+                store.add(&[rec]).await.unwrap();
+                store.cleanup_own_shard().await.unwrap();
+            }
+        }
+        state
+            .registry
+            .write()
+            .await
+            .upsert(name, &uri)
+            .await
+            .unwrap();
+
+        let rec = enqueue(&state, TaskKind::IndexId, name).await.unwrap();
+        let status = await_terminal(&state, &rec.id).await;
+        assert_eq!(status.state, TaskState::Done, "got {status:?}");
+        assert_eq!(status.detail.as_deref(), Some("built zonemap index on id"));
 
         worker.abort();
     }

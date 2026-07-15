@@ -70,6 +70,8 @@ use lance::index::DatasetIndexExt;
 use lance::io::{ObjectStoreParams, StorageOptionsAccessor};
 use lance::{Error as LanceError, Result as LanceResult};
 use lance_index::mem_wal::{ShardManifest, MEM_WAL_INDEX_NAME};
+use lance_index::scalar::ScalarIndexParams;
+use lance_index::IndexType;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -88,6 +90,10 @@ const DEFAULT_MANIFEST_SCAN_BATCH_SIZE: usize = 16;
 /// Maximum number of shard manifests or flushed-generation datasets opened
 /// concurrently while collecting observability metrics.
 const DEFAULT_OBSERVE_CONCURRENCY: usize = 16;
+
+/// Name of the scalar index on the base table's `id` column. Kept in sync with
+/// `ContextStore`'s `ID_INDEX_NAME` so both tables index `id` under one name.
+const ROLLOUT_ID_INDEX_NAME: &str = "id_idx";
 
 /// Read-only observability snapshot of a rollout store.
 ///
@@ -679,6 +685,37 @@ impl RolloutStore {
                 Err(e)
             }
         }
+    }
+
+    /// Build a ZoneMap scalar index on the base table's `id` column.
+    ///
+    /// `id` is the rollout table's (unenforced) primary key, so a lightweight
+    /// per-fragment min/max index accelerates id point-lookups and range scans
+    /// on the already-flushed base table. `replace(true)` makes this idempotent:
+    /// re-running simply rebuilds the index in place.
+    ///
+    /// # MemWAL interaction
+    ///
+    /// The rollout base table carries a fieldless MemWAL index, and Lance's
+    /// MemWAL does not *maintain* ZoneMap indices across WAL flushes (it only
+    /// keeps the indices named in `maintained_indexes`). That does not affect
+    /// correctness here: rollout rows are immutable and de-duplicated by `id` at
+    /// read time, so the ZoneMap only ever needs to describe the base table's
+    /// already-merged fragments — rows still living in unmerged WAL generations
+    /// are found by the normal full scan of those generations. Creating the
+    /// index is therefore safe alongside an existing MemWAL index.
+    pub async fn create_id_zonemap_index(&mut self) -> LanceResult<()> {
+        info!("Creating ZoneMap index on rollout id column");
+        self.dataset
+            .create_index_builder(&["id"], IndexType::ZoneMap, &ScalarIndexParams::default())
+            .name(ROLLOUT_ID_INDEX_NAME.to_string())
+            .replace(true)
+            .await?;
+        // Reload the handle so subsequent reads on this instance observe the
+        // new index (mirrors the reload done after `compact`).
+        let uri = self.dataset.uri().to_string();
+        self.dataset = Self::load_with_options(&uri, self.storage_options.clone()).await?;
+        Ok(())
     }
 
     /// Whether the base table has accumulated at least `min_fragments`
@@ -2366,6 +2403,45 @@ mod tests {
 
             // Nothing pending: a further pass reclaims nothing.
             assert_eq!(store.cleanup_own_shard().await.unwrap(), 0);
+        });
+    }
+
+    #[test]
+    fn create_id_zonemap_index_builds_and_is_idempotent() {
+        // Building the ZoneMap index on `id` must succeed even though the
+        // rollout table also carries a (fieldless) MemWAL index, and calling it
+        // twice must not error (replace(true) rebuilds in place).
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open(&uri).await.unwrap();
+            // Add rows and fold them into the base table so there is data (and a
+            // MemWAL index) present when we build the scalar index.
+            store.add(&[assistant_record("a-0")]).await.unwrap();
+            store.add(&[assistant_record("a-1")]).await.unwrap();
+            store.cleanup_own_shard().await.unwrap();
+
+            store.create_id_zonemap_index().await.unwrap();
+            let has_id_index = |s: &RolloutStore| {
+                let dataset = s.dataset.clone();
+                async move {
+                    dataset
+                        .load_indices()
+                        .await
+                        .unwrap()
+                        .iter()
+                        .any(|i| i.name == ROLLOUT_ID_INDEX_NAME)
+                }
+            };
+            assert!(has_id_index(&store).await, "id index should exist");
+
+            // Idempotent: a second build replaces in place without erroring.
+            store.create_id_zonemap_index().await.unwrap();
+            assert!(has_id_index(&store).await, "id index should still exist");
+
+            // Rows remain readable exactly once after indexing.
+            assert_eq!(store.list(None, None).await.unwrap().len(), 2);
         });
     }
 

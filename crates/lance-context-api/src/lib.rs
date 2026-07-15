@@ -928,6 +928,10 @@ pub enum TaskKind {
     /// task fans out to the configured worker endpoints and each worker merges
     /// its own shard.
     MergeWal,
+    /// Build a ZoneMap scalar index on the experiment base table's `id` column.
+    /// Runs on the master; serialized per experiment against `Compact` because
+    /// both mutate the shared base table.
+    IndexId,
 }
 
 /// Lifecycle state of a scheduled task, generalized from [`CompactJobStatus`]
@@ -1122,5 +1126,18 @@ mod tests {
             serde_json::from_str(r#"{"kind":"compact","target":"exp-7"}"#).unwrap();
         assert_eq!(req.kind, TaskKind::Compact);
         assert_eq!(req.target, "exp-7");
+    }
+
+    #[test]
+    fn task_kind_index_id_roundtrips_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&TaskKind::IndexId).unwrap(),
+            r#""index_id""#
+        );
+        let back: TaskKind = serde_json::from_str(r#""index_id""#).unwrap();
+        assert_eq!(back, TaskKind::IndexId);
+        let req: EnqueueTaskRequest =
+            serde_json::from_str(r#"{"kind":"index_id","target":"exp-9"}"#).unwrap();
+        assert_eq!(req.kind, TaskKind::IndexId);
     }
 }
