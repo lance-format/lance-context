@@ -36,10 +36,12 @@ pub struct MasterState {
     /// Every task (queued / running / terminal) keyed by task id, for the queue
     /// API and UI. Retained after completion so the UI can show recent history.
     pub tasks: Mutex<HashMap<String, TaskRecord>>,
-    /// Experiment names with a compaction currently executing — the per-name
-    /// serial gate. A `Compact` task must not run while another `Compact` on the
-    /// same experiment is in flight (two `Rewrite`s on one dataset conflict).
-    pub inflight_compacts: Mutex<HashSet<String>>,
+    /// Experiment names with a base-table write currently executing — the
+    /// per-name serial gate. A `Compact` or `IndexId` task must not run while
+    /// another base-table-mutating task on the same experiment is in flight:
+    /// two `Rewrite`s (or a `Rewrite` and a `CreateIndex`) on one dataset can
+    /// conflict in Lance's commit matrix, forcing wasteful retries.
+    pub inflight_dataset_writes: Mutex<HashSet<String>>,
     /// Shared HTTP client for fanning `MergeWal` tasks out to worker endpoints.
     pub http: reqwest::Client,
 }
@@ -68,7 +70,7 @@ impl MasterState {
             task_tx,
             task_rx: Mutex::new(Some(task_rx)),
             tasks: Mutex::new(HashMap::new()),
-            inflight_compacts: Mutex::new(HashSet::new()),
+            inflight_dataset_writes: Mutex::new(HashSet::new()),
             http: reqwest::Client::new(),
         }))
     }
