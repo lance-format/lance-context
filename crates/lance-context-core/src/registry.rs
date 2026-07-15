@@ -231,6 +231,56 @@ impl RolloutRegistry {
         Ok(false)
     }
 
+    /// Return one directory entry from the latest registry version.
+    pub async fn get(&mut self, name: &str) -> LanceResult<Option<RegistryEntry>> {
+        self.reload().await?;
+        let escaped = name.replace('\'', "''");
+        let mut scanner = self.dataset.scan();
+        scanner.project(&["name", "uri", "created_at"])?;
+        scanner.filter(&format!("name = '{}'", escaped))?;
+        scanner.limit(Some(1), None)?;
+        let mut stream = scanner.try_into_stream().await?;
+        let Some(batch) = stream.try_next().await? else {
+            return Ok(None);
+        };
+        if batch.num_rows() == 0 {
+            return Ok(None);
+        }
+
+        let names = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| {
+                LanceError::from(ArrowError::InvalidArgumentError(
+                    "registry 'name' column is not Utf8".into(),
+                ))
+            })?;
+        let uris = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| {
+                LanceError::from(ArrowError::InvalidArgumentError(
+                    "registry 'uri' column is not Utf8".into(),
+                ))
+            })?;
+        let created = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| {
+                LanceError::from(ArrowError::InvalidArgumentError(
+                    "registry 'created_at' column is not Int64".into(),
+                ))
+            })?;
+        Ok(Some(RegistryEntry {
+            name: names.value(0).to_string(),
+            uri: uris.value(0).to_string(),
+            created_at: created.value(0),
+        }))
+    }
+
     /// All directory entries from the latest registry version, ordered as
     /// stored (unspecified). The registry is a narrow three-column table, so
     /// even hundreds of thousands of rows scan quickly; pagination can be
@@ -325,6 +375,11 @@ mod tests {
             .await
             .unwrap();
         assert!(reg.contains("exp-b").await.unwrap());
+        assert_eq!(
+            reg.get("exp-b").await.unwrap().unwrap().uri,
+            "/data/exp-b.rollout.lance"
+        );
+        assert!(reg.get("missing").await.unwrap().is_none());
         reg.remove("exp-b").await.unwrap();
         assert!(!reg.contains("exp-b").await.unwrap());
         assert!(reg.list().await.unwrap().is_empty());
