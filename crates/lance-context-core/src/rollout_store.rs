@@ -558,6 +558,9 @@ impl RolloutStore {
         // drain can remove exactly these and nothing else.
         let base_uri = self.dataset.uri().trim_end_matches('/').to_string();
         let mut merged_generations: HashSet<u64> = HashSet::new();
+        // Remember each merged generation's on-storage folder name so we can
+        // delete the blob directory after the manifest drain (see below).
+        let mut merged_paths: Vec<String> = Vec::new();
         let mut batches: Vec<RecordBatch> = Vec::new();
         for flushed in &manifest.flushed_generations {
             let gen_uri = format!(
@@ -573,6 +576,7 @@ impl RolloutStore {
                 }
             }
             merged_generations.insert(flushed.generation);
+            merged_paths.push(flushed.path.clone());
         }
 
         // Append the merged rows to the base table.
@@ -616,6 +620,40 @@ impl RolloutStore {
                 ..current.clone()
             })
             .await?;
+
+        // Delete the merged generations' blob directories now that no manifest
+        // references them. Ordering matters: the drain above already removed
+        // these ids from `flushed_generations`, so a reader can no longer resolve
+        // them — deleting the data second (never before) keeps the sequence
+        // crash-safe. If the process dies between the drain and here, the rows
+        // are already in the base table and the manifest no longer lists these
+        // generations, so nothing reads them; they simply become storage that a
+        // sweep can reclaim later.
+        //
+        // Best-effort: a delete failure must NOT fail the merge — the merge has
+        // logically succeeded (data appended, manifest drained). A failed delete
+        // only leaks one directory, which the same reclamation path handles.
+        // Skipping this deletion is exactly the historical storage leak: every
+        // merged generation left its `_mem_wal/{shard}/{gen}/` directory behind
+        // forever.
+        let object_store = self.dataset.object_store(None).await?;
+        let branch_path = self.dataset.branch_location().path.clone();
+        for path in &merged_paths {
+            let gen_dir = branch_path
+                .clone()
+                .join("_mem_wal")
+                .join(self.write_shard.to_string().as_str())
+                .join(path.as_str());
+            if let Err(err) = object_store.remove_dir_all(gen_dir.clone()).await {
+                tracing::warn!(
+                    shard = %self.write_shard,
+                    generation_path = %path,
+                    error = %err,
+                    "failed to delete merged MemWAL generation directory; \
+                     it will remain until reclaimed"
+                );
+            }
+        }
 
         Ok(())
     }
