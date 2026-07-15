@@ -53,3 +53,4 @@ jobs:
           args: "--all-features"
           path: .
           dry-run: ${{ github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'dry_run') }}
+          check-repo: ${{ github.event_name != 'pull_request' }}
