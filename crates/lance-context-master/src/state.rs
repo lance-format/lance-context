@@ -1,11 +1,10 @@
 //! Shared master state: durable registry + stats table.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use lance_context_api::CompactJobStatus;
-use lance_context_core::RolloutRegistry;
+use lance_context_core::{join_uri, RolloutRegistry};
 use tokio::sync::{mpsc, Mutex, RwLock};
 
 use crate::config::MasterConfig;
@@ -25,7 +24,7 @@ pub struct MasterState {
     /// Periodically-refreshed per-experiment metrics (master-owned).
     pub stats: Mutex<StatsStore>,
     /// Shared data directory / object-store prefix.
-    pub base_path: PathBuf,
+    pub base_uri: String,
     /// Effective configuration.
     pub config: MasterConfig,
     /// Enqueues an experiment name for (serial) compaction. Both automatic
@@ -41,15 +40,9 @@ pub struct MasterState {
 impl MasterState {
     /// Open (or create) the registry and stats datasets under `data_dir`.
     pub async fn new(config: MasterConfig) -> lance::Result<Arc<Self>> {
-        let base_path = PathBuf::from(&config.data_dir);
-        let registry_uri = base_path
-            .join("_registry.rollout.lance")
-            .to_string_lossy()
-            .to_string();
-        let stats_uri = base_path
-            .join("_stats.rollout.lance")
-            .to_string_lossy()
-            .to_string();
+        let base_uri = config.data_dir.clone();
+        let registry_uri = join_uri(&base_uri, "_registry.rollout.lance");
+        let stats_uri = join_uri(&base_uri, "_stats.rollout.lance");
         let mut registry = RolloutRegistry::open_or_create(&registry_uri, None).await?;
         let backfilled = discovery::backfill_registry(&config.data_dir, &mut registry).await?;
         if backfilled > 0 {
@@ -63,7 +56,7 @@ impl MasterState {
         Ok(Arc::new(Self {
             registry: RwLock::new(registry),
             stats: Mutex::new(stats),
-            base_path,
+            base_uri,
             config,
             compact_tx,
             compact_rx: Mutex::new(Some(compact_rx)),
@@ -74,10 +67,7 @@ impl MasterState {
     /// Physical rollout dataset URI for `name`, matching the data-plane's
     /// `rollout_uri` convention (`{name}.rollout.lance`).
     pub fn rollout_uri(&self, name: &str) -> String {
-        self.base_path
-            .join(format!("{}.rollout.lance", name))
-            .to_string_lossy()
-            .to_string()
+        join_uri(&self.base_uri, &format!("{}.rollout.lance", name))
     }
 }
 

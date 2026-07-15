@@ -6,6 +6,7 @@ use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
+use lance_context_core::create_local_dir_if_needed;
 use lance_context_master::config::MasterConfig;
 use lance_context_master::routes;
 use lance_context_master::scanner;
@@ -21,9 +22,9 @@ async fn main() {
     let config = MasterConfig::parse();
     let addr = format!("{}:{}", config.host, config.port);
 
-    if let Err(e) = std::fs::create_dir_all(&config.data_dir) {
+    if let Err(e) = create_local_dir_if_needed(&config.data_dir) {
         tracing::error!(
-            "Failed to create data directory '{}': {}",
+            "Failed to create local data directory '{}': {}",
             config.data_dir,
             e
         );
