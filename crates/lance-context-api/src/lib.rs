@@ -883,6 +883,16 @@ pub struct ExperimentListResponse {
     pub total: i64,
 }
 
+/// Paginated rollout records for one experiment in the master data browser.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExperimentRecordsResponse {
+    pub records: Vec<RolloutRecordDto>,
+    /// Whether another page exists after this response.
+    pub has_more: bool,
+    pub limit: usize,
+    pub offset: usize,
+}
+
 /// State of a manual or automatic compaction job for one experiment.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", tag = "state")]

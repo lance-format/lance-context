@@ -107,6 +107,51 @@ pub struct RolloutObservation {
     pub pending_wal_generations: i64,
 }
 
+/// Exact-match filters for rollout record browsing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RolloutFilters {
+    pub id: Option<String>,
+    pub rollout_id: Option<String>,
+    pub problem_id: Option<String>,
+    pub dataset: Option<String>,
+    pub role: Option<String>,
+    pub content_type: Option<String>,
+    pub policy_version: Option<String>,
+    pub artifact_type: Option<String>,
+    pub include_in_training: Option<bool>,
+}
+
+impl RolloutFilters {
+    fn expression(&self) -> Option<String> {
+        let mut clauses = Vec::new();
+        for (column, value) in [
+            ("id", self.id.as_deref()),
+            ("rollout_id", self.rollout_id.as_deref()),
+            ("problem_id", self.problem_id.as_deref()),
+            ("dataset", self.dataset.as_deref()),
+            ("role", self.role.as_deref()),
+            ("content_type", self.content_type.as_deref()),
+            ("policy_version", self.policy_version.as_deref()),
+            ("artifact_type", self.artifact_type.as_deref()),
+        ] {
+            if let Some(value) = value.filter(|value| !value.is_empty()) {
+                clauses.push(format!("{column} = '{}'", value.replace('\'', "''")));
+            }
+        }
+        if let Some(value) = self.include_in_training {
+            clauses.push(format!("include_in_training = {value}"));
+        }
+        (!clauses.is_empty()).then(|| clauses.join(" AND "))
+    }
+}
+
+/// One server-side paginated rollout query result.
+#[derive(Debug, Clone)]
+pub struct RolloutPage {
+    pub records: Vec<RolloutRecord>,
+    pub has_more: bool,
+}
+
 /// Configuration for opening a [`RolloutStore`].
 #[derive(Debug, Clone, Default)]
 pub struct RolloutStoreOptions {
@@ -795,6 +840,40 @@ impl RolloutStore {
         Ok(results)
     }
 
+    /// Filter and page rollout rows in the LSM execution plan.
+    ///
+    /// Reads one row beyond the requested page to report `has_more`, avoiding
+    /// an unbounded full-table count on every UI request. Artifact bytes are
+    /// projected out, matching [`Self::list`].
+    pub async fn list_filtered(
+        &self,
+        filters: &RolloutFilters,
+        limit: usize,
+        offset: usize,
+    ) -> LanceResult<RolloutPage> {
+        let shard_snapshots = self.wal_shard_snapshots().await?;
+        let filter = filters.expression();
+
+        let columns = self.non_blob_columns();
+        let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+        let mut page_scanner = self
+            .lsm_scanner_with_snapshots(shard_snapshots)
+            .project(&refs);
+        if let Some(filter) = &filter {
+            page_scanner = page_scanner.filter(filter)?;
+        }
+        page_scanner = page_scanner.limit(limit.saturating_add(1), Some(offset));
+
+        let mut stream = page_scanner.try_into_stream().await?;
+        let mut records = Vec::new();
+        while let Some(batch) = stream.try_next().await? {
+            records.extend(batch_to_rollout_records(&batch)?);
+        }
+        let has_more = records.len() > limit;
+        records.truncate(limit);
+        Ok(RolloutPage { records, has_more })
+    }
+
     /// Retrieve a single rollout row by its unique id, including any freshly
     /// appended (MemWAL-flushed) row on any instance. `binary_payload` is
     /// projected out (fetch bytes via [`Self::get_blob`]).
@@ -866,11 +945,15 @@ impl RolloutStore {
     async fn lsm_scanner(&self) -> LanceResult<LsmScanner> {
         let shard_snapshots = self.wal_shard_snapshots().await?;
 
-        Ok(LsmScanner::new(
+        Ok(self.lsm_scanner_with_snapshots(shard_snapshots))
+    }
+
+    fn lsm_scanner_with_snapshots(&self, shard_snapshots: Vec<ShardSnapshot>) -> LsmScanner {
+        LsmScanner::new(
             Arc::new(self.dataset.clone()),
             shard_snapshots,
             vec!["id".to_string()],
-        ))
+        )
     }
 
     /// Read the latest manifest for every MemWAL shard. Manifest reads are
@@ -1859,6 +1942,73 @@ mod tests {
             assert_eq!(obs.row_count, 2);
             assert_eq!(obs.pending_wal_generations, 2);
             assert_eq!(obs.fragment_count, 0);
+        });
+    }
+
+    #[test]
+    fn filtered_listing_pages_across_shards_and_escapes_values() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let options = |shard: &str| RolloutStoreOptions {
+                shard_id: Some(shard.to_string()),
+                ..Default::default()
+            };
+            let mut instance_a = RolloutStore::open_with_options(&uri, options("filter-a"))
+                .await
+                .unwrap();
+            let mut quoted = assistant_record("row-'quoted");
+            quoted.rollout_id = "rollout-alpha".to_string();
+            quoted.policy_version = Some("policy-a".to_string());
+            instance_a
+                .add(&[quoted, assistant_record("row-a")])
+                .await
+                .unwrap();
+
+            let mut instance_b = RolloutStore::open_with_options(&uri, options("filter-b"))
+                .await
+                .unwrap();
+            let artifact = artifact_record("row-b", b"blob");
+            instance_b.add(&[artifact]).await.unwrap();
+
+            let reader = RolloutStore::open(&uri).await.unwrap();
+            let quoted_page = reader
+                .list_filtered(
+                    &RolloutFilters {
+                        id: Some("row-'quoted".to_string()),
+                        ..Default::default()
+                    },
+                    25,
+                    0,
+                )
+                .await
+                .unwrap();
+            assert!(!quoted_page.has_more);
+            assert_eq!(quoted_page.records[0].id, "row-'quoted");
+
+            let policy_page = reader
+                .list_filtered(
+                    &RolloutFilters {
+                        rollout_id: Some("rollout-alpha".to_string()),
+                        role: Some(ROLE_ASSISTANT.to_string()),
+                        policy_version: Some("policy-a".to_string()),
+                        ..Default::default()
+                    },
+                    25,
+                    0,
+                )
+                .await
+                .unwrap();
+            assert!(!policy_page.has_more);
+            assert_eq!(policy_page.records[0].id, "row-'quoted");
+
+            let page = reader
+                .list_filtered(&RolloutFilters::default(), 1, 1)
+                .await
+                .unwrap();
+            assert!(page.has_more);
+            assert_eq!(page.records.len(), 1);
         });
     }
 
