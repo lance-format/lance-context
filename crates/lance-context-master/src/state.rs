@@ -3,13 +3,14 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use lance_context_api::TaskRecord;
+use lance_context_api::{TaskRecord, TaskState};
 use lance_context_core::{join_uri, RolloutRegistry};
 use tokio::sync::{mpsc, Mutex, RwLock};
 
 use crate::config::MasterConfig;
 use crate::discovery;
 use crate::stats_store::StatsStore;
+use crate::task_store::TaskStore;
 
 /// Shared state for the master process.
 ///
@@ -33,8 +34,11 @@ pub struct MasterState {
     pub task_tx: mpsc::UnboundedSender<String>,
     /// Receiver half, taken once by [`crate::scheduler::spawn_scheduler`].
     pub task_rx: Mutex<Option<mpsc::UnboundedReceiver<String>>>,
+    /// Durable task records on the master-local RocksDB PVC.
+    pub task_store: TaskStore,
     /// Every task (queued / running / terminal) keyed by task id, for the queue
-    /// API and UI. Retained after completion so the UI can show recent history.
+    /// API, de-duplication, and UI. This is a cache of `task_store`, rebuilt at
+    /// startup. Terminal history is bounded by `task_history_limit`.
     pub tasks: Mutex<HashMap<String, TaskRecord>>,
     /// Experiment names with a compaction currently executing — the per-name
     /// serial gate. A `Compact` task must not run while another `Compact` on the
@@ -45,7 +49,7 @@ pub struct MasterState {
 }
 
 impl MasterState {
-    /// Open (or create) the registry and stats datasets under `data_dir`.
+    /// Open the registry, stats dataset, and local durable task store.
     pub async fn new(config: MasterConfig) -> lance::Result<Arc<Self>> {
         let base_uri = config.data_dir.clone();
         let registry_uri = join_uri(&base_uri, "_registry.rollout.lance");
@@ -59,18 +63,59 @@ impl MasterState {
             );
         }
         let stats = StatsStore::open_or_create(&stats_uri, None).await?;
+        let task_store = TaskStore::open(&config.task_db_path)?;
+        let mut tasks = task_store
+            .list()?
+            .into_iter()
+            .map(|task| (task.id.clone(), task))
+            .collect::<HashMap<_, _>>();
+
+        let mut recovered_running = 0usize;
+        for task in tasks.values_mut() {
+            if task.state == TaskState::Running {
+                task.state = TaskState::Queued;
+                task.started_at = None;
+                task.finished_at = None;
+                task.error = None;
+                task.detail = None;
+                task_store.put(task)?;
+                recovered_running += 1;
+            }
+        }
+        let pruned = prune_terminal_history(&task_store, &mut tasks, config.task_history_limit)?;
+        let mut pending = tasks
+            .values()
+            .filter(|task| task.state == TaskState::Queued)
+            .map(|task| (task.enqueued_at, task.id.clone()))
+            .collect::<Vec<_>>();
+        pending.sort();
+        let pending_ids = pending.into_iter().map(|(_, id)| id).collect::<Vec<_>>();
+
         let (task_tx, task_rx) = mpsc::unbounded_channel();
-        Ok(Arc::new(Self {
+        let state = Arc::new(Self {
             registry: RwLock::new(registry),
             stats: Mutex::new(stats),
             base_uri,
             config,
             task_tx,
             task_rx: Mutex::new(Some(task_rx)),
-            tasks: Mutex::new(HashMap::new()),
+            task_store,
+            tasks: Mutex::new(tasks),
             inflight_compacts: Mutex::new(HashSet::new()),
             http: reqwest::Client::new(),
-        }))
+        });
+        for id in &pending_ids {
+            let _ = state.task_tx.send(id.clone());
+        }
+        if !pending_ids.is_empty() || recovered_running > 0 || pruned > 0 {
+            tracing::info!(
+                queued = pending_ids.len(),
+                recovered_running,
+                pruned,
+                "loaded durable scheduler tasks"
+            );
+        }
+        Ok(state)
     }
 
     /// Physical rollout dataset URI for `name`, matching the data-plane's
@@ -80,9 +125,41 @@ impl MasterState {
     }
 }
 
+pub(crate) fn prune_terminal_history(
+    task_store: &TaskStore,
+    tasks: &mut HashMap<String, TaskRecord>,
+    limit: usize,
+) -> lance::Result<usize> {
+    // Keep at least the latest terminal task so legacy per-experiment status
+    // polling can observe completion even if the configured limit is zero.
+    let limit = limit.max(1);
+    let mut terminal = tasks
+        .values()
+        .filter(|task| matches!(task.state, TaskState::Done | TaskState::Failed))
+        .map(|task| {
+            (
+                task.finished_at.unwrap_or(task.enqueued_at),
+                task.id.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    terminal.sort_by_key(|(finished_at, _)| std::cmp::Reverse(*finished_at));
+    let ids = terminal
+        .into_iter()
+        .skip(limit)
+        .map(|(_, id)| id)
+        .collect::<Vec<_>>();
+    task_store.delete_many(ids.iter().map(String::as_str))?;
+    for id in &ids {
+        tasks.remove(id);
+    }
+    Ok(ids.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lance_context_api::TaskKind;
     use lance_context_core::RolloutStore;
     use tempfile::TempDir;
 
@@ -98,6 +175,12 @@ mod tests {
             target_rows_per_fragment: 1_048_576,
             worker_endpoints: vec![],
             task_concurrency: 4,
+            task_db_path: dir
+                .path()
+                .join("master-tasks")
+                .to_string_lossy()
+                .to_string(),
+            task_history_limit: 1_000,
             ui_dir: None,
         }
     }
@@ -114,5 +197,80 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "legacy");
         assert_eq!(entries[0].uri, uri.to_string_lossy().to_string());
+    }
+
+    #[tokio::test]
+    async fn startup_requeues_queued_and_interrupted_tasks() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config(&dir);
+        {
+            let state = MasterState::new(config.clone()).await.unwrap();
+            for (id, task_state) in [
+                ("queued-task", TaskState::Queued),
+                ("running-task", TaskState::Running),
+                ("done-task", TaskState::Done),
+            ] {
+                let task = TaskRecord {
+                    id: id.to_string(),
+                    kind: TaskKind::Compact,
+                    target: "legacy".to_string(),
+                    state: task_state,
+                    error: None,
+                    detail: None,
+                    enqueued_at: 1,
+                    started_at: (task_state == TaskState::Running).then_some(2),
+                    finished_at: (task_state == TaskState::Done).then_some(3),
+                };
+                state.task_store.put(&task).unwrap();
+            }
+        }
+
+        let state = MasterState::new(config).await.unwrap();
+        let tasks = state.tasks.lock().await;
+        assert_eq!(tasks["queued-task"].state, TaskState::Queued);
+        assert_eq!(tasks["running-task"].state, TaskState::Queued);
+        assert_eq!(tasks["running-task"].started_at, None);
+        assert_eq!(tasks["done-task"].state, TaskState::Done);
+        drop(tasks);
+
+        let mut rx = state.task_rx.lock().await.take().unwrap();
+        let mut recovered = Vec::new();
+        while let Ok(id) = rx.try_recv() {
+            recovered.push(id);
+        }
+        recovered.sort();
+        assert_eq!(recovered, ["queued-task", "running-task"]);
+    }
+
+    #[test]
+    fn terminal_history_pruning_keeps_active_tasks() {
+        let dir = TempDir::new().unwrap();
+        let store = TaskStore::open(dir.path().join("tasks")).unwrap();
+        let mut tasks = HashMap::new();
+        for (id, state, timestamp) in [
+            ("queued", TaskState::Queued, 1),
+            ("old", TaskState::Done, 2),
+            ("new", TaskState::Failed, 3),
+        ] {
+            let task = TaskRecord {
+                id: id.to_string(),
+                kind: TaskKind::Compact,
+                target: "experiment".to_string(),
+                state,
+                error: None,
+                detail: None,
+                enqueued_at: timestamp,
+                started_at: None,
+                finished_at: matches!(state, TaskState::Done | TaskState::Failed)
+                    .then_some(timestamp),
+            };
+            store.put(&task).unwrap();
+            tasks.insert(id.to_string(), task);
+        }
+
+        assert_eq!(prune_terminal_history(&store, &mut tasks, 1).unwrap(), 1);
+        assert!(tasks.contains_key("queued"));
+        assert!(tasks.contains_key("new"));
+        assert!(!tasks.contains_key("old"));
     }
 }

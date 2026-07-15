@@ -277,7 +277,9 @@ pub async fn compact_experiment(
             name
         )));
     }
-    let task = scheduler::enqueue(&state, TaskKind::Compact, &name).await;
+    let task = scheduler::enqueue(&state, TaskKind::Compact, &name)
+        .await
+        .map_err(MasterError::from_lance)?;
     Ok((StatusCode::ACCEPTED, Json(task_to_compact_status(&task))))
 }
 
@@ -312,7 +314,9 @@ pub async fn enqueue_task(
             req.target
         )));
     }
-    let task = scheduler::enqueue(&state, req.kind, &req.target).await;
+    let task = scheduler::enqueue(&state, req.kind, &req.target)
+        .await
+        .map_err(MasterError::from_lance)?;
     Ok((StatusCode::ACCEPTED, Json(task)))
 }
 
@@ -418,6 +422,12 @@ mod tests {
             target_rows_per_fragment: 1_048_576,
             worker_endpoints: vec![],
             task_concurrency: 4,
+            task_db_path: dir
+                .path()
+                .join("master-tasks")
+                .to_string_lossy()
+                .to_string(),
+            task_history_limit: 1_000,
             ui_dir: None,
         }
     }

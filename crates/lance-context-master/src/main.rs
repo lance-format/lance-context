@@ -22,6 +22,10 @@ async fn main() {
     let config = MasterConfig::parse();
     let addr = format!("{}:{}", config.host, config.port);
 
+    // Install the recorder before state recovery and scheduler startup so
+    // recovered queue depth is represented immediately.
+    let metrics_handle = lance_context_metrics::install_recorder();
+
     if let Err(e) = create_local_dir_if_needed(&config.data_dir) {
         tracing::error!(
             "Failed to create local data directory '{}': {}",
@@ -46,9 +50,6 @@ async fn main() {
 
     // Single serial compaction worker (+ optional periodic auto-sweep).
     let _scheduler = scheduler::spawn_scheduler(&state);
-
-    // Install the Prometheus recorder once, before any metrics are emitted.
-    let metrics_handle = lance_context_metrics::install_recorder();
 
     let mut app = Router::new().nest("/api/v1", routes::api_router());
 

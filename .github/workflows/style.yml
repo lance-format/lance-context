@@ -33,7 +33,7 @@ jobs:
 
   clippy:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -45,7 +45,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt update
-          sudo apt install -y protobuf-compiler
+          sudo apt install -y clang libclang-dev protobuf-compiler
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
