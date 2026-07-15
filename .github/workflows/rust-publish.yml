@@ -46,11 +46,15 @@ jobs:
 
       - uses: rui314/setup-mold@v1
 
+      - name: Validate Rust crate packages
+        if: github.event_name == 'pull_request'
+        run: cargo package --workspace --exclude lance-context-python --allow-dirty --no-verify --all-features --locked
+
       - name: Publish Rust crates
+        if: github.event_name != 'pull_request'
         uses: katyo/publish-crates@v2
         with:
           registry-token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           args: "--all-features"
           path: .
-          dry-run: ${{ github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'dry_run') }}
-          check-repo: ${{ github.event_name != 'pull_request' }}
+          dry-run: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'dry_run' }}
