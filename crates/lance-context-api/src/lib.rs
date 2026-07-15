@@ -148,6 +148,8 @@ pub trait RolloutStoreApi {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateContextRequest {
+    /// Portable dataset name: 1-128 ASCII characters matching
+    /// `[A-Za-z0-9_][A-Za-z0-9._-]*`; `_registry` and `_stats` are reserved.
     pub name: String,
     #[serde(default)]
     pub storage_options: Option<std::collections::HashMap<String, String>>,
@@ -571,6 +573,8 @@ pub struct CompactStatsResponse {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateRolloutStoreRequest {
+    /// Portable dataset name: 1-128 ASCII characters matching
+    /// `[A-Za-z0-9_][A-Za-z0-9._-]*`; `_registry` and `_stats` are reserved.
     pub name: String,
     #[serde(default)]
     pub storage_options: Option<std::collections::HashMap<String, String>>,

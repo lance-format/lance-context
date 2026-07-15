@@ -1,10 +1,12 @@
 use std::num::NonZeroUsize;
+#[cfg(test)]
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use lance_context_core::{
-    ContextStore, ContextStoreOptions, RolloutRegistry, RolloutStore, RolloutStoreOptions,
+    join_uri, validate_store_name, ContextStore, ContextStoreOptions, RolloutRegistry,
+    RolloutStore, RolloutStoreOptions,
 };
 use lru::LruCache;
 use tokio::sync::{Mutex, RwLock};
@@ -34,7 +36,7 @@ pub struct AppState {
     /// because every operation refreshes the snapshot and therefore takes
     /// `&mut`.
     pub rollout_registry: RwLock<RolloutRegistry>,
-    pub base_path: PathBuf,
+    pub base_uri: String,
     /// Stable identity of this server instance, used as the MemWAL shard key for
     /// rollout writes so each instance owns exactly one shard. `None` falls back
     /// to a single shared shard (single-instance deployments only).
@@ -55,11 +57,8 @@ impl AppState {
     /// under `data_dir`. Async because opening the registry touches storage.
     pub async fn new(config: ServerConfig) -> Result<Self, AppError> {
         let instance_id = config.resolved_instance_id();
-        let base_path = PathBuf::from(&config.data_dir);
-        let registry_uri = base_path
-            .join("_registry.rollout.lance")
-            .to_string_lossy()
-            .to_string();
+        let base_uri = config.data_dir.clone();
+        let registry_uri = join_uri(&base_uri, "_registry.rollout.lance");
         let registry = RolloutRegistry::open_or_create(&registry_uri, None)
             .await
             .map_err(AppError::from_lance)?;
@@ -69,7 +68,7 @@ impl AppState {
             stores: RwLock::new(std::collections::HashMap::new()),
             rollout_stores: Mutex::new(LruCache::new(capacity)),
             rollout_registry: RwLock::new(registry),
-            base_path,
+            base_uri,
             instance_id,
             rollout_merge_after_generations: config.rollout_merge_after_generations,
             rollout_cleanup_interval_secs: config.rollout_cleanup_interval_secs,
@@ -78,10 +77,7 @@ impl AppState {
     }
 
     pub fn context_uri(&self, name: &str) -> String {
-        self.base_path
-            .join(format!("{}.lance", name))
-            .to_string_lossy()
-            .to_string()
+        join_uri(&self.base_uri, &format!("{}.lance", name))
     }
 
     /// Build a default-configured `AppState` rooted at `base_path`, for tests.
@@ -98,10 +94,8 @@ impl AppState {
         base_path: PathBuf,
         instance_id: Option<String>,
     ) -> Self {
-        let registry_uri = base_path
-            .join("_registry.rollout.lance")
-            .to_string_lossy()
-            .to_string();
+        let base_uri = base_path.to_string_lossy().to_string();
+        let registry_uri = join_uri(&base_uri, "_registry.rollout.lance");
         let registry = RolloutRegistry::open_or_create(&registry_uri, None)
             .await
             .expect("open test registry");
@@ -111,7 +105,7 @@ impl AppState {
                 NonZeroUsize::new(DEFAULT_ROLLOUT_CACHE_CAPACITY).unwrap(),
             )),
             rollout_registry: RwLock::new(registry),
-            base_path,
+            base_uri,
             instance_id,
             rollout_merge_after_generations: 0,
             rollout_cleanup_interval_secs: 0,
@@ -123,10 +117,7 @@ impl AppState {
     /// rollout store and a context store may share the same name without
     /// colliding on disk.
     pub fn rollout_uri(&self, name: &str) -> String {
-        self.base_path
-            .join(format!("{}.rollout.lance", name))
-            .to_string_lossy()
-            .to_string()
+        join_uri(&self.base_uri, &format!("{}.rollout.lance", name))
     }
 
     fn rollout_store_options(&self) -> RolloutStoreOptions {
@@ -151,6 +142,7 @@ impl AppState {
         uri: &str,
         store: Arc<RwLock<RolloutStore>>,
     ) -> Result<(), AppError> {
+        Self::validate_name(name)?;
         self.rollout_registry
             .write()
             .await
@@ -170,6 +162,7 @@ impl AppState {
     /// Remove a rollout store from the durable registry and evict any resident
     /// handle. Returns whether the store existed.
     pub async fn unregister_rollout(&self, name: &str) -> Result<bool, AppError> {
+        Self::validate_name(name)?;
         let existed = self
             .rollout_registry
             .write()
@@ -203,6 +196,7 @@ impl AppState {
         &self,
         name: &str,
     ) -> Result<Arc<RwLock<RolloutStore>>, AppError> {
+        Self::validate_name(name)?;
         // Fast path: resident in this process's LRU (updates recency).
         if let Some(store) = self.rollout_stores.lock().await.get(name) {
             metrics::counter!("rollout_store_cache_hits_total").increment(1);
@@ -252,6 +246,7 @@ impl AppState {
         &self,
         name: &str,
     ) -> Result<Arc<RwLock<ContextStore>>, AppError> {
+        Self::validate_name(name)?;
         if let Some(store) = self.stores.read().await.get(name) {
             return Ok(store.clone());
         }
@@ -268,6 +263,10 @@ impl AppState {
         }
         stores.insert(name.to_string(), opened.clone());
         Ok(opened)
+    }
+
+    pub fn validate_name(name: &str) -> Result<(), AppError> {
+        validate_store_name(name).map_err(AppError::InvalidRequest)
     }
 
     /// Spawn the single, process-wide WAL-cleanup sweeper.

@@ -30,6 +30,7 @@ pub async fn create_rollout_store(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateRolloutStoreRequest>,
 ) -> Result<(StatusCode, Json<RolloutStoreInfo>), AppError> {
+    AppState::validate_name(&req.name)?;
     // Existence is tracked durably in the registry, not by cache membership.
     if state
         .rollout_registry
@@ -580,6 +581,52 @@ mod tests {
         .await
         .expect("create rollout store");
         (state, dir)
+    }
+
+    #[tokio::test]
+    async fn create_rejects_names_that_are_not_portable_path_segments() {
+        let dir = TempDir::new().unwrap();
+        let state = Arc::new(AppState::new_for_test(dir.path().to_path_buf()).await);
+
+        for name in [
+            "../escape",
+            "nested/store",
+            r"nested\store",
+            "_registry",
+            &"a".repeat(lance_context_core::MAX_STORE_NAME_LEN + 1),
+        ] {
+            let err = create_rollout_store(
+                State(state.clone()),
+                Json(CreateRolloutStoreRequest {
+                    name: name.to_string(),
+                    storage_options: None,
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(err, AppError::InvalidRequest(_)), "{name}");
+        }
+        assert!(state.rollout_stores.lock().await.is_empty());
+        assert!(state
+            .rollout_registry
+            .write()
+            .await
+            .list()
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn open_rejects_invalid_rollout_names_before_registry_access() {
+        let dir = TempDir::new().unwrap();
+        let state = AppState::new_for_test(dir.path().to_path_buf()).await;
+
+        let err = match state.get_or_open_rollout_store("../escape").await {
+            Ok(_) => panic!("invalid name unexpectedly opened"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, AppError::InvalidRequest(_)));
     }
 
     fn record_with_size(id: &str, payload_size: Option<i64>) -> AddRolloutRequest {

@@ -1,9 +1,7 @@
 //! Startup discovery for rollout datasets created before the registry existed.
 
-use std::path::Path;
-
 use lance::io::ObjectStore;
-use lance_context_core::RolloutRegistry;
+use lance_context_core::{join_uri, RolloutRegistry};
 
 const ROLLOUT_SUFFIX: &str = ".rollout.lance";
 
@@ -29,14 +27,6 @@ pub async fn backfill_registry(
         .collect();
 
     registry.insert_missing(&entries).await
-}
-
-fn join_uri(base: &str, child: &str) -> String {
-    if base.contains("://") {
-        format!("{}/{}", base.trim_end_matches('/'), child)
-    } else {
-        Path::new(base).join(child).to_string_lossy().to_string()
-    }
 }
 
 #[cfg(test)]
@@ -94,17 +84,5 @@ mod tests {
             .collect();
         names.sort();
         assert_eq!(names, vec!["existing", "legacy"]);
-    }
-
-    #[test]
-    fn joins_local_paths_and_object_store_uris() {
-        assert_eq!(
-            join_uri("/data/rollouts", "exp.rollout.lance"),
-            "/data/rollouts/exp.rollout.lance"
-        );
-        assert_eq!(
-            join_uri("s3://bucket/prefix/", "exp.rollout.lance"),
-            "s3://bucket/prefix/exp.rollout.lance"
-        );
     }
 }
