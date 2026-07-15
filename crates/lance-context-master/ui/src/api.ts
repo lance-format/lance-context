@@ -83,7 +83,7 @@ export type CompactJobStatus =
   | { state: "none" };
 
 // Unified scheduler task DTOs (mirror `TaskRecord` etc. in `lance-context-api`).
-export type TaskKind = "compact" | "merge_wal";
+export type TaskKind = "compact" | "merge_wal" | "index_id";
 export type TaskState = "queued" | "running" | "done" | "failed";
 
 export interface TaskRecord {
