@@ -130,6 +130,13 @@ pub trait RolloutStoreApi {
         offset: Option<usize>,
     ) -> impl Future<Output = ContextResult<Vec<RolloutRecordDto>>> + Send;
 
+    fn list_filtered(
+        &self,
+        limit: Option<usize>,
+        offset: Option<usize>,
+        filters: Option<Value>,
+    ) -> impl Future<Output = ContextResult<Vec<RolloutRecordDto>>> + Send;
+
     fn get(&self, id: &str)
         -> impl Future<Output = ContextResult<Option<RolloutRecordDto>>> + Send;
 

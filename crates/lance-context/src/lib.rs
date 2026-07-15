@@ -6,7 +6,8 @@ pub use lance_context_core::{
     CompactionConfig, CompactionMetrics, CompactionStats, Context, ContextEntry, ContextNamespace,
     ContextRecord, ContextStoreOptions, IdIndexType, LifecycleQueryOptions, MetadataFilter,
     PartitionInfo, PartitionSelector, PartitionSpec, RecordFilters, Relationship, RetrieveResult,
-    RolloutRecord, SearchResult, Snapshot, StateMetadata, LIFECYCLE_ACTIVE, LIFECYCLE_CONTRADICTED,
+    RolloutFilters, RolloutRecord, SearchResult, Snapshot, StateMetadata, LIFECYCLE_ACTIVE,
+    LIFECYCLE_CONTRADICTED,
 };
 
 pub use lance_context_api::{

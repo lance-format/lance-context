@@ -2475,15 +2475,25 @@ impl RolloutStore {
 
     /// List rollout rows (artifact bytes projected out). Returns a JSON array
     /// string of records for the Python wrapper to parse into dicts.
-    #[pyo3(signature = (limit = None, offset = None))]
+    #[pyo3(signature = (limit = None, offset = None, filters_json = None))]
     fn list(
         &self,
         py: Python<'_>,
         limit: Option<usize>,
         offset: Option<usize>,
+        filters_json: Option<String>,
     ) -> PyResult<String> {
+        let filters = filters_json
+            .map(|raw| {
+                serde_json::from_str(&raw)
+                    .map_err(|err| PyRuntimeError::new_err(format!("invalid filters JSON: {err}")))
+            })
+            .transpose()?;
         let records = py
-            .allow_threads(|| self.runtime.block_on(self.store.list(limit, offset)))
+            .allow_threads(|| {
+                self.runtime
+                    .block_on(self.store.list_filtered(limit, offset, filters))
+            })
             .map_err(to_py_err)?;
         rollout_records_to_json(&records)
     }

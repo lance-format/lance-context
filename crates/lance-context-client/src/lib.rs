@@ -310,6 +310,25 @@ impl RolloutStoreApi for RemoteRolloutStore {
         Ok(resp.records)
     }
 
+    async fn list_filtered(
+        &self,
+        limit: Option<usize>,
+        offset: Option<usize>,
+        filters: Option<serde_json::Value>,
+    ) -> ContextResult<Vec<RolloutRecordDto>> {
+        let filters = filters
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|err| ContextError::InvalidRequest(err.to_string()))?;
+        let resp = self
+            .client
+            .list_rollouts_filtered(&self.store_name, limit, offset, filters.as_deref())
+            .await
+            .map_err(to_ctx_err)?;
+        Ok(resp.records)
+    }
+
     async fn get(&self, id: &str) -> ContextResult<Option<RolloutRecordDto>> {
         let resp = self
             .client
@@ -777,6 +796,16 @@ impl ContextClient {
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> Result<ListRolloutsResponse, ClientError> {
+        self.list_rollouts_filtered(name, limit, offset, None).await
+    }
+
+    pub async fn list_rollouts_filtered(
+        &self,
+        name: &str,
+        limit: Option<usize>,
+        offset: Option<usize>,
+        filters: Option<&str>,
+    ) -> Result<ListRolloutsResponse, ClientError> {
         let mut request = self
             .http
             .get(self.url(&format!("/rollouts/{}/records", name)));
@@ -785,6 +814,9 @@ impl ContextClient {
         }
         if let Some(offset) = offset {
             request = request.query(&[("offset", offset)]);
+        }
+        if let Some(filters) = filters {
+            request = request.query(&[("filters", filters)]);
         }
         let resp = request.send().await?;
         Self::handle_response(resp).await

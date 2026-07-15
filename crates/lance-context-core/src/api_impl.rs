@@ -16,7 +16,7 @@ use crate::record::{
     LIFECYCLE_ACTIVE,
 };
 use crate::rollout::RolloutRecord;
-use crate::rollout_store::RolloutStore;
+use crate::rollout_store::{RolloutFilters, RolloutStore};
 use crate::store::{CompactionConfig, ContextStore};
 
 impl ContextStoreApi for ContextStore {
@@ -395,6 +395,22 @@ impl RolloutStoreApi for RolloutStore {
         offset: Option<usize>,
     ) -> ContextResult<Vec<RolloutRecordDto>> {
         let records = RolloutStore::list(self, limit, offset)
+            .await
+            .map_err(to_ctx_err)?;
+        Ok(records.into_iter().map(rollout_record_to_dto).collect())
+    }
+
+    async fn list_filtered(
+        &self,
+        limit: Option<usize>,
+        offset: Option<usize>,
+        filters: Option<Value>,
+    ) -> ContextResult<Vec<RolloutRecordDto>> {
+        let filters = filters
+            .map(RolloutFilters::from_json_value)
+            .transpose()
+            .map_err(ContextError::InvalidRequest)?;
+        let records = RolloutStore::list_with_filters(self, limit, offset, filters.as_ref())
             .await
             .map_err(to_ctx_err)?;
         Ok(records.into_iter().map(rollout_record_to_dto).collect())

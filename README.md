@@ -93,6 +93,13 @@ store.add({
 
 for row in store.list():
     print(row["rollout_id"], row["reward"])
+
+# Exact-match filters are combined with AND and applied before pagination.
+training_rows = store.list(filters={
+    "policy_version": "ckpt-100",
+    "include_in_training": True,
+    "role": "assistant",
+})
 ```
 
 In a real training run, generation workers and the learner talk to a shared

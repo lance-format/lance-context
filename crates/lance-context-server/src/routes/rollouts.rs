@@ -14,7 +14,8 @@ use lance_context_api::{
     RolloutStoreInfo, VersionResponse,
 };
 use lance_context_core::{
-    CompactionConfig, Relationship, RolloutRecord, RolloutStore, RolloutStoreOptions,
+    CompactionConfig, Relationship, RolloutFilters, RolloutRecord, RolloutStore,
+    RolloutStoreOptions,
 };
 use tokio::sync::RwLock;
 
@@ -316,6 +317,7 @@ async fn parse_multipart_rollouts(
 pub struct RolloutListParams {
     pub limit: Option<usize>,
     pub offset: Option<usize>,
+    pub filters: Option<String>,
 }
 
 pub async fn list_rollouts(
@@ -323,11 +325,22 @@ pub async fn list_rollouts(
     Path(name): Path<String>,
     Query(params): Query<RolloutListParams>,
 ) -> Result<Json<ListRolloutsResponse>, AppError> {
+    let filters = params
+        .filters
+        .as_deref()
+        .map(|raw| {
+            let value = serde_json::from_str(raw).map_err(|err| {
+                AppError::InvalidRequest(format!("invalid rollout filters: {err}"))
+            })?;
+            RolloutFilters::from_json_value(value).map_err(AppError::InvalidRequest)
+        })
+        .transpose()?;
+
     let store_lock = state.get_or_open_rollout_store(&name).await?;
 
     let store = store_lock.read().await;
     let records = store
-        .list(params.limit, params.offset)
+        .list_with_filters(params.limit, params.offset, filters.as_ref())
         .await
         .map_err(AppError::from_lance)?;
 
@@ -665,6 +678,18 @@ mod tests {
             id: id.to_string(),
             rollout_id: format!("traj-{id}"),
             payload_size,
+            ..Default::default()
+        }
+    }
+
+    fn filtered_record(id: &str, policy_version: &str, training: bool) -> AddRolloutRequest {
+        AddRolloutRequest {
+            id: id.to_string(),
+            rollout_id: format!("traj-{id}"),
+            problem_id: Some(format!("problem-{id}")),
+            role: "assistant".to_string(),
+            policy_version: Some(policy_version.to_string()),
+            include_in_training: Some(training),
             ..Default::default()
         }
     }
@@ -1063,5 +1088,72 @@ mod tests {
         assert!(matches!(err, AppError::NotFound(_)));
         let Json(listed) = list_rollout_stores(State(state.clone())).await.unwrap();
         assert!(listed.stores.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_rollouts_applies_json_filters() {
+        let (state, _dir) = rollout_state().await;
+        let body = serde_json::to_vec(&AddRolloutsRequest {
+            records: vec![
+                filtered_record("a", "ckpt-1", true),
+                filtered_record("b", "ckpt-2", false),
+            ],
+        })
+        .unwrap();
+        let _ = add_rollouts(
+            State(state.clone()),
+            Path("rl".to_string()),
+            json_request(body),
+        )
+        .await
+        .unwrap();
+
+        let Json(response) = list_rollouts(
+            State(state),
+            Path("rl".to_string()),
+            Query(RolloutListParams {
+                filters: Some(
+                    serde_json::json!({
+                        "policy_version": "ckpt-2",
+                        "include_in_training": false
+                    })
+                    .to_string(),
+                ),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.records.len(), 1);
+        assert_eq!(response.records[0].id, "b");
+    }
+
+    #[tokio::test]
+    async fn list_rollouts_rejects_invalid_filters() {
+        let (state, _dir) = rollout_state().await;
+        let invalid_json = list_rollouts(
+            State(state.clone()),
+            Path("rl".to_string()),
+            Query(RolloutListParams {
+                filters: Some("{not-json}".to_string()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(invalid_json, AppError::InvalidRequest(_)));
+
+        let unsupported = list_rollouts(
+            State(state),
+            Path("rl".to_string()),
+            Query(RolloutListParams {
+                filters: Some(serde_json::json!({"reward": 1.0}).to_string()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(unsupported, AppError::InvalidRequest(_)));
     }
 }

@@ -72,6 +72,7 @@ use lance::{Error as LanceError, Result as LanceResult};
 use lance_index::mem_wal::{ShardManifest, MEM_WAL_INDEX_NAME};
 use lance_index::scalar::ScalarIndexParams;
 use lance_index::IndexType;
+use serde_json::Value;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -128,6 +129,36 @@ pub struct RolloutFilters {
 }
 
 impl RolloutFilters {
+    pub fn from_json_value(value: Value) -> Result<Self, String> {
+        let Value::Object(object) = value else {
+            return Err("rollout filters must be a JSON object".to_string());
+        };
+
+        let mut filters = Self::default();
+        for (key, value) in object {
+            let string_value = || {
+                value
+                    .as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("rollout filter '{key}' must be a string"))
+            };
+            match key.as_str() {
+                "rollout_id" => filters.rollout_id = Some(string_value()?),
+                "problem_id" => filters.problem_id = Some(string_value()?),
+                "policy_version" => filters.policy_version = Some(string_value()?),
+                "role" => filters.role = Some(string_value()?),
+                "include_in_training" => {
+                    filters.include_in_training = Some(value.as_bool().ok_or_else(|| {
+                        "rollout filter 'include_in_training' must be a boolean".to_string()
+                    })?);
+                }
+                "artifact_type" => filters.artifact_type = Some(string_value()?),
+                _ => return Err(format!("unsupported rollout filter '{key}'")),
+            }
+        }
+        Ok(filters)
+    }
+
     fn expression(&self) -> Option<String> {
         let mut clauses = Vec::new();
         for (column, value) in [
@@ -897,20 +928,39 @@ impl RolloutStore {
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> LanceResult<Vec<RolloutRecord>> {
+        self.list_with_filters(limit, offset, None).await
+    }
+
+    /// List rollout rows matching exact field filters.
+    ///
+    /// The filter is pushed into every LSM source before merge and
+    /// deduplication. Rollout rows are immutable by id, so filtering each
+    /// generation cannot reveal an older state of a mutable record.
+    pub async fn list_with_filters(
+        &self,
+        limit: Option<usize>,
+        offset: Option<usize>,
+        filters: Option<&RolloutFilters>,
+    ) -> LanceResult<Vec<RolloutRecord>> {
         let columns = self.non_blob_columns();
         let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
-        let scanner = self.lsm_scanner().await?.project(&refs);
+        let mut scanner = self.lsm_scanner().await?.project(&refs);
+        if let Some(predicate) = filters.and_then(RolloutFilters::expression) {
+            scanner = scanner.filter(&predicate)?;
+        }
+        let post_scan_offset = if limit.is_none() { offset } else { None };
+        if let Some(limit) = limit {
+            scanner = scanner.limit(limit, offset);
+        }
+
         let mut stream = scanner.try_into_stream().await?;
         let mut results = Vec::new();
         while let Some(batch) = stream.try_next().await? {
             results.extend(batch_to_rollout_records(&batch)?);
         }
 
-        if let Some(offset) = offset {
+        if let Some(offset) = post_scan_offset {
             results = results.into_iter().skip(offset).collect();
-        }
-        if let Some(limit) = limit {
-            results.truncate(limit);
         }
         Ok(results)
     }
@@ -1746,6 +1796,51 @@ mod tests {
     use serde_json::json;
     use tempfile::TempDir;
 
+    #[test]
+    fn rollout_filters_parse_supported_fields() {
+        let filters = RolloutFilters::from_json_value(json!({
+            "rollout_id": "traj-1",
+            "problem_id": "problem-7",
+            "policy_version": "ckpt-42",
+            "role": "assistant",
+            "include_in_training": false,
+            "artifact_type": "screenshot"
+        }))
+        .unwrap();
+
+        assert_eq!(filters.rollout_id.as_deref(), Some("traj-1"));
+        assert_eq!(filters.problem_id.as_deref(), Some("problem-7"));
+        assert_eq!(filters.policy_version.as_deref(), Some("ckpt-42"));
+        assert_eq!(filters.role.as_deref(), Some("assistant"));
+        assert_eq!(filters.include_in_training, Some(false));
+        assert_eq!(filters.artifact_type.as_deref(), Some("screenshot"));
+    }
+
+    #[test]
+    fn rollout_filters_reject_unknown_and_wrong_types() {
+        assert!(RolloutFilters::from_json_value(json!({"reward": 1.0})).is_err());
+        assert!(RolloutFilters::from_json_value(json!({"policy_version": 42})).is_err());
+        assert!(RolloutFilters::from_json_value(json!({"include_in_training": "yes"})).is_err());
+        assert!(RolloutFilters::from_json_value(json!([])).is_err());
+    }
+
+    #[test]
+    fn rollout_filter_expression_escapes_strings_and_fields() {
+        let filters = RolloutFilters {
+            policy_version: Some("worker's-ckpt".to_string()),
+            role: Some("assistant".to_string()),
+            include_in_training: Some(true),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            filters.expression().as_deref(),
+            Some(
+                "role = 'assistant' AND policy_version = 'worker''s-ckpt' AND include_in_training = true"
+            )
+        );
+    }
+
     fn assistant_record(id: &str) -> RolloutRecord {
         RolloutRecord {
             id: id.to_string(),
@@ -1934,6 +2029,88 @@ mod tests {
             assert!(obs.pending_wal_generations >= 1);
             assert_eq!(obs.row_count, 2);
             assert!(obs.last_updated > 0);
+        });
+    }
+
+    #[test]
+    fn filtered_list_matches_fields_before_pagination() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open(&uri).await.unwrap();
+
+            let mut first = assistant_record("row-a");
+            first.rollout_id = "traj-a".to_string();
+            first.problem_id = "problem-a".to_string();
+            first.policy_version = Some("ckpt-1".to_string());
+            first.include_in_training = Some(true);
+
+            let mut second = assistant_record("row-b");
+            second.rollout_id = "traj-b".to_string();
+            second.problem_id = "problem-b".to_string();
+            second.policy_version = Some("ckpt-2".to_string());
+            second.include_in_training = Some(false);
+
+            let mut artifact = artifact_record("row-c", b"bytes");
+            artifact.rollout_id = "traj-b".to_string();
+            artifact.problem_id = "problem-b".to_string();
+            artifact.policy_version = Some("ckpt-2".to_string());
+            artifact.include_in_training = Some(false);
+
+            store.add(&[first, second, artifact]).await.unwrap();
+
+            let filters = RolloutFilters {
+                policy_version: Some("ckpt-2".to_string()),
+                include_in_training: Some(false),
+                ..Default::default()
+            };
+            let all = store
+                .list_with_filters(None, None, Some(&filters))
+                .await
+                .unwrap();
+            assert_eq!(all.len(), 2);
+            assert!(all
+                .iter()
+                .all(|row| row.policy_version.as_deref() == Some("ckpt-2")));
+            assert!(all.iter().all(|row| row.include_in_training == Some(false)));
+
+            let page = store
+                .list_with_filters(Some(1), Some(1), Some(&filters))
+                .await
+                .unwrap();
+            assert_eq!(page.len(), 1);
+            assert_eq!(page[0].policy_version.as_deref(), Some("ckpt-2"));
+        });
+    }
+
+    #[test]
+    fn filtered_list_supports_dictionary_and_nullable_string_columns() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open(&uri).await.unwrap();
+            store
+                .add(&[
+                    assistant_record("assistant"),
+                    artifact_record("artifact", b"bytes"),
+                ])
+                .await
+                .unwrap();
+
+            let filters = RolloutFilters {
+                role: Some(ROLE_ARTIFACT.to_string()),
+                artifact_type: Some("excel_grade_screenshot".to_string()),
+                ..Default::default()
+            };
+            let rows = store
+                .list_with_filters(None, None, Some(&filters))
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].id, "artifact");
+            assert!(rows[0].binary_payload.is_none());
         });
     }
 
