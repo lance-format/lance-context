@@ -849,7 +849,7 @@ pub struct ExperimentSummary {
     pub name: String,
     /// Physical dataset URI.
     pub uri: String,
-    /// Base-table logical row count as of the last scan.
+    /// Logical row count across the base table and all flushed MemWAL shards.
     pub row_count: i64,
     /// Base-table fragment count as of the last scan.
     pub fragment_count: i64,

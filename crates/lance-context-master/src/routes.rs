@@ -66,20 +66,17 @@ pub async fn get_experiment(
     if params.fresh {
         // Recompute this one experiment now, updating the stats table as a
         // side effect, then read it back.
-        let entries = state
+        let entry = state
             .registry
             .write()
             .await
-            .list()
+            .get(&name)
             .await
-            .map_err(MasterError::from_lance)?;
-        if !entries.iter().any(|e| e.name == name) {
-            return Err(MasterError::NotFound(format!(
-                "experiment '{}' does not exist",
-                name
-            )));
-        }
-        scanner::scan_once(&state)
+            .map_err(MasterError::from_lance)?
+            .ok_or_else(|| {
+                MasterError::NotFound(format!("experiment '{}' does not exist", name))
+            })?;
+        scanner::refresh_one(&state, &entry.name, &entry.uri)
             .await
             .map_err(MasterError::from_lance)?;
     }
@@ -284,5 +281,48 @@ mod tests {
         )
         .await;
         assert!(matches!(res, Err(MasterError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn fresh_detail_refreshes_only_requested_experiment() {
+        let dir = TempDir::new().unwrap();
+        let state = MasterState::new(test_config(&dir)).await.unwrap();
+
+        for name in ["target", "other"] {
+            let uri = state.rollout_uri(name);
+            RolloutStore::open(&uri).await.unwrap();
+            state
+                .registry
+                .write()
+                .await
+                .upsert(name, &uri)
+                .await
+                .unwrap();
+        }
+
+        let Json(detail) = get_experiment(
+            State(state.clone()),
+            Path("target".to_string()),
+            Query(DetailParams { fresh: true }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(detail.summary.name, "target");
+        assert!(state
+            .stats
+            .lock()
+            .await
+            .get("target")
+            .await
+            .unwrap()
+            .is_some());
+        assert!(state
+            .stats
+            .lock()
+            .await
+            .get("other")
+            .await
+            .unwrap()
+            .is_none());
     }
 }

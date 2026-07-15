@@ -60,7 +60,7 @@ use arrow_array::{
 };
 use arrow_schema::{ArrowError, DataType, Field, Schema, TimeUnit};
 use chrono::{DateTime, Utc};
-use futures::TryStreamExt;
+use futures::{stream, StreamExt, TryStreamExt};
 use lance::dataset::mem_wal::{
     DatasetMemWalExt, LsmScanner, ShardManifestStore, ShardSnapshot, ShardWriterConfig,
 };
@@ -85,13 +85,17 @@ use crate::store::{
 /// shard state (mirrors the constant used by `ContextStore`).
 const DEFAULT_MANIFEST_SCAN_BATCH_SIZE: usize = 16;
 
-/// Cheap, read-only observability snapshot of a rollout store's base table.
+/// Maximum number of shard manifests or flushed-generation datasets opened
+/// concurrently while collecting observability metrics.
+const DEFAULT_OBSERVE_CONCURRENCY: usize = 16;
+
+/// Read-only observability snapshot of a rollout store.
 ///
-/// Produced by [`RolloutStore::observe`] from dataset metadata (no full scan).
+/// Produced by [`RolloutStore::observe`] from base-table and MemWAL metadata.
 /// Consumed by the control-plane stats scanner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RolloutObservation {
-    /// Logical row count of the base table (fragment metadata, cheap).
+    /// Logical row count across the base table and every flushed MemWAL shard.
     pub row_count: i64,
     /// Number of fragments in the base table.
     pub fragment_count: i64,
@@ -99,7 +103,7 @@ pub struct RolloutObservation {
     pub version: u64,
     /// Manifest timestamp, Unix milliseconds — when the base table last changed.
     pub last_updated: i64,
-    /// Flushed MemWAL generations pending merge for this instance's shard.
+    /// Flushed MemWAL generations pending merge across all shards.
     pub pending_wal_generations: i64,
 }
 
@@ -651,38 +655,42 @@ impl RolloutStore {
     }
 
     /// Number of flushed MemWAL generations pending merge into the base table
-    /// for this instance's own shard. `0` when the shard has no manifest yet.
+    /// across all shards. `0` when no shard has a manifest yet.
     ///
     /// Read-only: unlike [`Self::cleanup_own_shard`] it never merges. Used by the
     /// control-plane stats scanner to surface read-amplification pressure.
     pub async fn pending_wal_generations(&self) -> LanceResult<usize> {
-        let object_store = self.dataset.object_store(None).await?;
-        let branch_location = self.dataset.branch_location();
-        let manifest_store = ShardManifestStore::new(
-            object_store,
-            &branch_location.path,
-            self.write_shard,
-            DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
-        );
-        match manifest_store.read_latest().await? {
-            Some(manifest) => Ok(manifest.flushed_generations.len()),
-            None => Ok(0),
-        }
+        Ok(self
+            .wal_shard_snapshots()
+            .await?
+            .iter()
+            .map(|snapshot| snapshot.flushed_generations.len())
+            .sum())
     }
 
-    /// Snapshot cheap, read-only observability metrics for the base table.
+    /// Snapshot read-only observability metrics for the rollout store.
     ///
-    /// All fields come from dataset metadata (manifest + fragment counts), not a
-    /// full table scan: `row_count` and `fragment_count` read fragment metadata,
-    /// `version`/`last_updated` come from the manifest. `pending_wal_generations`
-    /// reads this instance's shard manifest. Intended for the control-plane stats
-    /// scanner, which opens each store read-only and records the result.
+    /// `row_count` combines base-table fragment metadata with row counts from
+    /// every flushed generation in every MemWAL shard. Generation datasets are
+    /// opened concurrently and counted from their fragment metadata; rollout
+    /// IDs are append-only, so summing those immutable generations preserves the
+    /// store's logical row count without scanning payload columns.
+    ///
+    /// `fragment_count` intentionally remains the base-table fragment count:
+    /// master-driven compaction only rewrites the shared base table, while each
+    /// writer owns and merges its own WAL shard.
     pub async fn observe(&self) -> LanceResult<RolloutObservation> {
-        let row_count = self.dataset.count_rows(None).await? as i64;
+        let shard_snapshots = self.wal_shard_snapshots().await?;
+        let base_rows = self.dataset.count_rows(None).await? as u64;
+        let pending_rows = self.pending_wal_rows(&shard_snapshots).await?;
+        let row_count = (base_rows + pending_rows) as i64;
         let fragment_count = self.dataset.count_fragments() as i64;
         let version = self.dataset.manifest.version;
         let last_updated = self.dataset.manifest.timestamp().timestamp_millis();
-        let pending_wal_generations = self.pending_wal_generations().await? as i64;
+        let pending_wal_generations = shard_snapshots
+            .iter()
+            .map(|snapshot| snapshot.flushed_generations.len() as i64)
+            .sum();
         Ok(RolloutObservation {
             row_count,
             fragment_count,
@@ -854,36 +862,89 @@ impl RolloutStore {
     /// every other instance's flushed appends — reads are not pinned to the
     /// writing instance. Deduplicates by `id`.
     async fn lsm_scanner(&self) -> LanceResult<LsmScanner> {
-        let object_store = self.dataset.object_store(None).await?;
-        let branch_location = self.dataset.branch_location();
-        let shard_ids = self.dataset.list_mem_wal_latest_shard_ids().await?;
-
-        let mut shard_snapshots = Vec::with_capacity(shard_ids.len());
-        for shard_id in shard_ids {
-            let manifest_store = ShardManifestStore::new(
-                object_store.clone(),
-                &branch_location.path,
-                shard_id,
-                DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
-            );
-            let Some(manifest) = manifest_store.read_latest().await? else {
-                continue;
-            };
-
-            let mut snapshot = ShardSnapshot::new(shard_id)
-                .with_spec_id(manifest.shard_spec_id)
-                .with_current_generation(manifest.current_generation);
-            for flushed in manifest.flushed_generations {
-                snapshot = snapshot.with_flushed_generation(flushed.generation, flushed.path);
-            }
-            shard_snapshots.push(snapshot);
-        }
+        let shard_snapshots = self.wal_shard_snapshots().await?;
 
         Ok(LsmScanner::new(
             Arc::new(self.dataset.clone()),
             shard_snapshots,
             vec!["id".to_string()],
         ))
+    }
+
+    /// Read the latest manifest for every MemWAL shard. Manifest reads are
+    /// bounded-concurrent so stores with many writer instances do not pay one
+    /// object-store round trip per shard serially.
+    async fn wal_shard_snapshots(&self) -> LanceResult<Vec<ShardSnapshot>> {
+        let object_store = self.dataset.object_store(None).await?;
+        let branch_path = self.dataset.branch_location().path.clone();
+        let shard_ids = self.dataset.list_mem_wal_latest_shard_ids().await?;
+
+        let snapshots: Vec<Option<ShardSnapshot>> = stream::iter(shard_ids)
+            .map(|shard_id| {
+                let object_store = object_store.clone();
+                let branch_path = branch_path.clone();
+                async move {
+                    let manifest_store = ShardManifestStore::new(
+                        object_store,
+                        &branch_path,
+                        shard_id,
+                        DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
+                    );
+                    let Some(manifest) = manifest_store.read_latest().await? else {
+                        return Ok(None);
+                    };
+
+                    let mut snapshot = ShardSnapshot::new(shard_id)
+                        .with_spec_id(manifest.shard_spec_id)
+                        .with_current_generation(manifest.current_generation);
+                    for flushed in manifest.flushed_generations {
+                        snapshot =
+                            snapshot.with_flushed_generation(flushed.generation, flushed.path);
+                    }
+                    Ok::<_, LanceError>(Some(snapshot))
+                }
+            })
+            .buffer_unordered(DEFAULT_OBSERVE_CONCURRENCY)
+            .try_collect()
+            .await?;
+
+        Ok(snapshots.into_iter().flatten().collect())
+    }
+
+    /// Count rows in all immutable flushed-generation datasets using metadata
+    /// reads rather than a payload scan.
+    async fn pending_wal_rows(&self, snapshots: &[ShardSnapshot]) -> LanceResult<u64> {
+        let base_uri = self.dataset.uri().trim_end_matches('/').to_string();
+        let generation_paths: Vec<String> = snapshots
+            .iter()
+            .flat_map(|snapshot| {
+                snapshot.flushed_generations.iter().map(|generation| {
+                    format!(
+                        "{base_uri}/_mem_wal/{}/{}",
+                        snapshot.shard_id, generation.path
+                    )
+                })
+            })
+            .collect();
+        let session = self.dataset.session();
+        let storage_options = self.storage_options.clone();
+
+        stream::iter(generation_paths)
+            .map(|path| {
+                let session = session.clone();
+                let storage_options = storage_options.clone();
+                async move {
+                    let mut builder = DatasetBuilder::from_uri(&path).with_session(session);
+                    if let Some(options) = storage_options {
+                        builder = builder.with_storage_options(options);
+                    }
+                    let dataset = builder.load().await?;
+                    Ok::<_, LanceError>(dataset.count_rows(None).await? as u64)
+                }
+            })
+            .buffer_unordered(DEFAULT_OBSERVE_CONCURRENCY)
+            .try_fold(0_u64, |total, rows| async move { Ok(total + rows) })
+            .await
     }
 
     async fn load_with_options(
@@ -1711,6 +1772,7 @@ mod tests {
             let obs = store.observe().await.unwrap();
             assert!(obs.fragment_count >= 0);
             assert!(obs.pending_wal_generations >= 1);
+            assert_eq!(obs.row_count, 2);
             assert!(obs.last_updated > 0);
         });
     }
@@ -1787,6 +1849,14 @@ mod tests {
             assert_eq!(seen.len(), 2);
             assert!(seen.iter().any(|r| r.id == "a-0"));
             assert!(seen.iter().any(|r| r.id == "b-0"));
+
+            // Observability is independent of the reader's own write shard:
+            // both shards contribute rows and pending generations.
+            let reader = RolloutStore::open(&uri).await.unwrap();
+            let obs = reader.observe().await.unwrap();
+            assert_eq!(obs.row_count, 2);
+            assert_eq!(obs.pending_wal_generations, 2);
+            assert_eq!(obs.fragment_count, 0);
         });
     }
 
