@@ -18,6 +18,63 @@ export interface ExperimentListResponse {
   total: number;
 }
 
+export interface Relationship {
+  target_id: string;
+  relation: string;
+  weight?: number;
+}
+
+export interface RolloutRecord {
+  id: string;
+  rollout_id: string;
+  problem_id: string;
+  dataset?: string;
+  sequence_order: number;
+  role: string;
+  created_at: string;
+  content?: string;
+  content_type: string;
+  input_tokens?: number[];
+  output_tokens?: number[];
+  num_input_tokens?: number;
+  num_output_tokens?: number;
+  output_logprobs?: number[];
+  input_logprobs?: number[];
+  ref_logprobs?: number[];
+  loss_mask?: number[];
+  advantage?: number;
+  reward?: number;
+  raw_reward?: number;
+  grader_id?: string;
+  score?: number;
+  include_in_training?: boolean;
+  exclude_reason?: string;
+  policy_version?: string;
+  relationships?: Relationship[];
+  payload_size?: number;
+  payload_checksum?: string;
+  artifact_type?: string;
+  metadata?: unknown;
+}
+
+export interface RecordFilters {
+  id: string;
+  rollout_id: string;
+  problem_id: string;
+  dataset: string;
+  role: string;
+  policy_version: string;
+  artifact_type: string;
+  include_in_training: string;
+}
+
+export interface ExperimentRecordsResponse {
+  records: RolloutRecord[];
+  has_more: boolean;
+  limit: number;
+  offset: number;
+}
+
 export type CompactJobStatus =
   | { state: "queued" }
   | { state: "running" }
@@ -53,6 +110,29 @@ export async function getExperiment(
 ): Promise<{ summary?: ExperimentSummary } & ExperimentSummary> {
   const q = fresh ? "?fresh=true" : "";
   return json(await fetch(`${API}/experiments/${encodeURIComponent(name)}${q}`));
+}
+
+export async function listExperimentRecords(
+  name: string,
+  filters: RecordFilters,
+  limit: number,
+  offset: number,
+): Promise<ExperimentRecordsResponse> {
+  const params = new URLSearchParams();
+  params.set("limit", String(limit));
+  params.set("offset", String(offset));
+  for (const [key, value] of Object.entries(filters)) {
+    if (value) params.set(key, value);
+  }
+  return json(
+    await fetch(
+      `${API}/experiments/${encodeURIComponent(name)}/records?${params.toString()}`,
+    ),
+  );
+}
+
+export function experimentBlobUrl(name: string, id: string): string {
+  return `${API}/experiments/${encodeURIComponent(name)}/records/${encodeURIComponent(id)}/blob`;
 }
 
 export async function triggerCompaction(name: string): Promise<CompactJobStatus> {
