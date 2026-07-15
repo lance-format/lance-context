@@ -463,7 +463,8 @@ fn rollout_record_from_add_request(r: &AddRolloutRequest) -> RolloutRecord {
     }
 }
 
-fn rollout_record_to_dto(r: RolloutRecord) -> RolloutRecordDto {
+#[must_use]
+pub fn rollout_record_to_dto(r: RolloutRecord) -> RolloutRecordDto {
     RolloutRecordDto {
         id: r.id,
         rollout_id: r.rollout_id,

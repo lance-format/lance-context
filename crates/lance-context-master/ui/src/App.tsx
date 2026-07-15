@@ -1,14 +1,18 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useState } from "react";
+import { Fragment, useEffect, useState, type FormEvent } from "react";
 import {
   compactionStatus,
   enqueueTask,
+  experimentBlobUrl,
   getExperiment,
+  listExperimentRecords,
   listExperiments,
   listTasks,
   triggerCompaction,
   type CompactJobStatus,
   type ExperimentSummary,
+  type RecordFilters,
+  type RolloutRecord,
   type TaskRecord,
   type TaskState,
 } from "./api";
@@ -64,6 +68,30 @@ function CloseIcon() {
   return (
     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
       <path d="M18 6 6 18M6 6l12 12" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function DownloadIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+      <path d="M12 3v12m0 0 5-5m-5 5-5-5M5 21h14" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+function ChevronIcon({ open }: { open: boolean }) {
+  return (
+    <svg
+      width="14"
+      height="14"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      className={open ? "chevron chevron--open" : "chevron"}
+    >
+      <path d="m9 18 6-6-6-6" strokeLinecap="round" strokeLinejoin="round" />
     </svg>
   );
 }
@@ -184,11 +212,375 @@ function Metric({ label, value, wide }: { label: string; value: string; wide?: b
   );
 }
 
+const EMPTY_RECORD_FILTERS: RecordFilters = {
+  id: "",
+  rollout_id: "",
+  problem_id: "",
+  dataset: "",
+  role: "",
+  policy_version: "",
+  artifact_type: "",
+  include_in_training: "",
+};
+
+function fmtBytes(bytes: number): string {
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${bytes} B`;
+}
+
+function preview(content: string | undefined): string {
+  if (!content) return "—";
+  return content.length > 120 ? `${content.slice(0, 117)}…` : content;
+}
+
+function JsonBlock({ value }: { value: unknown }) {
+  return <pre className="json-block">{JSON.stringify(value, null, 2)}</pre>;
+}
+
+function RecordDetails({ record, name }: { record: RolloutRecord; name: string }) {
+  return (
+    <div className="record-detail">
+      <div className="record-detail__grid">
+        <div>
+          <span>ID</span>
+          <code>{record.id}</code>
+        </div>
+        <div>
+          <span>Rollout ID</span>
+          <code>{record.rollout_id}</code>
+        </div>
+        <div>
+          <span>Problem ID</span>
+          <code>{record.problem_id}</code>
+        </div>
+        <div>
+          <span>Dataset</span>
+          <code>{record.dataset ?? "—"}</code>
+        </div>
+        <div>
+          <span>Content type</span>
+          <code>{record.content_type}</code>
+        </div>
+        <div>
+          <span>Sequence</span>
+          <code>{record.sequence_order}</code>
+        </div>
+        <div>
+          <span>Input tokens</span>
+          <code>{record.num_input_tokens ?? record.input_tokens?.length ?? "—"}</code>
+        </div>
+        <div>
+          <span>Output tokens</span>
+          <code>{record.num_output_tokens ?? record.output_tokens?.length ?? "—"}</code>
+        </div>
+        <div>
+          <span>Training</span>
+          <code>
+            {record.include_in_training == null
+              ? "—"
+              : record.include_in_training
+                ? "included"
+                : "excluded"}
+          </code>
+        </div>
+        <div>
+          <span>Policy</span>
+          <code>{record.policy_version ?? "—"}</code>
+        </div>
+        <div>
+          <span>Artifact type</span>
+          <code>{record.artifact_type ?? "—"}</code>
+        </div>
+        <div>
+          <span>Checksum</span>
+          <code>{record.payload_checksum ?? "—"}</code>
+        </div>
+      </div>
+
+      {record.content && (
+        <div className="record-detail__section">
+          <span>Content</span>
+          <pre>{record.content}</pre>
+        </div>
+      )}
+      {record.exclude_reason && (
+        <div className="record-detail__section">
+          <span>Exclude reason</span>
+          <p>{record.exclude_reason}</p>
+        </div>
+      )}
+      {record.metadata != null && (
+        <div className="record-detail__section">
+          <span>Metadata</span>
+          <JsonBlock value={record.metadata} />
+        </div>
+      )}
+      {(record.relationships?.length ?? 0) > 0 && (
+        <div className="record-detail__section">
+          <span>Relationships</span>
+          <JsonBlock value={record.relationships} />
+        </div>
+      )}
+      {(record.input_tokens || record.output_tokens || record.loss_mask) && (
+        <div className="record-detail__section">
+          <span>Token data</span>
+          <JsonBlock
+            value={{
+              input_tokens: record.input_tokens,
+              output_tokens: record.output_tokens,
+              loss_mask: record.loss_mask,
+              output_logprobs: record.output_logprobs,
+              input_logprobs: record.input_logprobs,
+              ref_logprobs: record.ref_logprobs,
+            }}
+          />
+        </div>
+      )}
+      {record.payload_size != null && (
+        <a className="btn btn--accent blob-download" href={experimentBlobUrl(name, record.id)} download>
+          <DownloadIcon />
+          Download blob ({fmtBytes(record.payload_size)})
+        </a>
+      )}
+    </div>
+  );
+}
+
+function RecordsView({ name }: { name: string }) {
+  const [draft, setDraft] = useState<RecordFilters>({ ...EMPTY_RECORD_FILTERS });
+  const [filters, setFilters] = useState<RecordFilters>({ ...EMPTY_RECORD_FILTERS });
+  const [page, setPage] = useState(0);
+  const [expanded, setExpanded] = useState<string | null>(null);
+  const pageSize = 25;
+  const records = useQuery({
+    queryKey: ["experiment-records", name, filters, page],
+    queryFn: () => listExperimentRecords(name, filters, pageSize, page * pageSize),
+    placeholderData: (previous) => previous,
+  });
+  const rows = records.data?.records ?? [];
+  const hasMore = records.data?.has_more ?? false;
+
+  const setFilter = (key: keyof RecordFilters, value: string) => {
+    setDraft((current) => ({ ...current, [key]: value }));
+  };
+  const apply = (event: FormEvent) => {
+    event.preventDefault();
+    setFilters({ ...draft });
+    setPage(0);
+    setExpanded(null);
+  };
+  const clear = () => {
+    setDraft({ ...EMPTY_RECORD_FILTERS });
+    setFilters({ ...EMPTY_RECORD_FILTERS });
+    setPage(0);
+    setExpanded(null);
+  };
+  const hasFilters = Object.values(filters).some(Boolean);
+
+  return (
+    <div className="records-view">
+      <form className="record-filters" onSubmit={apply}>
+        <label>
+          <span>ID</span>
+          <input value={draft.id} onChange={(event) => setFilter("id", event.target.value)} />
+        </label>
+        <label>
+          <span>Rollout ID</span>
+          <input
+            value={draft.rollout_id}
+            onChange={(event) => setFilter("rollout_id", event.target.value)}
+          />
+        </label>
+        <label>
+          <span>Problem ID</span>
+          <input
+            value={draft.problem_id}
+            onChange={(event) => setFilter("problem_id", event.target.value)}
+          />
+        </label>
+        <label>
+          <span>Dataset</span>
+          <input
+            value={draft.dataset}
+            onChange={(event) => setFilter("dataset", event.target.value)}
+          />
+        </label>
+        <label>
+          <span>Role</span>
+          <select value={draft.role} onChange={(event) => setFilter("role", event.target.value)}>
+            <option value="">Any role</option>
+            <option value="assistant">assistant</option>
+            <option value="tool">tool</option>
+            <option value="grade">grade</option>
+            <option value="artifact">artifact</option>
+            <option value="user">user</option>
+            <option value="system">system</option>
+          </select>
+        </label>
+        <label>
+          <span>Policy version</span>
+          <input
+            value={draft.policy_version}
+            onChange={(event) => setFilter("policy_version", event.target.value)}
+          />
+        </label>
+        <label>
+          <span>Artifact type</span>
+          <input
+            value={draft.artifact_type}
+            onChange={(event) => setFilter("artifact_type", event.target.value)}
+          />
+        </label>
+        <label>
+          <span>Training</span>
+          <select
+            value={draft.include_in_training}
+            onChange={(event) => setFilter("include_in_training", event.target.value)}
+          >
+            <option value="">Any</option>
+            <option value="true">Included</option>
+            <option value="false">Excluded</option>
+          </select>
+        </label>
+        <div className="record-filters__actions">
+          <button className="btn btn--accent" type="submit">
+            Apply
+          </button>
+          <button className="btn btn--ghost" type="button" onClick={clear}>
+            Clear
+          </button>
+        </div>
+      </form>
+
+      <div className="records-summary">
+        <span>
+          {rows.length === 0
+            ? "no records"
+            : `records ${fmtInt(page * pageSize + 1)}–${fmtInt(page * pageSize + rows.length)}`}
+        </span>
+        {hasFilters && <span className="filter-state">filtered</span>}
+        {records.isFetching && <span className="records-sync">syncing</span>}
+      </div>
+
+      <div className="records-table-wrap">
+        {records.isError && <div className="error">{String(records.error)}</div>}
+        {!records.isError && (
+          <table className="records-table">
+            <thead>
+              <tr>
+                <th aria-label="expand" />
+                <th>ID</th>
+                <th>Rollout</th>
+                <th>Role</th>
+                <th>Content</th>
+                <th className="num">Reward / score</th>
+                <th>Policy</th>
+                <th>Created</th>
+                <th>Blob</th>
+              </tr>
+            </thead>
+            <tbody>
+              {records.isLoading &&
+                Array.from({ length: 6 }).map((_, index) => (
+                  <tr key={index}>
+                    {Array.from({ length: 9 }).map((__, cell) => (
+                      <td key={cell}>
+                        <div className="skeleton" />
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              {!records.isLoading &&
+                rows.map((record) => {
+                  const open = expanded === record.id;
+                  const signal = record.score ?? record.reward;
+                  return (
+                    <Fragment key={record.id}>
+                      <tr className={open ? "record-row record-row--open" : "record-row"}>
+                        <td>
+                          <button
+                            className="record-expand"
+                            onClick={() => setExpanded(open ? null : record.id)}
+                            aria-label={open ? "collapse record" : "expand record"}
+                          >
+                            <ChevronIcon open={open} />
+                          </button>
+                        </td>
+                        <td>
+                          <button className="record-id" onClick={() => setExpanded(open ? null : record.id)}>
+                            {record.id}
+                          </button>
+                        </td>
+                        <td className="mono muted">{record.rollout_id}</td>
+                        <td>
+                          <span className={`role role--${record.role}`}>{record.role}</span>
+                        </td>
+                        <td className="record-content" title={record.content}>
+                          {preview(record.content)}
+                        </td>
+                        <td className="num mono">{signal == null ? "—" : signal.toFixed(3)}</td>
+                        <td className="mono muted">{record.policy_version ?? "—"}</td>
+                        <td className="mono muted">{fmtTime(Date.parse(record.created_at))}</td>
+                        <td>
+                          {record.payload_size != null ? (
+                            <a
+                              className="iconbtn iconbtn--inline"
+                              href={experimentBlobUrl(name, record.id)}
+                              download
+                              title={`Download ${fmtBytes(record.payload_size)}`}
+                              aria-label="download blob"
+                            >
+                              <DownloadIcon />
+                            </a>
+                          ) : (
+                            <span className="muted">—</span>
+                          )}
+                        </td>
+                      </tr>
+                      {open && (
+                        <tr className="record-detail-row">
+                          <td colSpan={9}>
+                            <RecordDetails record={record} name={name} />
+                          </td>
+                        </tr>
+                      )}
+                    </Fragment>
+                  );
+                })}
+            </tbody>
+          </table>
+        )}
+        {!records.isLoading && !records.isError && rows.length === 0 && (
+          <div className="empty">No rollout records match these filters.</div>
+        )}
+      </div>
+
+      {(page > 0 || hasMore) && (
+        <div className="pager records-pager">
+          <span className="pager__info">page {page + 1}</span>
+          <button className="btn btn--ghost" disabled={page === 0} onClick={() => setPage(page - 1)}>
+            ← Prev
+          </button>
+          <button
+            className="btn btn--ghost"
+            disabled={!hasMore}
+            onClick={() => setPage(page + 1)}
+          >
+            Next →
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function Drawer({ name }: { name: string }) {
   const select = useUiStore((s) => s.select);
+  const [tab, setTab] = useState<"records" | "overview">("records");
   const detail = useQuery({
     queryKey: ["experiment", name],
-    queryFn: () => getExperiment(name, true),
+    queryFn: () => getExperiment(name),
   });
   const d = detail.data;
 
@@ -215,14 +607,34 @@ function Drawer({ name }: { name: string }) {
           </button>
         </div>
 
+        <div className="drawer__tabs" role="tablist">
+          <button
+            className={tab === "records" ? "drawer__tab drawer__tab--active" : "drawer__tab"}
+            onClick={() => setTab("records")}
+            role="tab"
+            aria-selected={tab === "records"}
+          >
+            Records
+          </button>
+          <button
+            className={tab === "overview" ? "drawer__tab drawer__tab--active" : "drawer__tab"}
+            onClick={() => setTab("overview")}
+            role="tab"
+            aria-selected={tab === "overview"}
+          >
+            Overview
+          </button>
+        </div>
+
         <div className="drawer__body">
-          {detail.isLoading && (
+          {tab === "overview" && detail.isLoading && (
             <div className="loading">
               <span className="spinner" />
               loading experiment…
             </div>
           )}
-          {d && (
+          {tab === "records" && <RecordsView name={name} />}
+          {tab === "overview" && d && (
             <>
               <div className="section-label">Storage</div>
               <div className="metric-grid">
@@ -238,10 +650,12 @@ function Drawer({ name }: { name: string }) {
           )}
         </div>
 
-        <div className="drawer__actions">
-          <CompactButton name={name} variant="accent" />
-          <MergeWalButton name={name} />
-        </div>
+        {tab === "overview" && (
+          <div className="drawer__actions">
+            <CompactButton name={name} variant="accent" />
+            <MergeWalButton name={name} />
+          </div>
+        )}
       </aside>
     </>
   );
@@ -496,7 +910,7 @@ export function App() {
         </>
       )}
 
-      {selected && <Drawer name={selected} />}
+      {selected && <Drawer key={selected} name={selected} />}
     </div>
   );
 }

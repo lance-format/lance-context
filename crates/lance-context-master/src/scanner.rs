@@ -36,7 +36,15 @@ pub async fn scan_once(state: &Arc<MasterState>) -> lance::Result<usize> {
     let observed: Vec<StatRow> = stream::iter(entries)
         .map(|entry| {
             let state = state.clone();
-            async move { observe_one(&state, &entry.name, &entry.uri).await }
+            async move {
+                match observe_one(&state, &entry.name, &entry.uri).await {
+                    Ok(row) => Some(row),
+                    Err(e) => {
+                        tracing::warn!(store = %entry.name, error = %e, "scan: observe failed");
+                        None
+                    }
+                }
+            }
         })
         .buffer_unordered(concurrency)
         .filter_map(|row| async move { row })
@@ -78,30 +86,26 @@ pub async fn scan_once(state: &Arc<MasterState>) -> lance::Result<usize> {
 
 /// Open one experiment read-only, observe it, and build its stats row. Preserves
 /// `last_compaction`/`total_compactions` from any existing stats row. Returns
-/// `None` (logged) on any error or timeout.
-async fn observe_one(state: &Arc<MasterState>, name: &str, uri: &str) -> Option<StatRow> {
+/// an error on open/observe failure or timeout.
+async fn observe_one(state: &Arc<MasterState>, name: &str, uri: &str) -> lance::Result<StatRow> {
     let opts = RolloutStoreOptions::default();
     let open = RolloutStore::open_existing_with_options(uri, opts);
     let store = match tokio::time::timeout(OBSERVE_TIMEOUT, open).await {
         Ok(Ok(store)) => store,
-        Ok(Err(e)) => {
-            tracing::warn!(store = %name, error = %e, "scan: open failed");
-            return None;
-        }
+        Ok(Err(e)) => return Err(e),
         Err(_) => {
-            tracing::warn!(store = %name, "scan: open timed out");
-            return None;
+            return Err(lance::Error::io(format!(
+                "open timed out for store '{name}'"
+            )))
         }
     };
     let obs = match tokio::time::timeout(OBSERVE_TIMEOUT, store.observe()).await {
         Ok(Ok(obs)) => obs,
-        Ok(Err(e)) => {
-            tracing::warn!(store = %name, error = %e, "scan: observe failed");
-            return None;
-        }
+        Ok(Err(e)) => return Err(e),
         Err(_) => {
-            tracing::warn!(store = %name, "scan: observe timed out");
-            return None;
+            return Err(lance::Error::io(format!(
+                "observe timed out for store '{name}'"
+            )));
         }
     };
 
@@ -114,7 +118,7 @@ async fn observe_one(state: &Arc<MasterState>, name: &str, uri: &str) -> Option<
         }
     };
 
-    Some(StatRow {
+    Ok(StatRow {
         name: name.to_string(),
         uri: uri.to_string(),
         row_count: obs.row_count,
@@ -125,6 +129,12 @@ async fn observe_one(state: &Arc<MasterState>, name: &str, uri: &str) -> Option<
         total_compactions,
         scanned_at: Utc::now().timestamp_millis(),
     })
+}
+
+/// Refresh one experiment immediately and persist its new stats row.
+pub async fn refresh_one(state: &Arc<MasterState>, name: &str, uri: &str) -> lance::Result<()> {
+    let row = observe_one(state, name, uri).await?;
+    state.stats.lock().await.upsert(&row).await
 }
 
 /// Spawn the periodic scanner. Returns `None` when the interval is `0`.

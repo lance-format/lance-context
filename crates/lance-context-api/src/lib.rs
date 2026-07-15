@@ -849,7 +849,7 @@ pub struct ExperimentSummary {
     pub name: String,
     /// Physical dataset URI.
     pub uri: String,
-    /// Base-table logical row count as of the last scan.
+    /// Logical row count across the base table and all flushed MemWAL shards.
     pub row_count: i64,
     /// Base-table fragment count as of the last scan.
     pub fragment_count: i64,
@@ -881,6 +881,16 @@ pub struct ExperimentListResponse {
     /// Total number of experiments matching the (optional) search filter,
     /// ignoring pagination.
     pub total: i64,
+}
+
+/// Paginated rollout records for one experiment in the master data browser.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExperimentRecordsResponse {
+    pub records: Vec<RolloutRecordDto>,
+    /// Whether another page exists after this response.
+    pub has_more: bool,
+    pub limit: usize,
+    pub offset: usize,
 }
 
 /// State of a manual or automatic compaction job for one experiment.
