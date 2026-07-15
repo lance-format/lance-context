@@ -1111,7 +1111,8 @@ mod tests {
             started_at: Some(2),
             finished_at: Some(3),
         };
-        let back: TaskRecord = serde_json::from_str(&serde_json::to_string(&done).unwrap()).unwrap();
+        let back: TaskRecord =
+            serde_json::from_str(&serde_json::to_string(&done).unwrap()).unwrap();
         assert_eq!(back, done);
     }
 

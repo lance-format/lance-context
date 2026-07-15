@@ -473,7 +473,10 @@ pub async fn merge_wal(
 ) -> Result<Json<MergeWalResponse>, AppError> {
     let store_lock = state.get_or_open_rollout_store(&name).await?;
     let mut store = store_lock.write().await;
-    let reclaimed = store.cleanup_own_shard().await.map_err(AppError::from_lance)?;
+    let reclaimed = store
+        .cleanup_own_shard()
+        .await
+        .map_err(AppError::from_lance)?;
     if reclaimed > 0 {
         ::metrics::counter!("rollout_wal_cleanup_total", "result" => "merged").increment(1);
         ::metrics::counter!("rollout_wal_generations_reclaimed_total").increment(reclaimed as u64);

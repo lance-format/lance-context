@@ -231,7 +231,8 @@ fn task_to_compact_status(task: &TaskRecord) -> CompactJobStatus {
         TaskState::Queued => CompactJobStatus::Queued,
         TaskState::Running => CompactJobStatus::Running,
         TaskState::Done => {
-            let (fragments_removed, fragments_added) = parse_fragment_detail(task.detail.as_deref());
+            let (fragments_removed, fragments_added) =
+                parse_fragment_detail(task.detail.as_deref());
             CompactJobStatus::Done {
                 fragments_removed,
                 fragments_added,
