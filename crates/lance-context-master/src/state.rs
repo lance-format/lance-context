@@ -1,9 +1,9 @@
 //! Shared master state: durable registry + stats table.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use lance_context_api::CompactJobStatus;
+use lance_context_api::TaskRecord;
 use lance_context_core::{join_uri, RolloutRegistry};
 use tokio::sync::{mpsc, Mutex, RwLock};
 
@@ -27,14 +27,21 @@ pub struct MasterState {
     pub base_uri: String,
     /// Effective configuration.
     pub config: MasterConfig,
-    /// Enqueues an experiment name for (serial) compaction. Both automatic
-    /// sweeps and manual API triggers push here, so compaction has a single
-    /// serial driver — never two concurrent `Rewrite`s.
-    pub compact_tx: mpsc::UnboundedSender<String>,
+    /// Enqueues a task id for the scheduler. Both automatic sweeps and manual
+    /// API triggers push here; the scheduler drains it with bounded concurrency
+    /// (see [`crate::scheduler`]).
+    pub task_tx: mpsc::UnboundedSender<String>,
     /// Receiver half, taken once by [`crate::scheduler::spawn_scheduler`].
-    pub compact_rx: Mutex<Option<mpsc::UnboundedReceiver<String>>>,
-    /// Last-known compaction job state per experiment, for the status endpoint.
-    pub jobs: Mutex<HashMap<String, CompactJobStatus>>,
+    pub task_rx: Mutex<Option<mpsc::UnboundedReceiver<String>>>,
+    /// Every task (queued / running / terminal) keyed by task id, for the queue
+    /// API and UI. Retained after completion so the UI can show recent history.
+    pub tasks: Mutex<HashMap<String, TaskRecord>>,
+    /// Experiment names with a compaction currently executing — the per-name
+    /// serial gate. A `Compact` task must not run while another `Compact` on the
+    /// same experiment is in flight (two `Rewrite`s on one dataset conflict).
+    pub inflight_compacts: Mutex<HashSet<String>>,
+    /// Shared HTTP client for fanning `MergeWal` tasks out to worker endpoints.
+    pub http: reqwest::Client,
 }
 
 impl MasterState {
@@ -52,15 +59,17 @@ impl MasterState {
             );
         }
         let stats = StatsStore::open_or_create(&stats_uri, None).await?;
-        let (compact_tx, compact_rx) = mpsc::unbounded_channel();
+        let (task_tx, task_rx) = mpsc::unbounded_channel();
         Ok(Arc::new(Self {
             registry: RwLock::new(registry),
             stats: Mutex::new(stats),
             base_uri,
             config,
-            compact_tx,
-            compact_rx: Mutex::new(Some(compact_rx)),
-            jobs: Mutex::new(HashMap::new()),
+            task_tx,
+            task_rx: Mutex::new(Some(task_rx)),
+            tasks: Mutex::new(HashMap::new()),
+            inflight_compacts: Mutex::new(HashSet::new()),
+            http: reqwest::Client::new(),
         }))
     }
 
@@ -87,6 +96,8 @@ mod tests {
             compaction_interval_secs: 0,
             min_fragments: 16,
             target_rows_per_fragment: 1_048_576,
+            worker_endpoints: vec![],
+            task_concurrency: 4,
             ui_dir: None,
         }
     }

@@ -153,6 +153,30 @@ body {
   flex: 1;
 }
 
+.tabs {
+  display: flex;
+  gap: 4px;
+  margin-right: 16px;
+}
+.tab {
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--text-muted);
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 5px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.tab:hover {
+  color: var(--text);
+}
+.tab--active {
+  color: var(--text);
+  border-color: var(--border);
+  background: var(--surface, rgba(255, 255, 255, 0.04));
+}
+
 .live {
   display: flex;
   align-items: center;

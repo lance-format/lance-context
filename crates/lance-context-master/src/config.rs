@@ -40,6 +40,22 @@ pub struct MasterConfig {
     #[arg(long, env = "TARGET_ROWS_PER_FRAGMENT", default_value_t = 1_048_576)]
     pub target_rows_per_fragment: usize,
 
+    /// Data-plane worker base URLs (comma-separated), e.g.
+    /// `http://rollout-0:3000,http://rollout-1:3000`. A `MergeWal` task fans out
+    /// to every endpoint so each worker merges its own MemWAL shard (the master
+    /// cannot merge a shard it does not own without fencing the live writer).
+    /// Empty (the default) means WAL-merge tasks have nowhere to go and fail
+    /// fast with a clear message.
+    #[arg(long, env = "WORKER_ENDPOINTS", value_delimiter = ',')]
+    pub worker_endpoints: Vec<String>,
+
+    /// Maximum number of scheduler tasks executing concurrently. Compaction of
+    /// the *same* experiment is always serialized regardless of this value
+    /// (two `Rewrite`s on one dataset conflict); this only bounds how many
+    /// *distinct* experiments/tasks run at once.
+    #[arg(long, env = "TASK_CONCURRENCY", default_value_t = 4)]
+    pub task_concurrency: usize,
+
     /// Directory of built UI assets to serve. When unset, only the JSON API is
     /// exposed.
     #[arg(long, env = "UI_DIR")]

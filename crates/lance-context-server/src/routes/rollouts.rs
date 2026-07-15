@@ -26,6 +26,13 @@ use crate::state::AppState;
 /// raises the ceiling well above it while still bounding memory.
 pub const MAX_ROLLOUT_UPLOAD_BYTES: usize = 1024 * 1024 * 1024;
 
+/// Response for the internal WAL-merge trigger: how many flushed generations
+/// this worker's shard folded into the base table.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct MergeWalResponse {
+    pub reclaimed: usize,
+}
+
 pub async fn create_rollout_store(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateRolloutStoreRequest>,
@@ -452,6 +459,31 @@ pub async fn compact_rollout_stats(
     }))
 }
 
+/// Trigger a WAL merge on this worker's own shard for `name`.
+///
+/// This is the worker half of the master-driven "MergeWal" task: the master
+/// cannot merge a shard it does not own without fencing the live writer, so it
+/// fans this call out to every worker and each worker folds *its own* flushed
+/// MemWAL generations into the base table via [`RolloutStore::cleanup_own_shard`]
+/// (which merges whatever is pending, no count threshold). A worker whose shard
+/// has nothing pending simply reports `reclaimed: 0`.
+pub async fn merge_wal(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<MergeWalResponse>, AppError> {
+    let store_lock = state.get_or_open_rollout_store(&name).await?;
+    let mut store = store_lock.write().await;
+    let reclaimed = store
+        .cleanup_own_shard()
+        .await
+        .map_err(AppError::from_lance)?;
+    if reclaimed > 0 {
+        ::metrics::counter!("rollout_wal_cleanup_total", "result" => "merged").increment(1);
+        ::metrics::counter!("rollout_wal_generations_reclaimed_total").increment(reclaimed as u64);
+    }
+    Ok(Json(MergeWalResponse { reclaimed }))
+}
+
 fn content_type_is(content_type: &str, expected: &str) -> bool {
     content_type
         .split(';')
@@ -843,6 +875,45 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, AppError::InvalidRequest(_)));
+    }
+
+    /// The internal merge-wal endpoint folds this worker's pending flushed
+    /// generations into the base table and reports how many it reclaimed. A
+    /// second call with nothing pending is a no-op reporting `0`.
+    #[tokio::test]
+    async fn merge_wal_reclaims_pending_then_is_noop() {
+        let (state, _dir) = rollout_state().await;
+        // One append flushes one generation into this instance's shard.
+        let body = serde_json::to_vec(&AddRolloutsRequest {
+            records: vec![record_with_size("r0", None)],
+        })
+        .unwrap();
+        let _ = add_rollouts(
+            State(state.clone()),
+            Path("rl".to_string()),
+            json_request(body),
+        )
+        .await
+        .expect("append succeeds");
+
+        let Json(first) = merge_wal(State(state.clone()), Path("rl".to_string()))
+            .await
+            .expect("merge succeeds");
+        assert_eq!(first.reclaimed, 1, "one pending generation merged");
+
+        let Json(second) = merge_wal(State(state.clone()), Path("rl".to_string()))
+            .await
+            .expect("second merge succeeds");
+        assert_eq!(second.reclaimed, 0, "nothing left to merge");
+
+        // The row survives the merge, readable exactly once.
+        let Json(got) = get_rollout(
+            State(state.clone()),
+            Path(("rl".to_string(), "r0".to_string())),
+        )
+        .await
+        .unwrap();
+        assert!(got.record.is_some());
     }
 
     /// A second server instance (distinct in-memory cache, shared data dir)

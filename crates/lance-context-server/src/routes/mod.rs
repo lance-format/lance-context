@@ -113,6 +113,10 @@ pub fn router() -> Router<Arc<AppState>> {
             "/api/v1/rollouts/{name}/compact/stats",
             get(rollouts::compact_rollout_stats),
         )
+        .route(
+            "/api/v1/internal/merge-wal/{name}",
+            post(rollouts::merge_wal),
+        )
 }
 
 #[cfg(test)]

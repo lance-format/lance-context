@@ -11,8 +11,9 @@ use axum::{Json, Router};
 use serde::Deserialize;
 
 use lance_context_api::{
-    CompactJobStatus, ExperimentDetail, ExperimentListResponse, ExperimentRecordsResponse,
-    ExperimentSummary,
+    CompactJobStatus, EnqueueTaskRequest, ExperimentDetail, ExperimentListResponse,
+    ExperimentRecordsResponse, ExperimentSummary, TaskKind, TaskListResponse, TaskRecord,
+    TaskState,
 };
 use lance_context_core::{
     rollout_record_to_dto, RolloutFilters, RolloutStore, RolloutStoreOptions,
@@ -205,8 +206,59 @@ pub async fn rescan(
     Ok(Json(serde_json::json!({ "scanned": n })))
 }
 
+/// Map a task's terminal `detail` string back into the fragment counts the
+/// legacy `CompactJobStatus::Done` shape carries. Best-effort: unparsable
+/// details yield zeros (the UI only needs the state to stop polling).
+fn parse_fragment_detail(detail: Option<&str>) -> (usize, usize) {
+    // Detail format: "removed {r} / added {a} fragments".
+    let parse = |s: &str, key: &str| -> usize {
+        s.split_whitespace()
+            .skip_while(|w| *w != key)
+            .nth(1)
+            .and_then(|w| w.parse().ok())
+            .unwrap_or(0)
+    };
+    match detail {
+        Some(d) => (parse(d, "removed"), parse(d, "added")),
+        None => (0, 0),
+    }
+}
+
+/// Project a [`TaskRecord`] into the legacy [`CompactJobStatus`] shape so the
+/// existing compaction UI keeps working while the queue view rolls out.
+fn task_to_compact_status(task: &TaskRecord) -> CompactJobStatus {
+    match task.state {
+        TaskState::Queued => CompactJobStatus::Queued,
+        TaskState::Running => CompactJobStatus::Running,
+        TaskState::Done => {
+            let (fragments_removed, fragments_added) =
+                parse_fragment_detail(task.detail.as_deref());
+            CompactJobStatus::Done {
+                fragments_removed,
+                fragments_added,
+            }
+        }
+        TaskState::Failed => CompactJobStatus::Failed {
+            error: task.error.clone().unwrap_or_default(),
+        },
+    }
+}
+
+/// The most recent `Compact` task for `name`, if any (by `enqueued_at`).
+async fn latest_compact_task(state: &Arc<MasterState>, name: &str) -> Option<TaskRecord> {
+    state
+        .tasks
+        .lock()
+        .await
+        .values()
+        .filter(|t| t.kind == TaskKind::Compact && t.target == name)
+        .max_by_key(|t| t.enqueued_at)
+        .cloned()
+}
+
 /// `POST /api/v1/experiments/{name}/compact` — enqueue a manual compaction.
-/// Returns 202 Accepted with the (possibly de-duped) job status.
+/// Returns 202 Accepted with the (possibly de-duped) job status. Retained for
+/// backward compatibility; internally this is just a `Compact` task.
 pub async fn compact_experiment(
     State(state): State<Arc<MasterState>>,
     Path(name): Path<String>,
@@ -225,8 +277,8 @@ pub async fn compact_experiment(
             name
         )));
     }
-    let status = scheduler::enqueue(&state, &name).await;
-    Ok((StatusCode::ACCEPTED, Json(status)))
+    let task = scheduler::enqueue(&state, TaskKind::Compact, &name).await;
+    Ok((StatusCode::ACCEPTED, Json(task_to_compact_status(&task))))
 }
 
 /// `GET /api/v1/experiments/{name}/compact/status` — latest compaction job
@@ -235,14 +287,51 @@ pub async fn compact_status(
     State(state): State<Arc<MasterState>>,
     Path(name): Path<String>,
 ) -> Json<CompactJobStatus> {
-    let status = state
-        .jobs
-        .lock()
+    match latest_compact_task(&state, &name).await {
+        Some(task) => Json(task_to_compact_status(&task)),
+        None => Json(CompactJobStatus::None),
+    }
+}
+
+/// `POST /api/v1/tasks` — enqueue a task of any kind. Returns 202 Accepted with
+/// the (possibly de-duped) task record.
+pub async fn enqueue_task(
+    State(state): State<Arc<MasterState>>,
+    Json(req): Json<EnqueueTaskRequest>,
+) -> Result<(StatusCode, Json<TaskRecord>), MasterError> {
+    let exists = state
+        .registry
+        .write()
         .await
-        .get(&name)
-        .cloned()
-        .unwrap_or(CompactJobStatus::None);
-    Json(status)
+        .contains(&req.target)
+        .await
+        .map_err(MasterError::from_lance)?;
+    if !exists {
+        return Err(MasterError::NotFound(format!(
+            "experiment '{}' does not exist",
+            req.target
+        )));
+    }
+    let task = scheduler::enqueue(&state, req.kind, &req.target).await;
+    Ok((StatusCode::ACCEPTED, Json(task)))
+}
+
+/// `GET /api/v1/tasks` — all tasks (queue + recent history), newest first.
+pub async fn list_tasks(State(state): State<Arc<MasterState>>) -> Json<TaskListResponse> {
+    let mut tasks: Vec<TaskRecord> = state.tasks.lock().await.values().cloned().collect();
+    tasks.sort_by_key(|t| std::cmp::Reverse(t.enqueued_at));
+    Json(TaskListResponse { tasks })
+}
+
+/// `GET /api/v1/tasks/{id}` — a single task by id.
+pub async fn get_task(
+    State(state): State<Arc<MasterState>>,
+    Path(id): Path<String>,
+) -> Result<Json<TaskRecord>, MasterError> {
+    match state.tasks.lock().await.get(&id).cloned() {
+        Some(task) => Ok(Json(task)),
+        None => Err(MasterError::NotFound(format!("task '{}' not found", id))),
+    }
 }
 
 /// Build the admin API router (mounted under `/api/v1`).
@@ -257,6 +346,8 @@ pub fn api_router() -> Router<Arc<MasterState>> {
         )
         .route("/experiments/{name}/compact", post(compact_experiment))
         .route("/experiments/{name}/compact/status", get(compact_status))
+        .route("/tasks", post(enqueue_task).get(list_tasks))
+        .route("/tasks/{id}", get(get_task))
         .route("/rescan", post(rescan))
 }
 
@@ -325,6 +416,8 @@ mod tests {
             compaction_interval_secs: 0,
             min_fragments: 16,
             target_rows_per_fragment: 1_048_576,
+            worker_endpoints: vec![],
+            task_concurrency: 4,
             ui_dir: None,
         }
     }
