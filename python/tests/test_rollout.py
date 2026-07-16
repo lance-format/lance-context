@@ -179,3 +179,17 @@ def test_list_rejects_invalid_filter_fields(store_uri):
     store = RolloutStore.open(store_uri)
     with pytest.raises(RuntimeError, match="unsupported rollout filter"):
         store.list(filters={"reward": 1.0})
+
+
+def test_get_trajectory_orders_rows(store_uri):
+    store = RolloutStore.open(store_uri)
+    store.add(
+        [
+            {"id": "row-a", "rollout_id": "target", "sequence_order": 2},
+            {"id": "other", "rollout_id": "other", "sequence_order": 0},
+            {"id": "row-b", "rollout_id": "target", "sequence_order": 0},
+        ]
+    )
+
+    rows = store.get_trajectory("target")
+    assert [row["id"] for row in rows] == ["row-b", "row-a"]

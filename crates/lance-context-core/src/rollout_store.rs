@@ -965,6 +965,27 @@ impl RolloutStore {
         Ok(results)
     }
 
+    /// Return one complete trajectory in deterministic message order.
+    pub async fn get_trajectory(&self, rollout_id: &str) -> LanceResult<Vec<RolloutRecord>> {
+        if rollout_id.is_empty() {
+            return Err(LanceError::from(ArrowError::InvalidArgumentError(
+                "rollout_id must not be empty".to_string(),
+            )));
+        }
+
+        let filters = RolloutFilters {
+            rollout_id: Some(rollout_id.to_string()),
+            ..Default::default()
+        };
+        let mut records = self.list_with_filters(None, None, Some(&filters)).await?;
+        records.sort_by(|left, right| {
+            left.sequence_order
+                .cmp(&right.sequence_order)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(records)
+    }
+
     /// Filter and page rollout rows in the LSM execution plan.
     ///
     /// Reads one row beyond the requested page to report `has_more`, avoiding
@@ -2261,6 +2282,54 @@ mod tests {
                 .unwrap();
             assert!(page.has_more);
             assert_eq!(page.records.len(), 1);
+        });
+    }
+
+    #[test]
+    fn trajectory_rows_are_filtered_and_sorted_across_fragments() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    shard_id: Some("trajectory-test".to_string()),
+                    merge_after_generations: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+            let mut later = assistant_record("row-a");
+            later.rollout_id = "target".to_string();
+            later.sequence_order = 2;
+            let mut unrelated = assistant_record("other");
+            unrelated.rollout_id = "other".to_string();
+            store.add(&[later, unrelated]).await.unwrap();
+
+            let mut earlier = assistant_record("row-b");
+            earlier.rollout_id = "target".to_string();
+            earlier.sequence_order = 0;
+            store.add(&[earlier]).await.unwrap();
+
+            assert_eq!(store.observe().await.unwrap().fragment_count, 2);
+            let rows = store.get_trajectory("target").await.unwrap();
+            let ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+            assert_eq!(ids, vec!["row-b", "row-a"]);
+        });
+    }
+
+    #[test]
+    fn trajectory_read_rejects_an_empty_rollout_id() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let store = RolloutStore::open(&uri).await.unwrap();
+            let err = store.get_trajectory("").await.unwrap_err();
+            assert!(err.to_string().contains("rollout_id must not be empty"));
         });
     }
 

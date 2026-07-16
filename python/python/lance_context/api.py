@@ -2594,6 +2594,11 @@ class RolloutStore:
         raw = self._sync.list(limit, offset, _json_dumps(filters, "filters"))
         return [_rollout_record_from_json(r) for r in json.loads(raw)]
 
+    def get_trajectory(self, rollout_id: str) -> list[dict[str, Any]]:
+        """Return one complete trajectory ordered by sequence and row id."""
+        raw = self._sync.get_trajectory(rollout_id)
+        return [_rollout_record_from_json(r) for r in json.loads(raw)]
+
     def get(self, id: str) -> dict[str, Any] | None:
         """Fetch a single rollout row by id, or ``None``."""
         raw = self._sync.get(id)
@@ -2678,6 +2683,14 @@ class AsyncRolloutStore:
         loop = asyncio.get_running_loop()
         raw = await loop.run_in_executor(
             None, lambda: self._sync.list(limit, offset, filters_json)
+        )
+        return [_rollout_record_from_json(r) for r in json.loads(raw)]
+
+    async def get_trajectory(self, rollout_id: str) -> list[dict[str, Any]]:
+        """Return one complete trajectory ordered by sequence and row id."""
+        loop = asyncio.get_running_loop()
+        raw = await loop.run_in_executor(
+            None, lambda: self._sync.get_trajectory(rollout_id)
         )
         return [_rollout_record_from_json(r) for r in json.loads(raw)]
 
