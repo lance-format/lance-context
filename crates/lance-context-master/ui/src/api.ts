@@ -96,6 +96,7 @@ export interface TaskRecord {
   enqueued_at: number;
   started_at?: number | null;
   finished_at?: number | null;
+  depends_on?: string[];
 }
 
 export interface TaskListResponse {
@@ -105,6 +106,7 @@ export interface TaskListResponse {
 export interface EnqueueTaskRequest {
   kind: TaskKind;
   target: string;
+  depends_on?: string[];
 }
 
 const API = "/api/v1";

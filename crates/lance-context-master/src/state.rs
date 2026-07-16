@@ -222,6 +222,7 @@ mod tests {
                     enqueued_at: 1,
                     started_at: (task_state == TaskState::Running).then_some(2),
                     finished_at: (task_state == TaskState::Done).then_some(3),
+                    depends_on: Vec::new(),
                 };
                 state.task_store.put(&task).unwrap();
             }
@@ -265,6 +266,7 @@ mod tests {
                 started_at: None,
                 finished_at: matches!(state, TaskState::Done | TaskState::Failed)
                     .then_some(timestamp),
+                depends_on: Vec::new(),
             };
             store.put(&task).unwrap();
             tasks.insert(id.to_string(), task);

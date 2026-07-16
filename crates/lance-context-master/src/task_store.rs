@@ -127,6 +127,7 @@ mod tests {
             enqueued_at,
             started_at: None,
             finished_at: None,
+            depends_on: Vec::new(),
         }
     }
 
