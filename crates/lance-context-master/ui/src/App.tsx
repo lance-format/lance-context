@@ -161,6 +161,36 @@ function useCompaction(name: string) {
   return { status: s, trigger, busy };
 }
 
+/** "Optimize" trigger — enqueues the full maintenance sequence for one
+ * experiment: merge WAL into the base table, compact its fragments, then build
+ * the ZoneMap index on `id`. Enqueued in that order so the scheduler drains
+ * them merge → compact → index. Used in the experiment list; the detail drawer
+ * keeps the three individual buttons. */
+function OptimizeButton({ name }: { name: string }) {
+  const qc = useQueryClient();
+  const setView = useUiStore((s) => s.setView);
+  const trigger = useMutation({
+    mutationFn: async () => {
+      await enqueueTask({ kind: "merge_wal", target: name });
+      await enqueueTask({ kind: "compact", target: name });
+      await enqueueTask({ kind: "index_id", target: name });
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["tasks"] });
+      setView("tasks");
+    },
+  });
+  return (
+    <button
+      className="btn"
+      onClick={() => trigger.mutate()}
+      disabled={trigger.isPending}
+    >
+      {trigger.isPending ? "Optimizing…" : "Optimize"}
+    </button>
+  );
+}
+
 function CompactButton({ name, variant }: { name: string; variant?: "accent" }) {
   const { status, trigger, busy } = useCompaction(name);
   return (
@@ -195,7 +225,7 @@ function Row({ exp }: { exp: ExperimentSummary }) {
       <td className="muted">{relTime(exp.last_updated)}</td>
       <td className="muted">{relTime(exp.last_compaction)}</td>
       <td style={{ textAlign: "right" }}>
-        <CompactButton name={exp.name} />
+        <OptimizeButton name={exp.name} />
       </td>
     </tr>
   );
