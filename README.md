@@ -135,8 +135,10 @@ crates/lance-context-core    # Rust engine: Context + Rollout stores (no Python 
 crates/lance-context-api     # Shared request/response types (DTOs)
 crates/lance-context-server  # HTTP server for remote access
 crates/lance-context-client  # HTTP client for the server
+crates/lance-context-master  # Control plane, scheduler, and admin UI
 crates/lance-context         # Re-export crate for downstream clients
 python/                      # Python bindings (PyO3) + tests
+deploy/kubernetes/           # Kubernetes master + RocksDB PVC example
 examples/                    # Runnable example projects
 ```
 

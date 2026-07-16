@@ -56,6 +56,22 @@ pub struct MasterConfig {
     #[arg(long, env = "TASK_CONCURRENCY", default_value_t = 4)]
     pub task_concurrency: usize,
 
+    /// Local RocksDB directory for durable scheduler task state. This must be
+    /// backed by persistent local storage in production; it must not be an
+    /// object-store URI or a volume shared by multiple master processes.
+    #[arg(
+        long,
+        env = "TASK_DB_PATH",
+        default_value = "./master-data/tasks.rocksdb"
+    )]
+    pub task_db_path: String,
+
+    /// Maximum number of terminal scheduler tasks retained in RocksDB and the
+    /// queue UI. Queued and running tasks are never pruned, and at least one
+    /// terminal task is retained for status polling.
+    #[arg(long, env = "TASK_HISTORY_LIMIT", default_value_t = 1_000)]
+    pub task_history_limit: usize,
+
     /// Directory of built UI assets to serve. When unset, only the JSON API is
     /// exposed.
     #[arg(long, env = "UI_DIR")]
