@@ -1,7 +1,10 @@
 //! Unified task scheduler.
 //!
-//! The master runs a single scheduler that drains one queue with **bounded
-//! concurrency**. It executes three kinds of task ([`TaskKind`]):
+//! The master runs a single scheduler that drains one durable queue with
+//! **bounded concurrency**. Task records are written to RocksDB before they
+//! enter the in-memory dispatch channel; queued and interrupted tasks are
+//! reloaded after a master restart. It executes three kinds of task
+//! ([`TaskKind`]):
 //!
 //! - **Compact** — rewrites an experiment's base-table fragments. Two `Rewrite`s
 //!   on the *same* dataset conflict in Lance's conflict matrix, so compaction of
@@ -30,7 +33,7 @@ use lance_context_core::{generate_id, CompactionConfig, RolloutStore, RolloutSto
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
-use crate::state::MasterState;
+use crate::state::{prune_terminal_history, MasterState};
 use crate::stats_store::StatRow;
 
 /// Build the [`CompactionConfig`] the scheduler applies, from master config.
@@ -61,7 +64,11 @@ fn kind_label(kind: TaskKind) -> &'static str {
 /// the same target: if one is already `Queued` or `Running`, its record is
 /// returned unchanged and nothing new is enqueued. `MergeWal` tasks are not
 /// de-duped (each fan-out is independent).
-pub async fn enqueue(state: &Arc<MasterState>, kind: TaskKind, target: &str) -> TaskRecord {
+pub async fn enqueue(
+    state: &Arc<MasterState>,
+    kind: TaskKind,
+    target: &str,
+) -> lance::Result<TaskRecord> {
     enqueue_with_deps(state, kind, target, Vec::new()).await
 }
 
@@ -74,15 +81,15 @@ pub async fn enqueue_with_deps(
     kind: TaskKind,
     target: &str,
     depends_on: Vec<String>,
-) -> TaskRecord {
+) -> lance::Result<TaskRecord> {
+    let mut tasks = state.tasks.lock().await;
     if depends_on.is_empty() && matches!(kind, TaskKind::Compact | TaskKind::IndexId) {
-        let tasks = state.tasks.lock().await;
         if let Some(existing) = tasks.values().find(|t| {
             t.kind == kind
                 && t.target == target
                 && matches!(t.state, TaskState::Queued | TaskState::Running)
         }) {
-            return existing.clone();
+            return Ok(existing.clone());
         }
     }
 
@@ -98,23 +105,39 @@ pub async fn enqueue_with_deps(
         finished_at: None,
         depends_on,
     };
-    state
-        .tasks
-        .lock()
-        .await
-        .insert(record.id.clone(), record.clone());
+    state.task_store.put(&record)?;
+    tasks.insert(record.id.clone(), record.clone());
+    drop(tasks);
     // Unbounded send only fails if the receiver was dropped (scheduler gone).
     let _ = state.task_tx.send(record.id.clone());
     metrics::counter!("master_task_enqueued_total", "kind" => kind_label(kind)).increment(1);
     metrics::gauge!("master_task_queue_depth").increment(1.0);
-    record
+    Ok(record)
 }
 
-/// Mutate a task record in place under the lock, if it still exists.
-async fn update_task(state: &Arc<MasterState>, id: &str, f: impl FnOnce(&mut TaskRecord)) {
-    if let Some(rec) = state.tasks.lock().await.get_mut(id) {
-        f(rec);
+/// Persist a task mutation before publishing it to the in-memory cache.
+async fn update_task(
+    state: &Arc<MasterState>,
+    id: &str,
+    f: impl FnOnce(&mut TaskRecord),
+) -> lance::Result<()> {
+    let mut tasks = state.tasks.lock().await;
+    let Some(current) = tasks.get(id) else {
+        return Ok(());
+    };
+    let mut updated = current.clone();
+    f(&mut updated);
+    state.task_store.put(&updated)?;
+    let terminal = matches!(updated.state, TaskState::Done | TaskState::Failed);
+    tasks.insert(id.to_string(), updated);
+    if terminal {
+        prune_terminal_history(
+            &state.task_store,
+            &mut tasks,
+            state.config.task_history_limit,
+        )?;
     }
+    Ok(())
 }
 
 /// Readiness of a task with respect to its declared dependencies.
@@ -161,7 +184,27 @@ async fn run_task(state: &Arc<MasterState>, id: String) {
         t.state = TaskState::Running;
         t.started_at = Some(now_ms());
     })
-    .await;
+    .await
+    .unwrap_or_else(|error| {
+        tracing::error!(task = %id, error = %error, "failed to persist task start");
+    });
+
+    let task_started = state
+        .tasks
+        .lock()
+        .await
+        .get(&id)
+        .is_some_and(|task| task.state == TaskState::Running);
+    if !task_started {
+        metrics::gauge!("master_task_queue_depth").increment(1.0);
+        let retry_tx = state.task_tx.clone();
+        let retry_id = id.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let _ = retry_tx.send(retry_id);
+        });
+        return;
+    }
 
     let started = std::time::Instant::now();
     let outcome = match task.kind {
@@ -190,7 +233,10 @@ async fn run_task(state: &Arc<MasterState>, id: String) {
             }
         }
     })
-    .await;
+    .await
+    .unwrap_or_else(|error| {
+        tracing::error!(task = %id, error = %error, "failed to persist task completion");
+    });
 }
 
 /// Compact one experiment. Serialized per experiment via the shared base-table
@@ -370,7 +416,7 @@ pub async fn sweep_candidates(state: &Arc<MasterState>) -> lance::Result<usize> 
     let mut queued = 0;
     for row in rows {
         if row.fragment_count as usize >= config.min_fragments {
-            enqueue(state, TaskKind::Compact, &row.name).await;
+            enqueue(state, TaskKind::Compact, &row.name).await?;
             queued += 1;
         }
     }
@@ -420,6 +466,17 @@ pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
     }
 
     let concurrency = state.config.task_concurrency.max(1);
+    let queue_depth = state
+        .tasks
+        .try_lock()
+        .map(|tasks| {
+            tasks
+                .values()
+                .filter(|task| task.state == TaskState::Queued)
+                .count()
+        })
+        .unwrap_or(0);
+    metrics::gauge!("master_task_queue_depth").set(queue_depth as f64);
     let sem = Arc::new(Semaphore::new(concurrency));
     let dispatch_state = state.clone();
     tokio::spawn(async move {
@@ -436,7 +493,10 @@ pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
                         t.finished_at = Some(now_ms());
                         t.error = Some(format!("dependency {dep} did not complete"));
                     })
-                    .await;
+                    .await
+                    .unwrap_or_else(|error| {
+                        tracing::error!(task = %id, error = %error, "failed to persist skipped task");
+                    });
                     metrics::gauge!("master_task_queue_depth").decrement(1.0);
                     continue;
                 }
@@ -485,6 +545,12 @@ mod tests {
             target_rows_per_fragment: 1_048_576,
             worker_endpoints: vec![],
             task_concurrency: 4,
+            task_db_path: dir
+                .path()
+                .join("master-tasks")
+                .to_string_lossy()
+                .to_string(),
+            task_history_limit: 1_000,
             ui_dir: None,
         }
     }
@@ -531,9 +597,20 @@ mod tests {
         // Seed a stats row so post-compaction upsert has a prior counter.
         crate::scanner::scan_once(&state).await.unwrap();
 
-        let rec = enqueue(&state, TaskKind::Compact, name).await;
+        let rec = enqueue(&state, TaskKind::Compact, name).await.unwrap();
         let status = await_terminal(&state, &rec.id).await;
         assert_eq!(status.state, TaskState::Done, "got {status:?}");
+        assert_eq!(
+            state
+                .task_store
+                .list()
+                .unwrap()
+                .into_iter()
+                .find(|task| task.id == rec.id)
+                .unwrap()
+                .state,
+            TaskState::Done
+        );
 
         let row = state.stats.lock().await.get(name).await.unwrap().unwrap();
         assert_eq!(row.total_compactions, 1);
@@ -568,7 +645,7 @@ mod tests {
             .await
             .unwrap();
 
-        let rec = enqueue(&state, TaskKind::IndexId, name).await;
+        let rec = enqueue(&state, TaskKind::IndexId, name).await.unwrap();
         let status = await_terminal(&state, &rec.id).await;
         assert_eq!(status.state, TaskState::Done, "got {status:?}");
         assert_eq!(status.detail.as_deref(), Some("built zonemap index on id"));
@@ -582,11 +659,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let state = MasterState::new(config(&dir)).await.unwrap();
         // Do NOT spawn the dispatcher, so the first task stays Queued.
-        let a = enqueue(&state, TaskKind::Compact, "x").await;
-        let b = enqueue(&state, TaskKind::Compact, "x").await;
+        let a = enqueue(&state, TaskKind::Compact, "x").await.unwrap();
+        let b = enqueue(&state, TaskKind::Compact, "x").await.unwrap();
         assert_eq!(a.id, b.id, "second enqueue returns the same task");
         // Only one task in the map, one message on the queue.
         assert_eq!(state.tasks.lock().await.len(), 1);
+        assert_eq!(state.task_store.list().unwrap().len(), 1);
         let mut rx = state.task_rx.lock().await.take().unwrap();
         let mut n = 0;
         while rx.try_recv().is_ok() {
@@ -601,7 +679,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let state = MasterState::new(config(&dir)).await.unwrap();
         let worker = spawn_scheduler(&state);
-        let rec = enqueue(&state, TaskKind::MergeWal, "exp").await;
+        let rec = enqueue(&state, TaskKind::MergeWal, "exp").await.unwrap();
         let status = await_terminal(&state, &rec.id).await;
         assert_eq!(status.state, TaskState::Failed);
         assert!(status.error.unwrap().contains("worker endpoints"));
@@ -634,7 +712,7 @@ mod tests {
         let state = MasterState::new(cfg).await.unwrap();
         let worker = spawn_scheduler(&state);
 
-        let rec = enqueue(&state, TaskKind::MergeWal, "exp").await;
+        let rec = enqueue(&state, TaskKind::MergeWal, "exp").await.unwrap();
         let status = await_terminal(&state, &rec.id).await;
         assert_eq!(status.state, TaskState::Done, "got {status:?}");
         let detail = status.detail.unwrap();
@@ -671,9 +749,10 @@ mod tests {
             .unwrap();
         crate::scanner::scan_once(&state).await.unwrap();
 
-        let compact = enqueue(&state, TaskKind::Compact, name).await;
-        let index =
-            enqueue_with_deps(&state, TaskKind::IndexId, name, vec![compact.id.clone()]).await;
+        let compact = enqueue(&state, TaskKind::Compact, name).await.unwrap();
+        let index = enqueue_with_deps(&state, TaskKind::IndexId, name, vec![compact.id.clone()])
+            .await
+            .unwrap();
 
         let compact_final = await_terminal(&state, &compact.id).await;
         assert_eq!(
@@ -703,9 +782,10 @@ mod tests {
         let worker = spawn_scheduler(&state);
 
         // MergeWal with no worker endpoints fails; its dependent must be skipped.
-        let merge = enqueue(&state, TaskKind::MergeWal, "exp").await;
-        let dependent =
-            enqueue_with_deps(&state, TaskKind::Compact, "exp", vec![merge.id.clone()]).await;
+        let merge = enqueue(&state, TaskKind::MergeWal, "exp").await.unwrap();
+        let dependent = enqueue_with_deps(&state, TaskKind::Compact, "exp", vec![merge.id.clone()])
+            .await
+            .unwrap();
 
         let merge_final = await_terminal(&state, &merge.id).await;
         assert_eq!(merge_final.state, TaskState::Failed);

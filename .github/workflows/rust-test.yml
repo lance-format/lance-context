@@ -43,10 +43,10 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt update
-          sudo apt install -y protobuf-compiler
+          sudo apt install -y clang libclang-dev protobuf-compiler
       - name: Build tests
-        run: cargo test -p lance-context-core --no-run
+        run: cargo test -p lance-context-core -p lance-context-master --no-run
       - name: Run unit tests
-        run: cargo test -p lance-context-core --lib
+        run: cargo test -p lance-context-core -p lance-context-master --lib
       - name: Run doc tests
         run: cargo test -p lance-context-core --doc

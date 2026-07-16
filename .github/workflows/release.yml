@@ -56,7 +56,7 @@ jobs:
     - name: Install system dependencies
       run: |
         sudo apt update
-        sudo apt install -y protobuf-compiler libssl-dev
+        sudo apt install -y clang libclang-dev protobuf-compiler libssl-dev
 
     - uses: actions-rust-lang/setup-rust-toolchain@v1
       with:
