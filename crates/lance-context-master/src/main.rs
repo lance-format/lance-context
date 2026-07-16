@@ -48,7 +48,7 @@ async fn main() {
     // Background stats scanner (detached; stops when the last Arc drops).
     let _scanner = scanner::spawn_scanner(&state);
 
-    // Single serial compaction worker (+ optional periodic auto-sweep).
+    // Durable scheduler poller (+ optional coordinated auto-sweep).
     let _scheduler = scheduler::spawn_scheduler(&state);
 
     let mut app = Router::new().nest("/api/v1", routes::api_router());

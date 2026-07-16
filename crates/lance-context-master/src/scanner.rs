@@ -26,6 +26,34 @@ const OBSERVE_TIMEOUT: Duration = Duration::from_secs(30);
 /// for experiments no longer in the registry. Returns the number of
 /// experiments successfully observed.
 pub async fn scan_once(state: &Arc<MasterState>) -> lance::Result<usize> {
+    let guard = state.task_store.coordination_lock("stats-writer").await?;
+    let result = scan_once_inner(state).await;
+    let release = state.task_store.release_coordination_lock(guard).await;
+    match (result, release) {
+        (Ok(count), Ok(())) => Ok(count),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+async fn try_scan_once(state: &Arc<MasterState>) -> lance::Result<Option<usize>> {
+    let Some(guard) = state
+        .task_store
+        .try_coordination_lock("stats-writer")
+        .await?
+    else {
+        return Ok(None);
+    };
+    let result = scan_once_inner(state).await;
+    let release = state.task_store.release_coordination_lock(guard).await;
+    match (result, release) {
+        (Ok(count), Ok(())) => Ok(Some(count)),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+async fn scan_once_inner(state: &Arc<MasterState>) -> lance::Result<usize> {
     let scan_start = std::time::Instant::now();
     let entries = state.registry.write().await.list().await?;
     let live: HashSet<String> = entries.iter().map(|e| e.name.clone()).collect();
@@ -111,7 +139,7 @@ async fn observe_one(state: &Arc<MasterState>, name: &str, uri: &str) -> lance::
 
     // Carry compaction counters forward across scans.
     let (last_compaction, total_compactions) = {
-        let stats = state.stats.lock().await;
+        let mut stats = state.stats.lock().await;
         match stats.get(name).await {
             Ok(Some(prev)) => (prev.last_compaction, prev.total_compactions),
             _ => (StatRow::NO_COMPACTION, 0),
@@ -133,8 +161,13 @@ async fn observe_one(state: &Arc<MasterState>, name: &str, uri: &str) -> lance::
 
 /// Refresh one experiment immediately and persist its new stats row.
 pub async fn refresh_one(state: &Arc<MasterState>, name: &str, uri: &str) -> lance::Result<()> {
-    let row = observe_one(state, name, uri).await?;
-    state.stats.lock().await.upsert(&row).await
+    let guard = state.task_store.coordination_lock("stats-writer").await?;
+    let result = match observe_one(state, name, uri).await {
+        Ok(row) => state.stats.lock().await.upsert(&row).await,
+        Err(error) => Err(error),
+    };
+    let release = state.task_store.release_coordination_lock(guard).await;
+    result.and(release)
 }
 
 /// Spawn the periodic scanner. Returns `None` when the interval is `0`.
@@ -148,8 +181,11 @@ pub fn spawn_scanner(state: &Arc<MasterState>) -> Option<JoinHandle<()>> {
         let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
         loop {
             ticker.tick().await;
-            match scan_once(&state).await {
-                Ok(n) => tracing::info!(experiments = n, "stats scan complete"),
+            match try_scan_once(&state).await {
+                Ok(Some(n)) => tracing::info!(experiments = n, "stats scan complete"),
+                Ok(None) => {
+                    tracing::debug!("stats scan skipped; another master owns the writer lock")
+                }
                 Err(e) => tracing::warn!(error = %e, "stats scan round failed"),
             }
         }

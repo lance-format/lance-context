@@ -21,6 +21,7 @@ arrow-schema = "58"
 axum = { version = "0.8", features = ["json"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive", "env"] }
+etcd-client = { version = "0.19", features = ["tls"] }
 futures = "0.3"
 lance = "7.0.0"
 metrics = "0.24"
