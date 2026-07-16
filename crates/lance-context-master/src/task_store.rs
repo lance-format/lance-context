@@ -1,11 +1,13 @@
-//! Durable scheduler task storage.
+//! Durable scheduler task storage backed by etcd.
 //!
-//! RocksDB is the single-master backend. etcd adds compare-and-swap enqueue,
-//! lease-backed task claims, and distributed target locks so several stateless
-//! masters can safely drain one shared queue.
+//! Scheduler state lives entirely in etcd: compare-and-swap enqueue,
+//! lease-backed task claims, and distributed per-experiment write locks so
+//! several stateless masters can safely drain one shared queue. Because claims
+//! ride renewed leases, a master that disappears has its in-flight task requeued
+//! after the lease expires — execution is at-least-once, so task
+//! implementations must be idempotent.
 
 use std::collections::HashSet;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,31 +18,17 @@ use etcd_client::{
 };
 use lance_context_api::{TaskKind, TaskRecord, TaskState};
 use lance_context_core::generate_id;
-use rocksdb::{Direction, IteratorMode, Options, WriteBatch, WriteOptions, DB};
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
-use crate::config::{MasterConfig, TaskStoreBackend};
+use crate::config::MasterConfig;
 
-const TASK_KEY_PREFIX: &[u8] = b"task/";
 const TASK_POLL_BATCH: usize = 256;
 
 #[derive(Clone)]
 pub struct TaskStore {
-    inner: Arc<TaskStoreInner>,
+    inner: Arc<EtcdTaskStore>,
     history_limit: usize,
-}
-
-enum TaskStoreInner {
-    Rocks(Box<RocksTaskStore>),
-    Etcd(Box<EtcdTaskStore>),
-}
-
-struct RocksTaskStore {
-    db: DB,
-    operation_lock: Mutex<()>,
-    claimed_tasks: Mutex<HashSet<String>>,
-    claimed_targets: Mutex<HashSet<String>>,
 }
 
 struct EtcdTaskStore {
@@ -49,39 +37,28 @@ struct EtcdTaskStore {
     lease_ttl: i64,
 }
 
-/// Ownership of one running task. Dropping an etcd claim stops lease renewal;
-/// etcd then removes its claim and target-lock keys, allowing recovery.
+/// Ownership of one running task. Dropping the claim stops lease renewal; etcd
+/// then removes its claim and target-lock keys, allowing recovery.
 pub struct TaskClaim {
     pub task: TaskRecord,
     backend: ClaimBackend,
 }
 
-enum ClaimBackend {
-    Rocks {
-        target_locked: bool,
-    },
-    Etcd {
-        token: String,
-        lease_id: i64,
-        claim_key: String,
-        target_key: Option<String>,
-        keepalive: LeaseKeepalive,
-    },
+struct ClaimBackend {
+    token: String,
+    lease_id: i64,
+    claim_key: String,
+    target_key: Option<String>,
+    keepalive: LeaseKeepalive,
 }
 
-/// Short-lived distributed guard used to serialize stats-table writers.
+/// Short-lived distributed guard used to serialize stats-table writers across
+/// master replicas.
 pub struct CoordinationGuard {
-    backend: GuardBackend,
-}
-
-enum GuardBackend {
-    Rocks,
-    Etcd {
-        token: String,
-        lease_id: i64,
-        key: String,
-        keepalive: LeaseKeepalive,
-    },
+    token: String,
+    lease_id: i64,
+    key: String,
+    keepalive: LeaseKeepalive,
 }
 
 struct LeaseKeepalive {
@@ -100,16 +77,8 @@ impl Drop for LeaseKeepalive {
 
 impl TaskStore {
     pub async fn open(config: &MasterConfig) -> lance::Result<Self> {
-        let inner = match config.task_store_backend {
-            TaskStoreBackend::Rocksdb => {
-                TaskStoreInner::Rocks(Box::new(RocksTaskStore::open(&config.task_db_path)?))
-            }
-            TaskStoreBackend::Etcd => {
-                TaskStoreInner::Etcd(Box::new(EtcdTaskStore::connect(config).await?))
-            }
-        };
         let store = Self {
-            inner: Arc::new(inner),
+            inner: Arc::new(EtcdTaskStore::connect(config).await?),
             history_limit: config.task_history_limit.max(1),
         };
         store.recover_orphaned().await?;
@@ -117,61 +86,35 @@ impl TaskStore {
         Ok(store)
     }
 
-    #[must_use]
-    pub fn is_distributed(&self) -> bool {
-        matches!(self.inner.as_ref(), TaskStoreInner::Etcd(_))
-    }
-
     /// Atomically enqueue a task. Standalone Compact and IndexId tasks use an
-    /// etcd/local dedupe key while queued or running. Tasks with dependencies
-    /// are always distinct because they belong to a specific ordered chain.
+    /// etcd dedupe key while queued or running. Tasks with dependencies are
+    /// always distinct because they belong to a specific ordered chain.
     pub async fn enqueue(
         &self,
         kind: TaskKind,
         target: &str,
         depends_on: Vec<String>,
     ) -> lance::Result<TaskRecord> {
-        match self.inner.as_ref() {
-            TaskStoreInner::Rocks(store) => store.enqueue(kind, target, depends_on).await,
-            TaskStoreInner::Etcd(store) => store.enqueue(kind, target, depends_on).await,
-        }
+        self.inner.enqueue(kind, target, depends_on).await
     }
 
     pub async fn list(&self) -> lance::Result<Vec<TaskRecord>> {
-        match self.inner.as_ref() {
-            TaskStoreInner::Rocks(store) => store.list(),
-            TaskStoreInner::Etcd(store) => store.list().await,
-        }
+        self.inner.list().await
     }
 
     pub async fn get(&self, id: &str) -> lance::Result<Option<TaskRecord>> {
-        match self.inner.as_ref() {
-            TaskStoreInner::Rocks(store) => store.get(id),
-            TaskStoreInner::Etcd(store) => store.get(id).await,
-        }
+        self.inner.get(id).await
     }
 
     pub async fn queue_depth(&self) -> lance::Result<usize> {
-        match self.inner.as_ref() {
-            TaskStoreInner::Rocks(store) => Ok(store
-                .list()?
-                .into_iter()
-                .filter(|task| task.state == TaskState::Queued)
-                .count()),
-            TaskStoreInner::Etcd(store) => store.queue_depth().await,
-        }
+        self.inner.queue_depth().await
     }
 
-    /// Claim the oldest runnable task. In etcd mode the queued->running update,
-    /// claim lease, and per-experiment write lock are one transaction.
+    /// Claim the oldest runnable task. The queued->running update, claim lease,
+    /// and per-experiment write lock are one etcd transaction.
     pub async fn claim_next(&self) -> lance::Result<Option<TaskClaim>> {
-        let (claim, dependency_failed) = match self.inner.as_ref() {
-            TaskStoreInner::Rocks(store) => store.claim_next().await,
-            TaskStoreInner::Etcd(store) => {
-                store.recover_orphaned().await?;
-                store.claim_next().await
-            }
-        }?;
+        self.inner.recover_orphaned().await?;
+        let (claim, dependency_failed) = self.inner.claim_next().await?;
         if dependency_failed {
             if let Err(error) = self.prune_terminal_history().await {
                 tracing::warn!(error = %error, "failed to prune task history");
@@ -186,10 +129,7 @@ impl TaskStore {
         claim: TaskClaim,
         outcome: Result<String, String>,
     ) -> lance::Result<()> {
-        match self.inner.as_ref() {
-            TaskStoreInner::Rocks(store) => store.finish(claim, outcome).await?,
-            TaskStoreInner::Etcd(store) => store.finish(claim, outcome).await?,
-        }
+        self.inner.finish(claim, outcome).await?;
         self.prune_terminal_history().await.map(|_| ())
     }
 
@@ -200,12 +140,7 @@ impl TaskStore {
         &self,
         name: &str,
     ) -> lance::Result<Option<CoordinationGuard>> {
-        match self.inner.as_ref() {
-            TaskStoreInner::Rocks(_) => Ok(Some(CoordinationGuard {
-                backend: GuardBackend::Rocks,
-            })),
-            TaskStoreInner::Etcd(store) => store.try_coordination_lock(name).await,
-        }
+        self.inner.try_coordination_lock(name).await
     }
 
     pub async fn coordination_lock(&self, name: &str) -> lance::Result<CoordinationGuard> {
@@ -218,32 +153,19 @@ impl TaskStore {
     }
 
     pub async fn release_coordination_lock(&self, guard: CoordinationGuard) -> lance::Result<()> {
-        match (self.inner.as_ref(), guard.backend) {
-            (TaskStoreInner::Rocks(_), GuardBackend::Rocks) => Ok(()),
-            (
-                TaskStoreInner::Etcd(store),
-                GuardBackend::Etcd {
-                    token,
-                    lease_id,
-                    key,
-                    keepalive,
-                },
-            ) => {
-                drop(keepalive);
-                store.delete_owned_key(&key, &token).await?;
-                store.revoke_lease(lease_id).await
-            }
-            _ => Err(lance::Error::io(
-                "coordination guard belongs to a different task backend",
-            )),
-        }
+        let CoordinationGuard {
+            token,
+            lease_id,
+            key,
+            keepalive,
+        } = guard;
+        drop(keepalive);
+        self.inner.delete_owned_key(&key, &token).await?;
+        self.inner.revoke_lease(lease_id).await
     }
 
     async fn recover_orphaned(&self) -> lance::Result<usize> {
-        match self.inner.as_ref() {
-            TaskStoreInner::Rocks(store) => store.recover_running().await,
-            TaskStoreInner::Etcd(store) => store.recover_orphaned().await,
-        }
+        self.inner.recover_orphaned().await
     }
 
     async fn prune_terminal_history(&self) -> lance::Result<usize> {
@@ -268,203 +190,8 @@ impl TaskStore {
         if ids.is_empty() {
             return Ok(0);
         }
-        match self.inner.as_ref() {
-            TaskStoreInner::Rocks(store) => store.delete_many(ids.iter().map(String::as_str))?,
-            TaskStoreInner::Etcd(store) => store.delete_many(&ids).await?,
-        }
+        self.inner.delete_many(&ids).await?;
         Ok(ids.len())
-    }
-}
-
-impl RocksTaskStore {
-    fn open(path: impl AsRef<Path>) -> lance::Result<Self> {
-        let path = path.as_ref();
-        let text = path.to_string_lossy();
-        if text.contains("://") {
-            return Err(lance::Error::io(format!(
-                "task DB path must be local, got '{text}'"
-            )));
-        }
-        if let Some(parent) = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            std::fs::create_dir_all(parent).map_err(|err| {
-                lance::Error::io(format!(
-                    "failed to create task DB parent '{}': {err}",
-                    parent.display()
-                ))
-            })?;
-        }
-        let mut options = Options::default();
-        options.create_if_missing(true);
-        options.set_max_open_files(64);
-        options.set_keep_log_file_num(4);
-        let db = DB::open(&options, path).map_err(|err| {
-            lance::Error::io(format!(
-                "failed to open task DB '{}': {err}",
-                path.display()
-            ))
-        })?;
-        Ok(Self {
-            db,
-            operation_lock: Mutex::new(()),
-            claimed_tasks: Mutex::new(HashSet::new()),
-            claimed_targets: Mutex::new(HashSet::new()),
-        })
-    }
-
-    async fn enqueue(
-        &self,
-        kind: TaskKind,
-        target: &str,
-        depends_on: Vec<String>,
-    ) -> lance::Result<TaskRecord> {
-        let _operation = self.operation_lock.lock().await;
-        if should_dedupe(kind, &depends_on) {
-            if let Some(existing) = self.list()?.into_iter().find(|task| {
-                task.kind == kind
-                    && task.target == target
-                    && task.depends_on.is_empty()
-                    && matches!(task.state, TaskState::Queued | TaskState::Running)
-            }) {
-                return Ok(existing);
-            }
-        }
-        let task = new_task(kind, target, depends_on);
-        self.put(&task)?;
-        Ok(task)
-    }
-
-    fn put(&self, task: &TaskRecord) -> lance::Result<()> {
-        let value = encode_task(task)?;
-        self.db
-            .put_opt(task_key(&task.id), value, &sync_write_options())
-            .map_err(|err| lance::Error::io(format!("failed to persist task '{}': {err}", task.id)))
-    }
-
-    fn get(&self, id: &str) -> lance::Result<Option<TaskRecord>> {
-        self.db
-            .get(task_key(id))
-            .map_err(|err| lance::Error::io(format!("failed to read task '{id}': {err}")))?
-            .map(|value| decode_task(&value, id))
-            .transpose()
-    }
-
-    fn list(&self) -> lance::Result<Vec<TaskRecord>> {
-        let mut tasks = Vec::new();
-        for item in self
-            .db
-            .iterator(IteratorMode::From(TASK_KEY_PREFIX, Direction::Forward))
-        {
-            let (key, value) =
-                item.map_err(|err| lance::Error::io(format!("failed to iterate task DB: {err}")))?;
-            if !key.starts_with(TASK_KEY_PREFIX) {
-                break;
-            }
-            tasks.push(decode_task(&value, &String::from_utf8_lossy(&key))?);
-        }
-        Ok(tasks)
-    }
-
-    async fn claim_next(&self) -> lance::Result<(Option<TaskClaim>, bool)> {
-        let _operation = self.operation_lock.lock().await;
-        let claimed_tasks = self.claimed_tasks.lock().await;
-        let mut claimed_targets = self.claimed_targets.lock().await;
-        let tasks = self.list()?;
-        let mut queued = tasks
-            .iter()
-            .filter(|task| task.state == TaskState::Queued && !claimed_tasks.contains(&task.id))
-            .cloned()
-            .collect::<Vec<_>>();
-        queued.sort_by_key(|task| task.enqueued_at);
-        let mut dependency_failed = false;
-        let mut runnable = None;
-        for mut task in queued {
-            match dependency_status(&task, |id| {
-                tasks
-                    .iter()
-                    .find(|candidate| candidate.id == id)
-                    .map(|task| task.state)
-            }) {
-                DependencyStatus::Ready => {}
-                DependencyStatus::Waiting => continue,
-                DependencyStatus::Failed(dependency) => {
-                    fail_dependency(&mut task, &dependency);
-                    self.put(&task)?;
-                    dependency_failed = true;
-                    continue;
-                }
-            }
-            if requires_target_lock(task.kind) && claimed_targets.contains(&task.target) {
-                continue;
-            }
-            runnable = Some(task);
-            break;
-        }
-        let Some(mut task) = runnable else {
-            return Ok((None, dependency_failed));
-        };
-        let target_locked = requires_target_lock(task.kind);
-        task.state = TaskState::Running;
-        task.started_at = Some(now_ms());
-        self.put(&task)?;
-        if target_locked {
-            claimed_targets.insert(task.target.clone());
-        }
-        drop(claimed_targets);
-        drop(claimed_tasks);
-        self.claimed_tasks.lock().await.insert(task.id.clone());
-        Ok((
-            Some(TaskClaim {
-                task,
-                backend: ClaimBackend::Rocks { target_locked },
-            }),
-            dependency_failed,
-        ))
-    }
-
-    async fn finish(&self, claim: TaskClaim, outcome: Result<String, String>) -> lance::Result<()> {
-        let ClaimBackend::Rocks { target_locked } = claim.backend else {
-            return Err(lance::Error::io("task claim belongs to etcd"));
-        };
-        let _operation = self.operation_lock.lock().await;
-        let mut task = claim.task;
-        apply_outcome(&mut task, outcome);
-        let result = self.put(&task);
-        self.claimed_tasks.lock().await.remove(&task.id);
-        if target_locked {
-            self.claimed_targets.lock().await.remove(&task.target);
-        }
-        result
-    }
-
-    async fn recover_running(&self) -> lance::Result<usize> {
-        let _operation = self.operation_lock.lock().await;
-        let mut recovered = 0;
-        for mut task in self.list()? {
-            if task.state == TaskState::Running {
-                requeue(&mut task);
-                self.put(&task)?;
-                recovered += 1;
-            }
-        }
-        Ok(recovered)
-    }
-
-    fn delete_many<'a>(&self, ids: impl IntoIterator<Item = &'a str>) -> lance::Result<()> {
-        let mut batch = WriteBatch::default();
-        let mut count = 0;
-        for id in ids {
-            batch.delete(task_key(id));
-            count += 1;
-        }
-        if count == 0 {
-            return Ok(());
-        }
-        self.db
-            .write_opt(batch, &sync_write_options())
-            .map_err(|err| lance::Error::io(format!("failed to prune task history: {err}")))
     }
 }
 
@@ -472,7 +199,7 @@ impl EtcdTaskStore {
     async fn connect(config: &MasterConfig) -> lance::Result<Self> {
         if config.etcd_endpoints.is_empty() {
             return Err(lance::Error::io(
-                "ETCD_ENDPOINTS is required when TASK_STORE_BACKEND=etcd",
+                "ETCD_ENDPOINTS is required to run the master",
             ));
         }
         if config.etcd_lease_ttl_secs < 5 {
@@ -709,7 +436,7 @@ impl EtcdTaskStore {
                     return Ok((
                         Some(TaskClaim {
                             task,
-                            backend: ClaimBackend::Etcd {
+                            backend: ClaimBackend {
                                 token,
                                 lease_id,
                                 claim_key,
@@ -734,16 +461,13 @@ impl EtcdTaskStore {
     }
 
     async fn finish(&self, claim: TaskClaim, outcome: Result<String, String>) -> lance::Result<()> {
-        let ClaimBackend::Etcd {
+        let ClaimBackend {
             token,
             lease_id,
             claim_key,
             target_key,
             keepalive,
-        } = claim.backend
-        else {
-            return Err(lance::Error::io("task claim belongs to RocksDB"));
-        };
+        } = claim.backend;
         let mut task = claim.task;
         apply_outcome(&mut task, outcome);
         let mut operations = vec![
@@ -846,12 +570,10 @@ impl EtcdTaskStore {
         }
         let keepalive = self.start_keepalive(lease_id).await?;
         Ok(Some(CoordinationGuard {
-            backend: GuardBackend::Etcd {
-                token,
-                lease_id,
-                key,
-                keepalive,
-            },
+            token,
+            lease_id,
+            key,
+            keepalive,
         }))
     }
 
@@ -1076,27 +798,6 @@ enum DependencyStatus {
     Failed(String),
 }
 
-fn dependency_status(
-    task: &TaskRecord,
-    mut lookup: impl FnMut(&str) -> Option<TaskState>,
-) -> DependencyStatus {
-    let mut waiting = false;
-    for dependency in &task.depends_on {
-        match lookup(dependency) {
-            Some(TaskState::Done) => {}
-            Some(TaskState::Failed) | None => {
-                return DependencyStatus::Failed(dependency.clone());
-            }
-            Some(TaskState::Queued | TaskState::Running) => waiting = true,
-        }
-    }
-    if waiting {
-        DependencyStatus::Waiting
-    } else {
-        DependencyStatus::Ready
-    }
-}
-
 fn fail_dependency(task: &mut TaskRecord, dependency: &str) {
     apply_outcome(
         task,
@@ -1154,19 +855,6 @@ fn decode_task(value: &[u8], key: &str) -> lance::Result<TaskRecord> {
         .map_err(|err| lance::Error::io(format!("failed to decode task '{key}': {err}")))
 }
 
-fn task_key(id: &str) -> Vec<u8> {
-    let mut key = Vec::with_capacity(TASK_KEY_PREFIX.len() + id.len());
-    key.extend_from_slice(TASK_KEY_PREFIX);
-    key.extend_from_slice(id.as_bytes());
-    key
-}
-
-fn sync_write_options() -> WriteOptions {
-    let mut options = WriteOptions::default();
-    options.set_sync(true);
-    options
-}
-
 fn etcd_error(action: &'static str) -> impl FnOnce(etcd_client::Error) -> lance::Error {
     move |err| lance::Error::io(format!("failed to {action}: {err}"))
 }
@@ -1188,8 +876,6 @@ mod tests {
             target_rows_per_fragment: 1_048_576,
             worker_endpoints: vec![],
             task_concurrency: 4,
-            task_store_backend: TaskStoreBackend::Rocksdb,
-            task_db_path: dir.path().join("tasks").to_string_lossy().to_string(),
             etcd_endpoints: vec![],
             etcd_prefix: "/test".to_string(),
             etcd_username: None,
@@ -1204,132 +890,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rocksdb_survives_reopen_and_dedupes() {
+    async fn connect_requires_etcd_endpoints() {
         let dir = TempDir::new().unwrap();
-        let cfg = config(&dir);
-        let first = TaskStore::open(&cfg).await.unwrap();
-        let a = first
-            .enqueue(TaskKind::Compact, "experiment", Vec::new())
-            .await
-            .unwrap();
-        let b = first
-            .enqueue(TaskKind::Compact, "experiment", Vec::new())
-            .await
-            .unwrap();
-        assert_eq!(a.id, b.id);
-        drop(first);
-
-        let reopened = TaskStore::open(&cfg).await.unwrap();
-        assert_eq!(reopened.get(&a.id).await.unwrap().unwrap(), a);
-    }
-
-    #[tokio::test]
-    async fn rocksdb_claims_and_finishes() {
-        let dir = TempDir::new().unwrap();
-        let store = TaskStore::open(&config(&dir)).await.unwrap();
-        let task = store
-            .enqueue(TaskKind::IndexId, "experiment", Vec::new())
-            .await
-            .unwrap();
-        let claim = store.claim_next().await.unwrap().unwrap();
-        assert_eq!(claim.task.id, task.id);
-        assert_eq!(claim.task.state, TaskState::Running);
-        store
-            .finish(claim, Ok("indexed".to_string()))
-            .await
-            .unwrap();
-        let finished = store.get(&task.id).await.unwrap().unwrap();
-        assert_eq!(finished.state, TaskState::Done);
-        assert_eq!(finished.detail.as_deref(), Some("indexed"));
-    }
-
-    #[tokio::test]
-    async fn rocksdb_waits_for_dependencies_and_propagates_failure() {
-        let dir = TempDir::new().unwrap();
-        let store = TaskStore::open(&config(&dir)).await.unwrap();
-
-        let prerequisite = store
-            .enqueue(TaskKind::MergeWal, "experiment", Vec::new())
-            .await
-            .unwrap();
-        let dependent = store
-            .enqueue(
-                TaskKind::Compact,
-                "experiment",
-                vec![prerequisite.id.clone()],
-            )
-            .await
-            .unwrap();
-        let claim = store.claim_next().await.unwrap().unwrap();
-        assert_eq!(claim.task.id, prerequisite.id);
-        assert!(
-            store.claim_next().await.unwrap().is_none(),
-            "dependent task must wait while its prerequisite is running"
-        );
-        store.finish(claim, Ok("merged".to_string())).await.unwrap();
-        let dependent_claim = store.claim_next().await.unwrap().unwrap();
-        assert_eq!(dependent_claim.task.id, dependent.id);
-        store
-            .finish(dependent_claim, Ok("compacted".to_string()))
-            .await
-            .unwrap();
-
-        let failed_prerequisite = store
-            .enqueue(TaskKind::MergeWal, "failed-chain", Vec::new())
-            .await
-            .unwrap();
-        let skipped = store
-            .enqueue(
-                TaskKind::IndexId,
-                "failed-chain",
-                vec![failed_prerequisite.id.clone()],
-            )
-            .await
-            .unwrap();
-        let claim = store.claim_next().await.unwrap().unwrap();
-        assert_eq!(claim.task.id, failed_prerequisite.id);
-        store
-            .finish(claim, Err("merge failed".to_string()))
-            .await
-            .unwrap();
-        assert!(store.claim_next().await.unwrap().is_none());
-        let skipped = store.get(&skipped.id).await.unwrap().unwrap();
-        assert_eq!(skipped.state, TaskState::Failed);
-        assert!(skipped
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("dependency")));
-    }
-
-    #[tokio::test]
-    async fn dependent_tasks_do_not_participate_in_standalone_dedupe() {
-        let dir = TempDir::new().unwrap();
-        let store = TaskStore::open(&config(&dir)).await.unwrap();
-        let prerequisite = store
-            .enqueue(TaskKind::MergeWal, "experiment", Vec::new())
-            .await
-            .unwrap();
-        let dependent = store
-            .enqueue(TaskKind::Compact, "experiment", vec![prerequisite.id])
-            .await
-            .unwrap();
-        let standalone = store
-            .enqueue(TaskKind::Compact, "experiment", Vec::new())
-            .await
-            .unwrap();
-        assert_ne!(dependent.id, standalone.id);
-    }
-
-    #[tokio::test]
-    async fn rejects_object_store_path_for_rocksdb() {
-        let dir = TempDir::new().unwrap();
-        let mut cfg = config(&dir);
-        cfg.task_db_path = "s3://bucket/tasks".to_string();
-        let error = match TaskStore::open(&cfg).await {
-            Ok(_) => panic!("object-store URI should be rejected"),
+        let error = match TaskStore::open(&config(&dir)).await {
+            Ok(_) => panic!("etcd backend must require endpoints"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains("must be local"));
+        assert!(error.to_string().contains("ETCD_ENDPOINTS is required"));
     }
 
     #[tokio::test]
@@ -1339,7 +906,6 @@ mod tests {
             .expect("ETCD_TEST_ENDPOINTS must point to a test etcd");
         let dir = TempDir::new().unwrap();
         let mut cfg = config(&dir);
-        cfg.task_store_backend = TaskStoreBackend::Etcd;
         cfg.etcd_endpoints = endpoint.split(',').map(str::to_string).collect();
         cfg.etcd_prefix = format!("/lance-context/test/{}", generate_id());
         cfg.etcd_lease_ttl_secs = 5;

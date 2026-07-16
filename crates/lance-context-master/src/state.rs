@@ -26,8 +26,8 @@ pub struct MasterState {
     pub base_uri: String,
     /// Effective configuration.
     pub config: MasterConfig,
-    /// Durable scheduler queue. RocksDB is single-master; etcd provides shared
-    /// CAS/lease semantics for stateless HA master replicas.
+    /// Durable scheduler queue in etcd, providing shared CAS/lease semantics
+    /// for stateless HA master replicas.
     pub task_store: TaskStore,
     /// Shared HTTP client for fanning `MergeWal` tasks out to worker endpoints.
     pub http: reqwest::Client,
@@ -79,9 +79,8 @@ impl MasterState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::TaskStoreBackend;
     use lance_context_api::{TaskKind, TaskState};
-    use lance_context_core::RolloutStore;
+    use lance_context_core::{generate_id, RolloutStore};
     use tempfile::TempDir;
 
     fn test_config(dir: &TempDir) -> MasterConfig {
@@ -96,26 +95,23 @@ mod tests {
             target_rows_per_fragment: 1_048_576,
             worker_endpoints: vec![],
             task_concurrency: 4,
-            task_store_backend: TaskStoreBackend::Rocksdb,
-            task_db_path: dir
-                .path()
-                .join("master-tasks")
-                .to_string_lossy()
-                .to_string(),
-            etcd_endpoints: vec![],
-            etcd_prefix: "/test".to_string(),
+            etcd_endpoints: std::env::var("ETCD_TEST_ENDPOINTS")
+                .map(|value| value.split(',').map(str::to_string).collect())
+                .unwrap_or_default(),
+            etcd_prefix: format!("/lance-context/test/{}", generate_id()),
             etcd_username: None,
             etcd_password: None,
             etcd_ca_cert: None,
             etcd_client_cert: None,
             etcd_client_key: None,
-            etcd_lease_ttl_secs: 30,
+            etcd_lease_ttl_secs: 5,
             task_history_limit: 1_000,
             ui_dir: None,
         }
     }
 
     #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn startup_backfills_legacy_rollout_datasets() {
         let dir = TempDir::new().unwrap();
         let uri = dir.path().join("legacy.rollout.lance");
@@ -130,6 +126,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn startup_requeues_interrupted_local_tasks() {
         let dir = TempDir::new().unwrap();
         let config = test_config(&dir);

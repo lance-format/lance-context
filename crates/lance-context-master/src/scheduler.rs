@@ -1,8 +1,8 @@
 //! Unified task scheduler.
 //!
-//! Each master polls one durable queue with **bounded concurrency**. RocksDB
-//! supports one master; etcd uses atomic lease-backed claims so multiple
-//! stateless masters can drain the same queue. It executes three kinds of task
+//! Each master polls one durable queue with **bounded concurrency**. The queue
+//! lives in etcd, which uses atomic lease-backed claims so multiple stateless
+//! masters can drain the same queue. It executes three kinds of task
 //! ([`TaskKind`]):
 //!
 //! - **Compact** — rewrites an experiment's base-table fragments. Two `Rewrite`s
@@ -362,8 +362,9 @@ pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{MasterConfig, TaskStoreBackend};
+    use crate::config::MasterConfig;
     use lance_context_api::TaskState;
+    use lance_context_core::generate_id;
     use tempfile::TempDir;
 
     fn config(dir: &TempDir) -> MasterConfig {
@@ -379,20 +380,16 @@ mod tests {
             target_rows_per_fragment: 1_048_576,
             worker_endpoints: vec![],
             task_concurrency: 4,
-            task_store_backend: TaskStoreBackend::Rocksdb,
-            task_db_path: dir
-                .path()
-                .join("master-tasks")
-                .to_string_lossy()
-                .to_string(),
-            etcd_endpoints: vec![],
-            etcd_prefix: "/test".to_string(),
+            etcd_endpoints: std::env::var("ETCD_TEST_ENDPOINTS")
+                .map(|value| value.split(',').map(str::to_string).collect())
+                .unwrap_or_default(),
+            etcd_prefix: format!("/lance-context/test/{}", generate_id()),
             etcd_username: None,
             etcd_password: None,
             etcd_ca_cert: None,
             etcd_client_cert: None,
             etcd_client_key: None,
-            etcd_lease_ttl_secs: 30,
+            etcd_lease_ttl_secs: 5,
             task_history_limit: 1_000,
             ui_dir: None,
         }
@@ -414,6 +411,7 @@ mod tests {
     /// Manual enqueue -> dispatcher compacts -> task reaches Done and the stats
     /// table records a compaction.
     #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn manual_compaction_runs_and_updates_stats() {
         let dir = TempDir::new().unwrap();
         let state = MasterState::new(config(&dir)).await.unwrap();
@@ -466,6 +464,7 @@ mod tests {
     /// Manual enqueue of an `IndexId` task -> dispatcher builds the ZoneMap
     /// index -> task reaches Done with the expected detail summary.
     #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn index_id_task_builds_index_and_reaches_done() {
         let dir = TempDir::new().unwrap();
         let state = MasterState::new(config(&dir)).await.unwrap();
@@ -499,6 +498,7 @@ mod tests {
 
     /// Enqueuing the same experiment twice while queued de-dupes to one task.
     #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn enqueue_dedupes_queued_compactions() {
         let dir = TempDir::new().unwrap();
         let state = MasterState::new(config(&dir)).await.unwrap();
@@ -511,6 +511,7 @@ mod tests {
 
     /// A MergeWal task with no configured endpoints fails fast with a clear msg.
     #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn merge_wal_without_endpoints_fails() {
         let dir = TempDir::new().unwrap();
         let state = MasterState::new(config(&dir)).await.unwrap();
@@ -525,6 +526,7 @@ mod tests {
     /// MergeWal fans out to every configured worker endpoint and sums the
     /// reclaimed counts. Uses a tiny in-process stub server per "worker".
     #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn merge_wal_broadcasts_and_sums_reclaimed() {
         use axum::{routing::post, Json, Router};
 
@@ -561,6 +563,7 @@ mod tests {
     /// `index_id` depending on a `compact` must start after compaction finishes,
     /// so the two never contend for the shared per-experiment base-table gate.
     #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn dependent_task_runs_after_dependency_done() {
         let dir = TempDir::new().unwrap();
         let state = MasterState::new(config(&dir)).await.unwrap();
@@ -612,6 +615,7 @@ mod tests {
     /// A dependent whose dependency `Failed` is skipped (marked `Failed`) rather
     /// than run.
     #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn dependent_skipped_when_dependency_fails() {
         let dir = TempDir::new().unwrap();
         let state = MasterState::new(config(&dir)).await.unwrap();
