@@ -5482,6 +5482,7 @@ dependencies = [
  "lance-context-core",
  "lance-context-metrics",
  "metrics",
+ "object_store 0.13.2",
  "reqwest 0.12.28",
  "rocksdb",
  "serde",

@@ -6,6 +6,7 @@ pub mod error;
 pub mod routes;
 pub mod scanner;
 pub mod scheduler;
+pub mod singleton;
 pub mod state;
 pub mod stats_store;
 pub mod task_store;

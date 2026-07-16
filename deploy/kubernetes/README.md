@@ -15,3 +15,12 @@ Before applying it:
 Keep the master at one replica. RocksDB is an embedded single-process database;
 the PVC must not be mounted by multiple active master pods. The `Recreate`
 strategy ensures an old pod releases the volume before its replacement starts.
+
+As a safety net, each master writes a heartbeat lease
+(`_master.singleton.json`) into `DATA_DIR` at startup and refreshes it every few
+seconds. A second master pointed at the same `DATA_DIR` refuses to start while a
+live lease exists, and logs which host holds it. A crashed master's lease goes
+stale after ~30s so a replacement can take over automatically; a graceful
+shutdown releases the lease immediately. This guards against the common mistake
+of leaving an old master running while starting a new one — even when the two
+use separate PVCs but share one `DATA_DIR`.

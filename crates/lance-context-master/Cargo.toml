@@ -24,6 +24,7 @@ clap = { version = "4", features = ["derive", "env"] }
 futures = "0.3"
 lance = "7.0.0"
 metrics = "0.24"
+object_store = "0.13"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rocksdb = { version = "0.24", default-features = false }
 serde = { version = "1", features = ["derive"] }

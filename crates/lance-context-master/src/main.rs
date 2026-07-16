@@ -11,6 +11,7 @@ use lance_context_master::config::MasterConfig;
 use lance_context_master::routes;
 use lance_context_master::scanner;
 use lance_context_master::scheduler;
+use lance_context_master::singleton::SingletonLease;
 use lance_context_master::state::MasterState;
 
 #[tokio::main]
@@ -36,6 +37,16 @@ async fn main() {
     }
 
     let ui_dir = config.ui_dir.clone();
+
+    // Enforce single-master operation for the RocksDB scheduler backend: refuse
+    // to start if another master already holds the lease on this data directory.
+    let lease = match SingletonLease::acquire(&config.data_dir).await {
+        Ok(lease) => lease,
+        Err(e) => {
+            tracing::error!("Refusing to start: {}", e);
+            std::process::exit(1);
+        }
+    };
 
     let state = match MasterState::new(config).await {
         Ok(state) => state,
@@ -76,6 +87,10 @@ async fn main() {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .unwrap();
+
+    // Best-effort release so a replacement master can start without waiting out
+    // the lease TTL.
+    lease.release().await;
 }
 
 async fn shutdown_signal() {
