@@ -1,5 +1,13 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient, useIsFetching } from "@tanstack/react-query";
 import { Fragment, useEffect, useState, type FormEvent } from "react";
+import {
+  NavLink,
+  Navigate,
+  Route,
+  Routes,
+  useNavigate,
+  useParams,
+} from "react-router-dom";
 import {
   compactionStatus,
   enqueueTask,
@@ -80,8 +88,31 @@ function DownloadIcon() {
   );
 }
 
-function ChevronIcon({ open }: { open: boolean }) {
+function LinkIcon() {
   return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+      <path
+        d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path
+        d="M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+/** Copy an absolute URL (origin + given path) to the clipboard. Best-effort:
+ * silently ignores clipboard failures (e.g. non-secure contexts). */
+function copyLink(path: string) {
+  const url = `${window.location.origin}${path}`;
+  void navigator.clipboard?.writeText(url).catch(() => {});
+}
+
+function ChevronIcon({ open }: { open: boolean }) {  return (
     <svg
       width="14"
       height="14"
@@ -168,7 +199,7 @@ function useCompaction(name: string) {
  * keeps the three individual buttons. */
 function OptimizeButton({ name }: { name: string }) {
   const qc = useQueryClient();
-  const setView = useUiStore((s) => s.setView);
+  const navigate = useNavigate();
   const trigger = useMutation({
     mutationFn: async () => {
       // Chain the three tasks so they run in order: compact waits for the WAL
@@ -189,7 +220,7 @@ function OptimizeButton({ name }: { name: string }) {
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["tasks"] });
-      setView("tasks");
+      navigate("/tasks");
     },
   });
   return (
@@ -222,12 +253,15 @@ function CompactButton({ name, variant }: { name: string; variant?: "accent" }) 
 /* ---- table --------------------------------------------------------------- */
 
 function Row({ exp }: { exp: ExperimentSummary }) {
-  const select = useUiStore((s) => s.select);
+  const navigate = useNavigate();
   const hot = exp.fragment_count >= 16;
   return (
     <tr>
       <td>
-        <button className="name-cell" onClick={() => select(exp.name)}>
+        <button
+          className="name-cell"
+          onClick={() => navigate(`/experiments/${encodeURIComponent(exp.name)}`)}
+        >
           {exp.name}
         </button>
       </td>
@@ -283,6 +317,19 @@ function JsonBlock({ value }: { value: unknown }) {
 function RecordDetails({ record, name }: { record: RolloutRecord; name: string }) {
   return (
     <div className="record-detail">
+      <div className="record-detail__toolbar">
+        <button
+          className="btn btn--ghost btn--sm"
+          onClick={() =>
+            copyLink(
+              `/experiments/${encodeURIComponent(name)}/records/${encodeURIComponent(record.id)}`,
+            )
+          }
+        >
+          <LinkIcon />
+          Copy link
+        </button>
+      </div>
       <div className="record-detail__grid">
         <div>
           <span>ID</span>
@@ -389,11 +436,18 @@ function RecordDetails({ record, name }: { record: RolloutRecord; name: string }
   );
 }
 
-function RecordsView({ name }: { name: string }) {
+function RecordsView({
+  name,
+  expandedId,
+  onToggle,
+}: {
+  name: string;
+  expandedId: string | null;
+  onToggle: (id: string | null) => void;
+}) {
   const [draft, setDraft] = useState<RecordFilters>({ ...EMPTY_RECORD_FILTERS });
   const [filters, setFilters] = useState<RecordFilters>({ ...EMPTY_RECORD_FILTERS });
   const [page, setPage] = useState(0);
-  const [expanded, setExpanded] = useState<string | null>(null);
   const pageSize = 25;
   const records = useQuery({
     queryKey: ["experiment-records", name, filters, page],
@@ -410,13 +464,13 @@ function RecordsView({ name }: { name: string }) {
     event.preventDefault();
     setFilters({ ...draft });
     setPage(0);
-    setExpanded(null);
+    onToggle(null);
   };
   const clear = () => {
     setDraft({ ...EMPTY_RECORD_FILTERS });
     setFilters({ ...EMPTY_RECORD_FILTERS });
     setPage(0);
-    setExpanded(null);
+    onToggle(null);
   };
   const hasFilters = Object.values(filters).some(Boolean);
 
@@ -535,7 +589,7 @@ function RecordsView({ name }: { name: string }) {
                 ))}
               {!records.isLoading &&
                 rows.map((record) => {
-                  const open = expanded === record.id;
+                  const open = expandedId === record.id;
                   const signal = record.score ?? record.reward;
                   return (
                     <Fragment key={record.id}>
@@ -543,14 +597,14 @@ function RecordsView({ name }: { name: string }) {
                         <td>
                           <button
                             className="record-expand"
-                            onClick={() => setExpanded(open ? null : record.id)}
+                            onClick={() => onToggle(open ? null : record.id)}
                             aria-label={open ? "collapse record" : "expand record"}
                           >
                             <ChevronIcon open={open} />
                           </button>
                         </td>
                         <td>
-                          <button className="record-id" onClick={() => setExpanded(open ? null : record.id)}>
+                          <button className="record-id" onClick={() => onToggle(open ? null : record.id)}>
                             {record.id}
                           </button>
                         </td>
@@ -617,9 +671,18 @@ function RecordsView({ name }: { name: string }) {
   );
 }
 
-function Drawer({ name }: { name: string }) {
-  const select = useUiStore((s) => s.select);
-  const [tab, setTab] = useState<"records" | "overview">("records");
+function Drawer({
+  name,
+  tab,
+  expandedId,
+}: {
+  name: string;
+  tab: "records" | "overview";
+  expandedId: string | null;
+}) {
+  const navigate = useNavigate();
+  const encName = encodeURIComponent(name);
+  const close = () => navigate("/experiments");
   const detail = useQuery({
     queryKey: ["experiment", name],
     queryFn: () => getExperiment(name),
@@ -627,24 +690,38 @@ function Drawer({ name }: { name: string }) {
   const d = detail.data;
 
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && select(null);
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && navigate("/experiments");
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [select]);
+  }, [navigate]);
+
+  // Toggling a record maps to a URL: expanded → /records/:id, collapsed → base.
+  const onToggle = (id: string | null) => {
+    if (id) navigate(`/experiments/${encName}/records/${encodeURIComponent(id)}`);
+    else navigate(`/experiments/${encName}`);
+  };
 
   return (
     <>
-      <div className="scrim" onClick={() => select(null)} />
+      <div className="scrim" onClick={close} />
       <aside className="drawer">
         <div className="drawer__head">
           <div>
             <div className="drawer__title">
               <span className="glyph" />
               {name}
+              <button
+                className="iconbtn iconbtn--inline drawer__share"
+                title="Copy link to this experiment"
+                aria-label="copy link"
+                onClick={() => copyLink(`/experiments/${encName}`)}
+              >
+                <LinkIcon />
+              </button>
             </div>
             {d && <div className="drawer__uri">{d.uri}</div>}
           </div>
-          <button className="iconbtn" onClick={() => select(null)} aria-label="close">
+          <button className="iconbtn" onClick={close} aria-label="close">
             <CloseIcon />
           </button>
         </div>
@@ -652,7 +729,7 @@ function Drawer({ name }: { name: string }) {
         <div className="drawer__tabs" role="tablist">
           <button
             className={tab === "records" ? "drawer__tab drawer__tab--active" : "drawer__tab"}
-            onClick={() => setTab("records")}
+            onClick={() => navigate(`/experiments/${encName}`)}
             role="tab"
             aria-selected={tab === "records"}
           >
@@ -660,7 +737,7 @@ function Drawer({ name }: { name: string }) {
           </button>
           <button
             className={tab === "overview" ? "drawer__tab drawer__tab--active" : "drawer__tab"}
-            onClick={() => setTab("overview")}
+            onClick={() => navigate(`/experiments/${encName}/overview`)}
             role="tab"
             aria-selected={tab === "overview"}
           >
@@ -675,7 +752,9 @@ function Drawer({ name }: { name: string }) {
               loading experiment…
             </div>
           )}
-          {tab === "records" && <RecordsView name={name} />}
+          {tab === "records" && (
+            <RecordsView name={name} expandedId={expandedId} onToggle={onToggle} />
+          )}
           {tab === "overview" && d && (
             <>
               <div className="section-label">Storage</div>
@@ -751,12 +830,12 @@ function taskDuration(t: TaskRecord): string {
 /** "Merge WAL" trigger — enqueues a merge_wal task for one experiment. */
 function MergeWalButton({ name }: { name: string }) {
   const qc = useQueryClient();
-  const setView = useUiStore((s) => s.setView);
+  const navigate = useNavigate();
   const trigger = useMutation({
     mutationFn: () => enqueueTask({ kind: "merge_wal", target: name }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["tasks"] });
-      setView("tasks");
+      navigate("/tasks");
     },
   });
   return (
@@ -773,12 +852,12 @@ function MergeWalButton({ name }: { name: string }) {
 /** "Index id" trigger — enqueues an index_id task (build ZoneMap on id). */
 function IndexIdButton({ name }: { name: string }) {
   const qc = useQueryClient();
-  const setView = useUiStore((s) => s.setView);
+  const navigate = useNavigate();
   const trigger = useMutation({
     mutationFn: () => enqueueTask({ kind: "index_id", target: name }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["tasks"] });
-      setView("tasks");
+      navigate("/tasks");
     },
   });
   return (
@@ -847,13 +926,14 @@ function TaskQueue() {
 
 /* ---- app ----------------------------------------------------------------- */
 
-export function App() {
-  const { view, search, page, pageSize, selected, setView, setSearch, setPage } = useUiStore();
+/** The experiments list view (stat strip + search + table + pager). The
+ * experiment drawer is rendered by the route, layered on top of this list. */
+function ExperimentsList() {
+  const { search, page, pageSize, setSearch, setPage } = useUiStore();
   const list = useQuery({
     queryKey: ["experiments", search, page, pageSize],
     queryFn: () => listExperiments(search, pageSize, page * pageSize),
     placeholderData: (prev) => prev,
-    enabled: view === "experiments",
   });
 
   const total = list.data?.total ?? 0;
@@ -866,39 +946,8 @@ export function App() {
   const hot = rows.filter((e) => e.fragment_count >= 16).length;
 
   return (
-    <div className="app">
-      <header className="topbar">
-        <div className="brand">
-          <div className="brand__mark" />
-          <span className="brand__name">lance-context</span>
-          <span className="brand__sub">control plane</span>
-        </div>
-        <div className="topbar__spacer" />
-        <nav className="tabs">
-          <button
-            className={`tab ${view === "experiments" ? "tab--active" : ""}`}
-            onClick={() => setView("experiments")}
-          >
-            Experiments
-          </button>
-          <button
-            className={`tab ${view === "tasks" ? "tab--active" : ""}`}
-            onClick={() => setView("tasks")}
-          >
-            Task Queue
-          </button>
-        </nav>
-        <div className="live">
-          <span className="live__dot" />
-          {list.isFetching ? "syncing" : "live"}
-        </div>
-      </header>
-
-      {view === "tasks" ? (
-        <TaskQueue />
-      ) : (
-        <>
-          <div className="stats">
+    <>
+      <div className="stats">
         <StatCard label="Experiments" value={fmtInt(total)} />
         <StatCard label="Rows (page)" value={fmtCompact(pageRows)} />
         <StatCard label="Fragments (page)" value={fmtCompact(pageFrags)} />
@@ -972,10 +1021,79 @@ export function App() {
           </button>
         </div>
       )}
-        </>
-      )}
+    </>
+  );
+}
 
-      {selected && <Drawer key={selected} name={selected} />}
+/** Experiments list plus, when the URL names an experiment, its detail drawer.
+ * `tab` and `recordId` come from the matched route so the drawer state (which
+ * tab, which expanded record) is fully reflected in — and driven by — the URL. */
+function ExperimentsRoute({ tab }: { tab: "records" | "overview" }) {
+  const params = useParams();
+  const name = params.name ? decodeURIComponent(params.name) : null;
+  const recordId = params.recordId ? decodeURIComponent(params.recordId) : null;
+  return (
+    <>
+      <ExperimentsList />
+      {name && (
+        <Drawer key={name} name={name} tab={tab} expandedId={recordId} />
+      )}
+    </>
+  );
+}
+
+/** Top nav shared across all routes. */
+function TopBar() {
+  const fetching = useIsFetching();
+  return (
+    <header className="topbar">
+      <div className="brand">
+        <div className="brand__mark" />
+        <span className="brand__name">lance-context</span>
+        <span className="brand__sub">control plane</span>
+      </div>
+      <div className="topbar__spacer" />
+      <nav className="tabs">
+        <NavLink
+          to="/experiments"
+          className={({ isActive }) => `tab ${isActive ? "tab--active" : ""}`}
+        >
+          Experiments
+        </NavLink>
+        <NavLink to="/tasks" className={({ isActive }) => `tab ${isActive ? "tab--active" : ""}`}>
+          Task Queue
+        </NavLink>
+      </nav>
+      <div className="live">
+        <span className="live__dot" />
+        {fetching > 0 ? "syncing" : "live"}
+      </div>
+    </header>
+  );
+}
+
+export function App() {
+  return (
+    <div className="app">
+      <TopBar />
+      <Routes>
+        <Route path="/" element={<Navigate to="/experiments" replace />} />
+        <Route path="/experiments" element={<ExperimentsRoute tab="records" />} />
+        <Route
+          path="/experiments/:name"
+          element={<ExperimentsRoute tab="records" />}
+        />
+        <Route
+          path="/experiments/:name/overview"
+          element={<ExperimentsRoute tab="overview" />}
+        />
+        <Route
+          path="/experiments/:name/records/:recordId"
+          element={<ExperimentsRoute tab="records" />}
+        />
+        <Route path="/tasks" element={<TaskQueue />} />
+        <Route path="*" element={<Navigate to="/experiments" replace />} />
+      </Routes>
     </div>
   );
 }
