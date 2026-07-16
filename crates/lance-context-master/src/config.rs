@@ -1,15 +1,6 @@
 //! Command-line / environment configuration for the master control-plane.
 
-use clap::{Parser, ValueEnum};
-
-/// Durable scheduler state backend.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum TaskStoreBackend {
-    /// Single-master RocksDB on a dedicated local PVC.
-    Rocksdb,
-    /// Shared etcd state with lease-based task claims for HA masters.
-    Etcd,
-}
+use clap::Parser;
 
 /// Control-plane (master) process for lance-context rollout stores.
 #[derive(Debug, Clone, Parser)]
@@ -65,29 +56,9 @@ pub struct MasterConfig {
     #[arg(long, env = "TASK_CONCURRENCY", default_value_t = 4)]
     pub task_concurrency: usize,
 
-    /// Scheduler state backend. `rocksdb` requires exactly one master and a
-    /// dedicated PVC; `etcd` supports multiple stateless master replicas.
-    #[arg(
-        long,
-        env = "TASK_STORE_BACKEND",
-        value_enum,
-        default_value_t = TaskStoreBackend::Rocksdb
-    )]
-    pub task_store_backend: TaskStoreBackend,
-
-    /// Local RocksDB directory for durable scheduler task state. This must be
-    /// backed by persistent local storage in production; it must not be an
-    /// object-store URI or a volume shared by multiple master processes. Used
-    /// only when `TASK_STORE_BACKEND=rocksdb`.
-    #[arg(
-        long,
-        env = "TASK_DB_PATH",
-        default_value = "./master-data/tasks.rocksdb"
-    )]
-    pub task_db_path: String,
-
-    /// Comma-separated etcd v3 endpoints. Required when
-    /// `TASK_STORE_BACKEND=etcd`.
+    /// Comma-separated etcd v3 endpoints. Scheduler state (task queue,
+    /// lease-based claims, per-experiment write locks) lives in etcd so several
+    /// stateless master replicas can share one queue. Required.
     #[arg(long, env = "ETCD_ENDPOINTS", value_delimiter = ',')]
     pub etcd_endpoints: Vec<String>,
 
@@ -120,7 +91,7 @@ pub struct MasterConfig {
     #[arg(long, env = "ETCD_LEASE_TTL_SECS", default_value_t = 30)]
     pub etcd_lease_ttl_secs: i64,
 
-    /// Maximum number of terminal scheduler tasks retained in RocksDB and the
+    /// Maximum number of terminal scheduler tasks retained in etcd and the
     /// queue UI. Queued and running tasks are never pruned, and at least one
     /// terminal task is retained for status polling.
     #[arg(long, env = "TASK_HISTORY_LIMIT", default_value_t = 1_000)]

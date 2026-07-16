@@ -422,9 +422,9 @@ fn blob_filename(record: &lance_context_core::RolloutRecord) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{MasterConfig, TaskStoreBackend};
+    use crate::config::MasterConfig;
     use chrono::Utc;
-    use lance_context_core::{RolloutRecord, RolloutRegistry, RolloutStore};
+    use lance_context_core::{generate_id, RolloutRecord, RolloutRegistry, RolloutStore};
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -440,23 +440,23 @@ mod tests {
             target_rows_per_fragment: 1_048_576,
             worker_endpoints: vec![],
             task_concurrency: 4,
-            task_store_backend: TaskStoreBackend::Rocksdb,
-            task_db_path: dir
-                .path()
-                .join("master-tasks")
-                .to_string_lossy()
-                .to_string(),
-            etcd_endpoints: vec![],
-            etcd_prefix: "/test".to_string(),
+            etcd_endpoints: test_etcd_endpoints(),
+            etcd_prefix: format!("/lance-context/test/{}", generate_id()),
             etcd_username: None,
             etcd_password: None,
             etcd_ca_cert: None,
             etcd_client_cert: None,
             etcd_client_key: None,
-            etcd_lease_ttl_secs: 30,
+            etcd_lease_ttl_secs: 5,
             task_history_limit: 1_000,
             ui_dir: None,
         }
+    }
+
+    fn test_etcd_endpoints() -> Vec<String> {
+        std::env::var("ETCD_TEST_ENDPOINTS")
+            .map(|value| value.split(',').map(str::to_string).collect())
+            .unwrap_or_default()
     }
 
     fn test_record(id: &str, with_blob: bool) -> RolloutRecord {
@@ -499,6 +499,7 @@ mod tests {
     /// Create N experiments via core, register them, scan, and assert the stats
     /// table + list endpoint reflect them.
     #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn scan_populates_and_list_returns_experiments() {
         let dir = TempDir::new().unwrap();
         let state = MasterState::new(test_config(&dir)).await.unwrap();
@@ -550,6 +551,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn scan_sees_registry_commits_from_another_handle() {
         let dir = TempDir::new().unwrap();
         let state = MasterState::new(test_config(&dir)).await.unwrap();
@@ -570,6 +572,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn scan_reconciles_removed_experiments() {
         let dir = TempDir::new().unwrap();
         let state = MasterState::new(test_config(&dir)).await.unwrap();
@@ -594,6 +597,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn get_experiment_not_found() {
         let dir = TempDir::new().unwrap();
         let state = MasterState::new(test_config(&dir)).await.unwrap();
@@ -607,6 +611,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn fresh_detail_refreshes_only_requested_experiment() {
         let dir = TempDir::new().unwrap();
         let state = MasterState::new(test_config(&dir)).await.unwrap();
@@ -650,6 +655,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn records_endpoint_filters_pages_and_rejects_unknown_experiment() {
         let dir = TempDir::new().unwrap();
         let state = MasterState::new(test_config(&dir)).await.unwrap();
@@ -716,6 +722,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn blob_endpoint_sets_download_headers_and_returns_bytes() {
         let dir = TempDir::new().unwrap();
         let state = MasterState::new(test_config(&dir)).await.unwrap();
