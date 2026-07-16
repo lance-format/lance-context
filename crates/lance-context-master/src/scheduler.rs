@@ -1,17 +1,16 @@
 //! Unified task scheduler.
 //!
-//! The master runs a single scheduler that drains one durable queue with
-//! **bounded concurrency**. Task records are written to RocksDB before they
-//! enter the in-memory dispatch channel; queued and interrupted tasks are
-//! reloaded after a master restart. It executes three kinds of task
+//! Each master polls one durable queue with **bounded concurrency**. RocksDB
+//! supports one master; etcd uses atomic lease-backed claims so multiple
+//! stateless masters can drain the same queue. It executes three kinds of task
 //! ([`TaskKind`]):
 //!
 //! - **Compact** — rewrites an experiment's base-table fragments. Two `Rewrite`s
 //!   on the *same* dataset conflict in Lance's conflict matrix, so compaction of
 //!   one experiment is serialized against itself (and against `IndexId`) via a
-//!   per-name in-flight gate ([`MasterState::inflight_dataset_writes`]). Distinct
-//!   experiments compact concurrently. `Rewrite` vs the data-plane's `Append` is
-//!   non-conflicting, so this runs safely alongside live ingest.
+//!   per-name task-store lock. Distinct experiments compact concurrently.
+//!   `Rewrite` vs the data-plane's `Append` is non-conflicting, so this runs
+//!   safely alongside live ingest.
 //! - **MergeWal** — folds flushed MemWAL generations back into the base table.
 //!   The master cannot do this itself without fencing the live shard writer, so
 //!   it fans out to every configured worker endpoint and each worker merges its
@@ -19,7 +18,7 @@
 //! - **IndexId** — builds a ZoneMap scalar index on the base table's `id` column
 //!   (runs locally on the master). It commits a `CreateIndex`, which can conflict
 //!   with a concurrent `Compact` `Rewrite` on the same dataset, so it shares the
-//!   per-name in-flight gate with `Compact`.
+//!   per-name task-store lock with `Compact`.
 //!
 //! Each task runs in its own `tokio::spawn`, so one task's failure never affects
 //! another. A global [`Semaphore`] bounds how many run at once.
@@ -28,13 +27,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
-use lance_context_api::{TaskKind, TaskRecord, TaskState};
-use lance_context_core::{generate_id, CompactionConfig, RolloutStore, RolloutStoreOptions};
+use lance_context_api::{TaskKind, TaskRecord};
+use lance_context_core::{CompactionConfig, RolloutStore, RolloutStoreOptions};
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
-use crate::state::{prune_terminal_history, MasterState};
+use crate::state::MasterState;
 use crate::stats_store::StatRow;
+use crate::task_store::TaskClaim;
 
 /// Build the [`CompactionConfig`] the scheduler applies, from master config.
 pub fn compaction_config(state: &MasterState) -> CompactionConfig {
@@ -44,11 +44,6 @@ pub fn compaction_config(state: &MasterState) -> CompactionConfig {
         target_rows_per_fragment: state.config.target_rows_per_fragment,
         ..Default::default()
     }
-}
-
-/// Current Unix-millisecond timestamp.
-fn now_ms() -> i64 {
-    Utc::now().timestamp_millis()
 }
 
 fn kind_label(kind: TaskKind) -> &'static str {
@@ -69,97 +64,14 @@ pub async fn enqueue(
     kind: TaskKind,
     target: &str,
 ) -> lance::Result<TaskRecord> {
-    let mut tasks = state.tasks.lock().await;
-    if matches!(kind, TaskKind::Compact | TaskKind::IndexId) {
-        if let Some(existing) = tasks.values().find(|t| {
-            t.kind == kind
-                && t.target == target
-                && matches!(t.state, TaskState::Queued | TaskState::Running)
-        }) {
-            return Ok(existing.clone());
-        }
-    }
-
-    let record = TaskRecord {
-        id: generate_id(),
-        kind,
-        target: target.to_string(),
-        state: TaskState::Queued,
-        error: None,
-        detail: None,
-        enqueued_at: now_ms(),
-        started_at: None,
-        finished_at: None,
-    };
-    state.task_store.put(&record)?;
-    tasks.insert(record.id.clone(), record.clone());
-    drop(tasks);
-    // Unbounded send only fails if the receiver was dropped (scheduler gone).
-    let _ = state.task_tx.send(record.id.clone());
+    let record = state.task_store.enqueue(kind, target).await?;
     metrics::counter!("master_task_enqueued_total", "kind" => kind_label(kind)).increment(1);
-    metrics::gauge!("master_task_queue_depth").increment(1.0);
     Ok(record)
 }
 
-/// Persist a task mutation before publishing it to the in-memory cache.
-async fn update_task(
-    state: &Arc<MasterState>,
-    id: &str,
-    f: impl FnOnce(&mut TaskRecord),
-) -> lance::Result<()> {
-    let mut tasks = state.tasks.lock().await;
-    let Some(current) = tasks.get(id) else {
-        return Ok(());
-    };
-    let mut updated = current.clone();
-    f(&mut updated);
-    state.task_store.put(&updated)?;
-    let terminal = matches!(updated.state, TaskState::Done | TaskState::Failed);
-    tasks.insert(id.to_string(), updated);
-    if terminal {
-        prune_terminal_history(
-            &state.task_store,
-            &mut tasks,
-            state.config.task_history_limit,
-        )?;
-    }
-    Ok(())
-}
-
-/// Execute one task by id: dispatch on its kind, recording lifecycle timestamps
-/// and the terminal state.
-async fn run_task(state: &Arc<MasterState>, id: String) {
-    metrics::gauge!("master_task_queue_depth").decrement(1.0);
-
-    let Some(task) = state.tasks.lock().await.get(&id).cloned() else {
-        return; // task vanished (should not happen)
-    };
-    update_task(state, &id, |t| {
-        t.state = TaskState::Running;
-        t.started_at = Some(now_ms());
-    })
-    .await
-    .unwrap_or_else(|error| {
-        tracing::error!(task = %id, error = %error, "failed to persist task start");
-    });
-
-    let task_started = state
-        .tasks
-        .lock()
-        .await
-        .get(&id)
-        .is_some_and(|task| task.state == TaskState::Running);
-    if !task_started {
-        metrics::gauge!("master_task_queue_depth").increment(1.0);
-        let retry_tx = state.task_tx.clone();
-        let retry_id = id.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            let _ = retry_tx.send(retry_id);
-        });
-        return;
-    }
-
+/// Execute one claimed task and atomically publish its terminal state.
+async fn run_task(state: &Arc<MasterState>, claim: TaskClaim) {
+    let task = claim.task.clone();
     let started = std::time::Instant::now();
     let outcome = match task.kind {
         TaskKind::Compact => run_compaction(state, &task.target).await,
@@ -173,46 +85,18 @@ async fn run_task(state: &Arc<MasterState>, id: String) {
     metrics::counter!("master_tasks_total", "kind" => kind_label(task.kind), "result" => result)
         .increment(1);
 
-    update_task(state, &id, |t| {
-        t.finished_at = Some(now_ms());
-        match outcome {
-            Ok(detail) => {
-                t.state = TaskState::Done;
-                t.detail = Some(detail);
-            }
-            Err(error) => {
-                tracing::warn!(task = %id, target = %t.target, error = %error, "task failed");
-                t.state = TaskState::Failed;
-                t.error = Some(error);
-            }
-        }
-    })
-    .await
-    .unwrap_or_else(|error| {
-        tracing::error!(task = %id, error = %error, "failed to persist task completion");
-    });
+    if let Err(error) = &outcome {
+        tracing::warn!(task = %task.id, target = %task.target, error, "task failed");
+    }
+    if let Err(error) = state.task_store.finish(claim, outcome).await {
+        tracing::error!(task = %task.id, error = %error, "failed to persist task completion");
+    }
 }
 
-/// Compact one experiment. Serialized per experiment via the shared base-table
-/// write gate so two `Rewrite`s (or a `Rewrite` racing a `CreateIndex`) on the
-/// same dataset never conflict. Returns a human-readable outcome summary on
-/// success.
+/// Compact one experiment. The task-store claim owns the per-experiment write
+/// lock for the full execution.
 async fn run_compaction(state: &Arc<MasterState>, name: &str) -> Result<String, String> {
-    // Per-name serial gate: refuse if another base-table write for this
-    // experiment is already running. (De-dup at enqueue makes this rare, but
-    // the gate is the real guarantee against conflicting commits.)
-    {
-        let mut inflight = state.inflight_dataset_writes.lock().await;
-        if !inflight.insert(name.to_string()) {
-            return Err(format!(
-                "a base-table write for '{name}' is already in progress"
-            ));
-        }
-    }
-    // Ensure the gate is released no matter how the inner call exits.
-    let result = compact_inner(state, name).await;
-    state.inflight_dataset_writes.lock().await.remove(name);
-    result
+    compact_inner(state, name).await
 }
 
 /// Build a ZoneMap scalar index on one experiment's `id` column. Shares the
@@ -220,17 +104,7 @@ async fn run_compaction(state: &Arc<MasterState>, name: &str) -> Result<String, 
 /// `Compact` for the same experiment never commit concurrently (`CreateIndex`
 /// vs `Rewrite` can conflict). Distinct experiments index concurrently.
 async fn run_index_id(state: &Arc<MasterState>, name: &str) -> Result<String, String> {
-    {
-        let mut inflight = state.inflight_dataset_writes.lock().await;
-        if !inflight.insert(name.to_string()) {
-            return Err(format!(
-                "a base-table write for '{name}' is already in progress"
-            ));
-        }
-    }
-    let result = index_id_inner(state, name).await;
-    state.inflight_dataset_writes.lock().await.remove(name);
-    result
+    index_id_inner(state, name).await
 }
 
 async fn index_id_inner(state: &Arc<MasterState>, name: &str) -> Result<String, String> {
@@ -329,10 +203,18 @@ async fn run_merge_wal(state: &Arc<MasterState>, name: &str) -> Result<String, S
 /// Refresh the stats row for `name` after a successful compaction: re-observe
 /// fragment/row counts and bump `last_compaction`/`total_compactions`.
 async fn update_stats_after_compaction(state: &Arc<MasterState>, name: &str, store: &RolloutStore) {
+    let guard = match state.task_store.coordination_lock("stats-writer").await {
+        Ok(guard) => guard,
+        Err(e) => {
+            tracing::warn!(store = %name, error = %e, "stats writer lock failed");
+            return;
+        }
+    };
     let obs = match store.observe().await {
         Ok(obs) => obs,
         Err(e) => {
             tracing::warn!(store = %name, error = %e, "post-compaction observe failed");
+            let _ = state.task_store.release_coordination_lock(guard).await;
             return;
         }
     };
@@ -355,12 +237,33 @@ async fn update_stats_after_compaction(state: &Arc<MasterState>, name: &str, sto
     if let Err(e) = stats.upsert(&row).await {
         tracing::warn!(store = %name, error = %e, "post-compaction stats upsert failed");
     }
+    drop(stats);
+    if let Err(e) = state.task_store.release_coordination_lock(guard).await {
+        tracing::warn!(store = %name, error = %e, "stats writer unlock failed");
+    }
 }
 
 /// Enqueue a `Compact` task for every experiment whose fragment count is at or
 /// above the configured threshold, honoring quiet hours. Reads candidates from
 /// the stats table.
 pub async fn sweep_candidates(state: &Arc<MasterState>) -> lance::Result<usize> {
+    let Some(guard) = state
+        .task_store
+        .try_coordination_lock("compaction-sweep")
+        .await?
+    else {
+        return Ok(0);
+    };
+    let result = sweep_candidates_inner(state).await;
+    let release = state.task_store.release_coordination_lock(guard).await;
+    match (result, release) {
+        (Ok(count), Ok(())) => Ok(count),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+async fn sweep_candidates_inner(state: &Arc<MasterState>) -> lance::Result<usize> {
     let config = compaction_config(state);
     // Quiet-hours gate applies to the whole sweep.
     if in_quiet_hours(&config) {
@@ -389,18 +292,8 @@ fn in_quiet_hours(config: &CompactionConfig) -> bool {
         .any(|(start, end)| hour >= *start && hour < *end)
 }
 
-/// Spawn the scheduler dispatcher plus (optionally) the periodic auto-sweep. The
-/// dispatcher owns the queue receiver and runs up to `task_concurrency` tasks at
-/// once, each in its own detached task. Returns the dispatcher handle. Panics if
-/// called twice (receiver already taken).
+/// Spawn the scheduler poller plus the optional periodic auto-sweep.
 pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
-    let mut rx = state
-        .task_rx
-        .try_lock()
-        .expect("scheduler: state lock")
-        .take()
-        .expect("spawn_scheduler called more than once");
-
     // Optional periodic auto-sweep feeds the same queue.
     let interval_secs = state.config.compaction_interval_secs;
     if interval_secs > 0 {
@@ -420,32 +313,35 @@ pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
     }
 
     let concurrency = state.config.task_concurrency.max(1);
-    let queue_depth = state
-        .tasks
-        .try_lock()
-        .map(|tasks| {
-            tasks
-                .values()
-                .filter(|task| task.state == TaskState::Queued)
-                .count()
-        })
-        .unwrap_or(0);
-    metrics::gauge!("master_task_queue_depth").set(queue_depth as f64);
     let sem = Arc::new(Semaphore::new(concurrency));
     let dispatch_state = state.clone();
     tokio::spawn(async move {
-        while let Some(id) = rx.recv().await {
-            // Acquire a slot before spawning so at most `concurrency` run at once.
-            let permit = sem
-                .clone()
-                .acquire_owned()
-                .await
-                .expect("semaphore never closed");
-            let st = dispatch_state.clone();
-            tokio::spawn(async move {
-                run_task(&st, id).await;
-                drop(permit);
-            });
+        loop {
+            if let Ok(queued) = dispatch_state.task_store.queue_depth().await {
+                metrics::gauge!("master_task_queue_depth").set(queued as f64);
+            }
+            while sem.available_permits() > 0 {
+                match dispatch_state.task_store.claim_next().await {
+                    Ok(Some(claim)) => {
+                        let permit = sem
+                            .clone()
+                            .acquire_owned()
+                            .await
+                            .expect("semaphore never closed");
+                        let st = dispatch_state.clone();
+                        tokio::spawn(async move {
+                            run_task(&st, claim).await;
+                            drop(permit);
+                        });
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        tracing::warn!(error = %error, "scheduler queue poll failed");
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
     })
 }
@@ -453,7 +349,8 @@ pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::MasterConfig;
+    use crate::config::{MasterConfig, TaskStoreBackend};
+    use lance_context_api::TaskState;
     use tempfile::TempDir;
 
     fn config(dir: &TempDir) -> MasterConfig {
@@ -469,11 +366,20 @@ mod tests {
             target_rows_per_fragment: 1_048_576,
             worker_endpoints: vec![],
             task_concurrency: 4,
+            task_store_backend: TaskStoreBackend::Rocksdb,
             task_db_path: dir
                 .path()
                 .join("master-tasks")
                 .to_string_lossy()
                 .to_string(),
+            etcd_endpoints: vec![],
+            etcd_prefix: "/test".to_string(),
+            etcd_username: None,
+            etcd_password: None,
+            etcd_ca_cert: None,
+            etcd_client_cert: None,
+            etcd_client_key: None,
+            etcd_lease_ttl_secs: 30,
             task_history_limit: 1_000,
             ui_dir: None,
         }
@@ -483,9 +389,9 @@ mod tests {
     async fn await_terminal(state: &Arc<MasterState>, id: &str) -> TaskRecord {
         for _ in 0..100 {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            if let Some(t) = state.tasks.lock().await.get(id) {
+            if let Some(t) = state.task_store.get(id).await.unwrap() {
                 if matches!(t.state, TaskState::Done | TaskState::Failed) {
-                    return t.clone();
+                    return t;
                 }
             }
         }
@@ -528,6 +434,7 @@ mod tests {
             state
                 .task_store
                 .list()
+                .await
                 .unwrap()
                 .into_iter()
                 .find(|task| task.id == rec.id)
@@ -586,15 +493,7 @@ mod tests {
         let a = enqueue(&state, TaskKind::Compact, "x").await.unwrap();
         let b = enqueue(&state, TaskKind::Compact, "x").await.unwrap();
         assert_eq!(a.id, b.id, "second enqueue returns the same task");
-        // Only one task in the map, one message on the queue.
-        assert_eq!(state.tasks.lock().await.len(), 1);
-        assert_eq!(state.task_store.list().unwrap().len(), 1);
-        let mut rx = state.task_rx.lock().await.take().unwrap();
-        let mut n = 0;
-        while rx.try_recv().is_ok() {
-            n += 1;
-        }
-        assert_eq!(n, 1);
+        assert_eq!(state.task_store.list().await.unwrap().len(), 1);
     }
 
     /// A MergeWal task with no configured endpoints fails fast with a clear msg.

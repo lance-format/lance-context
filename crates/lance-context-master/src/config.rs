@@ -1,6 +1,15 @@
 //! Command-line / environment configuration for the master control-plane.
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+
+/// Durable scheduler state backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum TaskStoreBackend {
+    /// Single-master RocksDB on a dedicated local PVC.
+    Rocksdb,
+    /// Shared etcd state with lease-based task claims for HA masters.
+    Etcd,
+}
 
 /// Control-plane (master) process for lance-context rollout stores.
 #[derive(Debug, Clone, Parser)]
@@ -56,15 +65,60 @@ pub struct MasterConfig {
     #[arg(long, env = "TASK_CONCURRENCY", default_value_t = 4)]
     pub task_concurrency: usize,
 
+    /// Scheduler state backend. `rocksdb` requires exactly one master and a
+    /// dedicated PVC; `etcd` supports multiple stateless master replicas.
+    #[arg(
+        long,
+        env = "TASK_STORE_BACKEND",
+        value_enum,
+        default_value_t = TaskStoreBackend::Rocksdb
+    )]
+    pub task_store_backend: TaskStoreBackend,
+
     /// Local RocksDB directory for durable scheduler task state. This must be
     /// backed by persistent local storage in production; it must not be an
-    /// object-store URI or a volume shared by multiple master processes.
+    /// object-store URI or a volume shared by multiple master processes. Used
+    /// only when `TASK_STORE_BACKEND=rocksdb`.
     #[arg(
         long,
         env = "TASK_DB_PATH",
         default_value = "./master-data/tasks.rocksdb"
     )]
     pub task_db_path: String,
+
+    /// Comma-separated etcd v3 endpoints. Required when
+    /// `TASK_STORE_BACKEND=etcd`.
+    #[arg(long, env = "ETCD_ENDPOINTS", value_delimiter = ',')]
+    pub etcd_endpoints: Vec<String>,
+
+    /// Namespace for all lance-context master keys in etcd.
+    #[arg(long, env = "ETCD_PREFIX", default_value = "/lance-context/master")]
+    pub etcd_prefix: String,
+
+    /// Optional etcd username. `ETCD_PASSWORD` must also be set.
+    #[arg(long, env = "ETCD_USERNAME")]
+    pub etcd_username: Option<String>,
+
+    /// Optional etcd password. `ETCD_USERNAME` must also be set.
+    #[arg(long, env = "ETCD_PASSWORD")]
+    pub etcd_password: Option<String>,
+
+    /// Optional PEM CA certificate path for etcd TLS.
+    #[arg(long, env = "ETCD_CA_CERT")]
+    pub etcd_ca_cert: Option<String>,
+
+    /// Optional PEM client certificate path for etcd mutual TLS.
+    #[arg(long, env = "ETCD_CLIENT_CERT")]
+    pub etcd_client_cert: Option<String>,
+
+    /// Optional PEM client private-key path for etcd mutual TLS.
+    #[arg(long, env = "ETCD_CLIENT_KEY")]
+    pub etcd_client_key: Option<String>,
+
+    /// TTL for etcd task claims and distributed locks. The master renews leases
+    /// while work is running; orphaned tasks are requeued after expiry.
+    #[arg(long, env = "ETCD_LEASE_TTL_SECS", default_value_t = 30)]
+    pub etcd_lease_ttl_secs: i64,
 
     /// Maximum number of terminal scheduler tasks retained in RocksDB and the
     /// queue UI. Queued and running tasks are never pruned, and at least one

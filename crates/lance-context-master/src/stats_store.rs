@@ -7,7 +7,8 @@
 //! the UI list endpoint can render row/fragment counts without opening every
 //! dataset on each request.
 //!
-//! The master is the sole writer of this table; the data-plane never touches it.
+//! Master replicas coordinate a single writer through the configured task-store
+//! backend; the data-plane never touches this table.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -170,6 +171,7 @@ impl StatsStore {
     /// Insert or replace the stats row for `row.name` (delete-then-append,
     /// idempotent). Callers must serialize mutations.
     pub async fn upsert(&mut self, row: &StatRow) -> LanceResult<()> {
+        self.dataset.checkout_latest().await?;
         self.delete_row(&row.name).await?;
         let batch = Self::row_to_batch(row)?;
         let schema = Arc::new(stats_schema());
@@ -181,6 +183,7 @@ impl StatsStore {
 
     /// Remove the stats row for `name`, if present. No-op when absent.
     pub async fn remove(&mut self, name: &str) -> LanceResult<()> {
+        self.dataset.checkout_latest().await?;
         self.delete_row(name).await
     }
 
@@ -193,7 +196,8 @@ impl StatsStore {
     }
 
     /// Fetch a single experiment's stats row by name.
-    pub async fn get(&self, name: &str) -> LanceResult<Option<StatRow>> {
+    pub async fn get(&mut self, name: &str) -> LanceResult<Option<StatRow>> {
+        self.dataset.checkout_latest().await?;
         let escaped = name.replace('\'', "''");
         let mut scanner = self.dataset.scan();
         scanner.filter(&format!("name = '{}'", escaped))?;
@@ -210,7 +214,8 @@ impl StatsStore {
 
     /// Total number of rows matching an optional case-sensitive substring on
     /// `name`, ignoring pagination.
-    pub async fn count(&self, search: Option<&str>) -> LanceResult<i64> {
+    pub async fn count(&mut self, search: Option<&str>) -> LanceResult<i64> {
+        self.dataset.checkout_latest().await?;
         let mut scanner = self.dataset.scan();
         scanner.project(&["name"])?;
         if let Some(q) = search {
@@ -227,11 +232,12 @@ impl StatsStore {
     /// List stats rows, optionally filtered by a `name` substring, ordered by
     /// name, with `limit`/`offset` pagination applied in memory.
     pub async fn list(
-        &self,
+        &mut self,
         search: Option<&str>,
         limit: usize,
         offset: usize,
     ) -> LanceResult<Vec<StatRow>> {
+        self.dataset.checkout_latest().await?;
         let mut scanner = self.dataset.scan();
         if let Some(q) = search {
             scanner.filter(&Self::like_filter(q))?;
@@ -384,7 +390,7 @@ mod tests {
             let mut s = new_store(&dir).await;
             s.upsert(&sample("persist", 7)).await.unwrap();
         }
-        let s = new_store(&dir).await;
+        let mut s = new_store(&dir).await;
         assert_eq!(s.get("persist").await.unwrap().unwrap().row_count, 7);
     }
 

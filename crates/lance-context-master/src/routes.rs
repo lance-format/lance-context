@@ -85,7 +85,7 @@ pub async fn list_experiments(
     Query(params): Query<ListParams>,
 ) -> Result<Json<ExperimentListResponse>, MasterError> {
     let search = params.search.as_deref().filter(|s| !s.is_empty());
-    let stats = state.stats.lock().await;
+    let mut stats = state.stats.lock().await;
     let total = stats.count(search).await.map_err(MasterError::from_lance)?;
     let rows = stats
         .list(search, params.limit, params.offset)
@@ -118,7 +118,7 @@ pub async fn get_experiment(
             .await
             .map_err(MasterError::from_lance)?;
     }
-    let stats = state.stats.lock().await;
+    let mut stats = state.stats.lock().await;
     match stats.get(&name).await.map_err(MasterError::from_lance)? {
         Some(row) => Ok(Json(ExperimentDetail {
             summary: row.into_summary(),
@@ -245,15 +245,17 @@ fn task_to_compact_status(task: &TaskRecord) -> CompactJobStatus {
 }
 
 /// The most recent `Compact` task for `name`, if any (by `enqueued_at`).
-async fn latest_compact_task(state: &Arc<MasterState>, name: &str) -> Option<TaskRecord> {
-    state
-        .tasks
-        .lock()
-        .await
-        .values()
+async fn latest_compact_task(
+    state: &Arc<MasterState>,
+    name: &str,
+) -> lance::Result<Option<TaskRecord>> {
+    Ok(state
+        .task_store
+        .list()
+        .await?
+        .into_iter()
         .filter(|t| t.kind == TaskKind::Compact && t.target == name)
-        .max_by_key(|t| t.enqueued_at)
-        .cloned()
+        .max_by_key(|t| t.enqueued_at))
 }
 
 /// `POST /api/v1/experiments/{name}/compact` — enqueue a manual compaction.
@@ -288,11 +290,16 @@ pub async fn compact_experiment(
 pub async fn compact_status(
     State(state): State<Arc<MasterState>>,
     Path(name): Path<String>,
-) -> Json<CompactJobStatus> {
-    match latest_compact_task(&state, &name).await {
-        Some(task) => Json(task_to_compact_status(&task)),
-        None => Json(CompactJobStatus::None),
-    }
+) -> Result<Json<CompactJobStatus>, MasterError> {
+    Ok(
+        match latest_compact_task(&state, &name)
+            .await
+            .map_err(MasterError::from_lance)?
+        {
+            Some(task) => Json(task_to_compact_status(&task)),
+            None => Json(CompactJobStatus::None),
+        },
+    )
 }
 
 /// `POST /api/v1/tasks` — enqueue a task of any kind. Returns 202 Accepted with
@@ -321,10 +328,16 @@ pub async fn enqueue_task(
 }
 
 /// `GET /api/v1/tasks` — all tasks (queue + recent history), newest first.
-pub async fn list_tasks(State(state): State<Arc<MasterState>>) -> Json<TaskListResponse> {
-    let mut tasks: Vec<TaskRecord> = state.tasks.lock().await.values().cloned().collect();
+pub async fn list_tasks(
+    State(state): State<Arc<MasterState>>,
+) -> Result<Json<TaskListResponse>, MasterError> {
+    let mut tasks = state
+        .task_store
+        .list()
+        .await
+        .map_err(MasterError::from_lance)?;
     tasks.sort_by_key(|t| std::cmp::Reverse(t.enqueued_at));
-    Json(TaskListResponse { tasks })
+    Ok(Json(TaskListResponse { tasks }))
 }
 
 /// `GET /api/v1/tasks/{id}` — a single task by id.
@@ -332,7 +345,12 @@ pub async fn get_task(
     State(state): State<Arc<MasterState>>,
     Path(id): Path<String>,
 ) -> Result<Json<TaskRecord>, MasterError> {
-    match state.tasks.lock().await.get(&id).cloned() {
+    match state
+        .task_store
+        .get(&id)
+        .await
+        .map_err(MasterError::from_lance)?
+    {
         Some(task) => Ok(Json(task)),
         None => Err(MasterError::NotFound(format!("task '{}' not found", id))),
     }
@@ -404,7 +422,7 @@ fn blob_filename(record: &lance_context_core::RolloutRecord) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::MasterConfig;
+    use crate::config::{MasterConfig, TaskStoreBackend};
     use chrono::Utc;
     use lance_context_core::{RolloutRecord, RolloutRegistry, RolloutStore};
     use serde_json::json;
@@ -422,11 +440,20 @@ mod tests {
             target_rows_per_fragment: 1_048_576,
             worker_endpoints: vec![],
             task_concurrency: 4,
+            task_store_backend: TaskStoreBackend::Rocksdb,
             task_db_path: dir
                 .path()
                 .join("master-tasks")
                 .to_string_lossy()
                 .to_string(),
+            etcd_endpoints: vec![],
+            etcd_prefix: "/test".to_string(),
+            etcd_username: None,
+            etcd_password: None,
+            etcd_ca_cert: None,
+            etcd_client_cert: None,
+            etcd_client_key: None,
+            etcd_lease_ttl_secs: 30,
             task_history_limit: 1_000,
             ui_dir: None,
         }

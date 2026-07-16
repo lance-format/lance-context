@@ -138,7 +138,7 @@ crates/lance-context-client  # HTTP client for the server
 crates/lance-context-master  # Control plane, scheduler, and admin UI
 crates/lance-context         # Re-export crate for downstream clients
 python/                      # Python bindings (PyO3) + tests
-deploy/kubernetes/           # Kubernetes master + RocksDB PVC example
+deploy/kubernetes/           # Kubernetes master examples: RocksDB/PVC or etcd HA
 examples/                    # Runnable example projects
 ```
 
