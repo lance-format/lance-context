@@ -56,7 +56,7 @@ use arrow_array::types::Int8Type;
 use arrow_array::{
     Array, ArrayRef, BooleanArray, DictionaryArray, Float32Array, Int32Array, Int64Array,
     Int8Array, LargeBinaryArray, LargeStringArray, ListArray, RecordBatch, RecordBatchIterator,
-    StringArray, TimestampMicrosecondArray,
+    StringArray, TimestampMicrosecondArray, UInt64Array,
 };
 use arrow_schema::{ArrowError, DataType, Field, Schema, TimeUnit};
 use chrono::{DateTime, Utc};
@@ -1025,29 +1025,91 @@ impl RolloutStore {
     /// Fetch a single artifact row's `binary_payload` bytes on demand.
     ///
     /// `list`/`get_by_id` project `binary_payload` out, so it reads back as
-    /// `None` there. This method projects it in and reads the inline bytes
-    /// directly. Returns `None` if the row or its payload is absent.
+    /// `None` there. This method first locates the row using only `id`, then
+    /// takes `binary_payload` for that exact row id. Keeping the large inline
+    /// column out of the filtered scan prevents a point lookup from
+    /// materializing an entire fragment's payloads. Returns `None` if the row
+    /// or its payload is absent.
     pub async fn get_blob(&self, id: &str) -> LanceResult<Option<Vec<u8>>> {
-        let escaped_id = id.replace('\'', "''");
-        let scanner = self
-            .lsm_scanner()
+        let snapshots = self.wal_shard_snapshots().await?;
+        let mut generations: Vec<(u64, String)> = snapshots
+            .iter()
+            .flat_map(|snapshot| {
+                snapshot.flushed_generations.iter().map(|generation| {
+                    (
+                        generation.generation,
+                        self.flushed_generation_uri(snapshot.shard_id, &generation.path),
+                    )
+                })
+            })
+            .collect();
+        generations.sort_by_key(|(generation, _)| std::cmp::Reverse(*generation));
+
+        for (_, uri) in generations {
+            let dataset = self.open_flushed_dataset(&uri).await?;
+            if let Some(payload) = Self::get_blob_from_dataset(&dataset, id).await? {
+                return Ok(payload);
+            }
+        }
+
+        Ok(Self::get_blob_from_dataset(&self.dataset, id)
             .await?
-            .project(&["id", "binary_payload"])
-            .filter(&format!("id = '{}'", escaped_id))?;
+            .flatten())
+    }
+
+    /// Locate `id` without projecting payload bytes, then take only the
+    /// matching row's payload. The outer option distinguishes a missing row
+    /// from a present row whose payload is null, which matters when a newer WAL
+    /// row shadows a base-table row.
+    async fn get_blob_from_dataset(
+        dataset: &Dataset,
+        id: &str,
+    ) -> LanceResult<Option<Option<Vec<u8>>>> {
+        let escaped_id = id.replace('\'', "''");
+        let mut scanner = dataset.scan();
+        scanner
+            .project(&["id"])?
+            .filter(&format!("id = '{}'", escaped_id))?
+            .with_row_id()
+            .limit(Some(1), None)?;
+
         let mut stream = scanner.try_into_stream().await?;
         while let Some(batch) = stream.try_next().await? {
             let id_array = column_as::<StringArray>(&batch, "id")?;
-            let binary_array = column_as_optional::<LargeBinaryArray>(&batch, "binary_payload");
+            let row_id_array = column_as::<UInt64Array>(&batch, "_rowid")?;
             for row in 0..batch.num_rows() {
-                if id_array.value(row) == id {
-                    return Ok(match binary_array {
-                        Some(arr) if !arr.is_null(row) => Some(arr.value(row).to_vec()),
-                        _ => None,
-                    });
+                if id_array.value(row) != id {
+                    continue;
                 }
+
+                let projection = dataset.schema().project(&["binary_payload"])?;
+                let payload_batch = dataset
+                    .take_rows(&[row_id_array.value(row)], projection)
+                    .await?;
+                let binary_array =
+                    column_as_optional::<LargeBinaryArray>(&payload_batch, "binary_payload");
+                return Ok(Some(match binary_array {
+                    Some(arr) if !arr.is_null(0) => Some(arr.value(0).to_vec()),
+                    _ => None,
+                }));
             }
         }
         Ok(None)
+    }
+
+    fn flushed_generation_uri(&self, shard_id: Uuid, path: &str) -> String {
+        format!(
+            "{}/_mem_wal/{shard_id}/{path}",
+            self.dataset.uri().trim_end_matches('/')
+        )
+    }
+
+    async fn open_flushed_dataset(&self, uri: &str) -> LanceResult<Dataset> {
+        let mut builder = DatasetBuilder::from_uri(uri).with_session(self.dataset.session());
+        if let Some(options) = self.storage_options.clone() {
+            builder = builder.with_storage_options(options);
+        }
+        builder.load().await
     }
 
     /// Top-level column names excluding `binary_payload`, so list-style scans
@@ -1124,15 +1186,11 @@ impl RolloutStore {
     /// Count rows in all immutable flushed-generation datasets using metadata
     /// reads rather than a payload scan.
     async fn pending_wal_rows(&self, snapshots: &[ShardSnapshot]) -> LanceResult<u64> {
-        let base_uri = self.dataset.uri().trim_end_matches('/').to_string();
         let generation_paths: Vec<String> = snapshots
             .iter()
             .flat_map(|snapshot| {
                 snapshot.flushed_generations.iter().map(|generation| {
-                    format!(
-                        "{base_uri}/_mem_wal/{}/{}",
-                        snapshot.shard_id, generation.path
-                    )
+                    self.flushed_generation_uri(snapshot.shard_id, &generation.path)
                 })
             })
             .collect();
@@ -1966,6 +2024,8 @@ mod tests {
         let assistant = assistant_record("row-0");
         let artifact_bytes = b"\x00\x01\x02trace-bytes";
         let artifact = artifact_record("row-1", artifact_bytes);
+        let quoted_artifact_bytes = b"quoted-id-bytes";
+        let quoted_artifact = artifact_record("row-'quoted'", quoted_artifact_bytes);
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
@@ -1973,7 +2033,7 @@ mod tests {
             // MemWAL appends land in the `_mem_wal` namespace and do not advance
             // the base dataset version; `add` returns it unchanged.
             store
-                .add(&[assistant.clone(), artifact.clone()])
+                .add(&[assistant.clone(), artifact.clone(), quoted_artifact.clone()])
                 .await
                 .unwrap();
 
@@ -1981,7 +2041,7 @@ mod tests {
             // guarantee append order, so look rows up by id rather than by
             // position.
             let listed = store.list(None, None).await.unwrap();
-            assert_eq!(listed.len(), 2);
+            assert_eq!(listed.len(), 3);
             let listed_assistant = listed.iter().find(|r| r.id == "row-0").unwrap();
             let listed_artifact = listed.iter().find(|r| r.id == "row-1").unwrap();
             assert_records_eq(listed_assistant, &assistant);
@@ -1996,6 +2056,8 @@ mod tests {
             // The bytes are recoverable on demand from the sidecar file.
             let blob = store.get_blob("row-1").await.unwrap();
             assert_eq!(blob.as_deref(), Some(&artifact_bytes[..]));
+            let quoted_blob = store.get_blob("row-'quoted'").await.unwrap();
+            assert_eq!(quoted_blob.as_deref(), Some(&quoted_artifact_bytes[..]));
             // The assistant row carries no payload.
             assert_eq!(store.get_blob("row-0").await.unwrap(), None);
 
@@ -2158,6 +2220,8 @@ mod tests {
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
+            let shard_a_blob = b"shard-a-blob";
+            let shard_b_blob = b"shard-b-blob";
             let options = |shard: &str| RolloutStoreOptions {
                 storage_options: None,
                 shard_id: Some(shard.to_string()),
@@ -2168,12 +2232,18 @@ mod tests {
             let mut instance_a = RolloutStore::open_with_options(&uri, options("rollout-0"))
                 .await
                 .unwrap();
-            instance_a.add(&[assistant_record("a-0")]).await.unwrap();
+            instance_a
+                .add(&[artifact_record("a-0", shard_a_blob)])
+                .await
+                .unwrap();
 
             let mut instance_b = RolloutStore::open_with_options(&uri, options("rollout-1"))
                 .await
                 .unwrap();
-            instance_b.add(&[assistant_record("b-0")]).await.unwrap();
+            instance_b
+                .add(&[artifact_record("b-0", shard_b_blob)])
+                .await
+                .unwrap();
 
             // Distinct instance ids derive distinct shards.
             assert_ne!(
@@ -2186,6 +2256,14 @@ mod tests {
             assert_eq!(seen.len(), 2);
             assert!(seen.iter().any(|r| r.id == "a-0"));
             assert!(seen.iter().any(|r| r.id == "b-0"));
+            assert_eq!(
+                instance_b.get_blob("a-0").await.unwrap().as_deref(),
+                Some(&shard_a_blob[..])
+            );
+            assert_eq!(
+                instance_a.get_blob("b-0").await.unwrap().as_deref(),
+                Some(&shard_b_blob[..])
+            );
 
             // Observability is independent of the reader's own write shard:
             // both shards contribute rows and pending generations.
