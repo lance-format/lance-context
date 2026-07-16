@@ -122,12 +122,18 @@ impl TaskStore {
         matches!(self.inner.as_ref(), TaskStoreInner::Etcd(_))
     }
 
-    /// Atomically enqueue a task. Compact and IndexId use an etcd/local dedupe
-    /// key while queued or running; MergeWal always creates a new task.
-    pub async fn enqueue(&self, kind: TaskKind, target: &str) -> lance::Result<TaskRecord> {
+    /// Atomically enqueue a task. Standalone Compact and IndexId tasks use an
+    /// etcd/local dedupe key while queued or running. Tasks with dependencies
+    /// are always distinct because they belong to a specific ordered chain.
+    pub async fn enqueue(
+        &self,
+        kind: TaskKind,
+        target: &str,
+        depends_on: Vec<String>,
+    ) -> lance::Result<TaskRecord> {
         match self.inner.as_ref() {
-            TaskStoreInner::Rocks(store) => store.enqueue(kind, target).await,
-            TaskStoreInner::Etcd(store) => store.enqueue(kind, target).await,
+            TaskStoreInner::Rocks(store) => store.enqueue(kind, target, depends_on).await,
+            TaskStoreInner::Etcd(store) => store.enqueue(kind, target, depends_on).await,
         }
     }
 
@@ -159,13 +165,19 @@ impl TaskStore {
     /// Claim the oldest runnable task. In etcd mode the queued->running update,
     /// claim lease, and per-experiment write lock are one transaction.
     pub async fn claim_next(&self) -> lance::Result<Option<TaskClaim>> {
-        match self.inner.as_ref() {
+        let (claim, dependency_failed) = match self.inner.as_ref() {
             TaskStoreInner::Rocks(store) => store.claim_next().await,
             TaskStoreInner::Etcd(store) => {
                 store.recover_orphaned().await?;
                 store.claim_next().await
             }
+        }?;
+        if dependency_failed {
+            if let Err(error) = self.prune_terminal_history().await {
+                tracing::warn!(error = %error, "failed to prune task history");
+            }
         }
+        Ok(claim)
     }
 
     /// Finish a claimed task and release its claim/target lock.
@@ -235,11 +247,16 @@ impl TaskStore {
     }
 
     async fn prune_terminal_history(&self) -> lance::Result<usize> {
-        let mut terminal = self
-            .list()
-            .await?
+        let tasks = self.list().await?;
+        let protected = tasks
+            .iter()
+            .filter(|task| matches!(task.state, TaskState::Queued | TaskState::Running))
+            .flat_map(|task| task.depends_on.iter().cloned())
+            .collect::<HashSet<_>>();
+        let mut terminal = tasks
             .into_iter()
             .filter(|task| matches!(task.state, TaskState::Done | TaskState::Failed))
+            .filter(|task| !protected.contains(&task.id))
             .collect::<Vec<_>>();
         terminal
             .sort_by_key(|task| std::cmp::Reverse(task.finished_at.unwrap_or(task.enqueued_at)));
@@ -297,18 +314,24 @@ impl RocksTaskStore {
         })
     }
 
-    async fn enqueue(&self, kind: TaskKind, target: &str) -> lance::Result<TaskRecord> {
+    async fn enqueue(
+        &self,
+        kind: TaskKind,
+        target: &str,
+        depends_on: Vec<String>,
+    ) -> lance::Result<TaskRecord> {
         let _operation = self.operation_lock.lock().await;
-        if requires_dedupe(kind) {
+        if should_dedupe(kind, &depends_on) {
             if let Some(existing) = self.list()?.into_iter().find(|task| {
                 task.kind == kind
                     && task.target == target
+                    && task.depends_on.is_empty()
                     && matches!(task.state, TaskState::Queued | TaskState::Running)
             }) {
                 return Ok(existing);
             }
         }
-        let task = new_task(kind, target);
+        let task = new_task(kind, target, depends_on);
         self.put(&task)?;
         Ok(task)
     }
@@ -344,35 +367,61 @@ impl RocksTaskStore {
         Ok(tasks)
     }
 
-    async fn claim_next(&self) -> lance::Result<Option<TaskClaim>> {
+    async fn claim_next(&self) -> lance::Result<(Option<TaskClaim>, bool)> {
         let _operation = self.operation_lock.lock().await;
         let claimed_tasks = self.claimed_tasks.lock().await;
         let mut claimed_targets = self.claimed_targets.lock().await;
-        let mut queued = self
-            .list()?
-            .into_iter()
+        let tasks = self.list()?;
+        let mut queued = tasks
+            .iter()
             .filter(|task| task.state == TaskState::Queued && !claimed_tasks.contains(&task.id))
+            .cloned()
             .collect::<Vec<_>>();
         queued.sort_by_key(|task| task.enqueued_at);
-        let Some(mut task) = queued.into_iter().find(|task| {
-            !requires_target_lock(task.kind) || !claimed_targets.contains(&task.target)
-        }) else {
-            return Ok(None);
+        let mut dependency_failed = false;
+        let mut runnable = None;
+        for mut task in queued {
+            match dependency_status(&task, |id| {
+                tasks
+                    .iter()
+                    .find(|candidate| candidate.id == id)
+                    .map(|task| task.state)
+            }) {
+                DependencyStatus::Ready => {}
+                DependencyStatus::Waiting => continue,
+                DependencyStatus::Failed(dependency) => {
+                    fail_dependency(&mut task, &dependency);
+                    self.put(&task)?;
+                    dependency_failed = true;
+                    continue;
+                }
+            }
+            if requires_target_lock(task.kind) && claimed_targets.contains(&task.target) {
+                continue;
+            }
+            runnable = Some(task);
+            break;
+        }
+        let Some(mut task) = runnable else {
+            return Ok((None, dependency_failed));
         };
         let target_locked = requires_target_lock(task.kind);
+        task.state = TaskState::Running;
+        task.started_at = Some(now_ms());
+        self.put(&task)?;
         if target_locked {
             claimed_targets.insert(task.target.clone());
         }
         drop(claimed_targets);
         drop(claimed_tasks);
         self.claimed_tasks.lock().await.insert(task.id.clone());
-        task.state = TaskState::Running;
-        task.started_at = Some(now_ms());
-        self.put(&task)?;
-        Ok(Some(TaskClaim {
-            task,
-            backend: ClaimBackend::Rocks { target_locked },
-        }))
+        Ok((
+            Some(TaskClaim {
+                task,
+                backend: ClaimBackend::Rocks { target_locked },
+            }),
+            dependency_failed,
+        ))
     }
 
     async fn finish(&self, claim: TaskClaim, outcome: Result<String, String>) -> lance::Result<()> {
@@ -382,12 +431,12 @@ impl RocksTaskStore {
         let _operation = self.operation_lock.lock().await;
         let mut task = claim.task;
         apply_outcome(&mut task, outcome);
-        self.put(&task)?;
+        let result = self.put(&task);
         self.claimed_tasks.lock().await.remove(&task.id);
         if target_locked {
             self.claimed_targets.lock().await.remove(&task.target);
         }
-        Ok(())
+        result
     }
 
     async fn recover_running(&self) -> lance::Result<usize> {
@@ -483,13 +532,18 @@ impl EtcdTaskStore {
         })
     }
 
-    async fn enqueue(&self, kind: TaskKind, target: &str) -> lance::Result<TaskRecord> {
-        let task = new_task(kind, target);
+    async fn enqueue(
+        &self,
+        kind: TaskKind,
+        target: &str,
+        depends_on: Vec<String>,
+    ) -> lance::Result<TaskRecord> {
+        let task = new_task(kind, target, depends_on);
         let task_key = self.task_key(&task.id);
         let queue_key = self.queue_key(&task.id);
         let value = encode_task(&task)?;
         let mut client = self.client.clone();
-        if let Some(dedupe_key) = self.dedupe_key(kind, target) {
+        if let Some(dedupe_key) = self.dedupe_key(kind, target, &task.depends_on) {
             for _ in 0..4 {
                 let txn = Txn::new()
                     .when([Compare::version(dedupe_key.as_str(), CompareOp::Equal, 0)])
@@ -568,81 +622,115 @@ impl EtcdTaskStore {
             .map_err(|_| lance::Error::io("etcd returned an invalid queue count"))
     }
 
-    async fn claim_next(&self) -> lance::Result<Option<TaskClaim>> {
-        let mut client = self.client.clone();
-        let response = client
-            .get(
-                self.queue_prefix(),
-                Some(
-                    GetOptions::new()
-                        .with_prefix()
-                        .with_limit(TASK_POLL_BATCH as i64),
-                ),
-            )
-            .await
-            .map_err(etcd_error("list queued tasks"))?;
-        let queued = response
-            .kvs()
-            .iter()
-            .map(|kv| decode_task(kv.value(), &String::from_utf8_lossy(kv.key())))
-            .collect::<lance::Result<Vec<_>>>()?;
+    async fn claim_next(&self) -> lance::Result<(Option<TaskClaim>, bool)> {
+        let prefix = self.queue_prefix();
+        let range_end = prefix_range_end(prefix.as_bytes());
+        let mut start_key = prefix.into_bytes();
+        let mut dependency_failed = false;
 
-        for mut task in queued {
-            let token = generate_id();
-            let lease_id = self.grant_lease().await?;
-            let claim_key = self.claim_key(&task.id);
-            let target_key =
-                requires_target_lock(task.kind).then(|| self.target_lock_key(&task.target));
-            let queue_key = self.queue_key(&task.id);
-            let running_key = self.running_key(&task.id);
-            let queued_value = encode_task(&task)?;
-            task.state = TaskState::Running;
-            task.started_at = Some(now_ms());
-            let running_value = encode_task(&task)?;
-            let mut compares = vec![
-                Compare::value(self.task_key(&task.id), CompareOp::Equal, queued_value),
-                Compare::version(claim_key.as_str(), CompareOp::Equal, 0),
-                Compare::version(queue_key.as_str(), CompareOp::Greater, 0),
-            ];
-            if let Some(key) = &target_key {
-                compares.push(Compare::version(key.as_str(), CompareOp::Equal, 0));
-            }
-            let lease_options = Some(PutOptions::new().with_lease(lease_id));
-            let mut operations = vec![
-                TxnOp::put(self.task_key(&task.id), running_value.clone(), None),
-                TxnOp::delete(queue_key, None),
-                TxnOp::put(running_key, running_value, None),
-                TxnOp::put(claim_key.as_str(), token.as_bytes(), lease_options.clone()),
-            ];
-            if let Some(key) = &target_key {
-                operations.push(TxnOp::put(
-                    key.as_str(),
-                    token.as_bytes(),
-                    lease_options.clone(),
-                ));
-            }
+        loop {
             let mut client = self.client.clone();
-            let claimed = client
-                .txn(Txn::new().when(compares).and_then(operations))
+            let response = client
+                .get(
+                    start_key,
+                    Some(
+                        GetOptions::new()
+                            .with_range(range_end.clone())
+                            .with_limit(TASK_POLL_BATCH as i64),
+                    ),
+                )
                 .await
-                .map_err(etcd_error("claim task"))?
-                .succeeded();
-            if claimed {
-                let keepalive = self.start_keepalive(lease_id).await?;
-                return Ok(Some(TaskClaim {
-                    task,
-                    backend: ClaimBackend::Etcd {
-                        token,
-                        lease_id,
-                        claim_key,
-                        target_key,
-                        keepalive,
-                    },
-                }));
+                .map_err(etcd_error("list queued tasks"))?;
+            let more = response.more();
+            let next_key = response.kvs().last().map(|kv| {
+                let mut key = kv.key().to_vec();
+                key.push(0);
+                key
+            });
+            let queued = response
+                .kvs()
+                .iter()
+                .map(|kv| decode_task(kv.value(), &String::from_utf8_lossy(kv.key())))
+                .collect::<lance::Result<Vec<_>>>()?;
+
+            for mut task in queued {
+                match self.dependency_status(&task).await? {
+                    DependencyStatus::Ready => {}
+                    DependencyStatus::Waiting => continue,
+                    DependencyStatus::Failed(dependency) => {
+                        if self.fail_dependency(&task, &dependency).await? {
+                            dependency_failed = true;
+                        }
+                        continue;
+                    }
+                }
+
+                let token = generate_id();
+                let lease_id = self.grant_lease().await?;
+                let claim_key = self.claim_key(&task.id);
+                let target_key =
+                    requires_target_lock(task.kind).then(|| self.target_lock_key(&task.target));
+                let queue_key = self.queue_key(&task.id);
+                let running_key = self.running_key(&task.id);
+                let queued_value = encode_task(&task)?;
+                task.state = TaskState::Running;
+                task.started_at = Some(now_ms());
+                let running_value = encode_task(&task)?;
+                let mut compares = vec![
+                    Compare::value(self.task_key(&task.id), CompareOp::Equal, queued_value),
+                    Compare::version(claim_key.as_str(), CompareOp::Equal, 0),
+                    Compare::version(queue_key.as_str(), CompareOp::Greater, 0),
+                ];
+                if let Some(key) = &target_key {
+                    compares.push(Compare::version(key.as_str(), CompareOp::Equal, 0));
+                }
+                let lease_options = Some(PutOptions::new().with_lease(lease_id));
+                let mut operations = vec![
+                    TxnOp::put(self.task_key(&task.id), running_value.clone(), None),
+                    TxnOp::delete(queue_key, None),
+                    TxnOp::put(running_key, running_value, None),
+                    TxnOp::put(claim_key.as_str(), token.as_bytes(), lease_options.clone()),
+                ];
+                if let Some(key) = &target_key {
+                    operations.push(TxnOp::put(
+                        key.as_str(),
+                        token.as_bytes(),
+                        lease_options.clone(),
+                    ));
+                }
+                let mut client = self.client.clone();
+                let claimed = client
+                    .txn(Txn::new().when(compares).and_then(operations))
+                    .await
+                    .map_err(etcd_error("claim task"))?
+                    .succeeded();
+                if claimed {
+                    let keepalive = self.start_keepalive(lease_id).await?;
+                    return Ok((
+                        Some(TaskClaim {
+                            task,
+                            backend: ClaimBackend::Etcd {
+                                token,
+                                lease_id,
+                                claim_key,
+                                target_key,
+                                keepalive,
+                            },
+                        }),
+                        dependency_failed,
+                    ));
+                }
+                self.revoke_lease(lease_id).await?;
             }
-            self.revoke_lease(lease_id).await?;
+
+            if !more {
+                return Ok((None, dependency_failed));
+            }
+            let Some(next_key) = next_key else {
+                return Ok((None, dependency_failed));
+            };
+            start_key = next_key;
         }
-        Ok(None)
     }
 
     async fn finish(&self, claim: TaskClaim, outcome: Result<String, String>) -> lance::Result<()> {
@@ -666,7 +754,7 @@ impl EtcdTaskStore {
         if let Some(key) = &target_key {
             operations.push(TxnOp::delete(key.as_str(), None));
         }
-        if let Some(key) = self.dedupe_key(task.kind, &task.target) {
+        if let Some(key) = self.dedupe_key(task.kind, &task.target, &task.depends_on) {
             operations.push(TxnOp::delete(key, None));
         }
         let mut client = self.client.clone();
@@ -844,6 +932,46 @@ impl EtcdTaskStore {
             .transpose()
     }
 
+    async fn dependency_status(&self, task: &TaskRecord) -> lance::Result<DependencyStatus> {
+        let mut waiting = false;
+        for dependency in &task.depends_on {
+            match self.get(dependency).await? {
+                Some(record) if record.state == TaskState::Done => {}
+                Some(record) if record.state == TaskState::Failed => {
+                    return Ok(DependencyStatus::Failed(dependency.clone()));
+                }
+                Some(_) => waiting = true,
+                None => return Ok(DependencyStatus::Failed(dependency.clone())),
+            }
+        }
+        Ok(if waiting {
+            DependencyStatus::Waiting
+        } else {
+            DependencyStatus::Ready
+        })
+    }
+
+    async fn fail_dependency(&self, task: &TaskRecord, dependency: &str) -> lance::Result<bool> {
+        let queued_value = encode_task(task)?;
+        let mut failed = task.clone();
+        fail_dependency(&mut failed, dependency);
+        let txn = Txn::new()
+            .when([
+                Compare::value(self.task_key(&task.id), CompareOp::Equal, queued_value),
+                Compare::version(self.queue_key(&task.id), CompareOp::Greater, 0),
+            ])
+            .and_then([
+                TxnOp::put(self.task_key(&task.id), encode_task(&failed)?, None),
+                TxnOp::delete(self.queue_key(&task.id), None),
+            ]);
+        let mut client = self.client.clone();
+        client
+            .txn(txn)
+            .await
+            .map(|response| response.succeeded())
+            .map_err(etcd_error("fail task with unsuccessful dependency"))
+    }
+
     async fn delete_many(&self, ids: &[String]) -> lance::Result<()> {
         for chunk in ids.chunks(100) {
             let operations = chunk
@@ -891,8 +1019,8 @@ impl EtcdTaskStore {
         format!("{}/target-locks/{}", self.prefix, encode_segment(target))
     }
 
-    fn dedupe_key(&self, kind: TaskKind, target: &str) -> Option<String> {
-        requires_dedupe(kind).then(|| {
+    fn dedupe_key(&self, kind: TaskKind, target: &str, depends_on: &[String]) -> Option<String> {
+        should_dedupe(kind, depends_on).then(|| {
             format!(
                 "{}/dedupe/{}/{}",
                 self.prefix,
@@ -903,7 +1031,7 @@ impl EtcdTaskStore {
     }
 }
 
-fn new_task(kind: TaskKind, target: &str) -> TaskRecord {
+fn new_task(kind: TaskKind, target: &str, depends_on: Vec<String>) -> TaskRecord {
     TaskRecord {
         id: generate_id(),
         kind,
@@ -914,6 +1042,7 @@ fn new_task(kind: TaskKind, target: &str) -> TaskRecord {
         enqueued_at: now_ms(),
         started_at: None,
         finished_at: None,
+        depends_on,
     }
 }
 
@@ -941,8 +1070,42 @@ fn requeue(task: &mut TaskRecord) {
     task.detail = None;
 }
 
-fn requires_dedupe(kind: TaskKind) -> bool {
-    matches!(kind, TaskKind::Compact | TaskKind::IndexId)
+enum DependencyStatus {
+    Ready,
+    Waiting,
+    Failed(String),
+}
+
+fn dependency_status(
+    task: &TaskRecord,
+    mut lookup: impl FnMut(&str) -> Option<TaskState>,
+) -> DependencyStatus {
+    let mut waiting = false;
+    for dependency in &task.depends_on {
+        match lookup(dependency) {
+            Some(TaskState::Done) => {}
+            Some(TaskState::Failed) | None => {
+                return DependencyStatus::Failed(dependency.clone());
+            }
+            Some(TaskState::Queued | TaskState::Running) => waiting = true,
+        }
+    }
+    if waiting {
+        DependencyStatus::Waiting
+    } else {
+        DependencyStatus::Ready
+    }
+}
+
+fn fail_dependency(task: &mut TaskRecord, dependency: &str) {
+    apply_outcome(
+        task,
+        Err(format!("dependency {dependency} did not complete")),
+    );
+}
+
+fn should_dedupe(kind: TaskKind, depends_on: &[String]) -> bool {
+    depends_on.is_empty() && matches!(kind, TaskKind::Compact | TaskKind::IndexId)
 }
 
 fn requires_target_lock(kind: TaskKind) -> bool {
@@ -967,6 +1130,18 @@ fn encode_segment(value: &str) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+fn prefix_range_end(prefix: &[u8]) -> Vec<u8> {
+    let mut end = prefix.to_vec();
+    for index in (0..end.len()).rev() {
+        if end[index] != u8::MAX {
+            end[index] += 1;
+            end.truncate(index + 1);
+            return end;
+        }
+    }
+    vec![0]
 }
 
 fn encode_task(task: &TaskRecord) -> lance::Result<Vec<u8>> {
@@ -1034,11 +1209,11 @@ mod tests {
         let cfg = config(&dir);
         let first = TaskStore::open(&cfg).await.unwrap();
         let a = first
-            .enqueue(TaskKind::Compact, "experiment")
+            .enqueue(TaskKind::Compact, "experiment", Vec::new())
             .await
             .unwrap();
         let b = first
-            .enqueue(TaskKind::Compact, "experiment")
+            .enqueue(TaskKind::Compact, "experiment", Vec::new())
             .await
             .unwrap();
         assert_eq!(a.id, b.id);
@@ -1053,7 +1228,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = TaskStore::open(&config(&dir)).await.unwrap();
         let task = store
-            .enqueue(TaskKind::IndexId, "experiment")
+            .enqueue(TaskKind::IndexId, "experiment", Vec::new())
             .await
             .unwrap();
         let claim = store.claim_next().await.unwrap().unwrap();
@@ -1066,6 +1241,83 @@ mod tests {
         let finished = store.get(&task.id).await.unwrap().unwrap();
         assert_eq!(finished.state, TaskState::Done);
         assert_eq!(finished.detail.as_deref(), Some("indexed"));
+    }
+
+    #[tokio::test]
+    async fn rocksdb_waits_for_dependencies_and_propagates_failure() {
+        let dir = TempDir::new().unwrap();
+        let store = TaskStore::open(&config(&dir)).await.unwrap();
+
+        let prerequisite = store
+            .enqueue(TaskKind::MergeWal, "experiment", Vec::new())
+            .await
+            .unwrap();
+        let dependent = store
+            .enqueue(
+                TaskKind::Compact,
+                "experiment",
+                vec![prerequisite.id.clone()],
+            )
+            .await
+            .unwrap();
+        let claim = store.claim_next().await.unwrap().unwrap();
+        assert_eq!(claim.task.id, prerequisite.id);
+        assert!(
+            store.claim_next().await.unwrap().is_none(),
+            "dependent task must wait while its prerequisite is running"
+        );
+        store.finish(claim, Ok("merged".to_string())).await.unwrap();
+        let dependent_claim = store.claim_next().await.unwrap().unwrap();
+        assert_eq!(dependent_claim.task.id, dependent.id);
+        store
+            .finish(dependent_claim, Ok("compacted".to_string()))
+            .await
+            .unwrap();
+
+        let failed_prerequisite = store
+            .enqueue(TaskKind::MergeWal, "failed-chain", Vec::new())
+            .await
+            .unwrap();
+        let skipped = store
+            .enqueue(
+                TaskKind::IndexId,
+                "failed-chain",
+                vec![failed_prerequisite.id.clone()],
+            )
+            .await
+            .unwrap();
+        let claim = store.claim_next().await.unwrap().unwrap();
+        assert_eq!(claim.task.id, failed_prerequisite.id);
+        store
+            .finish(claim, Err("merge failed".to_string()))
+            .await
+            .unwrap();
+        assert!(store.claim_next().await.unwrap().is_none());
+        let skipped = store.get(&skipped.id).await.unwrap().unwrap();
+        assert_eq!(skipped.state, TaskState::Failed);
+        assert!(skipped
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("dependency")));
+    }
+
+    #[tokio::test]
+    async fn dependent_tasks_do_not_participate_in_standalone_dedupe() {
+        let dir = TempDir::new().unwrap();
+        let store = TaskStore::open(&config(&dir)).await.unwrap();
+        let prerequisite = store
+            .enqueue(TaskKind::MergeWal, "experiment", Vec::new())
+            .await
+            .unwrap();
+        let dependent = store
+            .enqueue(TaskKind::Compact, "experiment", vec![prerequisite.id])
+            .await
+            .unwrap();
+        let standalone = store
+            .enqueue(TaskKind::Compact, "experiment", Vec::new())
+            .await
+            .unwrap();
+        assert_ne!(dependent.id, standalone.id);
     }
 
     #[tokio::test]
@@ -1095,8 +1347,8 @@ mod tests {
         let first = TaskStore::open(&cfg).await.unwrap();
         let second = TaskStore::open(&cfg).await.unwrap();
         let (a, b) = tokio::join!(
-            first.enqueue(TaskKind::Compact, "experiment"),
-            second.enqueue(TaskKind::Compact, "experiment")
+            first.enqueue(TaskKind::Compact, "experiment", Vec::new()),
+            second.enqueue(TaskKind::Compact, "experiment", Vec::new())
         );
         let a = a.unwrap();
         let b = b.unwrap();
@@ -1111,7 +1363,7 @@ mod tests {
         let compact_claim = claims.pop().unwrap();
 
         first
-            .enqueue(TaskKind::IndexId, "experiment")
+            .enqueue(TaskKind::IndexId, "experiment", Vec::new())
             .await
             .unwrap();
         assert!(
@@ -1130,7 +1382,39 @@ mod tests {
             .await
             .unwrap();
 
-        let orphan = first.enqueue(TaskKind::MergeWal, "orphan").await.unwrap();
+        let prerequisite = first
+            .enqueue(TaskKind::MergeWal, "dependency", Vec::new())
+            .await
+            .unwrap();
+        let dependent = second
+            .enqueue(
+                TaskKind::Compact,
+                "dependency",
+                vec![prerequisite.id.clone()],
+            )
+            .await
+            .unwrap();
+        let prerequisite_claim = first.claim_next().await.unwrap().unwrap();
+        assert_eq!(prerequisite_claim.task.id, prerequisite.id);
+        assert!(
+            second.claim_next().await.unwrap().is_none(),
+            "another master must not claim a task with a running dependency"
+        );
+        first
+            .finish(prerequisite_claim, Ok("merged".to_string()))
+            .await
+            .unwrap();
+        let dependent_claim = second.claim_next().await.unwrap().unwrap();
+        assert_eq!(dependent_claim.task.id, dependent.id);
+        second
+            .finish(dependent_claim, Ok("compacted".to_string()))
+            .await
+            .unwrap();
+
+        let orphan = first
+            .enqueue(TaskKind::MergeWal, "orphan", Vec::new())
+            .await
+            .unwrap();
         let abandoned = first.claim_next().await.unwrap().unwrap();
         assert_eq!(abandoned.task.id, orphan.id);
         drop(abandoned);

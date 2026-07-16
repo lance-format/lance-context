@@ -64,7 +64,20 @@ pub async fn enqueue(
     kind: TaskKind,
     target: &str,
 ) -> lance::Result<TaskRecord> {
-    let record = state.task_store.enqueue(kind, target).await?;
+    enqueue_with_deps(state, kind, target, Vec::new()).await
+}
+
+/// Like [`enqueue`] but the task waits for `depends_on` (task ids) to reach
+/// `Done` before it runs. De-dup is skipped when dependencies are present: a
+/// dependent task is part of an ordered chain and must not collapse into an
+/// unrelated in-flight task for the same target.
+pub async fn enqueue_with_deps(
+    state: &Arc<MasterState>,
+    kind: TaskKind,
+    target: &str,
+    depends_on: Vec<String>,
+) -> lance::Result<TaskRecord> {
+    let record = state.task_store.enqueue(kind, target, depends_on).await?;
     metrics::counter!("master_task_enqueued_total", "kind" => kind_label(kind)).increment(1);
     Ok(record)
 }
@@ -544,8 +557,82 @@ mod tests {
         worker.abort();
     }
 
-    /// Minimal rollout record builder for tests (the core struct has no
-    /// `Default`).
+    /// A dependent task runs only after its dependency reaches `Done`: an
+    /// `index_id` depending on a `compact` must start after compaction finishes,
+    /// so the two never contend for the shared per-experiment base-table gate.
+    #[tokio::test]
+    async fn dependent_task_runs_after_dependency_done() {
+        let dir = TempDir::new().unwrap();
+        let state = MasterState::new(config(&dir)).await.unwrap();
+        let worker = spawn_scheduler(&state);
+
+        let name = "exp";
+        let uri = state.rollout_uri(name);
+        {
+            let mut store = RolloutStore::open(&uri).await.unwrap();
+            for i in 0..4 {
+                let rec = rollout_record(&format!("r{i}"));
+                store.add(&[rec]).await.unwrap();
+                store.cleanup_own_shard().await.unwrap();
+            }
+        }
+        state
+            .registry
+            .write()
+            .await
+            .upsert(name, &uri)
+            .await
+            .unwrap();
+        crate::scanner::scan_once(&state).await.unwrap();
+
+        let compact = enqueue(&state, TaskKind::Compact, name).await.unwrap();
+        let index = enqueue_with_deps(&state, TaskKind::IndexId, name, vec![compact.id.clone()])
+            .await
+            .unwrap();
+
+        let compact_final = await_terminal(&state, &compact.id).await;
+        assert_eq!(
+            compact_final.state,
+            TaskState::Done,
+            "got {compact_final:?}"
+        );
+        let index_final = await_terminal(&state, &index.id).await;
+        assert_eq!(index_final.state, TaskState::Done, "got {index_final:?}");
+        // The dependent could not have started before the dependency finished.
+        assert!(
+            index_final.started_at.unwrap() >= compact_final.finished_at.unwrap(),
+            "index started {:?} before compact finished {:?}",
+            index_final.started_at,
+            compact_final.finished_at
+        );
+
+        worker.abort();
+    }
+
+    /// A dependent whose dependency `Failed` is skipped (marked `Failed`) rather
+    /// than run.
+    #[tokio::test]
+    async fn dependent_skipped_when_dependency_fails() {
+        let dir = TempDir::new().unwrap();
+        let state = MasterState::new(config(&dir)).await.unwrap();
+        let worker = spawn_scheduler(&state);
+
+        // MergeWal with no worker endpoints fails; its dependent must be skipped.
+        let merge = enqueue(&state, TaskKind::MergeWal, "exp").await.unwrap();
+        let dependent = enqueue_with_deps(&state, TaskKind::Compact, "exp", vec![merge.id.clone()])
+            .await
+            .unwrap();
+
+        let merge_final = await_terminal(&state, &merge.id).await;
+        assert_eq!(merge_final.state, TaskState::Failed);
+        let dep_final = await_terminal(&state, &dependent.id).await;
+        assert_eq!(dep_final.state, TaskState::Failed, "got {dep_final:?}");
+        assert!(dep_final.error.unwrap().contains("dependency"));
+
+        worker.abort();
+    }
+
+    /// Minimal rollout record builder for tests (the core struct has no    /// `Default`).
     pub fn rollout_record(id: &str) -> lance_context_core::RolloutRecord {
         use chrono::TimeZone;
         lance_context_core::RolloutRecord {

@@ -136,7 +136,7 @@ mod tests {
         let first = MasterState::new(config.clone()).await.unwrap();
         let task = first
             .task_store
-            .enqueue(TaskKind::Compact, "legacy")
+            .enqueue(TaskKind::Compact, "legacy", Vec::new())
             .await
             .unwrap();
         let claim = first.task_store.claim_next().await.unwrap().unwrap();

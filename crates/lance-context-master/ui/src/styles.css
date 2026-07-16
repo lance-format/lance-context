@@ -894,6 +894,29 @@ td .muted {
   height: 28px;
 }
 
+/* Small ghost button used for inline "Copy link" actions. */
+.btn--sm {
+  padding: 4px 10px;
+  font-size: 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* Share-link icon button next to the drawer title. */
+.drawer__share {
+  width: 24px;
+  height: 24px;
+  flex: none;
+}
+
+/* Toolbar row above an expanded record's detail grid. */
+.record-detail__toolbar {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 10px;
+}
+
 .record-detail-row td {
   height: auto;
   padding: 0;
