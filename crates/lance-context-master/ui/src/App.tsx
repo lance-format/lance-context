@@ -171,9 +171,21 @@ function OptimizeButton({ name }: { name: string }) {
   const setView = useUiStore((s) => s.setView);
   const trigger = useMutation({
     mutationFn: async () => {
-      await enqueueTask({ kind: "merge_wal", target: name });
-      await enqueueTask({ kind: "compact", target: name });
-      await enqueueTask({ kind: "index_id", target: name });
+      // Chain the three tasks so they run in order: compact waits for the WAL
+      // merge, and the id-index build waits for compaction. compact and
+      // index_id share a per-experiment base-table write gate, so running them
+      // concurrently would make one fail; the dependency chain serializes them.
+      const merge = await enqueueTask({ kind: "merge_wal", target: name });
+      const compact = await enqueueTask({
+        kind: "compact",
+        target: name,
+        depends_on: [merge.id],
+      });
+      await enqueueTask({
+        kind: "index_id",
+        target: name,
+        depends_on: [compact.id],
+      });
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["tasks"] });

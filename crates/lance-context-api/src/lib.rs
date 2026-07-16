@@ -980,6 +980,11 @@ pub struct TaskRecord {
     /// When the task reached a terminal state, Unix milliseconds, if finished.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<i64>,
+    /// Task ids that must reach `Done` before this task may run. The scheduler
+    /// defers a task while any dependency is still `Queued`/`Running`, and marks
+    /// it `Failed` if any dependency `Failed`. Empty for standalone tasks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
 }
 
 /// Request body for `POST /api/v1/tasks`.
@@ -987,6 +992,9 @@ pub struct TaskRecord {
 pub struct EnqueueTaskRequest {
     pub kind: TaskKind,
     pub target: String,
+    /// Optional task ids this task must wait for (see [`TaskRecord::depends_on`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
 }
 
 /// Response for `GET /api/v1/tasks`.
@@ -1096,6 +1104,7 @@ mod tests {
             enqueued_at: 1_700_000_000_000,
             started_at: None,
             finished_at: None,
+            depends_on: Vec::new(),
         };
         let json = serde_json::to_string(&queued).unwrap();
         // snake_case tags for the enums.
@@ -1105,6 +1114,7 @@ mod tests {
         assert!(!json.contains("error"));
         assert!(!json.contains("started_at"));
         assert!(!json.contains("finished_at"));
+        assert!(!json.contains("depends_on"));
         let back: TaskRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(back, queued);
     }
@@ -1121,6 +1131,7 @@ mod tests {
             enqueued_at: 1,
             started_at: Some(2),
             finished_at: Some(3),
+            depends_on: Vec::new(),
         };
         let back: TaskRecord =
             serde_json::from_str(&serde_json::to_string(&done).unwrap()).unwrap();

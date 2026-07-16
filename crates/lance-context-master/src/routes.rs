@@ -312,7 +312,7 @@ pub async fn enqueue_task(
             req.target
         )));
     }
-    let task = scheduler::enqueue(&state, req.kind, &req.target).await;
+    let task = scheduler::enqueue_with_deps(&state, req.kind, &req.target, req.depends_on).await;
     Ok((StatusCode::ACCEPTED, Json(task)))
 }
 

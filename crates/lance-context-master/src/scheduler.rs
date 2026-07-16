@@ -1,7 +1,7 @@
 //! Unified task scheduler.
 //!
 //! The master runs a single scheduler that drains one queue with **bounded
-//! concurrency**. It executes two kinds of task ([`TaskKind`]):
+//! concurrency**. It executes three kinds of task ([`TaskKind`]):
 //!
 //! - **Compact** — rewrites an experiment's base-table fragments. Two `Rewrite`s
 //!   on the *same* dataset conflict in Lance's conflict matrix, so compaction of
@@ -62,7 +62,20 @@ fn kind_label(kind: TaskKind) -> &'static str {
 /// returned unchanged and nothing new is enqueued. `MergeWal` tasks are not
 /// de-duped (each fan-out is independent).
 pub async fn enqueue(state: &Arc<MasterState>, kind: TaskKind, target: &str) -> TaskRecord {
-    if matches!(kind, TaskKind::Compact | TaskKind::IndexId) {
+    enqueue_with_deps(state, kind, target, Vec::new()).await
+}
+
+/// Like [`enqueue`] but the task waits for `depends_on` (task ids) to reach
+/// `Done` before it runs. De-dup is skipped when dependencies are present: a
+/// dependent task is part of an ordered chain and must not collapse into an
+/// unrelated in-flight task for the same target.
+pub async fn enqueue_with_deps(
+    state: &Arc<MasterState>,
+    kind: TaskKind,
+    target: &str,
+    depends_on: Vec<String>,
+) -> TaskRecord {
+    if depends_on.is_empty() && matches!(kind, TaskKind::Compact | TaskKind::IndexId) {
         let tasks = state.tasks.lock().await;
         if let Some(existing) = tasks.values().find(|t| {
             t.kind == kind
@@ -83,6 +96,7 @@ pub async fn enqueue(state: &Arc<MasterState>, kind: TaskKind, target: &str) -> 
         enqueued_at: now_ms(),
         started_at: None,
         finished_at: None,
+        depends_on,
     };
     state
         .tasks
@@ -101,6 +115,38 @@ async fn update_task(state: &Arc<MasterState>, id: &str, f: impl FnOnce(&mut Tas
     if let Some(rec) = state.tasks.lock().await.get_mut(id) {
         f(rec);
     }
+}
+
+/// Readiness of a task with respect to its declared dependencies.
+enum DepStatus {
+    /// All dependencies reached `Done` (or the task has none): ok to run.
+    Ready,
+    /// At least one dependency is still `Queued`/`Running`: defer and re-check.
+    Waiting,
+    /// At least one dependency `Failed` (or vanished): the dependent cannot run.
+    /// Carries the id of the offending dependency for the error message.
+    DepFailed(String),
+}
+
+/// Inspect a task's `depends_on` against the current task map. A missing
+/// dependency is treated as failed (its record was never created or was
+/// dropped), so a dependent never waits forever on a ghost id.
+async fn dep_status(state: &Arc<MasterState>, id: &str) -> DepStatus {
+    let tasks = state.tasks.lock().await;
+    let Some(task) = tasks.get(id) else {
+        return DepStatus::Ready; // vanished; run_task will no-op
+    };
+    for dep in &task.depends_on {
+        match tasks.get(dep) {
+            Some(d) => match d.state {
+                TaskState::Done => {}
+                TaskState::Failed => return DepStatus::DepFailed(dep.clone()),
+                TaskState::Queued | TaskState::Running => return DepStatus::Waiting,
+            },
+            None => return DepStatus::DepFailed(dep.clone()),
+        }
+    }
+    DepStatus::Ready
 }
 
 /// Execute one task by id: dispatch on its kind, recording lifecycle timestamps
@@ -378,6 +424,33 @@ pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
     let dispatch_state = state.clone();
     tokio::spawn(async move {
         while let Some(id) = rx.recv().await {
+            // Resolve dependencies before taking a slot, so a task waiting on a
+            // chain never occupies a permit that its own dependency needs to
+            // finish (which would deadlock at concurrency == 1).
+            match dep_status(&dispatch_state, &id).await {
+                DepStatus::Ready => {}
+                DepStatus::DepFailed(dep) => {
+                    // Skip: mark the dependent Failed and move on.
+                    update_task(&dispatch_state, &id, |t| {
+                        t.state = TaskState::Failed;
+                        t.finished_at = Some(now_ms());
+                        t.error = Some(format!("dependency {dep} did not complete"));
+                    })
+                    .await;
+                    metrics::gauge!("master_task_queue_depth").decrement(1.0);
+                    continue;
+                }
+                DepStatus::Waiting => {
+                    // Re-check later without busy-looping. Re-send the id after a
+                    // short delay; the queue is unbounded so this always succeeds.
+                    let tx = dispatch_state.task_tx.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        let _ = tx.send(id);
+                    });
+                    continue;
+                }
+            }
             // Acquire a slot before spawning so at most `concurrency` run at once.
             let permit = sem
                 .clone()
@@ -570,8 +643,80 @@ mod tests {
         worker.abort();
     }
 
-    /// Minimal rollout record builder for tests (the core struct has no
-    /// `Default`).
+    /// A dependent task runs only after its dependency reaches `Done`: an
+    /// `index_id` depending on a `compact` must start after compaction finishes,
+    /// so the two never contend for the shared per-experiment base-table gate.
+    #[tokio::test]
+    async fn dependent_task_runs_after_dependency_done() {
+        let dir = TempDir::new().unwrap();
+        let state = MasterState::new(config(&dir)).await.unwrap();
+        let worker = spawn_scheduler(&state);
+
+        let name = "exp";
+        let uri = state.rollout_uri(name);
+        {
+            let mut store = RolloutStore::open(&uri).await.unwrap();
+            for i in 0..4 {
+                let rec = rollout_record(&format!("r{i}"));
+                store.add(&[rec]).await.unwrap();
+                store.cleanup_own_shard().await.unwrap();
+            }
+        }
+        state
+            .registry
+            .write()
+            .await
+            .upsert(name, &uri)
+            .await
+            .unwrap();
+        crate::scanner::scan_once(&state).await.unwrap();
+
+        let compact = enqueue(&state, TaskKind::Compact, name).await;
+        let index =
+            enqueue_with_deps(&state, TaskKind::IndexId, name, vec![compact.id.clone()]).await;
+
+        let compact_final = await_terminal(&state, &compact.id).await;
+        assert_eq!(
+            compact_final.state,
+            TaskState::Done,
+            "got {compact_final:?}"
+        );
+        let index_final = await_terminal(&state, &index.id).await;
+        assert_eq!(index_final.state, TaskState::Done, "got {index_final:?}");
+        // The dependent could not have started before the dependency finished.
+        assert!(
+            index_final.started_at.unwrap() >= compact_final.finished_at.unwrap(),
+            "index started {:?} before compact finished {:?}",
+            index_final.started_at,
+            compact_final.finished_at
+        );
+
+        worker.abort();
+    }
+
+    /// A dependent whose dependency `Failed` is skipped (marked `Failed`) rather
+    /// than run.
+    #[tokio::test]
+    async fn dependent_skipped_when_dependency_fails() {
+        let dir = TempDir::new().unwrap();
+        let state = MasterState::new(config(&dir)).await.unwrap();
+        let worker = spawn_scheduler(&state);
+
+        // MergeWal with no worker endpoints fails; its dependent must be skipped.
+        let merge = enqueue(&state, TaskKind::MergeWal, "exp").await;
+        let dependent =
+            enqueue_with_deps(&state, TaskKind::Compact, "exp", vec![merge.id.clone()]).await;
+
+        let merge_final = await_terminal(&state, &merge.id).await;
+        assert_eq!(merge_final.state, TaskState::Failed);
+        let dep_final = await_terminal(&state, &dependent.id).await;
+        assert_eq!(dep_final.state, TaskState::Failed, "got {dep_final:?}");
+        assert!(dep_final.error.unwrap().contains("dependency"));
+
+        worker.abort();
+    }
+
+    /// Minimal rollout record builder for tests (the core struct has no    /// `Default`).
     pub fn rollout_record(id: &str) -> lance_context_core::RolloutRecord {
         use chrono::TimeZone;
         lance_context_core::RolloutRecord {
