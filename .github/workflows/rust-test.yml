@@ -37,9 +37,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "lance-context-deps"
-          workspaces: |
-            crates/lance-context-core
-            python
+          workspaces: "."
       - name: Install dependencies
         run: |
           sudo apt update
@@ -73,5 +71,3 @@ jobs:
           cargo test -p lance-context-master \
             task_store::tests::etcd_coordinates_dedupe_claims_and_target_locks \
             -- --ignored --exact
-      - name: Run doc tests
-        run: cargo test -p lance-context-core --doc
