@@ -30,3 +30,17 @@ remain idempotent across crash recovery.
 The `_stats.rollout.lance` table remains in `DATA_DIR`. etcd coordinates its
 single-writer sections, while readers reload the latest Lance manifest so every
 master replica sees current stats.
+
+## Automatic maintenance
+
+Two periodic sweeps run on the master and feed the shared scheduler queue:
+
+- **Compaction** (`COMPACTION_INTERVAL_SECS`, `MIN_FRAGMENTS`) rewrites an
+  experiment's base-table fragments locally on the master.
+- **WAL merge** (`MERGE_WAL_INTERVAL_SECS`, `MERGE_WAL_MIN_GENERATIONS`) enqueues
+  a `MergeWal` task for every experiment whose pending MemWAL generation count
+  (from the periodically-scanned stats table) crosses the threshold. The task
+  fans out to every `WORKER_ENDPOINTS` worker, each of which folds its own shard.
+  The master cannot merge a shard it does not own without fencing the live
+  writer, so the merge itself always runs on the owning worker. Set the interval
+  to `0` to disable it; the manual "Merge WAL" / "Optimize" UI actions still work.

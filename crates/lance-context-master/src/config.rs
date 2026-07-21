@@ -40,6 +40,19 @@ pub struct MasterConfig {
     #[arg(long, env = "TARGET_ROWS_PER_FRAGMENT", default_value_t = 1_048_576)]
     pub target_rows_per_fragment: usize,
 
+    /// Interval, in seconds, between automatic WAL-merge sweeps. Each sweep
+    /// enqueues a `MergeWal` task for every experiment whose pending MemWAL
+    /// generation count crosses `merge_wal_min_generations`; the task fans out
+    /// to the configured worker endpoints. `0` disables automatic WAL merge
+    /// (manual triggers still work).
+    #[arg(long, env = "MERGE_WAL_INTERVAL_SECS", default_value_t = 600)]
+    pub merge_wal_interval_secs: u64,
+
+    /// Minimum pending MemWAL generations (per experiment) before an automatic
+    /// `MergeWal` is enqueued. Read from the periodically-scanned stats table.
+    #[arg(long, env = "MERGE_WAL_MIN_GENERATIONS", default_value_t = 8)]
+    pub merge_wal_min_generations: i64,
+
     /// Data-plane worker base URLs (comma-separated), e.g.
     /// `http://rollout-0:3000,http://rollout-1:3000`. A `MergeWal` task fans out
     /// to every endpoint so each worker merges its own MemWAL shard (the master

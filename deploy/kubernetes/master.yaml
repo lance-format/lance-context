@@ -60,6 +60,13 @@ spec:
               value: /etc/lance-context/etcd/tls.key
             - name: TASK_HISTORY_LIMIT
               value: "1000"
+            # Master periodically fans a WAL merge out to every worker for any
+            # experiment with at least this many pending MemWAL generations.
+            # Set MERGE_WAL_INTERVAL_SECS to 0 to disable auto WAL merge.
+            - name: MERGE_WAL_INTERVAL_SECS
+              value: "600"
+            - name: MERGE_WAL_MIN_GENERATIONS
+              value: "8"
             - name: MASTER_PORT
               value: "8090"
             - name: UI_DIR

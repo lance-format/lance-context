@@ -54,11 +54,12 @@ fn kind_label(kind: TaskKind) -> &'static str {
     }
 }
 
-/// Enqueue a task and return its record. For [`TaskKind::Compact`] and
-/// [`TaskKind::IndexId`] this de-dupes against an existing non-terminal task for
-/// the same target: if one is already `Queued` or `Running`, its record is
-/// returned unchanged and nothing new is enqueued. `MergeWal` tasks are not
-/// de-duped (each fan-out is independent).
+/// Enqueue a task and return its record. For [`TaskKind::Compact`],
+/// [`TaskKind::IndexId`], and depless [`TaskKind::MergeWal`] this de-dupes
+/// against an existing non-terminal task for the same target: if one is already
+/// `Queued` or `Running`, its record is returned unchanged and nothing new is
+/// enqueued. A `MergeWal` that is part of a dependency chain (non-empty
+/// `depends_on`) is not de-duped.
 pub async fn enqueue(
     state: &Arc<MasterState>,
     kind: TaskKind,
@@ -305,9 +306,44 @@ fn in_quiet_hours(config: &CompactionConfig) -> bool {
         .any(|(start, end)| hour >= *start && hour < *end)
 }
 
+/// Enqueue a `MergeWal` task for every experiment whose pending MemWAL
+/// generation count is at or above the configured threshold, reading candidates
+/// from the stats table. Coordinated across master replicas by a dedicated
+/// task-store lock so only one replica sweeps at a time. Depless `MergeWal`
+/// enqueues de-dupe, so a still-running fan-out is not re-queued.
+pub async fn sweep_merge_wal_candidates(state: &Arc<MasterState>) -> lance::Result<usize> {
+    let Some(guard) = state
+        .task_store
+        .try_coordination_lock("merge-wal-sweep")
+        .await?
+    else {
+        return Ok(0);
+    };
+    let result = sweep_merge_wal_inner(state).await;
+    let release = state.task_store.release_coordination_lock(guard).await;
+    match (result, release) {
+        (Ok(count), Ok(())) => Ok(count),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+async fn sweep_merge_wal_inner(state: &Arc<MasterState>) -> lance::Result<usize> {
+    let threshold = state.config.merge_wal_min_generations;
+    let rows = state.stats.lock().await.list(None, usize::MAX, 0).await?;
+    let mut queued = 0;
+    for row in rows {
+        if row.pending_wal_generations >= threshold {
+            enqueue(state, TaskKind::MergeWal, &row.name).await?;
+            queued += 1;
+        }
+    }
+    Ok(queued)
+}
+
 /// Spawn the scheduler poller plus the optional periodic auto-sweep.
 pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
-    // Optional periodic auto-sweep feeds the same queue.
+    // Optional periodic compaction auto-sweep feeds the same queue.
     let interval_secs = state.config.compaction_interval_secs;
     if interval_secs > 0 {
         let sweep_state = state.clone();
@@ -320,6 +356,26 @@ pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
                     Ok(n) if n > 0 => tracing::info!(queued = n, "auto-sweep queued experiments"),
                     Ok(_) => {}
                     Err(e) => tracing::warn!(error = %e, "auto-sweep failed"),
+                }
+            }
+        });
+    }
+
+    // Optional periodic WAL-merge auto-sweep, independent of compaction.
+    let merge_interval_secs = state.config.merge_wal_interval_secs;
+    if merge_interval_secs > 0 {
+        let sweep_state = state.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(merge_interval_secs));
+            ticker.tick().await; // skip immediate tick
+            loop {
+                ticker.tick().await;
+                match sweep_merge_wal_candidates(&sweep_state).await {
+                    Ok(n) if n > 0 => {
+                        tracing::info!(queued = n, "auto merge-wal sweep queued experiments")
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "auto merge-wal sweep failed"),
                 }
             }
         });
@@ -378,6 +434,8 @@ mod tests {
             // Low threshold so a handful of appends crosses it.
             min_fragments: 2,
             target_rows_per_fragment: 1_048_576,
+            merge_wal_interval_secs: 0,
+            merge_wal_min_generations: 2,
             worker_endpoints: vec![],
             task_concurrency: 4,
             etcd_endpoints: std::env::var("ETCD_TEST_ENDPOINTS")
@@ -634,6 +692,60 @@ mod tests {
         assert!(dep_final.error.unwrap().contains("dependency"));
 
         worker.abort();
+    }
+
+    /// The WAL-merge sweep enqueues a `MergeWal` only for experiments whose
+    /// pending generation count is at or above the threshold, and de-dupes so a
+    /// second sweep does not pile up a duplicate for the same target.
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn sweep_merge_wal_enqueues_over_threshold_and_dedupes() {
+        use crate::stats_store::StatRow;
+
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.merge_wal_min_generations = 3;
+        let state = MasterState::new(cfg).await.unwrap();
+
+        let seed = |name: &str, pending: i64| StatRow {
+            name: name.to_string(),
+            uri: state.rollout_uri(name),
+            row_count: 0,
+            fragment_count: 0,
+            last_updated: 0,
+            pending_wal_generations: pending,
+            last_compaction: StatRow::NO_COMPACTION,
+            total_compactions: 0,
+            scanned_at: 0,
+        };
+        {
+            let mut stats = state.stats.lock().await;
+            stats.upsert(&seed("hot", 5)).await.unwrap(); // >= threshold
+            stats.upsert(&seed("cold", 1)).await.unwrap(); // < threshold
+        }
+
+        let queued = sweep_merge_wal_candidates(&state).await.unwrap();
+        assert_eq!(queued, 1, "only the over-threshold experiment is swept");
+
+        let tasks = state.task_store.list().await.unwrap();
+        let merge_tasks: Vec<_> = tasks
+            .iter()
+            .filter(|t| t.kind == TaskKind::MergeWal)
+            .collect();
+        assert_eq!(merge_tasks.len(), 1);
+        assert_eq!(merge_tasks[0].target, "hot");
+
+        // Second sweep must de-dupe against the still-queued MergeWal.
+        sweep_merge_wal_candidates(&state).await.unwrap();
+        let merge_after = state
+            .task_store
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|t| t.kind == TaskKind::MergeWal)
+            .count();
+        assert_eq!(merge_after, 1, "duplicate MergeWal is de-duped");
     }
 
     /// Minimal rollout record builder for tests (the core struct has no    /// `Default`).

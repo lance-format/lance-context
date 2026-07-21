@@ -86,9 +86,10 @@ impl TaskStore {
         Ok(store)
     }
 
-    /// Atomically enqueue a task. Standalone Compact and IndexId tasks use an
-    /// etcd dedupe key while queued or running. Tasks with dependencies are
-    /// always distinct because they belong to a specific ordered chain.
+    /// Atomically enqueue a task. Standalone Compact, IndexId, and depless
+    /// MergeWal tasks use an etcd dedupe key while queued or running. Tasks with
+    /// dependencies are always distinct because they belong to a specific
+    /// ordered chain.
     pub async fn enqueue(
         &self,
         kind: TaskKind,
@@ -806,7 +807,15 @@ fn fail_dependency(task: &mut TaskRecord, dependency: &str) {
 }
 
 fn should_dedupe(kind: TaskKind, depends_on: &[String]) -> bool {
-    depends_on.is_empty() && matches!(kind, TaskKind::Compact | TaskKind::IndexId)
+    // MergeWal is deduped for depless enqueues (periodic auto-sweep and the
+    // manual "Merge WAL" button) so a slow fan-out cannot pile up duplicate
+    // broadcasts for the same experiment. A MergeWal that is part of an ordered
+    // Optimize chain carries `depends_on` and is intentionally not deduped.
+    depends_on.is_empty()
+        && matches!(
+            kind,
+            TaskKind::Compact | TaskKind::IndexId | TaskKind::MergeWal
+        )
 }
 
 fn requires_target_lock(kind: TaskKind) -> bool {
@@ -874,6 +883,8 @@ mod tests {
             compaction_interval_secs: 0,
             min_fragments: 16,
             target_rows_per_fragment: 1_048_576,
+            merge_wal_interval_secs: 0,
+            merge_wal_min_generations: 8,
             worker_endpoints: vec![],
             task_concurrency: 4,
             etcd_endpoints: vec![],

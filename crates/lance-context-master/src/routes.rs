@@ -438,6 +438,8 @@ mod tests {
             compaction_interval_secs: 0,
             min_fragments: 16,
             target_rows_per_fragment: 1_048_576,
+            merge_wal_interval_secs: 0,
+            merge_wal_min_generations: 8,
             worker_endpoints: vec![],
             task_concurrency: 4,
             etcd_endpoints: test_etcd_endpoints(),
