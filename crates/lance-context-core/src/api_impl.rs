@@ -416,6 +416,13 @@ impl RolloutStoreApi for RolloutStore {
         Ok(records.into_iter().map(rollout_record_to_dto).collect())
     }
 
+    async fn get_trajectory(&self, rollout_id: &str) -> ContextResult<Vec<RolloutRecordDto>> {
+        let records = RolloutStore::get_trajectory(self, rollout_id)
+            .await
+            .map_err(to_ctx_err)?;
+        Ok(records.into_iter().map(rollout_record_to_dto).collect())
+    }
+
     async fn get(&self, id: &str) -> ContextResult<Option<RolloutRecordDto>> {
         let record = RolloutStore::get_by_id(self, id)
             .await

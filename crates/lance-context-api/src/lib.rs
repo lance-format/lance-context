@@ -137,6 +137,35 @@ pub trait RolloutStoreApi {
         filters: Option<Value>,
     ) -> impl Future<Output = ContextResult<Vec<RolloutRecordDto>>> + Send;
 
+    fn get_trajectory(
+        &self,
+        rollout_id: &str,
+    ) -> impl Future<Output = ContextResult<Vec<RolloutRecordDto>>> + Send
+    where
+        Self: Sync,
+    {
+        async move {
+            if rollout_id.is_empty() {
+                return Err(ContextError::InvalidRequest(
+                    "rollout_id must not be empty".to_string(),
+                ));
+            }
+            let mut records = self
+                .list_filtered(
+                    None,
+                    None,
+                    Some(serde_json::json!({"rollout_id": rollout_id})),
+                )
+                .await?;
+            records.sort_by(|left, right| {
+                left.sequence_order
+                    .cmp(&right.sequence_order)
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+            Ok(records)
+        }
+    }
+
     fn get(&self, id: &str)
         -> impl Future<Output = ContextResult<Option<RolloutRecordDto>>> + Send;
 

@@ -159,3 +159,20 @@ def test_remote_filtered_list(server):
         assert [row["id"] for row in rows] == ["row-7"]
 
     asyncio.run(run())
+
+
+def test_remote_get_trajectory_orders_rows(server):
+    async def run():
+        store = await AsyncRolloutStore.connect_or_create(server, "rl-trajectory")
+        await store.add(
+            [
+                {"id": "row-a", "rollout_id": "target", "sequence_order": 2},
+                {"id": "other", "rollout_id": "other", "sequence_order": 0},
+                {"id": "row-b", "rollout_id": "target", "sequence_order": 0},
+            ]
+        )
+
+        rows = await store.get_trajectory("target")
+        assert [row["id"] for row in rows] == ["row-b", "row-a"]
+
+    asyncio.run(run())

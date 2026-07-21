@@ -2498,6 +2498,14 @@ impl RolloutStore {
         rollout_records_to_json(&records)
     }
 
+    /// Return one complete trajectory in deterministic message order.
+    fn get_trajectory(&self, py: Python<'_>, rollout_id: &str) -> PyResult<String> {
+        let records = py
+            .allow_threads(|| self.runtime.block_on(self.store.get_trajectory(rollout_id)))
+            .map_err(to_py_err)?;
+        rollout_records_to_json(&records)
+    }
+
     /// Fetch a single rollout row by id, or `None`. Returns a JSON object
     /// string (artifact bytes projected out).
     fn get(&self, py: Python<'_>, id: &str) -> PyResult<Option<String>> {
