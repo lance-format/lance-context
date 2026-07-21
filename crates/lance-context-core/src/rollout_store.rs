@@ -62,7 +62,7 @@ use arrow_schema::{ArrowError, DataType, Field, Schema, TimeUnit};
 use chrono::{DateTime, Utc};
 use futures::{stream, StreamExt, TryStreamExt};
 use lance::dataset::mem_wal::{
-    DatasetMemWalExt, LsmScanner, ShardManifestStore, ShardSnapshot, ShardWriterConfig,
+    DatasetMemWalExt, LsmScanner, ShardManifestStore, ShardSnapshot, ShardWriter, ShardWriterConfig,
 };
 use lance::dataset::optimize::{compact_files, CompactionMetrics, CompactionOptions};
 use lance::dataset::{builder::DatasetBuilder, Dataset, WriteMode, WriteParams};
@@ -263,6 +263,17 @@ pub struct RolloutStore {
     total_compactions: u64,
     /// Error message from the most recent failed compaction on this handle.
     last_compaction_error: Option<String>,
+    /// Resident MemWAL writer for this instance's shard. Opened lazily on the
+    /// first [`Self::add`] and reused across appends, so the shard epoch is
+    /// claimed once and the object-store connection (TCP/TLS + DNS resolution)
+    /// is pooled instead of being torn down and cold-rebuilt on every append.
+    ///
+    /// Cleared (after an explicit `close`) whenever [`Self::merge_own_shard`]
+    /// claims the shard epoch — that claim would fence this writer — so the next
+    /// `add` transparently reopens with the fresh epoch. [`ShardWriter`] has no
+    /// `Drop`, so it must be closed explicitly to drain its background tasks;
+    /// see [`Self::close`] and the `Drop` impl.
+    write_writer: Option<ShardWriter>,
 }
 
 impl RolloutStore {
@@ -321,6 +332,7 @@ impl RolloutStore {
             last_compaction: None,
             total_compactions: 0,
             last_compaction_error: None,
+            write_writer: None,
         })
     }
 
@@ -348,9 +360,21 @@ impl RolloutStore {
     ///
     /// The write is routed to the shard derived from the configured
     /// `shard_id`, so concurrent appends from other server instances (each
-    /// owning a distinct shard) never contend. `close`-per-append flushes the
-    /// rows to object storage before returning, so they are immediately visible
-    /// to reads on any instance (see [`Self::lsm_scanner`]).
+    /// owning a distinct shard) never contend. Each append is sealed and its
+    /// flushed generation committed to the shard manifest before returning, so
+    /// the rows are immediately visible to reads on **any** instance — reads
+    /// rebuild their view from the shard manifests on object storage (see
+    /// [`Self::lsm_scanner`]).
+    ///
+    /// Unlike the previous close-per-append path, this reuses a single resident
+    /// [`ShardWriter`] (see [`Self::ensure_write_writer`]): the shard epoch is
+    /// claimed once and the object-store connection is pooled, so an append no
+    /// longer pays a cold DNS resolution + TCP/TLS handshake + epoch claim every
+    /// time. The per-append work is `put` (WAL-durable) → `force_seal_active`
+    /// (freeze this append's memtable) → `wait_for_flush_drain` (await the
+    /// generation's manifest commit), which keeps the same cross-instance
+    /// read-after-write visibility while dropping the per-append connection
+    /// churn that dominated latency.
     ///
     /// The returned value is the base dataset version, which MemWAL appends do
     /// **not** advance; it is retained for API compatibility, not as a per-append
@@ -364,16 +388,13 @@ impl RolloutStore {
 
         self.ensure_mem_wal().await?;
 
-        let config = ShardWriterConfig {
-            shard_id: self.write_shard,
-            ..Default::default()
-        };
-        let writer = self
-            .dataset
-            .mem_wal_writer(self.write_shard, config)
-            .await?;
-        writer.put(vec![batch]).await?;
-        writer.close().await?;
+        // Reuse the resident writer, retrying once on a fence. A fence means
+        // another claimer (in practice only this instance's own merge, which
+        // takes the writer down first) bumped the shard epoch out from under us;
+        // dropping and reopening the writer re-claims the current epoch. Rollout
+        // rows are immutable and de-duplicated by `id` at read time, so a retried
+        // append can never double-count.
+        self.write_with_resident_writer(&batch).await?;
 
         // Count-triggered self-merge: if this instance's shard has accumulated
         // enough un-merged flushed generations, fold them into the base table
@@ -384,6 +405,74 @@ impl RolloutStore {
         }
 
         Ok(self.dataset.manifest.version)
+    }
+
+    /// Put one batch through the resident writer, seal it into a generation, and
+    /// await its manifest commit. Reopens the writer once and retries if the
+    /// first attempt is fenced.
+    async fn write_with_resident_writer(&mut self, batch: &RecordBatch) -> LanceResult<()> {
+        match self.put_seal_drain(batch).await {
+            Ok(()) => Ok(()),
+            Err(err) if is_fenced_error(&err) => {
+                // Drop the fenced writer without close() — its epoch is already
+                // dead, so a graceful drain is neither possible nor useful — and
+                // reopen against the current epoch for a single retry.
+                self.write_writer = None;
+                self.put_seal_drain(batch).await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// One append against the resident writer: ensure it is open, `put` the
+    /// batch (WAL-durable), `force_seal_active` to freeze it into a generation,
+    /// then `wait_for_flush_drain` so the generation is committed to the shard
+    /// manifest (and therefore visible to reads on every instance) before we
+    /// return.
+    async fn put_seal_drain(&mut self, batch: &RecordBatch) -> LanceResult<()> {
+        self.ensure_write_writer().await?;
+        let writer = self
+            .write_writer
+            .as_ref()
+            .expect("ensure_write_writer set the writer");
+        writer.put(vec![batch.clone()]).await?;
+        writer.force_seal_active().await?;
+        writer.wait_for_flush_drain().await?;
+        Ok(())
+    }
+
+    /// Ensure a resident [`ShardWriter`] for this instance's shard is open,
+    /// opening one on first use. Reused across appends: the shard epoch is
+    /// claimed once at open and the object-store connection is pooled,
+    /// eliminating the per-append open/claim/reconnect that dominated append
+    /// latency (a cold DNS resolution + TCP/TLS handshake on every append).
+    async fn ensure_write_writer(&mut self) -> LanceResult<()> {
+        if self.write_writer.is_some() {
+            return Ok(());
+        }
+        let config = ShardWriterConfig {
+            shard_id: self.write_shard,
+            ..Default::default()
+        };
+        let writer = self
+            .dataset
+            .mem_wal_writer(self.write_shard, config)
+            .await?;
+        self.write_writer = Some(writer);
+        Ok(())
+    }
+
+    /// Gracefully close the resident writer, draining its background tasks.
+    ///
+    /// [`ShardWriter`] has no `Drop`, so its background tasks are only reclaimed
+    /// by an explicit `close().await`. Call this before dropping a store on a
+    /// path that can `await` (e.g. an LRU eviction that owns the last handle).
+    /// Idempotent: a no-op when no writer is resident.
+    pub async fn close(&mut self) -> LanceResult<()> {
+        if let Some(writer) = self.write_writer.take() {
+            writer.close().await?;
+        }
+        Ok(())
     }
 
     /// If this instance's own shard has at least `merge_after_generations`
@@ -583,6 +672,12 @@ impl RolloutStore {
         if manifest.flushed_generations.is_empty() {
             return Ok(());
         }
+
+        // This merge is about to `claim_epoch`, which fences any live writer of
+        // this shard — including our own resident writer. Close it (draining its
+        // background tasks; `ShardWriter` has no `Drop`) and clear it so the next
+        // `add` transparently reopens against the freshly-claimed epoch.
+        self.close().await?;
 
         // Resolve each flushed generation to its absolute dataset path and read
         // all its rows into memory. Record which generation ids we merge so the
@@ -1500,6 +1595,35 @@ impl RolloutStore {
     }
 }
 
+impl Drop for RolloutStore {
+    /// Best-effort drain of a still-resident writer's background tasks.
+    ///
+    /// [`ShardWriter`] has no `Drop`, so dropping it without `close().await`
+    /// leaks its background tasks. The graceful path is [`Self::close`], but a
+    /// store can also be dropped without an `await` (e.g. LRU eviction). When a
+    /// Tokio runtime is available we move the writer into a detached task that
+    /// closes it; otherwise (no runtime, e.g. some teardown paths) we can only
+    /// drop it. Callers that can `await` should prefer [`Self::close`].
+    fn drop(&mut self) {
+        if let Some(writer) = self.write_writer.take() {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    let _ = writer.close().await;
+                });
+            }
+        }
+    }
+}
+
+/// Whether a Lance error is a MemWAL writer-fence error — i.e. this writer's
+/// shard epoch was superseded by a later claimer. Matched on the error text
+/// because Lance surfaces the fence as a generic error rather than a dedicated
+/// variant (see `ShardWriter::check_fenced`, which reports "Writer fenced").
+fn is_fenced_error(err: &LanceError) -> bool {
+    let text = err.to_string();
+    text.contains("fenced") || text.contains("Fenced")
+}
+
 /// Derive the MemWAL shard UUID a server instance writes to from its stable
 /// instance id. Deterministic (UUID v5), so the same instance id always maps to
 /// the same shard across restarts and reopens — the losing/gaining semantics of
@@ -2359,6 +2483,153 @@ mod tests {
             .unwrap()
             .map(|m| m.flushed_generations.len())
             .unwrap_or(0)
+    }
+
+    /// Read the current writer epoch recorded for a store's own write shard.
+    /// Used to assert the resident writer claims the epoch once instead of
+    /// bumping it on every append.
+    async fn shard_writer_epoch(store: &RolloutStore) -> u64 {
+        let object_store = store.dataset.object_store(None).await.unwrap();
+        let branch_location = store.dataset.branch_location();
+        let manifest_store = ShardManifestStore::new(
+            object_store,
+            &branch_location.path,
+            store.write_shard,
+            DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
+        );
+        manifest_store
+            .read_latest()
+            .await
+            .unwrap()
+            .map(|m| m.writer_epoch)
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn add_reuses_resident_writer_epoch_stable() {
+        // The resident writer must claim the shard epoch exactly once at open
+        // and reuse it across appends (that reuse is what pools the object-store
+        // connection instead of cold-rebuilding it per append). Every append is
+        // still immediately visible cross-instance because it commits a flushed
+        // generation to the manifest before returning.
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    storage_options: None,
+                    shard_id: Some("rollout-0".to_string()),
+                    merge_after_generations: None, // no merge → epoch never reclaimed
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+            store.add(&[assistant_record("a-0")]).await.unwrap();
+            let epoch_after_first = shard_writer_epoch(&store).await;
+
+            // Read-after-write: the first append is visible right away.
+            assert!(store.get_by_id("a-0").await.unwrap().is_some());
+
+            for i in 1..5 {
+                store
+                    .add(&[assistant_record(&format!("a-{i}"))])
+                    .await
+                    .unwrap();
+                // Each append is immediately visible.
+                assert!(
+                    store.get_by_id(&format!("a-{i}")).await.unwrap().is_some(),
+                    "append a-{i} should be visible immediately"
+                );
+            }
+
+            // The epoch did NOT advance per append: the writer was opened once.
+            assert_eq!(
+                shard_writer_epoch(&store).await,
+                epoch_after_first,
+                "resident writer should claim the epoch once, not per append"
+            );
+
+            // Every append landed as its own flushed generation.
+            assert_eq!(flushed_generation_count(&store).await, 5);
+            assert_eq!(store.list(None, None).await.unwrap().len(), 5);
+        });
+    }
+
+    #[test]
+    fn merge_reopens_writer_after_epoch_claim() {
+        // A merge claims the shard epoch, which fences the resident writer. The
+        // next append must transparently reopen the writer against the fresh
+        // epoch rather than failing with a fence error.
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    storage_options: None,
+                    shard_id: Some("rollout-0".to_string()),
+                    // Merge on every append → epoch is reclaimed each time, so
+                    // the following append always hits the reopen path.
+                    merge_after_generations: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+            for i in 0..4 {
+                store
+                    .add(&[assistant_record(&format!("a-{i}"))])
+                    .await
+                    .unwrap_or_else(|e| panic!("append a-{i} after merge must not be fenced: {e}"));
+                assert!(store.get_by_id(&format!("a-{i}")).await.unwrap().is_some());
+            }
+
+            // Merges folded the generations into the base table.
+            assert_eq!(flushed_generation_count(&store).await, 0);
+            let listed = store.list(None, None).await.unwrap();
+            assert_eq!(listed.len(), 4);
+        });
+    }
+
+    #[test]
+    fn close_drains_resident_writer_and_add_reopens() {
+        // close() must gracefully drop the resident writer, and a subsequent
+        // add() must reopen one and keep working.
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    storage_options: None,
+                    shard_id: Some("rollout-0".to_string()),
+                    merge_after_generations: None,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+            store.add(&[assistant_record("a-0")]).await.unwrap();
+            assert!(store.write_writer.is_some());
+
+            // Idempotent close drops the resident writer.
+            store.close().await.unwrap();
+            assert!(store.write_writer.is_none());
+            store.close().await.unwrap(); // second close is a no-op
+
+            // add() after close reopens the writer and stays visible.
+            store.add(&[assistant_record("a-1")]).await.unwrap();
+            assert!(store.write_writer.is_some());
+            assert_eq!(store.list(None, None).await.unwrap().len(), 2);
+        });
     }
 
     #[test]
