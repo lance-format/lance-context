@@ -123,8 +123,6 @@ impl AppState {
             shard_id: self.instance_id.clone(),
             merge_after_generations: (self.rollout_merge_after_generations > 0)
                 .then_some(self.rollout_merge_after_generations),
-            cleanup_interval_secs: (self.rollout_cleanup_interval_secs > 0)
-                .then_some(self.rollout_cleanup_interval_secs),
         }
     }
 

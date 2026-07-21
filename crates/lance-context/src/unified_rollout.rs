@@ -38,11 +38,6 @@ impl RolloutStore {
             // caller that wants count-triggered self-merge opens the core
             // `RolloutStore` directly with `merge_after_generations` set.
             merge_after_generations: None,
-            // Embedded use has no long-lived background runtime to own a cleanup
-            // timer; leave the periodic WAL cleanup disabled here. A caller that
-            // wants it opens the core `RolloutStore` directly and drives
-            // `spawn_periodic_cleanup`.
-            ..Default::default()
         };
         let store = LocalStore::open_with_options(uri, options)
             .await

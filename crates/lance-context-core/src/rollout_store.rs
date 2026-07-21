@@ -73,7 +73,6 @@ use lance_index::mem_wal::{ShardManifest, MEM_WAL_INDEX_NAME};
 use lance_index::scalar::ScalarIndexParams;
 use lance_index::IndexType;
 use serde_json::Value;
-use tokio::task::JoinHandle;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -219,28 +218,6 @@ pub struct RolloutStoreOptions {
     /// `None` or `0` disables self-merge (the 0.6.0 behavior: generations
     /// accumulate and are unioned at read time).
     pub merge_after_generations: Option<usize>,
-    /// Interval, in seconds, for the periodic per-shard WAL cleanup task. When
-    /// set (and non-zero), a background timer wakes up every `interval` seconds
-    /// and folds this instance's flushed MemWAL generations into the base table
-    /// — the *time* half of the "time + count" trigger. It complements the
-    /// synchronous, count-triggered [`Self::merge_after_generations`]: even a
-    /// low-traffic shard that never crosses the count threshold still gets its
-    /// generations reclaimed on a timer, so read amplification stays bounded and
-    /// object storage does not accumulate stale generation datasets.
-    ///
-    /// The cleanup runs on the shard's own owner (reusing its writer epoch), so
-    /// it never fences a concurrent writer — exactly like the count-triggered
-    /// merge. `None` or `0` disables the periodic task.
-    ///
-    /// Spawn the task with [`RolloutStore::spawn_periodic_cleanup`] once the
-    /// store is behind an `Arc<RwLock<_>>` (the server's ownership model).
-    ///
-    /// The two triggers are a strict **OR**: whichever fires first merges. The
-    /// time trigger is *not* gated by any generation count — once the interval
-    /// elapses, every pending generation is folded into the base table even if
-    /// the count trigger's threshold was never crossed. (A pass with nothing
-    /// pending is a no-op.)
-    pub cleanup_interval_secs: Option<u64>,
 }
 
 /// A Lance-backed store for RL rollout trajectories.
@@ -254,9 +231,6 @@ pub struct RolloutStore {
     /// Self-merge threshold; see [`RolloutStoreOptions::merge_after_generations`].
     /// `0` (or `None` normalized to 0) disables it.
     merge_after_generations: usize,
-    /// Periodic-cleanup interval in seconds; `0` disables the timer. See
-    /// [`RolloutStoreOptions::cleanup_interval_secs`].
-    cleanup_interval_secs: u64,
     /// Timestamp of the last successful [`Self::compact`] on this handle.
     last_compaction: Option<DateTime<Utc>>,
     /// Number of successful compactions performed by this handle.
@@ -328,7 +302,6 @@ impl RolloutStore {
             write_shard,
             storage_options,
             merge_after_generations: options.merge_after_generations.unwrap_or(0),
-            cleanup_interval_secs: options.cleanup_interval_secs.unwrap_or(0),
             last_compaction: None,
             total_compactions: 0,
             last_compaction_error: None,
@@ -490,8 +463,8 @@ impl RolloutStore {
     ///
     /// This is the shared core of both triggers: the synchronous count trigger
     /// in [`Self::add`] (with `threshold = merge_after_generations`) and the
-    /// periodic timer in [`Self::spawn_periodic_cleanup`] (with `threshold = 1`,
-    /// i.e. merge whatever is pending once the interval elapses). Both merge only
+    /// caller-driven time trigger via [`Self::cleanup_own_shard`] (with
+    /// `threshold = 1`, i.e. merge whatever is pending). Both merge only
     /// the shard this instance owns and writes, so the epoch claim never fences
     /// another writer.
     async fn merge_own_shard_if_ready(&mut self, threshold: usize) -> LanceResult<usize> {
@@ -522,9 +495,9 @@ impl RolloutStore {
     /// ([`RolloutStoreOptions::merge_after_generations`]) never fired. Returns the
     /// number of generations reclaimed (`0` only when nothing was pending).
     ///
-    /// Exposed for callers that drive cleanup on their own schedule instead of
-    /// (or in addition to) the built-in timer from
-    /// [`Self::spawn_periodic_cleanup`]. Like every merge path here it operates
+    /// Exposed for callers that drive cleanup on their own schedule (the
+    /// server's process-wide sweeper and the master's fan-out `MergeWal`).
+    /// Like every merge path here it operates
     /// only on the shard this instance owns, so it is safe to call concurrently
     /// with this instance's own appends but must not target another instance's
     /// shard.
@@ -533,98 +506,6 @@ impl RolloutStore {
         // time trigger must not depend on the count threshold — that is what
         // makes the two triggers a true OR.
         self.merge_own_shard_if_ready(1).await
-    }
-
-    /// Spawn a background timer that periodically reclaims this instance's
-    /// flushed MemWAL generations into the base table (the *time* trigger).
-    ///
-    /// Every `cleanup_interval_secs` seconds the task acquires the write lock and
-    /// calls [`Self::cleanup_own_shard`], which merges whatever generations are
-    /// pending (no count threshold — time and count are a strict OR). This bounds
-    /// read amplification and reclaims stale generation datasets even on shards
-    /// that never cross the synchronous count threshold
-    /// ([`RolloutStoreOptions::merge_after_generations`]).
-    ///
-    /// Returns `None` (spawning nothing) when `cleanup_interval_secs` is `0`
-    /// (disabled). Otherwise returns the task handle.
-    ///
-    /// Each pass is wrapped in a [`tokio::time::timeout`] (several intervals,
-    /// floored at 30s). A single stuck object-store call therefore cannot wedge
-    /// the store: the timeout releases the write lock and the loop retries on the
-    /// next tick instead of blocking every read/write behind a hung merge.
-    ///
-    /// The task holds only a [`std::sync::Weak`] reference to the store, so it
-    /// never keeps a deleted store alive: once the caller drops the last strong
-    /// `Arc` (e.g. the server removes it from its store map on delete), the next
-    /// tick fails to upgrade and the loop exits on its own. `abort`ing the
-    /// returned handle also stops it immediately.
-    pub fn spawn_periodic_cleanup(store: Arc<tokio::sync::RwLock<Self>>) -> Option<JoinHandle<()>> {
-        let interval_secs = {
-            // Read the interval without holding the lock across the await loop.
-            let guard = store.try_read().ok()?;
-            guard.cleanup_interval_secs
-        };
-        if interval_secs == 0 {
-            return None;
-        }
-
-        let weak = Arc::downgrade(&store);
-        Some(tokio::spawn(async move {
-            let interval = std::time::Duration::from_secs(interval_secs);
-            // Bound how long a single cleanup pass may run before we give up on
-            // it. Without this, a hung object-store call inside
-            // `cleanup_own_shard` would never return: `tokio::time::interval`
-            // fires serially (it will not start the next tick until the current
-            // pass completes), and the pass holds the store's write lock the
-            // whole time — so one stuck I/O would wedge both the cleanup timer
-            // and every read/write on this store, permanently. `timeout` caps
-            // the pass, releases the write lock, and lets the next tick retry.
-            // Sized generously (several intervals, floor 30s) so a merely slow —
-            // not hung — merge is not aborted mid-flight.
-            let pass_timeout = interval
-                .saturating_mul(5)
-                .max(std::time::Duration::from_secs(30));
-            let mut ticker = tokio::time::interval(interval);
-            // Skip the immediate first tick so we don't merge the instant the
-            // task starts; wait a full interval before the first pass.
-            ticker.tick().await;
-            loop {
-                ticker.tick().await;
-                // Stop once the store has been dropped by its owner.
-                let Some(store) = weak.upgrade() else {
-                    return;
-                };
-                let mut guard = store.write().await;
-                match tokio::time::timeout(pass_timeout, guard.cleanup_own_shard()).await {
-                    Ok(Ok(0)) => {}
-                    Ok(Ok(n)) => {
-                        info!(
-                            shard = %guard.write_shard,
-                            reclaimed = n,
-                            "periodic WAL cleanup merged flushed generations"
-                        );
-                    }
-                    Ok(Err(e)) => {
-                        warn!(
-                            shard = %guard.write_shard,
-                            error = %e,
-                            "periodic WAL cleanup failed"
-                        );
-                    }
-                    Err(_elapsed) => {
-                        // The pass exceeded `pass_timeout`; abandon it so the
-                        // write lock is released (dropping `guard` below) and the
-                        // shard can be retried on the next tick rather than
-                        // wedging the store behind a hung call.
-                        warn!(
-                            shard = %guard.write_shard,
-                            timeout_secs = pass_timeout.as_secs(),
-                            "periodic WAL cleanup timed out; abandoning this pass and retrying next tick"
-                        );
-                    }
-                }
-            }
-        }))
     }
 
     /// Fold this instance's flushed MemWAL generations into the base table and
@@ -3079,69 +2960,6 @@ mod tests {
     }
 
     #[test]
-    fn spawn_periodic_cleanup_reclaims_on_a_timer() {
-        // The background timer folds accumulated generations into the base table
-        // without any count-triggered append. A short interval lets the test
-        // observe one cleanup pass drain the shard.
-        use std::time::Duration;
-        use tokio::sync::RwLock;
-
-        let dir = TempDir::new().unwrap();
-        let uri = dir.path().to_string_lossy().to_string();
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        runtime.block_on(async {
-            let store = RolloutStore::open_with_options(
-                &uri,
-                RolloutStoreOptions {
-                    storage_options: None,
-                    shard_id: Some("rollout-0".to_string()),
-                    merge_after_generations: None, // only the timer merges
-                    cleanup_interval_secs: Some(1),
-                },
-            )
-            .await
-            .unwrap();
-            let store = Arc::new(RwLock::new(store));
-
-            // Accumulate generations that no count trigger will reclaim.
-            {
-                let mut guard = store.write().await;
-                guard.add(&[assistant_record("a-0")]).await.unwrap();
-                guard.add(&[assistant_record("a-1")]).await.unwrap();
-                assert_eq!(flushed_generation_count(&guard).await, 2);
-            }
-
-            let handle =
-                RolloutStore::spawn_periodic_cleanup(store.clone()).expect("timer enabled");
-
-            // Wait for at least one tick (interval 1s, first tick skipped) to run
-            // the cleanup pass and drain the shard.
-            let drained = async {
-                loop {
-                    {
-                        let guard = store.read().await;
-                        if flushed_generation_count(&guard).await == 0 {
-                            return true;
-                        }
-                    }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-            };
-            let ok = tokio::time::timeout(Duration::from_secs(10), drained)
-                .await
-                .unwrap_or(false);
-            handle.abort();
-            assert!(ok, "periodic cleanup did not drain the shard in time");
-
-            let guard = store.read().await;
-            assert_eq!(guard.list(None, None).await.unwrap().len(), 2);
-        });
-    }
-
-    #[test]
     fn concurrent_merges_from_two_shards_into_one_base_table() {
         // Case 2 of the concurrency hardening: two instances (distinct shards)
         // fold their flushed generations into the SAME base table at the same
@@ -3267,30 +3085,6 @@ mod tests {
             let mut ids: Vec<_> = listed.iter().map(|r| r.id.clone()).collect();
             ids.sort();
             assert_eq!(ids, vec!["g-0", "g-1", "g-2", "g-3"]);
-        });
-    }
-
-    #[test]
-    fn spawn_periodic_cleanup_disabled_returns_none() {
-        // With `cleanup_interval_secs` unset (0), no timer task is spawned.
-        use tokio::sync::RwLock;
-
-        let dir = TempDir::new().unwrap();
-        let uri = dir.path().to_string_lossy().to_string();
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        runtime.block_on(async {
-            let store = RolloutStore::open_with_options(
-                &uri,
-                RolloutStoreOptions {
-                    storage_options: None,
-                    shard_id: Some("rollout-0".to_string()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-            let store = Arc::new(RwLock::new(store));
-            assert!(RolloutStore::spawn_periodic_cleanup(store).is_none());
         });
     }
 
