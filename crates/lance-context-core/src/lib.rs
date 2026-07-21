@@ -3,6 +3,8 @@
 
 mod api_impl;
 mod context;
+mod datagen;
+mod datagen_store;
 mod eval;
 mod export;
 mod id;
@@ -17,6 +19,13 @@ mod store;
 
 pub use api_impl::rollout_record_to_dto;
 pub use context::{Context, ContextEntry, Snapshot};
+pub use datagen::{
+    datagen_event_id, datagen_trajectory, fold_datagen_events, DatagenBlobValue, DatagenEvent,
+    DatagenEventType, DatagenFailure, DatagenFieldState, DatagenItemStatus, DatagenStepCursor,
+    DatagenTerminal, DatagenTrajectoryPoint, DatagenValue, FoldedDatagenItem,
+    DATAGEN_SCHEMA_VERSION,
+};
+pub use datagen_store::{datagen_log_schema, DatagenStore, DatagenStoreOptions};
 pub use eval::{
     AbReport, EvalConfig, EvalQuery, EvalQuerySet, EvalReport, MetricScores, QueryEval,
     RelevanceLabel, RetrievalMode,
