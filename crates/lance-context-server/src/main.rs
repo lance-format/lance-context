@@ -51,7 +51,7 @@ async fn main() {
     let metrics_handle = lance_context_metrics::install_recorder();
 
     let app = routes::router()
-        .with_state(state)
+        .with_state(state.clone())
         .merge(lance_context_metrics::metrics_router(metrics_handle))
         .layer(axum::middleware::from_fn(
             lance_context_metrics::http_metrics_layer,
@@ -66,6 +66,11 @@ async fn main() {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .unwrap();
+
+    // Connections have drained. Deterministically close resident rollout writers
+    // (whose `ShardWriter` background tasks need an explicit `close().await`)
+    // before the runtime tears down.
+    state.shutdown().await;
 }
 
 async fn shutdown_signal() {
