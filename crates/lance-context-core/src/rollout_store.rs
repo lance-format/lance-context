@@ -188,6 +188,29 @@ pub struct RolloutPage {
     pub has_more: bool,
 }
 
+/// Which data source a rollout list scan reads.
+///
+/// A rollout store's rows live in two tiers: the compacted **base table**
+/// (`self.dataset`) and the pending **MemWAL** generations that have been
+/// flushed but not yet merged into the base table. The default browse path
+/// reads only the base table so list latency is independent of WAL backlog
+/// (each pending generation is a separate object-store open); callers that need
+/// the not-yet-merged tail or full cross-tier consistency opt into `Wal`/`All`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ListSource {
+    /// Scan only the base table (`self.dataset`), skipping all MemWAL
+    /// generations. Fast and bounded; may lag the most recent (un-merged)
+    /// writes. This is the default.
+    #[default]
+    Fragments,
+    /// Scan only the flushed MemWAL generations (the not-yet-merged tail),
+    /// excluding the base table.
+    Wal,
+    /// Scan the base table unioned with every flushed MemWAL generation — fully
+    /// consistent, and the behavior of the historical union read path.
+    All,
+}
+
 /// Configuration for opening a [`RolloutStore`].
 #[derive(Debug, Clone, Default)]
 pub struct RolloutStoreOptions {
@@ -972,7 +995,21 @@ impl RolloutStore {
         Ok(records)
     }
 
-    /// Filter and page rollout rows in the LSM execution plan.
+    /// Filter and page rollout rows over the full base ∪ WAL union.
+    ///
+    /// Thin wrapper over [`Self::list_filtered_source`] with [`ListSource::All`],
+    /// preserving the historical union semantics for existing callers.
+    pub async fn list_filtered(
+        &self,
+        filters: &RolloutFilters,
+        limit: usize,
+        offset: usize,
+    ) -> LanceResult<RolloutPage> {
+        self.list_filtered_source(filters, limit, offset, ListSource::All)
+            .await
+    }
+
+    /// Filter and page rollout rows from a chosen [`ListSource`].
     ///
     /// Reads one row beyond the requested page to report `has_more`, avoiding
     /// an unbounded full-table count on every UI request. Pagination is
@@ -985,17 +1022,25 @@ impl RolloutStore {
     /// global limit. Keeping wide token/logprob/metadata columns out of that
     /// full-source sort makes browsing large rollout tables substantially
     /// cheaper while preserving the same LSM deduplication semantics.
-    pub async fn list_filtered(
+    ///
+    /// [`ListSource::Fragments`] skips MemWAL manifest discovery entirely, so its
+    /// latency is independent of how far the merge backlog has grown.
+    pub async fn list_filtered_source(
         &self,
         filters: &RolloutFilters,
         limit: usize,
         offset: usize,
+        source: ListSource,
     ) -> LanceResult<RolloutPage> {
-        let shard_snapshots = self.wal_shard_snapshots().await?;
+        // Fragments never touches the WAL, so skip the per-shard manifest reads.
+        let shard_snapshots = match source {
+            ListSource::Fragments => Vec::new(),
+            ListSource::Wal | ListSource::All => self.wal_shard_snapshots().await?,
+        };
         let filter = filters.expression();
 
         let mut page_scanner = self
-            .lsm_scanner_with_snapshots(shard_snapshots.clone())
+            .lsm_scanner_for_source(source, shard_snapshots.clone())
             .project(&["id"]);
         if let Some(filter) = &filter {
             page_scanner = page_scanner.filter(filter)?;
@@ -1022,7 +1067,7 @@ impl RolloutStore {
         let id_refs: Vec<&str> = page_ids.iter().map(String::as_str).collect();
         let id_filter = format!("id IN ({})", sql_quoted_list(&id_refs));
         let record_scanner = self
-            .lsm_scanner_with_snapshots(shard_snapshots)
+            .lsm_scanner_for_source(source, shard_snapshots)
             .project(&refs)
             .filter(&id_filter)?;
 
@@ -1182,6 +1227,43 @@ impl RolloutStore {
             shard_snapshots,
             vec!["id".to_string()],
         )
+    }
+
+    /// Build a paginating scanner for the requested [`ListSource`], deduplicating
+    /// by `id`:
+    /// - `Fragments`: base table only (`shard_snapshots` is ignored — callers
+    ///   pass an empty vec so no manifest reads happen);
+    /// - `All`: base table ∪ the flushed generations in `shard_snapshots`;
+    /// - `Wal`: only the flushed generations, via
+    ///   [`LsmScanner::without_base_table`], resolving relative generation paths
+    ///   against the dataset root (matching [`Self::flushed_generation_uri`]).
+    fn lsm_scanner_for_source(
+        &self,
+        source: ListSource,
+        shard_snapshots: Vec<ShardSnapshot>,
+    ) -> LsmScanner {
+        match source {
+            ListSource::Fragments => LsmScanner::new(
+                Arc::new(self.dataset.clone()),
+                Vec::new(),
+                vec!["id".to_string()],
+            ),
+            ListSource::All => LsmScanner::new(
+                Arc::new(self.dataset.clone()),
+                shard_snapshots,
+                vec!["id".to_string()],
+            ),
+            ListSource::Wal => {
+                let arrow_schema: Schema = self.dataset.schema().into();
+                LsmScanner::without_base_table(
+                    Arc::new(arrow_schema),
+                    self.dataset.uri().trim_end_matches('/').to_string(),
+                    shard_snapshots,
+                    vec!["id".to_string()],
+                )
+                .with_session(self.dataset.session())
+            }
+        }
     }
 
     /// Read the latest manifest for every MemWAL shard. Manifest reads are
@@ -3176,6 +3258,74 @@ mod tests {
             let mut ids: Vec<_> = listed.iter().map(|r| r.id.clone()).collect();
             ids.sort();
             assert_eq!(ids, vec!["g-0", "g-1", "g-2", "g-3"]);
+        });
+    }
+
+    #[test]
+    fn list_source_splits_base_and_wal() {
+        // Rows appended but not yet merged live only in the WAL, not the base
+        // table. `Fragments` must omit them; `Wal` must show exactly them; `All`
+        // is the union. After a merge the rows move to the base table and the WAL
+        // empties, flipping which source sees them.
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    storage_options: None,
+                    shard_id: Some("rollout-0".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+            async fn list_ids(store: &RolloutStore, source: ListSource) -> Vec<String> {
+                let page = store
+                    .list_filtered_source(&RolloutFilters::default(), 25, 0, source)
+                    .await
+                    .unwrap();
+                let mut ids: Vec<_> = page.records.iter().map(|r| r.id.clone()).collect();
+                ids.sort();
+                ids
+            }
+
+            // Two un-merged rows sit in the WAL only.
+            store.add(&[assistant_record("g-0")]).await.unwrap();
+            store.add(&[assistant_record("g-1")]).await.unwrap();
+            assert_eq!(flushed_generation_count(&store).await, 2);
+
+            assert!(
+                list_ids(&store, ListSource::Fragments).await.is_empty(),
+                "fragments must not see un-merged WAL rows"
+            );
+            assert_eq!(list_ids(&store, ListSource::Wal).await, vec!["g-0", "g-1"]);
+            assert_eq!(list_ids(&store, ListSource::All).await, vec!["g-0", "g-1"]);
+            // The default wrapper preserves the historical union semantics.
+            let default_page = store
+                .list_filtered(&RolloutFilters::default(), 25, 0)
+                .await
+                .unwrap();
+            let mut default_ids: Vec<_> =
+                default_page.records.iter().map(|r| r.id.clone()).collect();
+            default_ids.sort();
+            assert_eq!(default_ids, vec!["g-0", "g-1"]);
+
+            // Merge folds the WAL into the base table and drains it.
+            assert_eq!(store.cleanup_own_shard().await.unwrap(), 2);
+            assert_eq!(flushed_generation_count(&store).await, 0);
+
+            assert_eq!(
+                list_ids(&store, ListSource::Fragments).await,
+                vec!["g-0", "g-1"]
+            );
+            assert!(
+                list_ids(&store, ListSource::Wal).await.is_empty(),
+                "wal must be empty after a merge"
+            );
+            assert_eq!(list_ids(&store, ListSource::All).await, vec!["g-0", "g-1"]);
         });
     }
 

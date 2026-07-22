@@ -9,6 +9,7 @@ use serde_json::json;
 #[derive(Debug)]
 pub enum MasterError {
     NotFound(String),
+    InvalidRequest(String),
     Internal(String),
 }
 
@@ -23,6 +24,7 @@ impl IntoResponse for MasterError {
     fn into_response(self) -> Response {
         let (status, msg) = match self {
             MasterError::NotFound(m) => (StatusCode::NOT_FOUND, m),
+            MasterError::InvalidRequest(m) => (StatusCode::BAD_REQUEST, m),
             MasterError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
         };
         (status, Json(json!({ "error": msg }))).into_response()

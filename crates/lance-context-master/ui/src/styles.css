@@ -655,6 +655,39 @@ td .muted {
   min-width: 0;
 }
 
+.records-source {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding-bottom: 12px;
+}
+
+.records-source__tab {
+  padding: 5px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  font: 500 12px var(--sans);
+  cursor: pointer;
+}
+
+.records-source__tab:hover {
+  color: var(--text);
+}
+
+.records-source__tab--active {
+  color: var(--text);
+  background: var(--surface-raised, rgba(127, 127, 127, 0.12));
+  border-color: var(--text-muted);
+}
+
+.records-source__note {
+  margin-left: 8px;
+  color: var(--text-muted);
+  font: 400 11px var(--sans);
+}
+
 .record-filters {
   display: grid;
   grid-template-columns: repeat(4, minmax(130px, 1fr));

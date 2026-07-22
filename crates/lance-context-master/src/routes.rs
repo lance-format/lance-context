@@ -15,7 +15,7 @@ use lance_context_api::{
     ExperimentRecordsResponse, ExperimentSummary, TaskKind, TaskListResponse, TaskRecord,
     TaskState,
 };
-use lance_context_core::{rollout_record_to_dto, RolloutFilters, RolloutStore};
+use lance_context_core::{rollout_record_to_dto, ListSource, RolloutFilters, RolloutStore};
 use tokio::sync::RwLock;
 
 use crate::error::MasterError;
@@ -76,6 +76,32 @@ pub struct RecordListParams {
     pub artifact_type: Option<String>,
     #[serde(default)]
     pub include_in_training: Option<bool>,
+    /// Data source to scan: `fragments` (base table only, the default), `wal`
+    /// (pending MemWAL generations only), or `all` (the union). Absent/empty
+    /// defaults to `fragments`.
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+/// Parse the `source` query param into a [`ListSource`]. Absent or empty →
+/// `Fragments` (the fast default); an explicitly unknown value is rejected.
+fn parse_list_source(raw: Option<&str>) -> Result<ListSource, MasterError> {
+    match raw.map(str::trim) {
+        None | Some("") | Some("fragments") => Ok(ListSource::Fragments),
+        Some("wal") => Ok(ListSource::Wal),
+        Some("all") => Ok(ListSource::All),
+        Some(other) => Err(MasterError::InvalidRequest(format!(
+            "invalid source '{other}': expected one of fragments, wal, all"
+        ))),
+    }
+}
+
+fn list_source_label(source: ListSource) -> &'static str {
+    match source {
+        ListSource::Fragments => "fragments",
+        ListSource::Wal => "wal",
+        ListSource::All => "all",
+    }
 }
 
 /// `GET /api/v1/experiments`
@@ -142,6 +168,7 @@ pub async fn list_experiment_records(
         .await
         .map_err(MasterError::from_lance)?;
     let limit = params.limit.clamp(1, 100);
+    let source = parse_list_source(params.source.as_deref())?;
     let filters = RolloutFilters {
         id: non_empty(params.id),
         rollout_id: non_empty(params.rollout_id),
@@ -154,7 +181,7 @@ pub async fn list_experiment_records(
         include_in_training: params.include_in_training,
     };
     let page = store
-        .list_filtered(&filters, limit, params.offset)
+        .list_filtered_source(&filters, limit, params.offset, source)
         .await
         .map_err(MasterError::from_lance)?;
 
@@ -167,6 +194,7 @@ pub async fn list_experiment_records(
         has_more: page.has_more,
         limit,
         offset: params.offset,
+        source: list_source_label(source).to_string(),
     }))
 }
 
@@ -703,6 +731,7 @@ mod tests {
                 policy_version: Some("policy-a".to_string()),
                 artifact_type: Some("screenshot".to_string()),
                 include_in_training: Some(true),
+                source: Some("all".to_string()),
             }),
         )
         .await
@@ -711,6 +740,7 @@ mod tests {
         assert_eq!(page.limit, 1);
         assert_eq!(page.records[0].id, "artifact-1");
         assert!(page.records[0].binary_payload.is_none());
+        assert_eq!(page.source, "all");
 
         let missing = list_experiment_records(
             State(state),
@@ -727,10 +757,27 @@ mod tests {
                 policy_version: None,
                 artifact_type: None,
                 include_in_training: None,
+                source: None,
             }),
         )
         .await;
         assert!(matches!(missing, Err(MasterError::NotFound(_))));
+    }
+
+    #[test]
+    fn parse_list_source_maps_and_defaults() {
+        assert_eq!(parse_list_source(None).unwrap(), ListSource::Fragments);
+        assert_eq!(parse_list_source(Some("")).unwrap(), ListSource::Fragments);
+        assert_eq!(
+            parse_list_source(Some("fragments")).unwrap(),
+            ListSource::Fragments
+        );
+        assert_eq!(parse_list_source(Some("wal")).unwrap(), ListSource::Wal);
+        assert_eq!(parse_list_source(Some("all")).unwrap(), ListSource::All);
+        assert!(matches!(
+            parse_list_source(Some("bogus")),
+            Err(MasterError::InvalidRequest(_))
+        ));
     }
 
     #[tokio::test]

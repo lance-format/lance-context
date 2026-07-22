@@ -20,6 +20,7 @@ import {
   type CompactJobStatus,
   type ExperimentSummary,
   type RecordFilters,
+  type RecordSource,
   type RolloutRecord,
   type TaskRecord,
   type TaskState,
@@ -447,16 +448,23 @@ function RecordsView({
 }) {
   const [draft, setDraft] = useState<RecordFilters>({ ...EMPTY_RECORD_FILTERS });
   const [filters, setFilters] = useState<RecordFilters>({ ...EMPTY_RECORD_FILTERS });
+  const [source, setSource] = useState<RecordSource>("fragments");
   const [page, setPage] = useState(0);
   const pageSize = 25;
   const records = useQuery({
-    queryKey: ["experiment-records", name, filters, page],
-    queryFn: () => listExperimentRecords(name, filters, pageSize, page * pageSize),
+    queryKey: ["experiment-records", name, filters, source, page],
+    queryFn: () =>
+      listExperimentRecords(name, filters, pageSize, page * pageSize, source),
     placeholderData: (previous) => previous,
   });
   const rows = records.data?.records ?? [];
   const hasMore = records.data?.has_more ?? false;
 
+  const selectSource = (next: RecordSource) => {
+    setSource(next);
+    setPage(0);
+    onToggle(null);
+  };
   const setFilter = (key: keyof RecordFilters, value: string) => {
     setDraft((current) => ({ ...current, [key]: value }));
   };
@@ -474,8 +482,51 @@ function RecordsView({
   };
   const hasFilters = Object.values(filters).some(Boolean);
 
+  const sourceTabs: { key: RecordSource; label: string; title: string }[] = [
+    {
+      key: "fragments",
+      label: "Fragments",
+      title:
+        "Base table only. Fast and independent of WAL backlog, but may lag the most recent (un-merged) writes.",
+    },
+    {
+      key: "wal",
+      label: "WAL",
+      title: "Pending MemWAL generations only — the not-yet-merged tail.",
+    },
+    {
+      key: "all",
+      label: "All",
+      title: "Base table unioned with pending WAL (fully consistent).",
+    },
+  ];
+
   return (
     <div className="records-view">
+      <div className="records-source" role="tablist" aria-label="Record source">
+        {sourceTabs.map((t) => (
+          <button
+            key={t.key}
+            type="button"
+            role="tab"
+            aria-selected={source === t.key}
+            title={t.title}
+            className={
+              source === t.key
+                ? "records-source__tab records-source__tab--active"
+                : "records-source__tab"
+            }
+            onClick={() => selectSource(t.key)}
+          >
+            {t.label}
+          </button>
+        ))}
+        {source === "fragments" && (
+          <span className="records-source__note">
+            base table only — may lag un-merged writes
+          </span>
+        )}
+      </div>
       <form className="record-filters" onSubmit={apply}>
         <label>
           <span>ID</span>
