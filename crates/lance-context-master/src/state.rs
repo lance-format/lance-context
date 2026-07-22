@@ -1,14 +1,23 @@
 //! Shared master state: durable registry + stats table.
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use lance_context_core::{join_uri, RolloutRegistry};
+use lance_context_core::{join_uri, RolloutRegistry, RolloutStore, RolloutStoreOptions};
+use lru::LruCache;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::config::MasterConfig;
 use crate::discovery;
 use crate::stats_store::StatsStore;
 use crate::task_store::TaskStore;
+
+/// Bounded number of rollout handles retained by the master data browser.
+///
+/// Each handle keeps a Lance session whose fragment/file metadata caches are
+/// valuable across pagination requests. The bound prevents a master managing a
+/// very large registry from retaining one handle per experiment indefinitely.
+const RECORD_STORE_CACHE_CAPACITY: usize = 128;
 
 /// Shared state for the master process.
 ///
@@ -22,6 +31,9 @@ pub struct MasterState {
     pub registry: RwLock<RolloutRegistry>,
     /// Periodically-refreshed per-experiment metrics (master-owned).
     pub stats: Mutex<StatsStore>,
+    /// Read handles used by the records browser, retained to reuse Lance
+    /// session and fragment metadata caches across requests.
+    record_stores: Mutex<LruCache<String, Arc<RwLock<RolloutStore>>>>,
     /// Shared data directory / object-store prefix.
     pub base_uri: String,
     /// Effective configuration.
@@ -61,6 +73,9 @@ impl MasterState {
         let state = Arc::new(Self {
             registry: RwLock::new(registry),
             stats: Mutex::new(stats),
+            record_stores: Mutex::new(LruCache::new(
+                NonZeroUsize::new(RECORD_STORE_CACHE_CAPACITY).unwrap(),
+            )),
             base_uri,
             config,
             task_store,
@@ -73,6 +88,32 @@ impl MasterState {
     /// `rollout_uri` convention (`{name}.rollout.lance`).
     pub fn rollout_uri(&self, name: &str) -> String {
         join_uri(&self.base_uri, &format!("{}.rollout.lance", name))
+    }
+
+    /// Return a cached rollout handle for the master records browser, opening
+    /// it without holding the cache lock on a miss.
+    pub async fn get_or_open_record_store(
+        &self,
+        name: &str,
+        uri: &str,
+    ) -> lance::Result<Arc<RwLock<RolloutStore>>> {
+        if let Some(store) = self.record_stores.lock().await.get(name) {
+            metrics::counter!("master_record_store_cache_hits_total").increment(1);
+            return Ok(store.clone());
+        }
+        metrics::counter!("master_record_store_cache_misses_total").increment(1);
+
+        let opened = Arc::new(RwLock::new(
+            RolloutStore::open_existing_with_options(uri, RolloutStoreOptions::default()).await?,
+        ));
+
+        let mut cache = self.record_stores.lock().await;
+        if let Some(existing) = cache.get(name) {
+            return Ok(existing.clone());
+        }
+        cache.put(name.to_string(), opened.clone());
+        metrics::gauge!("master_record_stores_resident").set(cache.len() as f64);
+        Ok(opened)
     }
 }
 

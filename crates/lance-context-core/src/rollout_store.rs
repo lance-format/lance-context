@@ -328,6 +328,16 @@ impl RolloutStore {
         Ok(())
     }
 
+    /// Refresh this handle to the latest base-table manifest while retaining
+    /// its session and metadata caches.
+    ///
+    /// Long-lived read handles call this before a new request so compaction or
+    /// WAL merges committed by another process become visible without paying
+    /// the cost of reopening the dataset and rebuilding all session caches.
+    pub async fn refresh_latest(&mut self) -> LanceResult<()> {
+        self.dataset.checkout_latest().await
+    }
+
     /// Append rollout rows through this instance's MemWAL shard; returns the
     /// current base dataset version.
     ///
@@ -965,8 +975,16 @@ impl RolloutStore {
     /// Filter and page rollout rows in the LSM execution plan.
     ///
     /// Reads one row beyond the requested page to report `has_more`, avoiding
-    /// an unbounded full-table count on every UI request. Artifact bytes are
-    /// projected out, matching [`Self::list`].
+    /// an unbounded full-table count on every UI request. Pagination is
+    /// deliberately late-materialized in two scans:
+    ///
+    /// 1. scan, sort, and deduplicate only `id` to select the page;
+    /// 2. fetch the complete non-blob columns for those page ids in one query.
+    ///
+    /// [`LsmScanner`] sorts every source by primary key before applying its
+    /// global limit. Keeping wide token/logprob/metadata columns out of that
+    /// full-source sort makes browsing large rollout tables substantially
+    /// cheaper while preserving the same LSM deduplication semantics.
     pub async fn list_filtered(
         &self,
         filters: &RolloutFilters,
@@ -976,23 +994,49 @@ impl RolloutStore {
         let shard_snapshots = self.wal_shard_snapshots().await?;
         let filter = filters.expression();
 
-        let columns = self.non_blob_columns();
-        let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
         let mut page_scanner = self
-            .lsm_scanner_with_snapshots(shard_snapshots)
-            .project(&refs);
+            .lsm_scanner_with_snapshots(shard_snapshots.clone())
+            .project(&["id"]);
         if let Some(filter) = &filter {
             page_scanner = page_scanner.filter(filter)?;
         }
         page_scanner = page_scanner.limit(limit.saturating_add(1), Some(offset));
 
         let mut stream = page_scanner.try_into_stream().await?;
-        let mut records = Vec::new();
+        let mut page_ids = Vec::new();
         while let Some(batch) = stream.try_next().await? {
-            records.extend(batch_to_rollout_records(&batch)?);
+            let ids = column_as::<StringArray>(&batch, "id")?;
+            page_ids.extend((0..batch.num_rows()).map(|row| ids.value(row).to_string()));
         }
-        let has_more = records.len() > limit;
-        records.truncate(limit);
+        let has_more = page_ids.len() > limit;
+        page_ids.truncate(limit);
+        if page_ids.is_empty() {
+            return Ok(RolloutPage {
+                records: Vec::new(),
+                has_more,
+            });
+        }
+
+        let columns = self.non_blob_columns();
+        let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+        let id_refs: Vec<&str> = page_ids.iter().map(String::as_str).collect();
+        let id_filter = format!("id IN ({})", sql_quoted_list(&id_refs));
+        let record_scanner = self
+            .lsm_scanner_with_snapshots(shard_snapshots)
+            .project(&refs)
+            .filter(&id_filter)?;
+
+        let mut stream = record_scanner.try_into_stream().await?;
+        let mut records_by_id = HashMap::with_capacity(page_ids.len());
+        while let Some(batch) = stream.try_next().await? {
+            for record in batch_to_rollout_records(&batch)? {
+                records_by_id.insert(record.id.clone(), record);
+            }
+        }
+        let records = page_ids
+            .into_iter()
+            .filter_map(|id| records_by_id.remove(&id))
+            .collect();
         Ok(RolloutPage { records, has_more })
     }
 
@@ -1871,6 +1915,14 @@ fn optional_i8_list(array: Option<&ListArray>, row: usize) -> LanceResult<Option
     }
 }
 
+fn sql_quoted_list(values: &[&str]) -> String {
+    values
+        .iter()
+        .map(|value| format!("'{}'", value.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2341,6 +2393,15 @@ mod tests {
                 .unwrap();
             assert!(!quoted_page.has_more);
             assert_eq!(quoted_page.records[0].id, "row-'quoted");
+            assert_eq!(quoted_page.records[0].input_tokens, Some(vec![10, 11, 12]));
+            assert_eq!(
+                quoted_page.records[0].output_logprobs,
+                Some(vec![-0.5, -1.25])
+            );
+            assert_eq!(
+                quoted_page.records[0].metadata,
+                Some(json!({"harness": "verifiers"}))
+            );
 
             let policy_page = reader
                 .list_filtered(
@@ -2364,6 +2425,47 @@ mod tests {
                 .unwrap();
             assert!(page.has_more);
             assert_eq!(page.records.len(), 1);
+        });
+    }
+
+    #[test]
+    fn refresh_latest_keeps_cached_reader_current() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut writer = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    shard_id: Some("refresh-writer".to_string()),
+                    merge_after_generations: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            writer.add(&[assistant_record("row-0")]).await.unwrap();
+
+            let mut cached_reader =
+                RolloutStore::open_existing_with_options(&uri, RolloutStoreOptions::default())
+                    .await
+                    .unwrap();
+            assert_eq!(cached_reader.list(None, None).await.unwrap().len(), 1);
+
+            writer.add(&[assistant_record("row-1")]).await.unwrap();
+            cached_reader.refresh_latest().await.unwrap();
+
+            let ids: HashSet<_> = cached_reader
+                .list(None, None)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|record| record.id)
+                .collect();
+            assert_eq!(
+                ids,
+                HashSet::from(["row-0".to_string(), "row-1".to_string()])
+            );
         });
     }
 
@@ -3074,6 +3176,136 @@ mod tests {
             let mut ids: Vec<_> = listed.iter().map(|r| r.id.clone()).collect();
             ids.sort();
             assert_eq!(ids, vec!["g-0", "g-1", "g-2", "g-3"]);
+        });
+    }
+
+    /// Reproduces the master data-browser workload at the reported scale and
+    /// compares the former wide-row pagination plan with the late-materialized
+    /// implementation.
+    ///
+    /// Run explicitly with:
+    /// `cargo test -p lance-context-core bench_master_pagination_90k_52_fragments -- --ignored --nocapture`
+    #[test]
+    #[ignore = "benchmark; creates 90k rows across 52 fragments"]
+    fn bench_master_pagination_90k_52_fragments() {
+        use std::time::Instant;
+
+        const ROWS: usize = 90_000;
+        const FRAGMENTS: usize = 52;
+        const PAGE_SIZE: usize = 25;
+
+        async fn legacy_wide_page(
+            store: &RolloutStore,
+            limit: usize,
+        ) -> LanceResult<Vec<RolloutRecord>> {
+            let shard_snapshots = store.wal_shard_snapshots().await?;
+            let columns = store.non_blob_columns();
+            let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+            let scanner = store
+                .lsm_scanner_with_snapshots(shard_snapshots)
+                .project(&refs)
+                .limit(limit.saturating_add(1), Some(0));
+            let mut stream = scanner.try_into_stream().await?;
+            let mut records = Vec::new();
+            while let Some(batch) = stream.try_next().await? {
+                records.extend(batch_to_rollout_records(&batch)?);
+            }
+            records.truncate(limit);
+            Ok(records)
+        }
+
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut writer = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    shard_id: Some("pagination-benchmark".to_string()),
+                    merge_after_generations: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+            let rows_per_fragment = ROWS.div_ceil(FRAGMENTS);
+            let write_start = Instant::now();
+            for fragment in 0..FRAGMENTS {
+                let start = fragment * rows_per_fragment;
+                let end = ((fragment + 1) * rows_per_fragment).min(ROWS);
+                if start >= end {
+                    break;
+                }
+                let records: Vec<_> = (start..end)
+                    .map(|row| assistant_record(&format!("row-{row:06}")))
+                    .collect();
+                writer.add(&records).await.unwrap();
+            }
+            writer.close().await.unwrap();
+
+            let observation = writer.observe().await.unwrap();
+            assert_eq!(observation.row_count, ROWS as i64);
+            assert_eq!(observation.fragment_count, FRAGMENTS as i64);
+
+            let legacy_reader =
+                RolloutStore::open_existing_with_options(&uri, RolloutStoreOptions::default())
+                    .await
+                    .unwrap();
+            let legacy_start = Instant::now();
+            let legacy_rows = legacy_wide_page(&legacy_reader, PAGE_SIZE).await.unwrap();
+            let legacy_elapsed = legacy_start.elapsed();
+            assert_eq!(legacy_rows.len(), PAGE_SIZE);
+
+            let mut optimized_reader =
+                RolloutStore::open_existing_with_options(&uri, RolloutStoreOptions::default())
+                    .await
+                    .unwrap();
+            let optimized_start = Instant::now();
+            let optimized_page = optimized_reader
+                .list_filtered(&RolloutFilters::default(), PAGE_SIZE, 0)
+                .await
+                .unwrap();
+            let optimized_elapsed = optimized_start.elapsed();
+            assert_eq!(optimized_page.records.len(), PAGE_SIZE);
+            assert!(optimized_page.has_more);
+            assert_eq!(
+                optimized_page
+                    .records
+                    .iter()
+                    .map(|record| record.id.as_str())
+                    .collect::<Vec<_>>(),
+                legacy_rows
+                    .iter()
+                    .map(|record| record.id.as_str())
+                    .collect::<Vec<_>>()
+            );
+
+            optimized_reader.refresh_latest().await.unwrap();
+            let cached_start = Instant::now();
+            let cached_page = optimized_reader
+                .list_filtered(&RolloutFilters::default(), PAGE_SIZE, PAGE_SIZE)
+                .await
+                .unwrap();
+            let cached_elapsed = cached_start.elapsed();
+            assert_eq!(cached_page.records.len(), PAGE_SIZE);
+            assert!(cached_page.has_more);
+
+            println!("\n=== master pagination benchmark ===");
+            println!(
+                "  dataset                              : {ROWS} rows / {FRAGMENTS} fragments"
+            );
+            println!(
+                "  dataset construction                 : {:?}",
+                write_start.elapsed()
+            );
+            println!("  former wide-row LSM page             : {legacy_elapsed:?}");
+            println!("  late-materialized ID + row fetch page: {optimized_elapsed:?}");
+            println!("  cached-handle next page              : {cached_elapsed:?}");
+            println!(
+                "  speedup                              : {:.1}x",
+                legacy_elapsed.as_secs_f64() / optimized_elapsed.as_secs_f64().max(1e-9)
+            );
         });
     }
 
