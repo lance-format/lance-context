@@ -927,6 +927,9 @@ pub struct ExperimentRecordsResponse {
     pub has_more: bool,
     pub limit: usize,
     pub offset: usize,
+    /// The data source that was scanned: `"fragments"` (base table only),
+    /// `"wal"` (pending MemWAL generations only), or `"all"` (the union).
+    pub source: String,
 }
 
 /// State of a manual or automatic compaction job for one experiment.

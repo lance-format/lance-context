@@ -68,11 +68,14 @@ export interface RecordFilters {
   include_in_training: string;
 }
 
+export type RecordSource = "fragments" | "wal" | "all";
+
 export interface ExperimentRecordsResponse {
   records: RolloutRecord[];
   has_more: boolean;
   limit: number;
   offset: number;
+  source: RecordSource;
 }
 
 export type CompactJobStatus =
@@ -144,10 +147,12 @@ export async function listExperimentRecords(
   filters: RecordFilters,
   limit: number,
   offset: number,
+  source: RecordSource = "fragments",
 ): Promise<ExperimentRecordsResponse> {
   const params = new URLSearchParams();
   params.set("limit", String(limit));
   params.set("offset", String(offset));
+  params.set("source", source);
   for (const [key, value] of Object.entries(filters)) {
     if (value) params.set(key, value);
   }
