@@ -15,9 +15,8 @@ use lance_context_api::{
     ExperimentRecordsResponse, ExperimentSummary, TaskKind, TaskListResponse, TaskRecord,
     TaskState,
 };
-use lance_context_core::{
-    rollout_record_to_dto, RolloutFilters, RolloutStore, RolloutStoreOptions,
-};
+use lance_context_core::{rollout_record_to_dto, RolloutFilters, RolloutStore};
+use tokio::sync::RwLock;
 
 use crate::error::MasterError;
 use crate::scanner;
@@ -137,6 +136,11 @@ pub async fn list_experiment_records(
     Query(params): Query<RecordListParams>,
 ) -> Result<Json<ExperimentRecordsResponse>, MasterError> {
     let store = open_registered_store(&state, &name).await?;
+    let mut store = store.write().await;
+    store
+        .refresh_latest()
+        .await
+        .map_err(MasterError::from_lance)?;
     let limit = params.limit.clamp(1, 100);
     let filters = RolloutFilters {
         id: non_empty(params.id),
@@ -172,6 +176,11 @@ pub async fn download_experiment_blob(
     Path((name, id)): Path<(String, String)>,
 ) -> Result<Response, MasterError> {
     let store = open_registered_store(&state, &name).await?;
+    let mut store = store.write().await;
+    store
+        .refresh_latest()
+        .await
+        .map_err(MasterError::from_lance)?;
     let record = store
         .get_by_id(&id)
         .await
@@ -376,7 +385,7 @@ pub fn api_router() -> Router<Arc<MasterState>> {
 async fn open_registered_store(
     state: &MasterState,
     name: &str,
-) -> Result<RolloutStore, MasterError> {
+) -> Result<Arc<RwLock<RolloutStore>>, MasterError> {
     let entry = state
         .registry
         .write()
@@ -385,7 +394,8 @@ async fn open_registered_store(
         .await
         .map_err(MasterError::from_lance)?
         .ok_or_else(|| MasterError::NotFound(format!("experiment '{}' does not exist", name)))?;
-    RolloutStore::open_existing_with_options(&entry.uri, RolloutStoreOptions::default())
+    state
+        .get_or_open_record_store(name, &entry.uri)
         .await
         .map_err(MasterError::from_lance)
 }

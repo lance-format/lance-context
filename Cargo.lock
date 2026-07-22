@@ -5513,6 +5513,7 @@ dependencies = [
  "lance-context-api",
  "lance-context-core",
  "lance-context-metrics",
+ "lru",
  "metrics",
  "reqwest 0.12.28",
  "serde",
