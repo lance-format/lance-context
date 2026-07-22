@@ -1408,6 +1408,11 @@ impl RolloutStore {
         let mut created_at_builder = TimestampMicrosecondBuilder::with_capacity(records.len());
         let mut content_builder = LargeStringBuilder::new();
         let mut content_type_builder = StringBuilder::new();
+        let mut model_input_string_builder = LargeStringBuilder::new();
+        let mut model_output_string_builder = LargeStringBuilder::new();
+        let mut rationale_builder = LargeStringBuilder::new();
+        let mut problem_text_builder = LargeStringBuilder::new();
+        let mut user_metadata_builder = LargeStringBuilder::new();
         let mut input_tokens_builder = ListBuilder::new(Int32Builder::new());
         let mut output_tokens_builder = ListBuilder::new(Int32Builder::new());
         let mut num_input_tokens_builder = Int32Builder::new();
@@ -1442,6 +1447,11 @@ impl RolloutStore {
             created_at_builder.append_value(record.created_at.timestamp_micros());
             content_builder.append_option(record.content.as_deref());
             content_type_builder.append_value(&record.content_type);
+            model_input_string_builder.append_option(record.model_input_string.as_deref());
+            model_output_string_builder.append_option(record.model_output_string.as_deref());
+            rationale_builder.append_option(record.rationale.as_deref());
+            problem_text_builder.append_option(record.problem_text.as_deref());
+            user_metadata_builder.append_option(record.user_metadata.as_deref());
             append_i32_list(&mut input_tokens_builder, record.input_tokens.as_deref());
             append_i32_list(&mut output_tokens_builder, record.output_tokens.as_deref());
             num_input_tokens_builder.append_option(record.num_input_tokens);
@@ -1520,6 +1530,26 @@ impl RolloutStore {
         arrays_by_name.insert(
             "content_type".to_string(),
             Arc::new(content_type_builder.finish()),
+        );
+        arrays_by_name.insert(
+            "model_input_string".to_string(),
+            Arc::new(model_input_string_builder.finish()),
+        );
+        arrays_by_name.insert(
+            "model_output_string".to_string(),
+            Arc::new(model_output_string_builder.finish()),
+        );
+        arrays_by_name.insert(
+            "rationale".to_string(),
+            Arc::new(rationale_builder.finish()),
+        );
+        arrays_by_name.insert(
+            "problem_text".to_string(),
+            Arc::new(problem_text_builder.finish()),
+        );
+        arrays_by_name.insert(
+            "user_metadata".to_string(),
+            Arc::new(user_metadata_builder.finish()),
         );
         arrays_by_name.insert(
             "input_tokens".to_string(),
@@ -1698,6 +1728,12 @@ pub fn rollout_schema() -> Schema {
         // Message content.
         Field::new("content", DataType::LargeUtf8, true),
         Field::new("content_type", DataType::Utf8, false),
+        // Claim-check offloaded message fields.
+        Field::new("model_input_string", DataType::LargeUtf8, true),
+        Field::new("model_output_string", DataType::LargeUtf8, true),
+        Field::new("rationale", DataType::LargeUtf8, true),
+        Field::new("problem_text", DataType::LargeUtf8, true),
+        Field::new("user_metadata", DataType::LargeUtf8, true),
         // Tokens.
         list_field("input_tokens", DataType::Int32),
         list_field("output_tokens", DataType::Int32),
@@ -1788,6 +1824,13 @@ fn batch_to_rollout_records(batch: &RecordBatch) -> LanceResult<Vec<RolloutRecor
     let created_at_array = column_as::<TimestampMicrosecondArray>(batch, "created_at")?;
     let content_array = column_as_optional::<LargeStringArray>(batch, "content");
     let content_type_array = column_as::<StringArray>(batch, "content_type")?;
+    let model_input_string_array =
+        column_as_optional::<LargeStringArray>(batch, "model_input_string");
+    let model_output_string_array =
+        column_as_optional::<LargeStringArray>(batch, "model_output_string");
+    let rationale_array = column_as_optional::<LargeStringArray>(batch, "rationale");
+    let problem_text_array = column_as_optional::<LargeStringArray>(batch, "problem_text");
+    let user_metadata_array = column_as_optional::<LargeStringArray>(batch, "user_metadata");
     let input_tokens_array = column_as_optional::<ListArray>(batch, "input_tokens");
     let output_tokens_array = column_as_optional::<ListArray>(batch, "output_tokens");
     let num_input_tokens_array = column_as_optional::<Int32Array>(batch, "num_input_tokens");
@@ -1863,6 +1906,11 @@ fn batch_to_rollout_records(batch: &RecordBatch) -> LanceResult<Vec<RolloutRecor
             created_at,
             content: optional_large_string(content_array, row),
             content_type: content_type_array.value(row).to_string(),
+            model_input_string: optional_large_string(model_input_string_array, row),
+            model_output_string: optional_large_string(model_output_string_array, row),
+            rationale: optional_large_string(rationale_array, row),
+            problem_text: optional_large_string(problem_text_array, row),
+            user_metadata: optional_large_string(user_metadata_array, row),
             input_tokens: optional_i32_list(input_tokens_array, row)?,
             output_tokens: optional_i32_list(output_tokens_array, row)?,
             num_input_tokens: optional_i32(num_input_tokens_array, row),
@@ -2070,6 +2118,11 @@ mod tests {
             created_at: Utc.timestamp_micros(1_700_000_000_000_000).unwrap(),
             content: Some("the answer is 42".to_string()),
             content_type: "text/plain".to_string(),
+            model_input_string: None,
+            model_output_string: None,
+            rationale: None,
+            problem_text: None,
+            user_metadata: None,
             input_tokens: Some(vec![10, 11, 12]),
             output_tokens: Some(vec![20, 21]),
             num_input_tokens: Some(3),
@@ -2110,6 +2163,11 @@ mod tests {
             created_at: Utc.timestamp_micros(1_700_000_000_500_000).unwrap(),
             content: None,
             content_type: "application/octet-stream".to_string(),
+            model_input_string: None,
+            model_output_string: None,
+            rationale: None,
+            problem_text: None,
+            user_metadata: None,
             input_tokens: None,
             output_tokens: None,
             num_input_tokens: None,
