@@ -60,8 +60,6 @@ pub async fn create_rollout_store(
         shard_id: state.instance_id.clone(),
         merge_after_generations: (state.rollout_merge_after_generations > 0)
             .then_some(state.rollout_merge_after_generations),
-        cleanup_interval_secs: (state.rollout_cleanup_interval_secs > 0)
-            .then_some(state.rollout_cleanup_interval_secs),
     };
 
     let store = RolloutStore::open_with_options(&uri, options)
