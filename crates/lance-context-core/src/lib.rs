@@ -57,3 +57,7 @@ pub use store::{
 
 // Re-export CompactionMetrics from lance for Python bindings
 pub use lance::dataset::optimize::CompactionMetrics;
+
+// Re-export the Lance error type so downstream crates (e.g. the server) can
+// match on its typed variants instead of string-matching `Display` output.
+pub use lance::Error as LanceError;
