@@ -46,6 +46,24 @@ test/harness/smoke.sh
 test/harness/down.sh
 ```
 
+### Containerless mode (sandboxes without a working Docker runtime)
+
+Some environments have a Docker daemon but a locked-down kernel that forbids
+`unshare`/netlink, so no container can actually start (`docker run` fails with
+`failed to register layer: unshare: operation not permitted`). For those, the
+same stack runs as **plain host processes** — etcd (static binary, auto-downloaded),
+`lance-context-server`, and `lance-context-master`, with a local-filesystem
+`DATA_DIR` instead of MinIO:
+
+```bash
+test/harness/native-up.sh --smoke   # build if needed, start stack, run smoke.sh
+test/harness/native-down.sh --purge # stop everything + wipe state
+```
+
+State lives under `$HARNESS_DIR` (default `/tmp/lance-harness`). This mode needs
+`cargo` (to build the two binaries) and network access to fetch the etcd release
+on first run. It asserts the exact same `?source=` semantics as the Docker path.
+
 `up.sh --no-build` skips the image build if images already exist.
 `down.sh --keep-volumes` retains MinIO + etcd data across runs.
 
