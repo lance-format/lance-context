@@ -2252,7 +2252,6 @@ mod tests {
                 storage_options: None,
                 shard_id: Some(shard.to_string()),
                 merge_after_generations: None,
-                ..Default::default()
             };
 
             let mut instance_a = RolloutStore::open_with_options(&uri, options("rollout-0"))
@@ -2472,7 +2471,6 @@ mod tests {
                     storage_options: None,
                     shard_id: Some("rollout-0".to_string()),
                     merge_after_generations: None, // no merge → epoch never reclaimed
-                    ..Default::default()
                 },
             )
             .await
@@ -2526,7 +2524,6 @@ mod tests {
                     // Merge on every append → epoch is reclaimed each time, so
                     // the following append always hits the reopen path.
                     merge_after_generations: Some(1),
-                    ..Default::default()
                 },
             )
             .await
@@ -2561,7 +2558,6 @@ mod tests {
                     storage_options: None,
                     shard_id: Some("rollout-0".to_string()),
                     merge_after_generations: None,
-                    ..Default::default()
                 },
             )
             .await
@@ -2600,7 +2596,6 @@ mod tests {
                     shard_id: Some("rollout-0".to_string()),
                     // Merge every append into base so each forms its own fragment.
                     merge_after_generations: Some(1),
-                    ..Default::default()
                 },
             )
             .await
@@ -2665,7 +2660,6 @@ mod tests {
                     storage_options: None,
                     shard_id: Some("rollout-0".to_string()),
                     merge_after_generations: Some(1),
-                    ..Default::default()
                 },
             )
             .await
@@ -2710,7 +2704,6 @@ mod tests {
                     storage_options: None,
                     shard_id: Some("rollout-0".to_string()),
                     merge_after_generations: Some(1),
-                    ..Default::default()
                 },
             )
             .await
@@ -2773,7 +2766,6 @@ mod tests {
                     storage_options: None,
                     shard_id: Some("rollout-0".to_string()),
                     merge_after_generations: Some(3),
-                    ..Default::default()
                 },
             )
             .await
@@ -2806,7 +2798,6 @@ mod tests {
                     storage_options: None,
                     shard_id: Some("rollout-0".to_string()),
                     merge_after_generations: Some(3),
-                    ..Default::default()
                 },
             )
             .await
@@ -2858,7 +2849,6 @@ mod tests {
                         storage_options: None,
                         shard_id: Some("rollout-0".to_string()),
                         merge_after_generations: Some(2),
-                        ..Default::default()
                     },
                 )
                 .await
@@ -2894,7 +2884,6 @@ mod tests {
                     storage_options: None,
                     shard_id: Some("rollout-0".to_string()),
                     merge_after_generations: None, // count trigger off
-                    ..Default::default()
                 },
             )
             .await
@@ -3113,7 +3102,6 @@ mod tests {
                     storage_options: None,
                     shard_id: Some("rollout-0".to_string()),
                     merge_after_generations: None, // disabled
-                    ..Default::default()
                 },
             )
             .await
@@ -3143,7 +3131,6 @@ mod tests {
                     storage_options: None,
                     shard_id: Some("rollout-0".to_string()),
                     merge_after_generations: Some(1),
-                    ..Default::default()
                 },
             )
             .await
