@@ -340,6 +340,37 @@ impl AppState {
             }
         }))
     }
+
+    /// Gracefully drain every resident rollout writer on shutdown.
+    ///
+    /// [`RolloutStore`]'s writer ([`ShardWriter`]) has no `Drop`, so its
+    /// background tasks are only reclaimed by an explicit `close().await`. On the
+    /// normal serving path an LRU eviction owning the last handle drops it, and
+    /// the `Drop` impl spawns a detached best-effort close — but at process
+    /// shutdown the runtime is about to stop, so a detached task may never run.
+    /// This walks the resident cache and awaits [`RolloutStore::close`] on each
+    /// handle so writer background tasks are drained deterministically before the
+    /// runtime tears down. Idempotent and safe to call once after the server
+    /// stops accepting connections.
+    pub async fn shutdown(&self) {
+        // Snapshot resident stores without holding the LRU lock across the awaits.
+        let resident: Vec<(String, Arc<RwLock<RolloutStore>>)> = {
+            let cache = self.rollout_stores.lock().await;
+            cache
+                .iter()
+                .map(|(name, store)| (name.clone(), store.clone()))
+                .collect()
+        };
+        for (name, store) in resident {
+            if let Err(e) = store.write().await.close().await {
+                tracing::warn!(
+                    store = %name,
+                    error = %e,
+                    "failed to close rollout writer during shutdown"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -368,5 +399,40 @@ mod tests {
             .spawn_global_sweeper()
             .expect("sweeper spawns when interval > 0");
         handle.abort();
+    }
+
+    /// `shutdown` drains resident rollout writers by awaiting `close()` on each
+    /// (idempotent: `close` is a no-op when no writer is resident), so
+    /// `ShardWriter` background tasks are reclaimed deterministically instead of
+    /// relying on the detached best-effort `Drop`. It must also be a no-op when
+    /// the cache is empty.
+    #[tokio::test]
+    async fn shutdown_closes_resident_writers() {
+        use lance_context_core::RolloutStore;
+
+        let dir = TempDir::new().unwrap();
+        let state = state_with_interval(&dir, 0).await;
+
+        // Empty cache: shutdown is a no-op and returns promptly.
+        state.shutdown().await;
+
+        // Register a resident store, then shut down. The store's writer (if any)
+        // is closed under the write lock; the call must complete without error
+        // and leave the handle usable/droppable.
+        let uri = state.rollout_uri("exp");
+        let store = RolloutStore::open_with_options(&uri, state.rollout_store_options())
+            .await
+            .unwrap();
+        let store = Arc::new(RwLock::new(store));
+        state
+            .register_rollout("exp", &uri, store.clone())
+            .await
+            .unwrap();
+
+        state.shutdown().await;
+
+        // The handle survives shutdown (shutdown only drains the writer); a
+        // fresh close is still a no-op.
+        store.write().await.close().await.unwrap();
     }
 }
