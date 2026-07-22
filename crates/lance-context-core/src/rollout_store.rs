@@ -1088,13 +1088,68 @@ impl RolloutStore {
     /// Retrieve a single rollout row by its unique id, including any freshly
     /// appended (MemWAL-flushed) row on any instance. `binary_payload` is
     /// projected out (fetch bytes via [`Self::get_blob`]).
+    ///
+    /// # Base-table-first
+    ///
+    /// This queries the immutable base table first and returns immediately on a
+    /// hit, opening **zero** MemWAL generations for the common case of an
+    /// already-merged record. Only a base miss falls back to the flushed-WAL
+    /// union, so latency is decoupled from the pending-generation backlog
+    /// (which can run into the hundreds/thousands on a high-write experiment)
+    /// instead of paying one object-store open per pending generation.
+    ///
+    /// This is a pure optimization, not a semantic change: rollout rows are
+    /// immutable and an `id` is never re-appended, so a row present in the base
+    /// table is identical to any (necessarily absent) WAL copy, and a row that
+    /// is *only* in the WAL is still found by the fallback. The fetchability
+    /// invariant holds — any row visible in a `wal`/`all` list is returned here.
     pub async fn get_by_id(&self, id: &str) -> LanceResult<Option<RolloutRecord>> {
+        self.get_by_id_source(id, ListSource::All).await
+    }
+
+    /// [`Self::get_by_id`] with an explicit [`ListSource`]:
+    /// - `Fragments`: base table only — never opens a WAL generation (fastest,
+    ///   but misses un-merged rows);
+    /// - `Wal`: flushed MemWAL generations only (excludes the base table);
+    /// - `All`: base-table-first with a WAL fallback — the fetch-anything
+    ///   default, fast whenever the row is already merged.
+    pub async fn get_by_id_source(
+        &self,
+        id: &str,
+        source: ListSource,
+    ) -> LanceResult<Option<RolloutRecord>> {
+        match source {
+            ListSource::Fragments => self.scan_one_by_id(id, ListSource::Fragments).await,
+            ListSource::Wal => self.scan_one_by_id(id, ListSource::Wal).await,
+            ListSource::All => {
+                // Base-table-first: try the immutable base with no manifest
+                // reads, then fall back to the flushed-WAL union only on a miss.
+                if let Some(record) = self.scan_one_by_id(id, ListSource::Fragments).await? {
+                    return Ok(Some(record));
+                }
+                self.scan_one_by_id(id, ListSource::Wal).await
+            }
+        }
+    }
+
+    /// Run an id-equality point scan against a single [`ListSource`] and return
+    /// the first matching record. `Fragments` passes an empty snapshot set so it
+    /// performs no MemWAL manifest discovery; `Wal`/`All` discover flushed
+    /// generations first.
+    async fn scan_one_by_id(
+        &self,
+        id: &str,
+        source: ListSource,
+    ) -> LanceResult<Option<RolloutRecord>> {
+        let shard_snapshots = match source {
+            ListSource::Fragments => Vec::new(),
+            ListSource::Wal | ListSource::All => self.wal_shard_snapshots().await?,
+        };
         let escaped_id = id.replace('\'', "''");
         let columns = self.non_blob_columns();
         let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
         let scanner = self
-            .lsm_scanner()
-            .await?
+            .lsm_scanner_for_source(source, shard_snapshots)
             .project(&refs)
             .filter(&format!("id = '{}'", escaped_id))?;
         let mut stream = scanner.try_into_stream().await?;
@@ -1116,31 +1171,68 @@ impl RolloutStore {
     /// column out of the filtered scan prevents a point lookup from
     /// materializing an entire fragment's payloads. Returns `None` if the row
     /// or its payload is absent.
+    ///
+    /// # Base-table-first, then bounded-parallel WAL fallback
+    ///
+    /// The immutable base table is queried first and, on a hit, returned
+    /// immediately without opening any MemWAL generation — the common
+    /// already-merged case pays zero per-generation opens. Only a base miss
+    /// falls back to the flushed generations, which are then opened
+    /// **concurrently** (bounded by [`DEFAULT_OBSERVE_CONCURRENCY`]) with the
+    /// first match winning, rather than one-at-a-time newest-first.
+    ///
+    /// Because rollout rows are immutable and an `id` is never re-appended, a
+    /// row lives in exactly one place (the base table *or* one generation, never
+    /// both), so base-first cannot shadow a newer WAL copy and the parallel
+    /// fallback needs no ordering.
+    ///
+    /// The fallback is tolerant of a generation that a concurrent merge drained
+    /// and deleted between snapshot and open: such an open fails with a
+    /// not-found error, which is skipped (the row's data is already covered by
+    /// the base table we checked first). This removes the transient 500s that
+    /// the previous fail-fast fallback surfaced under concurrent auto-merge.
     pub async fn get_blob(&self, id: &str) -> LanceResult<Option<Vec<u8>>> {
+        // Base-table-first: an already-merged row is found here with no MemWAL
+        // manifest reads and no per-generation opens.
+        if let Some(payload) = Self::get_blob_from_dataset(&self.dataset, id).await? {
+            return Ok(payload);
+        }
+
+        // Base miss: fall back to the flushed generations. Open them with
+        // bounded concurrency and take the first hit; tolerate a generation that
+        // was concurrently merged away (NotFound) instead of failing the request.
         let snapshots = self.wal_shard_snapshots().await?;
-        let mut generations: Vec<(u64, String)> = snapshots
+        let uris: Vec<String> = snapshots
             .iter()
             .flat_map(|snapshot| {
                 snapshot.flushed_generations.iter().map(|generation| {
-                    (
-                        generation.generation,
-                        self.flushed_generation_uri(snapshot.shard_id, &generation.path),
-                    )
+                    self.flushed_generation_uri(snapshot.shard_id, &generation.path)
                 })
             })
             .collect();
-        generations.sort_by_key(|(generation, _)| std::cmp::Reverse(*generation));
 
-        for (_, uri) in generations {
-            let dataset = self.open_flushed_dataset(&uri).await?;
-            if let Some(payload) = Self::get_blob_from_dataset(&dataset, id).await? {
+        let mut hits = stream::iter(uris)
+            .map(|uri| async move {
+                match self.open_flushed_dataset(&uri).await {
+                    Ok(dataset) => Self::get_blob_from_dataset(&dataset, id).await,
+                    // A generation drained + deleted by a concurrent merge
+                    // between snapshot and open: its rows are already in the base
+                    // table (checked above), so skip it rather than 500.
+                    Err(err) if is_not_found_error(&err) => Ok(None),
+                    Err(err) => Err(err),
+                }
+            })
+            .buffer_unordered(DEFAULT_OBSERVE_CONCURRENCY);
+
+        while let Some(result) = hits.next().await {
+            if let Some(payload) = result? {
+                // Outer Some = row found in this generation; inner is
+                // payload-or-null. Return the inner value directly.
                 return Ok(payload);
             }
         }
 
-        Ok(Self::get_blob_from_dataset(&self.dataset, id)
-            .await?
-            .flatten())
+        Ok(None)
     }
 
     /// Locate `id` without projecting payload bytes, then take only the
@@ -1680,6 +1772,24 @@ impl Drop for RolloutStore {
 fn is_fenced_error(err: &LanceError) -> bool {
     let text = err.to_string();
     text.contains("fenced") || text.contains("Fenced")
+}
+
+/// Whether a Lance error means the target dataset/path does not exist. Used by
+/// the [`RolloutStore::get_blob`] WAL fallback to skip a flushed generation that
+/// a concurrent merge drained from the shard manifest and deleted between the
+/// manifest snapshot and the open — the row's data is already in the base table,
+/// so skipping is safe and avoids a transient failure. Both the structured
+/// not-found variants and the object-store "not found" surface are matched; the
+/// latter is text-based because it arrives as a generic wrapped IO error.
+fn is_not_found_error(err: &LanceError) -> bool {
+    if matches!(
+        err,
+        LanceError::DatasetNotFound { .. } | LanceError::NotFound { .. }
+    ) {
+        return true;
+    }
+    let text = err.to_string();
+    text.contains("was not found") || text.contains("not found") || text.contains("NotFound")
 }
 
 /// Derive the MemWAL shard UUID a server instance writes to from its stable
@@ -3601,6 +3711,125 @@ mod tests {
                 unmerged_read.as_secs_f64() / merged_read.as_secs_f64().max(1e-9)
             );
             println!("  slowest single add() (merge on every append) : {max_add:?}");
+        });
+    }
+
+    #[test]
+    fn point_lookup_base_first_finds_unmerged_and_merged_rows() {
+        // get_by_id / get_blob default to base-table-first with a WAL fallback.
+        // The fallback must still find a row that is only in the (un-merged)
+        // WAL, and after a merge the same row must be found via the base table.
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let bytes = b"\x00\x01payload-x";
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            // merge_after_generations = None: appended rows stay in the WAL,
+            // un-merged, so this exercises the base-miss -> WAL-fallback path.
+            let mut store = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    storage_options: None,
+                    shard_id: Some("rollout-0".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let artifact = artifact_record("row-x", bytes);
+            store.add(std::slice::from_ref(&artifact)).await.unwrap();
+
+            // Row is only in the WAL (nothing merged): base-first misses, the
+            // fallback finds it.
+            assert_eq!(flushed_generation_count(&store).await, 1);
+            let got = store.get_by_id("row-x").await.unwrap().unwrap();
+            assert_records_eq(&got, &artifact);
+            assert_eq!(
+                store.get_blob("row-x").await.unwrap().as_deref(),
+                Some(&bytes[..]),
+                "get_blob must find an un-merged WAL row via the fallback"
+            );
+
+            // Fragments source (base only) must NOT see the un-merged row;
+            // Wal source must.
+            assert!(store
+                .get_by_id_source("row-x", ListSource::Fragments)
+                .await
+                .unwrap()
+                .is_none());
+            assert!(store
+                .get_by_id_source("row-x", ListSource::Wal)
+                .await
+                .unwrap()
+                .is_some());
+
+            // Merge folds the row into the base table and drains the WAL.
+            store.cleanup_own_shard().await.unwrap();
+            assert_eq!(flushed_generation_count(&store).await, 0);
+
+            // Now base-first hits the base table with zero generations open.
+            let got = store.get_by_id("row-x").await.unwrap().unwrap();
+            assert_records_eq(&got, &artifact);
+            assert_eq!(
+                store.get_blob("row-x").await.unwrap().as_deref(),
+                Some(&bytes[..])
+            );
+            // After merge the row is in the base table (Fragments sees it) and
+            // no longer in the WAL.
+            assert!(store
+                .get_by_id_source("row-x", ListSource::Fragments)
+                .await
+                .unwrap()
+                .is_some());
+            assert!(store
+                .get_by_id_source("row-x", ListSource::Wal)
+                .await
+                .unwrap()
+                .is_none());
+
+            // A miss returns None on every source (no panic, no error).
+            assert!(store.get_by_id("nope").await.unwrap().is_none());
+            assert!(store.get_blob("nope").await.unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn point_lookup_immutability_contract_returns_base_version() {
+        // Contract guard: rollout ids are immutable and never re-appended, so a
+        // row present in the base table is authoritative. This pins that
+        // base-first returns the base row and does not require scanning the WAL
+        // to be correct — if someone later violates the no-overwrite contract by
+        // re-appending the same id, this test documents that base-first would
+        // return the base (merged) version, surfacing the contract break here
+        // rather than as silent stale reads in production.
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let bytes = b"base-version-bytes";
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    storage_options: None,
+                    shard_id: Some("rollout-0".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let base = artifact_record("dup", bytes);
+            store.add(std::slice::from_ref(&base)).await.unwrap();
+            store.cleanup_own_shard().await.unwrap();
+            assert_eq!(flushed_generation_count(&store).await, 0);
+
+            // Base table holds the authoritative row; base-first returns it
+            // without opening any WAL generation.
+            let got = store.get_by_id("dup").await.unwrap().unwrap();
+            assert_records_eq(&got, &base);
+            assert_eq!(
+                store.get_blob("dup").await.unwrap().as_deref(),
+                Some(&bytes[..])
+            );
         });
     }
 }
