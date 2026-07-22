@@ -1,0 +1,16 @@
+# Keep the Docker build context small. The Rust build happens inside the
+# builder stage; host build artifacts and node_modules must not be shipped.
+#
+# NOTE: do not exclude `python/` — it is a Cargo workspace member, so cargo
+# needs its manifest present to resolve the workspace even when we only build
+# the master/server crates.
+target/
+**/node_modules/
+crates/lance-context-master/ui/dist/
+.git/
+.github/
+examples/
+docs/
+specs/
+deploy/
+.claude/
