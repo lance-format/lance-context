@@ -663,6 +663,16 @@ pub struct AddRolloutRequest {
     #[serde(default = "default_content_type")]
     pub content_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_input_string: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_output_string: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rationale: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub problem_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_metadata: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_tokens: Option<Vec<i32>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<Vec<i32>>,
@@ -741,6 +751,16 @@ pub struct RolloutRecordDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
     pub content_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_input_string: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_output_string: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rationale: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub problem_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_metadata: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_tokens: Option<Vec<i32>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

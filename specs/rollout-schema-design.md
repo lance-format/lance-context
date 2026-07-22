@@ -100,6 +100,16 @@ One row per **message** in a rollout (assistant turn, tool call, grade, or artif
 | `content` | `LargeUtf8` | message text |
 | `content_type` | `Utf8` | MIME type |
 
+**Claim-check offloaded message fields** *(oversized rollout-message fields, each an individually-projectable nullable column)*
+
+| Column | Arrow type | Purpose |
+|---|---|---|
+| `model_input_string` | `LargeUtf8` | rendered model prompt string |
+| `model_output_string` | `LargeUtf8` | raw model completion string |
+| `rationale` | `LargeUtf8` | grader rationale |
+| `problem_text` | `LargeUtf8` | source problem text |
+| `user_metadata` | `LargeUtf8` | harness-supplied per-message metadata blob |
+
 **Tokens** *(first-class variable-length arrays)*
 
 | Column | Arrow type | Purpose |

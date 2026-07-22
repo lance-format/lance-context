@@ -45,6 +45,16 @@ pub struct RolloutRecord {
     pub content: Option<String>,
     pub content_type: String,
 
+    // Oversized message fields offloaded via the claim-check write path. Each is
+    // its own nullable, individually-projectable column (not packed into
+    // `content`/`binary_payload`) so a reader can select one without
+    // materializing the rest.
+    pub model_input_string: Option<String>,
+    pub model_output_string: Option<String>,
+    pub rationale: Option<String>,
+    pub problem_text: Option<String>,
+    pub user_metadata: Option<String>,
+
     // Tokens.
     pub input_tokens: Option<Vec<i32>>,
     pub output_tokens: Option<Vec<i32>>,
