@@ -54,9 +54,9 @@ use arrow_array::builder::{
 };
 use arrow_array::types::Int8Type;
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, DictionaryArray, Float32Array, Int32Array, Int64Array,
-    Int8Array, LargeBinaryArray, LargeStringArray, ListArray, RecordBatch, RecordBatchIterator,
-    StringArray, TimestampMicrosecondArray, UInt64Array,
+    new_null_array, Array, ArrayRef, BooleanArray, DictionaryArray, Float32Array, Int32Array,
+    Int64Array, Int8Array, LargeBinaryArray, LargeStringArray, ListArray, RecordBatch,
+    RecordBatchIterator, StringArray, TimestampMicrosecondArray, UInt64Array,
 };
 use arrow_schema::{ArrowError, DataType, Field, Schema, TimeUnit};
 use chrono::{DateTime, Utc};
@@ -602,6 +602,7 @@ impl RolloutStore {
         // delete the blob directory after the manifest drain (see below).
         let mut merged_paths: Vec<String> = Vec::new();
         let mut batches: Vec<RecordBatch> = Vec::new();
+        let merge_schema: Arc<Schema> = Arc::new(self.dataset.schema().into());
         for flushed in &manifest.flushed_generations {
             let gen_uri = format!(
                 "{}/_mem_wal/{}/{}",
@@ -612,7 +613,7 @@ impl RolloutStore {
             let mut stream = gen_dataset.scan().try_into_stream().await?;
             while let Some(batch) = stream.try_next().await? {
                 if batch.num_rows() > 0 {
-                    batches.push(batch);
+                    batches.push(align_batch_to_schema(batch, merge_schema.clone())?);
                 }
             }
             merged_generations.insert(flushed.generation);
@@ -621,10 +622,9 @@ impl RolloutStore {
 
         // Append the merged rows to the base table.
         if !batches.is_empty() {
-            let schema = Arc::new(rollout_schema());
             let reader = RecordBatchIterator::new(
                 batches.into_iter().map(Ok::<RecordBatch, ArrowError>),
-                schema,
+                merge_schema,
             );
             let mut params = WriteParams {
                 mode: WriteMode::Append,
@@ -1828,6 +1828,60 @@ fn is_not_found_error(err: &LanceError) -> bool {
     text.contains("was not found") || text.contains("not found") || text.contains("NotFound")
 }
 
+/// Align a flushed-generation batch with the base table schema before append.
+///
+/// Nullable columns added after the generation was written are materialized as
+/// null arrays. Missing required columns, type changes, and generation-only
+/// columns remain hard errors so a merge cannot silently corrupt or discard
+/// data.
+fn align_batch_to_schema(
+    batch: RecordBatch,
+    target_schema: Arc<Schema>,
+) -> LanceResult<RecordBatch> {
+    let source_schema = batch.schema();
+
+    for source_field in source_schema.fields() {
+        if target_schema.field_with_name(source_field.name()).is_err() {
+            return Err(ArrowError::SchemaError(format!(
+                "WAL generation column '{}' does not exist in the base table schema",
+                source_field.name()
+            ))
+            .into());
+        }
+    }
+
+    let columns = target_schema
+        .fields()
+        .iter()
+        .map(
+            |target_field| match source_schema.column_with_name(target_field.name()) {
+                Some((index, source_field)) => {
+                    if source_field.data_type() != target_field.data_type() {
+                        return Err(ArrowError::SchemaError(format!(
+                            "WAL generation column '{}' has type {}, expected {}",
+                            target_field.name(),
+                            source_field.data_type(),
+                            target_field.data_type()
+                        ))
+                        .into());
+                    }
+                    Ok(batch.column(index).clone())
+                }
+                None if target_field.is_nullable() => {
+                    Ok(new_null_array(target_field.data_type(), batch.num_rows()))
+                }
+                None => Err(ArrowError::SchemaError(format!(
+                    "required base table column '{}' is missing from the WAL generation",
+                    target_field.name()
+                ))
+                .into()),
+            },
+        )
+        .collect::<LanceResult<Vec<_>>>()?;
+
+    Ok(RecordBatch::try_new(target_schema, columns)?)
+}
+
 /// Derive the MemWAL shard UUID a server instance writes to from its stable
 /// instance id. Deterministic (UUID v5), so the same instance id always maps to
 /// the same shard across restarts and reopens — the losing/gaining semantics of
@@ -2205,6 +2259,7 @@ mod tests {
     use crate::record::Relationship;
     use crate::rollout::{ROLE_ARTIFACT, ROLE_ASSISTANT};
     use chrono::{TimeZone, Utc};
+    use lance::dataset::NewColumnTransform;
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -2337,6 +2392,34 @@ mod tests {
             artifact_type: Some("excel_grade_screenshot".to_string()),
             metadata: Some(json!({"filename": "trace.bin"})),
         }
+    }
+
+    fn pre_claim_check_schema() -> Arc<Schema> {
+        const CLAIM_CHECK_COLUMNS: [&str; 5] = [
+            "model_input_string",
+            "model_output_string",
+            "rationale",
+            "problem_text",
+            "user_metadata",
+        ];
+
+        Arc::new(Schema::new(
+            rollout_schema()
+                .fields()
+                .iter()
+                .filter(|field| !CLAIM_CHECK_COLUMNS.contains(&field.name().as_str()))
+                .cloned()
+                .collect::<Vec<_>>(),
+        ))
+    }
+
+    async fn create_empty_dataset(uri: &str, schema: Arc<Schema>) {
+        let empty_batch = RecordBatch::new_empty(schema.clone());
+        let batches = RecordBatchIterator::new(
+            vec![Ok::<RecordBatch, ArrowError>(empty_batch)].into_iter(),
+            schema,
+        );
+        Dataset::write(batches, uri, None).await.unwrap();
     }
 
     fn assert_records_eq(actual: &RolloutRecord, expected: &RolloutRecord) {
@@ -3294,6 +3377,71 @@ mod tests {
 
             // Nothing pending: a further pass reclaims nothing.
             assert_eq!(store.cleanup_own_shard().await.unwrap(), 0);
+        });
+    }
+
+    #[test]
+    fn cleanup_merges_pre_claim_check_generations_after_schema_evolution() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let legacy_schema = pre_claim_check_schema();
+            create_empty_dataset(&uri, legacy_schema.clone()).await;
+
+            let mut store = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    shard_id: Some("pre-claim-check".to_string()),
+                    merge_after_generations: None,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+            // The first old generation exercises cleanup while the base table
+            // still has the pre-#172 schema.
+            store.add(&[assistant_record("legacy-base")]).await.unwrap();
+            assert_eq!(store.cleanup_own_shard().await.unwrap(), 1);
+
+            // Leave another old generation pending, then evolve only the base
+            // schema. Its physical batch still lacks the five new columns.
+            store.add(&[assistant_record("legacy-wal")]).await.unwrap();
+            assert_eq!(flushed_generation_count(&store).await, 1);
+            store.close().await.unwrap();
+
+            let claim_check_fields = rollout_schema()
+                .fields()
+                .iter()
+                .filter(|field| legacy_schema.field_with_name(field.name()).is_err())
+                .cloned()
+                .collect::<Vec<_>>();
+            store
+                .dataset
+                .add_columns(
+                    NewColumnTransform::AllNulls(Arc::new(Schema::new(claim_check_fields))),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(store.cleanup_own_shard().await.unwrap(), 1);
+            assert_eq!(flushed_generation_count(&store).await, 0);
+
+            let mut rows = store.list(None, None).await.unwrap();
+            rows.sort_by(|left, right| left.id.cmp(&right.id));
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].id, "legacy-base");
+            assert_eq!(rows[1].id, "legacy-wal");
+            for row in rows {
+                assert!(row.model_input_string.is_none());
+                assert!(row.model_output_string.is_none());
+                assert!(row.rationale.is_none());
+                assert!(row.problem_text.is_none());
+                assert!(row.user_metadata.is_none());
+            }
         });
     }
 
