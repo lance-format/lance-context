@@ -286,7 +286,7 @@ body {
 .table-wrap {
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  overflow: hidden;
+  overflow-x: auto;
   background: var(--panel);
   box-shadow: var(--shadow);
 }
