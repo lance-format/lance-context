@@ -11,6 +11,9 @@ pub enum AppError {
     InvalidRequest(String),
     Internal(String),
     CompactionInProgress,
+    /// The in-flight blob-byte budget is exhausted; the client should retry
+    /// later. Maps to `503 Service Unavailable`.
+    Overloaded(String),
 }
 
 impl AppError {
@@ -55,6 +58,7 @@ impl IntoResponse for AppError {
                 "COMPACTION_IN_PROGRESS",
                 "Compaction already in progress".to_string(),
             ),
+            AppError::Overloaded(msg) => (StatusCode::SERVICE_UNAVAILABLE, "OVERLOADED", msg),
         };
 
         let body = ErrorResponse {

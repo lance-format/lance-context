@@ -17,6 +17,8 @@ lance-context-core = { version = "0.6.4", path = "../lance-context-core" }
 lance-context-api = { version = "0.6.4", path = "../lance-context-api" }
 lance-context-metrics = { version = "0.1.0", path = "../lance-context-metrics" }
 axum = { version = "0.8", features = ["json", "multipart"] }
+bytes = "1"
+futures = "0.3"
 metrics = "0.24"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive", "env"] }

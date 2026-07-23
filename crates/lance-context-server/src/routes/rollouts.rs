@@ -27,6 +27,71 @@ use crate::state::AppState;
 /// raises the ceiling well above it while still bounding memory.
 pub const MAX_ROLLOUT_UPLOAD_BYTES: usize = 1024 * 1024 * 1024;
 
+/// Frame size for chunked blob download responses. The in-memory `Vec<u8>` is
+/// sliced into frames of this size so the HTTP send path never holds an extra
+/// full-blob copy and a slow reader exerts backpressure at frame granularity
+/// rather than after the whole payload is queued. 256 KiB keeps per-frame
+/// overhead negligible while capping the amount buffered ahead of the socket.
+const BLOB_STREAM_CHUNK_BYTES: usize = 256 * 1024;
+
+/// Build a chunked [`Body`] from an owned blob. `Bytes` frames share one
+/// backing allocation (cheap refcounted slices — no per-frame copy), so this
+/// does not duplicate the payload; it only changes how it is fed to the socket.
+///
+/// `reservation` (the in-flight blob-budget guard, if any) is moved into the
+/// stream and released only when the last frame has been produced, so the
+/// budget accounts for a slow download for its full lifetime.
+fn blob_stream_body(
+    bytes: Vec<u8>,
+    mut reservation: Option<crate::state::BlobReservation>,
+) -> Body {
+    let buf = bytes::Bytes::from(bytes);
+    let len = buf.len();
+    let mut offset = 0usize;
+    let stream = futures::stream::poll_fn(move |_| {
+        if offset >= len {
+            // Drop the reservation exactly when the stream ends.
+            let _ = reservation.take();
+            return std::task::Poll::Ready(None);
+        }
+        let end = (offset + BLOB_STREAM_CHUNK_BYTES).min(len);
+        let frame = buf.slice(offset..end);
+        offset = end;
+        std::task::Poll::Ready(Some(Ok::<_, std::convert::Infallible>(frame)))
+    });
+    Body::from_stream(stream)
+}
+
+/// Parse the `Content-Length` header into a byte count, defaulting to `0` when
+/// absent or unparsable (a chunked upload without a declared length reserves
+/// nothing up-front; the body-size limit still caps it).
+fn content_length(headers: &header::HeaderMap) -> usize {
+    headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
+/// Reserve `bytes` from the instance's in-flight blob budget (if configured),
+/// returning the RAII guard to hold for the request's duration. Returns
+/// `503 Overloaded` when the budget cannot currently admit the request. When no
+/// budget is configured (`None`) this is a no-op that always admits.
+fn acquire_blob_budget(
+    state: &AppState,
+    bytes: usize,
+) -> Result<Option<crate::state::BlobReservation>, AppError> {
+    match &state.blob_budget {
+        None => Ok(None),
+        Some(budget) => budget.try_acquire(bytes).map(Some).ok_or_else(|| {
+            metrics::counter!("rollout_blob_budget_rejections_total").increment(1);
+            AppError::Overloaded(
+                "server is at its in-flight blob memory limit; retry shortly".to_string(),
+            )
+        }),
+    }
+}
+
 /// Response for the internal WAL-merge trigger: how many flushed generations
 /// this worker's shard folded into the base table.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -169,6 +234,12 @@ pub async fn add_rollouts(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("")
         .to_string();
+
+    // Admit against the in-flight blob budget before buffering the body, using
+    // the declared Content-Length as the reservation size. Held for the whole
+    // handler so concurrent uploads cannot collectively exceed the budget and
+    // OOM the worker; dropped when the request completes.
+    let _budget = acquire_blob_budget(&state, content_length(req.headers()))?;
 
     let records = if content_type_is(&content_type, "multipart/form-data") {
         let multipart = Multipart::from_request(req, &state)
@@ -364,6 +435,11 @@ pub async fn get_rollout(
 /// Materialize a rollout row's `binary_payload` bytes. The artifact
 /// bytes are opaque, so they stream as `application/octet-stream`. `404` when
 /// the row is absent or carries no payload.
+///
+/// The payload is sent as a **chunked** body ([`blob_stream_body`]) rather than
+/// a single giant frame: the response yields fixed-size frames so the HTTP
+/// layer never re-buffers the whole blob and a slow client applies backpressure
+/// instead of forcing the server to hold an extra full copy in the send queue.
 pub async fn fetch_rollout_blob(
     State(state): State<Arc<AppState>>,
     Path((name, id)): Path<(String, String)>,
@@ -377,9 +453,18 @@ pub async fn fetch_rollout_blob(
         .map_err(AppError::from_lance)?
         .ok_or_else(|| AppError::NotFound(format!("Rollout '{}' has no payload", id)))?;
 
+    // Reserve now that the payload size is known, and hold the reservation for
+    // the whole streamed send (moved into the body): a slow client keeps the
+    // blob resident until the last frame flushes, so the budget must account for
+    // it until then. Reject with 503 if the budget is currently exhausted.
+    let reservation = acquire_blob_budget(&state, bytes.len())?;
+    drop(store);
+
+    let len = bytes.len();
     Response::builder()
         .header(header::CONTENT_TYPE, "application/octet-stream")
-        .body(Body::from(bytes))
+        .header(header::CONTENT_LENGTH, len)
+        .body(blob_stream_body(bytes, reservation))
         .map_err(|err| AppError::Internal(err.to_string()))
 }
 
@@ -619,6 +704,36 @@ mod tests {
 
     use super::*;
     use crate::state::AppState;
+
+    #[tokio::test]
+    async fn blob_stream_body_reassembles_across_chunk_boundaries() {
+        // A payload spanning several BLOB_STREAM_CHUNK_BYTES frames must
+        // reassemble byte-for-byte, and a reservation moved into the body is
+        // held until the stream is fully drained.
+        let payload: Vec<u8> = (0..(BLOB_STREAM_CHUNK_BYTES * 2 + 123))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let budget = crate::state::BlobBudget::new(payload.len());
+        let reservation = budget.try_acquire(payload.len());
+        assert!(reservation.is_some());
+        // Budget is now fully occupied.
+        assert!(budget.try_acquire(1).is_none());
+
+        let body = blob_stream_body(payload.clone(), reservation);
+        let collected = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        assert_eq!(&collected[..], &payload[..]);
+
+        // Once the body is consumed the reservation dropped, freeing the budget.
+        assert!(budget.try_acquire(payload.len()).is_some());
+    }
+
+    #[test]
+    fn content_length_parses_or_defaults_zero() {
+        let mut headers = header::HeaderMap::new();
+        assert_eq!(content_length(&headers), 0);
+        headers.insert(header::CONTENT_LENGTH, header::HeaderValue::from(4096));
+        assert_eq!(content_length(&headers), 4096);
+    }
 
     async fn rollout_state() -> (Arc<AppState>, TempDir) {
         let dir = TempDir::new().unwrap();

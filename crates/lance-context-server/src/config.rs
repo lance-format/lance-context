@@ -53,6 +53,22 @@ pub struct ServerConfig {
     /// back to the built-in default.
     #[arg(long, env = "ROLLOUT_CACHE_CAPACITY", default_value = "2000")]
     pub rollout_cache_capacity: usize,
+
+    /// Ceiling, in bytes, on the total artifact-blob payload held in memory
+    /// across all *concurrent* rollout uploads and downloads on this instance.
+    ///
+    /// Each blob request materializes its full payload as an in-memory buffer
+    /// (uploads buffer the request body; downloads materialize the row's
+    /// `binary_payload`). Without a global cap, N concurrent 1 GiB requests
+    /// would need N GiB and can OOM the process. This budget admits a request
+    /// only while enough of the budget is free — otherwise it is rejected with
+    /// `503 Service Unavailable` and a `Retry-After`, applying backpressure at
+    /// the edge instead of the allocator. A single request larger than the whole
+    /// budget is still admitted when the instance is otherwise idle (it reserves
+    /// the entire budget), so this bounds concurrency, not maximum blob size.
+    /// `0` (the default) disables the budget.
+    #[arg(long, env = "ROLLOUT_MAX_INFLIGHT_BLOB_BYTES", default_value = "0")]
+    pub rollout_max_inflight_blob_bytes: usize,
 }
 
 impl ServerConfig {
