@@ -1,6 +1,6 @@
 [project]
 name = "lance-context"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
     "pyarrow>=14",
 ]
