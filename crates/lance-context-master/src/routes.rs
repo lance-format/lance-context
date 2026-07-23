@@ -209,16 +209,16 @@ pub async fn download_experiment_blob(
         .refresh_latest()
         .await
         .map_err(MasterError::from_lance)?;
-    let record = store
-        .get_by_id(&id)
+    // Single base-first scan returns the row metadata and its payload together,
+    // instead of a separate get_by_id + get_blob (two point scans over the same
+    // shard) as before.
+    let (record, payload) = store
+        .get_record_with_blob(&id)
         .await
         .map_err(MasterError::from_lance)?
         .ok_or_else(|| MasterError::NotFound(format!("record '{}' does not exist", id)))?;
-    let bytes = store
-        .get_blob(&id)
-        .await
-        .map_err(MasterError::from_lance)?
-        .ok_or_else(|| MasterError::NotFound(format!("record '{}' has no blob", id)))?;
+    let bytes =
+        payload.ok_or_else(|| MasterError::NotFound(format!("record '{}' has no blob", id)))?;
 
     let content_type = HeaderValue::from_str(&record.content_type)
         .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
@@ -229,8 +229,27 @@ pub async fn download_experiment_blob(
     Response::builder()
         .header(header::CONTENT_TYPE, content_type)
         .header(header::CONTENT_DISPOSITION, disposition)
-        .body(Body::from(bytes))
+        .header(header::CONTENT_LENGTH, bytes.len())
+        .body(blob_stream_body(bytes))
         .map_err(|err| MasterError::Internal(err.to_string()))
+}
+
+/// Frame size for chunked blob download responses (see [`blob_stream_body`]).
+const BLOB_STREAM_CHUNK_BYTES: usize = 256 * 1024;
+
+/// Build a chunked [`Body`] from an owned blob so the HTTP send path never holds
+/// a second full-blob copy and a slow client applies backpressure at frame
+/// granularity. `Bytes` frames are refcounted slices of one allocation, so no
+/// per-frame copy of the payload is made.
+fn blob_stream_body(bytes: Vec<u8>) -> Body {
+    let buf = bytes::Bytes::from(bytes);
+    let chunks = (0..buf.len())
+        .step_by(BLOB_STREAM_CHUNK_BYTES.max(1))
+        .map(move |start| {
+            let end = (start + BLOB_STREAM_CHUNK_BYTES).min(buf.len());
+            Ok::<_, std::convert::Infallible>(buf.slice(start..end))
+        });
+    Body::from_stream(futures::stream::iter(chunks))
 }
 
 /// `POST /api/v1/rescan` — trigger one immediate full scan.

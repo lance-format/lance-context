@@ -19,6 +19,7 @@ lance-context-metrics = { version = "0.1.0", path = "../lance-context-metrics" }
 arrow-array = "58"
 arrow-schema = "58"
 axum = { version = "0.8", features = ["json"] }
+bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive", "env"] }
 etcd-client = { version = "0.19", features = ["tls"] }

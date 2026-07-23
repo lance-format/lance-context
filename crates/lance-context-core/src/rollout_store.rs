@@ -1132,6 +1132,42 @@ impl RolloutStore {
         }
     }
 
+    /// Fetch a row *together with* its `binary_payload` in a single base-first
+    /// scan, returning `(record, payload)`.
+    ///
+    /// Callers that need both the row metadata (e.g. `content_type` for a
+    /// download's `Content-Type`/filename) and the artifact bytes would
+    /// otherwise call [`Self::get_by_id`] then [`Self::get_blob`] — two
+    /// independent point scans over the same shard. This folds them into one
+    /// scan: the row is located once and `binary_payload` is materialized for
+    /// only that row (via a projected `take`), so it never reads back an entire
+    /// fragment's payloads. `payload` is `None` when the row carries no blob.
+    ///
+    /// Base-table-first with the same immutable-row reasoning as
+    /// [`Self::get_by_id`]: a hit in the base table returns immediately with no
+    /// MemWAL generation opened; only a base miss falls back to the flushed WAL.
+    pub async fn get_record_with_blob(
+        &self,
+        id: &str,
+    ) -> LanceResult<Option<(RolloutRecord, Option<Vec<u8>>)>> {
+        // Base table first — no manifest reads, no per-generation opens.
+        if let Some(record) = self.scan_one_by_id(id, ListSource::Fragments).await? {
+            let payload = Self::get_blob_from_dataset(&self.dataset, id)
+                .await?
+                .flatten();
+            return Ok(Some((record, payload)));
+        }
+
+        // Base miss: locate the row in the flushed generations. Reuse the
+        // NotFound-tolerant, bounded-parallel blob fallback and pair it with the
+        // WAL-sourced metadata scan.
+        let Some(record) = self.scan_one_by_id(id, ListSource::Wal).await? else {
+            return Ok(None);
+        };
+        let payload = self.get_blob(id).await?;
+        Ok(Some((record, payload)))
+    }
+
     /// Run an id-equality point scan against a single [`ListSource`] and return
     /// the first matching record. `Fragments` passes an empty snapshot set so it
     /// performs no MemWAL manifest discovery; `Wal`/`All` discover flushed
@@ -3830,6 +3866,56 @@ mod tests {
                 store.get_blob("dup").await.unwrap().as_deref(),
                 Some(&bytes[..])
             );
+        });
+    }
+
+    #[test]
+    fn get_record_with_blob_returns_row_and_payload_in_one_scan() {
+        // get_record_with_blob folds the metadata point lookup and the payload
+        // fetch into a single base-first scan. It must return both the row and
+        // its bytes for an un-merged WAL row (base-miss -> fallback) and for a
+        // merged base row, and None for a missing id.
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let bytes = b"\x00\x01record-with-blob";
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    storage_options: None,
+                    shard_id: Some("rollout-0".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let artifact = artifact_record("row-rw", bytes);
+            store.add(std::slice::from_ref(&artifact)).await.unwrap();
+
+            // Un-merged: found via the WAL fallback, row + payload paired.
+            assert_eq!(flushed_generation_count(&store).await, 1);
+            let (record, payload) = store
+                .get_record_with_blob("row-rw")
+                .await
+                .unwrap()
+                .expect("row present in WAL");
+            assert_records_eq(&record, &artifact);
+            assert_eq!(payload.as_deref(), Some(&bytes[..]));
+
+            // After merge: found via the base table, still paired.
+            store.cleanup_own_shard().await.unwrap();
+            assert_eq!(flushed_generation_count(&store).await, 0);
+            let (record, payload) = store
+                .get_record_with_blob("row-rw")
+                .await
+                .unwrap()
+                .expect("row present in base");
+            assert_records_eq(&record, &artifact);
+            assert_eq!(payload.as_deref(), Some(&bytes[..]));
+
+            // Missing id: None, not an error.
+            assert!(store.get_record_with_blob("nope").await.unwrap().is_none());
         });
     }
 }

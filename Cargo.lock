@@ -5505,6 +5505,7 @@ dependencies = [
  "arrow-array 58.3.0",
  "arrow-schema 58.3.0",
  "axum",
+ "bytes",
  "chrono",
  "clap",
  "etcd-client",
@@ -5558,8 +5559,10 @@ name = "lance-context-server"
 version = "0.6.3"
 dependencies = [
  "axum",
+ "bytes",
  "chrono",
  "clap",
+ "futures",
  "lance-context-api",
  "lance-context-core",
  "lance-context-metrics",

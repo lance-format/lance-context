@@ -47,6 +47,89 @@ pub struct AppState {
     /// Periodic per-shard WAL-cleanup interval in seconds; `0` disables the
     /// global sweeper. See [`Self::spawn_global_sweeper`].
     pub rollout_cleanup_interval_secs: u64,
+    /// Admission budget for in-flight artifact-blob bytes across concurrent
+    /// uploads/downloads. `None` disables the budget (unbounded). See
+    /// [`BlobBudget`].
+    pub blob_budget: Option<Arc<BlobBudget>>,
+}
+
+/// Process-wide admission control for the total artifact-blob payload held in
+/// memory across concurrent rollout uploads and downloads.
+///
+/// Each blob request materializes its whole payload as an in-memory buffer, so
+/// unbounded concurrency of large requests can OOM the worker. A request calls
+/// [`BlobBudget::try_acquire`] with its byte size before allocating; the guard
+/// returned holds the reservation and releases it on drop (i.e. when the
+/// request completes). When the budget cannot fit the request the caller
+/// rejects it with `503` rather than proceeding to allocate.
+///
+/// This bounds *concurrency*, not maximum blob size: a single request larger
+/// than the entire budget is still admitted when nothing else is in flight (it
+/// transiently reserves the full budget), so a lone big download never
+/// deadlocks against its own limit.
+#[derive(Debug)]
+pub struct BlobBudget {
+    limit: usize,
+    used: std::sync::atomic::AtomicUsize,
+}
+
+/// RAII reservation returned by [`BlobBudget::try_acquire`]. Releases its bytes
+/// back to the budget when dropped.
+#[derive(Debug)]
+pub struct BlobReservation {
+    budget: Arc<BlobBudget>,
+    bytes: usize,
+}
+
+impl BlobBudget {
+    /// Create a budget admitting up to `limit` concurrent in-flight blob bytes.
+    #[must_use]
+    pub fn new(limit: usize) -> Arc<Self> {
+        Arc::new(Self {
+            limit,
+            used: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    /// Reserve `bytes` if they fit alongside what is already in flight. Returns
+    /// `None` (request should be rejected with `503`) when admitting the request
+    /// would exceed the limit, *unless* nothing is currently in flight — in that
+    /// case an over-limit request is admitted so a lone large blob is never
+    /// permanently rejected.
+    pub fn try_acquire(self: &Arc<Self>, bytes: usize) -> Option<BlobReservation> {
+        use std::sync::atomic::Ordering;
+        let mut current = self.used.load(Ordering::Acquire);
+        loop {
+            // Admit when it fits, or when the instance is otherwise idle (so a
+            // single request bigger than the whole budget can still proceed).
+            let fits = current + bytes <= self.limit;
+            if !fits && current != 0 {
+                return None;
+            }
+            match self.used.compare_exchange_weak(
+                current,
+                current + bytes,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(BlobReservation {
+                        budget: Arc::clone(self),
+                        bytes,
+                    })
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+impl Drop for BlobReservation {
+    fn drop(&mut self) {
+        self.budget
+            .used
+            .fetch_sub(self.bytes, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 
 impl AppState {
@@ -61,6 +144,8 @@ impl AppState {
             .map_err(AppError::from_lance)?;
         let capacity = NonZeroUsize::new(config.rollout_cache_capacity)
             .unwrap_or_else(|| NonZeroUsize::new(DEFAULT_ROLLOUT_CACHE_CAPACITY).unwrap());
+        let blob_budget = (config.rollout_max_inflight_blob_bytes > 0)
+            .then(|| BlobBudget::new(config.rollout_max_inflight_blob_bytes));
         Ok(Self {
             stores: RwLock::new(std::collections::HashMap::new()),
             rollout_stores: Mutex::new(LruCache::new(capacity)),
@@ -69,6 +154,7 @@ impl AppState {
             instance_id,
             rollout_merge_after_generations: config.rollout_merge_after_generations,
             rollout_cleanup_interval_secs: config.rollout_cleanup_interval_secs,
+            blob_budget,
         })
     }
 
@@ -105,6 +191,7 @@ impl AppState {
             instance_id,
             rollout_merge_after_generations: 0,
             rollout_cleanup_interval_secs: 0,
+            blob_budget: None,
         }
     }
 
@@ -375,6 +462,41 @@ impl AppState {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn blob_budget_admits_until_full_then_releases_on_drop() {
+        let budget = BlobBudget::new(1000);
+        // Two reservations that together fit.
+        let a = budget.try_acquire(600).expect("first fits");
+        let b = budget.try_acquire(300).expect("second fits (900 <= 1000)");
+        // A third that would overflow is rejected while others are in flight.
+        assert!(
+            budget.try_acquire(200).is_none(),
+            "over-limit request rejected while budget is occupied"
+        );
+        // Dropping frees the bytes back.
+        drop(b);
+        let c = budget.try_acquire(200).expect("fits again after release");
+        drop(a);
+        drop(c);
+        // Fully drained: a request equal to the whole budget now fits.
+        assert!(budget.try_acquire(1000).is_some());
+    }
+
+    #[test]
+    fn blob_budget_admits_a_lone_oversized_request() {
+        // A single request larger than the entire budget is admitted when the
+        // instance is idle, so a lone big blob is never permanently rejected —
+        // the budget bounds concurrency, not maximum blob size.
+        let budget = BlobBudget::new(100);
+        let big = budget
+            .try_acquire(500)
+            .expect("lone oversized request admitted");
+        // But while it holds the (over-)reservation, nothing else gets in.
+        assert!(budget.try_acquire(1).is_none());
+        drop(big);
+        assert!(budget.try_acquire(50).is_some());
+    }
 
     async fn state_with_interval(dir: &TempDir, secs: u64) -> Arc<AppState> {
         let mut state = AppState::new_for_test(dir.path().to_path_buf()).await;
