@@ -63,7 +63,7 @@ fn blob_stream_body(
 }
 
 /// Parse the `Content-Length` header into a byte count, defaulting to `0` when
-/// absent or unparseable (a chunked upload without a declared length reserves
+/// absent or unparsable (a chunked upload without a declared length reserves
 /// nothing up-front; the body-size limit still caps it).
 fn content_length(headers: &header::HeaderMap) -> usize {
     headers
