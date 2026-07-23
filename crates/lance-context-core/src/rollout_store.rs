@@ -91,6 +91,14 @@ const DEFAULT_MANIFEST_SCAN_BATCH_SIZE: usize = 16;
 /// concurrently while collecting observability metrics.
 const DEFAULT_OBSERVE_CONCURRENCY: usize = 16;
 
+const CLAIM_CHECK_COLUMNS: [&str; 5] = [
+    "model_input_string",
+    "model_output_string",
+    "rationale",
+    "problem_text",
+    "user_metadata",
+];
+
 /// Name of the scalar index on the base table's `id` column. Kept in sync with
 /// `ContextStore`'s `ID_INDEX_NAME` so both tables index `id` under one name.
 const ROLLOUT_ID_INDEX_NAME: &str = "id_idx";
@@ -1182,7 +1190,13 @@ impl RolloutStore {
             ListSource::Wal | ListSource::All => self.wal_shard_snapshots().await?,
         };
         let escaped_id = id.replace('\'', "''");
-        let columns = self.non_blob_columns();
+        let columns = self
+            .non_blob_columns()
+            .into_iter()
+            .filter(|column| {
+                source == ListSource::Fragments || !CLAIM_CHECK_COLUMNS.contains(&column.as_str())
+            })
+            .collect::<Vec<_>>();
         let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
         let scanner = self
             .lsm_scanner_for_source(source, shard_snapshots)
@@ -2395,14 +2409,6 @@ mod tests {
     }
 
     fn pre_claim_check_schema() -> Arc<Schema> {
-        const CLAIM_CHECK_COLUMNS: [&str; 5] = [
-            "model_input_string",
-            "model_output_string",
-            "rationale",
-            "problem_text",
-            "user_metadata",
-        ];
-
         Arc::new(Schema::new(
             rollout_schema()
                 .fields()
@@ -2422,6 +2428,49 @@ mod tests {
         Dataset::write(batches, uri, None).await.unwrap();
     }
 
+    async fn evolved_store_with_legacy_base_and_wal() -> (TempDir, RolloutStore) {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let legacy_schema = pre_claim_check_schema();
+        create_empty_dataset(&uri, legacy_schema.clone()).await;
+
+        let mut store = RolloutStore::open_with_options(
+            &uri,
+            RolloutStoreOptions {
+                shard_id: Some("pre-claim-check".to_string()),
+                merge_after_generations: None,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        store.add(&[assistant_record("legacy-base")]).await.unwrap();
+        assert_eq!(store.cleanup_own_shard().await.unwrap(), 1);
+
+        store.add(&[assistant_record("legacy-wal")]).await.unwrap();
+        assert_eq!(flushed_generation_count(&store).await, 1);
+        store.close().await.unwrap();
+
+        let claim_check_fields = rollout_schema()
+            .fields()
+            .iter()
+            .filter(|field| legacy_schema.field_with_name(field.name()).is_err())
+            .cloned()
+            .collect::<Vec<_>>();
+        store
+            .dataset
+            .add_columns(
+                NewColumnTransform::AllNulls(Arc::new(Schema::new(claim_check_fields))),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        (dir, store)
+    }
+
     fn assert_records_eq(actual: &RolloutRecord, expected: &RolloutRecord) {
         assert_eq!(actual.id, expected.id);
         assert_eq!(actual.rollout_id, expected.rollout_id);
@@ -2432,6 +2481,11 @@ mod tests {
         assert_eq!(actual.created_at, expected.created_at);
         assert_eq!(actual.content, expected.content);
         assert_eq!(actual.content_type, expected.content_type);
+        assert_eq!(actual.model_input_string, expected.model_input_string);
+        assert_eq!(actual.model_output_string, expected.model_output_string);
+        assert_eq!(actual.rationale, expected.rationale);
+        assert_eq!(actual.problem_text, expected.problem_text);
+        assert_eq!(actual.user_metadata, expected.user_metadata);
         assert_eq!(actual.input_tokens, expected.input_tokens);
         assert_eq!(actual.output_tokens, expected.output_tokens);
         assert_eq!(actual.num_input_tokens, expected.num_input_tokens);
@@ -3382,50 +3436,9 @@ mod tests {
 
     #[test]
     fn cleanup_merges_pre_claim_check_generations_after_schema_evolution() {
-        let dir = TempDir::new().unwrap();
-        let uri = dir.path().to_string_lossy().to_string();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let legacy_schema = pre_claim_check_schema();
-            create_empty_dataset(&uri, legacy_schema.clone()).await;
-
-            let mut store = RolloutStore::open_with_options(
-                &uri,
-                RolloutStoreOptions {
-                    shard_id: Some("pre-claim-check".to_string()),
-                    merge_after_generations: None,
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-
-            // The first old generation exercises cleanup while the base table
-            // still has the pre-#172 schema.
-            store.add(&[assistant_record("legacy-base")]).await.unwrap();
-            assert_eq!(store.cleanup_own_shard().await.unwrap(), 1);
-
-            // Leave another old generation pending, then evolve only the base
-            // schema. Its physical batch still lacks the five new columns.
-            store.add(&[assistant_record("legacy-wal")]).await.unwrap();
-            assert_eq!(flushed_generation_count(&store).await, 1);
-            store.close().await.unwrap();
-
-            let claim_check_fields = rollout_schema()
-                .fields()
-                .iter()
-                .filter(|field| legacy_schema.field_with_name(field.name()).is_err())
-                .cloned()
-                .collect::<Vec<_>>();
-            store
-                .dataset
-                .add_columns(
-                    NewColumnTransform::AllNulls(Arc::new(Schema::new(claim_check_fields))),
-                    None,
-                    None,
-                )
-                .await
-                .unwrap();
+            let (_dir, mut store) = evolved_store_with_legacy_base_and_wal().await;
 
             assert_eq!(store.cleanup_own_shard().await.unwrap(), 1);
             assert_eq!(flushed_generation_count(&store).await, 0);
@@ -3442,6 +3455,40 @@ mod tests {
                 assert!(row.problem_text.is_none());
                 assert!(row.user_metadata.is_none());
             }
+        });
+    }
+
+    #[test]
+    fn get_by_id_reads_pre_claim_check_base_and_wal_after_schema_evolution() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let (_dir, store) = evolved_store_with_legacy_base_and_wal().await;
+
+            let mut base = store.get_by_id("legacy-base").await.unwrap().unwrap();
+            let wal = store.get_by_id("legacy-wal").await.unwrap().unwrap();
+
+            assert!(store
+                .get_by_id_source("legacy-base", ListSource::Fragments)
+                .await
+                .unwrap()
+                .is_some());
+            assert!(store
+                .get_by_id_source("legacy-wal", ListSource::Wal)
+                .await
+                .unwrap()
+                .is_some());
+
+            for row in [&base, &wal] {
+                assert!(row.model_input_string.is_none());
+                assert!(row.model_output_string.is_none());
+                assert!(row.rationale.is_none());
+                assert!(row.problem_text.is_none());
+                assert!(row.user_metadata.is_none());
+            }
+
+            base.id.clone_from(&wal.id);
+            assert_records_eq(&base, &wal);
+            assert_eq!(base.binary_payload, wal.binary_payload);
         });
     }
 
