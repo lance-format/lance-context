@@ -65,7 +65,9 @@ use lance::dataset::mem_wal::{
     DatasetMemWalExt, LsmScanner, ShardManifestStore, ShardSnapshot, ShardWriter, ShardWriterConfig,
 };
 use lance::dataset::optimize::{compact_files, CompactionMetrics, CompactionOptions};
-use lance::dataset::{builder::DatasetBuilder, Dataset, WriteMode, WriteParams};
+use lance::dataset::{
+    builder::DatasetBuilder, Dataset, NewColumnTransform, WriteMode, WriteParams,
+};
 use lance::index::DatasetIndexExt;
 use lance::io::{ObjectStoreParams, StorageOptionsAccessor};
 use lance::{Error as LanceError, Result as LanceResult};
@@ -601,6 +603,8 @@ impl RolloutStore {
         // `add` transparently reopens against the freshly-claimed epoch.
         self.close().await?;
 
+        self.ensure_latest_rollout_schema().await?;
+
         // Resolve each flushed generation to its absolute dataset path and read
         // all its rows into memory. Record which generation ids we merge so the
         // drain can remove exactly these and nothing else.
@@ -701,6 +705,39 @@ impl RolloutStore {
                      it will remain until reclaimed"
                 );
             }
+        }
+
+        Ok(())
+    }
+
+    /// Evolve an older base table to the latest additive rollout schema.
+    ///
+    /// Missing nullable columns are added as all-null arrays. Existing unknown
+    /// columns, type changes, and missing required columns remain hard errors.
+    async fn ensure_latest_rollout_schema(&mut self) -> LanceResult<()> {
+        self.dataset.checkout_latest().await?;
+
+        let base_schema: Arc<Schema> = Arc::new(self.dataset.schema().into());
+        let latest_schema = Arc::new(rollout_schema());
+        align_batch_to_schema(
+            RecordBatch::new_empty(base_schema.clone()),
+            latest_schema.clone(),
+        )?;
+
+        let missing_fields = latest_schema
+            .fields()
+            .iter()
+            .filter(|field| base_schema.field_with_name(field.name()).is_err())
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing_fields.is_empty() {
+            self.dataset
+                .add_columns(
+                    NewColumnTransform::AllNulls(Arc::new(Schema::new(missing_fields))),
+                    None,
+                    None,
+                )
+                .await?;
         }
 
         Ok(())
@@ -2273,7 +2310,6 @@ mod tests {
     use crate::record::Relationship;
     use crate::rollout::{ROLE_ARTIFACT, ROLE_ASSISTANT};
     use chrono::{TimeZone, Utc};
-    use lance::dataset::NewColumnTransform;
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -2428,7 +2464,7 @@ mod tests {
         Dataset::write(batches, uri, None).await.unwrap();
     }
 
-    async fn evolved_store_with_legacy_base_and_wal() -> (TempDir, RolloutStore) {
+    async fn store_with_legacy_base_and_wal(evolve_base: bool) -> (TempDir, RolloutStore) {
         let dir = TempDir::new().unwrap();
         let uri = dir.path().to_string_lossy().to_string();
         let legacy_schema = pre_claim_check_schema();
@@ -2445,28 +2481,37 @@ mod tests {
         .await
         .unwrap();
 
-        store.add(&[assistant_record("legacy-base")]).await.unwrap();
-        assert_eq!(store.cleanup_own_shard().await.unwrap(), 1);
+        let base_batch = store
+            .records_to_batch(&[assistant_record("legacy-base")])
+            .unwrap();
+        let base_schema = base_batch.schema();
+        let base_reader = RecordBatchIterator::new(
+            vec![Ok::<RecordBatch, ArrowError>(base_batch)].into_iter(),
+            base_schema,
+        );
+        store.dataset.append(base_reader, None).await.unwrap();
 
         store.add(&[assistant_record("legacy-wal")]).await.unwrap();
         assert_eq!(flushed_generation_count(&store).await, 1);
         store.close().await.unwrap();
 
-        let claim_check_fields = rollout_schema()
-            .fields()
-            .iter()
-            .filter(|field| legacy_schema.field_with_name(field.name()).is_err())
-            .cloned()
-            .collect::<Vec<_>>();
-        store
-            .dataset
-            .add_columns(
-                NewColumnTransform::AllNulls(Arc::new(Schema::new(claim_check_fields))),
-                None,
-                None,
-            )
-            .await
-            .unwrap();
+        if evolve_base {
+            let claim_check_fields = rollout_schema()
+                .fields()
+                .iter()
+                .filter(|field| legacy_schema.field_with_name(field.name()).is_err())
+                .cloned()
+                .collect::<Vec<_>>();
+            store
+                .dataset
+                .add_columns(
+                    NewColumnTransform::AllNulls(Arc::new(Schema::new(claim_check_fields))),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
 
         (dir, store)
     }
@@ -3438,10 +3483,14 @@ mod tests {
     fn cleanup_merges_pre_claim_check_generations_after_schema_evolution() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let (_dir, mut store) = evolved_store_with_legacy_base_and_wal().await;
+            let (_dir, mut store) = store_with_legacy_base_and_wal(false).await;
 
             assert_eq!(store.cleanup_own_shard().await.unwrap(), 1);
             assert_eq!(flushed_generation_count(&store).await, 0);
+            let field_paths = store.dataset.schema().field_paths();
+            for column in CLAIM_CHECK_COLUMNS {
+                assert!(field_paths.iter().any(|path| path == column));
+            }
 
             let mut rows = store.list(None, None).await.unwrap();
             rows.sort_by(|left, right| left.id.cmp(&right.id));
@@ -3459,10 +3508,55 @@ mod tests {
     }
 
     #[test]
+    fn latest_schema_alignment_preserves_claim_check_values() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let legacy_dir = TempDir::new().unwrap();
+            let legacy_uri = legacy_dir.path().to_string_lossy().to_string();
+            create_empty_dataset(&legacy_uri, pre_claim_check_schema()).await;
+            let mut legacy_store = RolloutStore::open(&legacy_uri).await.unwrap();
+
+            let current_dir = TempDir::new().unwrap();
+            let current_uri = current_dir.path().to_string_lossy().to_string();
+            let current_store = RolloutStore::open(&current_uri).await.unwrap();
+            let mut record = assistant_record("current-generation");
+            record.model_input_string = Some("input".to_string());
+            record.model_output_string = Some("output".to_string());
+            record.rationale = Some("reason".to_string());
+            record.problem_text = Some("problem".to_string());
+            record.user_metadata = Some(r#"{"source":"worker"}"#.to_string());
+            let generation_batch = current_store.records_to_batch(&[record]).unwrap();
+
+            legacy_store.ensure_latest_rollout_schema().await.unwrap();
+            let merge_schema: Arc<Schema> = Arc::new(legacy_store.dataset.schema().into());
+            let aligned = align_batch_to_schema(generation_batch, merge_schema.clone()).unwrap();
+            let reader = RecordBatchIterator::new(
+                vec![Ok::<RecordBatch, ArrowError>(aligned)].into_iter(),
+                merge_schema,
+            );
+            legacy_store.dataset.append(reader, None).await.unwrap();
+
+            let merged = legacy_store
+                .get_by_id_source("current-generation", ListSource::Fragments)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(merged.model_input_string.as_deref(), Some("input"));
+            assert_eq!(merged.model_output_string.as_deref(), Some("output"));
+            assert_eq!(merged.rationale.as_deref(), Some("reason"));
+            assert_eq!(merged.problem_text.as_deref(), Some("problem"));
+            assert_eq!(
+                merged.user_metadata.as_deref(),
+                Some(r#"{"source":"worker"}"#)
+            );
+        });
+    }
+
+    #[test]
     fn get_by_id_reads_pre_claim_check_base_and_wal_after_schema_evolution() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let (_dir, store) = evolved_store_with_legacy_base_and_wal().await;
+            let (_dir, store) = store_with_legacy_base_and_wal(true).await;
 
             let mut base = store.get_by_id("legacy-base").await.unwrap().unwrap();
             let wal = store.get_by_id("legacy-wal").await.unwrap().unwrap();
