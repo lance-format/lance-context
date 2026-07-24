@@ -1104,3 +1104,59 @@ td .muted {
     grid-template-columns: 1fr;
   }
 }
+
+/* ---- SQL console -------------------------------------------------------- */
+
+.sql-bar {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+.sql-select {
+  height: 34px;
+  padding: 0 10px;
+  background: var(--bg-elev);
+  color: var(--text);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  font-size: 13px;
+  min-width: 220px;
+}
+
+.sql-editor {
+  width: 100%;
+  min-height: 140px;
+  resize: vertical;
+  padding: 12px 14px;
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.5;
+  box-shadow: var(--shadow);
+}
+
+.sql-editor:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.sql-hint {
+  margin: 8px 2px 0;
+  font-size: 12px;
+}
+
+.sql-hint code,
+.sql-meta code {
+  font-family: var(--mono);
+  color: var(--text);
+}
+
+.sql-meta {
+  margin: 16px 2px 8px;
+  font-size: 12px;
+}

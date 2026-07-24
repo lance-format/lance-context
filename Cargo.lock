@@ -5481,8 +5481,10 @@ version = "0.6.4"
 dependencies = [
  "arrow-array 58.3.0",
  "arrow-ipc 58.3.0",
+ "arrow-json 58.3.0",
  "arrow-schema 58.3.0",
  "chrono",
+ "datafusion 53.1.0",
  "futures",
  "lance 7.0.0",
  "lance-context-api",

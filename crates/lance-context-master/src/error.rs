@@ -18,6 +18,16 @@ impl MasterError {
     pub fn from_lance(err: lance::Error) -> Self {
         MasterError::Internal(err.to_string())
     }
+
+    /// Map a Lance error from a user-driven operation (e.g. an ad-hoc SQL
+    /// query): `InvalidInput` becomes a 400 so the caller sees their own
+    /// mistake, everything else stays a 500.
+    pub fn from_lance_user(err: lance::Error) -> Self {
+        match err {
+            lance::Error::InvalidInput { .. } => MasterError::InvalidRequest(err.to_string()),
+            other => MasterError::Internal(other.to_string()),
+        }
+    }
 }
 
 impl IntoResponse for MasterError {

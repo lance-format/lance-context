@@ -952,6 +952,27 @@ pub struct ExperimentRecordsResponse {
     pub source: String,
 }
 
+/// Body for a read-only SQL query against one experiment's rollout records.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SqlQueryRequest {
+    /// A single read-only `SELECT` statement. The records are exposed as a
+    /// table named `records`.
+    pub sql: String,
+}
+
+/// Result of a read-only SQL query: output columns plus JSON-encoded rows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SqlQueryResponse {
+    /// Output column names, in select order.
+    pub columns: Vec<String>,
+    /// Rows as JSON values (one inner vec per row, aligned to `columns`).
+    pub rows: Vec<Vec<serde_json::Value>>,
+    /// Number of rows returned in this response.
+    pub row_count: usize,
+    /// True when the result was capped at the server's row limit.
+    pub truncated: bool,
+}
+
 /// State of a manual or automatic compaction job for one experiment.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", tag = "state")]
