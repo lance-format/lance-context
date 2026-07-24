@@ -262,12 +262,8 @@ fn sql_batches_to_result(
         // re-key to a positional array so duplicate/expression column names are
         // preserved in select order.
         let mut writer = arrow_json::ArrayWriter::new(Vec::<u8>::new());
-        writer
-            .write(batch)
-            .map_err(|err| LanceError::from(ArrowError::from(err)))?;
-        writer
-            .finish()
-            .map_err(|err| LanceError::from(ArrowError::from(err)))?;
+        writer.write(batch).map_err(LanceError::from)?;
+        writer.finish().map_err(LanceError::from)?;
         let json_rows: Vec<serde_json::Map<String, serde_json::Value>> =
             serde_json::from_slice(&writer.into_inner()).map_err(|err| {
                 LanceError::from(ArrowError::InvalidArgumentError(err.to_string()))
@@ -4400,9 +4396,7 @@ mod tests {
     fn ensure_select_only_accepts_select_and_cte() {
         assert!(ensure_select_only("SELECT * FROM records").is_ok());
         assert!(ensure_select_only("  select id from records where reward > 0 ").is_ok());
-        assert!(
-            ensure_select_only("WITH t AS (SELECT id FROM records) SELECT * FROM t").is_ok()
-        );
+        assert!(ensure_select_only("WITH t AS (SELECT id FROM records) SELECT * FROM t").is_ok());
     }
 
     #[test]
@@ -4481,10 +4475,7 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let store = RolloutStore::open(&uri).await.unwrap();
-            let result = store
-                .query_sql("SELECT id FROM records")
-                .await
-                .unwrap();
+            let result = store.query_sql("SELECT id FROM records").await.unwrap();
             assert_eq!(result.columns, vec!["id".to_string()]);
             assert!(result.rows.is_empty());
             assert!(!result.truncated);
