@@ -12,8 +12,8 @@ use serde::Deserialize;
 
 use lance_context_api::{
     CompactJobStatus, EnqueueTaskRequest, ExperimentDetail, ExperimentListResponse,
-    ExperimentRecordsResponse, ExperimentSummary, TaskKind, TaskListResponse, TaskRecord,
-    TaskState,
+    ExperimentRecordsResponse, ExperimentSummary, SqlQueryRequest, SqlQueryResponse, TaskKind,
+    TaskListResponse, TaskRecord, TaskState,
 };
 use lance_context_core::{rollout_record_to_dto, ListSource, RolloutFilters, RolloutStore};
 use tokio::sync::RwLock;
@@ -195,6 +195,33 @@ pub async fn list_experiment_records(
         limit,
         offset: params.offset,
         source: list_source_label(source).to_string(),
+    }))
+}
+
+/// `POST /api/v1/experiments/{name}/query` — run a read-only `SELECT` against
+/// one experiment's rollout records (exposed as a table named `records`,
+/// merged base ∪ pending WAL view). Non-`SELECT` or malformed SQL returns 400.
+pub async fn query_experiment_sql(
+    State(state): State<Arc<MasterState>>,
+    Path(name): Path<String>,
+    Json(body): Json<SqlQueryRequest>,
+) -> Result<Json<SqlQueryResponse>, MasterError> {
+    let store = open_registered_store(&state, &name).await?;
+    let mut store = store.write().await;
+    store
+        .refresh_latest()
+        .await
+        .map_err(MasterError::from_lance)?;
+    let result = store
+        .query_sql(&body.sql)
+        .await
+        .map_err(MasterError::from_lance_user)?;
+    let row_count = result.rows.len();
+    Ok(Json(SqlQueryResponse {
+        columns: result.columns,
+        rows: result.rows,
+        row_count,
+        truncated: result.truncated,
     }))
 }
 
@@ -418,6 +445,7 @@ pub fn api_router() -> Router<Arc<MasterState>> {
         .route("/experiments", get(list_experiments))
         .route("/experiments/{name}", get(get_experiment))
         .route("/experiments/{name}/records", get(list_experiment_records))
+        .route("/experiments/{name}/query", post(query_experiment_sql))
         .route(
             "/experiments/{name}/records/{id}/blob",
             get(download_experiment_blob),
@@ -782,6 +810,65 @@ mod tests {
                 artifact_type: None,
                 include_in_training: None,
                 source: None,
+            }),
+        )
+        .await;
+        assert!(matches!(missing, Err(MasterError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn query_endpoint_runs_select_and_rejects_mutations() {
+        let dir = TempDir::new().unwrap();
+        let state = MasterState::new(test_config(&dir)).await.unwrap();
+        let uri = state.rollout_uri("records");
+        let mut store = RolloutStore::open(&uri).await.unwrap();
+        store
+            .add(&[
+                test_record("assistant-1", false),
+                test_record("artifact-1", true),
+            ])
+            .await
+            .unwrap();
+        state
+            .registry
+            .write()
+            .await
+            .upsert("records", &uri)
+            .await
+            .unwrap();
+
+        // A valid SELECT returns rows over the merged view.
+        let Json(result) = query_experiment_sql(
+            State(state.clone()),
+            Path("records".to_string()),
+            Json(SqlQueryRequest {
+                sql: "SELECT count(*) AS n FROM records".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.columns, vec!["n".to_string()]);
+        assert_eq!(result.row_count, 1);
+        assert!(!result.truncated);
+
+        // A mutation is rejected as a 400-class InvalidRequest.
+        let rejected = query_experiment_sql(
+            State(state.clone()),
+            Path("records".to_string()),
+            Json(SqlQueryRequest {
+                sql: "DROP TABLE records".to_string(),
+            }),
+        )
+        .await;
+        assert!(matches!(rejected, Err(MasterError::InvalidRequest(_))));
+
+        // Unknown experiment is a 404.
+        let missing = query_experiment_sql(
+            State(state),
+            Path("missing".to_string()),
+            Json(SqlQueryRequest {
+                sql: "SELECT 1".to_string(),
             }),
         )
         .await;

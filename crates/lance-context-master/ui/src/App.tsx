@@ -1,5 +1,11 @@
 import { useMutation, useQuery, useQueryClient, useIsFetching } from "@tanstack/react-query";
-import { Fragment, useEffect, useState, type FormEvent } from "react";
+import {
+  Fragment,
+  useEffect,
+  useState,
+  type FormEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
+} from "react";
 import {
   NavLink,
   Navigate,
@@ -16,12 +22,14 @@ import {
   listExperimentRecords,
   listExperiments,
   listTasks,
+  runSql,
   triggerCompaction,
   type CompactJobStatus,
   type ExperimentSummary,
   type RecordFilters,
   type RecordSource,
   type RolloutRecord,
+  type SqlQueryResponse,
   type TaskRecord,
   type TaskState,
 } from "./api";
@@ -977,6 +985,125 @@ function TaskQueue() {
 
 /* ---- app ----------------------------------------------------------------- */
 
+const SQL_PLACEHOLDER =
+  "SELECT problem_id, count(*) AS n\nFROM records\nGROUP BY problem_id\nORDER BY n DESC";
+
+/** Render one SQL result cell: objects/arrays as compact JSON, null as em dash. */
+function sqlCell(value: unknown): string {
+  if (value === null || value === undefined) return "—";
+  if (typeof value === "object") return JSON.stringify(value);
+  return String(value);
+}
+
+/** Read-only SQL console: pick an experiment, run a SELECT against `records`. */
+function SqlConsole() {
+  const experiments = useQuery({
+    queryKey: ["experiments", "sql-picker"],
+    queryFn: () => listExperiments("", 1000, 0),
+  });
+  const options = experiments.data?.experiments ?? [];
+
+  const [selected, setSelected] = useState("");
+  const [sql, setSql] = useState(SQL_PLACEHOLDER);
+
+  // Default the picker to the first experiment once the list loads.
+  useEffect(() => {
+    if (!selected && options.length > 0) setSelected(options[0].name);
+  }, [selected, options]);
+
+  const run = useMutation<SqlQueryResponse, Error>({
+    mutationFn: () => runSql(selected, sql),
+  });
+
+  const canRun = Boolean(selected) && sql.trim().length > 0 && !run.isPending;
+  const submit = () => {
+    if (canRun) run.mutate();
+  };
+  const onKeyDown = (e: ReactKeyboardEvent<HTMLTextAreaElement>) => {
+    if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+      e.preventDefault();
+      submit();
+    }
+  };
+
+  const result = run.data;
+
+  return (
+    <>
+      <div className="sql-bar">
+        <select
+          className="sql-select"
+          value={selected}
+          onChange={(e) => setSelected(e.target.value)}
+          disabled={experiments.isLoading}
+        >
+          {options.length === 0 && <option value="">No experiments</option>}
+          {options.map((exp) => (
+            <option key={exp.name} value={exp.name}>
+              {exp.name}
+            </option>
+          ))}
+        </select>
+        <button className="btn btn--accent" onClick={submit} disabled={!canRun}>
+          {run.isPending ? "Running…" : "Run ⌘⏎"}
+        </button>
+      </div>
+      <textarea
+        className="sql-editor"
+        value={sql}
+        spellCheck={false}
+        placeholder={SQL_PLACEHOLDER}
+        onChange={(e) => setSql(e.target.value)}
+        onKeyDown={onKeyDown}
+      />
+      <p className="sql-hint muted">
+        Read-only. Records are exposed as a table named{" "}
+        <code>records</code> (merged base + pending WAL view).
+      </p>
+
+      {run.isError && <div className="error">{String(run.error?.message ?? run.error)}</div>}
+
+      {result && (
+        <>
+          <div className="sql-meta muted">
+            {fmtInt(result.row_count)} row{result.row_count === 1 ? "" : "s"}
+            {result.truncated && " (truncated)"}
+          </div>
+          <div className="table-wrap">
+            {result.columns.length === 0 ? (
+              <div className="empty">Query returned no columns.</div>
+            ) : (
+              <table className="grid">
+                <thead>
+                  <tr>
+                    {result.columns.map((col) => (
+                      <th key={col}>{col}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {result.rows.map((row, ri) => (
+                    <tr key={ri}>
+                      {row.map((cell, ci) => (
+                        <td key={ci} className="muted">
+                          {sqlCell(cell)}
+                        </td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+            {result.rows.length === 0 && result.columns.length > 0 && (
+              <div className="empty">No rows.</div>
+            )}
+          </div>
+        </>
+      )}
+    </>
+  );
+}
+
 /** The experiments list view (stat strip + search + table + pager). The
  * experiment drawer is rendered by the route, layered on top of this list. */
 function ExperimentsList() {
@@ -1114,6 +1241,9 @@ function TopBar() {
         <NavLink to="/tasks" className={({ isActive }) => `tab ${isActive ? "tab--active" : ""}`}>
           Task Queue
         </NavLink>
+        <NavLink to="/sql" className={({ isActive }) => `tab ${isActive ? "tab--active" : ""}`}>
+          SQL
+        </NavLink>
       </nav>
       <div className="live">
         <span className="live__dot" />
@@ -1143,6 +1273,7 @@ export function App() {
           element={<ExperimentsRoute tab="records" />}
         />
         <Route path="/tasks" element={<TaskQueue />} />
+        <Route path="/sql" element={<SqlConsole />} />
         <Route path="*" element={<Navigate to="/experiments" replace />} />
       </Routes>
     </div>

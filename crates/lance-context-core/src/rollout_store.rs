@@ -58,8 +58,12 @@ use arrow_array::{
     Int64Array, Int8Array, LargeBinaryArray, LargeStringArray, ListArray, RecordBatch,
     RecordBatchIterator, StringArray, TimestampMicrosecondArray, UInt64Array,
 };
-use arrow_schema::{ArrowError, DataType, Field, Schema, TimeUnit};
+use arrow_schema::{ArrowError, DataType, Field, FieldRef, Schema, TimeUnit};
 use chrono::{DateTime, Utc};
+use datafusion::datasource::MemTable;
+use datafusion::prelude::SessionContext;
+use datafusion::sql::parser::{DFParser, Statement as DFStatement};
+use datafusion::sql::sqlparser::ast::Statement as SqlStatement;
 use futures::{stream, StreamExt, TryStreamExt};
 use lance::dataset::mem_wal::{
     DatasetMemWalExt, LsmScanner, ShardManifestStore, ShardSnapshot, ShardWriter, ShardWriterConfig,
@@ -196,6 +200,96 @@ impl RolloutFilters {
 pub struct RolloutPage {
     pub records: Vec<RolloutRecord>,
     pub has_more: bool,
+}
+
+/// Table name the ad-hoc SQL console binds an experiment's records to.
+pub const SQL_TABLE_NAME: &str = "records";
+
+/// Upper bound on rows materialized into the in-memory `records` table for an
+/// ad-hoc SQL query. Guards master memory against a huge experiment.
+pub const SQL_MAX_SCAN_ROWS: usize = 200_000;
+
+/// Upper bound on rows returned by an ad-hoc SQL query. Hitting it flags the
+/// result `truncated` rather than silently dropping rows.
+pub const SQL_MAX_RESULT_ROWS: usize = 10_000;
+
+/// Result of [`RolloutStore::query_sql`]: column names plus JSON-encoded rows.
+#[derive(Debug, Clone)]
+pub struct SqlQueryResult {
+    /// Output column names, in select order.
+    pub columns: Vec<String>,
+    /// Rows as JSON values (one inner vec per row, aligned to `columns`).
+    pub rows: Vec<Vec<serde_json::Value>>,
+    /// True when the result was capped at [`SQL_MAX_RESULT_ROWS`].
+    pub truncated: bool,
+}
+
+/// Reject anything that is not a single read-only `SELECT` (or CTE) statement.
+///
+/// Parsing with DataFusion's SQL parser is more robust than string matching:
+/// it rejects trailing/multiple statements, DML (`INSERT`/`UPDATE`/`DELETE`),
+/// DDL (`CREATE`/`DROP`/…), `COPY`, and `EXPLAIN ANALYZE` side effects. Because
+/// the console only registers one fixed in-memory table, there is no catalog
+/// surface to mutate even if a statement slipped through.
+fn ensure_select_only(sql: &str) -> LanceResult<()> {
+    let statements = DFParser::parse_sql(sql)
+        .map_err(|err| LanceError::invalid_input(format!("could not parse SQL: {err}")))?;
+    if statements.len() != 1 {
+        return Err(LanceError::invalid_input(
+            "exactly one SQL statement is allowed".to_string(),
+        ));
+    }
+    match &statements[0] {
+        DFStatement::Statement(stmt) if matches!(stmt.as_ref(), SqlStatement::Query(_)) => Ok(()),
+        _ => Err(LanceError::invalid_input(
+            "only read-only SELECT queries are allowed".to_string(),
+        )),
+    }
+}
+
+/// Convert DataFusion result batches into a JSON [`SqlQueryResult`], capping at
+/// [`SQL_MAX_RESULT_ROWS`] and flagging `truncated` when the cap is reached.
+/// `columns` is taken from the query plan schema so it is populated even for a
+/// zero-row result.
+fn sql_batches_to_result(
+    columns: Vec<String>,
+    batches: Vec<RecordBatch>,
+) -> LanceResult<SqlQueryResult> {
+    let mut rows: Vec<Vec<serde_json::Value>> = Vec::new();
+    let mut truncated = false;
+    'outer: for batch in &batches {
+        // arrow-json encodes each row as a JSON object keyed by column name;
+        // re-key to a positional array so duplicate/expression column names are
+        // preserved in select order.
+        let mut writer = arrow_json::ArrayWriter::new(Vec::<u8>::new());
+        writer
+            .write(batch)
+            .map_err(|err| LanceError::from(ArrowError::from(err)))?;
+        writer
+            .finish()
+            .map_err(|err| LanceError::from(ArrowError::from(err)))?;
+        let json_rows: Vec<serde_json::Map<String, serde_json::Value>> =
+            serde_json::from_slice(&writer.into_inner()).map_err(|err| {
+                LanceError::from(ArrowError::InvalidArgumentError(err.to_string()))
+            })?;
+        for obj in json_rows {
+            if rows.len() >= SQL_MAX_RESULT_ROWS {
+                truncated = true;
+                break 'outer;
+            }
+            let row = columns
+                .iter()
+                .map(|name| obj.get(name).cloned().unwrap_or(serde_json::Value::Null))
+                .collect();
+            rows.push(row);
+        }
+    }
+
+    Ok(SqlQueryResult {
+        columns,
+        rows,
+        truncated,
+    })
 }
 
 /// Which data source a rollout list scan reads.
@@ -1128,6 +1222,100 @@ impl RolloutStore {
             .filter_map(|id| records_by_id.remove(&id))
             .collect();
         Ok(RolloutPage { records, has_more })
+    }
+
+    /// Run a read-only `SELECT` against this experiment's rollout records.
+    ///
+    /// The merged view ([`ListSource::All`]: base table ∪ pending MemWAL
+    /// generations) is materialized into an in-memory table named `records`,
+    /// then queried with DataFusion. Only a single `SELECT`/CTE statement is
+    /// accepted — any DML/DDL/multi-statement input is rejected before
+    /// execution (see [`ensure_select_only`]). The `binary_payload` column is
+    /// excluded (blob bytes are fetched via [`Self::get_blob`]).
+    ///
+    /// Two bounds keep a query from exhausting master memory:
+    /// - [`SQL_MAX_SCAN_ROWS`] caps how many rows are materialized into the
+    ///   `records` table; exceeding it is a hard error asking the user to work
+    ///   on a smaller experiment.
+    /// - [`SQL_MAX_RESULT_ROWS`] caps returned rows; hitting it sets
+    ///   `truncated = true` rather than silently dropping rows.
+    ///
+    /// A syntactically invalid or non-`SELECT` query returns
+    /// [`LanceError::InvalidInput`] so callers can surface it as a 400.
+    pub async fn query_sql(&self, sql: &str) -> LanceResult<SqlQueryResult> {
+        ensure_select_only(sql)?;
+
+        // Materialize the merged (base ∪ WAL) non-blob rows, bounded.
+        let shard_snapshots = self.wal_shard_snapshots().await?;
+        let columns = self.non_blob_columns();
+        let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+        let scanner = self
+            .lsm_scanner_for_source(ListSource::All, shard_snapshots)
+            .project(&refs);
+        let mut stream = scanner.try_into_stream().await?;
+
+        let mut batches: Vec<RecordBatch> = Vec::new();
+        let mut scanned_rows = 0usize;
+        let mut table_schema: Option<Arc<Schema>> = None;
+        while let Some(batch) = stream.try_next().await? {
+            if table_schema.is_none() {
+                table_schema = Some(batch.schema());
+            }
+            scanned_rows += batch.num_rows();
+            if scanned_rows > SQL_MAX_SCAN_ROWS {
+                return Err(LanceError::invalid_input(format!(
+                    "experiment has more than {SQL_MAX_SCAN_ROWS} rows, which is too large \
+                     for ad-hoc SQL; use the record browser filters instead"
+                )));
+            }
+            batches.push(batch);
+        }
+
+        // Empty experiment: fall back to the projected dataset schema so
+        // `SELECT`s still resolve column names against an empty `records` table.
+        let schema = match table_schema {
+            Some(schema) => schema,
+            None => {
+                let full: Schema = self.dataset.schema().into();
+                let projected: Vec<FieldRef> = full
+                    .fields()
+                    .iter()
+                    .filter(|f| f.name() != "binary_payload")
+                    .cloned()
+                    .collect();
+                Arc::new(Schema::new(projected))
+            }
+        };
+
+        let ctx = SessionContext::new();
+        let provider = MemTable::try_new(schema, vec![batches])
+            .map_err(|err| LanceError::from(ArrowError::from_external_error(Box::new(err))))?;
+        ctx.register_table(SQL_TABLE_NAME, Arc::new(provider))
+            .map_err(|err| LanceError::from(ArrowError::from_external_error(Box::new(err))))?;
+
+        // DataFusion planning/exec errors (unknown column, bad function, …) are
+        // user errors → InvalidInput so the API returns 400, not 500.
+        let df = ctx
+            .sql(sql)
+            .await
+            .map_err(|err| LanceError::invalid_input(err.to_string()))?;
+        let df = df
+            .limit(0, Some(SQL_MAX_RESULT_ROWS + 1))
+            .map_err(|err| LanceError::invalid_input(err.to_string()))?;
+        // Capture the output columns from the plan schema so they are known even
+        // when the query returns zero rows.
+        let columns: Vec<String> = df
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        let result_batches = df
+            .collect()
+            .await
+            .map_err(|err| LanceError::invalid_input(err.to_string()))?;
+
+        sql_batches_to_result(columns, result_batches)
     }
 
     /// Retrieve a single rollout row by its unique id, including any freshly
@@ -4205,6 +4393,101 @@ mod tests {
 
             // Missing id: None, not an error.
             assert!(store.get_record_with_blob("nope").await.unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn ensure_select_only_accepts_select_and_cte() {
+        assert!(ensure_select_only("SELECT * FROM records").is_ok());
+        assert!(ensure_select_only("  select id from records where reward > 0 ").is_ok());
+        assert!(
+            ensure_select_only("WITH t AS (SELECT id FROM records) SELECT * FROM t").is_ok()
+        );
+    }
+
+    #[test]
+    fn ensure_select_only_rejects_mutations_and_multi_statements() {
+        for sql in [
+            "DELETE FROM records",
+            "UPDATE records SET reward = 1",
+            "INSERT INTO records (id) VALUES ('x')",
+            "DROP TABLE records",
+            "CREATE TABLE t (a INT)",
+            "SELECT 1; SELECT 2",
+            "not sql at all",
+        ] {
+            assert!(
+                ensure_select_only(sql).is_err(),
+                "expected rejection for: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn query_sql_runs_select_over_merged_records() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open(&uri).await.unwrap();
+            store
+                .add(&[
+                    assistant_record("a-0"),
+                    assistant_record("a-1"),
+                    assistant_record("a-2"),
+                ])
+                .await
+                .unwrap();
+
+            // Aggregate over the merged (base + pending WAL) view.
+            let result = store
+                .query_sql("SELECT count(*) AS n FROM records")
+                .await
+                .unwrap();
+            assert_eq!(result.columns, vec!["n".to_string()]);
+            assert_eq!(result.rows.len(), 1);
+            assert_eq!(result.rows[0][0], serde_json::json!(3));
+            assert!(!result.truncated);
+
+            // GROUP BY on a real column returns the expected shape.
+            let grouped = store
+                .query_sql("SELECT role, count(*) AS n FROM records GROUP BY role")
+                .await
+                .unwrap();
+            assert_eq!(grouped.columns, vec!["role".to_string(), "n".to_string()]);
+            assert_eq!(grouped.rows.len(), 1);
+            assert_eq!(grouped.rows[0][0], serde_json::json!(ROLE_ASSISTANT));
+            assert_eq!(grouped.rows[0][1], serde_json::json!(3));
+
+            // The blob column is not exposed to SQL.
+            let err = store
+                .query_sql("SELECT binary_payload FROM records")
+                .await
+                .unwrap_err();
+            assert!(matches!(err, LanceError::InvalidInput { .. }));
+
+            // A non-SELECT is rejected as invalid input (→ 400 at the API).
+            let rejected = store.query_sql("DELETE FROM records").await.unwrap_err();
+            assert!(matches!(rejected, LanceError::InvalidInput { .. }));
+        });
+    }
+
+    #[test]
+    fn query_sql_on_empty_experiment_returns_zero_rows() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let store = RolloutStore::open(&uri).await.unwrap();
+            let result = store
+                .query_sql("SELECT id FROM records")
+                .await
+                .unwrap();
+            assert_eq!(result.columns, vec!["id".to_string()]);
+            assert!(result.rows.is_empty());
+            assert!(!result.truncated);
         });
     }
 }

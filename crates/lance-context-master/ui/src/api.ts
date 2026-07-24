@@ -189,6 +189,27 @@ export async function getTask(id: string): Promise<TaskRecord> {
   return json(await fetch(`${API}/tasks/${encodeURIComponent(id)}`));
 }
 
+export interface SqlQueryResponse {
+  columns: string[];
+  rows: unknown[][];
+  row_count: number;
+  truncated: boolean;
+}
+
+/** Run a read-only SELECT against one experiment's records (table: `records`). */
+export async function runSql(
+  name: string,
+  sql: string,
+): Promise<SqlQueryResponse> {
+  return json(
+    await fetch(`${API}/experiments/${encodeURIComponent(name)}/query`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sql }),
+    }),
+  );
+}
+
 export async function enqueueTask(req: EnqueueTaskRequest): Promise<TaskRecord> {
   return json(
     await fetch(`${API}/tasks`, {
