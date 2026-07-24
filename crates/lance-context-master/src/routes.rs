@@ -42,6 +42,15 @@ fn default_records_limit() -> usize {
     25
 }
 
+/// Query params for the paginated task list.
+#[derive(Debug, Deserialize)]
+pub struct TaskListParams {
+    #[serde(default = "default_limit")]
+    pub limit: usize,
+    #[serde(default)]
+    pub offset: usize,
+}
+
 /// Query params for the detail endpoint.
 #[derive(Debug, Deserialize)]
 pub struct DetailParams {
@@ -410,9 +419,10 @@ pub async fn enqueue_task(
     Ok((StatusCode::ACCEPTED, Json(task)))
 }
 
-/// `GET /api/v1/tasks` — all tasks (queue + recent history), newest first.
+/// `GET /api/v1/tasks` — paginated tasks (queue + recent history), newest first.
 pub async fn list_tasks(
     State(state): State<Arc<MasterState>>,
+    Query(params): Query<TaskListParams>,
 ) -> Result<Json<TaskListResponse>, MasterError> {
     let mut tasks = state
         .task_store
@@ -420,7 +430,15 @@ pub async fn list_tasks(
         .await
         .map_err(MasterError::from_lance)?;
     tasks.sort_by_key(|t| std::cmp::Reverse(t.enqueued_at));
-    Ok(Json(TaskListResponse { tasks }))
+    let total = tasks.len();
+    let limit = params.limit.clamp(1, 200);
+    let page = tasks.into_iter().skip(params.offset).take(limit).collect();
+    Ok(Json(TaskListResponse {
+        tasks: page,
+        total,
+        limit,
+        offset: params.offset,
+    }))
 }
 
 /// `GET /api/v1/tasks/{id}` — a single task by id.
@@ -536,6 +554,7 @@ mod tests {
             etcd_client_key: None,
             etcd_lease_ttl_secs: 5,
             task_history_limit: 1_000,
+            task_history_ttl_secs: 86_400,
             ui_dir: None,
         }
     }

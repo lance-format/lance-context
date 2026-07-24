@@ -931,19 +931,24 @@ function IndexIdButton({ name }: { name: string }) {
 }
 
 function TaskQueue() {
+  const [page, setPage] = useState(0);
+  const pageSize = 50;
   const tasks = useQuery({
-    queryKey: ["tasks"],
-    queryFn: () => listTasks(),
+    queryKey: ["tasks", page],
+    queryFn: () => listTasks(pageSize, page * pageSize),
     refetchInterval: 1000,
+    placeholderData: (prev) => prev,
   });
   const rows = tasks.data?.tasks ?? [];
+  const total = tasks.data?.total ?? 0;
   const active = rows.filter((t) => t.state === "queued" || t.state === "running").length;
+  const hasMore = (page + 1) * pageSize < total;
 
   return (
     <>
       <div className="stats">
-        <StatCard label="Tasks" value={fmtInt(rows.length)} />
-        <StatCard label="Active" value={fmtInt(active)} />
+        <StatCard label="Tasks" value={fmtInt(total)} />
+        <StatCard label="Active (page)" value={fmtInt(active)} />
       </div>
       <div className="table-wrap">
         {tasks.isError && <div className="error">{String(tasks.error)}</div>}
@@ -979,6 +984,17 @@ function TaskQueue() {
           <div className="empty">No tasks in the queue.</div>
         )}
       </div>
+      {(page > 0 || hasMore) && (
+        <div className="pager records-pager">
+          <span className="pager__info">page {page + 1}</span>
+          <button className="btn btn--ghost" disabled={page === 0} onClick={() => setPage(page - 1)}>
+            ← Prev
+          </button>
+          <button className="btn btn--ghost" disabled={!hasMore} onClick={() => setPage(page + 1)}>
+            Next →
+          </button>
+        </div>
+      )}
     </>
   );
 }

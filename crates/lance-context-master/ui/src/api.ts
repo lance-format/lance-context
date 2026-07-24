@@ -104,6 +104,9 @@ export interface TaskRecord {
 
 export interface TaskListResponse {
   tasks: TaskRecord[];
+  total: number;
+  limit: number;
+  offset: number;
 }
 
 export interface EnqueueTaskRequest {
@@ -181,8 +184,14 @@ export async function compactionStatus(name: string): Promise<CompactJobStatus> 
   );
 }
 
-export async function listTasks(): Promise<TaskListResponse> {
-  return json(await fetch(`${API}/tasks`));
+export async function listTasks(
+  limit = 50,
+  offset = 0,
+): Promise<TaskListResponse> {
+  const params = new URLSearchParams();
+  params.set("limit", String(limit));
+  params.set("offset", String(offset));
+  return json(await fetch(`${API}/tasks?${params.toString()}`));
 }
 
 export async function getTask(id: string): Promise<TaskRecord> {

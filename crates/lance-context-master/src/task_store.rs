@@ -29,6 +29,7 @@ const TASK_POLL_BATCH: usize = 256;
 pub struct TaskStore {
     inner: Arc<EtcdTaskStore>,
     history_limit: usize,
+    history_ttl_secs: u64,
 }
 
 struct EtcdTaskStore {
@@ -80,6 +81,7 @@ impl TaskStore {
         let store = Self {
             inner: Arc::new(EtcdTaskStore::connect(config).await?),
             history_limit: config.task_history_limit.max(1),
+            history_ttl_secs: config.task_history_ttl_secs,
         };
         store.recover_orphaned().await?;
         store.prune_terminal_history().await?;
@@ -171,29 +173,57 @@ impl TaskStore {
 
     async fn prune_terminal_history(&self) -> lance::Result<usize> {
         let tasks = self.list().await?;
-        let protected = tasks
-            .iter()
-            .filter(|task| matches!(task.state, TaskState::Queued | TaskState::Running))
-            .flat_map(|task| task.depends_on.iter().cloned())
-            .collect::<HashSet<_>>();
-        let mut terminal = tasks
-            .into_iter()
-            .filter(|task| matches!(task.state, TaskState::Done | TaskState::Failed))
-            .filter(|task| !protected.contains(&task.id))
-            .collect::<Vec<_>>();
-        terminal
-            .sort_by_key(|task| std::cmp::Reverse(task.finished_at.unwrap_or(task.enqueued_at)));
-        let ids = terminal
-            .into_iter()
-            .skip(self.history_limit)
-            .map(|task| task.id)
-            .collect::<Vec<_>>();
+        let ttl_cutoff = if self.history_ttl_secs > 0 {
+            Some(now_ms() - (self.history_ttl_secs as i64) * 1_000)
+        } else {
+            None
+        };
+        let ids = prunable_terminal_ids(tasks, self.history_limit, ttl_cutoff);
         if ids.is_empty() {
             return Ok(0);
         }
         self.inner.delete_many(&ids).await?;
         Ok(ids.len())
     }
+}
+
+/// Select terminal (Done/Failed) task ids to prune under two independent
+/// policies, whichever removes a task first:
+/// - **count**: keep only the newest `history_limit` terminal tasks;
+/// - **age (TTL)**: when `ttl_cutoff` is `Some`, drop terminal tasks whose
+///   `finished_at` (fallback `enqueued_at`) is at or before the cutoff.
+///
+/// Queued/Running tasks, and any terminal task a live (Queued/Running) task
+/// still lists in `depends_on`, are never selected regardless of age or count.
+/// Pure and etcd-free so the policy is unit-testable.
+fn prunable_terminal_ids(
+    tasks: Vec<TaskRecord>,
+    history_limit: usize,
+    ttl_cutoff: Option<i64>,
+) -> Vec<String> {
+    let protected = tasks
+        .iter()
+        .filter(|task| matches!(task.state, TaskState::Queued | TaskState::Running))
+        .flat_map(|task| task.depends_on.iter().cloned())
+        .collect::<HashSet<_>>();
+    let mut terminal = tasks
+        .into_iter()
+        .filter(|task| matches!(task.state, TaskState::Done | TaskState::Failed))
+        .filter(|task| !protected.contains(&task.id))
+        .collect::<Vec<_>>();
+    // Newest first, so rank >= history_limit are the ones over the count cap.
+    terminal.sort_by_key(|task| std::cmp::Reverse(task.finished_at.unwrap_or(task.enqueued_at)));
+    terminal
+        .into_iter()
+        .enumerate()
+        .filter(|(rank, task)| {
+            let over_count = *rank >= history_limit;
+            let expired = ttl_cutoff
+                .is_some_and(|cutoff| task.finished_at.unwrap_or(task.enqueued_at) <= cutoff);
+            over_count || expired
+        })
+        .map(|(_, task)| task.id)
+        .collect()
 }
 
 impl EtcdTaskStore {
@@ -896,6 +926,7 @@ mod tests {
             etcd_client_key: None,
             etcd_lease_ttl_secs: 30,
             task_history_limit: 1_000,
+            task_history_ttl_secs: 86_400,
             ui_dir: None,
         }
     }
@@ -908,6 +939,73 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("ETCD_ENDPOINTS is required"));
+    }
+
+    fn terminal_task(id: &str, state: TaskState, finished_at: i64) -> TaskRecord {
+        TaskRecord {
+            id: id.to_string(),
+            kind: TaskKind::Compact,
+            target: "exp".to_string(),
+            state,
+            error: None,
+            detail: None,
+            enqueued_at: finished_at,
+            started_at: Some(finished_at),
+            finished_at: Some(finished_at),
+            depends_on: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn prune_keeps_newest_over_count_cap() {
+        // 5 terminal tasks, cap 2, TTL disabled → oldest 3 pruned.
+        let tasks = (0..5)
+            .map(|i| terminal_task(&format!("t{i}"), TaskState::Done, 1_000 + i * 10))
+            .collect::<Vec<_>>();
+        let mut pruned = prunable_terminal_ids(tasks, 2, None);
+        pruned.sort();
+        assert_eq!(pruned, vec!["t0", "t1", "t2"]);
+    }
+
+    #[test]
+    fn prune_expires_by_ttl_cutoff() {
+        // High count cap so only the TTL policy fires.
+        let tasks = vec![
+            terminal_task("old-1", TaskState::Done, 100),
+            terminal_task("old-2", TaskState::Failed, 200),
+            terminal_task("fresh", TaskState::Done, 5_000),
+        ];
+        let mut pruned = prunable_terminal_ids(tasks, 1_000, Some(1_000));
+        pruned.sort();
+        assert_eq!(pruned, vec!["old-1", "old-2"]);
+    }
+
+    #[test]
+    fn prune_never_touches_active_or_depended_on() {
+        // A queued task depends on a terminal one that is otherwise TTL-expired;
+        // that dependency must be protected. Queued/Running are never terminal
+        // candidates in the first place.
+        let mut dep = terminal_task("dep", TaskState::Done, 100);
+        dep.id = "dep".to_string();
+        let mut queued = terminal_task("live", TaskState::Queued, 100);
+        queued.depends_on = vec!["dep".to_string()];
+        let expired = terminal_task("expired", TaskState::Done, 100);
+        let tasks = vec![dep, queued, expired];
+
+        let pruned = prunable_terminal_ids(tasks, 0, Some(1_000));
+        // `dep` protected by the live task; `live` is Queued (not terminal);
+        // only the unreferenced expired terminal task is pruned.
+        assert_eq!(pruned, vec!["expired"]);
+    }
+
+    #[test]
+    fn prune_ttl_disabled_uses_count_only() {
+        let tasks = vec![
+            terminal_task("a", TaskState::Done, 1),
+            terminal_task("b", TaskState::Done, 2),
+        ];
+        // TTL None + generous cap → nothing pruned even though timestamps are old.
+        assert!(prunable_terminal_ids(tasks, 10, None).is_empty());
     }
 
     #[tokio::test]
