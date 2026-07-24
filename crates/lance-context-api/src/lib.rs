@@ -1070,10 +1070,14 @@ pub struct EnqueueTaskRequest {
     pub depends_on: Vec<String>,
 }
 
-/// Response for `GET /api/v1/tasks`.
+/// Response for `GET /api/v1/tasks`. Paginated newest-first.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskListResponse {
     pub tasks: Vec<TaskRecord>,
+    /// Total number of tasks (queue + retained history) before paging.
+    pub total: usize,
+    pub limit: usize,
+    pub offset: usize,
 }
 
 #[cfg(test)]

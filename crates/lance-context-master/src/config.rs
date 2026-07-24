@@ -110,6 +110,14 @@ pub struct MasterConfig {
     #[arg(long, env = "TASK_HISTORY_LIMIT", default_value_t = 1_000)]
     pub task_history_limit: usize,
 
+    /// Maximum age of terminal (Done/Failed) scheduler tasks before they are
+    /// pruned, in seconds. `0` disables age-based pruning (the count cap in
+    /// `TASK_HISTORY_LIMIT` still applies). Whichever of the two removes a task
+    /// first wins. Queued/running tasks and terminal tasks that a live task
+    /// still depends on are never pruned regardless of age.
+    #[arg(long, env = "TASK_HISTORY_TTL_SECS", default_value_t = 86_400)]
+    pub task_history_ttl_secs: u64,
+
     /// Directory of built UI assets to serve. When unset, only the JSON API is
     /// exposed.
     #[arg(long, env = "UI_DIR")]

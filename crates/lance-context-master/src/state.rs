@@ -149,6 +149,7 @@ mod tests {
             etcd_client_key: None,
             etcd_lease_ttl_secs: 5,
             task_history_limit: 1_000,
+            task_history_ttl_secs: 86_400,
             ui_dir: None,
         }
     }
