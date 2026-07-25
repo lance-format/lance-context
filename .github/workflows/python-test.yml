@@ -162,7 +162,14 @@ jobs:
         working-directory: python
         run: |
           source .venv/bin/activate
-          python -m doctest python/lance_context/__init__.py
+          # Import as a module, not a file path: `python -m doctest <path>`
+          # imports by filename, which breaks the package-relative imports in
+          # __init__.py. Runs against the installed wheel and fails on any
+          # failing doctest.
+          python -c "import doctest, sys, lance_context; \
+            r = doctest.testmod(lance_context); \
+            print(r); \
+            sys.exit(1 if r.failed else 0)"
 
   lint:
     runs-on: ubuntu-24.04
