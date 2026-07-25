@@ -73,6 +73,23 @@ fn content_length(headers: &header::HeaderMap) -> usize {
         .unwrap_or(0)
 }
 
+/// Whether the request asked for a synchronous flush via `?flush=true`.
+///
+/// Accepts `flush=true` or a bare `flush`; anything else (including
+/// `flush=false`) leaves the default asynchronous-visibility behavior. Parsed
+/// by hand because [`add_rollouts`] consumes the whole `Request` to dispatch on
+/// `Content-Type` and so cannot also use a `Query` extractor.
+fn flush_requested(query: Option<&str>) -> bool {
+    let Some(query) = query else {
+        return false;
+    };
+    query.split('&').any(|pair| match pair.split_once('=') {
+        Some(("flush", value)) => value.eq_ignore_ascii_case("true") || value == "1",
+        None => pair == "flush",
+        _ => false,
+    })
+}
+
 /// Reserve `bytes` from the instance's in-flight blob budget (if configured),
 /// returning the RAII guard to hold for the request's duration. Returns
 /// `503 Overloaded` when the budget cannot currently admit the request. When no
@@ -224,6 +241,16 @@ pub async fn delete_rollout_store(
 /// record, a duplicate index, a byte length disagreeing with the record's
 /// `payload_size`, or a record that declares `payload_size` yet receives no
 /// bytes rejects the whole request with `400` before anything is written.
+///
+/// # Visibility
+///
+/// By default the append is **durable but not yet readable**: `add` persists
+/// the WAL entry and returns, and the row becomes visible once the server's
+/// flush sweeper seals the memtable (`ROLLOUT_FLUSH_INTERVAL_SECS`, default
+/// 30s). Callers that must read their own write — a training loop verifying a
+/// trajectory, a write-then-assert test — can pass `?flush=true` to seal before
+/// responding, trading latency for immediate visibility. See
+/// [`RolloutStore::add`] for the full contract.
 pub async fn add_rollouts(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -235,6 +262,10 @@ pub async fn add_rollouts(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("")
         .to_string();
+
+    // Parsed from the URI rather than a `Query` extractor because this handler
+    // consumes the whole `Request` to dispatch on Content-Type.
+    let flush = flush_requested(req.uri().query());
 
     // Admit against the in-flight blob budget before buffering the body, using
     // the declared Content-Length as the reservation size. Held for the whole
@@ -283,6 +314,14 @@ pub async fn add_rollouts(
         .add(&core_records)
         .await
         .map_err(AppError::from_lance)?;
+
+    // Opt-in read-your-write: seal the memtable so the rows just appended are
+    // readable by the time this responds. Still the read lock — `flush` is
+    // `&self`, and concurrent appends are safe against it.
+    if flush {
+        store.flush().await.map_err(AppError::from_lance)?;
+        metrics::counter!("rollout_appends_flushed_total").increment(1);
+    }
 
     metrics::counter!("rollout_appends_total").increment(1);
     metrics::counter!("rollout_records_appended_total").increment(count as u64);
@@ -709,6 +748,27 @@ mod tests {
     use super::*;
     use crate::state::AppState;
 
+    #[test]
+    fn flush_query_param_is_parsed_conservatively() {
+        // Opt-in only: the default (and any non-affirmative spelling) must keep
+        // the asynchronous-visibility fast path, so a typo cannot silently make
+        // every append pay a seal.
+        assert!(flush_requested(Some("flush=true")));
+        assert!(flush_requested(Some("flush=TRUE")));
+        assert!(flush_requested(Some("flush=1")));
+        assert!(flush_requested(Some("flush")));
+        assert!(flush_requested(Some("other=x&flush=true")));
+
+        assert!(!flush_requested(None));
+        assert!(!flush_requested(Some("")));
+        assert!(!flush_requested(Some("flush=false")));
+        assert!(!flush_requested(Some("flush=0")));
+        assert!(!flush_requested(Some("flush=yes")));
+        // Must not match on a different key that merely contains "flush".
+        assert!(!flush_requested(Some("noflush=true")));
+        assert!(!flush_requested(Some("flushed=true")));
+    }
+
     #[tokio::test]
     async fn blob_stream_body_reassembles_across_chunk_boundaries() {
         // A payload spanning several BLOB_STREAM_CHUNK_BYTES frames must
@@ -752,6 +812,77 @@ mod tests {
         .await
         .expect("create rollout store");
         (state, dir)
+    }
+
+    /// Build a JSON append request for `add_rollouts`, with an optional query.
+    fn append_request(query: &str, id: &str) -> Request {
+        let body = serde_json::json!({
+            "records": [{
+                "id": id,
+                "rollout_id": "r-1",
+                "problem_id": "p-1",
+                "sequence_order": 0,
+                "role": "assistant",
+                "content": "hello",
+                "content_type": "text/plain",
+            }]
+        });
+        Request::builder()
+            .method("POST")
+            .uri(format!("/rollouts/rl/records{query}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn flush_true_gives_read_your_write_and_default_does_not() {
+        // End-to-end contract for `?flush=true`. The default path is durable but
+        // asynchronously visible (the flush sweeper is not running in this test,
+        // so an unflushed row stays invisible indefinitely) while the opt-in must
+        // make the row readable by the time the response is returned.
+        let (state, _dir) = rollout_state().await;
+
+        // Default: durable, not visible.
+        let (status, _resp) = add_rollouts(
+            State(state.clone()),
+            Path("rl".to_string()),
+            append_request("", "async-0"),
+        )
+        .await
+        .expect("append succeeds");
+        assert_eq!(status, StatusCode::CREATED);
+
+        let store = state.get_or_open_rollout_store("rl").await.unwrap();
+        assert!(
+            store
+                .read()
+                .await
+                .list(None, None)
+                .await
+                .unwrap()
+                .is_empty(),
+            "default append must not seal; visibility is the sweeper's job"
+        );
+
+        // Opt-in: visible on return.
+        let (status, _resp) = add_rollouts(
+            State(state.clone()),
+            Path("rl".to_string()),
+            append_request("?flush=true", "sync-0"),
+        )
+        .await
+        .expect("append with flush succeeds");
+        assert_eq!(status, StatusCode::CREATED);
+
+        let seen = store.read().await.list(None, None).await.unwrap();
+        let ids: Vec<&str> = seen.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            ids.contains(&"sync-0"),
+            "?flush=true must make the row readable before responding, got {ids:?}"
+        );
+        // The flush also seals the earlier append that shared the memtable.
+        assert!(ids.contains(&"async-0"));
     }
 
     #[tokio::test]
