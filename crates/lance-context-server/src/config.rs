@@ -82,6 +82,23 @@ pub struct ServerConfig {
     /// `0` (the default) disables the budget.
     #[arg(long, env = "ROLLOUT_MAX_INFLIGHT_BLOB_BYTES", default_value = "0")]
     pub rollout_max_inflight_blob_bytes: usize,
+
+    /// Total byte budget for the Lance metadata/index caches, shared across
+    /// **all** resident rollout stores on this instance.
+    ///
+    /// Every rollout store opens a Lance dataset; without an explicit session
+    /// Lance gives each store its own caches defaulting to **6 GiB index + 1 GiB
+    /// metadata**, keyed by dataset URI. Because each flushed MemWAL generation
+    /// is a distinct URI, a busy store's read path feeds an ever-growing key set
+    /// into that per-store cache until it approaches 6 GiB — worker RSS then
+    /// grows linearly with cumulative appends and never releases across
+    /// merge/compact cycles. Attaching one shared, capacity-bounded session caps
+    /// the process's *total* Lance cache at this budget instead of 6 GiB per
+    /// store. Split internally 6:1 (index:metadata), matching Lance's own
+    /// default ratio. `0` disables sharing and restores Lance's per-store
+    /// default session (the pre-fix, leak-prone behavior).
+    #[arg(long, env = "ROLLOUT_CACHE_BYTES", default_value = "2147483648")]
+    pub rollout_cache_bytes: usize,
 }
 
 impl ServerConfig {
