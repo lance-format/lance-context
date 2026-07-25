@@ -521,21 +521,34 @@ impl RolloutStore {
     ///
     /// The write is routed to the shard derived from the configured
     /// `shard_id`, so concurrent appends from other server instances (each
-    /// owning a distinct shard) never contend. Each append is sealed and its
-    /// flushed generation committed to the shard manifest before returning, so
-    /// the rows are immediately visible to reads on **any** instance — reads
-    /// rebuild their view from the shard manifests on object storage (see
-    /// [`Self::lsm_scanner`]).
+    /// owning a distinct shard) never contend.
     ///
-    /// Unlike the previous close-per-append path, this reuses a single resident
-    /// [`ShardWriter`] (see [`Self::ensure_write_writer`]): the shard epoch is
-    /// claimed once and the object-store connection is pooled, so an append no
-    /// longer pays a cold DNS resolution + TCP/TLS handshake + epoch claim every
-    /// time. The per-append work is `put` (WAL-durable) → `force_seal_active`
-    /// (freeze this append's memtable) → `wait_for_flush_drain` (await the
-    /// generation's manifest commit), which keeps the same cross-instance
-    /// read-after-write visibility while dropping the per-append connection
-    /// churn that dominated latency.
+    /// # Durable on return, *not* visible on return
+    ///
+    /// The only per-append work is `put`, which returns once the WAL entry has
+    /// been PUT to object storage. The rows are then **durable** — they survive
+    /// a crash and are replayed on reopen — but they are **not yet readable**,
+    /// by this instance or any other. A row becomes visible only after its
+    /// memtable is sealed into a flushed generation and committed to the shard
+    /// manifest, which happens in [`Self::flush`] (also performed by
+    /// [`Self::close`], and by the merge path via its internal close).
+    ///
+    /// Callers therefore get **no read-your-write guarantee**. In the server the
+    /// gap is bounded by the periodic flush sweeper's interval
+    /// (`ROLLOUT_FLUSH_INTERVAL_SECS`, default 30s); a caller that needs the row
+    /// readable immediately must `add(..).await` then `flush().await`.
+    ///
+    /// This decoupling is deliberate: sealing on the append path serialized
+    /// concurrent appends behind one seal+drain. Keeping only the durable `put`
+    /// here lets appends run concurrently, and reuses a single resident
+    /// [`ShardWriter`] (see [`Self::resident_writer`]) so the shard epoch is
+    /// claimed once and the object-store connection is pooled, rather than
+    /// paying a cold DNS resolution + TCP/TLS handshake + epoch claim per
+    /// append.
+    ///
+    /// Note that because visibility is asynchronous,
+    /// [`RolloutObservation::row_count`] does not count rows that are durable
+    /// but not yet flushed.
     ///
     /// The returned value is the base dataset version, which MemWAL appends do
     /// **not** advance; it is retained for API compatibility, not as a per-append
