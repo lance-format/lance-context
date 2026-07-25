@@ -117,6 +117,13 @@ const ROLLOUT_ID_INDEX_NAME: &str = "id_idx";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RolloutObservation {
     /// Logical row count across the base table and every flushed MemWAL shard.
+    ///
+    /// **Excludes rows that are durable but not yet flushed.** An `add` returns
+    /// once the WAL entry is persisted; the row only reaches a flushed
+    /// generation when the memtable is sealed. In steady state this count
+    /// therefore lags recent writes by up to the flush interval. Use
+    /// [`Self::unflushed_rows`] to see the gap, or `row_count +
+    /// unflushed_rows` for every row this instance has durably accepted.
     pub row_count: i64,
     /// Number of fragments in the base table.
     pub fragment_count: i64,
@@ -126,6 +133,18 @@ pub struct RolloutObservation {
     pub last_updated: i64,
     /// Flushed MemWAL generations pending merge across all shards.
     pub pending_wal_generations: i64,
+    /// Rows durably accepted by *this instance's* resident writer but not yet
+    /// sealed into a flushed generation, and so not yet counted by
+    /// [`Self::row_count`] or visible to any reader.
+    ///
+    /// Instance-local by nature: it reads this process's in-memory writer, so
+    /// it cannot see another instance's unflushed memtable. `0` when no writer
+    /// is resident (nothing buffered) — which is also the steady state right
+    /// after a flush.
+    ///
+    /// A persistently non-zero value means the flush sweeper is not keeping up
+    /// (or is disabled); that is the signal that reads are lagging writes.
+    pub unflushed_rows: i64,
 }
 
 /// Exact-match filters for rollout record browsing.
@@ -550,9 +569,15 @@ impl RolloutStore {
     /// [`RolloutObservation::row_count`] does not count rows that are durable
     /// but not yet flushed.
     ///
-    /// The returned value is the base dataset version, which MemWAL appends do
-    /// **not** advance; it is retained for API compatibility, not as a per-append
-    /// snapshot handle (see the module docs on reproducibility).
+    /// # The return value carries no information about this append
+    ///
+    /// It is the base dataset version, which MemWAL appends do **not** advance,
+    /// so it is a constant unrelated to the rows just written — the same value
+    /// before and after. It does not identify a snapshot containing them, and
+    /// (since the seal moved off this path) it does not indicate they are
+    /// visible either. Do not treat it as a write handle or use it to poll for
+    /// visibility; call [`Self::flush`] instead. Retained only for API
+    /// compatibility — see the module docs on reproducibility.
     pub async fn add(&self, records: &[RolloutRecord]) -> LanceResult<u64> {
         if records.is_empty() {
             return Ok(self.dataset.manifest.version);
@@ -1120,7 +1145,30 @@ impl RolloutStore {
             version,
             last_updated,
             pending_wal_generations,
+            unflushed_rows: self.unflushed_rows().await,
         })
+    }
+
+    /// Rows buffered in this instance's resident writer that have not yet been
+    /// sealed into a flushed generation.
+    ///
+    /// Best-effort and non-failing: no resident writer (nothing buffered), a
+    /// WAL-only writer with no memtable, or a fenced writer all report `0`
+    /// rather than erroring, so an observability read never fails because of
+    /// writer state. See [`RolloutObservation::unflushed_rows`].
+    async fn unflushed_rows(&self) -> i64 {
+        let writer = {
+            let guard = self.write_writer.lock().await;
+            guard.as_ref().cloned()
+        };
+        let Some(writer) = writer else {
+            return 0;
+        };
+        writer
+            .memtable_stats()
+            .await
+            .map(|stats| stats.row_count as i64)
+            .unwrap_or(0)
     }
 
     /// Current compaction statistics for the base table.
@@ -3211,6 +3259,55 @@ mod tests {
                 }
             }
             assert_eq!(seen, 1, "Drop must seal the memtable of an evicted store");
+        });
+    }
+
+    #[test]
+    fn observe_reports_unflushed_rows_excluded_from_row_count() {
+        // `row_count` counts base ∪ flushed generations, so durable-but-unsealed
+        // rows are invisible to it. That undercount is inherent to the async
+        // flush design; `unflushed_rows` is what makes it observable, and
+        // `row_count + unflushed_rows` is every row durably accepted.
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let store = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    storage_options: None,
+                    session: None,
+                    shard_id: Some("observe-0".to_string()),
+                    merge_after_generations: None,
+                },
+            )
+            .await
+            .unwrap();
+
+            // No writer resident yet: nothing buffered.
+            assert_eq!(store.observe().await.unwrap().unflushed_rows, 0);
+
+            store
+                .add(&[assistant_record("o-0"), assistant_record("o-1")])
+                .await
+                .unwrap();
+
+            let obs = store.observe().await.unwrap();
+            assert_eq!(obs.row_count, 0, "row_count must not count unsealed rows");
+            assert_eq!(
+                obs.unflushed_rows, 2,
+                "the durable-but-invisible rows must be observable"
+            );
+
+            store.flush().await.unwrap();
+
+            let obs = store.observe().await.unwrap();
+            assert_eq!(obs.row_count, 2, "flushed rows join row_count");
+            assert_eq!(
+                obs.unflushed_rows, 0,
+                "nothing remains buffered after a flush"
+            );
         });
     }
 
