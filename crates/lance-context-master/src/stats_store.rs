@@ -13,9 +13,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use std::time::Duration;
+
 use arrow_array::{Int64Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{ArrowError, DataType, Field, Schema};
 use futures::TryStreamExt;
+use lance::dataset::cleanup::RemovalStats;
+use lance::dataset::optimize::{compact_files, CompactionMetrics, CompactionOptions};
 use lance::dataset::{builder::DatasetBuilder, Dataset, WriteMode, WriteParams};
 use lance::io::{ObjectStoreParams, StorageOptionsAccessor};
 use lance::{Error as LanceError, Result as LanceResult};
@@ -312,6 +316,56 @@ impl StatsStore {
     pub fn uri(&self) -> &str {
         &self.uri
     }
+
+    /// Current dataset version (manifest chain head). Exposed for metrics and
+    /// tests asserting that maintenance actually bounds growth.
+    pub fn version(&self) -> u64 {
+        self.dataset.version().version
+    }
+
+    /// Fold the many tiny append fragments produced by [`Self::upsert`] into a
+    /// few, then drop manifest versions older than `older_than`.
+    ///
+    /// `_stats` is written delete-then-append, so *every* upsert adds one or
+    /// two dataset versions and at least one fragment. Lance retains every
+    /// historical manifest until explicitly cleaned, so without this the
+    /// version chain grows without bound (observed: 170k+ versions), and any
+    /// open/checkout/history traversal pays for the whole chain.
+    ///
+    /// Both halves are best-effort in the sense that a failure is returned to
+    /// the caller to log; neither is required for correctness of reads. The
+    /// cleanup never touches versions newer than the grace window, so a
+    /// concurrent reader holding a recent version is unaffected.
+    ///
+    /// Callers must serialize this with other mutations (it takes `&mut self`)
+    /// and, across master replicas, hold the `stats-writer` coordination lock.
+    pub async fn maintain(
+        &mut self,
+        older_than: Duration,
+    ) -> LanceResult<(CompactionMetrics, RemovalStats)> {
+        self.dataset.checkout_latest().await?;
+
+        let options = CompactionOptions {
+            // One small row per experiment: everything belongs in one fragment.
+            target_rows_per_fragment: 1_048_576,
+            // Deletions are the whole point here — every upsert leaves one.
+            materialize_deletions: true,
+            materialize_deletions_threshold: 0.0,
+            ..Default::default()
+        };
+        let compaction = compact_files(&mut self.dataset, options, None).await?;
+
+        // Re-open so the handle (and the cleanup below) sees the rewritten
+        // version rather than the pre-compaction manifest.
+        self.dataset = Self::load(&self.uri, self.storage_options.clone()).await?;
+
+        let grace = chrono::TimeDelta::from_std(older_than)
+            .map_err(|e| LanceError::io(format!("invalid stats history TTL: {e}")))?;
+        let removal = self.dataset.cleanup_old_versions(grace, None, None).await?;
+        self.dataset = Self::load(&self.uri, self.storage_options.clone()).await?;
+
+        Ok((compaction, removal))
+    }
 }
 
 #[cfg(test)]
@@ -392,6 +446,47 @@ mod tests {
         }
         let mut s = new_store(&dir).await;
         assert_eq!(s.get("persist").await.unwrap().unwrap().row_count, 7);
+    }
+
+    #[tokio::test]
+    async fn maintain_bounds_versions_and_preserves_rows() {
+        let dir = TempDir::new().unwrap();
+        let mut s = new_store(&dir).await;
+        for i in 0..20 {
+            s.upsert(&sample("exp-a", i)).await.unwrap();
+            s.upsert(&sample("exp-b", i)).await.unwrap();
+        }
+        let before = s.version();
+        assert!(before > 20, "expected version churn, got {before}");
+
+        // Zero grace window: everything older than "now" is prunable.
+        let (compaction, removal) = s.maintain(Duration::from_secs(0)).await.unwrap();
+        assert!(removal.old_versions > 0, "no versions reclaimed");
+        assert!(compaction.fragments_removed > 0, "nothing compacted");
+
+        // Data survives maintenance unchanged.
+        let rows = s.list(None, 100, 0).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].name, "exp-a");
+        assert_eq!(rows[0].row_count, 19);
+        assert_eq!(rows[1].row_count, 19);
+
+        // And the store keeps working afterwards.
+        s.upsert(&sample("exp-c", 1)).await.unwrap();
+        assert_eq!(s.count(None).await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn maintain_respects_grace_window() {
+        let dir = TempDir::new().unwrap();
+        let mut s = new_store(&dir).await;
+        for i in 0..5 {
+            s.upsert(&sample("exp-a", i)).await.unwrap();
+        }
+        // A wide grace window must leave the recent history alone.
+        let (_, removal) = s.maintain(Duration::from_secs(86_400)).await.unwrap();
+        assert_eq!(removal.old_versions, 0);
+        assert_eq!(s.list(None, 10, 0).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
