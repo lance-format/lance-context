@@ -30,6 +30,20 @@ pub struct AppState {
     /// residency: on overflow the least-recently-used handle is evicted and its
     /// `Arc<RwLock<RolloutStore>>` dropped. Existence is tracked durably by
     /// [`Self::rollout_registry`], not by membership in this cache.
+    ///
+    /// # Eviction does not strand unflushed rows
+    ///
+    /// The flush sweeper only visits *resident* stores, so it is worth being
+    /// explicit about why evicting a store that still has an unsealed memtable
+    /// is safe: dropping the last handle runs `RolloutStore`'s `Drop`, which
+    /// spawns a detached `ShardWriter::close`, and that seals the active
+    /// memtable before draining. An evicted store's rows therefore still become
+    /// visible without the sweeper ever seeing it.
+    ///
+    /// The residual risk is that the detached close is best-effort — it cannot
+    /// be awaited from `drop`, and it no-ops if an in-flight append still shares
+    /// the `Arc`. Both cases are logged (see that `Drop` impl) rather than
+    /// silently stranding rows.
     pub rollout_stores: Mutex<LruCache<String, Arc<RwLock<RolloutStore>>>>,
     /// Durable directory of which rollout stores exist. Consulted on a cache
     /// miss (existence check) and to back the list endpoint. Guarded by a lock

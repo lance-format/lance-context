@@ -2162,17 +2162,49 @@ impl Drop for RolloutStore {
     /// Tokio runtime is available we move the writer into a detached task that
     /// closes it; otherwise (no runtime, e.g. some teardown paths) we can only
     /// drop it. Callers that can `await` should prefer [`Self::close`].
+    ///
+    /// `ShardWriter::close` seals the active memtable, so this path is also
+    /// what keeps an evicted-but-unflushed store's rows from being stranded.
+    /// Each way it can fail to do that is logged rather than swallowed: a
+    /// stranded memtable leaves rows durable in the WAL but invisible to reads
+    /// until the next process restart replays it, which is near-impossible to
+    /// diagnose without a signal here.
     fn drop(&mut self) {
         // `&mut self` in drop → exclusive access, so `get_mut` avoids a lock.
         if let Some(writer) = self.write_writer.get_mut().take() {
+            let shard = self.write_shard;
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {
                     // Only the sole owner can close; if an append still shares the
                     // Arc it will drop last. Best-effort either way.
-                    if let Ok(writer) = Arc::try_unwrap(writer) {
-                        let _ = writer.close().await;
+                    match Arc::try_unwrap(writer) {
+                        Ok(writer) => {
+                            if let Err(err) = writer.close().await {
+                                tracing::warn!(
+                                    shard = %shard,
+                                    error = %err,
+                                    "detached close of a dropped rollout writer failed; \
+                                     unflushed rows stay durable in the WAL but remain \
+                                     invisible until the next replay"
+                                );
+                            }
+                        }
+                        Err(_shared) => {
+                            tracing::debug!(
+                                shard = %shard,
+                                "dropped rollout writer is still shared by an in-flight \
+                                 append; close deferred to the last Arc holder"
+                            );
+                        }
                     }
                 });
+            } else {
+                tracing::warn!(
+                    shard = %shard,
+                    "rollout writer dropped with no Tokio runtime available; its \
+                     background tasks leak and unflushed rows remain invisible until \
+                     the next WAL replay"
+                );
             }
         }
     }
@@ -3133,6 +3165,52 @@ mod tests {
             let seen = store.list(None, None).await.unwrap();
             assert_eq!(seen.len(), 1, "row must be visible after cleanup alone");
             assert_eq!(seen[0].id, "c-0");
+        });
+    }
+
+    #[test]
+    fn dropping_a_store_seals_its_unflushed_rows() {
+        // The server's flush sweeper only visits LRU-resident stores, so a store
+        // evicted while holding an unsealed memtable depends entirely on `Drop`
+        // to seal it. `Drop` spawns a detached `ShardWriter::close`, which does
+        // seal — this asserts that end to end, so the eviction path cannot
+        // silently regress into stranding rows.
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let options = || RolloutStoreOptions {
+                storage_options: None,
+                session: None,
+                shard_id: Some("evicted-0".to_string()),
+                merge_after_generations: None,
+            };
+
+            {
+                let store = RolloutStore::open_with_options(&uri, options())
+                    .await
+                    .unwrap();
+                store.add(&[assistant_record("e-0")]).await.unwrap();
+                // Deliberately no flush() and no close(): this models an LRU
+                // eviction dropping the last handle.
+                assert!(store.list(None, None).await.unwrap().is_empty());
+            }
+
+            // The detached close is spawned, not awaited, so poll for the row
+            // rather than assuming it has landed by now.
+            let mut seen = 0;
+            for _ in 0..100 {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                let reader = RolloutStore::open_with_options(&uri, options())
+                    .await
+                    .unwrap();
+                seen = reader.list(None, None).await.unwrap().len();
+                if seen > 0 {
+                    break;
+                }
+            }
+            assert_eq!(seen, 1, "Drop must seal the memtable of an evicted store");
         });
     }
 
