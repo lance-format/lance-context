@@ -27,6 +27,20 @@ pub struct MasterConfig {
     #[arg(long, env = "SCAN_CONCURRENCY", default_value_t = 8)]
     pub scan_concurrency: usize,
 
+    /// Run maintenance (compaction + old-version cleanup) on the `_stats`
+    /// dataset every Nth stats-scan round. `_stats` is written delete-then-
+    /// append, so each scan adds versions and fragments per experiment; without
+    /// maintenance the manifest chain grows without bound and slows cold start
+    /// and `/experiments`. `0` disables stats maintenance.
+    #[arg(long, env = "STATS_MAINTENANCE_EVERY_N_SCANS", default_value_t = 12)]
+    pub stats_maintenance_every_n_scans: u64,
+
+    /// Grace window, in seconds, for `_stats` old-version cleanup. Versions
+    /// newer than this are never removed, so in-flight readers on another
+    /// replica keep working.
+    #[arg(long, env = "STATS_HISTORY_TTL_SECS", default_value_t = 3_600)]
+    pub stats_history_ttl_secs: u64,
+
     /// Interval, in seconds, between automatic compaction sweeps. `0` disables
     /// automatic compaction (manual triggers still work).
     #[arg(long, env = "COMPACTION_INTERVAL_SECS", default_value_t = 600)]

@@ -22,6 +22,42 @@ use crate::stats_store::StatRow;
 /// scan round.
 const OBSERVE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Bound on one `_stats` maintenance pass (compaction + version cleanup) so a
+/// slow object store cannot wedge the scanner loop.
+const MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Compact `_stats` and prune its old manifest versions.
+///
+/// `_stats` is written delete-then-append (one upsert per experiment per
+/// round), so its version chain and fragment count grow every scan and Lance
+/// never reclaims them on its own. Callers must hold the `stats-writer`
+/// coordination lock so only one replica ever rewrites the dataset.
+pub async fn maintain_stats(state: &Arc<MasterState>) -> lance::Result<()> {
+    let ttl = Duration::from_secs(state.config.stats_history_ttl_secs);
+    let start = std::time::Instant::now();
+    let mut stats = state.stats.lock().await;
+    match tokio::time::timeout(MAINTENANCE_TIMEOUT, stats.maintain(ttl)).await {
+        Ok(Ok((compaction, removal))) => {
+            metrics::histogram!("master_stats_maintenance_duration_seconds")
+                .record(start.elapsed().as_secs_f64());
+            metrics::counter!("master_stats_versions_removed_total")
+                .increment(removal.old_versions);
+            metrics::gauge!("master_stats_version").set(stats.version() as f64);
+            tracing::info!(
+                fragments_removed = compaction.fragments_removed,
+                fragments_added = compaction.fragments_added,
+                old_versions_removed = removal.old_versions,
+                bytes_removed = removal.bytes_removed,
+                version = stats.version(),
+                "stats maintenance complete"
+            );
+            Ok(())
+        }
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(lance::Error::io("stats maintenance timed out")),
+    }
+}
+
 /// Run a single scan pass: refresh every experiment's stats row and drop rows
 /// for experiments no longer in the registry. Returns the number of
 /// experiments successfully observed.
@@ -36,7 +72,7 @@ pub async fn scan_once(state: &Arc<MasterState>) -> lance::Result<usize> {
     }
 }
 
-async fn try_scan_once(state: &Arc<MasterState>) -> lance::Result<Option<usize>> {
+async fn try_scan_once(state: &Arc<MasterState>, maintain: bool) -> lance::Result<Option<usize>> {
     let Some(guard) = state
         .task_store
         .try_coordination_lock("stats-writer")
@@ -45,6 +81,13 @@ async fn try_scan_once(state: &Arc<MasterState>) -> lance::Result<Option<usize>>
         return Ok(None);
     };
     let result = scan_once_inner(state).await;
+    // Maintenance runs under the same writer lock as the scan that just
+    // created the versions, and its failure never fails the scan round.
+    if maintain {
+        if let Err(e) = maintain_stats(state).await {
+            tracing::warn!(error = %e, "stats maintenance failed");
+        }
+    }
     let release = state.task_store.release_coordination_lock(guard).await;
     match (result, release) {
         (Ok(count), Ok(())) => Ok(Some(count)),
@@ -179,9 +222,16 @@ pub fn spawn_scanner(state: &Arc<MasterState>) -> Option<JoinHandle<()>> {
     let state = state.clone();
     Some(tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+        let every_n = state.config.stats_maintenance_every_n_scans;
+        let mut round: u64 = 0;
         loop {
             ticker.tick().await;
-            match try_scan_once(&state).await {
+            round += 1;
+            // Round 1 included: an existing deployment may start with a very
+            // long version chain, and waiting N rounds to reclaim it would
+            // leave cold start slow for another N intervals.
+            let maintain = every_n > 0 && (round == 1 || round.is_multiple_of(every_n));
+            match try_scan_once(&state, maintain).await {
                 Ok(Some(n)) => tracing::info!(experiments = n, "stats scan complete"),
                 Ok(None) => {
                     tracing::debug!("stats scan skipped; another master owns the writer lock")
