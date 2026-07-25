@@ -722,7 +722,21 @@ impl RolloutStore {
     /// only on the shard this instance owns, so it is safe to call concurrently
     /// with this instance's own appends but must not target another instance's
     /// shard.
+    ///
+    /// # Seals first
+    ///
+    /// This flushes the active memtable before looking at the manifest. Without
+    /// that, a deployment with the periodic flush sweeper disabled
+    /// (`ROLLOUT_FLUSH_INTERVAL_SECS=0`) could never make progress: nothing
+    /// would seal the memtable, so `flushed_generations` would stay empty, so
+    /// the threshold check below would return `0` and never reach the merge —
+    /// leaving rows durable but permanently invisible until a process restart
+    /// replayed the WAL. Sealing here makes the cleanup path a genuine
+    /// standalone fallback, as `ROLLOUT_FLUSH_INTERVAL_SECS`'s documentation
+    /// already promised.
     pub async fn cleanup_own_shard(&mut self) -> LanceResult<usize> {
+        // Materialize anything buffered so it is eligible for this pass.
+        self.flush().await?;
         // Threshold `1`: merge whenever at least one generation is pending. The
         // time trigger must not depend on the count threshold — that is what
         // makes the two triggers a true OR.
@@ -3057,6 +3071,55 @@ mod tests {
             assert_records_eq(&recovered, &artifact);
             let blob = store.get_blob("row-0").await.unwrap();
             assert_eq!(blob.as_deref(), Some(&artifact_bytes[..]));
+        });
+    }
+
+    #[test]
+    fn cleanup_own_shard_seals_before_merging() {
+        // Regression guard for the `ROLLOUT_FLUSH_INTERVAL_SECS=0` trap: with no
+        // periodic flush, nothing seals the active memtable, so
+        // `flushed_generations` stays empty and the threshold check in
+        // `merge_own_shard_if_ready` used to return 0 without ever merging —
+        // leaving rows durable but permanently invisible.
+        //
+        // `cleanup_own_shard` now flushes first, making it a genuine standalone
+        // fallback, which is what the config docs already claimed.
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    storage_options: None,
+                    session: None,
+                    shard_id: Some("cleanup-seal-0".to_string()),
+                    // Count trigger disabled: cleanup is the only path that can
+                    // make this row visible, exactly as with flush interval 0.
+                    merge_after_generations: Some(0),
+                },
+            )
+            .await
+            .unwrap();
+
+            store.add(&[assistant_record("c-0")]).await.unwrap();
+
+            // Nothing sealed yet: invisible, and no generation pending.
+            assert!(store.list(None, None).await.unwrap().is_empty());
+            assert_eq!(
+                store.observe().await.unwrap().pending_wal_generations,
+                0,
+                "precondition: the memtable is unsealed, so no generation exists"
+            );
+
+            // A single cleanup pass must seal, merge, and expose the row.
+            let reclaimed = store.cleanup_own_shard().await.unwrap();
+            assert_eq!(reclaimed, 1, "cleanup must seal then merge the generation");
+
+            let seen = store.list(None, None).await.unwrap();
+            assert_eq!(seen.len(), 1, "row must be visible after cleanup alone");
+            assert_eq!(seen[0].id, "c-0");
         });
     }
 

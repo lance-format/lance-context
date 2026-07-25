@@ -51,6 +51,20 @@ async fn main() {
     // without serializing concurrent appends. Detached for the server lifetime.
     let _flush_sweeper = state.spawn_flush_sweeper();
 
+    // With both sweepers off nothing ever seals the active memtable, so rollout
+    // appends stay durable-but-invisible until the process restarts and replays
+    // the WAL. `cleanup_own_shard` flushes before merging, so the cleanup
+    // sweeper alone is a sufficient fallback — but if neither runs, warn loudly
+    // rather than leaving the operator to discover it as missing rows.
+    if state.rollout_flush_interval_secs == 0 && state.rollout_cleanup_interval_secs == 0 {
+        tracing::warn!(
+            "ROLLOUT_FLUSH_INTERVAL_SECS=0 and ROLLOUT_CLEANUP_INTERVAL_SECS=0: \
+             nothing will seal MemWAL memtables, so rollout appends will be durable \
+             but invisible to reads until this process restarts. Set at least one \
+             of them to a non-zero interval."
+        );
+    }
+
     // Install the Prometheus recorder once, before any metrics are emitted.
     let metrics_handle = lance_context_metrics::install_recorder();
 
