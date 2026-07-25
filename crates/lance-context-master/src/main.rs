@@ -1,7 +1,6 @@
 use axum::Router;
 use clap::Parser;
 use tokio::net::TcpListener;
-use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
@@ -66,8 +65,7 @@ async fn main() {
         .layer(axum::middleware::from_fn(
             lance_context_metrics::http_metrics_layer,
         ))
-        .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::permissive());
+        .layer(TraceLayer::new_for_http());
 
     tracing::info!("Starting lance-context-master on {}", addr);
 
