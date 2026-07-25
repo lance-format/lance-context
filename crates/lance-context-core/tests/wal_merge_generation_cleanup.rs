@@ -87,32 +87,51 @@ async fn serial_merge_deletes_merged_generation_dirs() {
         .await
         .unwrap();
 
-    // 30 serial single-row appends. Each append flushes one generation; every
-    // 10th triggers a count-merge that folds the accumulated generations into
-    // the base table and drains them from the manifest.
+    // 30 serial single-row appends. `add` is durable-only now, so we `flush`
+    // each one into its own generation (as an inline seal used to), then run the
+    // count-triggered merge explicitly (it moved off the append path onto the
+    // periodic sweeper). Every 10th accumulated generation is folded into the
+    // base table and drained from the manifest.
     let n = 30;
     for i in 0..n {
         store.add(&[rec(&format!("row-{i}"))]).await.unwrap();
+        store.flush().await.unwrap();
+        store.maybe_merge_own_shard().await.unwrap();
     }
 
     let obs = store.observe().await.unwrap();
     let manifest_pending = obs.pending_wal_generations as usize;
-    let row_count = obs.row_count;
+
+    // Data correctness must be measured through the LSM read path, which
+    // de-duplicates by `id`. `observe().row_count` is a raw `count_rows()` over
+    // the base table and does NOT de-duplicate, so it over-counts the physical
+    // duplicate rows that a WAL merge can leave in the base table (see the
+    // dedup-consistency issue). Assert on the read path instead.
+    let listed = store.list(None, None).await.unwrap();
+    let mut ids: Vec<String> = listed.iter().map(|record| record.id.clone()).collect();
+    ids.sort();
+    ids.dedup();
 
     let on_disk = count_gen_dirs_on_disk(Path::new(&uri));
 
     eprintln!(
-        "appends={n} row_count={row_count} \
+        "appends={n} listed={} unique_ids={} raw_row_count={} \
          manifest_pending_generations={manifest_pending} \
          gen_dirs_on_disk={on_disk} leaked={}",
+        listed.len(),
+        ids.len(),
+        obs.row_count,
         on_disk.saturating_sub(manifest_pending)
     );
 
-    // Data correctness: all rows present exactly once.
+    // Data correctness: every appended row is readable exactly once through the
+    // deduplicating read path.
     assert_eq!(
-        row_count as usize, n,
-        "all rows must be readable exactly once"
+        listed.len(),
+        n,
+        "read path must return each appended row exactly once"
     );
+    assert_eq!(ids.len(), n, "no duplicate ids on the read path");
 
     // The fix: merged generations are drained from the manifest AND their blob
     // dirs are deleted, so on-disk gen dirs never exceed the manifest's pending

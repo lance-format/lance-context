@@ -771,7 +771,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let state = MasterState::new(test_config(&dir)).await.unwrap();
         let uri = state.rollout_uri("records");
-        let mut store = RolloutStore::open(&uri).await.unwrap();
+        let store = RolloutStore::open(&uri).await.unwrap();
         store
             .add(&[
                 test_record("assistant-1", false),
@@ -841,7 +841,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let state = MasterState::new(test_config(&dir)).await.unwrap();
         let uri = state.rollout_uri("records");
-        let mut store = RolloutStore::open(&uri).await.unwrap();
+        let store = RolloutStore::open(&uri).await.unwrap();
         store
             .add(&[
                 test_record("assistant-1", false),
@@ -916,7 +916,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let state = MasterState::new(test_config(&dir)).await.unwrap();
         let uri = state.rollout_uri("blobs");
-        let mut store = RolloutStore::open(&uri).await.unwrap();
+        let store = RolloutStore::open(&uri).await.unwrap();
         store
             .add(&[
                 test_record("artifact-1", true),
