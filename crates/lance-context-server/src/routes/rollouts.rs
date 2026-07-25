@@ -125,6 +125,7 @@ pub async fn create_rollout_store(
         shard_id: state.instance_id.clone(),
         merge_after_generations: (state.rollout_merge_after_generations > 0)
             .then_some(state.rollout_merge_after_generations),
+        session: state.rollout_session.clone(),
     };
 
     let store = RolloutStore::open_with_options(&uri, options)

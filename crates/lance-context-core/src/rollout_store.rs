@@ -74,6 +74,7 @@ use lance::dataset::{
 };
 use lance::index::DatasetIndexExt;
 use lance::io::{ObjectStoreParams, StorageOptionsAccessor};
+use lance::session::Session;
 use lance::{Error as LanceError, Result as LanceResult};
 use lance_index::mem_wal::{ShardManifest, MEM_WAL_INDEX_NAME};
 use lance_index::scalar::ScalarIndexParams;
@@ -341,6 +342,21 @@ pub struct RolloutStoreOptions {
     /// `None` or `0` disables self-merge (the 0.6.0 behavior: generations
     /// accumulate and are unioned at read time).
     pub merge_after_generations: Option<usize>,
+    /// Shared Lance [`Session`] used to open this store's base dataset (and,
+    /// transitively, every flushed MemWAL generation it reads — those inherit
+    /// the base dataset's session).
+    ///
+    /// When `None`, Lance builds a *fresh* per-store session whose index and
+    /// metadata caches default to **6 GiB / 1 GiB** and are keyed by dataset
+    /// URI. Each flushed generation is a distinct URI, so a busy store's read
+    /// path (`observe`, list, stats) feeds an ever-growing set of keys into that
+    /// cache until it approaches the 6 GiB cap — worker RSS then grows linearly
+    /// with cumulative appends and is never released across merge/compact cycles
+    /// (the session outlives the merged generations). Passing a single shared,
+    /// capacity-bounded session across all resident stores bounds this: the
+    /// deployment's total Lance cache is the session's capacity, shared, rather
+    /// than 6 GiB *per store*. Build one with [`RolloutStore::build_session`].
+    pub session: Option<Arc<Session>>,
 }
 
 /// A Lance-backed store for RL rollout trajectories.
@@ -370,6 +386,11 @@ pub struct RolloutStore {
     /// `add` transparently reopens with the fresh epoch. [`ShardWriter`] has no
     /// `Drop`, so it must be closed explicitly to drain its background tasks;
     /// see [`Self::close`] and the `Drop` impl.
+    /// Shared Lance session used to open the base dataset and every reload
+    /// (compact, zonemap, generation reads), so all resident stores share one
+    /// capacity-bounded cache instead of each allocating Lance's 6 GiB default.
+    /// `None` preserves Lance's per-open default session.
+    session: Option<Arc<Session>>,
     /// Resident MemWAL writer for this instance's shard, wrapped for `&self`
     /// concurrent access. The [`tokio::sync::Mutex`] is held only to fetch-or-open
     /// and clone the `Arc` (see [`Self::resident_writer`]) and to invalidate a
@@ -380,6 +401,25 @@ pub struct RolloutStore {
 }
 
 impl RolloutStore {
+    /// Build a shared, capacity-bounded Lance [`Session`] for opening rollout
+    /// stores.
+    ///
+    /// Split the total cache budget across Lance's two caches: `index_cache_bytes`
+    /// bounds opened-index data and `metadata_cache_bytes` bounds file/dataset
+    /// metadata. Both are byte-weighted LRUs keyed by dataset URI, so a single
+    /// session shared across every resident [`RolloutStore`] caps the process's
+    /// *total* Lance cache at this budget — instead of Lance's default of a fresh
+    /// 6 GiB + 1 GiB session per store (the source of the per-append RSS growth;
+    /// see [`RolloutStoreOptions::session`]).
+    #[must_use]
+    pub fn build_session(index_cache_bytes: usize, metadata_cache_bytes: usize) -> Arc<Session> {
+        Arc::new(Session::new(
+            index_cache_bytes,
+            metadata_cache_bytes,
+            Arc::default(),
+        ))
+    }
+
     /// Open an existing rollout dataset or create a new one with default
     /// options (`binary_payload` stored inline; see [`RolloutStoreOptions`]).
     ///
@@ -417,14 +457,16 @@ impl RolloutStore {
         create_if_missing: bool,
     ) -> LanceResult<Self> {
         let storage_options = options.storage_options.clone();
+        let session = options.session.clone();
         let write_shard = derive_shard_id(options.shard_id.as_deref());
-        let dataset = match Self::load_with_options(uri, storage_options.clone()).await {
-            Ok(dataset) => dataset,
-            Err(LanceError::DatasetNotFound { .. }) if create_if_missing => {
-                Self::create_with_options(uri, storage_options.clone()).await?
-            }
-            Err(err) => return Err(err),
-        };
+        let dataset =
+            match Self::load_with_options(uri, storage_options.clone(), session.clone()).await {
+                Ok(dataset) => dataset,
+                Err(LanceError::DatasetNotFound { .. }) if create_if_missing => {
+                    Self::create_with_options(uri, storage_options.clone(), session.clone()).await?
+                }
+                Err(err) => return Err(err),
+            };
 
         let mut store = Self {
             dataset,
@@ -434,6 +476,7 @@ impl RolloutStore {
             last_compaction: None,
             total_compactions: 0,
             last_compaction_error: None,
+            session,
             write_writer: tokio::sync::Mutex::new(None),
         };
         // Initialize the MemWAL index up front (idempotent, cheap when already
@@ -755,8 +798,12 @@ impl RolloutStore {
                 "{}/_mem_wal/{}/{}",
                 base_uri, self.write_shard, flushed.path
             );
-            let gen_dataset =
-                Self::load_with_options(&gen_uri, self.storage_options.clone()).await?;
+            let gen_dataset = Self::load_with_options(
+                &gen_uri,
+                self.storage_options.clone(),
+                self.session.clone(),
+            )
+            .await?;
             let mut stream = gen_dataset.scan().try_into_stream().await?;
             while let Some(batch) = stream.try_next().await? {
                 if batch.num_rows() > 0 {
@@ -926,7 +973,12 @@ impl RolloutStore {
                 // Reload the handle so the caller (and subsequent reads on this
                 // instance) observe the compacted version.
                 let uri = self.dataset.uri().to_string();
-                self.dataset = Self::load_with_options(&uri, self.storage_options.clone()).await?;
+                self.dataset = Self::load_with_options(
+                    &uri,
+                    self.storage_options.clone(),
+                    self.session.clone(),
+                )
+                .await?;
                 self.last_compaction = Some(Utc::now());
                 self.total_compactions += 1;
                 self.last_compaction_error = None;
@@ -972,7 +1024,9 @@ impl RolloutStore {
         // Reload the handle so subsequent reads on this instance observe the
         // new index (mirrors the reload done after `compact`).
         let uri = self.dataset.uri().to_string();
-        self.dataset = Self::load_with_options(&uri, self.storage_options.clone()).await?;
+        self.dataset =
+            Self::load_with_options(&uri, self.storage_options.clone(), self.session.clone())
+                .await?;
         Ok(())
     }
 
@@ -1089,7 +1143,12 @@ impl RolloutStore {
                 // A concurrent first-writer may have created the index between
                 // our check and our commit. Reload and accept it if so.
                 let uri = self.dataset.uri().to_string();
-                self.dataset = Self::load_with_options(&uri, self.storage_options.clone()).await?;
+                self.dataset = Self::load_with_options(
+                    &uri,
+                    self.storage_options.clone(),
+                    self.session.clone(),
+                )
+                .await?;
                 if self.mem_wal_index_present().await? {
                     Ok(())
                 } else {
@@ -1749,20 +1808,25 @@ impl RolloutStore {
     async fn load_with_options(
         uri: &str,
         storage_options: Option<HashMap<String, String>>,
+        session: Option<Arc<Session>>,
     ) -> LanceResult<Dataset> {
+        // A plain `Dataset::open` builds a fresh per-store session (Lance's 6 GiB
+        // index + 1 GiB metadata default). Route every open through the builder so
+        // an explicit shared, capacity-bounded session can be attached.
+        let mut builder = DatasetBuilder::from_uri(uri);
         if let Some(options) = storage_options {
-            DatasetBuilder::from_uri(uri)
-                .with_storage_options(options)
-                .load()
-                .await
-        } else {
-            Dataset::open(uri).await
+            builder = builder.with_storage_options(options);
         }
+        if let Some(session) = session {
+            builder = builder.with_session(session);
+        }
+        builder.load().await
     }
 
     async fn create_with_options(
         uri: &str,
         storage_options: Option<HashMap<String, String>>,
+        session: Option<Arc<Session>>,
     ) -> LanceResult<Dataset> {
         let schema = Arc::new(rollout_schema());
         let empty_batch = RecordBatch::new_empty(schema.clone());
@@ -1783,6 +1847,7 @@ impl RolloutStore {
                 ..Default::default()
             });
         }
+        params.session = session;
 
         Dataset::write(batches, uri, Some(params)).await
     }
@@ -3010,6 +3075,7 @@ mod tests {
             let shard_b_blob = b"shard-b-blob";
             let options = |shard: &str| RolloutStoreOptions {
                 storage_options: None,
+                session: None,
                 shard_id: Some(shard.to_string()),
                 merge_after_generations: None,
             };
@@ -3289,6 +3355,7 @@ mod tests {
                 &uri,
                 RolloutStoreOptions {
                     storage_options: None,
+                    session: None,
                     shard_id: Some("rollout-0".to_string()),
                     merge_after_generations: None, // no merge → epoch never reclaimed
                 },
@@ -3342,6 +3409,7 @@ mod tests {
                 &uri,
                 RolloutStoreOptions {
                     storage_options: None,
+                    session: None,
                     shard_id: Some("rollout-0".to_string()),
                     // Merge on every append → epoch is reclaimed each time, so
                     // the following append always hits the reopen path.
@@ -3380,6 +3448,7 @@ mod tests {
                 &uri,
                 RolloutStoreOptions {
                     storage_options: None,
+                    session: None,
                     shard_id: Some("rollout-0".to_string()),
                     merge_after_generations: None,
                 },
@@ -3512,6 +3581,7 @@ mod tests {
                 &uri,
                 RolloutStoreOptions {
                     storage_options: None,
+                    session: None,
                     shard_id: Some("rollout-0".to_string()),
                     // Merge every append into base so each forms its own fragment.
                     merge_after_generations: Some(1),
@@ -3581,6 +3651,7 @@ mod tests {
                 &uri,
                 RolloutStoreOptions {
                     storage_options: None,
+                    session: None,
                     shard_id: Some("rollout-0".to_string()),
                     merge_after_generations: Some(1),
                 },
@@ -3625,6 +3696,7 @@ mod tests {
                 &uri,
                 RolloutStoreOptions {
                     storage_options: None,
+                    session: None,
                     shard_id: Some("rollout-0".to_string()),
                     merge_after_generations: Some(1),
                 },
@@ -3642,6 +3714,7 @@ mod tests {
                 &uri,
                 RolloutStoreOptions {
                     storage_options: None,
+                    session: None,
                     shard_id: Some("rollout-1".to_string()),
                     ..Default::default()
                 },
@@ -3690,6 +3763,7 @@ mod tests {
                 &uri,
                 RolloutStoreOptions {
                     storage_options: None,
+                    session: None,
                     shard_id: Some("rollout-0".to_string()),
                     merge_after_generations: Some(3),
                 },
@@ -3724,6 +3798,7 @@ mod tests {
                 &uri,
                 RolloutStoreOptions {
                     storage_options: None,
+                    session: None,
                     shard_id: Some("rollout-0".to_string()),
                     merge_after_generations: Some(3),
                 },
@@ -3779,6 +3854,7 @@ mod tests {
                     &uri,
                     RolloutStoreOptions {
                         storage_options: None,
+                        session: None,
                         shard_id: Some("rollout-0".to_string()),
                         merge_after_generations: Some(2),
                     },
@@ -3817,6 +3893,7 @@ mod tests {
                 &uri,
                 RolloutStoreOptions {
                     storage_options: None,
+                    session: None,
                     shard_id: Some("rollout-0".to_string()),
                     merge_after_generations: None, // count trigger off
                 },
@@ -4019,6 +4096,7 @@ mod tests {
                         &uri,
                         RolloutStoreOptions {
                             storage_options: None,
+                            session: None,
                             shard_id: Some(shard),
                             ..Default::default()
                         },
@@ -4091,6 +4169,7 @@ mod tests {
                 &uri,
                 RolloutStoreOptions {
                     storage_options: None,
+                    session: None,
                     shard_id: Some("rollout-0".to_string()),
                     ..Default::default()
                 },
@@ -4140,6 +4219,7 @@ mod tests {
                 &uri,
                 RolloutStoreOptions {
                     storage_options: None,
+                    session: None,
                     shard_id: Some("rollout-0".to_string()),
                     ..Default::default()
                 },
@@ -4349,6 +4429,7 @@ mod tests {
                 &uri,
                 RolloutStoreOptions {
                     storage_options: None,
+                    session: None,
                     shard_id: Some("rollout-0".to_string()),
                     merge_after_generations: None, // disabled
                 },
@@ -4378,6 +4459,7 @@ mod tests {
                 &uri_m,
                 RolloutStoreOptions {
                     storage_options: None,
+                    session: None,
                     shard_id: Some("rollout-0".to_string()),
                     merge_after_generations: Some(1),
                 },
@@ -4429,6 +4511,7 @@ mod tests {
                 &uri,
                 RolloutStoreOptions {
                     storage_options: None,
+                    session: None,
                     shard_id: Some("rollout-0".to_string()),
                     ..Default::default()
                 },
@@ -4511,6 +4594,7 @@ mod tests {
                 &uri,
                 RolloutStoreOptions {
                     storage_options: None,
+                    session: None,
                     shard_id: Some("rollout-0".to_string()),
                     ..Default::default()
                 },
@@ -4549,6 +4633,7 @@ mod tests {
                 &uri,
                 RolloutStoreOptions {
                     storage_options: None,
+                    session: None,
                     shard_id: Some("rollout-0".to_string()),
                     ..Default::default()
                 },

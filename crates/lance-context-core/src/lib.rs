@@ -61,3 +61,7 @@ pub use lance::dataset::optimize::CompactionMetrics;
 // Re-export the Lance error type so downstream crates (e.g. the server) can
 // match on its typed variants instead of string-matching `Display` output.
 pub use lance::Error as LanceError;
+
+// Re-export the Lance session type so the server can build one shared,
+// capacity-bounded cache session across all resident rollout stores.
+pub use lance::session::Session;

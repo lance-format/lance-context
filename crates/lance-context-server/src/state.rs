@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use lance_context_core::{
     join_uri, validate_store_name, ContextStore, ContextStoreOptions, RolloutRegistry,
-    RolloutStore, RolloutStoreOptions,
+    RolloutStore, RolloutStoreOptions, Session,
 };
 use lru::LruCache;
 use tokio::sync::{Mutex, RwLock};
@@ -55,6 +55,11 @@ pub struct AppState {
     /// uploads/downloads. `None` disables the budget (unbounded). See
     /// [`BlobBudget`].
     pub blob_budget: Option<Arc<BlobBudget>>,
+    /// Shared Lance cache session attached to every resident rollout store, so
+    /// the process's total metadata/index cache is bounded by one budget rather
+    /// than Lance's default 6 GiB *per store*. `None` restores the per-store
+    /// default session (leak-prone; only when the budget is configured to `0`).
+    pub rollout_session: Option<Arc<Session>>,
 }
 
 /// Process-wide admission control for the total artifact-blob payload held in
@@ -136,6 +141,21 @@ impl Drop for BlobReservation {
     }
 }
 
+/// Build the process-wide shared Lance cache session for rollout stores from a
+/// single total byte budget, or `None` when the budget is `0` (which restores
+/// Lance's per-store default session).
+///
+/// The budget is split 6:1 index:metadata to mirror Lance's own default ratio
+/// (`DEFAULT_INDEX_CACHE_SIZE` = 6 GiB, `DEFAULT_METADATA_CACHE_SIZE` = 1 GiB).
+fn build_rollout_session(cache_bytes: usize) -> Option<Arc<Session>> {
+    if cache_bytes == 0 {
+        return None;
+    }
+    let metadata_bytes = cache_bytes / 7;
+    let index_bytes = cache_bytes - metadata_bytes;
+    Some(RolloutStore::build_session(index_bytes, metadata_bytes))
+}
+
 impl AppState {
     /// Build the shared server state, opening (or creating) the rollout registry
     /// under `data_dir`. Async because opening the registry touches storage.
@@ -150,6 +170,7 @@ impl AppState {
             .unwrap_or_else(|| NonZeroUsize::new(DEFAULT_ROLLOUT_CACHE_CAPACITY).unwrap());
         let blob_budget = (config.rollout_max_inflight_blob_bytes > 0)
             .then(|| BlobBudget::new(config.rollout_max_inflight_blob_bytes));
+        let rollout_session = build_rollout_session(config.rollout_cache_bytes);
         Ok(Self {
             stores: RwLock::new(std::collections::HashMap::new()),
             rollout_stores: Mutex::new(LruCache::new(capacity)),
@@ -160,6 +181,7 @@ impl AppState {
             rollout_cleanup_interval_secs: config.rollout_cleanup_interval_secs,
             rollout_flush_interval_secs: config.rollout_flush_interval_secs,
             blob_budget,
+            rollout_session,
         })
     }
 
@@ -198,6 +220,7 @@ impl AppState {
             rollout_cleanup_interval_secs: 0,
             rollout_flush_interval_secs: 0,
             blob_budget: None,
+            rollout_session: build_rollout_session(2 * 1024 * 1024 * 1024),
         }
     }
 
@@ -216,6 +239,7 @@ impl AppState {
             shard_id: self.instance_id.clone(),
             merge_after_generations: (self.rollout_merge_after_generations > 0)
                 .then_some(self.rollout_merge_after_generations),
+            session: self.rollout_session.clone(),
         }
     }
 
