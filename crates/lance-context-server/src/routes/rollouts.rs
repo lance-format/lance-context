@@ -274,7 +274,10 @@ pub async fn add_rollouts(
         .collect();
     let count = core_records.len();
 
-    let mut store = store_lock.write().await;
+    // A read lock: `add` is `&self` and MemWAL appends are internally
+    // concurrent, so multiple ingest requests to the same store run in parallel.
+    // Mutating ops (merge, compact, checkout, close) still take the write lock.
+    let store = store_lock.read().await;
     let version = store
         .add(&core_records)
         .await
@@ -824,6 +827,14 @@ mod tests {
             .unwrap()
     }
 
+    /// Flush a rollout store's MemWAL so just-added rows become visible to reads.
+    /// `add` is durable-but-async now (visible only after a flush / the periodic
+    /// flush sweeper), so tests that add then read must flush explicitly.
+    async fn flush_store(state: &Arc<AppState>, name: &str) {
+        let store = state.get_or_open_rollout_store(name).await.unwrap();
+        store.read().await.flush().await.unwrap();
+    }
+
     /// Assemble a `multipart/form-data` body from ordered (name, bytes) parts.
     fn multipart_request(boundary: &str, parts: &[(&str, Vec<u8>)]) -> Request {
         let mut body = Vec::new();
@@ -877,6 +888,7 @@ mod tests {
         assert_eq!(status, StatusCode::CREATED);
         assert_eq!(resp.count, 1);
         assert_eq!(resp.ids, vec!["r0".to_string()]);
+        flush_store(&state, "rl").await;
 
         // A plain get projects the binary column out, reading it back as None...
         let Json(got) = get_rollout(
@@ -917,6 +929,7 @@ mod tests {
             .unwrap();
         assert_eq!(status, StatusCode::CREATED);
         assert_eq!(resp.count, 1);
+        flush_store(&state, "rl").await;
 
         let resp = fetch_rollout_blob(
             State(state.clone()),
@@ -1043,6 +1056,9 @@ mod tests {
         )
         .await
         .expect("append succeeds");
+        // Seal the append into a flushed generation so the merge has something
+        // to reclaim (appends no longer flush inline).
+        flush_store(&state, "rl").await;
 
         let Json(first) = merge_wal(State(state.clone()), Path("rl".to_string()))
             .await
@@ -1082,6 +1098,9 @@ mod tests {
         )
         .await
         .expect("write on instance A");
+        // Flush A's shard so its row is visible to any reader (reads union all
+        // shards' flushed generations).
+        flush_store(&state_a, "rl").await;
 
         // Pod B: a fresh AppState over the SAME data dir, with an empty cache and
         // a different instance id (its own shard). It never saw the `create`.
@@ -1116,6 +1135,8 @@ mod tests {
         )
         .await
         .expect("write on instance B");
+        // Flush B's shard so its row is visible to A's reader too.
+        flush_store(&state_b, "rl").await;
         assert_eq!(count_rollouts(&state_a).await, 2);
     }
 
@@ -1230,6 +1251,7 @@ mod tests {
         )
         .await
         .unwrap();
+        flush_store(&state, "rl").await;
 
         let Json(response) = list_rollouts(
             State(state),

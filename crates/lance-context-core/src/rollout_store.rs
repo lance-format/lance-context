@@ -370,7 +370,13 @@ pub struct RolloutStore {
     /// `add` transparently reopens with the fresh epoch. [`ShardWriter`] has no
     /// `Drop`, so it must be closed explicitly to drain its background tasks;
     /// see [`Self::close`] and the `Drop` impl.
-    write_writer: Option<ShardWriter>,
+    /// Resident MemWAL writer for this instance's shard, wrapped for `&self`
+    /// concurrent access. The [`tokio::sync::Mutex`] is held only to fetch-or-open
+    /// and clone the `Arc` (see [`Self::resident_writer`]) and to invalidate a
+    /// fenced writer (see [`Self::invalidate_writer`]); it is **never** held
+    /// across `put`, so steady-state appends run concurrently. `Arc` lets an
+    /// in-flight `put` and a concurrent reopen/close each hold their own handle.
+    write_writer: tokio::sync::Mutex<Option<Arc<ShardWriter>>>,
 }
 
 impl RolloutStore {
@@ -420,7 +426,7 @@ impl RolloutStore {
             Err(err) => return Err(err),
         };
 
-        Ok(Self {
+        let mut store = Self {
             dataset,
             write_shard,
             storage_options,
@@ -428,8 +434,14 @@ impl RolloutStore {
             last_compaction: None,
             total_compactions: 0,
             last_compaction_error: None,
-            write_writer: None,
-        })
+            write_writer: tokio::sync::Mutex::new(None),
+        };
+        // Initialize the MemWAL index up front (idempotent, cheap when already
+        // present) so the hot `add(&self)` path never needs `&mut self` to lazily
+        // create it. `ensure_mem_wal` may reload `self.dataset` on a concurrent
+        // first-writer race, which is why it must run here where we hold `&mut`.
+        store.ensure_mem_wal().await?;
+        Ok(store)
     }
 
     /// URI of the underlying Lance dataset.
@@ -485,87 +497,103 @@ impl RolloutStore {
     /// The returned value is the base dataset version, which MemWAL appends do
     /// **not** advance; it is retained for API compatibility, not as a per-append
     /// snapshot handle (see the module docs on reproducibility).
-    pub async fn add(&mut self, records: &[RolloutRecord]) -> LanceResult<u64> {
+    pub async fn add(&self, records: &[RolloutRecord]) -> LanceResult<u64> {
         if records.is_empty() {
             return Ok(self.dataset.manifest.version);
         }
 
         let batch = self.records_to_batch(records)?;
 
-        self.ensure_mem_wal().await?;
-
-        // Reuse the resident writer, retrying once on a fence. A fence means
-        // another claimer (in practice only this instance's own merge, which
-        // takes the writer down first) bumped the shard epoch out from under us;
-        // dropping and reopening the writer re-claims the current epoch. Rollout
-        // rows are immutable and de-duplicated by `id` at read time, so a retried
-        // append can never double-count.
-        self.write_with_resident_writer(&batch).await?;
-
-        // Count-triggered self-merge: if this instance's shard has accumulated
-        // enough un-merged flushed generations, fold them into the base table
-        // now (spec §6). Bounds read amplification. Runs on the shard's own
-        // owner so it never fences a concurrent writer.
-        if self.merge_after_generations > 0 {
-            self.maybe_merge_own_shard().await?;
+        // Durable append only: `put` waits for the WAL entry to be PUT to object
+        // storage (data is safe) and returns. The memtable is materialized into a
+        // queryable generation later, by the periodic flush (see [`Self::flush`]),
+        // not on this path — so concurrent appends are not serialized behind a
+        // per-append seal+drain. Read-after-write is therefore asynchronous, up to
+        // the flush interval; durability is not.
+        //
+        // Reuse the resident writer, retrying once on a fence. A fence means a
+        // merge (which claims the shard epoch, taking the writer down first)
+        // superseded our epoch; invalidating and reopening re-claims the current
+        // one. Rollout rows are immutable and de-duplicated by `id` at read time,
+        // so a retried append can never double-count.
+        let writer = self.resident_writer().await?;
+        match writer.put(vec![batch.clone()]).await {
+            Ok(_) => {}
+            Err(err) if is_fenced_error(&err) => {
+                // Drop the fenced writer without close() — its epoch is already
+                // dead — and reopen against the current epoch for a single retry.
+                self.invalidate_writer(&writer).await;
+                let writer = self.resident_writer().await?;
+                writer.put(vec![batch]).await?;
+            }
+            Err(err) => return Err(err),
         }
 
         Ok(self.dataset.manifest.version)
     }
 
-    /// Put one batch through the resident writer, seal it into a generation, and
-    /// await its manifest commit. Reopens the writer once and retries if the
-    /// first attempt is fenced.
-    async fn write_with_resident_writer(&mut self, batch: &RecordBatch) -> LanceResult<()> {
-        match self.put_seal_drain(batch).await {
-            Ok(()) => Ok(()),
-            Err(err) if is_fenced_error(&err) => {
-                // Drop the fenced writer without close() — its epoch is already
-                // dead, so a graceful drain is neither possible nor useful — and
-                // reopen against the current epoch for a single retry.
-                self.write_writer = None;
-                self.put_seal_drain(batch).await
-            }
-            Err(err) => Err(err),
-        }
-    }
-
-    /// One append against the resident writer: ensure it is open, `put` the
-    /// batch (WAL-durable), `force_seal_active` to freeze it into a generation,
-    /// then `wait_for_flush_drain` so the generation is committed to the shard
-    /// manifest (and therefore visible to reads on every instance) before we
-    /// return.
-    async fn put_seal_drain(&mut self, batch: &RecordBatch) -> LanceResult<()> {
-        self.ensure_write_writer().await?;
-        let writer = self
-            .write_writer
-            .as_ref()
-            .expect("ensure_write_writer set the writer");
-        writer.put(vec![batch.clone()]).await?;
-        writer.force_seal_active().await?;
-        writer.wait_for_flush_drain().await?;
-        Ok(())
-    }
-
-    /// Ensure a resident [`ShardWriter`] for this instance's shard is open,
-    /// opening one on first use. Reused across appends: the shard epoch is
-    /// claimed once at open and the object-store connection is pooled,
-    /// eliminating the per-append open/claim/reconnect that dominated append
-    /// latency (a cold DNS resolution + TCP/TLS handshake on every append).
-    async fn ensure_write_writer(&mut self) -> LanceResult<()> {
-        if self.write_writer.is_some() {
-            return Ok(());
+    /// Fetch the resident [`ShardWriter`], opening one on first use. The mutex is
+    /// held only to read-or-open and clone the `Arc`; it is released before the
+    /// caller `put`s, so steady-state appends run concurrently. Opening under the
+    /// lock serializes only the (rare) first open / post-fence reopen, never the
+    /// hot path.
+    async fn resident_writer(&self) -> LanceResult<Arc<ShardWriter>> {
+        let mut guard = self.write_writer.lock().await;
+        if let Some(writer) = guard.as_ref() {
+            return Ok(writer.clone());
         }
         let config = ShardWriterConfig {
             shard_id: self.write_shard,
             ..Default::default()
         };
-        let writer = self
-            .dataset
-            .mem_wal_writer(self.write_shard, config)
-            .await?;
-        self.write_writer = Some(writer);
-        Ok(())
+        let writer = Arc::new(
+            self.dataset
+                .mem_wal_writer(self.write_shard, config)
+                .await?,
+        );
+        *guard = Some(writer.clone());
+        Ok(writer)
+    }
+
+    /// Invalidate a fenced writer so the next [`Self::resident_writer`] reopens.
+    /// Identity-checked: only clears the slot if it still holds `stale`, so when N
+    /// concurrent appends all fence on the same writer, the first clears+reopens
+    /// and the rest observe a fresh (non-stale) writer and reuse it — exactly one
+    /// reopen, and no append installs a writer another append just invalidated.
+    async fn invalidate_writer(&self, stale: &Arc<ShardWriter>) {
+        let mut guard = self.write_writer.lock().await;
+        if guard.as_ref().is_some_and(|cur| Arc::ptr_eq(cur, stale)) {
+            *guard = None;
+        }
+    }
+
+    /// Materialize the active memtable into a flushed, queryable generation:
+    /// `force_seal_active` freezes it and hands it to the background flusher, then
+    /// `wait_for_flush_drain` blocks until every frozen memtable has landed in the
+    /// shard manifest (and is therefore visible to reads on every instance).
+    ///
+    /// This is the visibility half of the write path, decoupled from the durable
+    /// append in [`Self::add`] and driven periodically (see the server's global
+    /// sweeper). A no-op when no writer is resident or nothing is buffered.
+    pub async fn flush(&self) -> LanceResult<()> {
+        let writer = {
+            let guard = self.write_writer.lock().await;
+            guard.as_ref().cloned()
+        };
+        let Some(writer) = writer else {
+            return Ok(());
+        };
+        match writer.force_seal_active().await {
+            Ok(()) => {}
+            // A fence means a merge superseded our epoch; the next `add` reopens
+            // and replays. Nothing to flush against the dead epoch.
+            Err(err) if is_fenced_error(&err) => {
+                self.invalidate_writer(&writer).await;
+                return Ok(());
+            }
+            Err(err) => return Err(err),
+        }
+        writer.wait_for_flush_drain().await
     }
 
     /// Gracefully close the resident writer, draining its background tasks.
@@ -575,18 +603,35 @@ impl RolloutStore {
     /// path that can `await` (e.g. an LRU eviction that owns the last handle).
     /// Idempotent: a no-op when no writer is resident.
     pub async fn close(&mut self) -> LanceResult<()> {
-        if let Some(writer) = self.write_writer.take() {
-            writer.close().await?;
+        // `&mut self` gives exclusive access, so `get_mut` avoids an async lock.
+        if let Some(writer) = self.write_writer.get_mut().take() {
+            match Arc::try_unwrap(writer) {
+                // Sole owner: drain the writer's background tasks gracefully.
+                Ok(writer) => writer.close().await?,
+                // Another handle (an in-flight append that cloned the Arc) still
+                // holds it; it will be dropped when that append completes. We hold
+                // `&mut self`, which excludes concurrent adds via the RwLock, so in
+                // practice this only happens transiently. Best-effort: leave it.
+                Err(_shared) => {}
+            }
         }
         Ok(())
     }
 
-    /// If this instance's own shard has at least `merge_after_generations`
-    /// flushed generations, merge them into the base table. No-op otherwise.
-    async fn maybe_merge_own_shard(&mut self) -> LanceResult<()> {
+    /// Merge this instance's flushed generations into the base table **if** the
+    /// shard has accumulated at least `merge_after_generations` of them (the
+    /// count trigger; `0` disables it). No-op otherwise.
+    ///
+    /// This used to run synchronously inside `add`, but `add` is now `&self` and
+    /// merge requires `&mut self` (it claims the shard epoch and reloads the
+    /// dataset). The periodic sweeper drives it instead, preserving the
+    /// count-based bound on read amplification off the hot write path.
+    pub async fn maybe_merge_own_shard(&mut self) -> LanceResult<usize> {
+        if self.merge_after_generations == 0 {
+            return Ok(0);
+        }
         self.merge_own_shard_if_ready(self.merge_after_generations)
             .await
-            .map(|_| ())
     }
 
     /// Merge this instance's flushed MemWAL generations into the base table when
@@ -2026,10 +2071,15 @@ impl Drop for RolloutStore {
     /// closes it; otherwise (no runtime, e.g. some teardown paths) we can only
     /// drop it. Callers that can `await` should prefer [`Self::close`].
     fn drop(&mut self) {
-        if let Some(writer) = self.write_writer.take() {
+        // `&mut self` in drop → exclusive access, so `get_mut` avoids a lock.
+        if let Some(writer) = self.write_writer.get_mut().take() {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {
-                    let _ = writer.close().await;
+                    // Only the sole owner can close; if an append still shares the
+                    // Arc it will drop last. Best-effort either way.
+                    if let Ok(writer) = Arc::try_unwrap(writer) {
+                        let _ = writer.close().await;
+                    }
                 });
             }
         }
@@ -2676,6 +2726,7 @@ mod tests {
         store.dataset.append(base_reader, None).await.unwrap();
 
         store.add(&[assistant_record("legacy-wal")]).await.unwrap();
+        store.flush().await.unwrap();
         assert_eq!(flushed_generation_count(&store).await, 1);
         store.close().await.unwrap();
 
@@ -2759,13 +2810,14 @@ mod tests {
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let mut store = RolloutStore::open(&uri).await.unwrap();
+            let store = RolloutStore::open(&uri).await.unwrap();
             // MemWAL appends land in the `_mem_wal` namespace and do not advance
             // the base dataset version; `add` returns it unchanged.
             store
                 .add(&[assistant.clone(), artifact.clone(), quoted_artifact.clone()])
                 .await
                 .unwrap();
+            store.flush().await.unwrap();
 
             // The LSM read path dedups by `id` across generations and does not
             // guarantee append order, so look rows up by id rather than by
@@ -2802,7 +2854,7 @@ mod tests {
         let uri = dir.path().to_string_lossy().to_string();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let mut store = RolloutStore::open(&uri).await.unwrap();
+            let store = RolloutStore::open(&uri).await.unwrap();
             // Empty store: no rows, no pending generations.
             let obs = store.observe().await.unwrap();
             assert_eq!(obs.row_count, 0);
@@ -2812,6 +2864,7 @@ mod tests {
                 .add(&[assistant_record("a"), assistant_record("b")])
                 .await
                 .unwrap();
+            store.flush().await.unwrap();
 
             // Two MemWAL-appended rows are visible via the LSM read path; the
             // base table itself has not been merged, so they surface as a
@@ -2830,7 +2883,7 @@ mod tests {
         let uri = dir.path().to_string_lossy().to_string();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let mut store = RolloutStore::open(&uri).await.unwrap();
+            let store = RolloutStore::open(&uri).await.unwrap();
 
             let mut first = assistant_record("row-a");
             first.rollout_id = "traj-a".to_string();
@@ -2851,6 +2904,7 @@ mod tests {
             artifact.include_in_training = Some(false);
 
             store.add(&[first, second, artifact]).await.unwrap();
+            store.flush().await.unwrap();
 
             let filters = RolloutFilters {
                 policy_version: Some("ckpt-2".to_string()),
@@ -2882,7 +2936,7 @@ mod tests {
         let uri = dir.path().to_string_lossy().to_string();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let mut store = RolloutStore::open(&uri).await.unwrap();
+            let store = RolloutStore::open(&uri).await.unwrap();
             store
                 .add(&[
                     assistant_record("assistant"),
@@ -2890,6 +2944,7 @@ mod tests {
                 ])
                 .await
                 .unwrap();
+            store.flush().await.unwrap();
 
             let filters = RolloutFilters {
                 role: Some(ROLE_ARTIFACT.to_string()),
@@ -2922,11 +2977,12 @@ mod tests {
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let mut store = RolloutStore::open(&uri).await.unwrap();
+            let store = RolloutStore::open(&uri).await.unwrap();
             store.add(std::slice::from_ref(&artifact)).await.unwrap();
 
             // A second append accumulates rather than replacing the first.
             store.add(&[assistant_record("row-1")]).await.unwrap();
+            store.flush().await.unwrap();
             assert_eq!(store.list(None, None).await.unwrap().len(), 2);
 
             // The first-appended row is still present and unchanged after the
@@ -2958,21 +3014,23 @@ mod tests {
                 merge_after_generations: None,
             };
 
-            let mut instance_a = RolloutStore::open_with_options(&uri, options("rollout-0"))
+            let instance_a = RolloutStore::open_with_options(&uri, options("rollout-0"))
                 .await
                 .unwrap();
             instance_a
                 .add(&[artifact_record("a-0", shard_a_blob)])
                 .await
                 .unwrap();
+            instance_a.flush().await.unwrap();
 
-            let mut instance_b = RolloutStore::open_with_options(&uri, options("rollout-1"))
+            let instance_b = RolloutStore::open_with_options(&uri, options("rollout-1"))
                 .await
                 .unwrap();
             instance_b
                 .add(&[artifact_record("b-0", shard_b_blob)])
                 .await
                 .unwrap();
+            instance_b.flush().await.unwrap();
 
             // Distinct instance ids derive distinct shards.
             assert_ne!(
@@ -3014,7 +3072,7 @@ mod tests {
                 shard_id: Some(shard.to_string()),
                 ..Default::default()
             };
-            let mut instance_a = RolloutStore::open_with_options(&uri, options("filter-a"))
+            let instance_a = RolloutStore::open_with_options(&uri, options("filter-a"))
                 .await
                 .unwrap();
             let mut quoted = assistant_record("row-'quoted");
@@ -3024,12 +3082,14 @@ mod tests {
                 .add(&[quoted, assistant_record("row-a")])
                 .await
                 .unwrap();
+            instance_a.flush().await.unwrap();
 
-            let mut instance_b = RolloutStore::open_with_options(&uri, options("filter-b"))
+            let instance_b = RolloutStore::open_with_options(&uri, options("filter-b"))
                 .await
                 .unwrap();
             let artifact = artifact_record("row-b", b"blob");
             instance_b.add(&[artifact]).await.unwrap();
+            instance_b.flush().await.unwrap();
 
             let reader = RolloutStore::open(&uri).await.unwrap();
             let quoted_page = reader
@@ -3086,7 +3146,7 @@ mod tests {
         let uri = dir.path().to_string_lossy().to_string();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let mut writer = RolloutStore::open_with_options(
+            let writer = RolloutStore::open_with_options(
                 &uri,
                 RolloutStoreOptions {
                     shard_id: Some("refresh-writer".to_string()),
@@ -3097,6 +3157,7 @@ mod tests {
             .await
             .unwrap();
             writer.add(&[assistant_record("row-0")]).await.unwrap();
+            writer.flush().await.unwrap();
 
             let mut cached_reader =
                 RolloutStore::open_existing_with_options(&uri, RolloutStoreOptions::default())
@@ -3105,6 +3166,7 @@ mod tests {
             assert_eq!(cached_reader.list(None, None).await.unwrap().len(), 1);
 
             writer.add(&[assistant_record("row-1")]).await.unwrap();
+            writer.flush().await.unwrap();
             cached_reader.refresh_latest().await.unwrap();
 
             let ids: HashSet<_> = cached_reader
@@ -3144,11 +3206,15 @@ mod tests {
             let mut unrelated = assistant_record("other");
             unrelated.rollout_id = "other".to_string();
             store.add(&[later, unrelated]).await.unwrap();
+            store.flush().await.unwrap();
+            store.maybe_merge_own_shard().await.unwrap();
 
             let mut earlier = assistant_record("row-b");
             earlier.rollout_id = "target".to_string();
             earlier.sequence_order = 0;
             store.add(&[earlier]).await.unwrap();
+            store.flush().await.unwrap();
+            store.maybe_merge_own_shard().await.unwrap();
 
             assert_eq!(store.observe().await.unwrap().fragment_count, 2);
             let rows = store.get_trajectory("target").await.unwrap();
@@ -3219,7 +3285,7 @@ mod tests {
         let uri = dir.path().to_string_lossy().to_string();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let mut store = RolloutStore::open_with_options(
+            let store = RolloutStore::open_with_options(
                 &uri,
                 RolloutStoreOptions {
                     storage_options: None,
@@ -3231,6 +3297,7 @@ mod tests {
             .unwrap();
 
             store.add(&[assistant_record("a-0")]).await.unwrap();
+            store.flush().await.unwrap();
             let epoch_after_first = shard_writer_epoch(&store).await;
 
             // Read-after-write: the first append is visible right away.
@@ -3241,6 +3308,7 @@ mod tests {
                     .add(&[assistant_record(&format!("a-{i}"))])
                     .await
                     .unwrap();
+                store.flush().await.unwrap();
                 // Each append is immediately visible.
                 assert!(
                     store.get_by_id(&format!("a-{i}")).await.unwrap().is_some(),
@@ -3288,6 +3356,8 @@ mod tests {
                     .add(&[assistant_record(&format!("a-{i}"))])
                     .await
                     .unwrap_or_else(|e| panic!("append a-{i} after merge must not be fenced: {e}"));
+                store.flush().await.unwrap();
+                store.maybe_merge_own_shard().await.unwrap();
                 assert!(store.get_by_id(&format!("a-{i}")).await.unwrap().is_some());
             }
 
@@ -3318,17 +3388,112 @@ mod tests {
             .unwrap();
 
             store.add(&[assistant_record("a-0")]).await.unwrap();
-            assert!(store.write_writer.is_some());
+            store.flush().await.unwrap();
+            assert_eq!(store.list(None, None).await.unwrap().len(), 1);
 
             // Idempotent close drops the resident writer.
             store.close().await.unwrap();
-            assert!(store.write_writer.is_none());
             store.close().await.unwrap(); // second close is a no-op
 
             // add() after close reopens the writer and stays visible.
             store.add(&[assistant_record("a-1")]).await.unwrap();
-            assert!(store.write_writer.is_some());
+            store.flush().await.unwrap();
             assert_eq!(store.list(None, None).await.unwrap().len(), 2);
+        });
+    }
+
+    #[test]
+    fn add_is_durable_but_not_visible_until_flush() {
+        // Core semantic of the concurrent-write design: `add` returns once the
+        // record is durable (WAL-persisted), but the row is NOT visible to reads
+        // until `flush` seals the memtable into a queryable generation. This is
+        // the accepted read-after-write asynchrony that lets appends run without
+        // a per-append seal.
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let store = RolloutStore::open(&uri).await.unwrap();
+
+            store.add(&[assistant_record("a-0")]).await.unwrap();
+            // Durable, but not yet flushed: the read path (base ∪ flushed
+            // generations) does not see it.
+            assert_eq!(store.list(None, None).await.unwrap().len(), 0);
+            assert!(store.get_by_id("a-0").await.unwrap().is_none());
+
+            // After a flush the row is visible, and nothing was lost.
+            store.flush().await.unwrap();
+            assert_eq!(store.list(None, None).await.unwrap().len(), 1);
+            assert!(store.get_by_id("a-0").await.unwrap().is_some());
+        });
+    }
+
+    #[test]
+    fn concurrent_adds_share_one_store_and_none_are_lost() {
+        // `add` is `&self`, so many appends can run concurrently against one
+        // shared store handle (no RwLock, no per-append serialization). All must
+        // succeed and every record must survive to be readable after a flush.
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let store = Arc::new(RolloutStore::open(&uri).await.unwrap());
+
+            const N: usize = 50;
+            let mut handles = Vec::with_capacity(N);
+            for i in 0..N {
+                let store = store.clone();
+                handles.push(tokio::spawn(async move {
+                    store
+                        .add(&[assistant_record(&format!("row-{i}"))])
+                        .await
+                        .unwrap();
+                }));
+            }
+            for h in handles {
+                h.await.unwrap();
+            }
+
+            store.flush().await.unwrap();
+            let listed = store.list(None, None).await.unwrap();
+            assert_eq!(listed.len(), N, "every concurrent append must be readable");
+            for i in 0..N {
+                assert!(
+                    store
+                        .get_by_id(&format!("row-{i}"))
+                        .await
+                        .unwrap()
+                        .is_some(),
+                    "row-{i} was lost"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn flush_is_noop_without_writes() {
+        // flush() with no resident writer / nothing buffered must be a harmless
+        // no-op (the periodic sweeper calls it on every resident store each tick).
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let store = RolloutStore::open(&uri).await.unwrap();
+            // No writer opened yet, nothing buffered.
+            store.flush().await.unwrap();
+            store.flush().await.unwrap();
+            assert_eq!(store.list(None, None).await.unwrap().len(), 0);
+
+            // A flush after an add makes the row visible; a second flush is a
+            // no-op (memtable already drained).
+            store.add(&[assistant_record("a-0")]).await.unwrap();
+            store.flush().await.unwrap();
+            store.flush().await.unwrap();
+            assert_eq!(store.list(None, None).await.unwrap().len(), 1);
         });
     }
 
@@ -3360,11 +3525,15 @@ mod tests {
                     .add(&[assistant_record(&format!("a-{i}"))])
                     .await
                     .unwrap();
+                store.flush().await.unwrap();
+                store.maybe_merge_own_shard().await.unwrap();
             }
             store
                 .add(&[artifact_record("a-6", artifact_bytes)])
                 .await
                 .unwrap();
+            store.flush().await.unwrap();
+            store.maybe_merge_own_shard().await.unwrap();
 
             let before = store.dataset.count_fragments();
             assert!(before > 1, "expected several fragments, got {before}");
@@ -3408,7 +3577,7 @@ mod tests {
         let uri = dir.path().to_string_lossy().to_string();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let mut store = RolloutStore::open_with_options(
+            let store = RolloutStore::open_with_options(
                 &uri,
                 RolloutStoreOptions {
                     storage_options: None,
@@ -3464,10 +3633,12 @@ mod tests {
             .unwrap();
             for i in 0..5 {
                 a.add(&[assistant_record(&format!("a-{i}"))]).await.unwrap();
+                a.flush().await.unwrap();
+                a.maybe_merge_own_shard().await.unwrap();
             }
 
             // B accumulates its own shard's generations (not yet merged).
-            let mut b = RolloutStore::open_with_options(
+            let b = RolloutStore::open_with_options(
                 &uri,
                 RolloutStoreOptions {
                     storage_options: None,
@@ -3479,6 +3650,7 @@ mod tests {
             .unwrap();
             for i in 0..3 {
                 b.add(&[assistant_record(&format!("b-{i}"))]).await.unwrap();
+                b.flush().await.unwrap();
             }
 
             let a = Arc::new(RwLock::new(a));
@@ -3514,7 +3686,7 @@ mod tests {
         let uri = dir.path().to_string_lossy().to_string();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let mut store = RolloutStore::open_with_options(
+            let store = RolloutStore::open_with_options(
                 &uri,
                 RolloutStoreOptions {
                     storage_options: None,
@@ -3526,7 +3698,9 @@ mod tests {
             .unwrap();
 
             store.add(&[assistant_record("a-0")]).await.unwrap();
+            store.flush().await.unwrap();
             store.add(&[assistant_record("a-1")]).await.unwrap();
+            store.flush().await.unwrap();
 
             // Two generations accumulated, threshold (3) not reached: no merge.
             assert_eq!(flushed_generation_count(&store).await, 2);
@@ -3558,12 +3732,16 @@ mod tests {
             .unwrap();
 
             store.add(&[assistant_record("a-0")]).await.unwrap();
+            store.flush().await.unwrap();
             store.add(&[assistant_record("a-1")]).await.unwrap();
+            store.flush().await.unwrap();
             // The third append reaches the threshold and triggers the merge.
             store
                 .add(&[artifact_record("a-2", artifact_bytes)])
                 .await
                 .unwrap();
+            store.flush().await.unwrap();
+            store.maybe_merge_own_shard().await.unwrap();
 
             // Shard drained: no un-merged generations remain.
             assert_eq!(flushed_generation_count(&store).await, 0);
@@ -3608,7 +3786,10 @@ mod tests {
                 .await
                 .unwrap();
                 store.add(&[assistant_record("a-0")]).await.unwrap();
+                store.flush().await.unwrap();
                 store.add(&[assistant_record("a-1")]).await.unwrap();
+                store.flush().await.unwrap();
+                store.maybe_merge_own_shard().await.unwrap();
                 assert_eq!(flushed_generation_count(&store).await, 0);
             }
 
@@ -3644,12 +3825,14 @@ mod tests {
             .unwrap();
 
             store.add(&[assistant_record("a-0")]).await.unwrap();
+            store.flush().await.unwrap();
             // One generation pending: the time trigger merges it immediately —
             // it does not wait for a count threshold.
             assert_eq!(store.cleanup_own_shard().await.unwrap(), 1);
             assert_eq!(flushed_generation_count(&store).await, 0);
 
             store.add(&[assistant_record("a-1")]).await.unwrap();
+            store.flush().await.unwrap();
             // Next generation is likewise merged on the following pass.
             assert_eq!(store.cleanup_own_shard().await.unwrap(), 1);
             assert_eq!(flushed_generation_count(&store).await, 0);
@@ -3784,6 +3967,7 @@ mod tests {
             // MemWAL index) present when we build the scalar index.
             store.add(&[assistant_record("a-0")]).await.unwrap();
             store.add(&[assistant_record("a-1")]).await.unwrap();
+            store.flush().await.unwrap();
             store.cleanup_own_shard().await.unwrap();
 
             store.create_id_zonemap_index().await.unwrap();
@@ -3845,11 +4029,13 @@ mod tests {
             };
 
             // Two instances, each accumulates a few generations on its own shard.
-            let mut a = make("rollout-0").await;
-            let mut b = make("rollout-1").await;
+            let a = make("rollout-0").await;
+            let b = make("rollout-1").await;
             for i in 0..4 {
                 a.add(&[assistant_record(&format!("a-{i}"))]).await.unwrap();
+                a.flush().await.unwrap();
                 b.add(&[assistant_record(&format!("b-{i}"))]).await.unwrap();
+                b.flush().await.unwrap();
             }
             assert_eq!(flushed_generation_count(&a).await, 4);
             assert_eq!(flushed_generation_count(&b).await, 4);
@@ -3917,6 +4103,7 @@ mod tests {
                     .add(&[assistant_record(&format!("g-{i}"))])
                     .await
                     .unwrap();
+                store.flush().await.unwrap();
             }
             assert_eq!(flushed_generation_count(&store).await, 3);
 
@@ -3927,6 +4114,7 @@ mod tests {
             // Append a fourth AFTER the drain: it forms a new generation that the
             // prior merge must not have wiped. A second merge folds just that one.
             store.add(&[assistant_record("g-3")]).await.unwrap();
+            store.flush().await.unwrap();
             assert_eq!(flushed_generation_count(&store).await, 1);
             assert_eq!(store.cleanup_own_shard().await.unwrap(), 1);
 
@@ -3971,7 +4159,9 @@ mod tests {
 
             // Two un-merged rows sit in the WAL only.
             store.add(&[assistant_record("g-0")]).await.unwrap();
+            store.flush().await.unwrap();
             store.add(&[assistant_record("g-1")]).await.unwrap();
+            store.flush().await.unwrap();
             assert_eq!(flushed_generation_count(&store).await, 2);
 
             assert!(
@@ -4155,7 +4345,7 @@ mod tests {
             // --- Un-merged: accumulate N generations, never merge. ---
             let dir_no_merge = TempDir::new().unwrap();
             let uri = dir_no_merge.path().to_string_lossy().to_string();
-            let mut store = RolloutStore::open_with_options(
+            let store = RolloutStore::open_with_options(
                 &uri,
                 RolloutStoreOptions {
                     storage_options: None,
@@ -4184,7 +4374,7 @@ mod tests {
             // base as soon as it lands (threshold 1). ---
             let dir_merge = TempDir::new().unwrap();
             let uri_m = dir_merge.path().to_string_lossy().to_string();
-            let mut merge_store = RolloutStore::open_with_options(
+            let merge_store = RolloutStore::open_with_options(
                 &uri_m,
                 RolloutStoreOptions {
                     storage_options: None,
@@ -4247,6 +4437,7 @@ mod tests {
             .unwrap();
             let artifact = artifact_record("row-x", bytes);
             store.add(std::slice::from_ref(&artifact)).await.unwrap();
+            store.flush().await.unwrap();
 
             // Row is only in the WAL (nothing merged): base-first misses, the
             // fallback finds it.
@@ -4328,6 +4519,7 @@ mod tests {
             .unwrap();
             let base = artifact_record("dup", bytes);
             store.add(std::slice::from_ref(&base)).await.unwrap();
+            store.flush().await.unwrap();
             store.cleanup_own_shard().await.unwrap();
             assert_eq!(flushed_generation_count(&store).await, 0);
 
@@ -4365,6 +4557,7 @@ mod tests {
             .unwrap();
             let artifact = artifact_record("row-rw", bytes);
             store.add(std::slice::from_ref(&artifact)).await.unwrap();
+            store.flush().await.unwrap();
 
             // Un-merged: found via the WAL fallback, row + payload paired.
             assert_eq!(flushed_generation_count(&store).await, 1);
@@ -4424,7 +4617,7 @@ mod tests {
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let mut store = RolloutStore::open(&uri).await.unwrap();
+            let store = RolloutStore::open(&uri).await.unwrap();
             store
                 .add(&[
                     assistant_record("a-0"),
@@ -4433,6 +4626,7 @@ mod tests {
                 ])
                 .await
                 .unwrap();
+            store.flush().await.unwrap();
 
             // Aggregate over the merged (base + pending WAL) view.
             let result = store

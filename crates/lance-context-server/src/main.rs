@@ -47,6 +47,10 @@ async fn main() {
     // the last `Arc<AppState>` is dropped.
     let _sweeper = state.spawn_global_sweeper();
 
+    // Periodic MemWAL flush sweeper: bounds rollout read-after-write latency
+    // without serializing concurrent appends. Detached for the server lifetime.
+    let _flush_sweeper = state.spawn_flush_sweeper();
+
     // Install the Prometheus recorder once, before any metrics are emitted.
     let metrics_handle = lance_context_metrics::install_recorder();
 

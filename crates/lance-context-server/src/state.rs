@@ -47,6 +47,10 @@ pub struct AppState {
     /// Periodic per-shard WAL-cleanup interval in seconds; `0` disables the
     /// global sweeper. See [`Self::spawn_global_sweeper`].
     pub rollout_cleanup_interval_secs: u64,
+    /// Periodic MemWAL flush interval in seconds; `0` disables periodic flush.
+    /// Bounds rollout read-after-write latency (appends are durable but not
+    /// visible until flushed). See [`Self::spawn_global_sweeper`].
+    pub rollout_flush_interval_secs: u64,
     /// Admission budget for in-flight artifact-blob bytes across concurrent
     /// uploads/downloads. `None` disables the budget (unbounded). See
     /// [`BlobBudget`].
@@ -154,6 +158,7 @@ impl AppState {
             instance_id,
             rollout_merge_after_generations: config.rollout_merge_after_generations,
             rollout_cleanup_interval_secs: config.rollout_cleanup_interval_secs,
+            rollout_flush_interval_secs: config.rollout_flush_interval_secs,
             blob_budget,
         })
     }
@@ -191,6 +196,7 @@ impl AppState {
             instance_id,
             rollout_merge_after_generations: 0,
             rollout_cleanup_interval_secs: 0,
+            rollout_flush_interval_secs: 0,
             blob_budget: None,
         }
     }
@@ -426,7 +432,92 @@ impl AppState {
         }))
     }
 
-    /// Gracefully drain every resident rollout writer on shutdown.
+    /// Spawn the process-wide MemWAL flush sweeper.
+    ///
+    /// Rollout appends are durable on return (the WAL entry is persisted) but not
+    /// visible to reads until the active memtable is flushed into a queryable
+    /// generation. Rather than flush on every append — which would serialize
+    /// concurrent writes behind a per-append seal — this sweeper flushes each
+    /// resident store on a fixed interval, bounding read-after-write latency
+    /// while keeping the append path concurrent.
+    ///
+    /// After flushing a store it also runs the count-triggered merge
+    /// ([`RolloutStore::maybe_merge_own_shard`]): the read-amplification bound
+    /// that formerly lived on the append path now rides this timer. The heavier
+    /// time-based cleanup/merge remains on [`Self::spawn_global_sweeper`].
+    ///
+    /// Returns `None` when the flush interval is `0`.
+    pub fn spawn_flush_sweeper(self: &Arc<Self>) -> Option<JoinHandle<()>> {
+        let interval_secs = self.rollout_flush_interval_secs;
+        if interval_secs == 0 {
+            return None;
+        }
+        let interval = Duration::from_secs(interval_secs);
+        // Abandon any single store's flush that outruns five intervals (min 30s)
+        // so one wedged store cannot stall flushing for the rest.
+        let pass_timeout = interval.saturating_mul(5).max(Duration::from_secs(30));
+        let weak = Arc::downgrade(self);
+        Some(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.tick().await; // skip the immediate first tick
+            loop {
+                ticker.tick().await;
+                let Some(state) = weak.upgrade() else {
+                    return;
+                };
+                let resident: Vec<(String, Arc<RwLock<RolloutStore>>)> = {
+                    let cache = state.rollout_stores.lock().await;
+                    cache
+                        .iter()
+                        .map(|(name, store)| (name.clone(), store.clone()))
+                        .collect()
+                };
+                for (name, store) in resident {
+                    // Flush under a read lock so concurrent appends are not blocked.
+                    {
+                        let guard = store.read().await;
+                        match tokio::time::timeout(pass_timeout, guard.flush()).await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => {
+                                metrics::counter!("rollout_wal_flush_total", "result" => "failed")
+                                    .increment(1);
+                                tracing::warn!(store = %name, error = %e, "flush sweeper failed");
+                                continue;
+                            }
+                            Err(_elapsed) => {
+                                metrics::counter!("rollout_wal_flush_total", "result" => "timeout")
+                                    .increment(1);
+                                tracing::warn!(store = %name, "flush sweeper timed out");
+                                continue;
+                            }
+                        }
+                        metrics::counter!("rollout_wal_flush_total", "result" => "ok").increment(1);
+                    }
+                    // Count-triggered merge (no-op unless the threshold is set and
+                    // met). Needs the write lock; excludes concurrent appends.
+                    let mut guard = store.write().await;
+                    match tokio::time::timeout(pass_timeout, guard.maybe_merge_own_shard()).await {
+                        Ok(Ok(0)) => {}
+                        Ok(Ok(n)) => {
+                            metrics::counter!("rollout_wal_generations_reclaimed_total")
+                                .increment(n as u64);
+                            tracing::info!(
+                                store = %name,
+                                reclaimed = n,
+                                "flush sweeper count-merged flushed generations"
+                            );
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!(store = %name, error = %e, "flush sweeper merge failed");
+                        }
+                        Err(_elapsed) => {
+                            tracing::warn!(store = %name, "flush sweeper merge timed out");
+                        }
+                    }
+                }
+            }
+        }))
+    }
     ///
     /// [`RolloutStore`]'s writer ([`ShardWriter`]) has no `Drop`, so its
     /// background tasks are only reclaimed by an explicit `close().await`. On the
