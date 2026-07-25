@@ -9,6 +9,7 @@ been built (e.g. a pure-Python CI job).
 from __future__ import annotations
 
 import asyncio
+import os
 import socket
 import subprocess
 import tempfile
@@ -43,12 +44,35 @@ def _wait_for_health(base_url: str, timeout: float = 30.0) -> None:
     raise RuntimeError(f"server did not become healthy at {url}")
 
 
+async def _eventually(fn, predicate, timeout: float = 15.0):
+    """Poll `fn` until `predicate` holds, or fail after `timeout`.
+
+    `add` is durable on return but not visible until the server's sweeper seals
+    the memtable, so a read immediately after a write legitimately returns
+    nothing. Polling asserts the row *arrives* without pinning the test to the
+    flush interval.
+    """
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        last = await fn()
+        if predicate(last):
+            return last
+        await asyncio.sleep(0.1)
+    raise AssertionError(f"condition not met within {timeout}s; last value: {last!r}")
+
+
 @pytest.fixture()
 def server():
     if not _SERVER_BIN.exists():
         pytest.skip(f"server binary not built at {_SERVER_BIN}")
     port = _free_port()
     with tempfile.TemporaryDirectory() as data_dir:
+        # Rows are durable on `add` but only become visible when the server's
+        # sweeper seals the memtable. The 30s production default would make
+        # every write-then-assert below hang; 1s keeps the tests honest about
+        # the async-visibility contract without waiting on it.
+        env = {**os.environ, "ROLLOUT_FLUSH_INTERVAL_SECS": "1"}
         proc = subprocess.Popen(
             [
                 str(_SERVER_BIN),
@@ -59,6 +83,7 @@ def server():
                 "--data-dir",
                 data_dir,
             ],
+            env=env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -101,7 +126,7 @@ def test_remote_roundtrip(server):
         )
         assert resp["count"] == 2
 
-        rows = await store.list()
+        rows = await _eventually(store.list, lambda r: len(r) == 2)
         assert {r["id"] for r in rows} == {"row-0", "row-1"}
 
         one = await store.get("row-0")
@@ -125,7 +150,7 @@ def test_remote_add_one_and_connect(server):
         # A second connection sees the first's flushed write (durable, no
         # read affinity).
         reader = await AsyncRolloutStore.connect(server, "rl-run-2")
-        rows = await reader.list()
+        rows = await _eventually(reader.list, lambda r: len(r) == 1)
         assert [r["id"] for r in rows] == ["only"]
 
     asyncio.run(run())
@@ -153,8 +178,11 @@ def test_remote_filtered_list(server):
             ]
         )
 
-        rows = await store.list(
-            filters={"policy_version": "ckpt-7", "include_in_training": True}
+        rows = await _eventually(
+            lambda: store.list(
+                filters={"policy_version": "ckpt-7", "include_in_training": True}
+            ),
+            lambda r: len(r) == 1,
         )
         assert [row["id"] for row in rows] == ["row-7"]
 
@@ -172,7 +200,9 @@ def test_remote_get_trajectory_orders_rows(server):
             ]
         )
 
-        rows = await store.get_trajectory("target")
+        rows = await _eventually(
+            lambda: store.get_trajectory("target"), lambda r: len(r) == 2
+        )
         assert [row["id"] for row in rows] == ["row-b", "row-a"]
 
     asyncio.run(run())

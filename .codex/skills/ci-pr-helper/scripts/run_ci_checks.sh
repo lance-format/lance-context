@@ -15,12 +15,12 @@ fi
 
 cd "$root"
 
-cargo fmt --manifest-path rust/lance-context/Cargo.toml -- --check
-cargo clippy --manifest-path rust/lance-context/Cargo.toml --all-targets -- -D warnings
-cargo test --manifest-path rust/lance-context/Cargo.toml
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --all-targets
 
 cd "$root/python"
 uv run pytest
-uv run ruff format --check python/
-uv run ruff check python/
+uv run ruff format --check .
+uv run ruff check .
 uv run pyright
