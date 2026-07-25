@@ -53,8 +53,15 @@ pub struct ServerConfig {
     /// storage) but are not visible to reads until the memtable is flushed, so
     /// this interval bounds read-after-write latency. Decoupling flush from the
     /// append path is what lets concurrent appends run without serializing behind
-    /// a per-append seal. Default `30`; `0` disables periodic flush (rows then
-    /// only become visible when the cleanup/merge path flushes them).
+    /// a per-append seal. Default `30`.
+    ///
+    /// `0` disables periodic flush, leaving the cleanup sweeper
+    /// (`ROLLOUT_CLEANUP_INTERVAL_SECS`) as the only thing that seals memtables
+    /// — it flushes before merging, so it is a sufficient fallback, but
+    /// read-after-write latency is then bounded by the *cleanup* interval
+    /// instead. Setting **both** to `0` means nothing ever seals: appends stay
+    /// durable but invisible until the process restarts and replays the WAL.
+    /// The server warns at startup in that configuration.
     #[arg(long, env = "ROLLOUT_FLUSH_INTERVAL_SECS", default_value = "30")]
     pub rollout_flush_interval_secs: u64,
 
