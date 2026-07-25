@@ -40,9 +40,19 @@ const JOB_LATENCY_BUCKETS: &[f64] = &[
 /// Metric names whose latency is job-scale rather than request-scale. A `Full`
 /// matcher outranks the `_duration_seconds` `Suffix` matcher (the exporter
 /// applies Full > Prefix > Suffix), so these get [`JOB_LATENCY_BUCKETS`].
+///
+/// Note the `_lock_wait_seconds` entries: they do not end in `_duration_seconds`
+/// and so match no suffix rule, meaning without an explicit entry here they
+/// would fall back to the exporter's default summary rather than a histogram.
 const JOB_LATENCY_METRICS: &[&str] = &[
     "master_task_duration_seconds",
+    "master_task_phase_duration_seconds",
+    "master_merge_wal_worker_duration_seconds",
     "rollout_compaction_duration_seconds",
+    "rollout_compaction_lock_wait_seconds",
+    "rollout_wal_merge_duration_seconds",
+    "rollout_wal_merge_request_duration_seconds",
+    "rollout_wal_merge_lock_wait_seconds",
 ];
 
 /// Handle used to render the Prometheus exposition text on demand, plus a
@@ -82,11 +92,98 @@ pub fn install_recorder() -> MetricsHandle {
     let process = Collector::default();
     // Register the process metric descriptions once up front.
     process.describe();
+    describe_metrics();
 
     MetricsHandle {
         prometheus,
         process: Arc::new(process),
     }
+}
+
+/// Register HELP text for the application metrics.
+///
+/// Purely descriptive, but without it `/metrics` exposes no `# HELP`/`# TYPE`
+/// for any application metric, so a scraped series is uninterpretable without
+/// reading the source.
+fn describe_metrics() {
+    use metrics::{describe_counter, describe_histogram, Unit};
+
+    describe_histogram!(
+        "http_request_duration_seconds",
+        Unit::Seconds,
+        "End-to-end HTTP handler latency, including body parsing and admission control."
+    );
+
+    // Rollout write path. `rollout_add_request_duration_seconds` is labelled by
+    // `flush` because flush is a query param on the add route, so the HTTP
+    // metric's `path` label cannot distinguish the two.
+    describe_histogram!(
+        "rollout_add_request_duration_seconds",
+        Unit::Seconds,
+        "Store time for an add request (add + optional flush), excluding body parsing. \
+         Labels: flush, result."
+    );
+    describe_histogram!(
+        "rollout_add_duration_seconds",
+        Unit::Seconds,
+        "RolloutStore::add — the durable WAL append only. Label: result."
+    );
+    describe_histogram!(
+        "rollout_flush_duration_seconds",
+        Unit::Seconds,
+        "RolloutStore::flush — sealing the memtable so added rows become readable. \
+         Labels: result, outcome (sealed|noop|fenced)."
+    );
+    describe_histogram!(
+        "rollout_wal_merge_duration_seconds",
+        Unit::Seconds,
+        "Per-phase WAL self-merge latency. \
+         Labels: phase (seal|read|append|claim_epoch|drain|delete), result."
+    );
+    describe_histogram!(
+        "rollout_wal_merge_request_duration_seconds",
+        Unit::Seconds,
+        "Worker-side handling of a master-driven WAL merge. Label: result."
+    );
+    describe_histogram!(
+        "rollout_wal_merge_lock_wait_seconds",
+        Unit::Seconds,
+        "Time waiting for the store write lock before a WAL merge (blocks all ingest)."
+    );
+    describe_histogram!(
+        "rollout_compaction_lock_wait_seconds",
+        Unit::Seconds,
+        "Time waiting for the store write lock before compaction."
+    );
+
+    // Master task lifecycle.
+    describe_histogram!(
+        "master_task_duration_seconds",
+        Unit::Seconds,
+        "Task work window only (excludes claim, permit wait, and commit). \
+         Labels: kind, result."
+    );
+    describe_histogram!(
+        "master_task_phase_duration_seconds",
+        Unit::Seconds,
+        "Task latency broken down by phase. \
+         Labels: kind, phase (claim|permit_wait|work|commit)."
+    );
+    describe_histogram!(
+        "master_merge_wal_worker_duration_seconds",
+        Unit::Seconds,
+        "Per-worker round trip of a WAL-merge fan-out; the slowest worker sets task latency. \
+         Label: result."
+    );
+    describe_counter!(
+        "master_merge_wal_workers_total",
+        "WAL-merge fan-out outcomes per worker. \
+         Labels: result (ok|not_found|http_error|transport_error)."
+    );
+    describe_counter!(
+        "master_merge_wal_generations_reclaimed_total",
+        "MemWAL generations folded into base tables by master-driven merges."
+    );
 }
 
 /// Router exposing `GET /metrics` (relative to wherever it is nested/merged).
@@ -148,6 +245,41 @@ mod tests {
         metrics::histogram!("http_request_duration_seconds").record(0.3);
         metrics::histogram!("master_task_duration_seconds").record(45.0);
 
+        // Per-operation write-path metrics: add and flush must be separable, and
+        // an add is separable by whether it flushed (they share one HTTP route,
+        // so the `path` label cannot distinguish them).
+        metrics::histogram!("rollout_add_duration_seconds", "result" => "ok").record(0.02);
+        metrics::histogram!(
+            "rollout_flush_duration_seconds",
+            "result" => "ok",
+            "outcome" => "sealed",
+        )
+        .record(0.4);
+        metrics::histogram!(
+            "rollout_add_request_duration_seconds",
+            "flush" => "true",
+            "result" => "ok",
+        )
+        .record(0.5);
+        metrics::histogram!(
+            "rollout_add_request_duration_seconds",
+            "flush" => "false",
+            "result" => "ok",
+        )
+        .record(0.01);
+        // Job-scale: WAL merge phases and per-worker fan-out.
+        metrics::histogram!(
+            "rollout_wal_merge_duration_seconds",
+            "phase" => "append",
+            "result" => "ok",
+        )
+        .record(120.0);
+        metrics::histogram!("master_task_phase_duration_seconds",
+            "kind" => "merge_wal", "phase" => "claim")
+        .record(90.0);
+        metrics::histogram!("master_merge_wal_worker_duration_seconds", "result" => "ok")
+            .record(200.0);
+
         let app = metrics_router(handle);
         let resp = app
             .oneshot(
@@ -189,6 +321,54 @@ mod tests {
         assert!(
             text.contains("master_task_duration_seconds_bucket{le=\"300\"}"),
             "job latency should use the extended (job) bucket set; body: {text}"
+        );
+
+        // add and flush must be distinct series, not one blended number.
+        assert!(
+            text.contains("# TYPE rollout_add_duration_seconds histogram")
+                && text.contains("# TYPE rollout_flush_duration_seconds histogram"),
+            "add and flush must be separate histograms; body: {text}"
+        );
+        // flush's `outcome` separates real sealing from the no-op fast path,
+        // which otherwise dominates the distribution with near-zero samples.
+        assert!(
+            text.contains("outcome=\"sealed\""),
+            "flush should carry an outcome label; body: {text}"
+        );
+        // The two add paths differ only by query param, so the `flush` label is
+        // the only thing that can separate them.
+        assert!(
+            text.contains("flush=\"true\"") && text.contains("flush=\"false\""),
+            "flushing and non-flushing adds must be separable; body: {text}"
+        );
+
+        // Job-scale bucket set must apply to the new long-running metrics too,
+        // otherwise a 120s merge phase lands in +Inf and p99 is unusable.
+        for name in [
+            "rollout_wal_merge_duration_seconds",
+            "master_task_phase_duration_seconds",
+            "master_merge_wal_worker_duration_seconds",
+        ] {
+            assert!(
+                text.contains(&format!("# TYPE {name} histogram")),
+                "{name} should be a histogram; body: {text}"
+            );
+            // Must assert the 300s bucket on *this* metric's own series: a bare
+            // `le="300"` substring check passes off any other job-scale metric
+            // in the same body and silently tolerates a missing bucket config.
+            assert!(
+                text.lines().any(|line| {
+                    line.starts_with(&format!("{name}_bucket{{")) && line.contains("le=\"300\"")
+                }),
+                "{name} should use the extended (job) bucket set; body: {text}"
+            );
+        }
+
+        // Every application metric should carry HELP so a scrape is
+        // interpretable without reading the source.
+        assert!(
+            text.contains("# HELP rollout_add_duration_seconds"),
+            "new metrics should be described; body: {text}"
         );
     }
 }

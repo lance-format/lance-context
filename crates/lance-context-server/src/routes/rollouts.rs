@@ -310,20 +310,56 @@ pub async fn add_rollouts(
     // concurrent, so multiple ingest requests to the same store run in parallel.
     // Mutating ops (merge, compact, checkout, close) still take the write lock.
     let store = store_lock.read().await;
-    let version = store
-        .add(&core_records)
-        .await
-        .map_err(AppError::from_lance)?;
+
+    // Times only the store work (`add` + optional `flush`), excluding body
+    // parsing, multipart decode and blob-budget admission. Subtracting this from
+    // `http_request_duration_seconds` gives the framing overhead. The `flush`
+    // label is what makes a flushing add separable at all: flush is a query
+    // param on this same route, so `MatchedPath` (and therefore the HTTP
+    // metric's `path` label) is byte-identical for both.
+    let store_start = std::time::Instant::now();
+    let add_result = store.add(&core_records).await;
+    let version = match add_result {
+        Ok(v) => v,
+        Err(e) => {
+            metrics::histogram!(
+                "rollout_add_request_duration_seconds",
+                "flush" => if flush { "true" } else { "false" },
+                "result" => "error",
+            )
+            .record(store_start.elapsed().as_secs_f64());
+            return Err(AppError::from_lance(e));
+        }
+    };
 
     // Opt-in read-your-write: seal the memtable so the rows just appended are
     // readable by the time this responds. Still the read lock — `flush` is
     // `&self`, and concurrent appends are safe against it.
     if flush {
-        store.flush().await.map_err(AppError::from_lance)?;
+        if let Err(e) = store.flush().await {
+            metrics::histogram!(
+                "rollout_add_request_duration_seconds",
+                "flush" => "true",
+                "result" => "error",
+            )
+            .record(store_start.elapsed().as_secs_f64());
+            return Err(AppError::from_lance(e));
+        }
         metrics::counter!("rollout_appends_flushed_total").increment(1);
     }
 
-    metrics::counter!("rollout_appends_total").increment(1);
+    metrics::histogram!(
+        "rollout_add_request_duration_seconds",
+        "flush" => if flush { "true" } else { "false" },
+        "result" => "ok",
+    )
+    .record(store_start.elapsed().as_secs_f64());
+
+    metrics::counter!(
+        "rollout_appends_total",
+        "flush" => if flush { "true" } else { "false" },
+    )
+    .increment(1);
     metrics::counter!("rollout_records_appended_total").increment(count as u64);
 
     Ok((
@@ -555,7 +591,10 @@ pub async fn compact_rollout(
         None
     };
 
+    let lock_start = std::time::Instant::now();
     let mut store = store_lock.write().await;
+    ::metrics::histogram!("rollout_compaction_lock_wait_seconds")
+        .record(lock_start.elapsed().as_secs_f64());
     let compact_start = std::time::Instant::now();
     let compact_result = store.compact(config).await;
     ::metrics::histogram!("rollout_compaction_duration_seconds")
@@ -611,15 +650,39 @@ pub async fn merge_wal(
     Path(name): Path<String>,
 ) -> Result<Json<MergeWalResponse>, AppError> {
     let store_lock = state.get_or_open_rollout_store(&name).await?;
+    // The write lock blocks all ingest on this store for the duration of the
+    // merge, so it is timed separately from the merge itself: a slow merge and a
+    // merge that spent its time queued behind other writers are different
+    // problems with the same end-to-end number.
+    let lock_start = std::time::Instant::now();
     let mut store = store_lock.write().await;
-    let reclaimed = store
-        .cleanup_own_shard()
-        .await
-        .map_err(AppError::from_lance)?;
-    if reclaimed > 0 {
-        ::metrics::counter!("rollout_wal_cleanup_total", "result" => "merged").increment(1);
-        ::metrics::counter!("rollout_wal_generations_reclaimed_total").increment(reclaimed as u64);
-    }
+    ::metrics::histogram!("rollout_wal_merge_lock_wait_seconds")
+        .record(lock_start.elapsed().as_secs_f64());
+
+    let merge_start = std::time::Instant::now();
+    let result = store.cleanup_own_shard().await;
+    ::metrics::histogram!(
+        "rollout_wal_merge_request_duration_seconds",
+        "result" => if result.is_ok() { "ok" } else { "error" },
+    )
+    .record(merge_start.elapsed().as_secs_f64());
+
+    let reclaimed = match result {
+        Ok(n) => n,
+        Err(e) => {
+            ::metrics::counter!("rollout_wal_cleanup_total", "result" => "failed").increment(1);
+            return Err(AppError::from_lance(e));
+        }
+    };
+    // Emitted unconditionally: gating on `reclaimed > 0` made the common no-op
+    // merge invisible, so a worker that never has anything to merge and a worker
+    // that is never called looked identical.
+    ::metrics::counter!(
+        "rollout_wal_cleanup_total",
+        "result" => if reclaimed > 0 { "merged" } else { "noop" },
+    )
+    .increment(1);
+    ::metrics::counter!("rollout_wal_generations_reclaimed_total").increment(reclaimed as u64);
     Ok(Json(MergeWalResponse { reclaimed }))
 }
 

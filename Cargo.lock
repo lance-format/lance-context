@@ -5492,6 +5492,8 @@ dependencies = [
  "lance-index 7.0.0",
  "lance-namespace 7.0.0",
  "lancedb",
+ "metrics",
+ "metrics-util",
  "serde",
  "serde_json",
  "tempfile",
@@ -6902,7 +6904,9 @@ dependencies = [
  "crossbeam-epoch",
  "crossbeam-utils",
  "hashbrown 0.15.5",
+ "indexmap 2.14.0",
  "metrics",
+ "ordered-float 4.6.0",
  "quanta",
  "rand 0.9.4",
  "rand_xoshiro",
@@ -7725,6 +7729,15 @@ name = "ordered-float"
 version = "2.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68f19d67e5a2795c94e73e0bb1cc1a7edeb2e28efd39e2e1c9b7a40c1108b11c"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
+name = "ordered-float"
+version = "4.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7bb71e1b3fa6ca1c61f383464aaf2bb0e2f8e772a1f01d486832464de363b951"
 dependencies = [
  "num-traits",
 ]

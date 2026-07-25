@@ -83,26 +83,58 @@ pub async fn enqueue_with_deps(
     Ok(record)
 }
 
+/// Time spent getting a task to the point where its work can start.
+#[derive(Debug, Clone, Copy, Default)]
+struct TaskClaimTiming {
+    /// The etcd claim transaction (queued→running, lease, target lock).
+    claim: std::time::Duration,
+    /// Waiting for a concurrency permit once the task was already claimed.
+    permit_wait: std::time::Duration,
+}
+
 /// Execute one claimed task and atomically publish its terminal state.
-async fn run_task(state: &Arc<MasterState>, claim: TaskClaim) {
+///
+/// `timing` carries how long the dispatch loop spent claiming this task and
+/// waiting for a concurrency permit, so every phase of the task's life lands on
+/// one metric rather than only the work window.
+async fn run_task(state: &Arc<MasterState>, claim: TaskClaim, timing: TaskClaimTiming) {
     let task = claim.task.clone();
+    let kind = kind_label(task.kind);
+
+    metrics::histogram!("master_task_phase_duration_seconds", "kind" => kind, "phase" => "claim")
+        .record(timing.claim.as_secs_f64());
+    metrics::histogram!(
+        "master_task_phase_duration_seconds",
+        "kind" => kind,
+        "phase" => "permit_wait",
+    )
+    .record(timing.permit_wait.as_secs_f64());
+
     let started = std::time::Instant::now();
     let outcome = match task.kind {
         TaskKind::Compact => run_compaction(state, &task.target).await,
         TaskKind::MergeWal => run_merge_wal(state, &task.target).await,
         TaskKind::IndexId => run_index_id(state, &task.target).await,
     };
-
-    metrics::histogram!("master_task_duration_seconds", "kind" => kind_label(task.kind))
-        .record(started.elapsed().as_secs_f64());
+    let work_elapsed = started.elapsed();
     let result = if outcome.is_ok() { "success" } else { "failed" };
-    metrics::counter!("master_tasks_total", "kind" => kind_label(task.kind), "result" => result)
-        .increment(1);
+
+    metrics::histogram!("master_task_phase_duration_seconds", "kind" => kind, "phase" => "work")
+        .record(work_elapsed.as_secs_f64());
+    // Scope unchanged (the work window) for back-compat, but now labelled by
+    // result so a fast failure is not averaged in with fast successes.
+    metrics::histogram!("master_task_duration_seconds", "kind" => kind, "result" => result)
+        .record(work_elapsed.as_secs_f64());
+    metrics::counter!("master_tasks_total", "kind" => kind, "result" => result).increment(1);
 
     if let Err(error) = &outcome {
         tracing::warn!(task = %task.id, target = %task.target, error, "task failed");
     }
-    if let Err(error) = state.task_store.finish(claim, outcome).await {
+    let commit_start = std::time::Instant::now();
+    let finished = state.task_store.finish(claim, outcome).await;
+    metrics::histogram!("master_task_phase_duration_seconds", "kind" => kind, "phase" => "commit")
+        .record(commit_start.elapsed().as_secs_f64());
+    if let Err(error) = finished {
         tracing::error!(task = %task.id, error = %error, "failed to persist task completion");
     }
 }
@@ -177,17 +209,27 @@ async fn run_merge_wal(state: &Arc<MasterState>, name: &str) -> Result<String, S
             name
         );
         async move {
-            let resp = http.post(&url).send().await.map_err(|e| e.to_string())?;
-            let status = resp.status();
-            if status == reqwest::StatusCode::NOT_FOUND {
-                // This worker owns no shard for `name`; treat as 0 reclaimed.
-                return Ok::<usize, String>(0);
-            }
-            if !status.is_success() {
-                return Err(format!("{url}: HTTP {status}"));
-            }
-            let body: MergeWalReply = resp.json().await.map_err(|e| e.to_string())?;
-            Ok(body.reclaimed)
+            // Per-worker timing: `join_all` means the slowest worker sets the
+            // whole task's latency, so without this one straggler is
+            // indistinguishable from every worker being slow.
+            let started = std::time::Instant::now();
+            let outcome = merge_wal_one(&http, &url).await;
+            let result = match &outcome {
+                Ok(WorkerMerge::Reclaimed(_)) => "ok",
+                Ok(WorkerMerge::NotFound) => "not_found",
+                Err(WorkerMergeError::Http(_)) => "http_error",
+                Err(WorkerMergeError::Transport(_)) => "transport_error",
+            };
+            metrics::histogram!(
+                "master_merge_wal_worker_duration_seconds",
+                "result" => result,
+            )
+            .record(started.elapsed().as_secs_f64());
+            // Counted per worker per attempt: a 404 is tolerated as "owns no
+            // shard" and N-1 failures still report task success, so this counter
+            // is the only place partial failure is visible at all.
+            metrics::counter!("master_merge_wal_workers_total", "result" => result).increment(1);
+            outcome
         }
     });
 
@@ -198,13 +240,18 @@ async fn run_merge_wal(state: &Arc<MasterState>, name: &str) -> Result<String, S
     let mut last_err = None;
     for r in results {
         match r {
-            Ok(n) => {
+            Ok(WorkerMerge::Reclaimed(n)) => {
                 reclaimed += n;
                 ok_workers += 1;
             }
-            Err(e) => last_err = Some(e),
+            Ok(WorkerMerge::NotFound) => {
+                ok_workers += 1;
+            }
+            Err(e) => last_err = Some(e.to_string()),
         }
     }
+
+    metrics::counter!("master_merge_wal_generations_reclaimed_total").increment(reclaimed as u64);
 
     if ok_workers == 0 {
         return Err(last_err.unwrap_or_else(|| "all workers failed".to_string()));
@@ -212,6 +259,50 @@ async fn run_merge_wal(state: &Arc<MasterState>, name: &str) -> Result<String, S
     Ok(format!(
         "merged {reclaimed} generations across {ok_workers}/{total_workers} workers"
     ))
+}
+
+/// One worker's response to a WAL-merge fan-out.
+enum WorkerMerge {
+    Reclaimed(usize),
+    /// The worker owns no shard for this experiment; tolerated as success.
+    NotFound,
+}
+
+enum WorkerMergeError {
+    /// A non-success HTTP status.
+    Http(String),
+    /// Connection/timeout/decode failure.
+    Transport(String),
+}
+
+impl std::fmt::Display for WorkerMergeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Http(m) | Self::Transport(m) => f.write_str(m),
+        }
+    }
+}
+
+/// Issue the merge call to one worker, classifying the failure mode so the
+/// caller can label its metrics.
+async fn merge_wal_one(http: &reqwest::Client, url: &str) -> Result<WorkerMerge, WorkerMergeError> {
+    let resp = http
+        .post(url)
+        .send()
+        .await
+        .map_err(|e| WorkerMergeError::Transport(e.to_string()))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(WorkerMerge::NotFound);
+    }
+    if !status.is_success() {
+        return Err(WorkerMergeError::Http(format!("{url}: HTTP {status}")));
+    }
+    let body: MergeWalReply = resp
+        .json()
+        .await
+        .map_err(|e| WorkerMergeError::Transport(e.to_string()))?;
+    Ok(WorkerMerge::Reclaimed(body.reclaimed))
 }
 
 /// Refresh the stats row for `name` after a successful compaction: re-observe
@@ -390,16 +481,27 @@ pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
                 metrics::gauge!("master_task_queue_depth").set(queued as f64);
             }
             while sem.available_permits() > 0 {
+                let claim_start = std::time::Instant::now();
                 match dispatch_state.task_store.claim_next().await {
                     Ok(Some(claim)) => {
+                        let claim_elapsed = claim_start.elapsed();
+                        // The task is already claimed at this point (queue key
+                        // deleted, lease granted, target lock held), so time
+                        // spent here is a claimed-but-idle task holding its
+                        // per-experiment lock — worth seeing separately.
+                        let permit_start = std::time::Instant::now();
                         let permit = sem
                             .clone()
                             .acquire_owned()
                             .await
                             .expect("semaphore never closed");
+                        let timing = TaskClaimTiming {
+                            claim: claim_elapsed,
+                            permit_wait: permit_start.elapsed(),
+                        };
                         let st = dispatch_state.clone();
                         tokio::spawn(async move {
-                            run_task(&st, claim).await;
+                            run_task(&st, claim, timing).await;
                             drop(permit);
                         });
                     }
