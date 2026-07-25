@@ -140,7 +140,7 @@ jobs:
         run: |
           uv venv
           source .venv/bin/activate
-          uv pip install pytest
+          uv pip install pytest pytest-asyncio
       - name: Download wheel
         uses: actions/download-artifact@v4
         with:
@@ -151,20 +151,18 @@ jobs:
         run: |
           source .venv/bin/activate
           WHEEL=$(ls dist/*.whl)
-          uv pip install "${WHEEL}[lance-python]"
+          uv pip install "${WHEEL}[lance-python,tests]"
 
       - name: Run tests
         working-directory: python
         run: |
           source .venv/bin/activate
-          pytest python/tests/ -v
+          pytest -v
       - name: Run doctests
         working-directory: python
         run: |
           source .venv/bin/activate
-          if [ -f python/lance_context/__init__.py ]; then
-            python -m doctest python/lance_context/__init__.py || echo "No doctests found"
-          fi
+          python -m doctest python/lance_context/__init__.py
 
   lint:
     runs-on: ubuntu-24.04
@@ -198,12 +196,12 @@ jobs:
         working-directory: python
         run: |
           source .venv/bin/activate
-          ruff format --check python/
+          ruff format --check .
       - name: Run ruff lint
         working-directory: python
         run: |
           source .venv/bin/activate
-          ruff check python/
+          ruff check .
       - name: Run pyright type check
         working-directory: python
         run: |
