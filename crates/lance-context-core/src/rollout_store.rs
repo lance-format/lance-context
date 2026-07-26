@@ -26,7 +26,7 @@
 //! has a single active writer per instance and no two instances share a shard,
 //! the MemWAL epoch-fencing invariant holds *by construction* — there is never
 //! a write war, no matter how a load balancer spreads worker requests across
-//! instances. See `specs/rollout-deployment.md`.
+//! instances. See `docs/src/specs/rollout-deployment.md`.
 //!
 //! `MemWAL close-per-append` makes each write durable on object storage before
 //! `add` returns, and the read path ([`RolloutStore::lsm_scanner`]) rebuilds
@@ -375,7 +375,7 @@ pub struct RolloutStoreOptions {
     /// no two instances ever contend for the same shard. `None` falls back to a
     /// single fixed shard (`"default"`), which is correct for single-instance
     /// deployments but must be set per-instance when running multiple writers.
-    /// See `specs/rollout-deployment.md`.
+    /// See `docs/src/specs/rollout-deployment.md`.
     pub shard_id: Option<String>,
     /// Count-triggered self-merge threshold. After an append flushes a new
     /// generation, if this instance's own shard has accumulated at least this
