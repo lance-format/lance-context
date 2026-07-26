@@ -484,12 +484,27 @@ impl ContextStore {
             groups.entry(key).or_default().push(entry.clone());
         }
 
-        // Ensure MemWAL is initialized (once for the dataset)
+        // Ensure MemWAL is initialized (once for the dataset).
+        //
+        // This is a `CreateIndex` transaction, so two writers reaching a fresh
+        // dataset at the same time both see `has_mem_wal == false` and both try
+        // to create it; the loser gets "Retryable commit conflict ... preempted
+        // by concurrent transaction CreateIndex". That is a one-time race on the
+        // very first write, but it failed the whole append, so a concurrent
+        // cold start could reject every row from one writer.
+        //
+        // Re-check after a conflict rather than retrying blindly: if the other
+        // writer's CreateIndex landed, MemWAL now exists and there is nothing
+        // left to do.
         {
-            let indices = self.dataset.load_indices().await?;
-            let has_mem_wal = indices.iter().any(|i| i.name == MEM_WAL_INDEX_NAME);
+            const MAX_INIT_ATTEMPTS: usize = 5;
+            let mut attempt = 0;
+            loop {
+                let indices = self.dataset.load_indices().await?;
+                if indices.iter().any(|i| i.name == MEM_WAL_INDEX_NAME) {
+                    break;
+                }
 
-            if !has_mem_wal {
                 // ZoneMap indices are not supported by MemWAL; exclude them
                 let maintained_indexes: Vec<String> = indices
                     .iter()
@@ -498,26 +513,81 @@ impl ContextStore {
                     })
                     .map(|i| i.name.clone())
                     .collect();
-                self.dataset
+                match self
+                    .dataset
                     .initialize_mem_wal()
                     .unsharded()
                     .maintained_indexes(maintained_indexes)
                     .execute()
-                    .await?;
+                    .await
+                {
+                    Ok(()) => break,
+                    Err(err) if is_retryable_commit_conflict(&err) => {
+                        attempt += 1;
+                        if attempt >= MAX_INIT_ATTEMPTS {
+                            return Err(err);
+                        }
+                        // Reload so the next iteration observes the winner's
+                        // committed index rather than our stale manifest.
+                        self.dataset.checkout_latest().await?;
+                    }
+                    Err(err) => return Err(err),
+                }
             }
         }
 
         for ((bot_id, session_id), group_entries) in groups {
             let region_id = Self::derive_region_id(&bot_id, &session_id);
             let batch = self.records_to_batch(&group_entries)?;
-            let config = ShardWriterConfig {
-                shard_id: region_id,
-                ..Default::default()
-            };
 
-            let writer = self.dataset.mem_wal_writer(region_id, config).await?;
-            writer.put(vec![batch]).await?;
-            writer.close().await?;
+            // Retry on shard-claim contention.
+            //
+            // `ContextStore` is `Clone`, so `add(&mut self)` does not prevent a
+            // second concurrent writer, and shards are derived from the record's
+            // own `(bot_id, session_id)` rather than from writer identity — so
+            // two writers appending to the *same session* necessarily target the
+            // same shard. Opening a `mem_wal_writer` claims that shard's epoch,
+            // and a concurrent open loses the claim with "another writer claimed
+            // epoch N" (or fences an already-open writer).
+            //
+            // Both are transient: the losing writer only has to reopen against
+            // the now-current epoch. Without this retry the append surfaced a
+            // hard error to the caller — reproducible with two clones appending
+            // to one session (see tests/context_store_concurrent_add.rs).
+            //
+            // Bounded, because a persistent claim failure is a real fault and
+            // must not spin forever. Rows carry caller-supplied ids and are
+            // de-duplicated by id at read time, so a retried append cannot
+            // double-count.
+            const MAX_CLAIM_ATTEMPTS: usize = 5;
+            let mut attempt = 0;
+            loop {
+                let config = ShardWriterConfig {
+                    shard_id: region_id,
+                    ..Default::default()
+                };
+                let result = async {
+                    let writer = self.dataset.mem_wal_writer(region_id, config).await?;
+                    writer.put(vec![batch.clone()]).await?;
+                    writer.close().await
+                }
+                .await;
+
+                match result {
+                    Ok(()) => break,
+                    Err(err) if is_shard_contention_error(&err) => {
+                        attempt += 1;
+                        if attempt >= MAX_CLAIM_ATTEMPTS {
+                            return Err(err);
+                        }
+                        // Brief backoff so the winning writer can finish its
+                        // claim before we re-read the manifest.
+                        tokio::time::sleep(std::time::Duration::from_millis(10 * attempt as u64))
+                            .await;
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
         }
 
         Ok(self.dataset.manifest.version)
@@ -3102,6 +3172,36 @@ where
     batch
         .column_by_name(name)
         .and_then(|col| col.as_ref().as_any().downcast_ref::<A>())
+}
+
+/// Whether a Lance commit failed because a concurrent transaction preempted it.
+///
+/// Lance signals this as retryable in the message itself ("Please retry"), and
+/// the loser only needs to re-read the manifest and re-evaluate. Matching on the
+/// text is unfortunate but is how the rest of this crate classifies Lance
+/// errors; the typed variant is not exposed.
+fn is_retryable_commit_conflict(err: &LanceError) -> bool {
+    let text = err.to_string();
+    text.contains("Retryable commit conflict") || text.contains("was preempted by concurrent")
+}
+
+/// Whether a Lance error means this writer lost a race for a MemWAL shard and
+/// should reopen against the current epoch.
+///
+/// Two distinct wordings, both transient:
+/// - **claim loss** — "Failed to claim shard ... another writer claimed epoch N";
+///   a concurrent open won the claim before ours landed.
+/// - **fence** — an already-open writer was superseded by a newer epoch.
+///
+/// Note the claim-loss text contains neither "fenced" nor "Fenced", so matching
+/// only on those (as the rollout store's `is_fenced_error` does) would miss the
+/// case `ContextStore` actually hits, since it opens a fresh writer per append.
+fn is_shard_contention_error(err: &LanceError) -> bool {
+    let text = err.to_string();
+    text.contains("fenced")
+        || text.contains("Fenced")
+        || text.contains("Failed to claim shard")
+        || text.contains("another writer claimed epoch")
 }
 
 /// Render a SQL `IN (...)` value list as comma-separated quoted string
