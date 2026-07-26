@@ -16,7 +16,7 @@ pub struct ServerConfig {
     /// Stable identity of this server instance, used as the MemWAL shard key for
     /// rollout writes. Each instance must present a distinct, stable value so it
     /// owns exactly one shard and never contends with peers (see
-    /// `specs/rollout-deployment.md`). In Kubernetes, set this to the
+    /// `docs/src/specs/rollout-deployment.md`). In Kubernetes, set this to the
     /// StatefulSet pod ordinal hostname (e.g. `rollout-0`). Defaults to the
     /// `INSTANCE_ID` env var, then the pod/host `HOSTNAME`; if neither is set,
     /// rollout writes fall back to a single shared `default` shard, which is
@@ -27,7 +27,7 @@ pub struct ServerConfig {
     /// Count-triggered self-merge threshold for rollout MemWAL shards. When this
     /// instance's shard has at least this many un-merged flushed generations, the
     /// periodic sweeper folds them into the base table and drains the shard (see
-    /// `specs/rollout-deployment.md`). This bounds read amplification. `0`
+    /// `docs/src/specs/rollout-deployment.md`). This bounds read amplification. `0`
     /// (the default) disables the count trigger — generations accumulate and are
     /// unioned at read time (or reclaimed by the time-based cleanup below).
     ///
