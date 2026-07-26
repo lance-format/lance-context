@@ -23,19 +23,26 @@ use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use metrics_process::Collector;
 
 /// Explicit histogram buckets (upper bounds, seconds) for request-scale latency
-/// metrics — anything matching the `_duration_seconds` suffix. Tuned for
-/// sub-second-to-tens-of-seconds work like HTTP requests and rollout scans.
-const REQUEST_LATENCY_BUCKETS: &[f64] = &[
-    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
-];
+/// metrics — anything matching the `_duration_seconds` suffix.
+///
+/// # Why only 9 buckets
+///
+/// Every bucket is a separate exported series, and in Datadog every series is a
+/// separately-billed custom metric. 9 buckets keeps adjacent ratios at or below
+/// 6x, which bounds `histogram_quantile` interpolation error to roughly that
+/// factor *within the straddling bucket only* — ample for latency SLOs, while
+/// costing a third less than a denser ladder. Boundaries sit on the values
+/// people actually alert on (10ms, 100ms, 250ms, 1s).
+const REQUEST_LATENCY_BUCKETS: &[f64] = &[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 10.0, 60.0];
 
 /// Coarser buckets (upper bounds, seconds) for long-running background jobs
 /// (compaction, WAL merge, index builds) whose latency can reach minutes.
 /// Without the extended tail every sample over 60s would fall into `+Inf`,
 /// pinning `histogram_quantile` for high percentiles at the last finite bucket.
-const JOB_LATENCY_BUCKETS: &[f64] = &[
-    0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0,
-];
+///
+/// Same cardinality reasoning as [`REQUEST_LATENCY_BUCKETS`]; 7 buckets spanning
+/// 0.5s..30min, since job latency is acted on at order-of-magnitude granularity.
+const JOB_LATENCY_BUCKETS: &[f64] = &[0.5, 2.0, 10.0, 30.0, 120.0, 600.0, 1800.0];
 
 /// Metric names whose latency is job-scale rather than request-scale. A `Full`
 /// matcher outranks the `_duration_seconds` `Suffix` matcher (the exporter
@@ -100,13 +107,20 @@ pub fn install_recorder() -> MetricsHandle {
     }
 }
 
-/// Register HELP text for the application metrics.
+/// Register HELP text and units for the application metrics.
 ///
-/// Purely descriptive, but without it `/metrics` exposes no `# HELP`/`# TYPE`
-/// for any application metric, so a scraped series is uninterpretable without
-/// reading the source.
+/// Not merely cosmetic: Datadog's OpenMetrics check uses the exported `# TYPE`
+/// to decide whether a series becomes a gauge or a monotonic count, and the
+/// declared `Unit` is what makes latency render as a duration rather than a bare
+/// number. Without these, `/metrics` exposes no `# HELP`/`# TYPE` for any
+/// application metric.
+///
+/// Latency histograms are deliberately **unlabelled by result**. Failures are
+/// counted (`*_errors_total`, `*_total{result=...}`), which costs one series per
+/// value, instead of labelled onto a histogram, which costs one series per
+/// bucket per value.
 fn describe_metrics() {
-    use metrics::{describe_counter, describe_histogram, Unit};
+    use metrics::{describe_counter, describe_gauge, describe_histogram, Unit};
 
     describe_histogram!(
         "http_request_duration_seconds",
@@ -120,30 +134,43 @@ fn describe_metrics() {
     describe_histogram!(
         "rollout_add_request_duration_seconds",
         Unit::Seconds,
-        "Store time for an add request (add + optional flush), excluding body parsing. \
-         Labels: flush, result."
+        "Store time for a successful add request (add + optional flush), excluding body \
+         parsing. Label: flush (true|false)."
     );
     describe_histogram!(
         "rollout_add_duration_seconds",
         Unit::Seconds,
-        "RolloutStore::add — the durable WAL append only. Label: result."
+        "RolloutStore::add — the durable WAL append only, success path."
+    );
+    describe_counter!(
+        "rollout_add_errors_total",
+        "Failed RolloutStore::add calls."
     );
     describe_histogram!(
         "rollout_flush_duration_seconds",
         Unit::Seconds,
         "RolloutStore::flush — sealing the memtable so added rows become readable. \
-         Labels: result, outcome (sealed|noop|fenced)."
+         Label: outcome (sealed|noop|fenced); the paths differ by orders of magnitude."
+    );
+    describe_counter!(
+        "rollout_flush_errors_total",
+        "Failed RolloutStore::flush calls."
     );
     describe_histogram!(
         "rollout_wal_merge_duration_seconds",
         Unit::Seconds,
         "Per-phase WAL self-merge latency. \
-         Labels: phase (seal|read|append|claim_epoch|drain|delete), result."
+         Label: phase (seal|read|append|claim_epoch|drain|delete)."
+    );
+    describe_counter!(
+        "rollout_wal_merge_errors_total",
+        "Failed WAL self-merge phases; the phase label identifies where the merge died. \
+         Label: phase."
     );
     describe_histogram!(
         "rollout_wal_merge_request_duration_seconds",
         Unit::Seconds,
-        "Worker-side handling of a master-driven WAL merge. Label: result."
+        "Worker-side handling of a master-driven WAL merge."
     );
     describe_histogram!(
         "rollout_wal_merge_lock_wait_seconds",
@@ -160,8 +187,8 @@ fn describe_metrics() {
     describe_histogram!(
         "master_task_duration_seconds",
         Unit::Seconds,
-        "Task work window only (excludes claim, permit wait, and commit). \
-         Labels: kind, result."
+        "Task work window only (excludes claim, permit wait, and commit). Label: kind. \
+         Success/failure is on master_tasks_total."
     );
     describe_histogram!(
         "master_task_phase_duration_seconds",
@@ -172,8 +199,7 @@ fn describe_metrics() {
     describe_histogram!(
         "master_merge_wal_worker_duration_seconds",
         Unit::Seconds,
-        "Per-worker round trip of a WAL-merge fan-out; the slowest worker sets task latency. \
-         Label: result."
+        "Per-worker round trip of a WAL-merge fan-out; the slowest worker sets task latency."
     );
     describe_counter!(
         "master_merge_wal_workers_total",
@@ -183,6 +209,34 @@ fn describe_metrics() {
     describe_counter!(
         "master_merge_wal_generations_reclaimed_total",
         "MemWAL generations folded into base tables by master-driven merges."
+    );
+
+    // Gauges. These deliberately carry no `_total` suffix: that suffix is the
+    // counter convention, and Datadog infers a monotonic count from it, which
+    // turns "how many exist right now" into a meaningless per-second rate.
+    describe_gauge!(
+        "master_experiments",
+        "Live experiments seen by the last scan."
+    );
+    describe_gauge!(
+        "master_rollout_rows",
+        "Total rollout rows across all experiments as of the last scan."
+    );
+    describe_gauge!(
+        "master_rollout_fragments",
+        "Total fragments across all experiments as of the last scan."
+    );
+    describe_gauge!(
+        "master_experiments_total",
+        "DEPRECATED alias for master_experiments; a gauge despite the _total suffix."
+    );
+    describe_gauge!(
+        "master_rollout_rows_total",
+        "DEPRECATED alias for master_rollout_rows; a gauge despite the _total suffix."
+    );
+    describe_gauge!(
+        "master_rollout_fragments_total",
+        "DEPRECATED alias for master_rollout_fragments; a gauge despite the _total suffix."
     );
 }
 
@@ -247,38 +301,23 @@ mod tests {
 
         // Per-operation write-path metrics: add and flush must be separable, and
         // an add is separable by whether it flushed (they share one HTTP route,
-        // so the `path` label cannot distinguish them).
-        metrics::histogram!("rollout_add_duration_seconds", "result" => "ok").record(0.02);
-        metrics::histogram!(
-            "rollout_flush_duration_seconds",
-            "result" => "ok",
-            "outcome" => "sealed",
-        )
-        .record(0.4);
-        metrics::histogram!(
-            "rollout_add_request_duration_seconds",
-            "flush" => "true",
-            "result" => "ok",
-        )
-        .record(0.5);
-        metrics::histogram!(
-            "rollout_add_request_duration_seconds",
-            "flush" => "false",
-            "result" => "ok",
-        )
-        .record(0.01);
+        // so the `path` label cannot distinguish them). None carry `result` --
+        // failures are counted, not timed.
+        metrics::histogram!("rollout_add_duration_seconds").record(0.02);
+        metrics::histogram!("rollout_flush_duration_seconds", "outcome" => "sealed").record(0.4);
+        metrics::histogram!("rollout_add_request_duration_seconds", "flush" => "true").record(0.5);
+        metrics::histogram!("rollout_add_request_duration_seconds", "flush" => "false")
+            .record(0.01);
+        metrics::counter!("rollout_add_errors_total").increment(1);
         // Job-scale: WAL merge phases and per-worker fan-out.
-        metrics::histogram!(
-            "rollout_wal_merge_duration_seconds",
-            "phase" => "append",
-            "result" => "ok",
-        )
-        .record(120.0);
+        metrics::histogram!("rollout_wal_merge_duration_seconds", "phase" => "append")
+            .record(120.0);
         metrics::histogram!("master_task_phase_duration_seconds",
             "kind" => "merge_wal", "phase" => "claim")
         .record(90.0);
-        metrics::histogram!("master_merge_wal_worker_duration_seconds", "result" => "ok")
-            .record(200.0);
+        metrics::histogram!("master_merge_wal_worker_duration_seconds").record(200.0);
+        metrics::counter!("master_merge_wal_workers_total", "result" => "http_error").increment(1);
+        metrics::gauge!("master_experiments").set(3.0);
 
         let app = metrics_router(handle);
         let resp = app
@@ -312,14 +351,14 @@ mod tests {
             "request latency must not export summary quantiles; body: {text}"
         );
 
-        // Job-scale metric gets the extended tail (a 300s bucket exists), so a
+        // Job-scale metric gets the extended tail (a 600s bucket exists), so a
         // 45s sample is not lumped straight into +Inf.
         assert!(
             text.contains("# TYPE master_task_duration_seconds histogram"),
             "job latency should be a histogram; body: {text}"
         );
         assert!(
-            text.contains("master_task_duration_seconds_bucket{le=\"300\"}"),
+            text.contains("master_task_duration_seconds_bucket{le=\"600\"}"),
             "job latency should use the extended (job) bucket set; body: {text}"
         );
 
@@ -353,22 +392,60 @@ mod tests {
                 text.contains(&format!("# TYPE {name} histogram")),
                 "{name} should be a histogram; body: {text}"
             );
-            // Must assert the 300s bucket on *this* metric's own series: a bare
-            // `le="300"` substring check passes off any other job-scale metric
+            // Must assert the bucket on *this* metric's own series: a bare
+            // `le="600"` substring check passes off any other job-scale metric
             // in the same body and silently tolerates a missing bucket config.
             assert!(
                 text.lines().any(|line| {
-                    line.starts_with(&format!("{name}_bucket{{")) && line.contains("le=\"300\"")
+                    line.starts_with(&format!("{name}_bucket{{")) && line.contains("le=\"600\"")
                 }),
                 "{name} should use the extended (job) bucket set; body: {text}"
             );
         }
 
         // Every application metric should carry HELP so a scrape is
-        // interpretable without reading the source.
+        // interpretable without reading the source, and so Datadog's
+        // OpenMetrics check can infer the right type.
         assert!(
             text.contains("# HELP rollout_add_duration_seconds"),
             "new metrics should be described; body: {text}"
+        );
+
+        // Latency histograms must not carry a `result` label. Failures belong on
+        // counters: `result` on a histogram costs one series *per bucket* per
+        // value, which in Datadog is one billed custom metric each.
+        for line in text.lines() {
+            if line.contains("_duration_seconds_bucket{") || line.contains("_seconds_sum{") {
+                assert!(
+                    !line.contains("result=\""),
+                    "latency histograms must not carry a `result` label \
+                     (use an errors counter instead): {line}"
+                );
+            }
+        }
+
+        // Gauges must not be named `_total`: Datadog infers a monotonic count
+        // from that suffix, turning "how many exist now" into a nonsense rate.
+        // The deprecated aliases are the documented exception.
+        assert!(
+            text.contains("# TYPE master_experiments gauge"),
+            "gauge should be exported without a _total suffix; body: {text}"
+        );
+
+        // Cardinality budget. Every series is a billed custom metric in Datadog,
+        // so a label added without thought is a cost regression. The bound is
+        // deliberately close to the actual count (112 at the time of writing):
+        // adding one two-valued label to a job-scale histogram costs ~9 series
+        // and trips this, forcing the tradeoff to be made explicitly rather than
+        // discovered on an invoice.
+        let series = text
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.is_empty())
+            .count();
+        assert!(
+            series <= 125,
+            "metric cardinality regressed to {series} series (budget 125). Every series is a \
+             billed custom metric in Datadog — prefer a counter label over a histogram label."
         );
     }
 }

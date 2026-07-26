@@ -317,49 +317,32 @@ pub async fn add_rollouts(
     // label is what makes a flushing add separable at all: flush is a query
     // param on this same route, so `MatchedPath` (and therefore the HTTP
     // metric's `path` label) is byte-identical for both.
+    //
+    // Success path only: failures already surface as `http_requests_total`
+    // with a 4xx/5xx status, so a `result` label here would double this
+    // histogram's series count to say something already observable.
+    let flush_label = if flush { "true" } else { "false" };
     let store_start = std::time::Instant::now();
-    let add_result = store.add(&core_records).await;
-    let version = match add_result {
-        Ok(v) => v,
-        Err(e) => {
-            metrics::histogram!(
-                "rollout_add_request_duration_seconds",
-                "flush" => if flush { "true" } else { "false" },
-                "result" => "error",
-            )
-            .record(store_start.elapsed().as_secs_f64());
-            return Err(AppError::from_lance(e));
-        }
-    };
+    let version = store
+        .add(&core_records)
+        .await
+        .map_err(AppError::from_lance)?;
 
     // Opt-in read-your-write: seal the memtable so the rows just appended are
     // readable by the time this responds. Still the read lock — `flush` is
     // `&self`, and concurrent appends are safe against it.
     if flush {
-        if let Err(e) = store.flush().await {
-            metrics::histogram!(
-                "rollout_add_request_duration_seconds",
-                "flush" => "true",
-                "result" => "error",
-            )
-            .record(store_start.elapsed().as_secs_f64());
-            return Err(AppError::from_lance(e));
-        }
+        store.flush().await.map_err(AppError::from_lance)?;
         metrics::counter!("rollout_appends_flushed_total").increment(1);
     }
 
     metrics::histogram!(
         "rollout_add_request_duration_seconds",
-        "flush" => if flush { "true" } else { "false" },
-        "result" => "ok",
+        "flush" => flush_label,
     )
     .record(store_start.elapsed().as_secs_f64());
 
-    metrics::counter!(
-        "rollout_appends_total",
-        "flush" => if flush { "true" } else { "false" },
-    )
-    .increment(1);
+    metrics::counter!("rollout_appends_total", "flush" => flush_label).increment(1);
     metrics::counter!("rollout_records_appended_total").increment(count as u64);
 
     Ok((
@@ -661,11 +644,6 @@ pub async fn merge_wal(
 
     let merge_start = std::time::Instant::now();
     let result = store.cleanup_own_shard().await;
-    ::metrics::histogram!(
-        "rollout_wal_merge_request_duration_seconds",
-        "result" => if result.is_ok() { "ok" } else { "error" },
-    )
-    .record(merge_start.elapsed().as_secs_f64());
 
     let reclaimed = match result {
         Ok(n) => n,
@@ -676,12 +654,15 @@ pub async fn merge_wal(
     };
     // Emitted unconditionally: gating on `reclaimed > 0` made the common no-op
     // merge invisible, so a worker that never has anything to merge and a worker
-    // that is never called looked identical.
+    // that is never called looked identical. `result` stays on this *counter*
+    // (1 series per value) rather than on a histogram (1 series per bucket).
     ::metrics::counter!(
         "rollout_wal_cleanup_total",
         "result" => if reclaimed > 0 { "merged" } else { "noop" },
     )
     .increment(1);
+    ::metrics::histogram!("rollout_wal_merge_request_duration_seconds")
+        .record(merge_start.elapsed().as_secs_f64());
     ::metrics::counter!("rollout_wal_generations_reclaimed_total").increment(reclaimed as u64);
     Ok(Json(MergeWalResponse { reclaimed }))
 }

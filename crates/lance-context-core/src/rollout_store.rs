@@ -83,7 +83,7 @@ use serde_json::Value;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::metrics::{observe_duration, timer_elapsed, timer_start};
+use crate::metrics::{count, observe_duration, observe_phase, timer_elapsed, timer_start};
 use crate::rollout::RolloutRecord;
 use crate::store::{
     column_as, column_as_optional, relationship_field, relationship_list_item_field,
@@ -594,16 +594,18 @@ impl RolloutStore {
         if records.is_empty() {
             return Ok(self.dataset.manifest.version);
         }
-        // Timed as a whole: `add_inner` has several `?` early-returns, so timing
-        // here (rather than inline) guarantees the error path is measured too --
-        // a failing append that is slow is exactly what you want to see.
+        // Success-path latency only. A failed append's *duration* is not
+        // actionable, but its *rate* is, so errors increment a flat counter
+        // rather than doubling this histogram's series count.
         let started = timer_start!();
         let result = self.add_inner(records).await;
-        observe_duration!(
-            crate::metrics::ROLLOUT_ADD_DURATION,
-            timer_elapsed!(started),
-            "result" => if result.is_ok() { "ok" } else { "error" },
-        );
+        match &result {
+            Ok(_) => observe_duration!(
+                crate::metrics::ROLLOUT_ADD_DURATION,
+                timer_elapsed!(started),
+            ),
+            Err(_) => count!(crate::metrics::ROLLOUT_ADD_ERRORS),
+        }
         result
     }
 
@@ -684,22 +686,26 @@ impl RolloutStore {
     pub async fn flush(&self) -> LanceResult<()> {
         let started = timer_start!();
         let result = self.flush_inner().await;
-        // `outcome` separates real sealing work from the two fast paths. Without
-        // it the histogram is dominated by near-zero `noop` samples (no resident
-        // writer is the common case) and its high percentiles are meaningless.
-        let (res_label, outcome) = match &result {
-            Ok(FlushOutcome::Sealed) => ("ok", "sealed"),
-            Ok(FlushOutcome::Noop) => ("ok", "noop"),
-            Ok(FlushOutcome::Fenced) => ("ok", "fenced"),
-            Err(_) => ("error", "sealed"),
-        };
-        let _ = (res_label, outcome);
-        observe_duration!(
-            crate::metrics::ROLLOUT_FLUSH_DURATION,
-            timer_elapsed!(started),
-            "result" => res_label,
-            "outcome" => outcome,
-        );
+        // `outcome` is worth its cardinality: the three paths differ by orders of
+        // magnitude, and `noop` (no resident writer) is by far the most common,
+        // so a blended histogram would be dominated by near-zero samples.
+        // Failures are counted, not timed.
+        match &result {
+            Ok(outcome) => {
+                let label = match outcome {
+                    FlushOutcome::Sealed => "sealed",
+                    FlushOutcome::Noop => "noop",
+                    FlushOutcome::Fenced => "fenced",
+                };
+                let _ = label;
+                observe_duration!(
+                    crate::metrics::ROLLOUT_FLUSH_DURATION,
+                    timer_elapsed!(started),
+                    "outcome" => label,
+                );
+            }
+            Err(_) => count!(crate::metrics::ROLLOUT_FLUSH_ERRORS),
+        }
         result.map(|_| ())
     }
 
@@ -879,42 +885,22 @@ impl RolloutStore {
         // this shard — including our own resident writer. Close it (draining its
         // background tasks; `ShardWriter` has no `Drop`) and clear it so the next
         // `add` transparently reopens against the freshly-claimed epoch.
-        let phase = timer_start!();
-        let sealed = self.close().await;
-        observe_duration!(
-            crate::metrics::ROLLOUT_WAL_MERGE_DURATION,
-            timer_elapsed!(phase),
-            "phase" => "seal",
-            "result" => if sealed.is_ok() { "ok" } else { "error" },
-        );
-        sealed?;
+        observe_phase!("seal", self.close().await)?;
 
         self.ensure_latest_rollout_schema().await?;
 
         // Resolve each flushed generation to its absolute dataset path and read
         // all its rows into memory. Record which generation ids we merge so the
         // drain can remove exactly these and nothing else.
-        let phase = timer_start!();
-        let read = self.read_flushed_generations(manifest).await;
-        observe_duration!(
-            crate::metrics::ROLLOUT_WAL_MERGE_DURATION,
-            timer_elapsed!(phase),
-            "phase" => "read",
-            "result" => if read.is_ok() { "ok" } else { "error" },
-        );
-        let (merged_generations, merged_paths, batches, merge_schema) = read?;
+        let (merged_generations, merged_paths, batches, merge_schema) =
+            observe_phase!("read", self.read_flushed_generations(manifest).await)?;
 
         // Append the merged rows to the base table.
         if !batches.is_empty() {
-            let phase = timer_start!();
-            let appended = self.append_merged_batches(batches, merge_schema).await;
-            observe_duration!(
-                crate::metrics::ROLLOUT_WAL_MERGE_DURATION,
-                timer_elapsed!(phase),
-                "phase" => "append",
-                "result" => if appended.is_ok() { "ok" } else { "error" },
-            );
-            appended?;
+            observe_phase!(
+                "append",
+                self.append_merged_batches(batches, merge_schema).await
+            )?;
         }
 
         // Drain the merged generations from the shard manifest. Claim the
@@ -923,36 +909,26 @@ impl RolloutStore {
         // Removing only the merged ids (rather than clearing the vec) is what
         // makes this safe against a generation that lands after we read the
         // manifest: it is preserved for the next merge instead of being dropped.
-        let phase = timer_start!();
-        let claimed = manifest_store.claim_epoch(manifest.shard_spec_id).await;
-        observe_duration!(
-            crate::metrics::ROLLOUT_WAL_MERGE_DURATION,
-            timer_elapsed!(phase),
-            "phase" => "claim_epoch",
-            "result" => if claimed.is_ok() { "ok" } else { "error" },
-        );
-        let (epoch, _) = claimed?;
+        let (epoch, _) = observe_phase!(
+            "claim_epoch",
+            manifest_store.claim_epoch(manifest.shard_spec_id).await
+        )?;
 
-        let phase = timer_start!();
-        let drained = manifest_store
-            .commit_update(epoch, |current| ShardManifest {
-                version: current.version + 1,
-                flushed_generations: current
-                    .flushed_generations
-                    .iter()
-                    .filter(|fg| !merged_generations.contains(&fg.generation))
-                    .cloned()
-                    .collect(),
-                ..current.clone()
-            })
-            .await;
-        observe_duration!(
-            crate::metrics::ROLLOUT_WAL_MERGE_DURATION,
-            timer_elapsed!(phase),
-            "phase" => "drain",
-            "result" => if drained.is_ok() { "ok" } else { "error" },
-        );
-        drained?;
+        observe_phase!(
+            "drain",
+            manifest_store
+                .commit_update(epoch, |current| ShardManifest {
+                    version: current.version + 1,
+                    flushed_generations: current
+                        .flushed_generations
+                        .iter()
+                        .filter(|fg| !merged_generations.contains(&fg.generation))
+                        .cloned()
+                        .collect(),
+                    ..current.clone()
+                })
+                .await
+        )?;
 
         // Delete the merged generations' blob directories now that no manifest
         // references them. Ordering matters: the drain above already removed
@@ -988,13 +964,12 @@ impl RolloutStore {
                 );
             }
         }
-        // Best-effort by contract, so always `ok`: a delete failure is logged
-        // above and does not fail the merge.
+        // Best-effort by contract: a delete failure is logged above and does not
+        // fail the merge, so there is no error counter for this phase.
         observe_duration!(
             crate::metrics::ROLLOUT_WAL_MERGE_DURATION,
             timer_elapsed!(phase),
             "phase" => "delete",
-            "result" => "ok",
         );
 
         Ok(())
@@ -5184,11 +5159,19 @@ mod tests {
             };
             if name == crate::metrics::ROLLOUT_ADD_DURATION {
                 add_samples += count;
+                // No `result` label: an error label would double this
+                // histogram's series count (one per bucket, twice) to describe
+                // the latency of a rare event. Errors are counted instead.
                 assert!(
-                    labels.iter().any(|(k, v)| k == "result" && v == "ok"),
-                    "add should be labelled by result; got {labels:?}"
+                    labels.is_empty(),
+                    "add latency must stay unlabelled to bound cardinality; got {labels:?}"
                 );
             } else if name == crate::metrics::ROLLOUT_FLUSH_DURATION {
+                assert_eq!(
+                    labels.len(),
+                    1,
+                    "flush should carry exactly `outcome`, no result label; got {labels:?}"
+                );
                 let outcome = labels
                     .iter()
                     .find(|(k, _)| k == "outcome")
@@ -5210,5 +5193,71 @@ mod tests {
             vec!["noop".to_string(), "sealed".to_string()],
             "flush should distinguish the no-op fast path from real sealing"
         );
+    }
+
+    /// Guards the cardinality contract: latency histograms must never carry a
+    /// label whose domain is unbounded (a store URI, shard id, experiment name)
+    /// or redundant with a counter (`result`).
+    ///
+    /// Every label combination times every bucket is a separate exported series,
+    /// and in Datadog a separately-billed custom metric, so this is a cost
+    /// regression test as much as a correctness one.
+    #[test]
+    fn latency_histograms_carry_only_bounded_labels() {
+        use metrics_util::debugging::DebuggingRecorder;
+        use metrics_util::MetricKind;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let dir = TempDir::new().unwrap();
+        let uri = dir
+            .path()
+            .join("rollouts.lance")
+            .to_string_lossy()
+            .into_owned();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let store = RolloutStore::open(&uri).await.unwrap();
+                store.add(&[assistant_record("row-0")]).await.unwrap();
+                store.flush().await.unwrap();
+            });
+        });
+
+        // Closed sets only. `result` is intentionally absent: it belongs on a
+        // counter, where it costs one series instead of one per bucket.
+        let allowed: &[(&str, &[&str])] = &[
+            ("outcome", &["sealed", "noop", "fenced"]),
+            (
+                "phase",
+                &["seal", "read", "append", "claim_epoch", "drain", "delete"],
+            ),
+        ];
+
+        for (key, _, _, _) in snapshotter.snapshot().into_vec() {
+            if key.kind() != MetricKind::Histogram {
+                continue;
+            }
+            for label in key.key().labels() {
+                let (k, v) = (label.key(), label.value());
+                let allowed_values = allowed
+                    .iter()
+                    .find(|(name, _)| *name == k)
+                    .map(|(_, vs)| *vs)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "histogram {} carries unexpected label `{k}`; latency labels must \
+                             come from a closed, documented set",
+                            key.key().name()
+                        )
+                    });
+                assert!(
+                    allowed_values.contains(&v),
+                    "histogram {} label {k}={v} is outside its documented domain {allowed_values:?}",
+                    key.key().name()
+                );
+            }
+        }
     }
 }

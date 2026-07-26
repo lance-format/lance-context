@@ -121,9 +121,11 @@ async fn run_task(state: &Arc<MasterState>, claim: TaskClaim, timing: TaskClaimT
 
     metrics::histogram!("master_task_phase_duration_seconds", "kind" => kind, "phase" => "work")
         .record(work_elapsed.as_secs_f64());
-    // Scope unchanged (the work window) for back-compat, but now labelled by
-    // result so a fast failure is not averaged in with fast successes.
-    metrics::histogram!("master_task_duration_seconds", "kind" => kind, "result" => result)
+    // Same scope as the `work` phase above, kept for back-compat with existing
+    // dashboards. Success/failure is carried by `master_tasks_total{result}`, a
+    // counter — putting `result` on the histogram would double its series count
+    // (every bucket, twice) to describe the latency of a rare event.
+    metrics::histogram!("master_task_duration_seconds", "kind" => kind)
         .record(work_elapsed.as_secs_f64());
     metrics::counter!("master_tasks_total", "kind" => kind, "result" => result).increment(1);
 
@@ -211,7 +213,9 @@ async fn run_merge_wal(state: &Arc<MasterState>, name: &str) -> Result<String, S
         async move {
             // Per-worker timing: `join_all` means the slowest worker sets the
             // whole task's latency, so without this one straggler is
-            // indistinguishable from every worker being slow.
+            // indistinguishable from every worker being slow. Unlabelled --
+            // outcome is carried by the counter below, which costs one series
+            // per value instead of one per bucket per value.
             let started = std::time::Instant::now();
             let outcome = merge_wal_one(&http, &url).await;
             let result = match &outcome {
@@ -220,11 +224,8 @@ async fn run_merge_wal(state: &Arc<MasterState>, name: &str) -> Result<String, S
                 Err(WorkerMergeError::Http(_)) => "http_error",
                 Err(WorkerMergeError::Transport(_)) => "transport_error",
             };
-            metrics::histogram!(
-                "master_merge_wal_worker_duration_seconds",
-                "result" => result,
-            )
-            .record(started.elapsed().as_secs_f64());
+            metrics::histogram!("master_merge_wal_worker_duration_seconds")
+                .record(started.elapsed().as_secs_f64());
             // Counted per worker per attempt: a 404 is tolerated as "owns no
             // shard" and N-1 failures still report task success, so this counter
             // is the only place partial failure is visible at all.
