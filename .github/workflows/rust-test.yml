@@ -43,9 +43,14 @@ jobs:
           sudo apt update
           sudo apt install -y clang libclang-dev protobuf-compiler
       - name: Build tests
-        run: cargo test -p lance-context-core -p lance-context-master --no-run
-      - name: Run unit tests
-        run: cargo test -p lance-context-core -p lance-context-master --lib
+        run: cargo test --workspace --all-targets --no-run
+      - name: Run unit and integration tests
+        # `--all-targets` matters: the previous `--lib` compiled the
+        # crates/lance-context-core/tests/*.rs integration tests and then threw
+        # them away without running them, so every WAL-merge and concurrency
+        # regression test was dead weight in CI. `--workspace` covers the crates
+        # that were silently untested (api, server, client, metrics, the facade).
+        run: cargo test --workspace --all-targets
       - name: Start etcd for HA scheduler test
         run: |
           ETCD_VERSION=3.7.0
