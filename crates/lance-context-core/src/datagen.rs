@@ -1,16 +1,18 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt;
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use uuid::Uuid;
 
 /// Current schema version for the append-only datagen checkpoint log.
-pub const DATAGEN_SCHEMA_VERSION: i32 = 1;
+pub const DATAGEN_SCHEMA_VERSION: i32 = 2;
 
 /// One lifecycle or field-level event in a datagen item's checkpoint history.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DatagenEventType {
     ItemCreated,
+    StepStarted,
     FieldSet,
     FieldAppend,
     StepCompleted,
@@ -23,6 +25,7 @@ impl DatagenEventType {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ItemCreated => "ITEM_CREATED",
+            Self::StepStarted => "STEP_STARTED",
             Self::FieldSet => "FIELD_SET",
             Self::FieldAppend => "FIELD_APPEND",
             Self::StepCompleted => "STEP_COMPLETED",
@@ -34,6 +37,7 @@ impl DatagenEventType {
     pub fn parse(value: &str) -> Result<Self, String> {
         match value {
             "ITEM_CREATED" => Ok(Self::ItemCreated),
+            "STEP_STARTED" => Ok(Self::StepStarted),
             "FIELD_SET" => Ok(Self::FieldSet),
             "FIELD_APPEND" => Ok(Self::FieldAppend),
             "STEP_COMPLETED" => Ok(Self::StepCompleted),
@@ -44,7 +48,171 @@ impl DatagenEventType {
     }
 }
 
-/// Terminal outcome of an item.
+/// The composition kind of a step. Drives two behaviors:
+///   - forks a stream: `MapReduce`/`Branch`/`SubPipeline` sub-items get their own `item_id`.
+///   - drives a frame: `Sequence`/`Loop` are the `enclosing_step` frames; only these emit STEP_STARTED.
+///
+/// `Conditional`/`Router` are selectors (wrap one chosen child); `Leaf`/`Root` are the endpoints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum DatagenStepKind {
+    Root,
+    Leaf,
+    Sequence,
+    Loop,
+    MapReduce,
+    Branch,
+    SubPipeline,
+    Conditional,
+    Router,
+}
+
+impl DatagenStepKind {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Root => "root",
+            Self::Leaf => "leaf",
+            Self::Sequence => "sequence",
+            Self::Loop => "loop",
+            Self::MapReduce => "map_reduce",
+            Self::Branch => "branch",
+            Self::SubPipeline => "sub_pipeline",
+            Self::Conditional => "conditional",
+            Self::Router => "router",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "root" => Ok(Self::Root),
+            "leaf" => Ok(Self::Leaf),
+            "sequence" => Ok(Self::Sequence),
+            "loop" => Ok(Self::Loop),
+            "map_reduce" => Ok(Self::MapReduce),
+            "branch" => Ok(Self::Branch),
+            "sub_pipeline" => Ok(Self::SubPipeline),
+            "conditional" => Ok(Self::Conditional),
+            "router" => Ok(Self::Router),
+            other => Err(format!("unsupported datagen step kind '{other}'")),
+        }
+    }
+
+    /// A driver frame (`Sequence`/`Loop`) is the only kind that emits STEP_STARTED.
+    #[must_use]
+    pub fn is_driver(self) -> bool {
+        matches!(self, Self::Sequence | Self::Loop)
+    }
+}
+
+/// An item (stream) identity — a structured value stored as a materialized path string. Root ids are
+/// built by the executor from a source key (e.g. `5`); sub-item ids extend a parent with one fan-out
+/// segment (`5/expand:0`) via [`DatagenItemId::child`]. The store owns the parse<->format; the client
+/// only ever holds the structured form.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DatagenItemId {
+    root_key: String,
+    /// One `(origin_step, branch_idx)` per fan-out hop below the root.
+    segments: Vec<(String, i64)>,
+}
+
+impl DatagenItemId {
+    /// Build a root id from the executor's source key (the base case).
+    #[must_use]
+    pub fn from_source_key(key: &str) -> Self {
+        Self {
+            root_key: key.to_string(),
+            segments: Vec::new(),
+        }
+    }
+
+    /// Extend this id with one fan-out segment -> the sub-item's id. Pure, deterministic, no I/O.
+    /// The sole id-composition entry point. Valid to call for a branch that was never written.
+    #[must_use]
+    pub fn child(&self, origin_step: &str, branch_idx: i64) -> Self {
+        let mut segments = self.segments.clone();
+        segments.push((origin_step.to_string(), branch_idx));
+        Self {
+            root_key: self.root_key.clone(),
+            segments,
+        }
+    }
+
+    /// The parent stream's id (`None` on a root).
+    #[must_use]
+    pub fn parent(&self) -> Option<Self> {
+        if self.segments.is_empty() {
+            return None;
+        }
+        let mut segments = self.segments.clone();
+        segments.pop();
+        Some(Self {
+            root_key: self.root_key.clone(),
+            segments,
+        })
+    }
+
+    /// The root of this id's tree (== self if root).
+    #[must_use]
+    pub fn root(&self) -> Self {
+        Self {
+            root_key: self.root_key.clone(),
+            segments: Vec::new(),
+        }
+    }
+
+    /// The fan-out step that created this sub-item (`None` on a root).
+    #[must_use]
+    pub fn origin_step(&self) -> Option<&str> {
+        self.segments.last().map(|(step, _)| step.as_str())
+    }
+
+    /// Which branch this sub-item is (`None` on a root).
+    #[must_use]
+    pub fn branch_idx(&self) -> Option<i64> {
+        self.segments.last().map(|(_, idx)| *idx)
+    }
+
+    #[must_use]
+    pub fn is_root(&self) -> bool {
+        self.segments.is_empty()
+    }
+
+    /// Parse a stored path string back into a structured id.
+    pub fn parse(path: &str) -> Result<Self, String> {
+        let mut parts = path.split('/');
+        let root_key = parts
+            .next()
+            .filter(|part| !part.is_empty())
+            .ok_or_else(|| format!("empty datagen item id '{path}'"))?
+            .to_string();
+        let mut segments = Vec::new();
+        for part in parts {
+            let (step, idx) = part
+                .split_once(':')
+                .ok_or_else(|| format!("malformed item id segment '{part}' in '{path}'"))?;
+            let branch_idx = idx
+                .parse::<i64>()
+                .map_err(|_| format!("non-integer branch index '{idx}' in '{path}'"))?;
+            segments.push((step.to_string(), branch_idx));
+        }
+        Ok(Self {
+            root_key,
+            segments,
+        })
+    }
+}
+
+impl fmt::Display for DatagenItemId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.root_key)?;
+        for (step, idx) in &self.segments {
+            write!(formatter, "/{step}:{idx}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Terminal outcome of an item (the write-side input to [`DatagenStreamWriter::item_terminal`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DatagenTerminal {
     Completed,
@@ -59,28 +227,43 @@ impl DatagenTerminal {
             Self::Filtered => "filtered",
         }
     }
-
-    pub fn parse(value: &str) -> Result<Self, String> {
-        match value {
-            "completed" => Ok(Self::Completed),
-            "filtered" => Ok(Self::Filtered),
-            other => Err(format!("unsupported datagen terminal value '{other}'")),
-        }
-    }
 }
 
-/// Current status derived exclusively by folding the event log.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The value type of the `status` column. Two read lenses: lifecycle {Running, Completed, Filtered}
+/// vs failure {Failed}. A folded item's status is only ever a lifecycle value; `Failed` surfaces only
+/// through the failure lens (overview / failure history).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum DatagenItemStatus {
-    Pending,
     Running,
     Completed,
     Filtered,
     Failed,
 }
 
-/// Lazy reference to an inline blob event. `bytes` is absent on normal fold and
-/// trajectory reads; callers materialize it through `DatagenStore::get_blob`.
+impl DatagenItemStatus {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Filtered => "filtered",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "running" => Ok(Self::Running),
+            "completed" => Ok(Self::Completed),
+            "filtered" => Ok(Self::Filtered),
+            "failed" => Ok(Self::Failed),
+            other => Err(format!("unsupported datagen status '{other}'")),
+        }
+    }
+}
+
+/// Lazy reference to an inline blob event. `bytes` is absent on normal (lazy) fold and trajectory
+/// reads; callers materialize it through `DatagenStore::load_blob`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DatagenBlobValue {
     pub bytes: Option<Vec<u8>>,
@@ -94,7 +277,7 @@ pub enum DatagenValue {
     Int(i64),
     Float(f64),
     Bool(bool),
-    String(String),
+    Str(String),
     Json(Value),
     Blob(DatagenBlobValue),
 }
@@ -106,14 +289,159 @@ impl DatagenValue {
             Self::Int(_) => "int",
             Self::Float(_) => "float",
             Self::Bool(_) => "bool",
-            Self::String(_) => "str",
+            Self::Str(_) => "str",
             Self::Json(_) => "json",
             Self::Blob(_) => "blob",
         }
     }
 }
 
-/// A single append-only row in `log.lance`.
+/// A step's identity: its (globally-unique) name + its kind. Name and kind always travel together.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DatagenStepId {
+    pub name: String,
+    pub kind: DatagenStepKind,
+}
+
+/// A position within one stream's step tree — the coordinate a step write is attributed to. Maps 1:1
+/// to the Group C provenance columns. `enclosing`/`selector` are stored as bare step *names* (the log
+/// has no enclosing/selector kind column); `None` means "directly under the stream root" / "no
+/// selector".
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DatagenStreamPosition {
+    pub step: DatagenStepId,
+    pub index: i64,
+    pub enclosing: Option<String>,
+    pub selector: Option<String>,
+}
+
+/// How a field folds: FIELD_SET replaces (last-writer-wins); FIELD_APPEND accumulates in order.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DatagenFieldState {
+    Set(DatagenValue),
+    Appended(Vec<DatagenValue>),
+}
+
+/// A pointer to one completed step position (a single STEP_COMPLETED).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DatagenStepCursor {
+    pub position: DatagenStreamPosition,
+    /// The STEP_COMPLETED's `item_seq` — the fold cutoff for "state as of this step".
+    pub item_seq: i64,
+}
+
+/// The ordered list of cursors an item passed through, plus sets for O(1) skip lookup. `completed`
+/// gates STEP_COMPLETED (re-)emission; `started` gates STEP_STARTED. `started \ completed` = frames
+/// that were open when the process died.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DatagenTrajectory {
+    pub ordered: Vec<DatagenStepCursor>,
+    pub completed: HashSet<DatagenStreamPosition>,
+    pub started: HashSet<DatagenStreamPosition>,
+}
+
+/// Error payload, shared by the write side (input to `item_failed`) and the read side (composed into
+/// [`DatagenFailure`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatagenErrorInfo {
+    pub error_type: String,
+    pub error_dump: Option<String>,
+    pub traceback: Option<String>,
+}
+
+/// One failure record — a lightweight pointer to a FAILED event (no folded item). An item may have
+/// 0..N of these across attempts.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DatagenFailure {
+    pub at: DatagenStepCursor,
+    pub run_id: String,
+    pub attempt: i32,
+    pub error: DatagenErrorInfo,
+}
+
+/// One item reconstructed by folding its events (latest state). Carries enough to continue processing
+/// and to rebuild a `DatagenStreamWriter` on resume. Does not carry failures.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FoldedDatagenItem {
+    pub item_id: DatagenItemId,
+    pub root_item_id: DatagenItemId,
+    pub parent_item_id: Option<DatagenItemId>,
+    pub status: DatagenItemStatus,
+    /// Max `item_seq` -> resume continues at `last_item_seq + 1`.
+    pub last_item_seq: i64,
+    /// Max `attempt` seen -> resume runs at `last_attempt + 1`.
+    pub last_attempt: i32,
+    pub fields: BTreeMap<String, DatagenFieldState>,
+    pub trajectory: DatagenTrajectory,
+    pub query_tags: Option<Value>,
+    /// Internal `field_name -> event_id` map for the folded blob fields, so the store can resolve a
+    /// lazy blob without the caller handling an `event_id`.
+    pub blob_event_ids: BTreeMap<String, String>,
+}
+
+/// Result of a resumption fold. `NeverStarted` (no ITEM_CREATED) is the fresh-vs-restore fork the
+/// executor acts on; `Found` carries the folded item (whose `status` is the lifecycle status).
+#[derive(Debug, Clone, PartialEq)]
+pub enum DatagenItemLookup {
+    NeverStarted,
+    Found(FoldedDatagenItem),
+}
+
+impl DatagenItemLookup {
+    #[must_use]
+    pub fn folded(&self) -> Option<&FoldedDatagenItem> {
+        match self {
+            Self::NeverStarted => None,
+            Self::Found(item) => Some(item),
+        }
+    }
+}
+
+/// Bulk startup classification of root items. A missing id means "never started".
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DatagenRootItemStatuses {
+    inner: HashMap<String, DatagenItemStatus>,
+}
+
+impl DatagenRootItemStatuses {
+    #[must_use]
+    pub fn from_map(inner: HashMap<String, DatagenItemStatus>) -> Self {
+        Self { inner }
+    }
+
+    /// The classified status of a root item, or `None` if it was never started.
+    #[must_use]
+    pub fn status(&self, item_id: &DatagenItemId) -> Option<DatagenItemStatus> {
+        self.inner.get(&item_id.to_string()).copied()
+    }
+
+    /// Whether this item reached a terminal lifecycle state (Completed | Filtered).
+    #[must_use]
+    pub fn is_terminated(&self, item_id: &DatagenItemId) -> bool {
+        matches!(
+            self.status(item_id),
+            Some(DatagenItemStatus::Completed | DatagenItemStatus::Filtered)
+        )
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    #[must_use]
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &DatagenItemStatus)> {
+        self.inner.iter()
+    }
+}
+
+/// One append-only row in `log.lance`. Item/root/parent ids are the stored path strings; fold parses
+/// them into [`DatagenItemId`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct DatagenEvent {
     /// Deterministic idempotency key. The MemWAL read path de-duplicates by it.
@@ -121,16 +449,16 @@ pub struct DatagenEvent {
     pub item_id: String,
     pub root_item_id: String,
     pub parent_item_id: Option<String>,
-    /// Strictly increasing per item. A collision between different event ids is
-    /// treated as split-brain corruption during fold.
+    /// Strictly increasing per item. A collision between different event ids is split-brain corruption.
     pub item_seq: i64,
     /// Shared by every event emitted for one checkpoint boundary.
     pub checkpoint_id: String,
     pub event_type: DatagenEventType,
     pub step_name: Option<String>,
+    pub step_kind: Option<DatagenStepKind>,
     pub step_index: Option<i64>,
-    pub step_instance_id: Option<String>,
-    pub iteration: Option<i64>,
+    pub enclosing_step: Option<String>,
+    pub selector_step: Option<String>,
     pub attempt: i32,
     pub run_id: String,
     /// Fencing identity for the writer/lease that owned this item.
@@ -140,9 +468,10 @@ pub struct DatagenEvent {
     pub field_type: Option<String>,
     pub codec_version: Option<i32>,
     pub value: Option<DatagenValue>,
-    /// Query tags captured on ITEM_CREATED. They are not part of correctness.
+    /// Query tags captured on ITEM_CREATED. Not part of correctness.
     pub query_tags: Option<Value>,
-    pub terminal: Option<DatagenTerminal>,
+    /// The stored lifecycle/failure status (populated on ITEM_CREATED / TERMINAL / FAILED).
+    pub status: Option<DatagenItemStatus>,
     pub error_type: Option<String>,
     pub error_dump: Option<String>,
     pub traceback: Option<String>,
@@ -188,38 +517,35 @@ impl DatagenEvent {
                 if self.value.is_none() {
                     return Err("field events require a value".to_string());
                 }
-                if self.step_name.as_deref().is_none_or(str::is_empty)
-                    || self.step_index.is_none()
-                    || self.step_instance_id.as_deref().is_none_or(str::is_empty)
-                {
-                    return Err(
-                        "field events require step_name, step_index, and step_instance_id"
-                            .to_string(),
-                    );
-                }
+                self.require_step_provenance("field events")?;
             }
-            DatagenEventType::StepCompleted => {
-                if self.step_name.as_deref().is_none_or(str::is_empty)
-                    || self.step_index.is_none()
-                    || self.step_instance_id.as_deref().is_none_or(str::is_empty)
-                {
-                    return Err(
-                        "STEP_COMPLETED requires step_name, step_index, and step_instance_id"
-                            .to_string(),
-                    );
-                }
+            DatagenEventType::StepStarted | DatagenEventType::StepCompleted => {
+                self.require_step_provenance(self.event_type.as_str())?;
             }
             DatagenEventType::Failed => {
                 if self.error_type.as_deref().is_none_or(str::is_empty) {
                     return Err("FAILED requires error_type".to_string());
                 }
+                self.require_step_provenance("FAILED")?;
             }
-            DatagenEventType::Terminal => {
-                if self.terminal.is_none() {
-                    return Err("TERMINAL requires terminal".to_string());
-                }
-            }
+            DatagenEventType::Terminal => match self.status {
+                Some(DatagenItemStatus::Completed | DatagenItemStatus::Filtered) => {}
+                _ => return Err("TERMINAL requires status completed or filtered".to_string()),
+            },
             DatagenEventType::ItemCreated => {}
+        }
+        Ok(())
+    }
+
+    fn require_step_provenance(&self, context: &str) -> Result<(), String> {
+        if self.step_name.as_deref().is_none_or(str::is_empty) {
+            return Err(format!("{context} require step_name"));
+        }
+        if self.step_kind.is_none() {
+            return Err(format!("{context} require step_kind"));
+        }
+        if self.step_index.is_none() {
+            return Err(format!("{context} require step_index"));
         }
         Ok(())
     }
@@ -232,89 +558,52 @@ pub fn datagen_event_id(item_id: &str, checkpoint_id: &str, ordinal: u32) -> Str
     Uuid::new_v5(&Uuid::NAMESPACE_OID, input.as_bytes()).to_string()
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct DatagenStepCursor {
-    pub checkpoint_id: String,
-    pub step_name: String,
-    pub step_index: i64,
-    pub step_instance_id: String,
-    pub iteration: Option<i64>,
-    pub attempt: i32,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum DatagenFieldState {
-    Set(DatagenValue),
-    Appended(Vec<DatagenValue>),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DatagenFailure {
-    pub event_id: String,
-    pub run_id: String,
-    pub checkpoint_id: String,
-    pub item_seq: i64,
-    pub step_name: Option<String>,
-    pub error_type: String,
-    pub error_dump: Option<String>,
-    pub traceback: Option<String>,
-    pub failed_at: DateTime<Utc>,
-}
-
-/// Current item state reconstructed solely from the append-only log.
-#[derive(Debug, Clone, PartialEq)]
-pub struct FoldedDatagenItem {
-    pub item_id: String,
-    pub root_item_id: String,
-    pub parent_item_id: Option<String>,
-    pub fields: BTreeMap<String, DatagenFieldState>,
-    pub completed_steps: BTreeSet<DatagenStepCursor>,
-    pub status: DatagenItemStatus,
-    pub terminal: Option<DatagenTerminal>,
-    pub failure: Option<DatagenFailure>,
-    pub query_tags: Option<Value>,
-    pub current_run_id: String,
-    pub last_item_seq: i64,
-    pub last_checkpoint_id: String,
-}
-
-/// State captured immediately after a STEP_COMPLETED event.
-#[derive(Debug, Clone, PartialEq)]
-pub struct DatagenTrajectoryPoint {
-    pub cursor: DatagenStepCursor,
-    pub item: FoldedDatagenItem,
-}
-
-pub fn fold_datagen_events(events: &[DatagenEvent]) -> Result<FoldedDatagenItem, String> {
+/// Fold an item's events into its latest state. Returns `None` if there is no ITEM_CREATED (the item
+/// was never started).
+pub fn fold_datagen_events(events: &[DatagenEvent]) -> Result<Option<FoldedDatagenItem>, String> {
     let ordered = normalize_events(events)?;
-    let first = ordered
-        .first()
-        .ok_or_else(|| "cannot fold an empty datagen event list".to_string())?;
-    let mut item = initial_item(first);
+    let Some(first) = ordered.first() else {
+        return Ok(None);
+    };
+    if first.event_type != DatagenEventType::ItemCreated {
+        return Ok(None);
+    }
+    let mut item = initial_item(first)?;
     for event in ordered {
         apply_event(&mut item, event)?;
     }
-    Ok(item)
+    Ok(Some(item))
 }
 
-pub fn datagen_trajectory(events: &[DatagenEvent]) -> Result<Vec<DatagenTrajectoryPoint>, String> {
+/// The ordered completed-step cursors of an item, in `item_seq` order.
+pub fn datagen_trajectory(events: &[DatagenEvent]) -> Result<Vec<DatagenStepCursor>, String> {
+    Ok(fold_datagen_events(events)?
+        .map(|item| item.trajectory.ordered)
+        .unwrap_or_default())
+}
+
+/// The lightweight failure pointers of an item, in `item_seq` order.
+pub fn datagen_failures(events: &[DatagenEvent]) -> Result<Vec<DatagenFailure>, String> {
     let ordered = normalize_events(events)?;
-    let first = ordered
-        .first()
-        .ok_or_else(|| "cannot build a trajectory from an empty event list".to_string())?;
-    let mut item = initial_item(first);
-    let mut trajectory = Vec::new();
+    let mut failures = Vec::new();
     for event in ordered {
-        apply_event(&mut item, event)?;
-        if event.event_type == DatagenEventType::StepCompleted {
-            let cursor = step_cursor(event)?;
-            trajectory.push(DatagenTrajectoryPoint {
-                cursor,
-                item: item.clone(),
+        if event.event_type == DatagenEventType::Failed {
+            failures.push(DatagenFailure {
+                at: DatagenStepCursor {
+                    position: stream_position(event)?,
+                    item_seq: event.item_seq,
+                },
+                run_id: event.run_id.clone(),
+                attempt: event.attempt,
+                error: DatagenErrorInfo {
+                    error_type: event.error_type.clone().unwrap(),
+                    error_dump: event.error_dump.clone(),
+                    traceback: event.traceback.clone(),
+                },
             });
         }
     }
-    Ok(trajectory)
+    Ok(failures)
 }
 
 fn normalize_events(events: &[DatagenEvent]) -> Result<Vec<&DatagenEvent>, String> {
@@ -352,69 +641,56 @@ fn normalize_events(events: &[DatagenEvent]) -> Result<Vec<&DatagenEvent>, Strin
     Ok(ordered)
 }
 
-fn initial_item(first: &DatagenEvent) -> FoldedDatagenItem {
-    FoldedDatagenItem {
-        item_id: first.item_id.clone(),
-        root_item_id: first.root_item_id.clone(),
-        parent_item_id: first.parent_item_id.clone(),
-        fields: BTreeMap::new(),
-        completed_steps: BTreeSet::new(),
-        status: DatagenItemStatus::Pending,
-        terminal: None,
-        failure: None,
-        query_tags: None,
-        current_run_id: first.run_id.clone(),
+fn initial_item(first: &DatagenEvent) -> Result<FoldedDatagenItem, String> {
+    let parent_item_id = match &first.parent_item_id {
+        Some(parent) => Some(DatagenItemId::parse(parent)?),
+        None => None,
+    };
+    Ok(FoldedDatagenItem {
+        item_id: DatagenItemId::parse(&first.item_id)?,
+        root_item_id: DatagenItemId::parse(&first.root_item_id)?,
+        parent_item_id,
+        status: DatagenItemStatus::Running,
         last_item_seq: first.item_seq,
-        last_checkpoint_id: first.checkpoint_id.clone(),
-    }
+        last_attempt: first.attempt,
+        fields: BTreeMap::new(),
+        trajectory: DatagenTrajectory::default(),
+        query_tags: None,
+        blob_event_ids: BTreeMap::new(),
+    })
 }
 
 fn apply_event(item: &mut FoldedDatagenItem, event: &DatagenEvent) -> Result<(), String> {
-    if event.item_id != item.item_id {
+    if DatagenItemId::parse(&event.item_id)? != item.item_id {
         return Err(format!(
             "event '{}' belongs to item '{}', expected '{}'",
             event.event_id, event.item_id, item.item_id
         ));
     }
-    if event.root_item_id != item.root_item_id {
-        return Err(format!(
-            "item '{}' changed root_item_id from '{}' to '{}'",
-            item.item_id, item.root_item_id, event.root_item_id
-        ));
-    }
-    if event.parent_item_id != item.parent_item_id {
-        return Err(format!(
-            "item '{}' changed parent_item_id during its trajectory",
-            item.item_id
-        ));
-    }
 
-    item.current_run_id = event.run_id.clone();
-    item.last_item_seq = event.item_seq;
-    item.last_checkpoint_id = event.checkpoint_id.clone();
+    item.last_item_seq = item.last_item_seq.max(event.item_seq);
+    item.last_attempt = item.last_attempt.max(event.attempt);
 
     match event.event_type {
         DatagenEventType::ItemCreated => {
-            item.status = DatagenItemStatus::Pending;
-            item.terminal = None;
-            item.failure = None;
+            item.status = DatagenItemStatus::Running;
             if event.query_tags.is_some() {
                 item.query_tags = event.query_tags.clone();
             }
         }
+        DatagenEventType::StepStarted => {
+            item.trajectory.started.insert(stream_position(event)?);
+        }
         DatagenEventType::FieldSet => {
             let field_name = event.field_name.clone().unwrap();
-            item.fields.insert(
-                field_name,
-                DatagenFieldState::Set(event.value.clone().unwrap()),
-            );
-            item.status = DatagenItemStatus::Running;
-            item.terminal = None;
-            item.failure = None;
+            let value = event.value.clone().unwrap();
+            record_blob_event_id(item, &field_name, &value, &event.event_id);
+            item.fields.insert(field_name, DatagenFieldState::Set(value));
         }
         DatagenEventType::FieldAppend => {
             let field_name = event.field_name.clone().unwrap();
             let value = event.value.clone().unwrap();
+            record_blob_event_id(item, &field_name, &value, &event.event_id);
             match item.fields.entry(field_name) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
                     entry.insert(DatagenFieldState::Appended(vec![value]));
@@ -429,60 +705,56 @@ fn apply_event(item: &mut FoldedDatagenItem, event: &DatagenEvent) -> Result<(),
                     }
                 },
             }
-            item.status = DatagenItemStatus::Running;
-            item.terminal = None;
-            item.failure = None;
         }
         DatagenEventType::StepCompleted => {
-            item.completed_steps.insert(step_cursor(event)?);
-            item.status = DatagenItemStatus::Running;
-            item.terminal = None;
-            item.failure = None;
-        }
-        DatagenEventType::Failed => {
-            item.status = DatagenItemStatus::Failed;
-            item.terminal = None;
-            item.failure = Some(DatagenFailure {
-                event_id: event.event_id.clone(),
-                run_id: event.run_id.clone(),
-                checkpoint_id: event.checkpoint_id.clone(),
+            let position = stream_position(event)?;
+            item.trajectory.completed.insert(position.clone());
+            item.trajectory.ordered.push(DatagenStepCursor {
+                position,
                 item_seq: event.item_seq,
-                step_name: event.step_name.clone(),
-                error_type: event.error_type.clone().unwrap(),
-                error_dump: event.error_dump.clone(),
-                traceback: event.traceback.clone(),
-                failed_at: event.event_ts,
             });
         }
+        DatagenEventType::Failed => {
+            // Failure lens only: a FAILED row leaves the item Running under the lifecycle lens.
+        }
         DatagenEventType::Terminal => {
-            let terminal = event.terminal.unwrap();
-            item.status = match terminal {
-                DatagenTerminal::Completed => DatagenItemStatus::Completed,
-                DatagenTerminal::Filtered => DatagenItemStatus::Filtered,
+            item.status = match event.status {
+                Some(status @ (DatagenItemStatus::Completed | DatagenItemStatus::Filtered)) => status,
+                _ => return Err("TERMINAL event missing completed/filtered status".to_string()),
             };
-            item.terminal = Some(terminal);
-            item.failure = None;
         }
     }
     Ok(())
 }
 
-fn step_cursor(event: &DatagenEvent) -> Result<DatagenStepCursor, String> {
-    Ok(DatagenStepCursor {
-        checkpoint_id: event.checkpoint_id.clone(),
-        step_name: event
-            .step_name
-            .clone()
-            .ok_or_else(|| "STEP_COMPLETED missing step_name".to_string())?,
-        step_index: event
+fn record_blob_event_id(
+    item: &mut FoldedDatagenItem,
+    field_name: &str,
+    value: &DatagenValue,
+    event_id: &str,
+) {
+    if matches!(value, DatagenValue::Blob(_)) {
+        item.blob_event_ids
+            .insert(field_name.to_string(), event_id.to_string());
+    }
+}
+
+fn stream_position(event: &DatagenEvent) -> Result<DatagenStreamPosition, String> {
+    Ok(DatagenStreamPosition {
+        step: DatagenStepId {
+            name: event
+                .step_name
+                .clone()
+                .ok_or_else(|| "step event missing step_name".to_string())?,
+            kind: event
+                .step_kind
+                .ok_or_else(|| "step event missing step_kind".to_string())?,
+        },
+        index: event
             .step_index
-            .ok_or_else(|| "STEP_COMPLETED missing step_index".to_string())?,
-        step_instance_id: event
-            .step_instance_id
-            .clone()
-            .ok_or_else(|| "STEP_COMPLETED missing step_instance_id".to_string())?,
-        iteration: event.iteration,
-        attempt: event.attempt,
+            .ok_or_else(|| "step event missing step_index".to_string())?,
+        enclosing: event.enclosing_step.clone(),
+        selector: event.selector_step.clone(),
     })
 }
 
@@ -495,17 +767,18 @@ mod tests {
     fn event(seq: i64, event_type: DatagenEventType) -> DatagenEvent {
         let checkpoint_id = format!("checkpoint-{seq}");
         DatagenEvent {
-            event_id: datagen_event_id("item-1", &checkpoint_id, 0),
-            item_id: "item-1".to_string(),
-            root_item_id: "item-1".to_string(),
+            event_id: datagen_event_id("5", &checkpoint_id, 0),
+            item_id: "5".to_string(),
+            root_item_id: "5".to_string(),
             parent_item_id: None,
             item_seq: seq,
             checkpoint_id,
             event_type,
             step_name: None,
+            step_kind: None,
             step_index: None,
-            step_instance_id: None,
-            iteration: None,
+            enclosing_step: None,
+            selector_step: None,
             attempt: 0,
             run_id: "run-1".to_string(),
             writer_epoch: "writer-1".to_string(),
@@ -514,7 +787,7 @@ mod tests {
             codec_version: None,
             value: None,
             query_tags: None,
-            terminal: None,
+            status: None,
             error_type: None,
             error_dump: None,
             traceback: None,
@@ -523,77 +796,158 @@ mod tests {
         }
     }
 
-    fn completed_step(seq: i64) -> DatagenEvent {
-        let mut event = event(seq, DatagenEventType::StepCompleted);
-        event.step_name = Some("noop".to_string());
-        event.step_index = Some(3);
-        event.step_instance_id = Some("loop/2/noop".to_string());
-        event.iteration = Some(2);
-        event
+    fn created(seq: i64) -> DatagenEvent {
+        let mut created = event(seq, DatagenEventType::ItemCreated);
+        created.status = Some(DatagenItemStatus::Running);
+        created
+    }
+
+    fn leaf_completed(seq: i64, name: &str, index: i64, enclosing: Option<&str>) -> DatagenEvent {
+        let mut completed = event(seq, DatagenEventType::StepCompleted);
+        completed.step_name = Some(name.to_string());
+        completed.step_kind = Some(DatagenStepKind::Leaf);
+        completed.step_index = Some(index);
+        completed.enclosing_step = enclosing.map(str::to_string);
+        completed
+    }
+
+    fn driver_started(seq: i64, name: &str, index: i64, enclosing: Option<&str>) -> DatagenEvent {
+        let mut started = event(seq, DatagenEventType::StepStarted);
+        started.step_name = Some(name.to_string());
+        started.step_kind = Some(DatagenStepKind::Sequence);
+        started.step_index = Some(index);
+        started.enclosing_step = enclosing.map(str::to_string);
+        started
     }
 
     #[test]
-    fn no_op_step_is_present_in_fold_and_trajectory() {
-        let created = event(0, DatagenEventType::ItemCreated);
-        let completed = completed_step(1);
+    fn item_id_round_trips_and_navigates() {
+        let root = DatagenItemId::from_source_key("5");
+        let child = root.child("expand", 0).child("enrich", 1);
+        assert_eq!(child.to_string(), "5/expand:0/enrich:1");
+        assert_eq!(DatagenItemId::parse("5/expand:0/enrich:1").unwrap(), child);
+        assert_eq!(child.origin_step(), Some("enrich"));
+        assert_eq!(child.branch_idx(), Some(1));
+        assert_eq!(child.parent().unwrap().to_string(), "5/expand:0");
+        assert_eq!(child.root(), root);
+        assert!(root.is_root());
+        assert_eq!(root.origin_step(), None);
+    }
 
-        let folded = fold_datagen_events(&[completed.clone(), created]).unwrap();
+    #[test]
+    fn never_started_folds_to_none() {
+        let completed = leaf_completed(1, "gen", 0, Some("main"));
+        assert!(fold_datagen_events(&[completed]).unwrap().is_none());
+    }
+
+    #[test]
+    fn fold_tracks_started_and_completed_positions() {
+        let events = [
+            created(0),
+            driver_started(1, "main", 0, None),
+            leaf_completed(2, "gen", 0, Some("main")),
+        ];
+        let folded = fold_datagen_events(&events).unwrap().unwrap();
         assert_eq!(folded.status, DatagenItemStatus::Running);
-        assert_eq!(folded.completed_steps.len(), 1);
-        assert!(folded.fields.is_empty());
+        assert_eq!(folded.trajectory.ordered.len(), 1);
+        assert_eq!(folded.trajectory.completed.len(), 1);
+        assert_eq!(folded.trajectory.started.len(), 1);
+        assert_eq!(folded.last_item_seq, 2);
+    }
 
-        let trajectory = datagen_trajectory(&[completed]).unwrap();
-        assert_eq!(trajectory.len(), 1);
-        assert_eq!(trajectory[0].cursor.step_instance_id, "loop/2/noop");
+    #[test]
+    fn field_set_is_last_writer_wins_and_append_accumulates() {
+        let mut set_v1 = leaf_completed(1, "gen", 0, Some("main"));
+        set_v1.event_type = DatagenEventType::FieldSet;
+        set_v1.field_name = Some("draft".to_string());
+        set_v1.field_type = Some("str".to_string());
+        set_v1.codec_version = Some(1);
+        set_v1.value = Some(DatagenValue::Str("v1".to_string()));
+
+        let mut set_v2 = set_v1.clone();
+        set_v2.item_seq = 2;
+        set_v2.checkpoint_id = "c2".to_string();
+        set_v2.event_id = datagen_event_id("5", "c2", 0);
+        set_v2.value = Some(DatagenValue::Str("v2".to_string()));
+
+        let mut append = leaf_completed(3, "b1", 0, Some("body"));
+        append.event_type = DatagenEventType::FieldAppend;
+        append.field_name = Some("revisions".to_string());
+        append.field_type = Some("json".to_string());
+        append.codec_version = Some(1);
+        append.value = Some(DatagenValue::Json(json!({"n": "a"})));
+        let mut append2 = append.clone();
+        append2.item_seq = 4;
+        append2.checkpoint_id = "c4".to_string();
+        append2.event_id = datagen_event_id("5", "c4", 0);
+        append2.value = Some(DatagenValue::Json(json!({"n": "b"})));
+
+        let folded =
+            fold_datagen_events(&[created(0), set_v1, set_v2, append, append2]).unwrap().unwrap();
+        assert_eq!(
+            folded.fields.get("draft"),
+            Some(&DatagenFieldState::Set(DatagenValue::Str("v2".to_string())))
+        );
+        assert_eq!(
+            folded.fields.get("revisions"),
+            Some(&DatagenFieldState::Appended(vec![
+                DatagenValue::Json(json!({"n": "a"})),
+                DatagenValue::Json(json!({"n": "b"})),
+            ]))
+        );
+    }
+
+    #[test]
+    fn terminal_sets_lifecycle_status() {
+        let mut terminal = event(2, DatagenEventType::Terminal);
+        terminal.status = Some(DatagenItemStatus::Completed);
+        let folded = fold_datagen_events(&[created(0), terminal]).unwrap().unwrap();
+        assert_eq!(folded.status, DatagenItemStatus::Completed);
+    }
+
+    #[test]
+    fn failed_leaves_item_running_but_surfaces_in_failures() {
+        let mut failed = leaf_completed(1, "check", 2, Some("solve"));
+        failed.event_type = DatagenEventType::Failed;
+        failed.status = Some(DatagenItemStatus::Failed);
+        failed.error_type = Some("ValueError".to_string());
+        failed.attempt = 0;
+
+        let folded = fold_datagen_events(&[created(0), failed.clone()]).unwrap().unwrap();
+        assert_eq!(folded.status, DatagenItemStatus::Running);
+
+        let failures = datagen_failures(&[created(0), failed]).unwrap();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].error.error_type, "ValueError");
+        assert_eq!(failures[0].at.position.step.name, "check");
+    }
+
+    #[test]
+    fn sequence_collision_is_rejected() {
+        let first = leaf_completed(1, "gen", 0, Some("main"));
+        let mut second = first.clone();
+        second.event_id = "different-event".to_string();
+        second.checkpoint_id = "different-checkpoint".to_string();
+        let error = fold_datagen_events(&[created(0), first, second]).unwrap_err();
+        assert!(error.contains("conflicting events at item_seq 1"));
     }
 
     #[test]
     fn retry_duplicate_event_is_folded_once() {
-        let created = event(0, DatagenEventType::ItemCreated);
-        let mut append = event(1, DatagenEventType::FieldAppend);
+        let mut append = leaf_completed(1, "gen", 1, Some("main"));
+        append.event_type = DatagenEventType::FieldAppend;
         append.field_name = Some("messages".to_string());
         append.field_type = Some("json".to_string());
         append.codec_version = Some(1);
         append.value = Some(DatagenValue::Json(json!({"role": "assistant"})));
-        append.step_name = Some("generate".to_string());
-        append.step_index = Some(1);
-        append.step_instance_id = Some("generate/0".to_string());
 
-        let folded = fold_datagen_events(&[created, append.clone(), append.clone()]).unwrap();
+        let folded =
+            fold_datagen_events(&[created(0), append.clone(), append]).unwrap().unwrap();
         assert_eq!(
             folded.fields.get("messages"),
             Some(&DatagenFieldState::Appended(vec![DatagenValue::Json(
                 json!({"role": "assistant"})
             )]))
         );
-    }
-
-    #[test]
-    fn sequence_collision_is_rejected() {
-        let created = event(0, DatagenEventType::ItemCreated);
-        let first = completed_step(1);
-        let mut second = first.clone();
-        second.event_id = "different-event".to_string();
-        second.checkpoint_id = "different-checkpoint".to_string();
-
-        let error = fold_datagen_events(&[created, first, second]).unwrap_err();
-        assert!(error.contains("conflicting events at item_seq 1"));
-    }
-
-    #[test]
-    fn later_run_can_supersede_a_failure() {
-        let created = event(0, DatagenEventType::ItemCreated);
-        let mut failed = event(1, DatagenEventType::Failed);
-        failed.error_type = Some("RuntimeError".to_string());
-
-        let mut retried = event(2, DatagenEventType::ItemCreated);
-        retried.run_id = "run-2".to_string();
-        retried.checkpoint_id = "retry-created".to_string();
-        retried.event_id = datagen_event_id("item-1", "retry-created", 0);
-
-        let folded = fold_datagen_events(&[created, failed, retried]).unwrap();
-        assert_eq!(folded.status, DatagenItemStatus::Pending);
-        assert_eq!(folded.current_run_id, "run-2");
-        assert!(folded.failure.is_none());
     }
 }
