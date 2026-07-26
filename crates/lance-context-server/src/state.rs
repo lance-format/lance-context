@@ -433,9 +433,48 @@ impl AppState {
                         .collect()
                 };
                 for (name, store) in resident {
+                    // Same read-lock/write-lock split as the flush sweeper: seal
+                    // and read under the shared lock so appends keep flowing,
+                    // then commit under the exclusive lock. Threshold 1 — merge
+                    // whatever is pending, which is what makes this the *time*
+                    // half of the "time OR count" trigger.
+                    let prepared = {
+                        let guard = store.read().await;
+                        match tokio::time::timeout(pass_timeout, guard.prepare_cleanup_merge())
+                            .await
+                        {
+                            Ok(Ok(prepared)) => prepared,
+                            Ok(Err(e)) => {
+                                metrics::counter!("rollout_wal_cleanup_total", "result" => "failed")
+                                    .increment(1);
+                                tracing::warn!(
+                                    store = %name,
+                                    error = %e,
+                                    "global sweeper WAL cleanup failed"
+                                );
+                                continue;
+                            }
+                            Err(_elapsed) => {
+                                metrics::counter!("rollout_wal_cleanup_total", "result" => "timeout")
+                                    .increment(1);
+                                tracing::warn!(
+                                    store = %name,
+                                    "global sweeper WAL cleanup timed out; abandoning this store this tick"
+                                );
+                                continue;
+                            }
+                        }
+                    };
+                    let Some((manifest_store, manifest, prepared)) = prepared else {
+                        continue;
+                    };
                     let mut guard = store.write().await;
-                    match tokio::time::timeout(pass_timeout, guard.cleanup_own_shard()).await {
-                        Ok(Ok(0)) => {}
+                    match tokio::time::timeout(
+                        pass_timeout,
+                        guard.commit_prepared_merge(&manifest_store, &manifest, prepared),
+                    )
+                    .await
+                    {
                         Ok(Ok(n)) => {
                             metrics::counter!("rollout_wal_cleanup_total", "result" => "merged")
                                 .increment(1);
@@ -531,11 +570,50 @@ impl AppState {
                         }
                         metrics::counter!("rollout_wal_flush_total", "result" => "ok").increment(1);
                     }
-                    // Count-triggered merge (no-op unless the threshold is set and
-                    // met). Needs the write lock; excludes concurrent appends.
+                    // Count-triggered merge (no-op unless the threshold is set
+                    // and met).
+                    //
+                    // Split by lock scope: the expensive half (sealing the
+                    // memtable and reading every flushed generation out of
+                    // object storage) runs under the *read* lock, so appends
+                    // keep flowing through it. Only the short commit — append to
+                    // the base table, drain the manifest, delete the merged
+                    // dirs — takes the write lock. Previously the whole merge
+                    // held the write lock, which stalled every concurrent append
+                    // for its full duration.
+                    let threshold = state.rollout_merge_after_generations;
+                    if threshold == 0 {
+                        continue;
+                    }
+                    let prepared = {
+                        let guard = store.read().await;
+                        match tokio::time::timeout(
+                            pass_timeout,
+                            guard.prepare_merge_if_ready(threshold),
+                        )
+                        .await
+                        {
+                            Ok(Ok(prepared)) => prepared,
+                            Ok(Err(e)) => {
+                                tracing::warn!(store = %name, error = %e, "flush sweeper merge failed");
+                                continue;
+                            }
+                            Err(_elapsed) => {
+                                tracing::warn!(store = %name, "flush sweeper merge timed out");
+                                continue;
+                            }
+                        }
+                    };
+                    let Some((manifest_store, manifest, prepared)) = prepared else {
+                        continue;
+                    };
                     let mut guard = store.write().await;
-                    match tokio::time::timeout(pass_timeout, guard.maybe_merge_own_shard()).await {
-                        Ok(Ok(0)) => {}
+                    match tokio::time::timeout(
+                        pass_timeout,
+                        guard.commit_prepared_merge(&manifest_store, &manifest, prepared),
+                    )
+                    .await
+                    {
                         Ok(Ok(n)) => {
                             metrics::counter!("rollout_wal_generations_reclaimed_total")
                                 .increment(n as u64);

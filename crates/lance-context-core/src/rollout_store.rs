@@ -102,6 +102,27 @@ enum FlushOutcome {
     Fenced,
 }
 
+/// Rows read out of the flushed generations, ready to be appended to the base
+/// table and drained from the shard manifest.
+///
+/// Produced by [`RolloutStore::prepare_merge`] under `&self` (so appends keep
+/// running while it reads object storage) and consumed by
+/// [`RolloutStore::commit_merge`] under `&mut self`.
+pub struct PreparedMerge {
+    merged_generations: HashSet<u64>,
+    merged_paths: Vec<String>,
+    batches: Vec<RecordBatch>,
+    merge_schema: Arc<Schema>,
+}
+
+impl PreparedMerge {
+    /// Number of generations this merge will reclaim.
+    #[must_use]
+    pub fn generation_count(&self) -> usize {
+        self.merged_generations.len()
+    }
+}
+
 /// Number of shard manifest files to scan per batch when discovering the latest
 /// shard state (mirrors the constant used by `ContextStore`).
 const DEFAULT_MANIFEST_SCAN_BATCH_SIZE: usize = 16;
@@ -778,9 +799,70 @@ impl RolloutStore {
     /// in [`Self::add`] (with `threshold = merge_after_generations`) and the
     /// caller-driven time trigger via [`Self::cleanup_own_shard`] (with
     /// `threshold = 1`, i.e. merge whatever is pending). Both merge only
-    /// the shard this instance owns and writes, so the epoch claim never fences
-    /// another writer.
+    /// the shard this instance owns and writes.
     async fn merge_own_shard_if_ready(&mut self, threshold: usize) -> LanceResult<usize> {
+        let Some((manifest_store, manifest, prepared)) =
+            self.prepare_merge_if_ready(threshold).await?
+        else {
+            return Ok(0);
+        };
+        let pending = prepared.generation_count();
+        self.commit_merge(&manifest_store, &manifest, prepared)
+            .await?;
+        Ok(pending)
+    }
+
+    /// The shared-lock half of a merge: decide whether one is due, seal the
+    /// memtable, and read the flushed generations into memory.
+    ///
+    /// Takes `&self`, so a caller holding a *read* lock can run the expensive
+    /// part while appends continue, then take the write lock only to hand the
+    /// result to [`Self::commit_merge`]. Returns `None` when nothing is due.
+    ///
+    /// This is the pairing that keeps a background merge off the write path:
+    ///
+    /// ```ignore
+    /// let prepared = { store.read().await.prepare_merge_if_ready(1).await? };
+    /// if let Some((manifest_store, manifest, prepared)) = prepared {
+    ///     let mut guard = store.write().await;
+    ///     guard.commit_merge(&manifest_store, &manifest, prepared).await?;
+    /// }
+    /// ```
+    ///
+    /// Callers that do not care about lock scope should use
+    /// [`Self::cleanup_own_shard`] or [`Self::maybe_merge_own_shard`], which do
+    /// both halves under whatever lock the caller already holds.
+    pub async fn prepare_merge_if_ready(
+        &self,
+        threshold: usize,
+    ) -> LanceResult<Option<(ShardManifestStore, ShardManifest, PreparedMerge)>> {
+        self.prepare_merge_if_ready_inner(threshold, false).await
+    }
+
+    /// [`Self::prepare_merge_if_ready`], but seals the active memtable *before*
+    /// consulting the manifest.
+    ///
+    /// This is the time-triggered (`threshold = 1`) behaviour of
+    /// [`Self::cleanup_own_shard`], and the ordering is load-bearing: with the
+    /// periodic flush sweeper disabled (`ROLLOUT_FLUSH_INTERVAL_SECS=0`) nothing
+    /// else seals the memtable, so `flushed_generations` would stay empty, the
+    /// threshold check would return `None`, and rows would remain durable but
+    /// permanently invisible until a process restart replayed the WAL.
+    pub async fn prepare_cleanup_merge(
+        &self,
+    ) -> LanceResult<Option<(ShardManifestStore, ShardManifest, PreparedMerge)>> {
+        self.prepare_merge_if_ready_inner(1, true).await
+    }
+
+    async fn prepare_merge_if_ready_inner(
+        &self,
+        threshold: usize,
+        seal_first: bool,
+    ) -> LanceResult<Option<(ShardManifestStore, ShardManifest, PreparedMerge)>> {
+        if seal_first {
+            // Materialize anything buffered so it is eligible for this pass.
+            self.flush().await?;
+        }
         let object_store = self.dataset.object_store(None).await?;
         let branch_location = self.dataset.branch_location();
         let manifest_store = ShardManifestStore::new(
@@ -790,13 +872,29 @@ impl RolloutStore {
             DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
         );
         let Some(manifest) = manifest_store.read_latest().await? else {
-            return Ok(0);
+            return Ok(None);
         };
         let pending = manifest.flushed_generations.len();
         if pending == 0 || pending < threshold.max(1) {
-            return Ok(0);
+            return Ok(None);
         }
-        self.merge_own_shard(&manifest_store, &manifest).await?;
+        let Some(prepared) = self.prepare_merge(&manifest).await? else {
+            return Ok(None);
+        };
+        Ok(Some((manifest_store, manifest, prepared)))
+    }
+
+    /// Commit a merge prepared by [`Self::prepare_merge_if_ready`]. See that
+    /// method for the intended read-lock/write-lock split.
+    pub async fn commit_prepared_merge(
+        &mut self,
+        manifest_store: &ShardManifestStore,
+        manifest: &ShardManifest,
+        prepared: PreparedMerge,
+    ) -> LanceResult<usize> {
+        let pending = prepared.generation_count();
+        self.commit_merge(manifest_store, manifest, prepared)
+            .await?;
         Ok(pending)
     }
 
@@ -857,45 +955,107 @@ impl RolloutStore {
     /// committing the drain, *without merging it* (data loss). `commit_update`
     /// re-reads the latest manifest and applies this closure to it, so the
     /// retain filter runs against the current state, not the stale snapshot.
+    /// # Concurrency: the expensive phase does not need exclusive access
     ///
-    /// # Safety of the epoch claim
+    /// A merge only ever touches *sealed* generations — history — while `add`
+    /// writes the active memtable at the WAL tail. They operate on disjoint
+    /// data, which is the whole point of an LSM, so a merge should not stop the
+    /// write path. Two things used to force it to:
     ///
-    /// `claim_epoch` bumps the shard's writer epoch, which would fence any
-    /// *other* live writer of this shard. That is safe here precisely because
-    /// each instance merges only the shard it owns and writes: there is no
-    /// other live writer of `self.write_shard` to fence. After the merge this
-    /// instance's next `add` opens a fresh `mem_wal_writer`, which re-claims
-    /// the (now-current) epoch.
+    /// 1. `claim_epoch` bumped `writer_epoch`, fencing every live writer of the
+    ///    shard — including our own — so the merge had to `close()` the resident
+    ///    writer first and callers had to hide that window behind an exclusive
+    ///    lock. Removed: the epoch is an *ownership* token, not a per-commit
+    ///    token. [`ShardManifestStore::commit_update`] only rejects a writer
+    ///    whose epoch is **older** than the stored one, and Lance's own flush
+    ///    path reuses a single epoch for every manifest commit a writer makes.
+    ///    Reusing the shard's current epoch commits the drain and leaves the
+    ///    live writer untouched.
+    ///
+    /// 2. The dominant cost — reading every flushed generation out of object
+    ///    storage into memory — sat inside that same exclusive section. It is
+    ///    now split into [`Self::prepare_merge`], which takes `&self`, so a
+    ///    caller can run it under a shared lock and take the exclusive lock only
+    ///    for the short commit ([`Self::commit_merge`]).
+    ///
+    /// Lance explicitly sanctions an external compactor draining
+    /// `flushed_generations` concurrently: recovery keys off
+    /// `replay_after_wal_entry_position` alone and deliberately does not consult
+    /// that vector.
+    ///
+    /// # Surgical drain, not blanket clear
+    ///
+    /// The drain removes only the generation ids this call actually merged,
+    /// retaining anything else present. This is load-bearing now that a
+    /// concurrent flush can seal a new generation mid-merge: `commit_update`
+    /// re-runs the closure against a freshly-read manifest on every CAS retry,
+    /// so a *relative* edit (retain-not-in-set) composes with a concurrent
+    /// flush's append, while an absolute `flushed_generations = []` would
+    /// silently discard a generation that was never merged — data loss. For the
+    /// same reason the closure must preserve `current_generation`,
+    /// `replay_after_wal_entry_position` and `wal_entry_position_last_seen`,
+    /// which a concurrent flush advances; `..current.clone()` carries them.
     ///
     /// Rollout rows are immutable and de-duplicated by `id` at read time, so
     /// even if a crash interrupts the sequence (data appended to base but
     /// manifest not yet drained), a subsequent read simply sees the rows via
     /// both the base table and the still-listed generation and de-dups them —
     /// no double counting. The next merge attempt then drains the manifest.
-    async fn merge_own_shard(
-        &mut self,
-        manifest_store: &ShardManifestStore,
-        manifest: &ShardManifest,
-    ) -> LanceResult<()> {
+    /// The `&self` half of a merge: everything that can run while appends
+    /// continue — sealing the memtable and reading every flushed generation
+    /// into memory.
+    ///
+    /// Returns `None` when there is nothing to merge. Callers holding a shared
+    /// lock can run this, then upgrade to the exclusive lock only for
+    /// [`Self::commit_merge`].
+    async fn prepare_merge(&self, manifest: &ShardManifest) -> LanceResult<Option<PreparedMerge>> {
         if manifest.flushed_generations.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
 
-        // This merge is about to `claim_epoch`, which fences any live writer of
-        // this shard — including our own resident writer. Close it (draining its
-        // background tasks; `ShardWriter` has no `Drop`) and clear it so the next
-        // `add` transparently reopens against the freshly-claimed epoch.
-        observe_phase!("seal", self.close().await)?;
+        // Seal the active memtable so its rows are in a generation rather than
+        // buffered. Uses `&self` (the writer lives behind a Mutex), and no
+        // longer closes the writer: without `claim_epoch` there is nothing to
+        // fence it against, so appends continue throughout.
+        observe_phase!("seal", self.flush().await)?;
 
-        self.ensure_latest_rollout_schema().await?;
-
-        // Resolve each flushed generation to its absolute dataset path and read
-        // all its rows into memory. Record which generation ids we merge so the
-        // drain can remove exactly these and nothing else.
+        // The expensive phase: pull every flushed generation out of object
+        // storage. Buffered in memory, so this is the part that must not hold an
+        // exclusive lock.
         let (merged_generations, merged_paths, batches, merge_schema) =
             observe_phase!("read", self.read_flushed_generations(manifest).await)?;
 
-        // Append the merged rows to the base table.
+        Ok(Some(PreparedMerge {
+            merged_generations,
+            merged_paths,
+            batches,
+            merge_schema,
+        }))
+    }
+
+    /// The `&mut self` half of a merge: append the prepared rows to the base
+    /// table, drain the merged generations from the manifest, and delete their
+    /// directories.
+    ///
+    /// Short relative to [`Self::prepare_merge`], and `&mut self` because
+    /// `Dataset::append` rebinds this handle to the post-commit dataset — which
+    /// is also what keeps subsequent reads on this instance correct, since the
+    /// merged generations are about to disappear from the manifest.
+    async fn commit_merge(
+        &mut self,
+        manifest_store: &ShardManifestStore,
+        manifest: &ShardManifest,
+        prepared: PreparedMerge,
+    ) -> LanceResult<()> {
+        let PreparedMerge {
+            merged_generations,
+            merged_paths,
+            batches,
+            merge_schema,
+        } = prepared;
+
+        self.ensure_latest_rollout_schema().await?;
+
         if !batches.is_empty() {
             observe_phase!(
                 "append",
@@ -903,52 +1063,58 @@ impl RolloutStore {
             )?;
         }
 
-        // Drain the merged generations from the shard manifest. Claim the
-        // shard's epoch (safe: we own it) and commit a manifest that retains
-        // every generation except the ones we just folded into the base table.
-        // Removing only the merged ids (rather than clearing the vec) is what
-        // makes this safe against a generation that lands after we read the
-        // manifest: it is preserved for the next merge instead of being dropped.
-        let (epoch, _) = observe_phase!(
-            "claim_epoch",
-            manifest_store.claim_epoch(manifest.shard_spec_id).await
-        )?;
+        // Reuse the shard's *current* epoch rather than claiming a new one:
+        // claiming would fence our own live writer (see the doc comment above).
+        // `commit_update` still fails cleanly if a genuinely new writer has
+        // claimed the shard meanwhile — its epoch would exceed ours — which is
+        // the correct outcome, since that writer now owns the shard.
+        let epoch = manifest.writer_epoch;
 
         observe_phase!(
             "drain",
             manifest_store
                 .commit_update(epoch, |current| ShardManifest {
                     version: current.version + 1,
+                    // Relative edit: retain everything we did not merge. Must
+                    // never become an absolute assignment — see the doc comment.
                     flushed_generations: current
                         .flushed_generations
                         .iter()
                         .filter(|fg| !merged_generations.contains(&fg.generation))
                         .cloned()
                         .collect(),
+                    // Carries `current_generation`,
+                    // `replay_after_wal_entry_position` and
+                    // `wal_entry_position_last_seen`, which a concurrent flush
+                    // advances and this merge must never roll back.
                     ..current.clone()
                 })
                 .await
         )?;
 
-        // Delete the merged generations' blob directories now that no manifest
-        // references them. Ordering matters: the drain above already removed
-        // these ids from `flushed_generations`, so a reader can no longer resolve
-        // them — deleting the data second (never before) keeps the sequence
-        // crash-safe. If the process dies between the drain and here, the rows
-        // are already in the base table and the manifest no longer lists these
-        // generations, so nothing reads them; they simply become storage that a
-        // sweep can reclaim later.
-        //
-        // Best-effort: a delete failure must NOT fail the merge — the merge has
-        // logically succeeded (data appended, manifest drained). A failed delete
-        // only leaks one directory, which the same reclamation path handles.
-        // Skipping this deletion is exactly the historical storage leak: every
-        // merged generation left its `_mem_wal/{shard}/{gen}/` directory behind
-        // forever.
+        self.delete_merged_generation_dirs(&merged_paths).await
+    }
+
+    /// Delete the merged generations' blob directories now that no manifest
+    /// references them.
+    ///
+    /// Ordering matters: the drain already removed these ids from
+    /// `flushed_generations`, so a reader can no longer resolve them — deleting
+    /// the data second (never before) keeps the sequence crash-safe. If the
+    /// process dies between the drain and here, the rows are already in the base
+    /// table and the manifest no longer lists these generations, so nothing
+    /// reads them; they simply become storage a later sweep reclaims.
+    ///
+    /// Best-effort: a delete failure must NOT fail the merge — the merge has
+    /// logically succeeded (data appended, manifest drained). A failed delete
+    /// only leaks one directory. Skipping this deletion entirely is exactly the
+    /// historical storage leak: every merged generation left its
+    /// `_mem_wal/{shard}/{gen}/` directory behind forever.
+    async fn delete_merged_generation_dirs(&self, merged_paths: &[String]) -> LanceResult<()> {
         let phase = timer_start!();
         let object_store = self.dataset.object_store(None).await?;
         let branch_path = self.dataset.branch_location().path.clone();
-        for path in &merged_paths {
+        for path in merged_paths {
             let gen_dir = branch_path
                 .clone()
                 .join("_mem_wal")

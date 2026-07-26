@@ -47,8 +47,9 @@ pub use record::{
 pub use registry::{RegistryEntry, RolloutRegistry};
 pub use rollout::{RolloutRecord, ROLE_ARTIFACT, ROLE_ASSISTANT, ROLE_GRADE, ROLE_TOOL};
 pub use rollout_store::{
-    rollout_schema, ListSource, RolloutFilters, RolloutObservation, RolloutPage, RolloutStore,
-    RolloutStoreOptions, SqlQueryResult, SQL_MAX_RESULT_ROWS, SQL_MAX_SCAN_ROWS, SQL_TABLE_NAME,
+    rollout_schema, ListSource, PreparedMerge, RolloutFilters, RolloutObservation, RolloutPage,
+    RolloutStore, RolloutStoreOptions, SqlQueryResult, SQL_MAX_RESULT_ROWS, SQL_MAX_SCAN_ROWS,
+    SQL_TABLE_NAME,
 };
 pub use storage::{create_local_dir_if_needed, join_uri, validate_store_name, MAX_STORE_NAME_LEN};
 pub use store::{
