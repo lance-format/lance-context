@@ -633,24 +633,41 @@ pub async fn merge_wal(
     Path(name): Path<String>,
 ) -> Result<Json<MergeWalResponse>, AppError> {
     let store_lock = state.get_or_open_rollout_store(&name).await?;
-    // The write lock blocks all ingest on this store for the duration of the
-    // merge, so it is timed separately from the merge itself: a slow merge and a
-    // merge that spent its time queued behind other writers are different
-    // problems with the same end-to-end number.
+    // Split by lock scope: seal + read every flushed generation under the
+    // *read* lock so ingest on this store keeps running, then take the write
+    // lock only for the short commit. Holding the write lock across the whole
+    // merge is what used to stall every concurrent append for its duration.
     let lock_start = std::time::Instant::now();
-    let mut store = store_lock.write().await;
-    ::metrics::histogram!("rollout_wal_merge_lock_wait_seconds")
-        .record(lock_start.elapsed().as_secs_f64());
+    let prepared = {
+        let store = store_lock.read().await;
+        ::metrics::histogram!("rollout_wal_merge_lock_wait_seconds")
+            .record(lock_start.elapsed().as_secs_f64());
+        match store.prepare_cleanup_merge().await {
+            Ok(prepared) => prepared,
+            Err(e) => {
+                ::metrics::counter!("rollout_wal_cleanup_total", "result" => "failed").increment(1);
+                return Err(AppError::from_lance(e));
+            }
+        }
+    };
 
     let merge_start = std::time::Instant::now();
-    let result = store.cleanup_own_shard().await;
-
-    let reclaimed = match result {
-        Ok(n) => n,
-        Err(e) => {
-            ::metrics::counter!("rollout_wal_cleanup_total", "result" => "failed").increment(1);
-            return Err(AppError::from_lance(e));
+    let reclaimed = match prepared {
+        Some((manifest_store, manifest, prepared)) => {
+            let mut store = store_lock.write().await;
+            match store
+                .commit_prepared_merge(&manifest_store, &manifest, prepared)
+                .await
+            {
+                Ok(n) => n,
+                Err(e) => {
+                    ::metrics::counter!("rollout_wal_cleanup_total", "result" => "failed")
+                        .increment(1);
+                    return Err(AppError::from_lance(e));
+                }
+            }
         }
+        None => 0,
     };
     // Emitted unconditionally: gating on `reclaimed > 0` made the common no-op
     // merge invisible, so a worker that never has anything to merge and a worker
