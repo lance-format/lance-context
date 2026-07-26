@@ -2536,7 +2536,7 @@ fn is_fenced_error(err: &LanceError) -> bool {
 /// so skipping is safe and avoids a transient failure. Both the structured
 /// not-found variants and the object-store "not found" surface are matched; the
 /// latter is text-based because it arrives as a generic wrapped IO error.
-fn is_not_found_error(err: &LanceError) -> bool {
+pub(crate) fn is_not_found_error(err: &LanceError) -> bool {
     if matches!(
         err,
         LanceError::DatasetNotFound { .. } | LanceError::NotFound { .. }
@@ -2553,7 +2553,7 @@ fn is_not_found_error(err: &LanceError) -> bool {
 /// null arrays. Missing required columns, type changes, and generation-only
 /// columns remain hard errors so a merge cannot silently corrupt or discard
 /// data.
-fn align_batch_to_schema(
+pub(crate) fn align_batch_to_schema(
     batch: RecordBatch,
     target_schema: Arc<Schema>,
 ) -> LanceResult<RecordBatch> {
