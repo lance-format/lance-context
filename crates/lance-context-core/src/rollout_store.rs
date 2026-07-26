@@ -83,12 +83,24 @@ use serde_json::Value;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::metrics::{count, observe_duration, observe_phase, timer_elapsed, timer_start};
 use crate::rollout::RolloutRecord;
 use crate::store::{
     column_as, column_as_optional, relationship_field, relationship_list_item_field,
     relationship_struct_builder, relationships_from_list, timestamp_from_micros, CompactionConfig,
     CompactionStats, RELATIONSHIPS_COLUMN,
 };
+
+/// What a [`RolloutStore::flush`] actually did, for the `outcome` metric label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlushOutcome {
+    /// A memtable was sealed and drained into a flushed generation.
+    Sealed,
+    /// No resident writer, so nothing to seal (the common case).
+    Noop,
+    /// The writer's epoch was superseded by a merge; nothing to flush.
+    Fenced,
+}
 
 /// Number of shard manifest files to scan per batch when discovering the latest
 /// shard state (mirrors the constant used by `ContextStore`).
@@ -582,7 +594,22 @@ impl RolloutStore {
         if records.is_empty() {
             return Ok(self.dataset.manifest.version);
         }
+        // Success-path latency only. A failed append's *duration* is not
+        // actionable, but its *rate* is, so errors increment a flat counter
+        // rather than doubling this histogram's series count.
+        let started = timer_start!();
+        let result = self.add_inner(records).await;
+        match &result {
+            Ok(_) => observe_duration!(
+                crate::metrics::ROLLOUT_ADD_DURATION,
+                timer_elapsed!(started),
+            ),
+            Err(_) => count!(crate::metrics::ROLLOUT_ADD_ERRORS),
+        }
+        result
+    }
 
+    async fn add_inner(&self, records: &[RolloutRecord]) -> LanceResult<u64> {
         let batch = self.records_to_batch(records)?;
 
         // Durable append only: `put` waits for the WAL entry to be PUT to object
@@ -657,12 +684,38 @@ impl RolloutStore {
     /// append in [`Self::add`] and driven periodically (see the server's global
     /// sweeper). A no-op when no writer is resident or nothing is buffered.
     pub async fn flush(&self) -> LanceResult<()> {
+        let started = timer_start!();
+        let result = self.flush_inner().await;
+        // `outcome` is worth its cardinality: the three paths differ by orders of
+        // magnitude, and `noop` (no resident writer) is by far the most common,
+        // so a blended histogram would be dominated by near-zero samples.
+        // Failures are counted, not timed.
+        match &result {
+            Ok(outcome) => {
+                let label = match outcome {
+                    FlushOutcome::Sealed => "sealed",
+                    FlushOutcome::Noop => "noop",
+                    FlushOutcome::Fenced => "fenced",
+                };
+                let _ = label;
+                observe_duration!(
+                    crate::metrics::ROLLOUT_FLUSH_DURATION,
+                    timer_elapsed!(started),
+                    "outcome" => label,
+                );
+            }
+            Err(_) => count!(crate::metrics::ROLLOUT_FLUSH_ERRORS),
+        }
+        result.map(|_| ())
+    }
+
+    async fn flush_inner(&self) -> LanceResult<FlushOutcome> {
         let writer = {
             let guard = self.write_writer.lock().await;
             guard.as_ref().cloned()
         };
         let Some(writer) = writer else {
-            return Ok(());
+            return Ok(FlushOutcome::Noop);
         };
         match writer.force_seal_active().await {
             Ok(()) => {}
@@ -670,11 +723,12 @@ impl RolloutStore {
             // and replays. Nothing to flush against the dead epoch.
             Err(err) if is_fenced_error(&err) => {
                 self.invalidate_writer(&writer).await;
-                return Ok(());
+                return Ok(FlushOutcome::Fenced);
             }
             Err(err) => return Err(err),
         }
-        writer.wait_for_flush_drain().await
+        writer.wait_for_flush_drain().await?;
+        Ok(FlushOutcome::Sealed)
     }
 
     /// Gracefully close the resident writer, draining its background tasks.
@@ -831,17 +885,109 @@ impl RolloutStore {
         // this shard — including our own resident writer. Close it (draining its
         // background tasks; `ShardWriter` has no `Drop`) and clear it so the next
         // `add` transparently reopens against the freshly-claimed epoch.
-        self.close().await?;
+        observe_phase!("seal", self.close().await)?;
 
         self.ensure_latest_rollout_schema().await?;
 
         // Resolve each flushed generation to its absolute dataset path and read
         // all its rows into memory. Record which generation ids we merge so the
         // drain can remove exactly these and nothing else.
+        let (merged_generations, merged_paths, batches, merge_schema) =
+            observe_phase!("read", self.read_flushed_generations(manifest).await)?;
+
+        // Append the merged rows to the base table.
+        if !batches.is_empty() {
+            observe_phase!(
+                "append",
+                self.append_merged_batches(batches, merge_schema).await
+            )?;
+        }
+
+        // Drain the merged generations from the shard manifest. Claim the
+        // shard's epoch (safe: we own it) and commit a manifest that retains
+        // every generation except the ones we just folded into the base table.
+        // Removing only the merged ids (rather than clearing the vec) is what
+        // makes this safe against a generation that lands after we read the
+        // manifest: it is preserved for the next merge instead of being dropped.
+        let (epoch, _) = observe_phase!(
+            "claim_epoch",
+            manifest_store.claim_epoch(manifest.shard_spec_id).await
+        )?;
+
+        observe_phase!(
+            "drain",
+            manifest_store
+                .commit_update(epoch, |current| ShardManifest {
+                    version: current.version + 1,
+                    flushed_generations: current
+                        .flushed_generations
+                        .iter()
+                        .filter(|fg| !merged_generations.contains(&fg.generation))
+                        .cloned()
+                        .collect(),
+                    ..current.clone()
+                })
+                .await
+        )?;
+
+        // Delete the merged generations' blob directories now that no manifest
+        // references them. Ordering matters: the drain above already removed
+        // these ids from `flushed_generations`, so a reader can no longer resolve
+        // them — deleting the data second (never before) keeps the sequence
+        // crash-safe. If the process dies between the drain and here, the rows
+        // are already in the base table and the manifest no longer lists these
+        // generations, so nothing reads them; they simply become storage that a
+        // sweep can reclaim later.
+        //
+        // Best-effort: a delete failure must NOT fail the merge — the merge has
+        // logically succeeded (data appended, manifest drained). A failed delete
+        // only leaks one directory, which the same reclamation path handles.
+        // Skipping this deletion is exactly the historical storage leak: every
+        // merged generation left its `_mem_wal/{shard}/{gen}/` directory behind
+        // forever.
+        let phase = timer_start!();
+        let object_store = self.dataset.object_store(None).await?;
+        let branch_path = self.dataset.branch_location().path.clone();
+        for path in &merged_paths {
+            let gen_dir = branch_path
+                .clone()
+                .join("_mem_wal")
+                .join(self.write_shard.to_string().as_str())
+                .join(path.as_str());
+            if let Err(err) = object_store.remove_dir_all(gen_dir.clone()).await {
+                tracing::warn!(
+                    shard = %self.write_shard,
+                    generation_path = %path,
+                    error = %err,
+                    "failed to delete merged MemWAL generation directory; \
+                     it will remain until reclaimed"
+                );
+            }
+        }
+        // Best-effort by contract: a delete failure is logged above and does not
+        // fail the merge, so there is no error counter for this phase.
+        observe_duration!(
+            crate::metrics::ROLLOUT_WAL_MERGE_DURATION,
+            timer_elapsed!(phase),
+            "phase" => "delete",
+        );
+
+        Ok(())
+    }
+
+    /// Read every flushed generation listed in `manifest` into memory, aligned
+    /// to the base table's current schema.
+    ///
+    /// Returns the merged generation ids, their on-storage folder names (needed
+    /// to delete the directories after the manifest drain), the batches, and the
+    /// schema they were aligned to.
+    #[allow(clippy::type_complexity)]
+    async fn read_flushed_generations(
+        &self,
+        manifest: &ShardManifest,
+    ) -> LanceResult<(HashSet<u64>, Vec<String>, Vec<RecordBatch>, Arc<Schema>)> {
         let base_uri = self.dataset.uri().trim_end_matches('/').to_string();
         let mut merged_generations: HashSet<u64> = HashSet::new();
-        // Remember each merged generation's on-storage folder name so we can
-        // delete the blob directory after the manifest drain (see below).
         let mut merged_paths: Vec<String> = Vec::new();
         let mut batches: Vec<RecordBatch> = Vec::new();
         let merge_schema: Arc<Schema> = Arc::new(self.dataset.schema().into());
@@ -865,82 +1011,32 @@ impl RolloutStore {
             merged_generations.insert(flushed.generation);
             merged_paths.push(flushed.path.clone());
         }
+        Ok((merged_generations, merged_paths, batches, merge_schema))
+    }
 
-        // Append the merged rows to the base table.
-        if !batches.is_empty() {
-            let reader = RecordBatchIterator::new(
-                batches.into_iter().map(Ok::<RecordBatch, ArrowError>),
-                merge_schema,
-            );
-            let mut params = WriteParams {
-                mode: WriteMode::Append,
+    /// Append merged WAL rows into the base table with this store's credentials.
+    async fn append_merged_batches(
+        &mut self,
+        batches: Vec<RecordBatch>,
+        merge_schema: Arc<Schema>,
+    ) -> LanceResult<()> {
+        let reader = RecordBatchIterator::new(
+            batches.into_iter().map(Ok::<RecordBatch, ArrowError>),
+            merge_schema,
+        );
+        let mut params = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
+        if let Some(options) = &self.storage_options {
+            params.store_params = Some(ObjectStoreParams {
+                storage_options_accessor: Some(Arc::new(
+                    StorageOptionsAccessor::with_static_options(options.clone()),
+                )),
                 ..Default::default()
-            };
-            if let Some(options) = &self.storage_options {
-                params.store_params = Some(ObjectStoreParams {
-                    storage_options_accessor: Some(Arc::new(
-                        StorageOptionsAccessor::with_static_options(options.clone()),
-                    )),
-                    ..Default::default()
-                });
-            }
-            self.dataset.append(reader, Some(params)).await?;
+            });
         }
-
-        // Drain the merged generations from the shard manifest. Claim the
-        // shard's epoch (safe: we own it) and commit a manifest that retains
-        // every generation except the ones we just folded into the base table.
-        // Removing only the merged ids (rather than clearing the vec) is what
-        // makes this safe against a generation that lands after we read the
-        // manifest: it is preserved for the next merge instead of being dropped.
-        let (epoch, _) = manifest_store.claim_epoch(manifest.shard_spec_id).await?;
-        manifest_store
-            .commit_update(epoch, |current| ShardManifest {
-                version: current.version + 1,
-                flushed_generations: current
-                    .flushed_generations
-                    .iter()
-                    .filter(|fg| !merged_generations.contains(&fg.generation))
-                    .cloned()
-                    .collect(),
-                ..current.clone()
-            })
-            .await?;
-
-        // Delete the merged generations' blob directories now that no manifest
-        // references them. Ordering matters: the drain above already removed
-        // these ids from `flushed_generations`, so a reader can no longer resolve
-        // them — deleting the data second (never before) keeps the sequence
-        // crash-safe. If the process dies between the drain and here, the rows
-        // are already in the base table and the manifest no longer lists these
-        // generations, so nothing reads them; they simply become storage that a
-        // sweep can reclaim later.
-        //
-        // Best-effort: a delete failure must NOT fail the merge — the merge has
-        // logically succeeded (data appended, manifest drained). A failed delete
-        // only leaks one directory, which the same reclamation path handles.
-        // Skipping this deletion is exactly the historical storage leak: every
-        // merged generation left its `_mem_wal/{shard}/{gen}/` directory behind
-        // forever.
-        let object_store = self.dataset.object_store(None).await?;
-        let branch_path = self.dataset.branch_location().path.clone();
-        for path in &merged_paths {
-            let gen_dir = branch_path
-                .clone()
-                .join("_mem_wal")
-                .join(self.write_shard.to_string().as_str())
-                .join(path.as_str());
-            if let Err(err) = object_store.remove_dir_all(gen_dir.clone()).await {
-                tracing::warn!(
-                    shard = %self.write_shard,
-                    generation_path = %path,
-                    error = %err,
-                    "failed to delete merged MemWAL generation directory; \
-                     it will remain until reclaimed"
-                );
-            }
-        }
-
+        self.dataset.append(reader, Some(params)).await?;
         Ok(())
     }
 
@@ -5010,5 +5106,158 @@ mod tests {
             assert!(result.rows.is_empty());
             assert!(!result.truncated);
         });
+    }
+
+    /// `add` and `flush` must land on separate histograms, and `flush` must
+    /// report which of its three paths it took.
+    ///
+    /// This is the core of "split the latency": at the HTTP layer these two are
+    /// one route (flush is a query param), so if they are not distinguished here
+    /// they cannot be distinguished anywhere.
+    #[test]
+    fn add_and_flush_emit_distinct_labelled_histograms() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use metrics_util::MetricKind;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        let dir = TempDir::new().unwrap();
+        let uri = dir
+            .path()
+            .join("rollouts.lance")
+            .to_string_lossy()
+            .into_owned();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let store = RolloutStore::open(&uri).await.unwrap();
+                // A flush with no resident writer: the `noop` fast path.
+                store.flush().await.unwrap();
+                store.add(&[assistant_record("row-0")]).await.unwrap();
+                // Now there is a writer with buffered rows: the `sealed` path.
+                store.flush().await.unwrap();
+            });
+        });
+
+        let mut add_samples = 0usize;
+        let mut flush_outcomes: Vec<String> = Vec::new();
+        for (key, _, _, value) in snapshotter.snapshot().into_vec() {
+            if key.kind() != MetricKind::Histogram {
+                continue;
+            }
+            let name = key.key().name().to_string();
+            let labels: Vec<(String, String)> = key
+                .key()
+                .labels()
+                .map(|l| (l.key().to_string(), l.value().to_string()))
+                .collect();
+            let count = match value {
+                DebugValue::Histogram(v) => v.len(),
+                _ => 0,
+            };
+            if name == crate::metrics::ROLLOUT_ADD_DURATION {
+                add_samples += count;
+                // No `result` label: an error label would double this
+                // histogram's series count (one per bucket, twice) to describe
+                // the latency of a rare event. Errors are counted instead.
+                assert!(
+                    labels.is_empty(),
+                    "add latency must stay unlabelled to bound cardinality; got {labels:?}"
+                );
+            } else if name == crate::metrics::ROLLOUT_FLUSH_DURATION {
+                assert_eq!(
+                    labels.len(),
+                    1,
+                    "flush should carry exactly `outcome`, no result label; got {labels:?}"
+                );
+                let outcome = labels
+                    .iter()
+                    .find(|(k, _)| k == "outcome")
+                    .map(|(_, v)| v.clone())
+                    .expect("flush must carry an outcome label");
+                for _ in 0..count {
+                    flush_outcomes.push(outcome.clone());
+                }
+            }
+        }
+
+        assert_eq!(add_samples, 1, "one add should record exactly one sample");
+        flush_outcomes.sort();
+        // The two flushes took genuinely different paths; collapsing them into
+        // one series is what makes the flush histogram unreadable in production,
+        // since `noop` is by far the common case and is near-zero.
+        assert_eq!(
+            flush_outcomes,
+            vec!["noop".to_string(), "sealed".to_string()],
+            "flush should distinguish the no-op fast path from real sealing"
+        );
+    }
+
+    /// Guards the cardinality contract: latency histograms must never carry a
+    /// label whose domain is unbounded (a store URI, shard id, experiment name)
+    /// or redundant with a counter (`result`).
+    ///
+    /// Every label combination times every bucket is a separate exported series,
+    /// and in Datadog a separately-billed custom metric, so this is a cost
+    /// regression test as much as a correctness one.
+    #[test]
+    fn latency_histograms_carry_only_bounded_labels() {
+        use metrics_util::debugging::DebuggingRecorder;
+        use metrics_util::MetricKind;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let dir = TempDir::new().unwrap();
+        let uri = dir
+            .path()
+            .join("rollouts.lance")
+            .to_string_lossy()
+            .into_owned();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let store = RolloutStore::open(&uri).await.unwrap();
+                store.add(&[assistant_record("row-0")]).await.unwrap();
+                store.flush().await.unwrap();
+            });
+        });
+
+        // Closed sets only. `result` is intentionally absent: it belongs on a
+        // counter, where it costs one series instead of one per bucket.
+        let allowed: &[(&str, &[&str])] = &[
+            ("outcome", &["sealed", "noop", "fenced"]),
+            (
+                "phase",
+                &["seal", "read", "append", "claim_epoch", "drain", "delete"],
+            ),
+        ];
+
+        for (key, _, _, _) in snapshotter.snapshot().into_vec() {
+            if key.kind() != MetricKind::Histogram {
+                continue;
+            }
+            for label in key.key().labels() {
+                let (k, v) = (label.key(), label.value());
+                let allowed_values = allowed
+                    .iter()
+                    .find(|(name, _)| *name == k)
+                    .map(|(_, vs)| *vs)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "histogram {} carries unexpected label `{k}`; latency labels must \
+                             come from a closed, documented set",
+                            key.key().name()
+                        )
+                    });
+                assert!(
+                    allowed_values.contains(&v),
+                    "histogram {} label {k}={v} is outside its documented domain {allowed_values:?}",
+                    key.key().name()
+                );
+            }
+        }
     }
 }

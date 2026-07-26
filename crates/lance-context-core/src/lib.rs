@@ -8,6 +8,7 @@ mod datagen_store;
 mod eval;
 mod export;
 mod id;
+pub mod metrics;
 mod namespace;
 mod record;
 mod registry;
