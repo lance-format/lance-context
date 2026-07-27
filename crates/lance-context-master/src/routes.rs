@@ -1,5 +1,6 @@
 //! Admin JSON API routes (PR A: read-only observability endpoints).
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -114,18 +115,70 @@ fn list_source_label(source: ListSource) -> &'static str {
 }
 
 /// `GET /api/v1/experiments`
+///
+/// Without `search`, returns the experiments the stats table holds — the ones
+/// written recently enough not to have been retired. That is the useful default
+/// view at scale: a flat list of every experiment ever created is neither
+/// renderable nor interesting once there are tens of thousands of them.
+///
+/// With `search`, falls back to the registry for names the stats table no
+/// longer holds, and observes those on demand. Retirement therefore removes an
+/// experiment from the *default* list but never makes it unfindable.
 pub async fn list_experiments(
     State(state): State<Arc<MasterState>>,
     Query(params): Query<ListParams>,
 ) -> Result<Json<ExperimentListResponse>, MasterError> {
     let search = params.search.as_deref().filter(|s| !s.is_empty());
-    let mut stats = state.stats.lock().await;
-    let total = stats.count(search).await.map_err(MasterError::from_lance)?;
-    let rows = stats
-        .list(search, params.limit, params.offset)
-        .await
-        .map_err(MasterError::from_lance)?;
-    let experiments: Vec<ExperimentSummary> = rows.into_iter().map(|r| r.into_summary()).collect();
+
+    let (mut experiments, mut total) = {
+        let mut stats = state.stats.lock().await;
+        let total = stats.count(search).await.map_err(MasterError::from_lance)?;
+        let rows = stats
+            .list(search, params.limit, params.offset)
+            .await
+            .map_err(MasterError::from_lance)?;
+        let experiments: Vec<ExperimentSummary> =
+            rows.into_iter().map(|r| r.into_summary()).collect();
+        (experiments, total)
+    };
+
+    if let Some(query) = search {
+        // Retired experiments have no stats row, so a search that only consulted
+        // the stats table would silently omit them. The registry is the
+        // authoritative list of what exists.
+        let known: HashSet<String> = experiments.iter().map(|e| e.name.clone()).collect();
+        let matches: Vec<_> = state
+            .registry
+            .write()
+            .await
+            .list()
+            .await
+            .map_err(MasterError::from_lance)?
+            .into_iter()
+            .filter(|entry| entry.name.contains(query) && !known.contains(&entry.name))
+            .collect();
+
+        total += matches.len() as i64;
+
+        // Observe the retired matches this page needs. Bounded by the page
+        // size: a search matching thousands of cold experiments must not open
+        // thousands of datasets to render one page.
+        let want = params.limit.saturating_sub(experiments.len());
+        for entry in matches.into_iter().take(want) {
+            match scanner::observe_cold(&entry.name, &entry.uri).await {
+                Ok(summary) => experiments.push(summary),
+                Err(e) => {
+                    tracing::warn!(
+                        store = %entry.name,
+                        error = %e,
+                        "search: failed to observe retired experiment"
+                    );
+                }
+            }
+        }
+        experiments.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+
     Ok(Json(ExperimentListResponse { experiments, total }))
 }
 
@@ -152,16 +205,30 @@ pub async fn get_experiment(
             .await
             .map_err(MasterError::from_lance)?;
     }
-    let mut stats = state.stats.lock().await;
-    match stats.get(&name).await.map_err(MasterError::from_lance)? {
-        Some(row) => Ok(Json(ExperimentDetail {
+    let cached = {
+        let mut stats = state.stats.lock().await;
+        stats.get(&name).await.map_err(MasterError::from_lance)?
+    };
+    if let Some(row) = cached {
+        return Ok(Json(ExperimentDetail {
             summary: row.into_summary(),
-        })),
-        None => Err(MasterError::NotFound(format!(
-            "experiment '{}' not found in stats",
-            name
-        ))),
+        }));
     }
+
+    // No stats row: either retired, or never scanned. Resolve through the
+    // registry and observe on demand rather than reporting it as missing.
+    let entry = state
+        .registry
+        .write()
+        .await
+        .get(&name)
+        .await
+        .map_err(MasterError::from_lance)?
+        .ok_or_else(|| MasterError::NotFound(format!("experiment '{}' does not exist", name)))?;
+    let summary = scanner::observe_cold(&entry.name, &entry.uri)
+        .await
+        .map_err(MasterError::from_lance)?;
+    Ok(Json(ExperimentDetail { summary }))
 }
 
 /// `GET /api/v1/experiments/{name}/records`

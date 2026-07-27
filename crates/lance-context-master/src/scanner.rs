@@ -18,6 +18,7 @@ use tokio::task::JoinHandle;
 
 use crate::state::MasterState;
 use crate::stats_store::StatRow;
+use lance_context_api::ExperimentSummary;
 
 /// Per-experiment open+observe timeout so one wedged dataset cannot stall a
 /// scan round.
@@ -494,6 +495,18 @@ async fn prepare_for_retirement(name: &str, uri: &str) -> lance::Result<bool> {
     Ok(obs.pending_wal_generations == 0)
 }
 
+/// Observe one experiment on demand, without touching the stats table.
+///
+/// Used for experiments the stats table no longer holds — retired ones surfaced
+/// by search or a detail request. Deliberately does not write a row back:
+/// reading about a cold experiment must not make it hot again, or browsing the
+/// UI would undo retirement and the table would creep back toward holding
+/// everything.
+pub async fn observe_cold(name: &str, uri: &str) -> lance::Result<ExperimentSummary> {
+    let (row, _) = observe_one(name, uri, None).await?;
+    Ok(row.into_summary())
+}
+
 /// Refresh one experiment immediately and persist its new stats row.
 ///
 /// Passes `None` as the previous row so this always does a full observation:
@@ -930,5 +943,46 @@ mod retirement_tests {
             retired.is_empty(),
             "an experiment that failed to prepare must not be retired"
         );
+    }
+    /// A cold observation must not write a stats row.
+    ///
+    /// Reading about a retired experiment (search, or opening its detail page)
+    /// must not make it hot again -- otherwise browsing the UI would silently
+    /// undo retirement and the table would creep back toward holding every
+    /// experiment that ever existed, which is the state retirement exists to
+    /// prevent.
+    #[tokio::test]
+    async fn observe_cold_reports_without_rehydrating() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().join("e.lance").to_string_lossy().to_string();
+        {
+            let store = RolloutStore::open_with_options(&uri, RolloutStoreOptions::default())
+                .await
+                .unwrap();
+            store.add(&[rec("a")]).await.unwrap();
+            store.flush().await.unwrap();
+        }
+
+        let summary = observe_cold("e", &uri).await.unwrap();
+        assert_eq!(summary.name, "e");
+        assert_eq!(
+            summary.row_count, 1,
+            "a cold read still reports real counts"
+        );
+
+        // `observe_cold` takes no `MasterState`, so it structurally cannot
+        // write to the stats table -- asserted here so a future refactor that
+        // hands it one has to justify itself.
+        let second = observe_cold("e", &uri).await.unwrap();
+        assert_eq!(second.row_count, summary.row_count);
+    }
+
+    /// A missing dataset surfaces as an error rather than a panic, so a search
+    /// hit on a registry entry whose data is gone degrades to one skipped row.
+    #[tokio::test]
+    async fn observe_cold_errors_on_missing_dataset() {
+        assert!(observe_cold("gone", "/no/such/dataset.lance")
+            .await
+            .is_err());
     }
 }
