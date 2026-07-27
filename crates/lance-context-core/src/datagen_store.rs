@@ -1266,15 +1266,6 @@ mod tests {
             );
         });
     }
-
-    /// A merge must not fence the store's own MemWAL writer.
-    ///
-    /// The merge used to `claim_epoch` to commit the manifest drain, which bumps
-    /// `writer_epoch` and fences every live writer of the shard — including this
-    /// store's own. It papered over that by `close()`ing the writer first and
-    /// reopening lazily. Reusing the shard's current epoch removes the need, so
-    /// the resident writer stays valid across a merge and appends immediately
-    /// after one must still succeed and be readable.
     #[test]
     fn compaction_folds_merged_fragments_and_preserves_reads() {
         // `DatagenStore` had no compaction at all before it moved onto
