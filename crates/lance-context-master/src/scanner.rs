@@ -6,7 +6,8 @@
 //! experiments that have since been deleted from the registry. Failures on a
 //! single experiment are logged and skipped; the next round retries.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,22 +23,55 @@ use crate::stats_store::StatRow;
 /// scan round.
 const OBSERVE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Bound on one `_stats` maintenance pass (compaction + version cleanup) so a
-/// slow object store cannot wedge the scanner loop.
+/// Bound on one steady-state `_stats` maintenance pass so a slow object store
+/// cannot wedge the scanner loop.
+///
+/// Deliberately not applied to the first pass after startup: see
+/// [`maintain_stats`].
 const MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Compact `_stats` and prune its old manifest versions.
 ///
-/// `_stats` is written delete-then-append (one upsert per experiment per
-/// round), so its version chain and fragment count grow every scan and Lance
-/// never reclaims them on its own. Callers must hold the `stats-writer`
-/// coordination lock so only one replica ever rewrites the dataset.
+/// Scans now write the table as one `Overwrite` snapshot per round rather than
+/// two commits per experiment, so in steady state the version chain grows by
+/// one per round and this pass is cheap. It remains necessary to reclaim those
+/// versions, and to recover deployments that ran the old per-row path.
+///
+/// # The first pass runs without a timeout
+///
+/// A deployment upgraded from the per-row path can arrive with a chain
+/// hundreds of thousands of versions long (246k+ observed). Compacting and
+/// pruning that cannot finish inside `MAINTENANCE_TIMEOUT`, so every pass timed
+/// out, rolled back, and left the table exactly as bloated as before — the
+/// bound guaranteed the table could never recover. The first pass after startup
+/// therefore runs unbounded, and subsequent passes take the bound: by then the
+/// backlog is gone and any pass exceeding it is a genuine fault.
+///
+/// Callers must hold the `stats-writer` coordination lock so only one replica
+/// ever rewrites the dataset.
 pub async fn maintain_stats(state: &Arc<MasterState>) -> lance::Result<()> {
     let ttl = Duration::from_secs(state.config.stats_history_ttl_secs);
     let start = std::time::Instant::now();
     let mut stats = state.stats.lock().await;
-    match tokio::time::timeout(MAINTENANCE_TIMEOUT, stats.maintain(ttl)).await {
-        Ok(Ok((compaction, removal))) => {
+
+    // `swap` so exactly one pass per process is unbounded, even if several
+    // scanner ticks race here.
+    let first_pass = state.stats_maintenance_done.swap(true, Ordering::SeqCst);
+    let outcome = if first_pass {
+        tokio::time::timeout(MAINTENANCE_TIMEOUT, stats.maintain(ttl))
+            .await
+            .unwrap_or_else(|_| Err(lance::Error::io("stats maintenance timed out")))
+    } else {
+        tracing::info!(
+            version = stats.version(),
+            "running first stats maintenance pass without a timeout; \
+             a table carried over from the per-row write path can take a while to reclaim"
+        );
+        stats.maintain(ttl).await
+    };
+
+    match outcome {
+        Ok((compaction, removal)) => {
             metrics::histogram!("master_stats_maintenance_duration_seconds")
                 .record(start.elapsed().as_secs_f64());
             metrics::counter!("master_stats_versions_removed_total")
@@ -53,8 +87,7 @@ pub async fn maintain_stats(state: &Arc<MasterState>) -> lance::Result<()> {
             );
             Ok(())
         }
-        Ok(Err(e)) => Err(e),
-        Err(_) => Err(lance::Error::io("stats maintenance timed out")),
+        Err(e) => Err(e),
     }
 }
 
@@ -103,49 +136,70 @@ async fn scan_once_inner(state: &Arc<MasterState>) -> lance::Result<usize> {
     let concurrency = state.config.scan_concurrency.max(1);
 
     // Observe experiments concurrently (bounded), preserving prior compaction
-    // counters by reading the existing stats row first.
-    let observed: Vec<StatRow> = stream::iter(entries)
+    // counters by reading the existing stats row first. `None` means this round
+    // could not observe that experiment; its previous row is carried over below
+    // rather than dropped.
+    let observed: Vec<(String, Option<StatRow>)> = stream::iter(entries)
         .map(|entry| {
             let state = state.clone();
             async move {
                 match observe_one(&state, &entry.name, &entry.uri).await {
-                    Ok(row) => Some(row),
+                    Ok(row) => (entry.name, Some(row)),
                     Err(e) => {
                         tracing::warn!(store = %entry.name, error = %e, "scan: observe failed");
-                        None
+                        (entry.name, None)
                     }
                 }
             }
         })
         .buffer_unordered(concurrency)
-        .filter_map(|row| async move { row })
         .collect()
         .await;
 
-    let count = observed.len();
+    let count = observed.iter().filter(|(_, row)| row.is_some()).count();
 
-    // Upsert observed rows and reconcile deletions under the stats lock.
     let mut stats = state.stats.lock().await;
-    for row in observed {
-        if let Err(e) = stats.upsert(&row).await {
-            tracing::warn!(store = %row.name, error = %e, "stats upsert failed");
+
+    // Build the round's snapshot. This replaces the whole table in one commit
+    // instead of two commits per experiment, and subsumes the old
+    // reconcile-remove pass: an experiment absent from the registry is simply
+    // absent from the snapshot.
+    //
+    // An experiment this round failed to observe keeps its previous row, so a
+    // transient storage error does not blank it from the UI or, worse, hide it
+    // from the compaction and WAL-merge sweeps that read this table.
+    let previous = stats.list(None, usize::MAX, 0).await?;
+    let mut carry_over: HashMap<String, StatRow> = previous
+        .into_iter()
+        .map(|row| (row.name.clone(), row))
+        .collect();
+
+    let mut snapshot: Vec<StatRow> = Vec::with_capacity(observed.len());
+    for (name, row) in observed {
+        match row {
+            Some(row) => snapshot.push(row),
+            None => {
+                if let Some(stale) = carry_over.remove(&name) {
+                    snapshot.push(stale);
+                }
+            }
         }
     }
-    // Drop stats rows for experiments removed from the registry.
-    let existing = stats.list(None, usize::MAX, 0).await?;
+    snapshot.sort_by(|a, b| a.name.cmp(&b.name));
+
     let mut total_rows: i64 = 0;
     let mut total_fragments: i64 = 0;
     let mut live_count: usize = 0;
-    for row in existing {
-        if !live.contains(&row.name) {
-            if let Err(e) = stats.remove(&row.name).await {
-                tracing::warn!(store = %row.name, error = %e, "stats reconcile-remove failed");
-            }
-        } else {
+    for row in &snapshot {
+        if live.contains(&row.name) {
             live_count += 1;
             total_rows += row.row_count;
             total_fragments += row.fragment_count;
         }
+    }
+
+    if let Err(e) = stats.write_snapshot(&snapshot).await {
+        tracing::warn!(error = %e, "stats snapshot write failed");
     }
 
     metrics::histogram!("master_scan_duration_seconds").record(scan_start.elapsed().as_secs_f64());

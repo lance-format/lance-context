@@ -43,6 +43,13 @@ pub struct MasterState {
     pub task_store: TaskStore,
     /// Shared HTTP client for fanning `MergeWal` tasks out to worker endpoints.
     pub http: reqwest::Client,
+    /// Whether this process has already run one `_stats` maintenance pass.
+    ///
+    /// The first pass runs without a timeout so a deployment carrying a version
+    /// chain from the old per-row write path can actually reclaim it; a bounded
+    /// first pass times out forever and never recovers. See
+    /// [`crate::scanner::maintain_stats`].
+    pub stats_maintenance_done: std::sync::atomic::AtomicBool,
 }
 
 impl MasterState {
@@ -80,6 +87,7 @@ impl MasterState {
             config,
             task_store,
             http: reqwest::Client::new(),
+            stats_maintenance_done: std::sync::atomic::AtomicBool::new(false),
         });
         Ok(state)
     }
