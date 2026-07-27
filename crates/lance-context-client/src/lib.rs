@@ -361,6 +361,108 @@ impl RolloutStoreApi for RemoteRolloutStore {
     }
 }
 
+pub struct RemoteDatagenStore {
+    client: ContextClient,
+    store_name: String,
+    cached_version: u64,
+}
+
+impl RemoteDatagenStore {
+    pub async fn connect(base_url: &str, store_name: &str) -> Result<Self, ClientError> {
+        let client = ContextClient::new(base_url);
+        let info = client.get_datagen_store(store_name).await?;
+        Ok(Self {
+            client,
+            store_name: store_name.to_string(),
+            cached_version: info.version.unwrap_or(0),
+        })
+    }
+
+    pub async fn connect_or_create(
+        base_url: &str,
+        req: &CreateDatagenStoreRequest,
+    ) -> Result<Self, ClientError> {
+        let client = ContextClient::new(base_url);
+        let info = match client.get_datagen_store(&req.name).await {
+            Ok(info) => info,
+            Err(ClientError::Api { status: 404, .. }) => client.create_datagen_store(req).await?,
+            Err(e) => return Err(e),
+        };
+        Ok(Self {
+            client,
+            store_name: req.name.clone(),
+            cached_version: info.version.unwrap_or(0),
+        })
+    }
+}
+
+impl DatagenStoreApi for RemoteDatagenStore {
+    async fn append(
+        &mut self,
+        events: &[DatagenEventDto],
+    ) -> ContextResult<AddDatagenEventsResponse> {
+        let resp = self
+            .client
+            .add_datagen_events(&self.store_name, events, false)
+            .await
+            .map_err(to_ctx_err)?;
+        self.cached_version = resp.version;
+        Ok(resp)
+    }
+
+    async fn append_checkpoint(
+        &mut self,
+        events: &[DatagenEventDto],
+    ) -> ContextResult<AddDatagenEventsResponse> {
+        let resp = self
+            .client
+            .add_datagen_events(&self.store_name, events, true)
+            .await
+            .map_err(to_ctx_err)?;
+        self.cached_version = resp.version;
+        Ok(resp)
+    }
+
+    async fn fold_item(&self, item_id: &str) -> ContextResult<Option<FoldedDatagenItemDto>> {
+        let resp = self
+            .client
+            .fold_datagen_item(&self.store_name, item_id)
+            .await
+            .map_err(to_ctx_err)?;
+        Ok(resp.item)
+    }
+
+    async fn root_item_statuses(
+        &self,
+        root_item_ids: &[String],
+    ) -> ContextResult<DatagenRootItemStatusesResponse> {
+        self.client
+            .datagen_root_item_statuses(&self.store_name, root_item_ids)
+            .await
+            .map_err(to_ctx_err)
+    }
+
+    async fn item_failures(&self, item_id: &str) -> ContextResult<Vec<DatagenFailureDto>> {
+        let resp = self
+            .client
+            .datagen_item_failures(&self.store_name, item_id)
+            .await
+            .map_err(to_ctx_err)?;
+        Ok(resp.failures)
+    }
+
+    async fn get_blob(&self, event_id: &str) -> ContextResult<Option<Vec<u8>>> {
+        self.client
+            .fetch_datagen_blob(&self.store_name, event_id)
+            .await
+            .map_err(to_ctx_err)
+    }
+
+    fn version(&self) -> u64 {
+        self.cached_version
+    }
+}
+
 fn to_ctx_err(err: ClientError) -> ContextError {
     match err {
         ClientError::Api {
@@ -868,6 +970,130 @@ impl ContextClient {
             .send()
             .await?;
         Self::handle_response(resp).await
+    }
+
+    pub async fn create_datagen_store(
+        &self,
+        req: &CreateDatagenStoreRequest,
+    ) -> Result<DatagenStoreInfo, ClientError> {
+        let resp = self
+            .http
+            .post(self.url("/datagen"))
+            .json(req)
+            .send()
+            .await?;
+        Self::handle_response(resp).await
+    }
+
+    pub async fn list_datagen_stores(&self) -> Result<ListDatagenStoresResponse, ClientError> {
+        let resp = self.http.get(self.url("/datagen")).send().await?;
+        Self::handle_response(resp).await
+    }
+
+    pub async fn get_datagen_store(&self, name: &str) -> Result<DatagenStoreInfo, ClientError> {
+        let resp = self
+            .http
+            .get(self.url(&format!("/datagen/{}", name)))
+            .send()
+            .await?;
+        Self::handle_response(resp).await
+    }
+
+    pub async fn delete_datagen_store(&self, name: &str) -> Result<(), ClientError> {
+        let resp = self
+            .http
+            .delete(self.url(&format!("/datagen/{}", name)))
+            .send()
+            .await?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(Self::extract_error(resp).await)
+        }
+    }
+
+    /// Append datagen events. `checkpoint = true` commits the batch as one atomic
+    /// step boundary (`append_checkpoint`); `false` appends a raw generation.
+    /// FIELD blobs are offloaded to a content-addressed artifact store before the
+    /// event reaches the log, so events are small JSON and travel inline.
+    pub async fn add_datagen_events(
+        &self,
+        name: &str,
+        events: &[DatagenEventDto],
+        checkpoint: bool,
+    ) -> Result<AddDatagenEventsResponse, ClientError> {
+        let req = AddDatagenEventsRequest {
+            events: events.to_vec(),
+        };
+        let resp = self
+            .http
+            .post(self.url(&format!("/datagen/{}/events", name)))
+            .query(&[("checkpoint", checkpoint)])
+            .json(&req)
+            .send()
+            .await?;
+        Self::handle_response(resp).await
+    }
+
+    pub async fn fold_datagen_item(
+        &self,
+        name: &str,
+        item_id: &str,
+    ) -> Result<GetFoldedDatagenItemResponse, ClientError> {
+        let resp = self
+            .http
+            .get(self.url(&format!("/datagen/{}/items/{}", name, item_id)))
+            .send()
+            .await?;
+        Self::handle_response(resp).await
+    }
+
+    pub async fn datagen_item_failures(
+        &self,
+        name: &str,
+        item_id: &str,
+    ) -> Result<ListDatagenFailuresResponse, ClientError> {
+        let resp = self
+            .http
+            .get(self.url(&format!("/datagen/{}/items/{}/failures", name, item_id)))
+            .send()
+            .await?;
+        Self::handle_response(resp).await
+    }
+
+    pub async fn datagen_root_item_statuses(
+        &self,
+        name: &str,
+        root_item_ids: &[String],
+    ) -> Result<DatagenRootItemStatusesResponse, ClientError> {
+        let resp = self
+            .http
+            .get(self.url(&format!("/datagen/{}/root-status", name)))
+            .query(&[("ids", root_item_ids.join(","))])
+            .send()
+            .await?;
+        Self::handle_response(resp).await
+    }
+
+    /// Materialize one FIELD_* event's offloaded blob bytes by event id.
+    /// Returns `None` when the event or its payload is absent (server 404).
+    pub async fn fetch_datagen_blob(
+        &self,
+        name: &str,
+        event_id: &str,
+    ) -> Result<Option<Vec<u8>>, ClientError> {
+        let resp = self
+            .http
+            .get(self.url(&format!("/datagen/{}/blobs/{}", name, event_id)))
+            .send()
+            .await?;
+        if resp.status().is_success() {
+            Ok(Some(resp.bytes().await?.to_vec()))
+        } else if resp.status().as_u16() == 404 {
+            Ok(None)
+        } else {
+            Err(Self::extract_error(resp).await)
+        }
     }
 
     async fn handle_response<T: serde::de::DeserializeOwned>(

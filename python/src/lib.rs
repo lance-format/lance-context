@@ -12,8 +12,10 @@ use serde_json::Value;
 use tokio::runtime::Runtime;
 
 use lance_context::{
-    AddRolloutRequest, CreateRolloutStoreRequest, RolloutRecordDto,
-    RolloutStore as UnifiedRolloutStore, RolloutStoreApi,
+    AddRolloutRequest, CreateDatagenStoreRequest, CreateRolloutStoreRequest, DatagenEventDto,
+    DatagenFailureDto, DatagenFieldStateDto, DatagenStepCursorDto,
+    DatagenStore as UnifiedDatagenStore, DatagenStoreApi, DatagenValueDto, FoldedDatagenItemDto,
+    RolloutRecordDto, RolloutStore as UnifiedRolloutStore, RolloutStoreApi,
 };
 use lance_context_api::{
     AddRecordRequest, CompactRequest, CompactResponse, CompactStatsResponse, ContextStoreApi,
@@ -23,12 +25,13 @@ use lance_context_api::{
 use lance_context_client::RemoteContextStore;
 use lance_context_core::serde::CONTENT_TYPE_TEXT;
 use lance_context_core::{
-    CompactionConfig, CompactionMetrics, CompactionStats, Context as RustContext,
-    ContextNamespace as RustContextNamespace, ContextRecord, ContextStore, ContextStoreOptions,
-    DistanceMetric, EvalConfig, EvalQuerySet, ExportConfig, ExportTask, GroupBy, IdIndexType,
-    LifecycleQueryOptions, PartitionInfo, PartitionSelector, PartitionSpec, PreferenceForm,
-    ReadProjection, RecordFilters, RecordPatch, Relationship, RetrievalMode, RetrieveResult,
-    SearchResult, SplitConfig, StateMetadata, LIFECYCLE_ACTIVE,
+    datagen_event_id as core_datagen_event_id, CompactionConfig, CompactionMetrics,
+    CompactionStats, Context as RustContext, ContextNamespace as RustContextNamespace,
+    ContextRecord, ContextStore, ContextStoreOptions, DistanceMetric, EvalConfig, EvalQuerySet,
+    ExportConfig, ExportTask, GroupBy, IdIndexType, LifecycleQueryOptions, PartitionInfo,
+    PartitionSelector, PartitionSpec, PreferenceForm, ReadProjection, RecordFilters, RecordPatch,
+    Relationship, RetrievalMode, RetrieveResult, SearchResult, SplitConfig, StateMetadata,
+    DATAGEN_SCHEMA_VERSION, LIFECYCLE_ACTIVE,
 };
 
 const DEFAULT_BINARY_CONTENT_TYPE: &str = "application/octet-stream";
@@ -2548,13 +2551,409 @@ fn rollout_record_to_json(record: &RolloutRecordDto) -> PyResult<String> {
     serde_json::to_string(record).map_err(to_py_err)
 }
 
+// ---------------------------------------------------------------------------
+// Datagen store binding (append-only delta-log, fold model)
+// ---------------------------------------------------------------------------
+
+/// A single embedded datagen checkpoint log (`open`).
+///
+/// Events cross the FFI boundary as plain dicts (not pickle): the executor
+/// builds each `DatagenEvent` field-by-field, `append_checkpoint` persists one
+/// atomic step boundary, and reads (`fold_item`) return the folded item state as
+/// a dict. Mirrors the concurrency contract of the rollout store: open a fresh
+/// handle per writer, never share a handle across concurrent appends.
+#[pyclass]
+struct DatagenStore {
+    store: UnifiedDatagenStore,
+    runtime: Arc<Runtime>,
+}
+
+impl DatagenStore {
+    fn from_store(store: UnifiedDatagenStore, runtime: Arc<Runtime>) -> Self {
+        Self { store, runtime }
+    }
+}
+
+#[pymethods]
+impl DatagenStore {
+    /// Open (or create) an embedded datagen log at `uri`. `shard_id` gives this
+    /// writer instance a stable identity for multi-writer fencing.
+    #[classmethod]
+    #[pyo3(signature = (uri, storage_options = None, shard_id = None))]
+    fn open(
+        _cls: &Bound<'_, PyType>,
+        py: Python<'_>,
+        uri: &str,
+        storage_options: Option<HashMap<String, String>>,
+        shard_id: Option<String>,
+    ) -> PyResult<Self> {
+        let _ = shard_id;
+        let runtime = Arc::new(Runtime::new().map_err(to_py_err)?);
+        let store_res = py.allow_threads(|| {
+            runtime.block_on(UnifiedDatagenStore::open_with_options(uri, storage_options))
+        });
+        let store = store_res.map_err(to_py_err)?;
+        Ok(Self::from_store(store, runtime))
+    }
+
+    /// Connect to an existing datagen store on a remote server.
+    #[classmethod]
+    fn connect(
+        _cls: &Bound<'_, PyType>,
+        py: Python<'_>,
+        base_url: &str,
+        name: &str,
+    ) -> PyResult<Self> {
+        let runtime = Arc::new(Runtime::new().map_err(to_py_err)?);
+        let store_res =
+            py.allow_threads(|| runtime.block_on(UnifiedDatagenStore::connect(base_url, name)));
+        let store = store_res.map_err(to_py_err)?;
+        Ok(Self::from_store(store, runtime))
+    }
+
+    /// Connect to a remote datagen store, creating it if it does not exist.
+    #[classmethod]
+    #[pyo3(signature = (base_url, name, storage_options = None))]
+    fn connect_or_create(
+        _cls: &Bound<'_, PyType>,
+        py: Python<'_>,
+        base_url: &str,
+        name: &str,
+        storage_options: Option<HashMap<String, String>>,
+    ) -> PyResult<Self> {
+        let req = CreateDatagenStoreRequest {
+            name: name.to_string(),
+            storage_options,
+        };
+        let runtime = Arc::new(Runtime::new().map_err(to_py_err)?);
+        let store_res = py.allow_threads(|| {
+            runtime.block_on(UnifiedDatagenStore::connect_or_create(base_url, &req))
+        });
+        let store = store_res.map_err(to_py_err)?;
+        Ok(Self::from_store(store, runtime))
+    }
+
+    /// Current store version (base dataset version).
+    fn version(&self) -> u64 {
+        self.store.version()
+    }
+
+    /// Append one completed step boundary atomically. `events` is a list of
+    /// event dicts sharing one item/checkpoint/writer attempt, with exactly one
+    /// STEP_COMPLETED. Returns the new store version.
+    fn append_checkpoint(&mut self, py: Python<'_>, events: &Bound<'_, PyList>) -> PyResult<u64> {
+        let parsed = events_from_pylist(events)?;
+        let resp = py
+            .allow_threads(|| self.runtime.block_on(self.store.append_checkpoint(&parsed)))
+            .map_err(to_py_err)?;
+        Ok(resp.version)
+    }
+
+    /// Append raw events as one MemWAL generation (no single-STEP_COMPLETED
+    /// constraint). Returns the new store version.
+    fn append(&mut self, py: Python<'_>, events: &Bound<'_, PyList>) -> PyResult<u64> {
+        let parsed = events_from_pylist(events)?;
+        let resp = py
+            .allow_threads(|| self.runtime.block_on(self.store.append(&parsed)))
+            .map_err(to_py_err)?;
+        Ok(resp.version)
+    }
+
+    /// Fold an item's events into its latest state, or `None` if never started.
+    fn fold_item(&self, py: Python<'_>, item_id: &str) -> PyResult<Option<PyObject>> {
+        let item = py
+            .allow_threads(|| self.runtime.block_on(self.store.fold_item(item_id)))
+            .map_err(to_py_err)?;
+        match item {
+            None => Ok(None),
+            Some(item) => Ok(Some(folded_item_to_py(py, &item)?)),
+        }
+    }
+
+    /// Classify each root item id by folded lifecycle status. Missing ids (never
+    /// started) are absent from the returned dict.
+    fn root_item_statuses(&self, py: Python<'_>, root_item_ids: Vec<String>) -> PyResult<PyObject> {
+        let statuses = py
+            .allow_threads(|| {
+                self.runtime
+                    .block_on(self.store.root_item_statuses(&root_item_ids))
+            })
+            .map_err(to_py_err)?;
+        let dict = PyDict::new(py);
+        for (item_id, status) in statuses.statuses.iter() {
+            dict.set_item(item_id, status)?;
+        }
+        Ok(dict.into_pyobject(py)?.unbind().into())
+    }
+
+    /// All failure records for an item (the failure lens), oldest first.
+    fn item_failures(&self, py: Python<'_>, item_id: &str) -> PyResult<PyObject> {
+        let failures = py
+            .allow_threads(|| self.runtime.block_on(self.store.item_failures(item_id)))
+            .map_err(to_py_err)?;
+        let list = PyList::empty(py);
+        for failure in &failures {
+            list.append(failure_to_py(py, failure)?)?;
+        }
+        Ok(list.into_pyobject(py)?.unbind().into())
+    }
+
+    /// Materialize one FIELD_* event's blob bytes by event id, or `None`.
+    fn get_blob(&self, py: Python<'_>, event_id: &str) -> PyResult<Option<Py<PyBytes>>> {
+        let bytes = py
+            .allow_threads(|| self.runtime.block_on(self.store.get_blob(event_id)))
+            .map_err(to_py_err)?;
+        Ok(bytes.map(|b| PyBytes::new(py, &b).unbind()))
+    }
+}
+
+/// Deterministic idempotency key for a checkpoint event, so retried batches
+/// dedup instead of double-appending.
+#[pyfunction]
+fn datagen_event_id(item_id: &str, checkpoint_id: &str, ordinal: u32) -> String {
+    core_datagen_event_id(item_id, checkpoint_id, ordinal)
+}
+
+fn events_from_pylist(events: &Bound<'_, PyList>) -> PyResult<Vec<DatagenEventDto>> {
+    events
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let dict = item
+                .downcast::<PyDict>()
+                .map_err(|_| PyTypeError::new_err(format!("events[{index}] must be a dict")))?;
+            event_from_dict(dict, index)
+        })
+        .collect()
+}
+
+fn event_from_dict(dict: &Bound<'_, PyDict>, index: usize) -> PyResult<DatagenEventDto> {
+    let value = optional_item(dict, "value")?
+        .map(|value| {
+            let value_dict = value
+                .downcast::<PyDict>()
+                .map_err(|_| PyTypeError::new_err("event value must be a dict"))?;
+            value_from_dict(value_dict)
+        })
+        .transpose()?;
+    let query_tags = optional_item(dict, "query_tags")?
+        .map(|value| py_any_to_json(&value))
+        .transpose()?;
+    let event_ts = optional_item(dict, "event_ts")?
+        .map(|value| parse_optional_datetime(Some(value.extract::<String>()?), "event_ts"))
+        .transpose()?
+        .flatten();
+
+    Ok(DatagenEventDto {
+        event_id: required_item(dict, "event_id", index)?.extract::<String>()?,
+        item_id: required_item(dict, "item_id", index)?.extract::<String>()?,
+        root_item_id: required_item(dict, "root_item_id", index)?.extract::<String>()?,
+        parent_item_id: optional_item(dict, "parent_item_id")?
+            .map(|value| value.extract::<String>())
+            .transpose()?,
+        item_seq: required_item(dict, "item_seq", index)?.extract::<i64>()?,
+        checkpoint_id: required_item(dict, "checkpoint_id", index)?.extract::<String>()?,
+        event_type: required_item(dict, "event_type", index)?.extract::<String>()?,
+        step_name: optional_item(dict, "step_name")?
+            .map(|value| value.extract::<String>())
+            .transpose()?,
+        step_kind: optional_item(dict, "step_kind")?
+            .map(|value| value.extract::<String>())
+            .transpose()?,
+        step_index: optional_item(dict, "step_index")?
+            .map(|value| value.extract::<i64>())
+            .transpose()?,
+        enclosing_step: optional_item(dict, "enclosing_step")?
+            .map(|value| value.extract::<String>())
+            .transpose()?,
+        selector_step: optional_item(dict, "selector_step")?
+            .map(|value| value.extract::<String>())
+            .transpose()?,
+        attempt: optional_item(dict, "attempt")?
+            .map(|value| value.extract::<i32>())
+            .transpose()?
+            .unwrap_or(0),
+        run_id: required_item(dict, "run_id", index)?.extract::<String>()?,
+        writer_epoch: required_item(dict, "writer_epoch", index)?.extract::<String>()?,
+        field_name: optional_item(dict, "field_name")?
+            .map(|value| value.extract::<String>())
+            .transpose()?,
+        field_type: optional_item(dict, "field_type")?
+            .map(|value| value.extract::<String>())
+            .transpose()?,
+        codec_version: optional_item(dict, "codec_version")?
+            .map(|value| value.extract::<i32>())
+            .transpose()?,
+        value,
+        query_tags,
+        status: optional_item(dict, "status")?
+            .map(|value| value.extract::<String>())
+            .transpose()?,
+        error_type: optional_item(dict, "error_type")?
+            .map(|value| value.extract::<String>())
+            .transpose()?,
+        error_dump: optional_item(dict, "error_dump")?
+            .map(|value| value.extract::<String>())
+            .transpose()?,
+        traceback: optional_item(dict, "traceback")?
+            .map(|value| value.extract::<String>())
+            .transpose()?,
+        event_ts,
+        schema_version: optional_item(dict, "schema_version")?
+            .map(|value| value.extract::<i32>())
+            .transpose()?
+            .unwrap_or(DATAGEN_SCHEMA_VERSION),
+    })
+}
+
+fn value_from_dict(dict: &Bound<'_, PyDict>) -> PyResult<DatagenValueDto> {
+    let kind = dict
+        .get_item("kind")?
+        .ok_or_else(|| PyRuntimeError::new_err("event value is missing 'kind'"))?
+        .extract::<String>()?;
+    let inner = || {
+        dict.get_item("value")?
+            .ok_or_else(|| PyRuntimeError::new_err("event value is missing 'value'"))
+    };
+    let mut dto = DatagenValueDto {
+        kind: kind.clone(),
+        value: None,
+        bytes: None,
+        size: None,
+        checksum: None,
+    };
+    match kind.as_str() {
+        "int" => dto.value = Some(Value::from(inner()?.extract::<i64>()?)),
+        "float" => dto.value = Some(Value::from(inner()?.extract::<f64>()?)),
+        "bool" => dto.value = Some(Value::from(inner()?.extract::<bool>()?)),
+        "str" => dto.value = Some(Value::from(inner()?.extract::<String>()?)),
+        "json" => dto.value = Some(py_any_to_json(&inner()?)?),
+        "blob" => {
+            let bytes = dict
+                .get_item("bytes")?
+                .filter(|value| !value.is_none())
+                .map(|value| value.extract::<Vec<u8>>())
+                .transpose()?;
+            let size = match dict.get_item("size")? {
+                Some(value) if !value.is_none() => Some(value.extract::<i64>()?),
+                _ => bytes.as_ref().map(|b| b.len() as i64),
+            };
+            let checksum = dict
+                .get_item("checksum")?
+                .filter(|value| !value.is_none())
+                .map(|value| value.extract::<String>())
+                .transpose()?;
+            dto.bytes = bytes;
+            dto.size = size;
+            dto.checksum = checksum;
+        }
+        other => {
+            return Err(PyRuntimeError::new_err(format!(
+                "unsupported datagen value kind '{other}'"
+            )))
+        }
+    }
+    Ok(dto)
+}
+
+fn py_any_to_json(value: &Bound<'_, PyAny>) -> PyResult<Value> {
+    let py = value.py();
+    let json = PyModule::import(py, "json")?;
+    let text = json.call_method1("dumps", (value,))?.extract::<String>()?;
+    serde_json::from_str(&text).map_err(to_py_err)
+}
+
+fn value_to_py(py: Python<'_>, value: &DatagenValueDto) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("kind", &value.kind)?;
+    if value.kind == "blob" {
+        dict.set_item("bytes", value.bytes.as_ref().map(|b| PyBytes::new(py, b)))?;
+        dict.set_item("size", value.size)?;
+        dict.set_item("checksum", value.checksum.clone())?;
+    } else if let Some(inner) = &value.value {
+        dict.set_item("value", json_value_to_py(py, inner)?)?;
+    }
+    Ok(dict.into_pyobject(py)?.unbind().into())
+}
+
+fn folded_item_to_py(py: Python<'_>, item: &FoldedDatagenItemDto) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("item_id", &item.item_id)?;
+    dict.set_item("root_item_id", &item.root_item_id)?;
+    dict.set_item("parent_item_id", item.parent_item_id.clone())?;
+    dict.set_item("status", &item.status)?;
+    dict.set_item("last_item_seq", item.last_item_seq)?;
+    dict.set_item("last_attempt", item.last_attempt)?;
+
+    let fields = PyDict::new(py);
+    for (name, state) in &item.fields {
+        fields.set_item(name, field_state_to_py(py, state)?)?;
+    }
+    dict.set_item("fields", fields)?;
+
+    let trajectory = PyList::empty(py);
+    for cursor in &item.trajectory {
+        trajectory.append(cursor_to_py(py, cursor)?)?;
+    }
+    dict.set_item("trajectory", trajectory)?;
+
+    dict.set_item(
+        "query_tags",
+        match &item.query_tags {
+            Some(tags) => Some(json_value_to_py(py, tags)?),
+            None => None,
+        },
+    )?;
+    Ok(dict.into_pyobject(py)?.unbind().into())
+}
+
+fn field_state_to_py(py: Python<'_>, state: &DatagenFieldStateDto) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("mode", &state.mode)?;
+    if let Some(value) = &state.value {
+        dict.set_item("value", value_to_py(py, value)?)?;
+    }
+    if !state.values.is_empty() {
+        let list = PyList::empty(py);
+        for value in &state.values {
+            list.append(value_to_py(py, value)?)?;
+        }
+        dict.set_item("values", list)?;
+    }
+    Ok(dict.into_pyobject(py)?.unbind().into())
+}
+
+fn cursor_to_py(py: Python<'_>, cursor: &DatagenStepCursorDto) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("step_name", &cursor.step_name)?;
+    dict.set_item("step_kind", &cursor.step_kind)?;
+    dict.set_item("step_index", cursor.step_index)?;
+    dict.set_item("enclosing_step", cursor.enclosing_step.clone())?;
+    dict.set_item("selector_step", cursor.selector_step.clone())?;
+    dict.set_item("item_seq", cursor.item_seq)?;
+    Ok(dict.into_pyobject(py)?.unbind().into())
+}
+
+fn failure_to_py(py: Python<'_>, failure: &DatagenFailureDto) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("at", cursor_to_py(py, &failure.at)?)?;
+    dict.set_item("run_id", &failure.run_id)?;
+    dict.set_item("attempt", failure.attempt)?;
+    dict.set_item("error_type", &failure.error_type)?;
+    dict.set_item("error_dump", failure.error_dump.clone())?;
+    dict.set_item("traceback", failure.traceback.clone())?;
+    Ok(dict.into_pyobject(py)?.unbind().into())
+}
+
 #[pymodule]
 fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(version, m)?)?;
     m.add_function(wrap_pyfunction!(generate_id, m)?)?;
+    m.add_function(wrap_pyfunction!(datagen_event_id, m)?)?;
     m.add_class::<Context>()?;
     m.add_class::<ContextNamespace>()?;
     m.add_class::<RemoteContext>()?;
     m.add_class::<RolloutStore>()?;
+    m.add_class::<DatagenStore>()?;
     Ok(())
 }

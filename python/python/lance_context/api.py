@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import warnings
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime
 from io import BytesIO
 from typing import TYPE_CHECKING, Any
@@ -22,6 +22,12 @@ from ._internal import (  # pyright: ignore[reportMissingImports]
     RolloutStore as _RolloutStore,
 )
 from ._internal import (  # pyright: ignore[reportMissingImports]
+    DatagenStore as _DatagenStore,
+)
+from ._internal import (  # pyright: ignore[reportMissingImports]
+    datagen_event_id as datagen_event_id,
+)
+from ._internal import (  # pyright: ignore[reportMissingImports]
     generate_id as _generate_id,
 )
 from ._internal import version as _version  # pyright: ignore[reportMissingImports]
@@ -32,10 +38,12 @@ __all__ = [
     "AsyncRolloutStore",
     "Context",
     "ContextNamespace",
+    "DatagenStore",
     "EmbeddingProvider",
     "RemoteContext",
     "RolloutStore",
     "__version__",
+    "datagen_event_id",
     "generate_id",
 ]
 
@@ -2738,3 +2746,89 @@ class AsyncRolloutStore:
 
     def __repr__(self) -> str:
         return f"AsyncRolloutStore(version={self._sync.version()})"
+
+
+class DatagenStore:
+    """Synchronous append-only datagen delta-log store.
+
+    Wraps the native store: events are appended as plain dicts and item state is
+    recovered by folding an item's events. Open an embedded log with :meth:`open`.
+
+    Event dicts carry the datagen event schema (``event_id``, ``item_id``,
+    ``root_item_id``, ``event_type``, ``item_seq``, ...); values use the tagged
+    ``{"kind": ..., "value": ...}`` shape. Folded items and failures come back as
+    plain dicts.
+    """
+
+    def __init__(self, sync_store: _DatagenStore) -> None:
+        self._sync = sync_store
+
+    @classmethod
+    def open(
+        cls,
+        uri: str,
+        *,
+        storage_options: Mapping[str, str] | None = None,
+        shard_id: str | None = None,
+    ) -> "DatagenStore":
+        """Open (or create) an embedded datagen log at ``uri``.
+
+        ``shard_id`` gives this writer a stable identity for multi-writer fencing.
+        """
+        opts = dict(storage_options) if storage_options else None
+        return cls(_DatagenStore.open(uri, opts, shard_id))
+
+    @classmethod
+    def connect(cls, base_url: str, name: str) -> "DatagenStore":
+        """Connect to an existing datagen store on a remote server."""
+        return cls(_DatagenStore.connect(base_url, name))
+
+    @classmethod
+    def connect_or_create(
+        cls,
+        base_url: str,
+        name: str,
+        *,
+        storage_options: Mapping[str, str] | None = None,
+    ) -> "DatagenStore":
+        """Connect to a remote datagen store, creating it if absent."""
+        opts = dict(storage_options) if storage_options else None
+        return cls(_DatagenStore.connect_or_create(base_url, name, opts))
+
+    def version(self) -> int:
+        """Return the current store version (base dataset version)."""
+        return self._sync.version()
+
+    def append_checkpoint(self, events: Iterable[Mapping[str, Any]]) -> int:
+        """Append one completed step boundary atomically.
+
+        ``events`` share one item/checkpoint/writer attempt and contain exactly
+        one ``STEP_COMPLETED``. Returns the new store version.
+        """
+        return self._sync.append_checkpoint(list(events))
+
+    def append(self, events: Iterable[Mapping[str, Any]]) -> int:
+        """Append raw events as one MemWAL generation. Returns the new store version."""
+        return self._sync.append(list(events))
+
+    def fold_item(self, item_id: str) -> dict[str, Any] | None:
+        """Fold an item's events into its latest state, or ``None`` if never started."""
+        return self._sync.fold_item(item_id)
+
+    def root_item_statuses(self, root_item_ids: Sequence[str]) -> dict[str, str]:
+        """Classify each root item id by folded lifecycle status.
+
+        Missing ids (never started) are absent from the returned dict.
+        """
+        return self._sync.root_item_statuses(list(root_item_ids))
+
+    def item_failures(self, item_id: str) -> list[dict[str, Any]]:
+        """All failure records for an item (the failure lens), oldest first."""
+        return self._sync.item_failures(item_id)
+
+    def get_blob(self, event_id: str) -> bytes | None:
+        """Materialize one ``FIELD_*`` event's blob bytes by event id, or ``None``."""
+        return self._sync.get_blob(event_id)
+
+    def __repr__(self) -> str:
+        return f"DatagenStore(version={self._sync.version()})"

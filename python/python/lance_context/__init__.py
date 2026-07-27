@@ -5,10 +5,12 @@ from .api import (  # pyright: ignore[reportMissingImports]
     AsyncRolloutStore,
     Context,
     ContextNamespace,
+    DatagenStore,
     EmbeddingProvider,
     RemoteContext,
     RolloutStore,
     __version__,
+    datagen_event_id,
     generate_id,
 )
 from .embeddings import (  # pyright: ignore[reportMissingImports]
@@ -20,10 +22,12 @@ __all__ = [
     "AsyncRolloutStore",
     "Context",
     "ContextNamespace",
+    "DatagenStore",
     "EmbeddingProvider",
     "MultiModalEmbeddingProvider",
     "RemoteContext",
     "RolloutStore",
     "__version__",
+    "datagen_event_id",
     "generate_id",
 ]

@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use lance_context_core::{
-    join_uri, validate_store_name, ContextStore, ContextStoreOptions, RolloutRegistry,
-    RolloutStore, RolloutStoreOptions, Session,
+    join_uri, validate_store_name, ContextStore, ContextStoreOptions, DatagenStore,
+    DatagenStoreOptions, RolloutRegistry, RolloutStore, RolloutStoreOptions, Session,
 };
 use lru::LruCache;
 use tokio::sync::{Mutex, RwLock};
@@ -74,6 +74,15 @@ pub struct AppState {
     /// than Lance's default 6 GiB *per store*. `None` restores the per-store
     /// default session (leak-prone; only when the budget is configured to `0`).
     pub rollout_session: Option<Arc<Session>>,
+    /// Bounded LRU of resident datagen-store handles, mirroring
+    /// [`Self::rollout_stores`]. Datagen delta-log datasets are also one per
+    /// experiment, so the same residency bound and durable-registry existence
+    /// model applies.
+    pub datagen_stores: Mutex<LruCache<String, Arc<RwLock<DatagenStore>>>>,
+    /// Durable directory of which datagen stores exist. A separate registry
+    /// dataset from [`Self::rollout_registry`] so the two store kinds never
+    /// collide on a shared name.
+    pub datagen_registry: RwLock<RolloutRegistry>,
 }
 
 /// Process-wide admission control for the total artifact-blob payload held in
@@ -185,6 +194,10 @@ impl AppState {
         let blob_budget = (config.rollout_max_inflight_blob_bytes > 0)
             .then(|| BlobBudget::new(config.rollout_max_inflight_blob_bytes));
         let rollout_session = build_rollout_session(config.rollout_cache_bytes);
+        let datagen_registry_uri = join_uri(&base_uri, "_registry.datagen.lance");
+        let datagen_registry = RolloutRegistry::open_or_create(&datagen_registry_uri, None)
+            .await
+            .map_err(AppError::from_lance)?;
         Ok(Self {
             stores: RwLock::new(std::collections::HashMap::new()),
             rollout_stores: Mutex::new(LruCache::new(capacity)),
@@ -196,6 +209,8 @@ impl AppState {
             rollout_flush_interval_secs: config.rollout_flush_interval_secs,
             blob_budget,
             rollout_session,
+            datagen_stores: Mutex::new(LruCache::new(capacity)),
+            datagen_registry: RwLock::new(datagen_registry),
         })
     }
 
@@ -222,6 +237,10 @@ impl AppState {
         let registry = RolloutRegistry::open_or_create(&registry_uri, None)
             .await
             .expect("open test registry");
+        let datagen_registry_uri = join_uri(&base_uri, "_registry.datagen.lance");
+        let datagen_registry = RolloutRegistry::open_or_create(&datagen_registry_uri, None)
+            .await
+            .expect("open test datagen registry");
         Self {
             stores: RwLock::new(std::collections::HashMap::new()),
             rollout_stores: Mutex::new(LruCache::new(
@@ -235,6 +254,10 @@ impl AppState {
             rollout_flush_interval_secs: 0,
             blob_budget: None,
             rollout_session: build_rollout_session(2 * 1024 * 1024 * 1024),
+            datagen_stores: Mutex::new(LruCache::new(
+                NonZeroUsize::new(DEFAULT_ROLLOUT_CACHE_CAPACITY).unwrap(),
+            )),
+            datagen_registry: RwLock::new(datagen_registry),
         }
     }
 
@@ -390,6 +413,109 @@ impl AppState {
 
     pub fn validate_name(name: &str) -> Result<(), AppError> {
         validate_store_name(name).map_err(AppError::InvalidRequest)
+    }
+
+    /// Datagen delta-log datasets live under a distinct `.datagen.lance` suffix
+    /// so a datagen store shares neither a rollout nor a context store's path.
+    pub fn datagen_uri(&self, name: &str) -> String {
+        join_uri(&self.base_uri, &format!("{}.datagen.lance", name))
+    }
+
+    fn datagen_store_options(&self) -> DatagenStoreOptions {
+        DatagenStoreOptions {
+            storage_options: None,
+            shard_id: self.instance_id.clone(),
+            merge_after_generations: (self.rollout_merge_after_generations > 0)
+                .then_some(self.rollout_merge_after_generations),
+            cleanup_interval_secs: None,
+        }
+    }
+
+    /// Record that a datagen store exists, in both the durable registry and the
+    /// in-memory LRU. Called by the create route after the dataset is written.
+    pub async fn register_datagen(
+        &self,
+        name: &str,
+        uri: &str,
+        store: Arc<RwLock<DatagenStore>>,
+    ) -> Result<(), AppError> {
+        Self::validate_name(name)?;
+        self.datagen_registry
+            .write()
+            .await
+            .upsert(name, uri)
+            .await
+            .map_err(AppError::from_lance)?;
+        self.datagen_stores
+            .lock()
+            .await
+            .put(name.to_string(), store);
+        Ok(())
+    }
+
+    /// Remove a datagen store from the durable registry and evict any resident
+    /// handle. Returns whether the store existed.
+    pub async fn unregister_datagen(&self, name: &str) -> Result<bool, AppError> {
+        Self::validate_name(name)?;
+        let existed = self
+            .datagen_registry
+            .write()
+            .await
+            .contains(name)
+            .await
+            .map_err(AppError::from_lance)?;
+        if !existed {
+            return Ok(false);
+        }
+        self.datagen_registry
+            .write()
+            .await
+            .remove(name)
+            .await
+            .map_err(AppError::from_lance)?;
+        self.datagen_stores.lock().await.pop(name);
+        Ok(true)
+    }
+
+    /// Look up a datagen store by name, lazily loading it from object storage on
+    /// a local cache miss. Existence is resolved against the durable registry, so
+    /// an evicted-but-registered store reopens rather than 404ing. See
+    /// [`Self::get_or_open_rollout_store`] for the full rationale.
+    pub async fn get_or_open_datagen_store(
+        &self,
+        name: &str,
+    ) -> Result<Arc<RwLock<DatagenStore>>, AppError> {
+        Self::validate_name(name)?;
+        if let Some(store) = self.datagen_stores.lock().await.get(name) {
+            return Ok(store.clone());
+        }
+
+        let exists = self
+            .datagen_registry
+            .write()
+            .await
+            .contains(name)
+            .await
+            .map_err(AppError::from_lance)?;
+        if !exists {
+            return Err(AppError::NotFound(format!(
+                "Datagen store '{}' does not exist",
+                name
+            )));
+        }
+
+        let uri = self.datagen_uri(name);
+        let opened = DatagenStore::open_existing_with_options(&uri, self.datagen_store_options())
+            .await
+            .map_err(AppError::from_lance)?;
+        let opened = Arc::new(RwLock::new(opened));
+
+        let mut cache = self.datagen_stores.lock().await;
+        if let Some(existing) = cache.get(name) {
+            return Ok(existing.clone());
+        }
+        cache.put(name.to_string(), opened.clone());
+        Ok(opened)
     }
 
     /// Spawn the single, process-wide WAL-cleanup sweeper.

@@ -1,7 +1,7 @@
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use lance_context_api::{ErrorBody, ErrorResponse};
+use lance_context_api::{ContextError, ErrorBody, ErrorResponse};
 use lance_context_core::LanceError;
 
 #[derive(Debug)]
@@ -42,6 +42,19 @@ impl AppError {
                 AppError::InvalidRequest(err.to_string())
             }
             other => AppError::Internal(other.to_string()),
+        }
+    }
+
+    /// Map an API-layer [`ContextError`] onto the server's error taxonomy.
+    /// Datagen routes call the `DatagenStoreApi` trait (which owns the DTO↔core
+    /// conversion) and so surface `ContextError` rather than raw `LanceError`.
+    pub fn from_context(err: ContextError) -> Self {
+        match err {
+            ContextError::NotFound(msg) => AppError::NotFound(msg),
+            ContextError::AlreadyExists(msg) => AppError::AlreadyExists(msg),
+            ContextError::InvalidRequest(msg) => AppError::InvalidRequest(msg),
+            ContextError::Internal(msg) => AppError::Internal(msg),
+            ContextError::CompactionInProgress => AppError::CompactionInProgress,
         }
     }
 }

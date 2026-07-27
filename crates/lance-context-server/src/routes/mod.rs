@@ -1,5 +1,6 @@
 pub mod compact;
 pub mod contexts;
+pub mod datagen;
 pub mod health;
 pub mod records;
 pub mod rollouts;
@@ -116,6 +117,34 @@ pub fn router() -> Router<Arc<AppState>> {
         .route(
             "/api/v1/internal/merge-wal/{name}",
             post(rollouts::merge_wal),
+        )
+        .route("/api/v1/datagen", post(datagen::create_datagen_store))
+        .route("/api/v1/datagen", get(datagen::list_datagen_stores))
+        .route("/api/v1/datagen/{name}", get(datagen::get_datagen_store))
+        .route(
+            "/api/v1/datagen/{name}",
+            delete(datagen::delete_datagen_store),
+        )
+        .route(
+            "/api/v1/datagen/{name}/events",
+            post(datagen::add_datagen_events)
+                .layer(DefaultBodyLimit::max(datagen::MAX_DATAGEN_UPLOAD_BYTES)),
+        )
+        .route(
+            "/api/v1/datagen/{name}/items/{item_id}",
+            get(datagen::fold_datagen_item),
+        )
+        .route(
+            "/api/v1/datagen/{name}/items/{item_id}/failures",
+            get(datagen::datagen_item_failures),
+        )
+        .route(
+            "/api/v1/datagen/{name}/root-status",
+            get(datagen::datagen_root_item_statuses),
+        )
+        .route(
+            "/api/v1/datagen/{name}/blobs/{event_id}",
+            get(datagen::fetch_datagen_blob),
         )
 }
 

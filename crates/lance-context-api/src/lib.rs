@@ -179,6 +179,60 @@ pub trait RolloutStoreApi {
 }
 
 // ---------------------------------------------------------------------------
+// Datagen trait
+// ---------------------------------------------------------------------------
+
+/// Remote-capable surface of a datagen checkpoint store — the append-only
+/// delta-log of item lifecycle / field events plus the folded read lenses.
+///
+/// A datagen store has no upsert/search/compaction: writers only append events
+/// (`append` for lifecycle rows, `append_checkpoint` for an atomic step
+/// boundary), and readers fold an item's events into latest state
+/// (`fold_item`), classify root items in bulk (`root_item_statuses`), list an
+/// item's failure pointers (`item_failures`), or materialize one field's
+/// offloaded blob bytes (`get_blob`).
+///
+/// Field blob bytes (`DatagenValueDto::bytes`) travel inline as base64 in JSON
+/// or, for large payloads on the append endpoints, as raw multipart parts. By
+/// the time a call reaches this trait the bytes are already materialized in
+/// memory, so the signatures are transport-agnostic.
+pub trait DatagenStoreApi {
+    fn append(
+        &mut self,
+        events: &[DatagenEventDto],
+    ) -> impl Future<Output = ContextResult<AddDatagenEventsResponse>> + Send;
+
+    fn append_checkpoint(
+        &mut self,
+        events: &[DatagenEventDto],
+    ) -> impl Future<Output = ContextResult<AddDatagenEventsResponse>> + Send;
+
+    fn fold_item(
+        &self,
+        item_id: &str,
+    ) -> impl Future<Output = ContextResult<Option<FoldedDatagenItemDto>>> + Send;
+
+    fn root_item_statuses(
+        &self,
+        root_item_ids: &[String],
+    ) -> impl Future<Output = ContextResult<DatagenRootItemStatusesResponse>> + Send;
+
+    fn item_failures(
+        &self,
+        item_id: &str,
+    ) -> impl Future<Output = ContextResult<Vec<DatagenFailureDto>>> + Send;
+
+    /// Materialize one FIELD_* event's offloaded blob bytes by event id.
+    /// Returns `None` when the event or its payload is absent.
+    fn get_blob(
+        &self,
+        event_id: &str,
+    ) -> impl Future<Output = ContextResult<Option<Vec<u8>>>> + Send;
+
+    fn version(&self) -> u64;
+}
+
+// ---------------------------------------------------------------------------
 // Context lifecycle
 // ---------------------------------------------------------------------------
 
@@ -824,6 +878,204 @@ pub struct ListRolloutsResponse {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GetRolloutResponse {
     pub record: Option<RolloutRecordDto>,
+}
+
+// ---------------------------------------------------------------------------
+// Datagen lifecycle
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreateDatagenStoreRequest {
+    /// Portable dataset name: 1-128 ASCII characters matching
+    /// `[A-Za-z0-9_][A-Za-z0-9._-]*`; `_registry` and `_stats` are reserved.
+    pub name: String,
+    #[serde(default)]
+    pub storage_options: Option<std::collections::HashMap<String, String>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DatagenStoreInfo {
+    pub name: String,
+    pub uri: String,
+    /// Dataset version. `None` in list responses, which are served from the
+    /// durable registry without opening each dataset. Single-store lookups
+    /// (`get`/`create`) always populate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ListDatagenStoresResponse {
+    pub stores: Vec<DatagenStoreInfo>,
+}
+
+// ---------------------------------------------------------------------------
+// Datagen values
+// ---------------------------------------------------------------------------
+
+/// The wire form of a core `DatagenValue`. `kind` tags the payload:
+/// `"int"`/`"float"`/`"bool"`/`"str"`/`"json"` carry a JSON scalar in `value`;
+/// `"blob"` carries raw bytes in `bytes` (inline base64 in JSON, or a raw
+/// multipart part on the append endpoints) plus `size`/`checksum`. Mirrors the
+/// `DatagenValue.to_wire`/`from_wire` dict shape in the Python binding.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatagenValueDto {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<Value>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_base64_opt",
+        deserialize_with = "deserialize_base64_opt"
+    )]
+    pub bytes: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checksum: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Datagen events (append)
+// ---------------------------------------------------------------------------
+
+/// One append-only datagen log row. Field names and semantics mirror the core
+/// `DatagenEvent` and the Python `datagen_events` wire dict; enum-valued columns
+/// (`event_type`, `step_kind`, `status`) travel as their canonical strings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatagenEventDto {
+    pub event_id: String,
+    pub item_id: String,
+    pub root_item_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_item_id: Option<String>,
+    pub item_seq: i64,
+    pub checkpoint_id: String,
+    pub event_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_index: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enclosing_step: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector_step: Option<String>,
+    #[serde(default)]
+    pub attempt: i32,
+    pub run_id: String,
+    pub writer_epoch: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codec_version: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<DatagenValueDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_tags: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_dump: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traceback: Option<String>,
+    /// Defaults to the server's current time when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_ts: Option<DateTime<Utc>>,
+    pub schema_version: i32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AddDatagenEventsRequest {
+    pub events: Vec<DatagenEventDto>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AddDatagenEventsResponse {
+    pub version: u64,
+    pub count: usize,
+}
+
+// ---------------------------------------------------------------------------
+// Datagen folded read lenses
+// ---------------------------------------------------------------------------
+
+/// A folded field: `mode = "set"` carries a single `value`; `mode = "append"`
+/// carries an ordered `values` list. Mirrors the Python `FieldState` wire dict.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatagenFieldStateDto {
+    pub mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<DatagenValueDto>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<DatagenValueDto>,
+}
+
+/// One completed step position an item passed through (a single STEP_COMPLETED).
+/// Mirrors the Python `StepCursor` wire dict.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatagenStepCursorDto {
+    pub step_name: String,
+    pub step_kind: String,
+    pub step_index: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enclosing_step: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector_step: Option<String>,
+    pub item_seq: i64,
+}
+
+/// An item reconstructed by folding its events into latest state.
+/// Mirrors the Python `FoldedItem` wire dict.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FoldedDatagenItemDto {
+    pub item_id: String,
+    pub root_item_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_item_id: Option<String>,
+    pub status: String,
+    pub last_item_seq: i64,
+    pub last_attempt: i32,
+    pub fields: std::collections::BTreeMap<String, DatagenFieldStateDto>,
+    pub trajectory: Vec<DatagenStepCursorDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_tags: Option<Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GetFoldedDatagenItemResponse {
+    pub item: Option<FoldedDatagenItemDto>,
+}
+
+/// Bulk startup classification of root items. A missing id means "never started".
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DatagenRootItemStatusesResponse {
+    pub statuses: std::collections::HashMap<String, String>,
+}
+
+/// One failure record for an item (the failure lens). Mirrors the Python
+/// `Failure` wire dict, with the step position flattened under `at`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatagenFailureDto {
+    pub at: DatagenStepCursorDto,
+    pub run_id: String,
+    pub attempt: i32,
+    pub error_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_dump: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traceback: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ListDatagenFailuresResponse {
+    pub failures: Vec<DatagenFailureDto>,
 }
 
 // ---------------------------------------------------------------------------
