@@ -251,6 +251,29 @@ fn describe_metrics() {
          Sustained growth means old manifests are accumulating on storage."
     );
     describe_gauge!(
+        "master_stats_hot_experiments",
+        "Experiments currently held in the stats table. Bounded by retirement, \
+         unlike the registry, which lists every experiment ever created."
+    );
+    describe_gauge!(
+        "master_scan_experiments_skipped",
+        "Experiments a scan round skipped because their base version had not moved. \
+         A ratio near 1 of total is the healthy state at scale."
+    );
+    describe_gauge!(
+        "master_scan_experiments_observed",
+        "Experiments a scan round observed in full."
+    );
+    describe_counter!(
+        "master_stats_experiments_retired_total",
+        "Cold experiments merged, compacted, verified quiescent, and dropped from \
+         the stats table."
+    );
+    describe_counter!(
+        "master_stats_retire_failures_total",
+        "Retirement attempts that failed; the experiment stays in the table and retries."
+    );
+    describe_gauge!(
         "master_rollout_rows",
         "Total rollout rows across all experiments as of the last scan."
     );

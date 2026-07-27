@@ -30,6 +30,11 @@ const OBSERVE_TIMEOUT: Duration = Duration::from_secs(30);
 /// [`maintain_stats`].
 const MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Bound on the merge and compaction steps of retiring one experiment. Larger
+/// than `OBSERVE_TIMEOUT` because both genuinely rewrite data; a retirement that
+/// exceeds it is abandoned and retried next round, which is harmless.
+const RETIRE_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// Compact `_stats` and prune its old manifest versions.
 ///
 /// Scans now write the table as one `Overwrite` snapshot per round rather than
@@ -241,6 +246,21 @@ async fn scan_once_inner(state: &Arc<MasterState>) -> lance::Result<usize> {
     }
     snapshot.sort_by(|a, b| a.name.cmp(&b.name));
 
+    // Retire experiments with no writes for the configured window. Each is
+    // merged, compacted and verified quiescent first; only then is its row
+    // dropped, because a row absent from this table is invisible to both
+    // auto-sweeps forever. See `retire_cold_experiments`.
+    //
+    // Done before the snapshot is written so a retirement takes effect in the
+    // same commit rather than leaving a round where the row is stale.
+    let retire_after = Duration::from_secs(state.config.stats_cold_retire_secs);
+    let retired =
+        retire_cold_experiments(&snapshot, retire_after, Utc::now().timestamp_millis()).await;
+    if !retired.is_empty() {
+        snapshot.retain(|row| !retired.contains(&row.name));
+    }
+    metrics::gauge!("master_stats_hot_experiments").set(snapshot.len() as f64);
+
     let mut total_rows: i64 = 0;
     let mut total_fragments: i64 = 0;
     let mut live_count: usize = 0;
@@ -365,6 +385,113 @@ async fn observe_one(
         },
         false,
     ))
+}
+
+/// Decide which of `rows` are cold enough to retire, and leave each one in a
+/// state that needs no further maintenance before dropping it.
+///
+/// Returns the names that were successfully retired.
+///
+/// # Ordering is a correctness property, not an optimisation
+///
+/// Both auto-sweeps read the stats table and nothing else, so an experiment
+/// absent from it is invisible to them forever. Retiring one that still has
+/// un-merged MemWAL generations would strand those generations permanently:
+/// their rows stay readable (the read path unions them) but they are never
+/// folded into the base table, read amplification never goes down, and the
+/// `_mem_wal/{shard}/` directories are never reclaimed. That is a storage leak
+/// with no process left to notice it.
+///
+/// So retirement is: merge the WAL, compact, **verify the WAL actually drained**,
+/// and only then drop the row. `compact_files` deliberately does not touch WAL
+/// generations, so compaction alone would not have been enough.
+///
+/// Any step failing leaves the experiment in the table to be retried next
+/// round. Refusing to retire is always safe; retiring early is not.
+async fn retire_cold_experiments(
+    rows: &[StatRow],
+    retire_after: Duration,
+    now_ms: i64,
+) -> HashSet<String> {
+    if retire_after.is_zero() {
+        return HashSet::new();
+    }
+    let cutoff_ms = now_ms.saturating_sub(retire_after.as_millis() as i64);
+
+    let mut retired = HashSet::new();
+    for row in rows {
+        if row.last_updated > cutoff_ms {
+            continue;
+        }
+        match prepare_for_retirement(&row.name, &row.uri).await {
+            Ok(true) => {
+                retired.insert(row.name.clone());
+                metrics::counter!("master_stats_experiments_retired_total").increment(1);
+                tracing::info!(
+                    store = %row.name,
+                    idle_ms = now_ms.saturating_sub(row.last_updated),
+                    "retiring cold experiment from the stats table"
+                );
+            }
+            Ok(false) => {
+                // Still had pending generations after the merge, so something
+                // else is writing or the merge did not fully drain. Keep it.
+                tracing::debug!(
+                    store = %row.name,
+                    "cold experiment not retired: WAL still pending after merge"
+                );
+            }
+            Err(e) => {
+                metrics::counter!("master_stats_retire_failures_total").increment(1);
+                tracing::warn!(
+                    store = %row.name,
+                    error = %e,
+                    "failed to prepare cold experiment for retirement; keeping it"
+                );
+            }
+        }
+    }
+    retired
+}
+
+/// Merge, compact, and verify one experiment is quiescent.
+///
+/// `Ok(true)` means it is safe to drop from the stats table.
+async fn prepare_for_retirement(name: &str, uri: &str) -> lance::Result<bool> {
+    let opts = RolloutStoreOptions::default();
+    let mut store = match tokio::time::timeout(
+        OBSERVE_TIMEOUT,
+        RolloutStore::open_existing_with_options(uri, opts),
+    )
+    .await
+    {
+        Ok(Ok(store)) => store,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            return Err(lance::Error::io(format!(
+                "open timed out retiring store '{name}'"
+            )))
+        }
+    };
+
+    // 1. Drain the WAL. Must precede compaction: `compact_files` rewrites base
+    //    fragments and leaves MemWAL generations untouched.
+    tokio::time::timeout(RETIRE_TIMEOUT, store.cleanup_own_shard())
+        .await
+        .map_err(|_| lance::Error::io(format!("WAL merge timed out retiring '{name}'")))??;
+
+    // 2. Compact, so the retired table is not left as many small fragments that
+    //    nothing will ever come back to tidy.
+    tokio::time::timeout(RETIRE_TIMEOUT, store.compact(None))
+        .await
+        .map_err(|_| lance::Error::io(format!("compaction timed out retiring '{name}'")))??;
+
+    // 3. Verify. Only a genuinely drained shard may leave the sweeps' view.
+    let obs = tokio::time::timeout(OBSERVE_TIMEOUT, store.observe())
+        .await
+        .map_err(|_| lance::Error::io(format!("observe timed out retiring '{name}'")))??;
+
+    Ok(obs.pending_wal_generations == 0)
 }
 
 /// Refresh one experiment immediately and persist its new stats row.
@@ -642,5 +769,166 @@ mod incremental_scan_tests {
         assert!(skipped);
         assert_eq!(next.last_compaction, 1_700_000_000_000);
         assert_eq!(next.total_compactions, 7);
+    }
+}
+
+#[cfg(test)]
+mod retirement_tests {
+    use super::*;
+    use lance_context_core::{RolloutRecord, RolloutStore, RolloutStoreOptions, ROLE_ASSISTANT};
+    use tempfile::TempDir;
+
+    fn rec(id: &str) -> RolloutRecord {
+        RolloutRecord {
+            id: id.to_string(),
+            rollout_id: "r".to_string(),
+            problem_id: "p".to_string(),
+            dataset: None,
+            sequence_order: 0,
+            role: ROLE_ASSISTANT.to_string(),
+            created_at: Utc::now(),
+            content: Some("x".to_string()),
+            content_type: "text/plain".to_string(),
+            model_input_string: None,
+            model_output_string: None,
+            rationale: None,
+            problem_text: None,
+            user_metadata: None,
+            input_tokens: None,
+            output_tokens: None,
+            num_input_tokens: None,
+            num_output_tokens: None,
+            output_logprobs: None,
+            input_logprobs: None,
+            ref_logprobs: None,
+            loss_mask: None,
+            advantage: None,
+            reward: None,
+            raw_reward: None,
+            grader_id: None,
+            score: None,
+            include_in_training: None,
+            exclude_reason: None,
+            policy_version: None,
+            relationships: vec![],
+            binary_payload: None,
+            payload_size: None,
+            payload_checksum: None,
+            artifact_type: None,
+            metadata: None,
+        }
+    }
+
+    fn row(name: &str, uri: &str, last_updated: i64) -> StatRow {
+        StatRow {
+            name: name.to_string(),
+            uri: uri.to_string(),
+            row_count: 1,
+            fragment_count: 1,
+            last_updated,
+            pending_wal_generations: 0,
+            last_compaction: StatRow::NO_COMPACTION,
+            total_compactions: 0,
+            scanned_at: last_updated,
+            version: 1,
+        }
+    }
+
+    /// Retirement must drain the WAL before dropping the row.
+    ///
+    /// The sweeps read the stats table and nothing else, so a retired
+    /// experiment is invisible to them forever. Dropping one with pending
+    /// generations would strand them: never merged, read amplification never
+    /// recovers, `_mem_wal/` never reclaimed, and no process left to notice.
+    #[tokio::test]
+    async fn retirement_drains_the_wal_before_dropping_the_row() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().join("e.lance").to_string_lossy().to_string();
+        {
+            let store = RolloutStore::open_with_options(&uri, RolloutStoreOptions::default())
+                .await
+                .unwrap();
+            for i in 0..3 {
+                store.add(&[rec(&format!("r{i}"))]).await.unwrap();
+                store.flush().await.unwrap();
+            }
+            // Pending generations exist at this point.
+            let obs = store.observe().await.unwrap();
+            assert!(
+                obs.pending_wal_generations > 0,
+                "test setup must leave un-merged generations"
+            );
+        }
+
+        let now = Utc::now().timestamp_millis();
+        let old = now - Duration::from_secs(30 * 86_400).as_millis() as i64;
+        let retired =
+            retire_cold_experiments(&[row("e", &uri, old)], Duration::from_secs(7 * 86_400), now)
+                .await;
+
+        assert!(retired.contains("e"), "a cold experiment should retire");
+
+        // The decisive assertion: nothing was left behind for a sweep that will
+        // never look again.
+        let store = RolloutStore::open_existing_with_options(&uri, RolloutStoreOptions::default())
+            .await
+            .unwrap();
+        let obs = store.observe().await.unwrap();
+        assert_eq!(
+            obs.pending_wal_generations, 0,
+            "retirement must leave zero pending generations, or they are stranded forever"
+        );
+        assert_eq!(obs.row_count, 3, "no rows may be lost by retirement");
+    }
+
+    /// An experiment written recently must not be retired.
+    #[tokio::test]
+    async fn recently_written_experiment_is_not_retired() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().join("e.lance").to_string_lossy().to_string();
+        {
+            let store = RolloutStore::open_with_options(&uri, RolloutStoreOptions::default())
+                .await
+                .unwrap();
+            store.add(&[rec("a")]).await.unwrap();
+            store.flush().await.unwrap();
+        }
+
+        let now = Utc::now().timestamp_millis();
+        let retired =
+            retire_cold_experiments(&[row("e", &uri, now)], Duration::from_secs(7 * 86_400), now)
+                .await;
+        assert!(
+            retired.is_empty(),
+            "a hot experiment must stay in the table"
+        );
+    }
+
+    /// Retirement disabled means nothing is ever retired, however old.
+    #[tokio::test]
+    async fn zero_window_disables_retirement() {
+        let now = Utc::now().timestamp_millis();
+        let retired =
+            retire_cold_experiments(&[row("e", "/nonexistent", 0)], Duration::from_secs(0), now)
+                .await;
+        assert!(retired.is_empty());
+    }
+
+    /// An experiment that cannot be prepared stays in the table rather than
+    /// being dropped. Refusing to retire is always safe; retiring early is not.
+    #[tokio::test]
+    async fn unpreparable_experiment_is_kept() {
+        let now = Utc::now().timestamp_millis();
+        let old = now - Duration::from_secs(30 * 86_400).as_millis() as i64;
+        let retired = retire_cold_experiments(
+            &[row("gone", "/no/such/dataset.lance", old)],
+            Duration::from_secs(7 * 86_400),
+            now,
+        )
+        .await;
+        assert!(
+            retired.is_empty(),
+            "an experiment that failed to prepare must not be retired"
+        );
     }
 }
