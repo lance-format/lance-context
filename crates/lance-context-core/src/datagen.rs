@@ -195,10 +195,7 @@ impl DatagenItemId {
                 .map_err(|_| format!("non-integer branch index '{idx}' in '{path}'"))?;
             segments.push((step.to_string(), branch_idx));
         }
-        Ok(Self {
-            root_key,
-            segments,
-        })
+        Ok(Self { root_key, segments })
     }
 }
 
@@ -382,6 +379,7 @@ pub struct FoldedDatagenItem {
 /// Result of a resumption fold. `NeverStarted` (no ITEM_CREATED) is the fresh-vs-restore fork the
 /// executor acts on; `Found` carries the folded item (whose `status` is the lifecycle status).
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)] // `Found` is the common path; boxing it adds indirection to the hot case.
 pub enum DatagenItemLookup {
     NeverStarted,
     Found(FoldedDatagenItem),
@@ -434,7 +432,6 @@ impl DatagenRootItemStatuses {
         self.inner.is_empty()
     }
 
-    #[must_use]
     pub fn iter(&self) -> impl Iterator<Item = (&String, &DatagenItemStatus)> {
         self.inner.iter()
     }
@@ -685,7 +682,8 @@ fn apply_event(item: &mut FoldedDatagenItem, event: &DatagenEvent) -> Result<(),
             let field_name = event.field_name.clone().unwrap();
             let value = event.value.clone().unwrap();
             record_blob_event_id(item, &field_name, &value, &event.event_id);
-            item.fields.insert(field_name, DatagenFieldState::Set(value));
+            item.fields
+                .insert(field_name, DatagenFieldState::Set(value));
         }
         DatagenEventType::FieldAppend => {
             let field_name = event.field_name.clone().unwrap();
@@ -719,7 +717,9 @@ fn apply_event(item: &mut FoldedDatagenItem, event: &DatagenEvent) -> Result<(),
         }
         DatagenEventType::Terminal => {
             item.status = match event.status {
-                Some(status @ (DatagenItemStatus::Completed | DatagenItemStatus::Filtered)) => status,
+                Some(status @ (DatagenItemStatus::Completed | DatagenItemStatus::Filtered)) => {
+                    status
+                }
                 _ => return Err("TERMINAL event missing completed/filtered status".to_string()),
             };
         }
@@ -882,8 +882,9 @@ mod tests {
         append2.event_id = datagen_event_id("5", "c4", 0);
         append2.value = Some(DatagenValue::Json(json!({"n": "b"})));
 
-        let folded =
-            fold_datagen_events(&[created(0), set_v1, set_v2, append, append2]).unwrap().unwrap();
+        let folded = fold_datagen_events(&[created(0), set_v1, set_v2, append, append2])
+            .unwrap()
+            .unwrap();
         assert_eq!(
             folded.fields.get("draft"),
             Some(&DatagenFieldState::Set(DatagenValue::Str("v2".to_string())))
@@ -901,7 +902,9 @@ mod tests {
     fn terminal_sets_lifecycle_status() {
         let mut terminal = event(2, DatagenEventType::Terminal);
         terminal.status = Some(DatagenItemStatus::Completed);
-        let folded = fold_datagen_events(&[created(0), terminal]).unwrap().unwrap();
+        let folded = fold_datagen_events(&[created(0), terminal])
+            .unwrap()
+            .unwrap();
         assert_eq!(folded.status, DatagenItemStatus::Completed);
     }
 
@@ -913,7 +916,9 @@ mod tests {
         failed.error_type = Some("ValueError".to_string());
         failed.attempt = 0;
 
-        let folded = fold_datagen_events(&[created(0), failed.clone()]).unwrap().unwrap();
+        let folded = fold_datagen_events(&[created(0), failed.clone()])
+            .unwrap()
+            .unwrap();
         assert_eq!(folded.status, DatagenItemStatus::Running);
 
         let failures = datagen_failures(&[created(0), failed]).unwrap();
@@ -941,8 +946,9 @@ mod tests {
         append.codec_version = Some(1);
         append.value = Some(DatagenValue::Json(json!({"role": "assistant"})));
 
-        let folded =
-            fold_datagen_events(&[created(0), append.clone(), append]).unwrap().unwrap();
+        let folded = fold_datagen_events(&[created(0), append.clone(), append])
+            .unwrap()
+            .unwrap();
         assert_eq!(
             folded.fields.get("messages"),
             Some(&DatagenFieldState::Appended(vec![DatagenValue::Json(
@@ -987,7 +993,9 @@ mod tests {
     fn terminal_filtered_sets_filtered_status() {
         let mut terminal = event(2, DatagenEventType::Terminal);
         terminal.status = Some(DatagenItemStatus::Filtered);
-        let folded = fold_datagen_events(&[created(0), terminal]).unwrap().unwrap();
+        let folded = fold_datagen_events(&[created(0), terminal])
+            .unwrap()
+            .unwrap();
         assert_eq!(folded.status, DatagenItemStatus::Filtered);
     }
 

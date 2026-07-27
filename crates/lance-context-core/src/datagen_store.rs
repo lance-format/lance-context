@@ -36,8 +36,8 @@ use uuid::Uuid;
 
 use crate::datagen::{
     datagen_failures, datagen_trajectory, fold_datagen_events, DatagenBlobValue, DatagenEvent,
-    DatagenEventType, DatagenFailure, DatagenItemLookup, DatagenItemStatus, DatagenRootItemStatuses,
-    DatagenStepCursor, DatagenStepKind, DatagenValue,
+    DatagenEventType, DatagenFailure, DatagenItemLookup, DatagenItemStatus,
+    DatagenRootItemStatuses, DatagenStepCursor, DatagenStepKind, DatagenValue,
 };
 use crate::rollout_store::{align_batch_to_schema, derive_shard_id, is_not_found_error};
 use crate::store::{column_as, column_as_optional, timestamp_from_micros};
@@ -1566,10 +1566,7 @@ mod tests {
             assert!(statuses.is_terminated(&root_id));
 
             let child = store.fold_item("7/solve_twice:0").await.unwrap();
-            assert_eq!(
-                child.folded().unwrap().status,
-                DatagenItemStatus::Running
-            );
+            assert_eq!(child.folded().unwrap().status, DatagenItemStatus::Running);
             assert_eq!(
                 child.folded().unwrap().parent_item_id,
                 Some(DatagenItemId::from_source_key("7"))

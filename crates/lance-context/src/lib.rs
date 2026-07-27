@@ -7,7 +7,7 @@ pub use lance_context_core::{
     CompactionConfig, CompactionMetrics, CompactionStats, Context, ContextEntry, ContextNamespace,
     ContextRecord, ContextStoreOptions, DatagenBlobValue, DatagenEvent, DatagenEventType,
     DatagenFailure, DatagenFieldState, DatagenItemStatus, DatagenStepCursor, DatagenStore,
-    DatagenStoreOptions, DatagenTerminal, DatagenTrajectoryPoint, DatagenValue, FoldedDatagenItem,
+    DatagenStoreOptions, DatagenTerminal, DatagenTrajectory, DatagenValue, FoldedDatagenItem,
     IdIndexType, LifecycleQueryOptions, MetadataFilter, PartitionInfo, PartitionSelector,
     PartitionSpec, RecordFilters, Relationship, RetrieveResult, RolloutFilters, RolloutRecord,
     SearchResult, Snapshot, StateMetadata, DATAGEN_SCHEMA_VERSION, LIFECYCLE_ACTIVE,
