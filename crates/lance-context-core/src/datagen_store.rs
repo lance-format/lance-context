@@ -39,8 +39,8 @@ use crate::datagen::{
     DatagenEventType, DatagenFailure, DatagenItemLookup, DatagenItemStatus,
     DatagenRootItemStatuses, DatagenStepCursor, DatagenStepKind, DatagenValue,
 };
-use crate::rollout_store::{align_batch_to_schema, derive_shard_id, is_not_found_error};
 use crate::store::{column_as, column_as_optional, timestamp_from_micros};
+use crate::store_base::{align_batch_to_schema, derive_shard_id, is_not_found_error};
 
 const DEFAULT_MANIFEST_SCAN_BATCH_SIZE: usize = 16;
 const DEFAULT_SHARD_SCAN_CONCURRENCY: usize = 16;
