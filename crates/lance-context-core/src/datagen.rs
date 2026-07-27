@@ -432,7 +432,6 @@ impl DatagenRootItemStatuses {
         self.inner.is_empty()
     }
 
-    #[must_use]
     pub fn iter(&self) -> impl Iterator<Item = (&String, &DatagenItemStatus)> {
         self.inner.iter()
     }

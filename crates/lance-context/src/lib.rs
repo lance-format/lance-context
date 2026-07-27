@@ -6,11 +6,13 @@ pub use lance_context_core::{
     datagen_event_id, datagen_log_schema, datagen_trajectory, fold_datagen_events,
     CompactionConfig, CompactionMetrics, CompactionStats, Context, ContextEntry, ContextNamespace,
     ContextRecord, ContextStoreOptions, DatagenBlobValue, DatagenEvent, DatagenEventType,
-    DatagenFailure, DatagenFieldState, DatagenItemStatus, DatagenStepCursor, DatagenStoreOptions,
-    DatagenTerminal, DatagenTrajectory, DatagenValue, FoldedDatagenItem, IdIndexType,
-    LifecycleQueryOptions, MetadataFilter, PartitionInfo, PartitionSelector, PartitionSpec,
-    RecordFilters, Relationship, RetrieveResult, RolloutFilters, RolloutRecord, SearchResult,
-    Snapshot, StateMetadata, DATAGEN_SCHEMA_VERSION, LIFECYCLE_ACTIVE, LIFECYCLE_CONTRADICTED,
+    DatagenFailure, DatagenFieldState, DatagenItemStatus, DatagenStepCursor, DatagenStore,
+    DatagenStoreOptions, DatagenTerminal, DatagenTrajectory, DatagenValue, FoldedDatagenItem,
+    IdIndexType, LifecycleQueryOptions, MetadataFilter, PartitionInfo, PartitionSelector,
+    PartitionSpec, RecordFilters, Relationship, RetrieveResult, RolloutFilters, RolloutRecord,
+    SearchResult, Snapshot, StateMetadata, DATAGEN_SCHEMA_VERSION, LIFECYCLE_ACTIVE,
+    LIFECYCLE_CONTRADICTED,
+};
 };
 
 pub use lance_context_api::{
