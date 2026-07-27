@@ -13,7 +13,6 @@ pub use lance_context_core::{
     SearchResult, Snapshot, StateMetadata, DATAGEN_SCHEMA_VERSION, LIFECYCLE_ACTIVE,
     LIFECYCLE_CONTRADICTED,
 };
-};
 
 pub use lance_context_api::{
     AddDatagenEventsRequest, AddDatagenEventsResponse, AddRecordRequest, AddRecordsResponse,
