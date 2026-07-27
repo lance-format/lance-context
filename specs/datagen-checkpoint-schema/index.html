@@ -597,6 +597,30 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="Event model">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#item-identity" class="md-nav__link">
+    <span class="md-ellipsis">
+      Item identity
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#read-lenses" class="md-nav__link">
+    <span class="md-ellipsis">
+      Read lenses
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
@@ -650,6 +674,8 @@
   
     
     
+      
+        
       
         
       
@@ -730,6 +756,27 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../design/using-datagen-store/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Using the datagen store
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -778,6 +825,30 @@
       Event model
     </span>
   </a>
+  
+    <nav class="md-nav" aria-label="Event model">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#item-identity" class="md-nav__link">
+    <span class="md-ellipsis">
+      Item identity
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#read-lenses" class="md-nav__link">
+    <span class="md-ellipsis">
+      Read lenses
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
   
 </li>
       
@@ -838,22 +909,41 @@ transactions across multiple datasets.</p>
 <p>Optional query projections may be added later, but they must be disposable,
 rebuildable, and excluded from checkpoint correctness.</p>
 <h2 id="event-model">Event model<a class="headerlink" href="#event-model" title="Permanent link">&para;</a></h2>
-<p>Every row is an immutable event:</p>
+<p>Every row is an immutable event. The current schema version is
+<code>DATAGEN_SCHEMA_VERSION = 2</code>. There are seven event types:</p>
 <ul>
-<li><code>ITEM_CREATED</code></li>
-<li><code>FIELD_SET</code></li>
-<li><code>FIELD_APPEND</code></li>
-<li><code>STEP_COMPLETED</code></li>
-<li><code>FAILED</code></li>
-<li><code>TERMINAL</code></li>
+<li><code>ITEM_CREATED</code> — an item (stream) first appears, exactly once, <code>status = running</code>.</li>
+<li><code>STEP_STARTED</code> — a driver frame (<code>Sequence</code>/<code>Loop</code>) opened. A structural marker.</li>
+<li><code>FIELD_SET</code> — replaces a field's value (fold: last-writer-wins).</li>
+<li><code>FIELD_APPEND</code> — accumulates onto a field (fold: append in order).</li>
+<li><code>STEP_COMPLETED</code> — a checkpointed step boundary, carrying that step's field delta.</li>
+<li><code>FAILED</code> — a step raised; a failure-lens row that leaves the item <code>running</code>.</li>
+<li><code>TERMINAL</code> — the item finished, <code>status = completed | filtered</code>.</li>
 </ul>
 <p>Every completed step emits a <code>STEP_COMPLETED</code> event, even when no field changed.
 All field events and the completion marker for one step are written in the same
-checkpoint batch.</p>
+checkpoint batch. Only driver kinds emit <code>STEP_STARTED</code>; fan-out kinds
+(<code>MapReduce</code>/<code>Branch</code>/<code>SubPipeline</code>) emit only their reduce <code>STEP_COMPLETED</code>;
+selector kinds (<code>Conditional</code>/<code>Router</code>) emit no row of their own — the chosen
+child records the selector in <code>selector_step</code>.</p>
 <p><code>event_id</code> is a deterministic idempotency key. Retrying an ambiguously
 acknowledged batch writes the same event ids, and the MemWAL LSM read path
 de-duplicates them. <code>item_seq</code> is strictly increasing per item; two different
 events at the same sequence are treated as a writer-fencing violation.</p>
+<h3 id="item-identity">Item identity<a class="headerlink" href="#item-identity" title="Permanent link">&para;</a></h3>
+<p>An item id is a materialized path string owned by the store. A root id is the
+executor's source key (<code>5</code>); a fan-out sub-item extends its parent with one
+<code>step:idx</code> segment (<code>5/solve_twice:0</code>). Ids compose purely on the client, with
+no store round-trip. <code>root_item_id</code> / <code>parent_item_id</code> are denormalized on every
+row, so any subtree is a single filter with no join.</p>
+<h3 id="read-lenses">Read lenses<a class="headerlink" href="#read-lenses" title="Permanent link">&para;</a></h3>
+<p>State is read under two lenses:</p>
+<ul>
+<li><em>lifecycle</em> — fold the events; <code>status</code> is <code>running</code> until a <code>TERMINAL</code>. Drives
+  skip/resume/fresh classification and ignores <code>FAILED</code>.</li>
+<li><em>failure</em> — read <code>FAILED</code> rows directly (forensics). An item may have 0..N
+  failures across attempts while still folding to <code>running</code> under lifecycle.</li>
+</ul>
 <h2 id="schema">Schema<a class="headerlink" href="#schema" title="Permanent link">&para;</a></h2>
 <table>
 <thead>
@@ -872,17 +962,17 @@ events at the same sequence are treated as a writer-fencing violation.</p>
 <tr>
 <td><code>item_id</code></td>
 <td>string</td>
-<td>Scoped item identity</td>
+<td>Scoped item identity (materialized path)</td>
 </tr>
 <tr>
 <td><code>root_item_id</code></td>
 <td>string</td>
-<td>Root of the projected item tree</td>
+<td>Root of the projected item tree (denormalized)</td>
 </tr>
 <tr>
 <td><code>parent_item_id</code></td>
 <td>string?</td>
-<td>Direct parent item</td>
+<td>Direct parent item (denormalized)</td>
 </tr>
 <tr>
 <td><code>item_seq</code></td>
@@ -897,27 +987,32 @@ events at the same sequence are treated as a writer-fencing violation.</p>
 <tr>
 <td><code>event_type</code></td>
 <td>string</td>
-<td>Event kind</td>
+<td>Event kind (one of the seven above)</td>
 </tr>
 <tr>
 <td><code>step_name</code></td>
 <td>string?</td>
-<td>Step provenance</td>
+<td>Step provenance (globally-unique step name)</td>
+</tr>
+<tr>
+<td><code>step_kind</code></td>
+<td>string?</td>
+<td>Composition kind (<code>sequence</code>, <code>loop</code>, <code>map_reduce</code>, <code>branch</code>, <code>sub_pipeline</code>, <code>conditional</code>, <code>router</code>, <code>leaf</code>, <code>root</code>)</td>
 </tr>
 <tr>
 <td><code>step_index</code></td>
 <td>int64?</td>
-<td>Static step position</td>
+<td>Static step position (loop iteration = driver frame's index)</td>
 </tr>
 <tr>
-<td><code>step_instance_id</code></td>
+<td><code>enclosing_step</code></td>
 <td>string?</td>
-<td>Runtime step identity</td>
+<td>Name of the <code>Sequence</code>/<code>Loop</code> driver frame this step ran under</td>
 </tr>
 <tr>
-<td><code>iteration</code></td>
-<td>int64?</td>
-<td>Loop/branch iteration</td>
+<td><code>selector_step</code></td>
+<td>string?</td>
+<td>Name of the <code>Conditional</code>/<code>Router</code> that chose this step</td>
 </tr>
 <tr>
 <td><code>attempt</code></td>
@@ -1000,9 +1095,9 @@ events at the same sequence are treated as a writer-fencing violation.</p>
 <td>Non-authoritative query tags</td>
 </tr>
 <tr>
-<td><code>terminal</code></td>
+<td><code>status</code></td>
 <td>string?</td>
-<td><code>completed</code> or <code>filtered</code></td>
+<td><code>running</code> / <code>completed</code> / <code>filtered</code> / <code>failed</code> (on ITEM_CREATED / TERMINAL / FAILED)</td>
 </tr>
 <tr>
 <td><code>error_type</code></td>
@@ -1031,6 +1126,11 @@ events at the same sequence are treated as a writer-fencing violation.</p>
 </tr>
 </tbody>
 </table>
+<p>The <code>status</code> column replaces the earlier <code>terminal</code> column: it carries a stored
+<code>running</code> (from <code>ITEM_CREATED</code>) rather than deriving it, plus <code>failed</code> for the
+failure lens. Structured <code>step_kind</code> / <code>enclosing_step</code> / <code>selector_step</code> replace
+the earlier opaque <code>step_instance_id</code> + <code>iteration</code> provenance, so a resume can
+rebuild step coordinates instead of trusting a stored cursor blob.</p>
 <p><code>value_blob</code> remains inline while MemWAL's LSM scanner cannot materialize
 blob-v2 columns. Normal fold and trajectory reads project it out. Blob access
 first locates <code>event_id</code> using lightweight columns and then calls <code>take_rows</code>
@@ -1041,9 +1141,12 @@ for the exact <code>_rowid</code>.</p>
 <li>Log writes are append-only; retries reuse deterministic event ids.</li>
 <li>One live owner writes a given item at a time. Ownership changes require a
    new <code>writer_epoch</code>.</li>
-<li>Resume reads <code>item_id = X</code>, orders by <code>item_seq</code>, and folds the events.</li>
-<li><code>FIELD_SET</code> replaces a field; <code>FIELD_APPEND</code> accumulates it.</li>
-<li><code>STEP_COMPLETED</code> reconstructs the resume cursor.</li>
+<li>Resume reads <code>item_id = X</code>, orders by <code>item_seq</code>, and folds the events. An
+   item with no <code>ITEM_CREATED</code> folds to <code>NeverStarted</code> (fresh vs. restore fork).</li>
+<li><code>FIELD_SET</code> replaces a field; <code>FIELD_APPEND</code> accumulates it. Mixing the two
+   on one field is rejected.</li>
+<li><code>STEP_COMPLETED</code> reconstructs the resume cursor; <code>STEP_STARTED \ STEP_COMPLETED</code>
+   (started minus completed) is the driver frame open at crash time.</li>
 <li><code>FAILED</code> and <code>TERMINAL</code> are ordinary log events, not separate datasets.</li>
 <li>Blob bytes are loaded only when the corresponding lazy reference is used.</li>
 </ol>

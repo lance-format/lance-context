@@ -2,46 +2,50 @@
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
     <url>
          <loc>https://lance-format.github.io/lance-context/</loc>
-         <lastmod>2026-07-26</lastmod>
+         <lastmod>2026-07-27</lastmod>
     </url>
     <url>
          <loc>https://lance-format.github.io/lance-context/design/auto-dream/</loc>
-         <lastmod>2026-07-26</lastmod>
+         <lastmod>2026-07-27</lastmod>
     </url>
     <url>
          <loc>https://lance-format.github.io/lance-context/design/partitioned-namespace/</loc>
-         <lastmod>2026-07-26</lastmod>
+         <lastmod>2026-07-27</lastmod>
+    </url>
+    <url>
+         <loc>https://lance-format.github.io/lance-context/design/using-datagen-store/</loc>
+         <lastmod>2026-07-27</lastmod>
     </url>
     <url>
          <loc>https://lance-format.github.io/lance-context/guide/development/</loc>
-         <lastmod>2026-07-26</lastmod>
+         <lastmod>2026-07-27</lastmod>
     </url>
     <url>
          <loc>https://lance-format.github.io/lance-context/guide/quickstart/</loc>
-         <lastmod>2026-07-26</lastmod>
+         <lastmod>2026-07-27</lastmod>
     </url>
     <url>
          <loc>https://lance-format.github.io/lance-context/guide/rollouts/</loc>
-         <lastmod>2026-07-26</lastmod>
+         <lastmod>2026-07-27</lastmod>
     </url>
     <url>
          <loc>https://lance-format.github.io/lance-context/guide/storage/</loc>
-         <lastmod>2026-07-26</lastmod>
+         <lastmod>2026-07-27</lastmod>
     </url>
     <url>
          <loc>https://lance-format.github.io/lance-context/specs/datagen-checkpoint-schema/</loc>
-         <lastmod>2026-07-26</lastmod>
+         <lastmod>2026-07-27</lastmod>
     </url>
     <url>
          <loc>https://lance-format.github.io/lance-context/specs/rollout-blob-streaming/</loc>
-         <lastmod>2026-07-26</lastmod>
+         <lastmod>2026-07-27</lastmod>
     </url>
     <url>
          <loc>https://lance-format.github.io/lance-context/specs/rollout-deployment/</loc>
-         <lastmod>2026-07-26</lastmod>
+         <lastmod>2026-07-27</lastmod>
     </url>
     <url>
          <loc>https://lance-format.github.io/lance-context/specs/rollout-schema-design/</loc>
-         <lastmod>2026-07-26</lastmod>
+         <lastmod>2026-07-27</lastmod>
     </url>
 </urlset>
