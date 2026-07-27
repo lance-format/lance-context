@@ -40,11 +40,25 @@ pub struct StatRow {
     pub last_compaction: i64,
     pub total_compactions: i64,
     pub scanned_at: i64,
+    /// Base-dataset version at the last full observation.
+    ///
+    /// A scan compares this against the experiment's current version to decide
+    /// whether anything can have changed. Opening the dataset already reads the
+    /// manifest, so the current version is free; an unchanged version means the
+    /// expensive parts of `observe` (listing MemWAL shards, opening every
+    /// flushed generation, counting rows) can be skipped entirely. `-1` marks a
+    /// row written before this column existed, forcing one full observation.
+    pub version: i64,
 }
 
 impl StatRow {
     /// Sentinel stored in `last_compaction` when no compaction has run.
     pub const NO_COMPACTION: i64 = -1;
+
+    /// Sentinel stored in `version` for a row written before that column
+    /// existed, or whose version could not be read. Never matches a real
+    /// version, so it always forces a full observation.
+    pub const UNKNOWN_VERSION: i64 = -1;
 
     /// Convert to the wire DTO, mapping the `-1` sentinel back to `None`.
     #[must_use]
@@ -84,6 +98,7 @@ fn stats_schema() -> Schema {
         Field::new("last_compaction", DataType::Int64, false),
         Field::new("total_compactions", DataType::Int64, false),
         Field::new("scanned_at", DataType::Int64, false),
+        Field::new("version", DataType::Int64, false),
     ])
 }
 
@@ -168,6 +183,7 @@ impl StatsStore {
                 Arc::new(Int64Array::from(vec![row.last_compaction])),
                 Arc::new(Int64Array::from(vec![row.total_compactions])),
                 Arc::new(Int64Array::from(vec![row.scanned_at])),
+                Arc::new(Int64Array::from(vec![row.version])),
             ],
         )?)
     }
@@ -205,6 +221,9 @@ impl StatsStore {
                 )),
                 Arc::new(Int64Array::from(
                     rows.iter().map(|r| r.scanned_at).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|r| r.version).collect::<Vec<_>>(),
                 )),
             ],
         )?)
@@ -412,6 +431,12 @@ impl StatsStore {
         let last_compaction = Self::i64_col(batch, "last_compaction")?;
         let total_compactions = Self::i64_col(batch, "total_compactions")?;
         let scanned_at = Self::i64_col(batch, "scanned_at")?;
+        // Absent on a table written before this column existed. Reading must
+        // tolerate that rather than erroring, or an upgrade breaks every
+        // deployment until the table happens to be rewritten. Missing means
+        // "version unknown", which forces one full observation and then
+        // persists the column.
+        let version = Self::i64_col(batch, "version").ok();
         let mut out = Vec::with_capacity(batch.num_rows());
         for i in 0..batch.num_rows() {
             out.push(StatRow {
@@ -424,6 +449,7 @@ impl StatsStore {
                 last_compaction: last_compaction.value(i),
                 total_compactions: total_compactions.value(i),
                 scanned_at: scanned_at.value(i),
+                version: version.map_or(StatRow::UNKNOWN_VERSION, |v| v.value(i)),
             });
         }
         Ok(out)
@@ -525,6 +551,7 @@ mod tests {
             pending_wal_generations: 0,
             last_compaction: StatRow::NO_COMPACTION,
             total_compactions: 0,
+            version: 1,
             scanned_at: 1_700_000_001_000,
         }
     }
@@ -660,6 +687,7 @@ mod scale_tests {
             pending_wal_generations: 0,
             last_compaction: StatRow::NO_COMPACTION,
             total_compactions: 0,
+            version: 1,
             scanned_at: 1_700_000_000_000,
         }
     }
@@ -820,6 +848,82 @@ mod scale_tests {
         assert_eq!(
             page2.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
             vec!["exp-03", "exp-04", "exp-05"]
+        );
+    }
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use tempfile::TempDir;
+
+    /// A `_stats` table written before the `version` column existed must still
+    /// be readable, and the first snapshot must migrate it forward.
+    ///
+    /// Without this, an upgrade fails on every read until the table happens to
+    /// be rewritten -- and the read path is what the UI and both auto-sweeps
+    /// use, so the master would come up blind.
+    #[tokio::test]
+    async fn table_without_version_column_is_readable_and_migrates() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir
+            .path()
+            .join("_stats.lance")
+            .to_string_lossy()
+            .to_string();
+
+        // Build a table with the pre-`version` schema.
+        let legacy_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("uri", DataType::Utf8, false),
+            Field::new("row_count", DataType::Int64, false),
+            Field::new("fragment_count", DataType::Int64, false),
+            Field::new("last_updated", DataType::Int64, false),
+            Field::new("pending_wal_generations", DataType::Int64, false),
+            Field::new("last_compaction", DataType::Int64, false),
+            Field::new("total_compactions", DataType::Int64, false),
+            Field::new("scanned_at", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            legacy_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["old-exp"])),
+                Arc::new(StringArray::from(vec!["/data/old-exp.lance"])),
+                Arc::new(Int64Array::from(vec![42i64])),
+                Arc::new(Int64Array::from(vec![7i64])),
+                Arc::new(Int64Array::from(vec![1_700_000_000_000i64])),
+                Arc::new(Int64Array::from(vec![3i64])),
+                Arc::new(Int64Array::from(vec![-1i64])),
+                Arc::new(Int64Array::from(vec![0i64])),
+                Arc::new(Int64Array::from(vec![1_700_000_000_000i64])),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), legacy_schema);
+        Dataset::write(reader, &uri, None).await.unwrap();
+
+        // Reading must succeed and report the sentinel, not error.
+        let mut s = StatsStore::open_or_create(&uri, None).await.unwrap();
+        let rows = s.list(None, 10, 0).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "old-exp");
+        assert_eq!(
+            rows[0].version,
+            StatRow::UNKNOWN_VERSION,
+            "a pre-migration row must read as version-unknown, forcing one full observation"
+        );
+        assert_eq!(rows[0].row_count, 42, "existing data must survive");
+
+        // The first snapshot rewrites the table with the new schema.
+        let mut migrated = rows[0].clone();
+        migrated.version = 11;
+        s.write_snapshot(&[migrated]).await.unwrap();
+
+        let after = s.list(None, 10, 0).await.unwrap();
+        assert_eq!(
+            after[0].version, 11,
+            "the snapshot must persist the version"
         );
     }
 }
