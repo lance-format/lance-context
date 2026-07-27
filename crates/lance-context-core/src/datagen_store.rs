@@ -1162,8 +1162,8 @@ fn is_fenced_error(error: &LanceError) -> bool {
 mod tests {
     use super::*;
     use crate::datagen::{
-        datagen_event_id, DatagenFieldState, DatagenItemStatus, DatagenStepKind,
-        DATAGEN_SCHEMA_VERSION,
+        datagen_event_id, DatagenFieldState, DatagenItemId, DatagenItemLookup, DatagenItemStatus,
+        DatagenStepKind, DATAGEN_SCHEMA_VERSION,
     };
     use chrono::{TimeZone, Utc};
     use serde_json::json;
@@ -1452,6 +1452,61 @@ mod tests {
             assert_eq!(
                 store.get_blob(&blob.event_id).await.unwrap(),
                 Some(b"payload".to_vec())
+            );
+        });
+    }
+
+    #[test]
+    fn fan_out_tree_reads_by_root_and_classifies_status() {
+        let directory = TempDir::new().unwrap();
+        let uri = directory.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = DatagenStore::open(&uri).await.unwrap();
+
+            // Root item "7" fans out into one sub-item "7/solve_twice:0".
+            let mut root_created = event("7", 0, "created-root", 0, DatagenEventType::ItemCreated);
+            root_created.status = Some(DatagenItemStatus::Running);
+            store.append(&[root_created]).await.unwrap();
+
+            let mut child_created = event(
+                "7/solve_twice:0",
+                0,
+                "created-child",
+                0,
+                DatagenEventType::ItemCreated,
+            );
+            child_created.parent_item_id = Some("7".to_string());
+            child_created.status = Some(DatagenItemStatus::Running);
+            store.append(&[child_created]).await.unwrap();
+
+            let mut root_terminal = event("7", 1, "terminal", 0, DatagenEventType::Terminal);
+            root_terminal.status = Some(DatagenItemStatus::Completed);
+            store.append(&[root_terminal]).await.unwrap();
+
+            // The whole tree is one root filter, no join.
+            let tree = store.events_for_root("7").await.unwrap();
+            assert_eq!(tree.len(), 3);
+
+            // Bulk classification sees the root as terminated; the child is still running.
+            let statuses = store.root_item_statuses(&["7"]).await.unwrap();
+            let root_id = DatagenItemId::from_source_key("7");
+            assert!(statuses.is_terminated(&root_id));
+
+            let child = store.fold_item("7/solve_twice:0").await.unwrap();
+            assert_eq!(
+                child.folded().unwrap().status,
+                DatagenItemStatus::Running
+            );
+            assert_eq!(
+                child.folded().unwrap().parent_item_id,
+                Some(DatagenItemId::from_source_key("7"))
+            );
+
+            // A never-started sibling folds to NeverStarted.
+            assert_eq!(
+                store.fold_item("7/solve_twice:1").await.unwrap(),
+                DatagenItemLookup::NeverStarted
             );
         });
     }

@@ -950,4 +950,122 @@ mod tests {
             )]))
         );
     }
+
+    #[test]
+    fn step_kind_and_status_parse_round_trip() {
+        for kind in [
+            DatagenStepKind::Root,
+            DatagenStepKind::Leaf,
+            DatagenStepKind::Sequence,
+            DatagenStepKind::Loop,
+            DatagenStepKind::MapReduce,
+            DatagenStepKind::Branch,
+            DatagenStepKind::SubPipeline,
+            DatagenStepKind::Conditional,
+            DatagenStepKind::Router,
+        ] {
+            assert_eq!(DatagenStepKind::parse(kind.as_str()).unwrap(), kind);
+        }
+        assert!(DatagenStepKind::Sequence.is_driver());
+        assert!(DatagenStepKind::Loop.is_driver());
+        assert!(!DatagenStepKind::MapReduce.is_driver());
+        assert!(!DatagenStepKind::Leaf.is_driver());
+        assert!(DatagenStepKind::parse("nope").is_err());
+
+        for status in [
+            DatagenItemStatus::Running,
+            DatagenItemStatus::Completed,
+            DatagenItemStatus::Filtered,
+            DatagenItemStatus::Failed,
+        ] {
+            assert_eq!(DatagenItemStatus::parse(status.as_str()).unwrap(), status);
+        }
+        assert!(DatagenItemStatus::parse("nope").is_err());
+    }
+
+    #[test]
+    fn terminal_filtered_sets_filtered_status() {
+        let mut terminal = event(2, DatagenEventType::Terminal);
+        terminal.status = Some(DatagenItemStatus::Filtered);
+        let folded = fold_datagen_events(&[created(0), terminal]).unwrap().unwrap();
+        assert_eq!(folded.status, DatagenItemStatus::Filtered);
+    }
+
+    #[test]
+    fn selector_step_is_folded_onto_the_chosen_child_position() {
+        // A Conditional/Router writes no row; the chosen leaf records who selected it.
+        let mut chosen = leaf_completed(1, "stage2_qa", 0, Some("rubric_generation"));
+        chosen.selector_step = Some("if_stage2_qa".to_string());
+        let folded = fold_datagen_events(&[created(0), chosen]).unwrap().unwrap();
+        let cursor = &folded.trajectory.ordered[0];
+        assert_eq!(cursor.position.selector.as_deref(), Some("if_stage2_qa"));
+        assert_eq!(cursor.position.step.name, "stage2_qa");
+    }
+
+    #[test]
+    fn fan_out_sub_item_folds_with_lineage() {
+        // A MapReduce/Branch sub-item is its own stream carrying denormalized parent/root ids.
+        let root = DatagenItemId::from_source_key("5");
+        let child = root.child("solve_twice", 1);
+        let mut created = event(0, DatagenEventType::ItemCreated);
+        created.item_id = child.to_string();
+        created.parent_item_id = Some(root.to_string());
+        created.status = Some(DatagenItemStatus::Running);
+        created.event_id = datagen_event_id(&child.to_string(), "created", 0);
+
+        let mut solved = leaf_completed(1, "solve", 0, Some("solve_attempt"));
+        solved.item_id = child.to_string();
+        solved.root_item_id = root.to_string();
+        solved.parent_item_id = Some(root.to_string());
+        solved.event_id = datagen_event_id(&child.to_string(), "solve-0", 0);
+
+        let folded = fold_datagen_events(&[created, solved]).unwrap().unwrap();
+        assert_eq!(folded.item_id, child);
+        assert_eq!(folded.root_item_id, root);
+        assert_eq!(folded.parent_item_id, Some(root));
+        assert_eq!(folded.item_id.origin_step(), Some("solve_twice"));
+        assert_eq!(folded.item_id.branch_idx(), Some(1));
+    }
+
+    #[test]
+    fn field_rejects_mixing_set_and_append() {
+        let mut set = leaf_completed(1, "gen", 0, Some("main"));
+        set.event_type = DatagenEventType::FieldSet;
+        set.field_name = Some("draft".to_string());
+        set.field_type = Some("str".to_string());
+        set.codec_version = Some(1);
+        set.value = Some(DatagenValue::Str("v1".to_string()));
+
+        let mut append = set.clone();
+        append.event_type = DatagenEventType::FieldAppend;
+        append.item_seq = 2;
+        append.checkpoint_id = "c2".to_string();
+        append.event_id = datagen_event_id("5", "c2", 0);
+
+        let error = fold_datagen_events(&[created(0), set, append]).unwrap_err();
+        assert!(error.contains("mixes FIELD_SET and FIELD_APPEND"));
+    }
+
+    #[test]
+    fn resume_open_frame_is_started_minus_completed() {
+        // A driver frame that opened but never completed = the frame live at crash time.
+        let mut main_completed = driver_started(3, "main", 0, None);
+        main_completed.event_type = DatagenEventType::StepCompleted;
+        main_completed.checkpoint_id = "main-done".to_string();
+        main_completed.event_id = datagen_event_id("5", "main-done", 0);
+        let events = [
+            created(0),
+            driver_started(1, "main", 0, None),
+            driver_started(2, "refine", 1, Some("main")),
+            main_completed,
+        ];
+        let folded = fold_datagen_events(&events).unwrap().unwrap();
+        let open: Vec<_> = folded
+            .trajectory
+            .started
+            .difference(&folded.trajectory.completed)
+            .collect();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].step.name, "refine");
+    }
 }
