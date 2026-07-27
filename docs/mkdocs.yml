@@ -73,6 +73,7 @@ nav:
   - Design:
       - Partitioned namespace: design/partitioned-namespace.md
       - Auto-dream: design/auto-dream.md
+      - Using the datagen store: design/using-datagen-store.md
 
 extra:
   social:

@@ -21,10 +21,11 @@ mod store;
 pub use api_impl::rollout_record_to_dto;
 pub use context::{Context, ContextEntry, Snapshot};
 pub use datagen::{
-    datagen_event_id, datagen_trajectory, fold_datagen_events, DatagenBlobValue, DatagenEvent,
-    DatagenEventType, DatagenFailure, DatagenFieldState, DatagenItemStatus, DatagenStepCursor,
-    DatagenTerminal, DatagenTrajectoryPoint, DatagenValue, FoldedDatagenItem,
-    DATAGEN_SCHEMA_VERSION,
+    datagen_event_id, datagen_failures, datagen_trajectory, fold_datagen_events, DatagenBlobValue,
+    DatagenErrorInfo, DatagenEvent, DatagenEventType, DatagenFailure, DatagenFieldState,
+    DatagenItemId, DatagenItemLookup, DatagenItemStatus, DatagenRootItemStatuses,
+    DatagenStepCursor, DatagenStepId, DatagenStepKind, DatagenStreamPosition, DatagenTerminal,
+    DatagenTrajectory, DatagenValue, FoldedDatagenItem, DATAGEN_SCHEMA_VERSION,
 };
 pub use datagen_store::{datagen_log_schema, DatagenStore, DatagenStoreOptions};
 pub use eval::{

@@ -35,8 +35,9 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::datagen::{
-    datagen_trajectory, fold_datagen_events, DatagenBlobValue, DatagenEvent, DatagenEventType,
-    DatagenTrajectoryPoint, DatagenValue, FoldedDatagenItem,
+    datagen_failures, datagen_trajectory, fold_datagen_events, DatagenBlobValue, DatagenEvent,
+    DatagenEventType, DatagenFailure, DatagenItemLookup, DatagenItemStatus,
+    DatagenRootItemStatuses, DatagenStepCursor, DatagenStepKind, DatagenValue,
 };
 use crate::rollout_store::{align_batch_to_schema, derive_shard_id, is_not_found_error};
 use crate::store::{column_as, column_as_optional, timestamp_from_micros};
@@ -224,23 +225,45 @@ impl DatagenStore {
         self.filtered_events(&filter).await
     }
 
-    /// Reconstruct one item's latest state exclusively from its event log.
-    pub async fn fold_item(&self, item_id: &str) -> LanceResult<Option<FoldedDatagenItem>> {
+    /// Reconstruct one item's latest state exclusively from its event log. Returns
+    /// [`DatagenItemLookup::NeverStarted`] when the item has no ITEM_CREATED (the fresh-vs-resume fork).
+    pub async fn fold_item(&self, item_id: &str) -> LanceResult<DatagenItemLookup> {
         let events = self.events_for_item(item_id).await?;
-        if events.is_empty() {
-            return Ok(None);
+        match fold_datagen_events(&events).map_err(invalid_input)? {
+            Some(item) => Ok(DatagenItemLookup::Found(item)),
+            None => Ok(DatagenItemLookup::NeverStarted),
         }
-        fold_datagen_events(&events)
-            .map(Some)
-            .map_err(invalid_input)
     }
 
-    /// Reconstruct state after every completed step without loading blob bytes.
-    pub async fn trajectory(&self, item_id: &str) -> LanceResult<Vec<DatagenTrajectoryPoint>> {
-        let events = self.events_for_item(item_id).await?;
-        if events.is_empty() {
-            return Ok(Vec::new());
+    /// Classify every root item that shares `root_item_id` with the given roots by folded lifecycle
+    /// status. A root not present in the log is simply absent from the result (never started).
+    pub async fn root_item_statuses(
+        &self,
+        root_item_ids: &[&str],
+    ) -> LanceResult<DatagenRootItemStatuses> {
+        let mut statuses = HashMap::new();
+        for root_item_id in root_item_ids {
+            let events = self.events_for_root(root_item_id).await?;
+            let root_events: Vec<DatagenEvent> = events
+                .into_iter()
+                .filter(|event| &event.item_id == root_item_id)
+                .collect();
+            if let Some(item) = fold_datagen_events(&root_events).map_err(invalid_input)? {
+                statuses.insert(root_item_id.to_string(), item.status);
+            }
         }
+        Ok(DatagenRootItemStatuses::from_map(statuses))
+    }
+
+    /// Read all failure records for an item directly from the failure lens.
+    pub async fn item_failures(&self, item_id: &str) -> LanceResult<Vec<DatagenFailure>> {
+        let events = self.events_for_item(item_id).await?;
+        datagen_failures(&events).map_err(invalid_input)
+    }
+
+    /// Reconstruct the ordered step cursors an item passed through, without loading blob bytes.
+    pub async fn trajectory(&self, item_id: &str) -> LanceResult<Vec<DatagenStepCursor>> {
+        let events = self.events_for_item(item_id).await?;
         datagen_trajectory(&events).map_err(invalid_input)
     }
 
@@ -704,9 +727,10 @@ pub fn datagen_log_schema() -> Schema {
         Field::new("checkpoint_id", DataType::Utf8, false),
         Field::new("event_type", DataType::Utf8, false),
         Field::new("step_name", DataType::Utf8, true),
+        Field::new("step_kind", DataType::Utf8, true),
         Field::new("step_index", DataType::Int64, true),
-        Field::new("step_instance_id", DataType::Utf8, true),
-        Field::new("iteration", DataType::Int64, true),
+        Field::new("enclosing_step", DataType::Utf8, true),
+        Field::new("selector_step", DataType::Utf8, true),
         Field::new("attempt", DataType::Int32, false),
         Field::new("run_id", DataType::Utf8, false),
         Field::new("writer_epoch", DataType::Utf8, false),
@@ -725,7 +749,7 @@ pub fn datagen_log_schema() -> Schema {
         Field::new("payload_size", DataType::Int64, true),
         Field::new("payload_checksum", DataType::Utf8, true),
         Field::new("query_tags_json", DataType::LargeUtf8, true),
-        Field::new("terminal", DataType::Utf8, true),
+        Field::new("status", DataType::Utf8, true),
         Field::new("error_type", DataType::Utf8, true),
         Field::new("error_dump", DataType::LargeUtf8, true),
         Field::new("traceback", DataType::LargeUtf8, true),
@@ -824,8 +848,9 @@ fn validate_checkpoint_batch(events: &[DatagenEvent]) -> LanceResult<()> {
     }) {
         if event.step_name != completion.step_name
             || event.step_index != completion.step_index
-            || event.step_instance_id != completion.step_instance_id
-            || event.iteration != completion.iteration
+            || event.step_kind != completion.step_kind
+            || event.enclosing_step != completion.enclosing_step
+            || event.selector_step != completion.selector_step
         {
             return Err(invalid_input(
                 "all field events must share the STEP_COMPLETED step identity",
@@ -844,9 +869,10 @@ fn events_to_batch(events: &[DatagenEvent]) -> LanceResult<RecordBatch> {
     let mut checkpoint_id = StringBuilder::new();
     let mut event_type = StringBuilder::new();
     let mut step_name = StringBuilder::new();
+    let mut step_kind = StringBuilder::new();
     let mut step_index = Int64Builder::new();
-    let mut step_instance_id = StringBuilder::new();
-    let mut iteration = Int64Builder::new();
+    let mut enclosing_step = StringBuilder::new();
+    let mut selector_step = StringBuilder::new();
     let mut attempt = Int32Builder::new();
     let mut run_id = StringBuilder::new();
     let mut writer_epoch = StringBuilder::new();
@@ -863,7 +889,7 @@ fn events_to_batch(events: &[DatagenEvent]) -> LanceResult<RecordBatch> {
     let mut payload_size = Int64Builder::new();
     let mut payload_checksum = StringBuilder::new();
     let mut query_tags_json = LargeStringBuilder::new();
-    let mut terminal = StringBuilder::new();
+    let mut status = StringBuilder::new();
     let mut error_type = StringBuilder::new();
     let mut error_dump = LargeStringBuilder::new();
     let mut traceback = LargeStringBuilder::new();
@@ -880,9 +906,10 @@ fn events_to_batch(events: &[DatagenEvent]) -> LanceResult<RecordBatch> {
         checkpoint_id.append_value(&event.checkpoint_id);
         event_type.append_value(event.event_type.as_str());
         step_name.append_option(event.step_name.as_deref());
+        step_kind.append_option(event.step_kind.map(DatagenStepKind::as_str));
         step_index.append_option(event.step_index);
-        step_instance_id.append_option(event.step_instance_id.as_deref());
-        iteration.append_option(event.iteration);
+        enclosing_step.append_option(event.enclosing_step.as_deref());
+        selector_step.append_option(event.selector_step.as_deref());
         attempt.append_value(event.attempt);
         run_id.append_value(&event.run_id);
         writer_epoch.append_value(&event.writer_epoch);
@@ -904,7 +931,7 @@ fn events_to_batch(events: &[DatagenEvent]) -> LanceResult<RecordBatch> {
             _ => None,
         });
         value_str.append_option(match &event.value {
-            Some(DatagenValue::String(value)) => Some(value.as_str()),
+            Some(DatagenValue::Str(value)) => Some(value.as_str()),
             _ => None,
         });
         match &event.value {
@@ -927,7 +954,7 @@ fn events_to_batch(events: &[DatagenEvent]) -> LanceResult<RecordBatch> {
             Some(tags) => query_tags_json.append_value(tags.to_string()),
             None => query_tags_json.append_null(),
         }
-        terminal.append_option(event.terminal.map(|value| value.as_str()));
+        status.append_option(event.status.map(DatagenItemStatus::as_str));
         error_type.append_option(event.error_type.as_deref());
         error_dump.append_option(event.error_dump.as_deref());
         traceback.append_option(event.traceback.as_deref());
@@ -945,9 +972,10 @@ fn events_to_batch(events: &[DatagenEvent]) -> LanceResult<RecordBatch> {
         Arc::new(checkpoint_id.finish()),
         Arc::new(event_type.finish()),
         Arc::new(step_name.finish()),
+        Arc::new(step_kind.finish()),
         Arc::new(step_index.finish()),
-        Arc::new(step_instance_id.finish()),
-        Arc::new(iteration.finish()),
+        Arc::new(enclosing_step.finish()),
+        Arc::new(selector_step.finish()),
         Arc::new(attempt.finish()),
         Arc::new(run_id.finish()),
         Arc::new(writer_epoch.finish()),
@@ -964,7 +992,7 @@ fn events_to_batch(events: &[DatagenEvent]) -> LanceResult<RecordBatch> {
         Arc::new(payload_size.finish()),
         Arc::new(payload_checksum.finish()),
         Arc::new(query_tags_json.finish()),
-        Arc::new(terminal.finish()),
+        Arc::new(status.finish()),
         Arc::new(error_type.finish()),
         Arc::new(error_dump.finish()),
         Arc::new(traceback.finish()),
@@ -983,9 +1011,10 @@ fn batch_to_events(batch: &RecordBatch) -> LanceResult<Vec<DatagenEvent>> {
     let checkpoint_id = column_as::<StringArray>(batch, "checkpoint_id")?;
     let event_type = column_as::<StringArray>(batch, "event_type")?;
     let step_name = column_as_optional::<StringArray>(batch, "step_name");
+    let step_kind = column_as_optional::<StringArray>(batch, "step_kind");
     let step_index = column_as_optional::<Int64Array>(batch, "step_index");
-    let step_instance_id = column_as_optional::<StringArray>(batch, "step_instance_id");
-    let iteration = column_as_optional::<Int64Array>(batch, "iteration");
+    let enclosing_step = column_as_optional::<StringArray>(batch, "enclosing_step");
+    let selector_step = column_as_optional::<StringArray>(batch, "selector_step");
     let attempt = column_as::<Int32Array>(batch, "attempt")?;
     let run_id = column_as::<StringArray>(batch, "run_id")?;
     let writer_epoch = column_as::<StringArray>(batch, "writer_epoch")?;
@@ -1002,7 +1031,7 @@ fn batch_to_events(batch: &RecordBatch) -> LanceResult<Vec<DatagenEvent>> {
     let payload_size = column_as_optional::<Int64Array>(batch, "payload_size");
     let payload_checksum = column_as_optional::<StringArray>(batch, "payload_checksum");
     let query_tags_json = column_as_optional::<LargeStringArray>(batch, "query_tags_json");
-    let terminal = column_as_optional::<StringArray>(batch, "terminal");
+    let status = column_as_optional::<StringArray>(batch, "status");
     let error_type = column_as_optional::<StringArray>(batch, "error_type");
     let error_dump = column_as_optional::<LargeStringArray>(batch, "error_dump");
     let traceback = column_as_optional::<LargeStringArray>(batch, "traceback");
@@ -1029,7 +1058,7 @@ fn batch_to_events(batch: &RecordBatch) -> LanceResult<Vec<DatagenEvent>> {
                 row,
                 "value_bool",
             )?)),
-            Some("str") => Some(DatagenValue::String(
+            Some("str") => Some(DatagenValue::Str(
                 optional_large_string(value_str, row)
                     .ok_or_else(|| invalid_input("value_kind=str requires value_str"))?,
             )),
@@ -1076,9 +1105,13 @@ fn batch_to_events(batch: &RecordBatch) -> LanceResult<Vec<DatagenEvent>> {
             checkpoint_id: checkpoint_id.value(row).to_string(),
             event_type: DatagenEventType::parse(event_type.value(row)).map_err(invalid_input)?,
             step_name: optional_string(step_name, row),
+            step_kind: match optional_string(step_kind, row) {
+                Some(value) => Some(DatagenStepKind::parse(&value).map_err(invalid_input)?),
+                None => None,
+            },
             step_index: optional_i64(step_index, row),
-            step_instance_id: optional_string(step_instance_id, row),
-            iteration: optional_i64(iteration, row),
+            enclosing_step: optional_string(enclosing_step, row),
+            selector_step: optional_string(selector_step, row),
             attempt: attempt.value(row),
             run_id: run_id.value(row).to_string(),
             writer_epoch: writer_epoch.value(row).to_string(),
@@ -1087,10 +1120,8 @@ fn batch_to_events(batch: &RecordBatch) -> LanceResult<Vec<DatagenEvent>> {
             codec_version: optional_i32(codec_version, row),
             value,
             query_tags,
-            terminal: match optional_string(terminal, row) {
-                Some(value) => {
-                    Some(crate::datagen::DatagenTerminal::parse(&value).map_err(invalid_input)?)
-                }
+            status: match optional_string(status, row) {
+                Some(value) => Some(DatagenItemStatus::parse(&value).map_err(invalid_input)?),
                 None => None,
             },
             error_type: optional_string(error_type, row),
@@ -1203,8 +1234,8 @@ fn is_fenced_error(error: &LanceError) -> bool {
 mod tests {
     use super::*;
     use crate::datagen::{
-        datagen_event_id, DatagenFieldState, DatagenItemStatus, DatagenTerminal,
-        DATAGEN_SCHEMA_VERSION,
+        datagen_event_id, DatagenFieldState, DatagenItemId, DatagenItemLookup, DatagenItemStatus,
+        DatagenStepKind, DATAGEN_SCHEMA_VERSION,
     };
     use chrono::{TimeZone, Utc};
     use serde_json::json;
@@ -1226,9 +1257,10 @@ mod tests {
             checkpoint_id: checkpoint_id.to_string(),
             event_type,
             step_name: None,
+            step_kind: None,
             step_index: None,
-            step_instance_id: None,
-            iteration: None,
+            enclosing_step: None,
+            selector_step: None,
             attempt: 0,
             run_id: "run-1".to_string(),
             writer_epoch: "writer-1".to_string(),
@@ -1237,7 +1269,7 @@ mod tests {
             codec_version: None,
             value: None,
             query_tags: None,
-            terminal: None,
+            status: None,
             error_type: None,
             error_dump: None,
             traceback: None,
@@ -1256,8 +1288,8 @@ mod tests {
     ) -> DatagenEvent {
         let mut event = event("item-1", seq, "grade-0", ordinal, event_type);
         event.step_name = Some("grade".to_string());
+        event.step_kind = Some(DatagenStepKind::Leaf);
         event.step_index = Some(2);
-        event.step_instance_id = Some("root/grade/0".to_string());
         event.field_name = Some(field_name.to_string());
         event.field_type = Some(field_type.to_string());
         event.codec_version = Some(1);
@@ -1274,8 +1306,8 @@ mod tests {
             DatagenEventType::StepCompleted,
         );
         event.step_name = Some("grade".to_string());
+        event.step_kind = Some(DatagenStepKind::Leaf);
         event.step_index = Some(2);
-        event.step_instance_id = Some("root/grade/0".to_string());
         event
     }
 
@@ -1328,7 +1360,7 @@ mod tests {
             store.append_checkpoint(&checkpoint).await.unwrap();
 
             let mut terminal = event("item-1", 5, "terminal", 0, DatagenEventType::Terminal);
-            terminal.terminal = Some(DatagenTerminal::Completed);
+            terminal.status = Some(DatagenItemStatus::Completed);
             store.append(&[terminal]).await.unwrap();
 
             let events = store.events_for_item("item-1").await.unwrap();
@@ -1347,18 +1379,19 @@ mod tests {
                 Some(blob_bytes)
             );
 
-            let folded = store.fold_item("item-1").await.unwrap().unwrap();
+            let folded = store.fold_item("item-1").await.unwrap();
+            let folded = folded.folded().expect("item-1 was created");
             assert_eq!(folded.status, DatagenItemStatus::Completed);
             assert_eq!(
                 folded.fields.get("score"),
                 Some(&DatagenFieldState::Set(DatagenValue::Int(i64::MAX)))
             );
-            assert_eq!(folded.completed_steps.len(), 1);
+            assert_eq!(folded.trajectory.ordered.len(), 1);
             assert_eq!(folded.query_tags, Some(json!({"domain": "math"})));
 
             let trajectory = store.trajectory("item-1").await.unwrap();
             assert_eq!(trajectory.len(), 1);
-            assert_eq!(trajectory[0].cursor.step_name, "grade");
+            assert_eq!(trajectory[0].position.step.name, "grade");
         });
     }
 
@@ -1369,13 +1402,16 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let mut store = DatagenStore::open(&uri).await.unwrap();
-            let no_op = completed_step(0, 0);
+            let created = event("item-1", 0, "created", 0, DatagenEventType::ItemCreated);
+            store.append(&[created]).await.unwrap();
+            let no_op = completed_step(1, 0);
             store.append_checkpoint(&[no_op]).await.unwrap();
-            let folded = store.fold_item("item-1").await.unwrap().unwrap();
-            assert_eq!(folded.completed_steps.len(), 1);
+            let folded = store.fold_item("item-1").await.unwrap();
+            let folded = folded.folded().expect("item-1 was created");
+            assert_eq!(folded.trajectory.ordered.len(), 1);
 
             let field_only = field_event(
-                1,
+                2,
                 0,
                 DatagenEventType::FieldSet,
                 "score",
@@ -1432,6 +1468,9 @@ mod tests {
             let mut failed = event("root-b", 0, "failed-b", 0, DatagenEventType::Failed);
             failed.run_id = "run-failed".to_string();
             failed.writer_epoch = "writer-b".to_string();
+            failed.step_name = Some("expand".to_string());
+            failed.step_kind = Some(DatagenStepKind::Leaf);
+            failed.step_index = Some(0);
             failed.error_type = Some("ValueError".to_string());
             failed.error_dump = Some("bad source item".to_string());
             writer_b.append(&[failed]).await.unwrap();
@@ -1485,6 +1524,58 @@ mod tests {
             assert_eq!(
                 store.get_blob(&blob.event_id).await.unwrap(),
                 Some(b"payload".to_vec())
+            );
+        });
+    }
+
+    #[test]
+    fn fan_out_tree_reads_by_root_and_classifies_status() {
+        let directory = TempDir::new().unwrap();
+        let uri = directory.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = DatagenStore::open(&uri).await.unwrap();
+
+            // Root item "7" fans out into one sub-item "7/solve_twice:0".
+            let mut root_created = event("7", 0, "created-root", 0, DatagenEventType::ItemCreated);
+            root_created.status = Some(DatagenItemStatus::Running);
+            store.append(&[root_created]).await.unwrap();
+
+            let mut child_created = event(
+                "7/solve_twice:0",
+                0,
+                "created-child",
+                0,
+                DatagenEventType::ItemCreated,
+            );
+            child_created.parent_item_id = Some("7".to_string());
+            child_created.status = Some(DatagenItemStatus::Running);
+            store.append(&[child_created]).await.unwrap();
+
+            let mut root_terminal = event("7", 1, "terminal", 0, DatagenEventType::Terminal);
+            root_terminal.status = Some(DatagenItemStatus::Completed);
+            store.append(&[root_terminal]).await.unwrap();
+
+            // The whole tree is one root filter, no join.
+            let tree = store.events_for_root("7").await.unwrap();
+            assert_eq!(tree.len(), 3);
+
+            // Bulk classification sees the root as terminated; the child is still running.
+            let statuses = store.root_item_statuses(&["7"]).await.unwrap();
+            let root_id = DatagenItemId::from_source_key("7");
+            assert!(statuses.is_terminated(&root_id));
+
+            let child = store.fold_item("7/solve_twice:0").await.unwrap();
+            assert_eq!(child.folded().unwrap().status, DatagenItemStatus::Running);
+            assert_eq!(
+                child.folded().unwrap().parent_item_id,
+                Some(DatagenItemId::from_source_key("7"))
+            );
+
+            // A never-started sibling folds to NeverStarted.
+            assert_eq!(
+                store.fold_item("7/solve_twice:1").await.unwrap(),
+                DatagenItemLookup::NeverStarted
             );
         });
     }
