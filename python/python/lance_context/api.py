@@ -16,16 +16,16 @@ from ._internal import (  # pyright: ignore[reportMissingImports]
     ContextNamespace as _ContextNamespace,
 )
 from ._internal import (  # pyright: ignore[reportMissingImports]
+    DatagenStore as _DatagenStore,
+)
+from ._internal import (  # pyright: ignore[reportMissingImports]
     RemoteContext as _RemoteContext,
 )
 from ._internal import (  # pyright: ignore[reportMissingImports]
     RolloutStore as _RolloutStore,
 )
 from ._internal import (  # pyright: ignore[reportMissingImports]
-    DatagenStore as _DatagenStore,
-)
-from ._internal import (  # pyright: ignore[reportMissingImports]
-    datagen_event_id as datagen_event_id,
+    datagen_event_id as _datagen_event_id,
 )
 from ._internal import (  # pyright: ignore[reportMissingImports]
     generate_id as _generate_id,
@@ -57,6 +57,15 @@ def generate_id() -> str:
     for append-heavy tables such as the rollout store.
     """
     return _generate_id()
+
+
+def datagen_event_id(item_id: str, checkpoint_id: str, ordinal: int) -> str:
+    """Compute the deterministic event id for a datagen checkpoint field write.
+
+    The id is a pure function of `item_id`, `checkpoint_id`, and `ordinal`, so a
+    retried append produces the same id and dedupes against the log.
+    """
+    return _datagen_event_id(item_id, checkpoint_id, ordinal)
 
 
 _ARROW_STREAM_MIME = "application/vnd.apache.arrow.stream"
