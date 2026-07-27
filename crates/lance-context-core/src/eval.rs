@@ -529,7 +529,7 @@ mod tests {
         let uri = dir.path().to_string_lossy().to_string();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let mut store = ContextStore::open(&uri).await.unwrap();
+            let store = ContextStore::open(&uri).await.unwrap();
             let a = embedding(&store, &[1.0]);
             let b = embedding(&store, &[0.5]);
             let c = embedding(&store, &[0.0, 1.0]);
@@ -579,7 +579,7 @@ mod tests {
         let uri = dir.path().to_string_lossy().to_string();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let mut store = ContextStore::open(&uri).await.unwrap();
+            let store = ContextStore::open(&uri).await.unwrap();
             let q = embedding(&store, &[1.0]);
             // the only relevant doc is retired -> hidden by default.
             let mut retired = record("doc-a", "alpha", q.clone());
@@ -624,7 +624,7 @@ mod tests {
         let uri = dir.path().to_string_lossy().to_string();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let mut store = ContextStore::open(&uri).await.unwrap();
+            let store = ContextStore::open(&uri).await.unwrap();
             let shared = embedding(&store, &[1.0]);
             let mut a = record("doc-a", "alpha", shared.clone());
             a.tenant = Some("x".to_string());
@@ -662,7 +662,7 @@ mod tests {
         let uri = dir.path().to_string_lossy().to_string();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let mut store = ContextStore::open(&uri).await.unwrap();
+            let store = ContextStore::open(&uri).await.unwrap();
             let a = embedding(&store, &[1.0]);
             let b = embedding(&store, &[0.0, 1.0]);
             store
@@ -701,7 +701,7 @@ mod tests {
         let uri = dir.path().to_string_lossy().to_string();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let mut store = ContextStore::open(&uri).await.unwrap();
+            let store = ContextStore::open(&uri).await.unwrap();
             let a = embedding(&store, &[1.0]);
             let b = embedding(&store, &[0.5]);
             store

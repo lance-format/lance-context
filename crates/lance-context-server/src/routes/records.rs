@@ -45,7 +45,10 @@ pub async fn add_records(
     }
 
     let count = core_records.len();
-    let mut store = store_lock.write().await;
+    // Read lock: `add` is `&self` now that the resident writer lives behind the
+    // storage layer's own mutex, so concurrent appends no longer serialize on
+    // this store's RwLock.
+    let store = store_lock.read().await;
     let version = store
         .add(&core_records)
         .await

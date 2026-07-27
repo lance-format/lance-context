@@ -1,5 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,22 +13,19 @@ use arrow_array::builder::{
 use arrow_array::types::Int8Type;
 use arrow_array::{
     Array, ArrayRef, DictionaryArray, FixedSizeListArray, Float32Array, Int32Array, Int64Array,
-    LargeBinaryArray, LargeStringArray, ListArray, RecordBatch, RecordBatchIterator, StringArray,
-    StructArray, TimestampMicrosecondArray,
+    LargeBinaryArray, LargeStringArray, ListArray, RecordBatch, StringArray, StructArray,
+    TimestampMicrosecondArray,
 };
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Schema, TimeUnit};
 use chrono::{DateTime, Timelike, Utc};
 use futures::TryStreamExt;
-use lance::dataset::mem_wal::{
-    DatasetMemWalExt, LsmScanner, ShardManifestStore, ShardSnapshot, ShardWriterConfig,
-};
-use lance::dataset::optimize::{compact_files, CompactionMetrics, CompactionOptions};
+use lance::dataset::mem_wal::LsmScanner;
+use lance::dataset::optimize::CompactionMetrics;
+use lance::dataset::Dataset;
 use lance::dataset::NewColumnTransform;
-use lance::dataset::{builder::DatasetBuilder, Dataset, WriteMode, WriteParams};
 use lance::index::DatasetIndexExt;
 use lance::io::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry, StorageOptionsAccessor};
 use lance::{Error as LanceError, Result as LanceResult};
-use lance_index::mem_wal::MEM_WAL_INDEX_NAME;
 use lance_index::scalar::ScalarIndexParams;
 use lance_index::IndexType;
 use tokio::sync::Mutex;
@@ -39,11 +38,11 @@ use crate::record::{
     SearchResult, StateMetadata, UpdateResult, UpsertResult, LIFECYCLE_ACTIVE,
 };
 use crate::serde::CONTENT_TYPE_TOMBSTONE;
+use crate::store_base::{StorageBase, StorageBaseOptions};
 
 /// Embedding length used for the semantic index column.
 const DEFAULT_EMBEDDING_DIM: i32 = 1536;
 const DEFAULT_SEARCH_LIMIT: usize = 10;
-const DEFAULT_MANIFEST_SCAN_BATCH_SIZE: usize = 16;
 const RRF_K: f32 = 60.0;
 const ID_INDEX_NAME: &str = "id_idx";
 pub(crate) const RELATIONSHIPS_COLUMN: &str = "relationships";
@@ -186,24 +185,49 @@ struct CompactionState {
 /// Valid column names that may use blob encoding.
 const VALID_BLOB_COLUMNS: &[&str] = &["text_payload", "binary_payload"];
 
+/// Open a store handle for the background compactor, with the recursion broken.
+///
+/// `ContextStore::open_inner` may spawn the background compaction task, and that
+/// task needs to reopen the store — a mutual recursion between two `async fn`s.
+/// Rust cannot infer `Send` for either of the resulting opaque future types, so
+/// the task fails to compile even though the recursion is unreachable at runtime
+/// (the reopen passes `spawn_background_compaction: false`).
+///
+/// Boxing to `dyn Future` here erases the type and cuts the cycle. It lives
+/// outside the `impl` so the erasure is what the spawned task names, rather than
+/// the opaque type it is trying to break out of.
+fn open_for_compaction(
+    uri: &str,
+    options: ContextStoreOptions,
+) -> Pin<Box<dyn Future<Output = LanceResult<ContextStore>> + Send + '_>> {
+    Box::pin(ContextStore::open_inner(uri, options, false, false))
+}
+
 /// Persistent Lance-backed context store.
-#[derive(Clone)]
 pub struct ContextStore {
-    dataset: Dataset,
+    /// Shared storage layer: dataset handle, resident MemWAL writer, durable
+    /// append, flush, WAL merge, compaction, indexing and the LSM scanner.
+    ///
+    /// Behind an `Arc` because `ContextStore` is `Clone` (the background
+    /// compactor and the Python `fork` both rely on it) while `StorageBase`
+    /// owns a resident `ShardWriter` and a `Drop` impl, so it must have exactly
+    /// one owner. Sharing the base is also what makes clones agree about the
+    /// resident writer instead of each opening their own.
+    base: StorageBase,
     compaction_state: Arc<Mutex<CompactionState>>,
     pub compaction_config: CompactionConfig,
     blob_columns: HashSet<String>,
     id_index_type: IdIndexType,
     embedding_dim: i32,
     distance_metric: DistanceMetric,
-    /// Object-store configuration used to resolve external payload references
-    /// (see [`ContextStore::fetch_payload`]). Reuses the same options the
-    /// dataset was opened with so referenced media can live in the same bucket.
-    storage_options: Option<HashMap<String, String>>,
 }
 
 /// Additional configuration when opening a [`ContextStore`].
-#[derive(Debug, Clone, Default)]
+///
+/// [`Default`] is hand-written rather than derived because `seal_on_add`
+/// must default to `true` (preserving read-your-write), which `derive(Default)`
+/// would silently turn into `false`.
+#[derive(Debug, Clone)]
 pub struct ContextStoreOptions {
     pub storage_options: Option<HashMap<String, String>>,
     pub compaction: CompactionConfig,
@@ -222,6 +246,53 @@ pub struct ContextStoreOptions {
     /// is used; passing a different metric here is an error. `None` defaults to
     /// the persisted metric (or `L2` for datasets created before persistence).
     pub distance_metric: Option<DistanceMetric>,
+    /// Stable identity of this writer instance, mapped to a MemWAL shard.
+    ///
+    /// Each instance owns exactly one shard, so no two instances ever contend
+    /// and the epoch-fencing invariant holds by construction. `None` falls back
+    /// to a single `"default"` shard, which is correct for single-instance use
+    /// but must be set per-instance when running multiple writers.
+    pub shard_id: Option<String>,
+    /// Fold this instance's flushed MemWAL generations into the base table once
+    /// it has accumulated this many. `None`/`0` disables the count trigger.
+    ///
+    /// Without a merge trigger, generations accumulate under `_mem_wal/` forever
+    /// and every read unions all of them — the read amplification that
+    /// previously had no bound at all on this store.
+    pub merge_after_generations: Option<usize>,
+    /// Whether [`ContextStore::add`] seals the memtable before returning, so the
+    /// rows it wrote are immediately readable.
+    ///
+    /// Defaults to `true`, which is this store's historical behavior and is
+    /// **required for correctness on the paths that read the table back**:
+    /// id/external-id uniqueness validation, `upsert_by_external_id`, and
+    /// tombstone-based deletes.
+    ///
+    /// Set `false` to get [`crate::RolloutStore`]'s throughput profile: `add`
+    /// becomes a durable WAL append only, concurrent appends stop serializing
+    /// behind a per-append seal, and one flushed generation per call is no
+    /// longer emitted. In exchange there is **no read-your-write guarantee** —
+    /// visibility then depends on [`ContextStore::flush`] being driven
+    /// periodically. Only appropriate for trusted bulk appends that do not rely
+    /// on the read-back paths above.
+    pub seal_on_add: bool,
+}
+
+impl Default for ContextStoreOptions {
+    fn default() -> Self {
+        Self {
+            storage_options: None,
+            compaction: CompactionConfig::default(),
+            embedding_dim: None,
+            blob_columns: HashSet::new(),
+            id_index_type: IdIndexType::default(),
+            distance_metric: None,
+            shard_id: None,
+            merge_after_generations: None,
+            // Read-your-write by default; see the field docs.
+            seal_on_add: true,
+        }
+    }
 }
 
 impl ContextStoreOptions {
@@ -339,7 +410,7 @@ impl ContextStore {
     /// Open a dataset with explicit object store configuration (e.g. S3 credentials).
     /// Creates the dataset if it does not exist.
     pub async fn open_with_options(uri: &str, options: ContextStoreOptions) -> LanceResult<Self> {
-        Self::open_inner(uri, options, true).await
+        Self::open_inner(uri, options, true, true).await
     }
 
     /// Open an **existing** context dataset. Unlike [`Self::open_with_options`],
@@ -354,13 +425,14 @@ impl ContextStore {
         uri: &str,
         options: ContextStoreOptions,
     ) -> LanceResult<Self> {
-        Self::open_inner(uri, options, false).await
+        Self::open_inner(uri, options, false, true).await
     }
 
     async fn open_inner(
         uri: &str,
         options: ContextStoreOptions,
         create_if_missing: bool,
+        spawn_background_compaction: bool,
     ) -> LanceResult<Self> {
         // Validate blob_columns
         for col in &options.blob_columns {
@@ -417,8 +489,31 @@ impl ContextStore {
             }
         }
 
-        let mut store = Self {
+        let base = StorageBase::from_dataset(
             dataset,
+            StorageBaseOptions {
+                storage_options,
+                shard_id: options.shard_id.clone(),
+                merge_after_generations: options.merge_after_generations,
+                session: None,
+                schema: Arc::new(arrow_schema.clone()),
+                key_column: "id".to_string(),
+                // The context schema is parameterized per dataset (blob columns,
+                // embedding width, optional feature columns), so there is no
+                // single "latest" schema to evolve an older table to. Schema
+                // migration stays explicit, via `migrate_relationships_column`.
+                latest_schema: None,
+                // Context writes read the table back — id/external-id uniqueness
+                // validation, upsert, and tombstones all need read-your-write —
+                // so seal by default. Callers appending trusted batches can opt
+                // into rollout's deferred-seal throughput instead.
+                seal_on_put: options.seal_on_add,
+            },
+        )
+        .await?;
+
+        let mut store = Self {
+            base,
             compaction_state: Arc::new(Mutex::new(CompactionState {
                 background_task: None,
                 is_compacting: false,
@@ -431,14 +526,20 @@ impl ContextStore {
             id_index_type: options.id_index_type,
             embedding_dim,
             distance_metric,
-            storage_options,
         };
 
         // Ensure id index if configured
         store.ensure_id_index().await?;
 
-        // Start background compaction if enabled
-        store.start_background_compaction().await?;
+        // Start background compaction if enabled.
+        //
+        // Skipped when this open *is* the background compactor reopening the
+        // store: that path would otherwise re-enter here and spawn another
+        // compactor, making the recursion type-level (the future can never be
+        // proven `Send`) rather than merely infinite.
+        if spawn_background_compaction {
+            store.start_background_compaction().await?;
+        }
 
         Ok(store)
     }
@@ -452,7 +553,7 @@ impl ContextStore {
     /// URI of the underlying Lance dataset.
     #[must_use]
     pub fn uri(&self) -> &str {
-        self.dataset.uri()
+        self.base.dataset.uri()
     }
 
     /// Distance metric this context ranks vector-search results with.
@@ -462,65 +563,28 @@ impl ContextStore {
     }
 
     /// Append context records to the store and return the new dataset version.
-    pub async fn add(&mut self, entries: &[ContextRecord]) -> LanceResult<u64> {
+    pub async fn add(&self, entries: &[ContextRecord]) -> LanceResult<u64> {
         if entries.is_empty() {
-            return Ok(self.dataset.manifest.version);
+            return Ok(self.base.version());
         }
 
         self.validate_unique_ids(entries).await?;
         self.write_entries(entries).await
     }
 
-    async fn write_entries(&mut self, entries: &[ContextRecord]) -> LanceResult<u64> {
+    /// Encode and append `entries` through the shared storage layer.
+    ///
+    /// Takes `&self`: the resident writer lives behind the base's mutex, so
+    /// appends no longer need exclusive access. Whether the rows are readable
+    /// when this returns is governed by
+    /// [`ContextStoreOptions::seal_on_add`] (default `true`).
+    async fn write_entries(&self, entries: &[ContextRecord]) -> LanceResult<u64> {
         if entries.is_empty() {
-            return Ok(self.dataset.manifest.version);
+            return Ok(self.base.version());
         }
-
-        // Group entries by (bot_id, session_id)
-        let mut groups: HashMap<(Option<String>, Option<String>), Vec<ContextRecord>> =
-            HashMap::new();
-        for entry in entries {
-            let key = (entry.bot_id.clone(), entry.session_id.clone());
-            groups.entry(key).or_default().push(entry.clone());
-        }
-
-        // Ensure MemWAL is initialized (once for the dataset)
-        {
-            let indices = self.dataset.load_indices().await?;
-            let has_mem_wal = indices.iter().any(|i| i.name == MEM_WAL_INDEX_NAME);
-
-            if !has_mem_wal {
-                // ZoneMap indices are not supported by MemWAL; exclude them
-                let maintained_indexes: Vec<String> = indices
-                    .iter()
-                    .filter(|i| {
-                        !(self.id_index_type == IdIndexType::ZoneMap && i.name == ID_INDEX_NAME)
-                    })
-                    .map(|i| i.name.clone())
-                    .collect();
-                self.dataset
-                    .initialize_mem_wal()
-                    .unsharded()
-                    .maintained_indexes(maintained_indexes)
-                    .execute()
-                    .await?;
-            }
-        }
-
-        for ((bot_id, session_id), group_entries) in groups {
-            let region_id = Self::derive_region_id(&bot_id, &session_id);
-            let batch = self.records_to_batch(&group_entries)?;
-            let config = ShardWriterConfig {
-                shard_id: region_id,
-                ..Default::default()
-            };
-
-            let writer = self.dataset.mem_wal_writer(region_id, config).await?;
-            writer.put(vec![batch]).await?;
-            writer.close().await?;
-        }
-
-        Ok(self.dataset.manifest.version)
+        let batch = self.records_to_batch(entries)?;
+        self.base.put(vec![batch]).await?;
+        Ok(self.base.version())
     }
 
     /// Resolve a record's external payload reference to its bytes on demand.
@@ -572,7 +636,7 @@ impl ContextStore {
     /// same credentials/endpoint apply when resolving external payload URIs.
     fn payload_store_params(&self) -> ObjectStoreParams {
         let mut params = ObjectStoreParams::default();
-        if let Some(options) = &self.storage_options {
+        if let Some(options) = &self.base.storage_options {
             params.storage_options_accessor = Some(Arc::new(
                 StorageOptionsAccessor::with_static_options(options.clone()),
             ));
@@ -1197,23 +1261,9 @@ impl ContextStore {
         Ok((existing_ids, existing_external_ids))
     }
 
-    fn derive_region_id(bot_id: &Option<String>, session_id: &Option<String>) -> Uuid {
-        let mut input = String::new();
-
-        if let Some(bid) = bot_id {
-            input.push_str(bid);
-        }
-        input.push('#');
-        if let Some(sid) = session_id {
-            input.push_str(sid);
-        }
-
-        // Use OID namespace as a base for our deterministic UUIDs
-        Uuid::new_v5(&Uuid::NAMESPACE_OID, input.as_bytes())
-    }
-
     fn has_relationships_column(&self) -> bool {
-        self.dataset
+        self.base
+            .dataset
             .schema()
             .field_paths()
             .iter()
@@ -1221,7 +1271,8 @@ impl ContextStore {
     }
 
     fn has_external_id_column(&self) -> bool {
-        self.dataset
+        self.base
+            .dataset
             .schema()
             .field_paths()
             .iter()
@@ -1230,7 +1281,7 @@ impl ContextStore {
 
     /// Current dataset version.
     pub fn version(&self) -> u64 {
-        self.dataset.manifest.version
+        self.base.version()
     }
 
     /// Add the relationships column to an older dataset if it is missing.
@@ -1243,7 +1294,8 @@ impl ContextStore {
         }
 
         let schema = Arc::new(Schema::new(vec![relationship_field()]));
-        self.dataset
+        self.base
+            .dataset
             .add_columns(NewColumnTransform::AllNulls(schema), None, None)
             .await?;
         Ok(true)
@@ -1251,15 +1303,15 @@ impl ContextStore {
 
     /// Checkout a specific dataset version.
     pub async fn checkout(&mut self, version_id: u64) -> LanceResult<()> {
-        let dataset = self.dataset.checkout_version(version_id).await?;
-        self.dataset = dataset;
+        let dataset = self.base.dataset.checkout_version(version_id).await?;
+        self.base.dataset = dataset;
         Ok(())
     }
 
     /// Retrieve a single record by its unique ID.
     pub async fn get(&self, id: &str) -> LanceResult<Option<ContextRecord>> {
         let escaped_id = id.replace('\'', "''");
-        let mut scanner = self.dataset.scan();
+        let mut scanner = self.base.dataset.scan();
         scanner.filter(&format!("id = '{}'", escaped_id))?;
         scanner.limit(Some(1), None)?;
 
@@ -1604,44 +1656,18 @@ impl ContextStore {
         Ok(results)
     }
 
+    /// LSM scanner over the base table unioned with every shard's flushed
+    /// MemWAL generations, deduplicating by `id`.
     async fn lsm_scanner(&self) -> LanceResult<LsmScanner> {
-        let object_store = self.dataset.object_store(None).await?;
-        let branch_location = self.dataset.branch_location();
-        let shard_ids = self.dataset.list_mem_wal_latest_shard_ids().await?;
-
-        let mut shard_snapshots = Vec::with_capacity(shard_ids.len());
-        for shard_id in shard_ids {
-            let manifest_store = ShardManifestStore::new(
-                object_store.clone(),
-                &branch_location.path,
-                shard_id,
-                DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
-            );
-            let Some(manifest) = manifest_store.read_latest().await? else {
-                continue;
-            };
-
-            let mut snapshot = ShardSnapshot::new(shard_id)
-                .with_spec_id(manifest.shard_spec_id)
-                .with_current_generation(manifest.current_generation);
-            for flushed in manifest.flushed_generations {
-                snapshot = snapshot.with_flushed_generation(flushed.generation, flushed.path);
-            }
-            shard_snapshots.push(snapshot);
-        }
-
-        Ok(LsmScanner::new(
-            Arc::new(self.dataset.clone()),
-            shard_snapshots,
-            vec!["id".to_string()],
-        ))
+        self.base.lsm_scanner().await
     }
 
     /// Top-level column names to read for a projection (drops the excluded
     /// payload columns; everything else is always loaded so lifecycle
     /// filtering and metadata stay correct).
     fn projected_columns(&self, projection: ReadProjection) -> Vec<String> {
-        self.dataset
+        self.base
+            .dataset
             .schema()
             .fields
             .iter()
@@ -1700,7 +1726,7 @@ impl ContextStore {
 
         info!(
             "Starting compaction: {} fragments",
-            self.dataset.count_fragments()
+            self.base.dataset.count_fragments()
         );
         let start = std::time::Instant::now();
 
@@ -1716,18 +1742,11 @@ impl ContextStore {
             state.is_compacting = true;
         }
 
-        // Build Lance CompactionOptions
-        let lance_options = CompactionOptions {
-            target_rows_per_fragment: config.target_rows_per_fragment,
-            max_rows_per_group: config.max_rows_per_group,
-            materialize_deletions: config.materialize_deletions,
-            materialize_deletions_threshold: config.materialize_deletions_threshold,
-            num_threads: config.num_threads,
-            ..Default::default()
-        };
-
-        // Run compaction
-        let result = compact_files(&mut self.dataset, lance_options, None).await;
+        // Run compaction through the shared layer, which sets
+        // `defer_index_remap` (the base table carries a fieldless MemWAL index
+        // that Lance's inline remap panics on) and reloads the handle with this
+        // store's storage options and session.
+        let result = self.base.compact(Some(config.clone())).await;
 
         // Update state
         let mut state = self.compaction_state.lock().await;
@@ -1749,8 +1768,10 @@ impl ContextStore {
                     metrics.files_added
                 );
 
-                // Reload dataset to see new version
-                self.dataset = Dataset::open(self.dataset.uri()).await?;
+                // `StorageBase::compact` already reloaded the handle, with the
+                // storage options and session attached -- the bare
+                // `Dataset::open` that used to run here dropped both, which
+                // broke reopening on any credentialed object store.
 
                 // Ensure id index exists after compaction
                 // (handles first-time creation on previously empty dataset)
@@ -1768,9 +1789,53 @@ impl ContextStore {
         }
     }
 
+    /// Seal the active memtable so previously added rows become readable on
+    /// every instance.
+    ///
+    /// A no-op when no writer is resident, and unnecessary under the default
+    /// [`ContextStoreOptions::seal_on_add`] (`true`), where `add` already seals.
+    /// Stores that opted into deferred sealing must drive this — periodically or
+    /// explicitly — or their writes stay durable but invisible.
+    pub async fn flush(&self) -> LanceResult<()> {
+        self.base.flush().await
+    }
+
+    /// Gracefully close the resident MemWAL writer, draining its background
+    /// tasks and sealing whatever it still buffers. Idempotent.
+    pub async fn close(&mut self) -> LanceResult<()> {
+        self.base.close().await
+    }
+
+    /// Fold this instance's flushed MemWAL generations into the base table when
+    /// it has accumulated [`ContextStoreOptions::merge_after_generations`] of
+    /// them. Returns the number reclaimed; a no-op when the trigger is unset.
+    ///
+    /// # This store previously never merged at all
+    ///
+    /// Flushed generations accumulated under `_mem_wal/` forever, and every read
+    /// unioned all of them, so read cost grew without bound in the number of
+    /// writes. Merging is what keeps that bounded — drive it from a sweeper, or
+    /// use [`Self::cleanup_wal`] for the time-based trigger.
+    pub async fn maybe_merge_wal(&mut self) -> LanceResult<usize> {
+        self.base.maybe_merge_own_shard().await
+    }
+
+    /// Seal, then fold **every** pending flushed generation into the base table.
+    /// The time half of the "time OR count" trigger, so deliberately not gated
+    /// by the count threshold. Returns the number of generations reclaimed.
+    pub async fn cleanup_wal(&mut self) -> LanceResult<usize> {
+        self.base.cleanup_own_shard().await
+    }
+
+    /// Number of flushed MemWAL generations pending merge into the base table,
+    /// across all shards. Read-only: never merges.
+    pub async fn pending_wal_generations(&self) -> LanceResult<usize> {
+        self.base.pending_wal_generations().await
+    }
+
     /// Check if compaction should run based on configuration thresholds.
     pub async fn should_compact(&self) -> LanceResult<bool> {
-        let fragment_count = self.dataset.count_fragments();
+        let fragment_count = self.base.dataset.count_fragments();
 
         if fragment_count < self.compaction_config.min_fragments {
             return Ok(false);
@@ -1797,7 +1862,7 @@ impl ContextStore {
         let state = self.compaction_state.lock().await;
 
         Ok(CompactionStats {
-            total_fragments: self.dataset.count_fragments(),
+            total_fragments: self.base.dataset.count_fragments(),
             is_compacting: state.is_compacting,
             last_compaction: state.last_compaction,
             last_error: state.last_error.clone(),
@@ -1811,7 +1876,7 @@ impl ContextStore {
             return Ok(());
         }
 
-        let indices = self.dataset.load_indices().await?;
+        let indices = self.base.dataset.load_indices().await?;
         if indices.iter().any(|i| i.name == ID_INDEX_NAME) {
             return Ok(());
         }
@@ -1831,16 +1896,17 @@ impl ContextStore {
 
         let params = ScalarIndexParams::default();
 
-        self.dataset
+        self.base
+            .dataset
             .create_index_builder(&["id"], index_type, &params)
             .name(ID_INDEX_NAME.to_string())
             .replace(true)
             .await?;
 
-        // Reload dataset to pick up new index
-        self.dataset = Dataset::open(self.dataset.uri()).await?;
-
-        Ok(())
+        // Reload through the base so the new index is visible to subsequent
+        // reads, keeping the storage options and session (a bare
+        // `Dataset::open` here silently dropped them).
+        self.base.reload().await
     }
 
     /// Start background compaction task if enabled.
@@ -1860,19 +1926,54 @@ impl ContextStore {
             self.compaction_config.check_interval_secs, self.compaction_config.min_fragments
         );
 
-        let mut store_clone = self.clone();
+        // The task opens its *own* store handle rather than cloning this one.
+        // `ContextStore` is no longer `Clone`: it owns a `StorageBase`, which
+        // owns the resident MemWAL writer and a `Drop` that seals it, so it must
+        // have exactly one owner. A second handle is the right model anyway --
+        // compaction only rewrites base-table fragments and takes `&mut`, so
+        // sharing a handle with the write path would mean contending for it.
+        let uri = self.uri().to_string();
         let interval_secs = self.compaction_config.check_interval_secs;
+        let options = ContextStoreOptions {
+            storage_options: self.base.storage_options.clone(),
+            // `enabled: false` is load-bearing, not tidiness: the reopened
+            // handle would otherwise spawn its own background compactor, which
+            // makes `start_background_compaction` infinitely recursive (and the
+            // resulting future un-`Send`, so it does not even compile).
+            compaction: CompactionConfig {
+                enabled: false,
+                ..self.compaction_config.clone()
+            },
+            embedding_dim: Some(self.embedding_dim),
+            blob_columns: self.blob_columns.clone(),
+            id_index_type: self.id_index_type,
+            distance_metric: Some(self.distance_metric),
+            shard_id: None,
+            merge_after_generations: None,
+            // A compactor never appends, so the seal mode is irrelevant to it;
+            // deferring keeps it from ever emitting a generation.
+            seal_on_add: false,
+        };
 
         let task = tokio::spawn(async move {
+            let compaction_options = options;
             let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
 
             loop {
                 interval.tick().await;
 
-                match store_clone.should_compact().await {
+                let mut store = match open_for_compaction(&uri, compaction_options.clone()).await {
+                    Ok(store) => store,
+                    Err(e) => {
+                        error!("Background compaction could not open store: {}", e);
+                        continue;
+                    }
+                };
+
+                match store.should_compact().await {
                     Ok(true) => {
                         info!("Background compaction triggered");
-                        if let Err(e) = store_clone.compact(None).await {
+                        if let Err(e) = store.compact(None).await {
                             error!("Background compaction failed: {}", e);
                         }
                     }
@@ -2050,14 +2151,7 @@ impl ContextStore {
         uri: &str,
         storage_options: Option<HashMap<String, String>>,
     ) -> LanceResult<Dataset> {
-        if let Some(options) = storage_options {
-            DatasetBuilder::from_uri(uri)
-                .with_storage_options(options)
-                .load()
-                .await
-        } else {
-            Dataset::open(uri).await
-        }
+        StorageBase::load_with_options(uri, storage_options, None).await
     }
 
     async fn create_with_options(
@@ -2077,62 +2171,47 @@ impl ContextStore {
             embedding_dim,
             distance_metric,
         ));
-        let empty_batch = RecordBatch::new_empty(schema.clone());
-        let batches = RecordBatchIterator::new(
-            vec![Ok::<RecordBatch, ArrowError>(empty_batch)].into_iter(),
-            schema.clone(),
-        );
-
-        let mut params = WriteParams {
-            mode: WriteMode::Create,
-            ..Default::default()
-        };
-
-        if let Some(options) = storage_options {
-            let store_params = ObjectStoreParams {
-                storage_options_accessor: Some(Arc::new(
-                    StorageOptionsAccessor::with_static_options(options),
-                )),
-                ..Default::default()
-            };
-            params.store_params = Some(store_params);
-        }
-
-        Dataset::write(batches, uri, Some(params)).await
+        StorageBase::create_with_options(uri, schema, storage_options, None).await
     }
 
     fn records_to_batch(&self, entries: &[ContextRecord]) -> LanceResult<RecordBatch> {
         let include_external_id = self
+            .base
             .dataset
             .schema()
             .field_paths()
             .iter()
             .any(|path| path == "external_id");
         let include_lifecycle = self
+            .base
             .dataset
             .schema()
             .field_paths()
             .iter()
             .any(|path| path == "expires_at");
         let include_metadata = self
+            .base
             .dataset
             .schema()
             .field_paths()
             .iter()
             .any(|path| path == "metadata");
         let include_tenant = self
+            .base
             .dataset
             .schema()
             .field_paths()
             .iter()
             .any(|path| path == "tenant");
         let include_source = self
+            .base
             .dataset
             .schema()
             .field_paths()
             .iter()
             .any(|path| path == "source");
         let include_external_reference = self
+            .base
             .dataset
             .schema()
             .field_paths()
@@ -2458,7 +2537,7 @@ impl ContextStore {
             ]);
         }
 
-        let schema: Arc<Schema> = Arc::new(self.dataset.schema().into());
+        let schema: Arc<Schema> = Arc::new(self.base.dataset.schema().into());
         let arrays = schema
             .fields()
             .iter()
@@ -3118,8 +3197,11 @@ fn sql_quoted_list(values: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::serde::CONTENT_TYPE_TEXT;
+    use arrow_array::RecordBatchIterator;
     use chrono::{Duration as ChronoDuration, Utc};
+    use lance::dataset::{WriteMode, WriteParams};
     use tempfile::TempDir;
 
     fn make_embedding_with_dim(dim: usize, pivot: f32) -> Vec<f32> {
@@ -3184,7 +3266,7 @@ mod tests {
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let mut store = ContextStore::open(&uri).await.unwrap();
+            let store = ContextStore::open(&uri).await.unwrap();
 
             // Offload bytes to the object store, then reference them by URI.
             let written = store.put_payload(&object_uri, &payload).await.unwrap();
@@ -3219,7 +3301,7 @@ mod tests {
         let uri = dir.path().to_string_lossy().to_string();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let mut store = ContextStore::open(&uri).await.unwrap();
+            let store = ContextStore::open(&uri).await.unwrap();
 
             // Unknown id resolves to None rather than erroring.
             assert_eq!(store.fetch_payload("does-not-exist").await.unwrap(), None);
@@ -3238,7 +3320,7 @@ mod tests {
         let uri = dir.path().to_string_lossy().to_string();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let mut store = ContextStore::open(&uri).await.unwrap();
+            let store = ContextStore::open(&uri).await.unwrap();
             let first = text_record("a", 0.0);
             let second = text_record("b", 1.0);
             store.add(&[first.clone(), second.clone()]).await.unwrap();
@@ -3324,7 +3406,7 @@ mod tests {
 
             // Default (L2): `near` should rank first.
             let l2_dir = TempDir::new().unwrap();
-            let mut l2_store = ContextStore::open(&l2_dir.path().to_string_lossy())
+            let l2_store = ContextStore::open(&l2_dir.path().to_string_lossy())
                 .await
                 .unwrap();
             l2_store
@@ -3343,7 +3425,7 @@ mod tests {
                 distance_metric: Some(DistanceMetric::Cosine),
                 ..Default::default()
             };
-            let mut cos_store =
+            let cos_store =
                 ContextStore::open_with_options(&cos_dir.path().to_string_lossy(), cos_opts)
                     .await
                     .unwrap();
@@ -3363,7 +3445,7 @@ mod tests {
                 distance_metric: Some(DistanceMetric::Dot),
                 ..Default::default()
             };
-            let mut dot_store =
+            let dot_store =
                 ContextStore::open_with_options(&dot_dir.path().to_string_lossy(), dot_opts)
                     .await
                     .unwrap();
@@ -3395,7 +3477,7 @@ mod tests {
                     distance_metric: Some(DistanceMetric::Cosine),
                     ..Default::default()
                 };
-                let mut store = ContextStore::open_with_options(&uri, opts).await.unwrap();
+                let store = ContextStore::open_with_options(&uri, opts).await.unwrap();
                 store
                     .add(&[
                         text_record_with("aligned", aligned.clone()),
@@ -3465,7 +3547,7 @@ mod tests {
         let uri = dir.path().to_string_lossy().to_string();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let mut store = ContextStore::open(&uri).await.unwrap();
+            let store = ContextStore::open(&uri).await.unwrap();
             let mut semantic_near = text_record("semantic-near", 0.0);
             semantic_near.text_payload = Some("general rollout risk guidance".to_string());
             let mut exact_policy = text_record("exact-policy", 1.0);
@@ -3507,7 +3589,7 @@ mod tests {
                 embedding_dim: Some(3),
                 ..Default::default()
             };
-            let mut store = ContextStore::open_with_options(&uri, options)
+            let store = ContextStore::open_with_options(&uri, options)
                 .await
                 .unwrap();
             assert_eq!(store.embedding_dim(), 3);
@@ -3544,7 +3626,7 @@ mod tests {
         let uri = dir.path().to_string_lossy().to_string();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let mut store = ContextStore::open(&uri).await.unwrap();
+            let store = ContextStore::open(&uri).await.unwrap();
             assert_eq!(store.embedding_dim(), DEFAULT_EMBEDDING_DIM);
             store.add(&[text_record("default-dim", 0.0)]).await.unwrap();
             drop(store);
@@ -3594,7 +3676,7 @@ mod tests {
         let uri = dir.path().to_string_lossy().to_string();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let mut store = ContextStore::open(&uri).await.unwrap();
+            let store = ContextStore::open(&uri).await.unwrap();
             let active = text_record("active", 0.0);
             let mut expired = text_record("expired", 0.0);
             expired.expires_at = Some(Utc::now() - ChronoDuration::minutes(1));
@@ -3642,7 +3724,7 @@ mod tests {
         let uri = dir.path().to_string_lossy().to_string();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let mut store = ContextStore::open(&uri).await.unwrap();
+            let store = ContextStore::open(&uri).await.unwrap();
             let old = text_record("old", 0.0);
             let mut replacement = text_record("new", 1.0);
             replacement.supersedes_id = Some(old.id.clone());
@@ -3671,7 +3753,7 @@ mod tests {
         let uri = dir.path().to_string_lossy().to_string();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let mut store = ContextStore::open(&uri).await.unwrap();
+            let store = ContextStore::open(&uri).await.unwrap();
             let active = text_record("active", 1.0);
             let mut expired_better_match = text_record("expired", 0.0);
             expired_better_match.expires_at = Some(Utc::now() - ChronoDuration::minutes(1));
@@ -3700,7 +3782,7 @@ mod tests {
         let uri = dir.path().to_string_lossy().to_string();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let mut store = ContextStore::open(&uri).await.unwrap();
+            let store = ContextStore::open(&uri).await.unwrap();
             let mut record = text_record("a", 0.0);
             record.external_id = Some("doc-123#chunk-1".to_string());
             store.add(std::slice::from_ref(&record)).await.unwrap();
@@ -4150,7 +4232,7 @@ mod tests {
         let uri = dir.path().to_string_lossy().to_string();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let mut store = ContextStore::open(&uri).await.unwrap();
+            let store = ContextStore::open(&uri).await.unwrap();
             let mut related = text_record("related", 0.0);
             related.relationships = vec![
                 Relationship {
@@ -4259,7 +4341,7 @@ mod tests {
         let uri = dir.path().to_string_lossy().to_string();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let mut store = ContextStore::open(&uri).await.unwrap();
+            let store = ContextStore::open(&uri).await.unwrap();
             let mut first = text_record("a", 0.0);
             first.external_id = Some("doc-123#chunk-1".to_string());
             store.add(std::slice::from_ref(&first)).await.unwrap();
@@ -4281,7 +4363,7 @@ mod tests {
         let uri = dir.path().to_string_lossy().to_string();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let mut store = ContextStore::open(&uri).await.unwrap();
+            let store = ContextStore::open(&uri).await.unwrap();
             let mut record = text_record("a", 0.0);
             record.content_type = CONTENT_TYPE_TOMBSTONE.to_string();
 
@@ -4300,7 +4382,7 @@ mod tests {
         let uri = dir.path().to_string_lossy().to_string();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let mut store = ContextStore::open(&uri).await.unwrap();
+            let store = ContextStore::open(&uri).await.unwrap();
             store.add(&[text_record("dup", 0.0)]).await.unwrap();
 
             let err = store.add(&[text_record("dup", 1.0)]).await.unwrap_err();
@@ -4318,7 +4400,7 @@ mod tests {
         let uri = dir.path().to_string_lossy().to_string();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let mut store = ContextStore::open(&uri).await.unwrap();
+            let store = ContextStore::open(&uri).await.unwrap();
             let err = store
                 .add(&[text_record("same", 0.0), text_record("same", 1.0)])
                 .await
@@ -4337,7 +4419,7 @@ mod tests {
         let uri = dir.path().to_string_lossy().to_string();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let mut store = ContextStore::open(&uri).await.unwrap();
+            let store = ContextStore::open(&uri).await.unwrap();
             let mut first = text_record("a", 0.0);
             first.external_id = Some("ext".to_string());
             let mut second = text_record("b", 1.0);
@@ -4492,7 +4574,7 @@ mod tests {
                 id_index_type: IdIndexType::BTree,
                 ..Default::default()
             };
-            let mut store = ContextStore::open_with_options(&uri, options)
+            let store = ContextStore::open_with_options(&uri, options)
                 .await
                 .unwrap();
 
@@ -4607,7 +4689,7 @@ mod tests {
         let uri = dir.path().to_string_lossy().to_string();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let mut store = ContextStore::open(&uri).await.unwrap();
+            let store = ContextStore::open(&uri).await.unwrap();
             let tricky = "o'brien#chunk-1";
 
             let mut first = text_record("a", 0.0);
@@ -4744,34 +4826,104 @@ mod tests {
     }
 
     #[test]
-    fn test_region_id_derivation_explicit() {
-        let bot_id = Some("bot-123".to_string());
-        let session_id = Some("session-456".to_string());
+    fn add_is_visible_on_return_by_default() {
+        // The default `seal_on_add: true` contract. `ContextStore`'s uniqueness
+        // validation, upsert and tombstones all read the table back, so an `add`
+        // that returned before sealing would silently break them.
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let store = ContextStore::open(&uri).await.unwrap();
+            store.add(&[text_record("r1", 0.0)]).await.unwrap();
 
-        let region_id_1 = ContextStore::derive_region_id(&bot_id, &session_id);
-        let region_id_2 = ContextStore::derive_region_id(&bot_id, &session_id);
-
-        assert_eq!(
-            region_id_1, region_id_2,
-            "Region ID should be deterministic for same inputs"
-        );
-
-        let other_session = Some("session-789".to_string());
-        let region_id_3 = ContextStore::derive_region_id(&bot_id, &other_session);
-
-        assert_ne!(
-            region_id_1, region_id_3,
-            "Region ID should differ for different inputs"
-        );
-
-        // Test None/None case (now deterministic based on empty strings)
-        let region_id_none = ContextStore::derive_region_id(&None, &None);
-        let region_id_none_2 = ContextStore::derive_region_id(&None, &None);
-        assert_eq!(
-            region_id_none, region_id_none_2,
-            "Region ID for None/None should be deterministic"
-        );
+            // No flush: the row must already be readable.
+            assert_eq!(store.list(None, None).await.unwrap().len(), 1);
+            assert!(store.get_by_id("r1").await.unwrap().is_some());
+        });
     }
+
+    #[test]
+    fn deferred_seal_makes_add_durable_but_invisible_until_flush() {
+        // Opting into `RolloutStore`'s write profile: `add` is a durable WAL
+        // append only, and visibility waits for an explicit flush. Mirrors
+        // `rollout_store::tests::add_is_durable_but_not_visible_until_flush`.
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let store = ContextStore::open_with_options(
+                &uri,
+                ContextStoreOptions {
+                    seal_on_add: false,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+            store.add(&[text_record("r1", 0.0)]).await.unwrap();
+            assert_eq!(
+                store.list(None, None).await.unwrap().len(),
+                0,
+                "deferred seal must not publish the row"
+            );
+
+            store.flush().await.unwrap();
+            assert_eq!(store.list(None, None).await.unwrap().len(), 1);
+            assert!(store.get_by_id("r1").await.unwrap().is_some());
+        });
+    }
+
+    #[test]
+    fn wal_generations_merge_into_the_base_table() {
+        // This store previously never merged: flushed generations accumulated
+        // under `_mem_wal/` forever and every read unioned all of them. Each
+        // sealing `add` emits one generation, so after N adds the merge must
+        // reclaim them and leave every row readable from the base table.
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = ContextStore::open(&uri).await.unwrap();
+            for i in 0..3 {
+                store
+                    .add(&[text_record(&format!("r{i}"), i as f32)])
+                    .await
+                    .unwrap();
+            }
+
+            assert!(
+                store.pending_wal_generations().await.unwrap() > 0,
+                "sealing adds should leave generations pending"
+            );
+
+            let reclaimed = store.cleanup_wal().await.unwrap();
+            assert!(reclaimed > 0, "cleanup must merge the pending generations");
+            assert_eq!(store.pending_wal_generations().await.unwrap(), 0);
+
+            // Rows survive the merge and are still readable.
+            let ids: Vec<String> = store
+                .list(None, None)
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.id.clone())
+                .collect();
+            assert_eq!(ids.len(), 3);
+            for i in 0..3 {
+                assert!(ids.contains(&format!("r{i}")));
+            }
+        });
+    }
+
+    // `test_region_id_derivation_explicit` was deleted with the per-conversation
+    // MemWAL sharding it covered. Writes now go to the shard owned by this
+    // writer instance (see `ContextStoreOptions::shard_id`), matching
+    // `RolloutStore` -- one instance owns exactly one shard, so the epoch-fencing
+    // invariant holds by construction. `test_add_multiple_regions` below still
+    // pins the user-visible behavior: records with differing bot/session ids
+    // round-trip through a single store.
 
     #[test]
     fn test_add_multiple_regions() {
@@ -4780,7 +4932,7 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().unwrap();
 
         runtime.block_on(async {
-            let mut store = ContextStore::open(&uri).await.unwrap();
+            let store = ContextStore::open(&uri).await.unwrap();
 
             // Create records for different regions
             let mut record1 = text_record("r1", 0.0);
@@ -4821,7 +4973,7 @@ mod tests {
                 blob_columns: HashSet::from(["binary_payload".to_string()]),
                 ..Default::default()
             };
-            let mut store = ContextStore::open_with_options(&uri, options)
+            let store = ContextStore::open_with_options(&uri, options)
                 .await
                 .unwrap();
 
@@ -4854,7 +5006,7 @@ mod tests {
                 blob_columns: HashSet::from(["text_payload".to_string()]),
                 ..Default::default()
             };
-            let mut store = ContextStore::open_with_options(&uri, options)
+            let store = ContextStore::open_with_options(&uri, options)
                 .await
                 .unwrap();
 
@@ -4896,7 +5048,7 @@ mod tests {
                 ]),
                 ..Default::default()
             };
-            let mut store = ContextStore::open_with_options(&uri, options)
+            let store = ContextStore::open_with_options(&uri, options)
                 .await
                 .unwrap();
 
@@ -5038,7 +5190,7 @@ mod tests {
                 .unwrap();
 
             // Index should be created eagerly on open
-            let indices = store.dataset.load_indices().await.unwrap();
+            let indices = store.base.dataset.load_indices().await.unwrap();
             assert!(
                 indices.iter().any(|i| i.name == ID_INDEX_NAME),
                 "btree index should be created on open"
@@ -5054,7 +5206,7 @@ mod tests {
             store.compact(None).await.unwrap();
 
             // Index should still exist after compaction
-            let indices = store.dataset.load_indices().await.unwrap();
+            let indices = store.base.dataset.load_indices().await.unwrap();
             assert!(
                 indices.iter().any(|i| i.name == ID_INDEX_NAME),
                 "btree index should persist after compaction"
@@ -5078,7 +5230,7 @@ mod tests {
                 .unwrap();
 
             // Index should be created eagerly on open
-            let indices = store.dataset.load_indices().await.unwrap();
+            let indices = store.base.dataset.load_indices().await.unwrap();
             assert!(
                 indices.iter().any(|i| i.name == ID_INDEX_NAME),
                 "zonemap index should be created on open"
@@ -5092,7 +5244,7 @@ mod tests {
             }
             store.compact(None).await.unwrap();
 
-            let indices = store.dataset.load_indices().await.unwrap();
+            let indices = store.base.dataset.load_indices().await.unwrap();
             assert!(
                 indices.iter().any(|i| i.name == ID_INDEX_NAME),
                 "zonemap index should persist after compaction"
@@ -5112,7 +5264,7 @@ mod tests {
             store.add(&[text_record("no-idx-1", 0.0)]).await.unwrap();
             store.compact(None).await.unwrap();
 
-            let indices = store.dataset.load_indices().await.unwrap();
+            let indices = store.base.dataset.load_indices().await.unwrap();
             assert!(
                 !indices.iter().any(|i| i.name == ID_INDEX_NAME),
                 "no id index should be created when IdIndexType::None"
@@ -5157,7 +5309,7 @@ mod tests {
         let uri = dir.path().to_string_lossy().to_string();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let mut store = ContextStore::open(&uri).await.unwrap();
+            let store = ContextStore::open(&uri).await.unwrap();
             let mut record = text_record("img", 0.0);
             record.content_type = "image/png".to_string();
             record.binary_payload = Some(vec![1, 2, 3, 4]);
@@ -5213,7 +5365,7 @@ mod tests {
         let uri = dir.path().to_string_lossy().to_string();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let mut store = ContextStore::open(&uri).await.unwrap();
+            let store = ContextStore::open(&uri).await.unwrap();
             let mut a = text_record("a", 0.0);
             a.binary_payload = Some(vec![9, 9, 9]);
             let mut b = text_record("b", 1.0);
