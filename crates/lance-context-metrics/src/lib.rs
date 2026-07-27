@@ -218,6 +218,38 @@ fn describe_metrics() {
         "master_experiments",
         "Live experiments seen by the last scan."
     );
+
+    // `_stats` table upkeep. The alerting signal is
+    // `master_stats_unreclaimed_versions` (and consecutive failures), not
+    // `master_stats_version`: the version number climbs by design and says
+    // nothing about disk usage, while unreclaimed versions are manifests still
+    // sitting on storage.
+    describe_histogram!(
+        "master_stats_maintenance_duration_seconds",
+        Unit::Seconds,
+        "One _stats maintenance pass (compaction plus old-version cleanup)."
+    );
+    describe_counter!(
+        "master_stats_versions_removed_total",
+        "Old _stats manifest versions physically reclaimed by cleanup."
+    );
+    describe_counter!(
+        "master_stats_maintenance_failures_total",
+        "Failed _stats maintenance passes."
+    );
+    describe_gauge!(
+        "master_stats_version",
+        "Current _stats Lance version number. Monotonic by design; not an alerting signal."
+    );
+    describe_gauge!(
+        "master_stats_maintenance_consecutive_failures",
+        "Consecutive failed _stats maintenance passes; 0 after any success."
+    );
+    describe_gauge!(
+        "master_stats_unreclaimed_versions",
+        "_stats versions created since the last successful maintenance pass. \
+         Sustained growth means old manifests are accumulating on storage."
+    );
     describe_gauge!(
         "master_rollout_rows",
         "Total rollout rows across all experiments as of the last scan."
