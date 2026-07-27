@@ -1,0 +1,5 @@
+nav:
+  - Home: index.md
+  - Guide: guide
+  - Specs: specs
+  - Design: design

@@ -1,0 +1,4 @@
+nav:
+  - Partitioned namespace: partitioned-namespace.md
+  - Auto-dream: auto-dream.md
+  - Using the datagen store: using-datagen-store.md

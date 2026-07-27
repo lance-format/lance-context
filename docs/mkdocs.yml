@@ -1,6 +1,6 @@
 site_name: lance-context
 site_description: A storage engine for AI data — agent memory and RL training data — built on Lance
-site_url: https://lance-format.github.io/lance-context/
+site_url: https://lance.org/integrations/context/
 docs_dir: src
 
 repo_name: lance-format/lance-context
@@ -57,23 +57,8 @@ markdown_extensions:
 
 plugins:
   - search
+  - awesome-pages
 
-nav:
-  - Home: index.md
-  - Guide:
-      - Quickstart: guide/quickstart.md
-      - Rollouts (RolloutDB): guide/rollouts.md
-      - Storage backends: guide/storage.md
-      - Development: guide/development.md
-  - Specs:
-      - Rollout schema: specs/rollout-schema-design.md
-      - Rollout deployment: specs/rollout-deployment.md
-      - Blob streaming: specs/rollout-blob-streaming.md
-      - Datagen checkpoints: specs/datagen-checkpoint-schema.md
-  - Design:
-      - Partitioned namespace: design/partitioned-namespace.md
-      - Auto-dream: design/auto-dream.md
-      - Using the datagen store: design/using-datagen-store.md
 
 extra:
   social:
