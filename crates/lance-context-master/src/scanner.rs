@@ -149,6 +149,17 @@ async fn scan_once_inner(state: &Arc<MasterState>) -> lance::Result<usize> {
     }
 
     metrics::histogram!("master_scan_duration_seconds").record(scan_start.elapsed().as_secs_f64());
+    // Named without a `_total` suffix: these are gauges (current value), and
+    // `_total` is the counter convention. Datadog's OpenMetrics check infers
+    // type from the name, so `_total` on a gauge was being ingested as a
+    // monotonic count -- graphing "experiments created per second" for a metric
+    // whose meaning is "how many exist right now". `rate()` was equally
+    // meaningless in Prometheus. The `_total` names are still emitted alongside,
+    // deprecated, so existing dashboards keep working.
+    metrics::gauge!("master_experiments").set(live_count as f64);
+    metrics::gauge!("master_rollout_rows").set(total_rows as f64);
+    metrics::gauge!("master_rollout_fragments").set(total_fragments as f64);
+    // Deprecated aliases -- remove once dashboards have migrated.
     metrics::gauge!("master_experiments_total").set(live_count as f64);
     metrics::gauge!("master_rollout_rows_total").set(total_rows as f64);
     metrics::gauge!("master_rollout_fragments_total").set(total_fragments as f64);

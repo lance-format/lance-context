@@ -2453,6 +2453,13 @@ impl RolloutStore {
         self.store.version()
     }
 
+    /// Seal the local MemWAL memtable so previously added rows become visible
+    /// to subsequent reads. No-op for remote stores.
+    fn flush(&self, py: Python<'_>) -> PyResult<()> {
+        py.allow_threads(|| self.runtime.block_on(self.store.flush()))
+            .map_err(to_py_err)
+    }
+
     /// Append rollout rows given as a JSON array of `AddRolloutRequest` objects.
     /// Returns a dict `{version, ids, count}`.
     fn add(&mut self, py: Python<'_>, records_json: &str) -> PyResult<PyObject> {

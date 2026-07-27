@@ -28,6 +28,10 @@ one).
 - **Runs anywhere.** Local files, or S3 / GCS / Azure via a simple
   `storage_options` dict. Embedded in your process, or behind an HTTP server.
 
+## Documentation
+
+Full documentation: **<https://lance-format.github.io/lance-context/>**
+
 ## Install
 
 ```bash

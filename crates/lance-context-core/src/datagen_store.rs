@@ -39,7 +39,7 @@ use crate::datagen::{
     DatagenEventType, DatagenFailure, DatagenItemLookup, DatagenItemStatus, DatagenRootItemStatuses,
     DatagenStepCursor, DatagenStepKind, DatagenValue,
 };
-use crate::rollout_store::derive_shard_id;
+use crate::rollout_store::{align_batch_to_schema, derive_shard_id, is_not_found_error};
 use crate::store::{column_as, column_as_optional, timestamp_from_micros};
 
 const DEFAULT_MANIFEST_SCAN_BATCH_SIZE: usize = 16;
@@ -288,7 +288,16 @@ impl DatagenStore {
         generations.sort_by_key(|(generation, _)| std::cmp::Reverse(*generation));
 
         for (_, uri) in generations {
-            let dataset = self.open_flushed_dataset(&uri).await?;
+            // A generation drained and deleted by a concurrent merge between
+            // taking the snapshot and opening it: its rows are already in the
+            // base table (checked below), so skip it rather than failing the
+            // whole lookup. Now that merges no longer block appends, this window
+            // is genuinely reachable. (Mirrors the rollout store.)
+            let dataset = match self.open_flushed_dataset(&uri).await {
+                Ok(dataset) => dataset,
+                Err(err) if is_not_found_error(&err) => continue,
+                Err(err) => return Err(err),
+            };
             if let Some(payload) = Self::get_blob_from_dataset(&dataset, event_id).await? {
                 return Ok(payload);
             }
@@ -397,6 +406,37 @@ impl DatagenStore {
         Ok(pending)
     }
 
+    /// Fold this instance's flushed MemWAL generations into the base table and
+    /// drain them from the shard manifest.
+    ///
+    /// # Concurrency: does not stop the writer
+    ///
+    /// A merge only touches *sealed* generations — history — while appends write
+    /// the active memtable at the WAL tail. They operate on disjoint data, so a
+    /// merge must not block the write path.
+    ///
+    /// That requires *not* calling `claim_epoch`. Claiming bumps `writer_epoch`,
+    /// which fences every live writer of the shard including our own, forcing a
+    /// `close()` first and an exclusive lock to hide the window. The epoch is an
+    /// *ownership* token, not a per-commit token: `commit_update` only rejects a
+    /// writer whose epoch is **older** than the stored one, and Lance's own
+    /// flush path reuses one epoch for every manifest commit a writer makes. So
+    /// this reuses the shard's current epoch and leaves the writer untouched.
+    ///
+    /// Lance sanctions concurrent draining explicitly: recovery keys off
+    /// `replay_after_wal_entry_position` and deliberately does not consult
+    /// `flushed_generations`, "since an external compactor may legitimately
+    /// drain that vector back to empty".
+    ///
+    /// # Surgical drain, not blanket clear
+    ///
+    /// The drain retains everything this call did not merge. `commit_update`
+    /// re-runs the closure against a freshly-read manifest on every CAS retry,
+    /// so a *relative* edit composes with a concurrent flush's append, while an
+    /// absolute `flushed_generations = []` would silently discard a generation
+    /// that was never merged. `..current.clone()` preserves
+    /// `current_generation`, `replay_after_wal_entry_position` and
+    /// `wal_entry_position_last_seen`, which a concurrent flush advances.
     async fn merge_own_shard(
         &mut self,
         manifest_store: &ShardManifestStore,
@@ -406,9 +446,17 @@ impl DatagenStore {
             return Ok(());
         }
 
-        // claim_epoch below fences the resident writer. Drain it first and
-        // reopen lazily on the next append.
-        self.close().await?;
+        // NOTE: deliberately no `self.close()` here. Closing the resident writer
+        // was only needed because the drain below used to `claim_epoch`, which
+        // fenced our own writer. Reusing the current epoch removes that need, so
+        // appends continue uninterrupted for the whole merge.
+
+        // Align to the *live* dataset schema rather than the compile-time
+        // `datagen_log_schema()`: a base table written by an older binary can
+        // lack columns the current schema has, and merging a batch built against
+        // the compile-time schema into it fails. This mirrors the rollout store,
+        // which hit exactly this and now aligns against the live schema.
+        let merge_schema: Arc<Schema> = Arc::new(self.dataset.schema().into());
 
         let base_uri = self.dataset.uri().trim_end_matches('/').to_string();
         let mut merged_generations = HashSet::new();
@@ -424,7 +472,7 @@ impl DatagenStore {
             let mut stream = generation.scan().try_into_stream().await?;
             while let Some(batch) = stream.try_next().await? {
                 if batch.num_rows() > 0 {
-                    batches.push(batch);
+                    batches.push(align_batch_to_schema(batch, merge_schema.clone())?);
                 }
             }
             merged_generations.insert(flushed.generation);
@@ -432,10 +480,9 @@ impl DatagenStore {
         }
 
         if !batches.is_empty() {
-            let schema = Arc::new(datagen_log_schema());
             let reader = RecordBatchIterator::new(
                 batches.into_iter().map(Ok::<RecordBatch, ArrowError>),
-                schema,
+                merge_schema,
             );
             let mut params = WriteParams {
                 mode: WriteMode::Append,
@@ -452,7 +499,11 @@ impl DatagenStore {
             self.dataset.append(reader, Some(params)).await?;
         }
 
-        let (epoch, _) = manifest_store.claim_epoch(manifest.shard_spec_id).await?;
+        // Reuse the shard's *current* epoch rather than claiming a new one:
+        // claiming would fence our own live writer. `commit_update` still fails
+        // cleanly if a genuinely new writer has claimed the shard meanwhile —
+        // its epoch would exceed ours — which is the correct outcome.
+        let epoch = manifest.writer_epoch;
         manifest_store
             .commit_update(epoch, |current| ShardManifest {
                 version: current.version + 1,
@@ -1142,12 +1193,33 @@ fn invalid_input(message: impl Into<String>) -> LanceError {
 }
 
 impl Drop for DatagenStore {
+    /// Best-effort drain of a still-resident writer's background tasks.
+    ///
+    /// [`ShardWriter`] has no `Drop`, so dropping it without `close().await`
+    /// leaks its background tasks. When a Tokio runtime is available we move the
+    /// writer into a detached task that closes it; otherwise we can only drop it.
     fn drop(&mut self) {
         if let Some(writer) = self.write_writer.take() {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {
-                    let _ = writer.close().await;
+                    // Log rather than discard: a failing close leaks the
+                    // writer's background tasks and, if the memtable was still
+                    // buffered, strands rows that are durable in the WAL but
+                    // never sealed. Silently swallowing that leaves no signal
+                    // anywhere. (Mirrors the rollout store.)
+                    if let Err(error) = writer.close().await {
+                        tracing::warn!(
+                            error = %error,
+                            "failed to close datagen MemWAL writer on drop; \
+                             its background tasks may leak"
+                        );
+                    }
                 });
+            } else {
+                tracing::debug!(
+                    "datagen store dropped outside a Tokio runtime; \
+                     MemWAL writer background tasks cannot be drained"
+                );
             }
         }
     }
@@ -1508,6 +1580,72 @@ mod tests {
                 store.fold_item("7/solve_twice:1").await.unwrap(),
                 DatagenItemLookup::NeverStarted
             );
+        });
+    }
+
+    /// A merge must not fence the store's own MemWAL writer.
+    ///
+    /// The merge used to `claim_epoch` to commit the manifest drain, which bumps
+    /// `writer_epoch` and fences every live writer of the shard — including this
+    /// store's own. It papered over that by `close()`ing the writer first and
+    /// reopening lazily. Reusing the shard's current epoch removes the need, so
+    /// the resident writer stays valid across a merge and appends immediately
+    /// after one must still succeed and be readable.
+    #[test]
+    fn append_after_merge_reuses_the_writer_without_being_fenced() {
+        let directory = TempDir::new().unwrap();
+        let uri = directory.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = DatagenStore::open_with_options(
+                &uri,
+                DatagenStoreOptions {
+                    storage_options: None,
+                    shard_id: Some("writer-a".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+            store
+                .append(&[event(
+                    "item-1",
+                    0,
+                    "created",
+                    0,
+                    DatagenEventType::ItemCreated,
+                )])
+                .await
+                .unwrap();
+            assert_eq!(store.pending_wal_generations().await.unwrap(), 1);
+
+            // Merge with the writer still resident. Previously this closed it.
+            assert_eq!(store.cleanup_own_shard().await.unwrap(), 1);
+
+            // The append below goes through whatever writer survived the merge.
+            // Under the old claim-then-close behaviour a stale writer would have
+            // been fenced here; datagen has no fence-retry, so it would fail.
+            store
+                .append(&[event(
+                    "item-2",
+                    0,
+                    "created-2",
+                    0,
+                    DatagenEventType::ItemCreated,
+                )])
+                .await
+                .unwrap_or_else(|e| panic!("append immediately after a merge failed: {e}"));
+
+            // Both the merged and the post-merge event must be readable.
+            assert_eq!(store.events_for_item("item-1").await.unwrap().len(), 1);
+            assert_eq!(store.events_for_item("item-2").await.unwrap().len(), 1);
+
+            // And a second merge must still converge.
+            store.cleanup_own_shard().await.unwrap();
+            assert_eq!(store.pending_wal_generations().await.unwrap(), 0);
+            assert_eq!(store.events_for_item("item-1").await.unwrap().len(), 1);
+            assert_eq!(store.events_for_item("item-2").await.unwrap().len(), 1);
         });
     }
 }

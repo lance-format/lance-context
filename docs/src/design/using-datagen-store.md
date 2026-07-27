@@ -8,7 +8,7 @@ its pyo3 bindings) drives the store through a run — create, checkpoint, resume
 read — with runnable Rust snippets.
 
 For the schema and the design rationale, see
-[`specs/datagen-checkpoint-schema.md`](../../specs/datagen-checkpoint-schema.md).
+[`specs/datagen-checkpoint-schema.md`](../specs/datagen-checkpoint-schema.md).
 
 ## The model in one paragraph
 

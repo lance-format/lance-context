@@ -64,6 +64,27 @@ impl RolloutStore {
             .map_err(|e| ContextError::Internal(e.to_string()))?;
         Ok(Self::Remote(store))
     }
+
+    /// Seal the local MemWAL memtable so rows written by [`RolloutStoreApi::add`]
+    /// become visible to subsequent reads on this handle.
+    ///
+    /// `add` is durable on return but *not* visible on return: visibility is
+    /// driven by a periodic sweeper in the server. An embedded caller has no
+    /// sweeper, so without an explicit `flush` a write-then-read sequence
+    /// returns nothing. Call this before reading back rows you just wrote.
+    ///
+    /// A no-op for `Remote` stores, where the server owns flush scheduling and
+    /// per-request `?flush=true` provides read-your-write.
+    pub async fn flush(&self) -> Result<(), ContextError> {
+        match self {
+            RolloutStore::Local(s) => s
+                .flush()
+                .await
+                .map_err(|e| ContextError::Internal(e.to_string())),
+            #[cfg(feature = "remote")]
+            RolloutStore::Remote(_) => Ok(()),
+        }
+    }
 }
 
 macro_rules! dispatch_mut {

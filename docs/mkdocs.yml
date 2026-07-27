@@ -1,0 +1,86 @@
+site_name: lance-context
+site_description: A storage engine for AI data — agent memory and RL training data — built on Lance
+site_url: https://lance-format.github.io/lance-context/
+docs_dir: src
+
+repo_name: lance-format/lance-context
+repo_url: https://github.com/lance-format/lance-context
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.sections
+    - navigation.instant
+    - navigation.indexes
+    - navigation.tracking
+    - search.highlight
+    - search.share
+    - content.code.copy
+    - content.code.annotate
+  icon:
+    repo: fontawesome/brands/github
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.tabbed:
+      alternate_style: true
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+
+plugins:
+  - search
+
+nav:
+  - Home: index.md
+  - Guide:
+      - Quickstart: guide/quickstart.md
+      - Rollouts (RolloutDB): guide/rollouts.md
+      - Storage backends: guide/storage.md
+      - Development: guide/development.md
+  - Specs:
+      - Rollout schema: specs/rollout-schema-design.md
+      - Rollout deployment: specs/rollout-deployment.md
+      - Blob streaming: specs/rollout-blob-streaming.md
+      - Datagen checkpoints: specs/datagen-checkpoint-schema.md
+  - Design:
+      - Partitioned namespace: design/partitioned-namespace.md
+      - Auto-dream: design/auto-dream.md
+      - Using the datagen store: design/using-datagen-store.md
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/lance-format/lance-context
+    - icon: fontawesome/brands/discord
+      link: https://discord.gg/lance
+
+extra_javascript:
+  - https://unpkg.com/mermaid@10/dist/mermaid.min.js

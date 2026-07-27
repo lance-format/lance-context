@@ -60,6 +60,16 @@ tests = [
 ]
 dev = ["ruff", "pyright"]
 
+[tool.pytest.ini_options]
+# `testpaths` is relative to this file (python/), so this resolves to
+# python/tests/ -- the real suite. Without it, running pytest from python/
+# with a bare `pytest` argument could collect python/python/tests/ instead.
+testpaths = ["tests"]
+asyncio_mode = "strict"
+# Fail on unregistered marks so a typo'd @pytest.mark.asyncio cannot silently
+# turn an async test into a no-op pass.
+addopts = "--strict-markers --strict-config"
+
 [tool.ruff]
 lint.select = ["F", "E", "W", "I", "G", "TCH", "PERF", "B019"]
 

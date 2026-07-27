@@ -2579,6 +2579,19 @@ class RolloutStore:
         """Append a single record given as keyword arguments."""
         return self.add(fields)
 
+    def flush(self) -> None:
+        """Make previously added rows visible to subsequent reads.
+
+        ``add`` is durable on return but *not* visible on return: rows land in
+        a write-ahead log and only reach a readable generation when the
+        memtable is sealed. A deployed server does this on a timer; an embedded
+        store has no such timer, so a write-then-read sequence returns nothing
+        until you call this.
+
+        No-op for stores connected to a remote server.
+        """
+        self._sync.flush()
+
     def list(
         self,
         limit: int | None = None,
@@ -2671,6 +2684,17 @@ class AsyncRolloutStore:
     async def add_one(self, **fields: Any) -> dict[str, Any]:
         """Append a single record given as keyword arguments."""
         return await self.add(fields)
+
+    async def flush(self) -> None:
+        """Make previously added rows visible to subsequent reads.
+
+        For an embedded store this seals the local memtable. For a store
+        connected to a remote server this is a no-op: the server flushes on its
+        own interval (``ROLLOUT_FLUSH_INTERVAL_SECS``), which bounds how long a
+        just-written row stays invisible.
+        """
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._sync.flush)
 
     async def list(
         self,

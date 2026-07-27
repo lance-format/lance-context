@@ -31,6 +31,8 @@ class DummyInner:
         ] = []
         self.list_calls: list[tuple[int | None, int | None, str | None]] = []
         self.list_lifecycle_calls: list[tuple[bool, bool]] = []
+        self.list_projection_calls: list[tuple[bool, bool]] = []
+        self.search_projection_calls: list[tuple[bool, bool]] = []
         self.related_calls: list[tuple[str, str | None, int | None, bool, bool]] = []
         self.get_calls: list[tuple[str | None, str | None]] = []
         self.delete_calls: list[tuple[str | None, str | None]] = []
@@ -274,10 +276,13 @@ class DummyInner:
         include_expired: bool = False,
         include_retired: bool = False,
         include_relationships: bool = False,
+        include_binary: bool = True,
+        include_embedding: bool = True,
     ):
         self.search_calls.append((vector, limit, filters_json))
         self.search_lifecycle_calls.append((include_expired, include_retired))
         self.search_relationship_calls.append(include_relationships)
+        self.search_projection_calls.append((include_binary, include_embedding))
         hit = {
             "id": "rec-1",
             "external_id": "source-1",
@@ -362,9 +367,12 @@ class DummyInner:
         filters_json: str | None,
         include_expired: bool = False,
         include_retired: bool = False,
+        include_binary: bool = True,
+        include_embedding: bool = True,
     ):
         self.list_calls.append((limit, offset, filters_json))
         self.list_lifecycle_calls.append((include_expired, include_retired))
+        self.list_projection_calls.append((include_binary, include_embedding))
         return [
             {
                 "id": "rec-1",
