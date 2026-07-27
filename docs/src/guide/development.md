@@ -42,7 +42,9 @@ mkdocs serve -f docs/mkdocs.yml
 ```
 
 It deploys automatically to GitHub Pages on every push to `main` that touches
-`docs/`.
+`docs/`, via the `Docs` workflow (`actions/deploy-pages`). Pull requests build
+the site with `--strict` but do not deploy, so a broken link fails the PR
+rather than the live site.
 
 ## Contributing
 
