@@ -17,6 +17,7 @@ mod rollout_store;
 pub mod serde;
 mod storage;
 mod store;
+mod store_base;
 
 pub use api_impl::rollout_record_to_dto;
 pub use context::{Context, ContextEntry, Snapshot};
