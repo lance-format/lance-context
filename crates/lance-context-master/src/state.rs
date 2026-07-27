@@ -154,6 +154,7 @@ mod tests {
             scan_concurrency: 4,
             stats_maintenance_every_n_scans: 0,
             stats_history_ttl_secs: 3_600,
+            stats_cold_retire_secs: 0,
             compaction_interval_secs: 0,
             min_fragments: 16,
             target_rows_per_fragment: 1_048_576,

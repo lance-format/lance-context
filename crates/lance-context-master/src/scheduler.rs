@@ -555,6 +555,7 @@ mod tests {
             scan_concurrency: 4,
             stats_maintenance_every_n_scans: 0,
             stats_history_ttl_secs: 3_600,
+            stats_cold_retire_secs: 0,
             compaction_interval_secs: 0,
             // Low threshold so a handful of appends crosses it.
             min_fragments: 2,
