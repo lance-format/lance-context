@@ -13,8 +13,14 @@ on:
       - .github/workflows/docs.yml
 
 concurrency:
+  # Deploys to a single live site, so let an in-flight deploy finish rather
+  # than cancelling it half-way; PRs (build-only) are still cancellable.
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Read-only by default; the deploy job opts into exactly what Pages needs.
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -31,6 +37,11 @@ jobs:
       # failures, so a PR that moves a doc cannot silently ship a dead site.
       - name: Build site
         run: mkdocs build -f docs/mkdocs.yml --strict
+      - name: Upload Pages artifact
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/site
 
   deploy:
     # Only main deploys; PRs stop at the build check above.
@@ -39,18 +50,12 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
-      contents: write
+      pages: write # deploy to GitHub Pages
+      id-token: write # verify the deployment originates from this workflow
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - name: Install MkDocs
-        run: pip install mkdocs-material==9.5.49
-      - name: Deploy to gh-pages
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          mkdocs gh-deploy -f docs/mkdocs.yml --force
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
