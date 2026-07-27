@@ -40,11 +40,25 @@ pub struct StatRow {
     pub last_compaction: i64,
     pub total_compactions: i64,
     pub scanned_at: i64,
+    /// Base-dataset version at the last full observation.
+    ///
+    /// A scan compares this against the experiment's current version to decide
+    /// whether anything can have changed. Opening the dataset already reads the
+    /// manifest, so the current version is free; an unchanged version means the
+    /// expensive parts of `observe` (listing MemWAL shards, opening every
+    /// flushed generation, counting rows) can be skipped entirely. `-1` marks a
+    /// row written before this column existed, forcing one full observation.
+    pub version: i64,
 }
 
 impl StatRow {
     /// Sentinel stored in `last_compaction` when no compaction has run.
     pub const NO_COMPACTION: i64 = -1;
+
+    /// Sentinel stored in `version` for a row written before that column
+    /// existed, or whose version could not be read. Never matches a real
+    /// version, so it always forces a full observation.
+    pub const UNKNOWN_VERSION: i64 = -1;
 
     /// Convert to the wire DTO, mapping the `-1` sentinel back to `None`.
     #[must_use]
@@ -84,6 +98,7 @@ fn stats_schema() -> Schema {
         Field::new("last_compaction", DataType::Int64, false),
         Field::new("total_compactions", DataType::Int64, false),
         Field::new("scanned_at", DataType::Int64, false),
+        Field::new("version", DataType::Int64, false),
     ])
 }
 
@@ -168,12 +183,102 @@ impl StatsStore {
                 Arc::new(Int64Array::from(vec![row.last_compaction])),
                 Arc::new(Int64Array::from(vec![row.total_compactions])),
                 Arc::new(Int64Array::from(vec![row.scanned_at])),
+                Arc::new(Int64Array::from(vec![row.version])),
             ],
         )?)
     }
 
+    fn rows_to_batch(rows: &[StatRow]) -> LanceResult<RecordBatch> {
+        let schema = Arc::new(stats_schema());
+        Ok(RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(
+                    rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    rows.iter().map(|r| r.uri.as_str()).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|r| r.row_count).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|r| r.fragment_count).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|r| r.last_updated).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    rows.iter()
+                        .map(|r| r.pending_wal_generations)
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|r| r.last_compaction).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|r| r.total_compactions).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|r| r.scanned_at).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|r| r.version).collect::<Vec<_>>(),
+                )),
+            ],
+        )?)
+    }
+
+    /// Current fragment count of the stats table.
+    #[must_use]
+    pub fn fragment_count(&self) -> usize {
+        self.dataset.count_fragments()
+    }
+
+    /// Replace the whole stats table with `rows` in a single commit.
+    ///
+    /// # Why a snapshot rather than per-row upserts
+    ///
+    /// [`Self::upsert`] costs two Lance commits per row (a delete and an
+    /// append). A scan round covering N experiments therefore created 2N
+    /// versions — at 50 experiments on the default 300s interval that is ~100
+    /// versions per round and ~28,800 per day, unbounded. Lance keeps every
+    /// version's manifest until cleanup, and anything that opens the dataset
+    /// pays for the chain, which is how `GET /experiments` degraded to 30-43s
+    /// against a table holding fifty rows.
+    ///
+    /// A scan already computes the complete set of live experiments, so it can
+    /// write that set as one `Overwrite` commit: one version and one fragment
+    /// per round regardless of N. This also subsumes the reconcile-remove pass,
+    /// since an experiment absent from the snapshot is simply not written.
+    ///
+    /// # Empty snapshots are refused
+    ///
+    /// An empty `rows` is a no-op, not a wipe. A round in which every `observe`
+    /// failed would otherwise blank the table, which both empties the UI and
+    /// silently stops the compaction and WAL-merge sweeps — they read this
+    /// table to decide what to enqueue. Remove experiments explicitly via
+    /// [`Self::remove`].
+    pub async fn write_snapshot(&mut self, rows: &[StatRow]) -> LanceResult<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let batch = Self::rows_to_batch(rows)?;
+        let schema = Arc::new(stats_schema());
+        let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema);
+        let params = Self::write_params(WriteMode::Overwrite, self.storage_options.clone());
+        // `Dataset::append` hardcodes `WriteMode::Append` and silently ignores
+        // `params.mode`; `Dataset::write` honours it. Using `append` here would
+        // duplicate every row each round instead of replacing the table.
+        self.dataset = Dataset::write(reader, &self.uri, Some(params)).await?;
+        Ok(())
+    }
+
     /// Insert or replace the stats row for `row.name` (delete-then-append,
     /// idempotent). Callers must serialize mutations.
+    ///
+    /// Prefer [`Self::write_snapshot`] for whole-round updates: this path costs
+    /// two Lance versions per call.
     pub async fn upsert(&mut self, row: &StatRow) -> LanceResult<()> {
         self.dataset.checkout_latest().await?;
         self.delete_row(&row.name).await?;
@@ -234,7 +339,13 @@ impl StatsStore {
     }
 
     /// List stats rows, optionally filtered by a `name` substring, ordered by
-    /// name, with `limit`/`offset` pagination applied in memory.
+    /// name, with `limit`/`offset` pagination.
+    ///
+    /// Rows are ordered by `name` for stable pagination. The sort is done here
+    /// rather than pushed into Lance because the scan has no ordering guarantee
+    /// and the result set is bounded by the caller's `limit`; see
+    /// [`Self::list_above_fragment_count`] for the threshold queries the sweeps
+    /// use, which must not read the whole table.
     pub async fn list(
         &mut self,
         search: Option<&str>,
@@ -255,6 +366,56 @@ impl StatsStore {
         Ok(rows.into_iter().skip(offset).take(limit).collect())
     }
 
+    /// Rows whose `fragment_count` is at least `threshold`, capped at `limit`.
+    ///
+    /// The compaction sweep used `list(None, usize::MAX, 0)` and filtered in a
+    /// Rust loop, materialising every row on every sweep. Pushing the predicate
+    /// into the scan means the sweep reads only the rows it can act on, and the
+    /// cap bounds how many tasks one sweep can enqueue — previously unbounded.
+    pub async fn list_above_fragment_count(
+        &mut self,
+        threshold: usize,
+        limit: usize,
+    ) -> LanceResult<Vec<StatRow>> {
+        self.list_above("fragment_count", threshold as i64, limit)
+            .await
+    }
+
+    /// Rows whose `pending_wal_generations` is at least `threshold`, capped at
+    /// `limit`. See [`Self::list_above_fragment_count`].
+    pub async fn list_above_pending_wal(
+        &mut self,
+        threshold: i64,
+        limit: usize,
+    ) -> LanceResult<Vec<StatRow>> {
+        self.list_above("pending_wal_generations", threshold, limit)
+            .await
+    }
+
+    /// Shared implementation for the sweeps' threshold queries.
+    ///
+    /// `column` is a fixed identifier chosen by the two callers above, never
+    /// caller input, so it is safe to interpolate; `threshold` is an `i64`.
+    async fn list_above(
+        &mut self,
+        column: &str,
+        threshold: i64,
+        limit: usize,
+    ) -> LanceResult<Vec<StatRow>> {
+        self.dataset.checkout_latest().await?;
+        let mut scanner = self.dataset.scan();
+        scanner.filter(&format!("{column} >= {threshold}"))?;
+        scanner.limit(Some(limit as i64), None)?;
+        let mut stream = scanner.try_into_stream().await?;
+        let mut rows = Vec::new();
+        while let Some(batch) = stream.try_next().await? {
+            rows.extend(Self::batch_to_rows(&batch)?);
+        }
+        rows.sort_by(|a, b| a.name.cmp(&b.name));
+        rows.truncate(limit);
+        Ok(rows)
+    }
+
     fn like_filter(search: &str) -> String {
         let escaped = search.replace('\'', "''");
         format!("name LIKE '%{}%'", escaped)
@@ -270,6 +431,12 @@ impl StatsStore {
         let last_compaction = Self::i64_col(batch, "last_compaction")?;
         let total_compactions = Self::i64_col(batch, "total_compactions")?;
         let scanned_at = Self::i64_col(batch, "scanned_at")?;
+        // Absent on a table written before this column existed. Reading must
+        // tolerate that rather than erroring, or an upgrade breaks every
+        // deployment until the table happens to be rewritten. Missing means
+        // "version unknown", which forces one full observation and then
+        // persists the column.
+        let version = Self::i64_col(batch, "version").ok();
         let mut out = Vec::with_capacity(batch.num_rows());
         for i in 0..batch.num_rows() {
             out.push(StatRow {
@@ -282,6 +449,7 @@ impl StatsStore {
                 last_compaction: last_compaction.value(i),
                 total_compactions: total_compactions.value(i),
                 scanned_at: scanned_at.value(i),
+                version: version.map_or(StatRow::UNKNOWN_VERSION, |v| v.value(i)),
             });
         }
         Ok(out)
@@ -383,6 +551,7 @@ mod tests {
             pending_wal_generations: 0,
             last_compaction: StatRow::NO_COMPACTION,
             total_compactions: 0,
+            version: 1,
             scanned_at: 1_700_000_001_000,
         }
     }
@@ -496,5 +665,265 @@ mod tests {
         let mut with = sample("y", 1);
         with.last_compaction = 123;
         assert_eq!(with.into_summary().last_compaction, Some(123));
+    }
+}
+
+/// Tests pinning the write-amplification and pagination properties that make
+/// this table survivable at scale. Kept separate from the behavioural tests
+/// above because these assert on *cost*, not correctness, and would otherwise
+/// read as redundant.
+#[cfg(test)]
+mod scale_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn sample(name: &str, rows: i64) -> StatRow {
+        StatRow {
+            name: name.to_string(),
+            uri: format!("/data/{name}.rollout.lance"),
+            row_count: rows,
+            fragment_count: 3,
+            last_updated: 1_700_000_000_000,
+            pending_wal_generations: 0,
+            last_compaction: StatRow::NO_COMPACTION,
+            total_compactions: 0,
+            version: 1,
+            scanned_at: 1_700_000_000_000,
+        }
+    }
+
+    async fn store(dir: &TempDir) -> StatsStore {
+        let uri = dir
+            .path()
+            .join("_stats.lance")
+            .to_string_lossy()
+            .to_string();
+        StatsStore::open_or_create(&uri, None).await.unwrap()
+    }
+
+    /// One scan round must cost a bounded number of Lance versions, independent
+    /// of how many experiments it covers.
+    ///
+    /// The per-row delete+append pattern cost 2 versions *per experiment*: 50
+    /// experiments meant 100 new versions every 300s, ~28,800/day, unbounded.
+    /// Observed in production at version 246,000+ with `GET /experiments`
+    /// degraded to 30-43s, because every open traverses the version chain.
+    #[tokio::test]
+    async fn snapshot_write_costs_one_version_per_round_not_per_experiment() {
+        let dir = TempDir::new().unwrap();
+        let mut s = store(&dir).await;
+
+        const N: usize = 50;
+        let round = |bump: i64| -> Vec<StatRow> {
+            (0..N)
+                .map(|i| sample(&format!("exp-{i}"), i as i64 + bump))
+                .collect()
+        };
+
+        let before = s.version();
+        s.write_snapshot(&round(0)).await.unwrap();
+        s.write_snapshot(&round(1)).await.unwrap();
+        let per_round = (s.version() - before) / 2;
+
+        assert!(
+            per_round <= 2,
+            "a scan round must not cost more than a couple of versions; got {per_round} \
+             (the old delete-then-append path cost 2 per experiment = {} per round)",
+            N * 2
+        );
+
+        // And the table must stay compact: one fragment, not one per row.
+        assert!(
+            s.fragment_count() <= 2,
+            "snapshot write should leave a compact table; got {} fragments",
+            s.fragment_count()
+        );
+    }
+
+    /// A snapshot fully replaces the previous one: no duplicate rows, and
+    /// experiments absent from the new snapshot are gone.
+    ///
+    /// This is what lets the scan drop its separate reconcile-remove pass.
+    #[tokio::test]
+    async fn snapshot_replaces_rather_than_appends() {
+        let dir = TempDir::new().unwrap();
+        let mut s = store(&dir).await;
+
+        s.write_snapshot(&[sample("a", 1), sample("b", 2), sample("c", 3)])
+            .await
+            .unwrap();
+        assert_eq!(s.count(None).await.unwrap(), 3);
+
+        // `b` disappears from the registry; `a` updates.
+        s.write_snapshot(&[sample("a", 10), sample("c", 3)])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            s.count(None).await.unwrap(),
+            2,
+            "a snapshot must replace the table, not append to it"
+        );
+        assert_eq!(s.get("a").await.unwrap().unwrap().row_count, 10);
+        assert!(
+            s.get("b").await.unwrap().is_none(),
+            "an experiment missing from the snapshot must be gone"
+        );
+    }
+
+    /// An empty snapshot is rejected rather than wiping the table.
+    ///
+    /// A scan round where every `observe` failed would otherwise blank the
+    /// stats table, which both empties the UI and stops both auto-sweeps
+    /// (they read this table to decide what to enqueue).
+    #[tokio::test]
+    async fn empty_snapshot_does_not_wipe_the_table() {
+        let dir = TempDir::new().unwrap();
+        let mut s = store(&dir).await;
+        s.write_snapshot(&[sample("a", 1)]).await.unwrap();
+
+        s.write_snapshot(&[]).await.unwrap();
+
+        assert_eq!(
+            s.count(None).await.unwrap(),
+            1,
+            "an empty snapshot must be a no-op, not a wipe"
+        );
+    }
+
+    /// Pagination and threshold filters must be pushed into the scan, not
+    /// applied after materialising every row.
+    ///
+    /// `list` used to read the whole table, sort it in Rust, then
+    /// `.skip(offset).take(limit)`, and both auto-sweeps called it with
+    /// `usize::MAX` to filter in a Rust loop. At tens of thousands of
+    /// experiments that is a full scan per page and per sweep.
+    #[tokio::test]
+    async fn threshold_query_returns_only_matching_rows() {
+        let dir = TempDir::new().unwrap();
+        let mut s = store(&dir).await;
+
+        let mut rows: Vec<StatRow> = (0..20)
+            .map(|i| {
+                let mut r = sample(&format!("exp-{i:02}"), i);
+                r.fragment_count = i; // 0..19
+                r.pending_wal_generations = if i % 5 == 0 { 30 } else { 0 };
+                r
+            })
+            .collect();
+        rows.sort_by(|a, b| a.name.cmp(&b.name));
+        s.write_snapshot(&rows).await.unwrap();
+
+        let compactable = s.list_above_fragment_count(16, 100).await.unwrap();
+        assert_eq!(
+            compactable
+                .iter()
+                .map(|r| r.fragment_count)
+                .collect::<Vec<_>>(),
+            vec![16, 17, 18, 19],
+            "threshold query must return exactly the rows over the threshold"
+        );
+
+        let mergeable = s.list_above_pending_wal(30, 100).await.unwrap();
+        assert_eq!(mergeable.len(), 4, "expected the four rows with 30 pending");
+
+        // The cap must bound how much work one sweep can enqueue.
+        let capped = s.list_above_fragment_count(16, 2).await.unwrap();
+        assert_eq!(capped.len(), 2, "limit must bound the result set");
+    }
+
+    #[tokio::test]
+    async fn list_paginates_deterministically() {
+        let dir = TempDir::new().unwrap();
+        let mut s = store(&dir).await;
+        let rows: Vec<StatRow> = (0..10).map(|i| sample(&format!("exp-{i:02}"), i)).collect();
+        s.write_snapshot(&rows).await.unwrap();
+
+        let page1 = s.list(None, 3, 0).await.unwrap();
+        let page2 = s.list(None, 3, 3).await.unwrap();
+        assert_eq!(
+            page1.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            vec!["exp-00", "exp-01", "exp-02"]
+        );
+        assert_eq!(
+            page2.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            vec!["exp-03", "exp-04", "exp-05"]
+        );
+    }
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use tempfile::TempDir;
+
+    /// A `_stats` table written before the `version` column existed must still
+    /// be readable, and the first snapshot must migrate it forward.
+    ///
+    /// Without this, an upgrade fails on every read until the table happens to
+    /// be rewritten -- and the read path is what the UI and both auto-sweeps
+    /// use, so the master would come up blind.
+    #[tokio::test]
+    async fn table_without_version_column_is_readable_and_migrates() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir
+            .path()
+            .join("_stats.lance")
+            .to_string_lossy()
+            .to_string();
+
+        // Build a table with the pre-`version` schema.
+        let legacy_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("uri", DataType::Utf8, false),
+            Field::new("row_count", DataType::Int64, false),
+            Field::new("fragment_count", DataType::Int64, false),
+            Field::new("last_updated", DataType::Int64, false),
+            Field::new("pending_wal_generations", DataType::Int64, false),
+            Field::new("last_compaction", DataType::Int64, false),
+            Field::new("total_compactions", DataType::Int64, false),
+            Field::new("scanned_at", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            legacy_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["old-exp"])),
+                Arc::new(StringArray::from(vec!["/data/old-exp.lance"])),
+                Arc::new(Int64Array::from(vec![42i64])),
+                Arc::new(Int64Array::from(vec![7i64])),
+                Arc::new(Int64Array::from(vec![1_700_000_000_000i64])),
+                Arc::new(Int64Array::from(vec![3i64])),
+                Arc::new(Int64Array::from(vec![-1i64])),
+                Arc::new(Int64Array::from(vec![0i64])),
+                Arc::new(Int64Array::from(vec![1_700_000_000_000i64])),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), legacy_schema);
+        Dataset::write(reader, &uri, None).await.unwrap();
+
+        // Reading must succeed and report the sentinel, not error.
+        let mut s = StatsStore::open_or_create(&uri, None).await.unwrap();
+        let rows = s.list(None, 10, 0).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "old-exp");
+        assert_eq!(
+            rows[0].version,
+            StatRow::UNKNOWN_VERSION,
+            "a pre-migration row must read as version-unknown, forcing one full observation"
+        );
+        assert_eq!(rows[0].row_count, 42, "existing data must survive");
+
+        // The first snapshot rewrites the table with the new schema.
+        let mut migrated = rows[0].clone();
+        migrated.version = 11;
+        s.write_snapshot(&[migrated]).await.unwrap();
+
+        let after = s.list(None, 10, 0).await.unwrap();
+        assert_eq!(
+            after[0].version, 11,
+            "the snapshot must persist the version"
+        );
     }
 }

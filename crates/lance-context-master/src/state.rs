@@ -43,6 +43,24 @@ pub struct MasterState {
     pub task_store: TaskStore,
     /// Shared HTTP client for fanning `MergeWal` tasks out to worker endpoints.
     pub http: reqwest::Client,
+    /// Whether this process has already run one `_stats` maintenance pass.
+    ///
+    /// The first pass runs without a timeout so a deployment carrying a version
+    /// chain from the old per-row write path can actually reclaim it; a bounded
+    /// first pass times out forever and never recovers. See
+    /// [`crate::scanner::maintain_stats`].
+    pub stats_maintenance_done: std::sync::atomic::AtomicBool,
+    /// Consecutive `_stats` maintenance failures, for alerting.
+    ///
+    /// Failure was previously silent: the success counter simply stopped
+    /// incrementing, which is indistinguishable from "nothing to reclaim".
+    pub stats_maintenance_failures: std::sync::atomic::AtomicU64,
+    /// `_stats` version at the last successful maintenance pass.
+    ///
+    /// The gap between this and the current version is how many versions are
+    /// going unreclaimed -- the number worth alerting on. The raw version
+    /// number is not: it climbs by design and says nothing about disk usage.
+    pub stats_last_reclaimed_version: std::sync::atomic::AtomicU64,
 }
 
 impl MasterState {
@@ -80,6 +98,9 @@ impl MasterState {
             config,
             task_store,
             http: reqwest::Client::new(),
+            stats_maintenance_done: std::sync::atomic::AtomicBool::new(false),
+            stats_maintenance_failures: std::sync::atomic::AtomicU64::new(0),
+            stats_last_reclaimed_version: std::sync::atomic::AtomicU64::new(0),
         });
         Ok(state)
     }
@@ -133,6 +154,7 @@ mod tests {
             scan_concurrency: 4,
             stats_maintenance_every_n_scans: 0,
             stats_history_ttl_secs: 3_600,
+            stats_cold_retire_secs: 0,
             compaction_interval_secs: 0,
             min_fragments: 16,
             target_rows_per_fragment: 1_048_576,

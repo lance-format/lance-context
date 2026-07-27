@@ -218,6 +218,61 @@ fn describe_metrics() {
         "master_experiments",
         "Live experiments seen by the last scan."
     );
+
+    // `_stats` table upkeep. The alerting signal is
+    // `master_stats_unreclaimed_versions` (and consecutive failures), not
+    // `master_stats_version`: the version number climbs by design and says
+    // nothing about disk usage, while unreclaimed versions are manifests still
+    // sitting on storage.
+    describe_histogram!(
+        "master_stats_maintenance_duration_seconds",
+        Unit::Seconds,
+        "One _stats maintenance pass (compaction plus old-version cleanup)."
+    );
+    describe_counter!(
+        "master_stats_versions_removed_total",
+        "Old _stats manifest versions physically reclaimed by cleanup."
+    );
+    describe_counter!(
+        "master_stats_maintenance_failures_total",
+        "Failed _stats maintenance passes."
+    );
+    describe_gauge!(
+        "master_stats_version",
+        "Current _stats Lance version number. Monotonic by design; not an alerting signal."
+    );
+    describe_gauge!(
+        "master_stats_maintenance_consecutive_failures",
+        "Consecutive failed _stats maintenance passes; 0 after any success."
+    );
+    describe_gauge!(
+        "master_stats_unreclaimed_versions",
+        "_stats versions created since the last successful maintenance pass. \
+         Sustained growth means old manifests are accumulating on storage."
+    );
+    describe_gauge!(
+        "master_stats_hot_experiments",
+        "Experiments currently held in the stats table. Bounded by retirement, \
+         unlike the registry, which lists every experiment ever created."
+    );
+    describe_gauge!(
+        "master_scan_experiments_skipped",
+        "Experiments a scan round skipped because their base version had not moved. \
+         A ratio near 1 of total is the healthy state at scale."
+    );
+    describe_gauge!(
+        "master_scan_experiments_observed",
+        "Experiments a scan round observed in full."
+    );
+    describe_counter!(
+        "master_stats_experiments_retired_total",
+        "Cold experiments merged, compacted, verified quiescent, and dropped from \
+         the stats table."
+    );
+    describe_counter!(
+        "master_stats_retire_failures_total",
+        "Retirement attempts that failed; the experiment stays in the table and retries."
+    );
     describe_gauge!(
         "master_rollout_rows",
         "Total rollout rows across all experiments as of the last scan."

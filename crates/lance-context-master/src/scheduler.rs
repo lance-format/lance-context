@@ -36,6 +36,14 @@ use crate::state::MasterState;
 use crate::stats_store::StatRow;
 use crate::task_store::TaskClaim;
 
+/// Maximum tasks a single auto-sweep may enqueue.
+///
+/// Previously unbounded: a sweep read the whole stats table and enqueued one
+/// task per row over the threshold, so at tens of thousands of experiments a
+/// single tick could flood the queue. Capping keeps each tick's work bounded;
+/// anything still over the threshold is picked up by the next tick.
+const MAX_SWEEP_ENQUEUE: usize = 256;
+
 /// Build the [`CompactionConfig`] the scheduler applies, from master config.
 pub fn compaction_config(state: &MasterState) -> CompactionConfig {
     CompactionConfig {
@@ -339,6 +347,7 @@ async fn update_stats_after_compaction(state: &Arc<MasterState>, name: &str, sto
         last_compaction: Utc::now().timestamp_millis(),
         total_compactions: prev_total + 1,
         scanned_at: Utc::now().timestamp_millis(),
+        version: obs.version as i64,
     };
     if let Err(e) = stats.upsert(&row).await {
         tracing::warn!(store = %name, error = %e, "post-compaction stats upsert failed");
@@ -375,13 +384,20 @@ async fn sweep_candidates_inner(state: &Arc<MasterState>) -> lance::Result<usize
     if in_quiet_hours(&config) {
         return Ok(0);
     }
-    let rows = state.stats.lock().await.list(None, usize::MAX, 0).await?;
+    // Threshold pushed into the scan and capped, rather than reading the whole
+    // stats table and filtering in this loop. At tens of thousands of
+    // experiments the full read dominated every sweep, and the enqueue count
+    // was unbounded.
+    let rows = state
+        .stats
+        .lock()
+        .await
+        .list_above_fragment_count(config.min_fragments, MAX_SWEEP_ENQUEUE)
+        .await?;
     let mut queued = 0;
     for row in rows {
-        if row.fragment_count as usize >= config.min_fragments {
-            enqueue(state, TaskKind::Compact, &row.name).await?;
-            queued += 1;
-        }
+        enqueue(state, TaskKind::Compact, &row.name).await?;
+        queued += 1;
     }
     Ok(queued)
 }
@@ -422,13 +438,17 @@ pub async fn sweep_merge_wal_candidates(state: &Arc<MasterState>) -> lance::Resu
 
 async fn sweep_merge_wal_inner(state: &Arc<MasterState>) -> lance::Result<usize> {
     let threshold = state.config.merge_wal_min_generations;
-    let rows = state.stats.lock().await.list(None, usize::MAX, 0).await?;
+    // See `sweep_candidates_inner`: predicate pushed down, enqueue capped.
+    let rows = state
+        .stats
+        .lock()
+        .await
+        .list_above_pending_wal(threshold, MAX_SWEEP_ENQUEUE)
+        .await?;
     let mut queued = 0;
     for row in rows {
-        if row.pending_wal_generations >= threshold {
-            enqueue(state, TaskKind::MergeWal, &row.name).await?;
-            queued += 1;
-        }
+        enqueue(state, TaskKind::MergeWal, &row.name).await?;
+        queued += 1;
     }
     Ok(queued)
 }
@@ -535,6 +555,7 @@ mod tests {
             scan_concurrency: 4,
             stats_maintenance_every_n_scans: 0,
             stats_history_ttl_secs: 3_600,
+            stats_cold_retire_secs: 0,
             compaction_interval_secs: 0,
             // Low threshold so a handful of appends crosses it.
             min_fragments: 2,
@@ -814,6 +835,7 @@ mod tests {
         let state = MasterState::new(cfg).await.unwrap();
 
         let seed = |name: &str, pending: i64| StatRow {
+            version: StatRow::UNKNOWN_VERSION,
             name: name.to_string(),
             uri: state.rollout_uri(name),
             row_count: 0,

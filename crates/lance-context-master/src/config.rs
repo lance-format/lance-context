@@ -41,6 +41,22 @@ pub struct MasterConfig {
     #[arg(long, env = "STATS_HISTORY_TTL_SECS", default_value_t = 3_600)]
     pub stats_history_ttl_secs: u64,
 
+    /// Age, in seconds, after which an experiment with no writes is retired
+    /// from the stats table. `0` disables retirement (every known experiment
+    /// stays in the table forever).
+    ///
+    /// Retirement is what keeps the stats table proportional to *active* work
+    /// rather than to everything ever created. A retired experiment is still
+    /// listed in the registry and is observed on demand; it simply stops
+    /// costing a row and an open on every scan round.
+    ///
+    /// Before an experiment is retired its MemWAL generations are merged and
+    /// its fragments compacted, so it is left in a state that needs no further
+    /// maintenance — which is what makes it safe for the sweeps to stop looking
+    /// at it. See `scanner::retire_cold_experiments`.
+    #[arg(long, env = "STATS_COLD_RETIRE_SECS", default_value_t = 604_800)]
+    pub stats_cold_retire_secs: u64,
+
     /// Interval, in seconds, between automatic compaction sweeps. `0` disables
     /// automatic compaction (manual triggers still work).
     #[arg(long, env = "COMPACTION_INTERVAL_SECS", default_value_t = 600)]
