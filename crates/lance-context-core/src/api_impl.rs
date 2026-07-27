@@ -3,14 +3,23 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use lance_context_api::{
-    AddRecordRequest, AddRecordsResponse, AddRolloutRequest, AddRolloutsResponse, CompactRequest,
-    CompactResponse, CompactStatsResponse, ContextError, ContextResult, ContextStoreApi,
-    DeleteRecordResponse, RecordDto, RecordPatchDto, RelationshipDto, RetrieveRequest,
-    RetrieveResultDto, RolloutRecordDto, RolloutStoreApi, SearchRequest, SearchResultDto,
-    StateMetadataDto, UpdateRecordRequest, UpdateRecordResponse, UpsertRecordRequest,
-    UpsertRecordResponse, UpsertRecordsRequest, UpsertRecordsResponse, UpsertResultDto,
+    AddDatagenEventsResponse, AddRecordRequest, AddRecordsResponse, AddRolloutRequest,
+    AddRolloutsResponse, CompactRequest, CompactResponse, CompactStatsResponse, ContextError,
+    ContextResult, ContextStoreApi, DatagenEventDto, DatagenFailureDto, DatagenFieldStateDto,
+    DatagenRootItemStatusesResponse, DatagenStepCursorDto, DatagenStoreApi, DatagenValueDto,
+    DeleteRecordResponse, FoldedDatagenItemDto, RecordDto, RecordPatchDto, RelationshipDto,
+    RetrieveRequest, RetrieveResultDto, RolloutRecordDto, RolloutStoreApi, SearchRequest,
+    SearchResultDto, StateMetadataDto, UpdateRecordRequest, UpdateRecordResponse,
+    UpsertRecordRequest, UpsertRecordResponse, UpsertRecordsRequest, UpsertRecordsResponse,
+    UpsertResultDto,
 };
 
+use crate::datagen::{
+    DatagenBlobValue, DatagenEvent, DatagenEventType, DatagenFailure, DatagenFieldState,
+    DatagenItemLookup, DatagenItemStatus, DatagenRootItemStatuses, DatagenStepCursor,
+    DatagenStepKind, DatagenValue, FoldedDatagenItem,
+};
+use crate::datagen_store::DatagenStore;
 use crate::record::{
     ContextRecord, LifecycleQueryOptions, RecordFilters, RecordPatch, Relationship, StateMetadata,
     LIFECYCLE_ACTIVE,
@@ -676,5 +685,255 @@ fn to_ctx_err(err: lance::Error) -> ContextError {
         ContextError::InvalidRequest(msg)
     } else {
         ContextError::Internal(msg)
+    }
+}
+
+impl DatagenStoreApi for DatagenStore {
+    async fn append(
+        &mut self,
+        events: &[DatagenEventDto],
+    ) -> ContextResult<AddDatagenEventsResponse> {
+        let core = datagen_events_from_dtos(events)?;
+        let count = core.len();
+        let version = DatagenStore::append(self, &core)
+            .await
+            .map_err(to_ctx_err)?;
+        Ok(AddDatagenEventsResponse { version, count })
+    }
+
+    async fn append_checkpoint(
+        &mut self,
+        events: &[DatagenEventDto],
+    ) -> ContextResult<AddDatagenEventsResponse> {
+        let core = datagen_events_from_dtos(events)?;
+        let count = core.len();
+        let version = DatagenStore::append_checkpoint(self, &core)
+            .await
+            .map_err(to_ctx_err)?;
+        Ok(AddDatagenEventsResponse { version, count })
+    }
+
+    async fn fold_item(&self, item_id: &str) -> ContextResult<Option<FoldedDatagenItemDto>> {
+        let lookup = DatagenStore::fold_item(self, item_id)
+            .await
+            .map_err(to_ctx_err)?;
+        Ok(match lookup {
+            DatagenItemLookup::NeverStarted => None,
+            DatagenItemLookup::Found(item) => Some(folded_item_to_dto(&item)),
+        })
+    }
+
+    async fn root_item_statuses(
+        &self,
+        root_item_ids: &[String],
+    ) -> ContextResult<DatagenRootItemStatusesResponse> {
+        let ids: Vec<&str> = root_item_ids.iter().map(String::as_str).collect();
+        let statuses = DatagenStore::root_item_statuses(self, &ids)
+            .await
+            .map_err(to_ctx_err)?;
+        Ok(root_item_statuses_to_dto(&statuses))
+    }
+
+    async fn item_failures(&self, item_id: &str) -> ContextResult<Vec<DatagenFailureDto>> {
+        let failures = DatagenStore::item_failures(self, item_id)
+            .await
+            .map_err(to_ctx_err)?;
+        Ok(failures.iter().map(failure_to_dto).collect())
+    }
+
+    async fn get_blob(&self, event_id: &str) -> ContextResult<Option<Vec<u8>>> {
+        DatagenStore::get_blob(self, event_id)
+            .await
+            .map_err(to_ctx_err)
+    }
+
+    fn version(&self) -> u64 {
+        DatagenStore::version(self)
+    }
+}
+
+fn datagen_events_from_dtos(events: &[DatagenEventDto]) -> ContextResult<Vec<DatagenEvent>> {
+    events.iter().map(datagen_event_from_dto).collect()
+}
+
+fn datagen_event_from_dto(dto: &DatagenEventDto) -> ContextResult<DatagenEvent> {
+    let event_type =
+        DatagenEventType::parse(&dto.event_type).map_err(ContextError::InvalidRequest)?;
+    let step_kind = dto
+        .step_kind
+        .as_deref()
+        .map(DatagenStepKind::parse)
+        .transpose()
+        .map_err(ContextError::InvalidRequest)?;
+    let status = dto
+        .status
+        .as_deref()
+        .map(DatagenItemStatus::parse)
+        .transpose()
+        .map_err(ContextError::InvalidRequest)?;
+    let value = dto.value.as_ref().map(datagen_value_from_dto).transpose()?;
+    Ok(DatagenEvent {
+        event_id: dto.event_id.clone(),
+        item_id: dto.item_id.clone(),
+        root_item_id: dto.root_item_id.clone(),
+        parent_item_id: dto.parent_item_id.clone(),
+        item_seq: dto.item_seq,
+        checkpoint_id: dto.checkpoint_id.clone(),
+        event_type,
+        step_name: dto.step_name.clone(),
+        step_kind,
+        step_index: dto.step_index,
+        enclosing_step: dto.enclosing_step.clone(),
+        selector_step: dto.selector_step.clone(),
+        attempt: dto.attempt,
+        run_id: dto.run_id.clone(),
+        writer_epoch: dto.writer_epoch.clone(),
+        field_name: dto.field_name.clone(),
+        field_type: dto.field_type.clone(),
+        codec_version: dto.codec_version,
+        value,
+        query_tags: dto.query_tags.clone(),
+        status,
+        error_type: dto.error_type.clone(),
+        error_dump: dto.error_dump.clone(),
+        traceback: dto.traceback.clone(),
+        event_ts: dto.event_ts.unwrap_or_else(Utc::now),
+        schema_version: dto.schema_version,
+    })
+}
+
+fn datagen_value_from_dto(dto: &DatagenValueDto) -> ContextResult<DatagenValue> {
+    let missing = || {
+        ContextError::InvalidRequest(format!(
+            "datagen value of kind '{}' is missing 'value'",
+            dto.kind
+        ))
+    };
+    match dto.kind.as_str() {
+        "int" => Ok(DatagenValue::Int(
+            dto.value
+                .as_ref()
+                .and_then(Value::as_i64)
+                .ok_or_else(missing)?,
+        )),
+        "float" => Ok(DatagenValue::Float(
+            dto.value
+                .as_ref()
+                .and_then(Value::as_f64)
+                .ok_or_else(missing)?,
+        )),
+        "bool" => Ok(DatagenValue::Bool(
+            dto.value
+                .as_ref()
+                .and_then(Value::as_bool)
+                .ok_or_else(missing)?,
+        )),
+        "str" => Ok(DatagenValue::Str(
+            dto.value
+                .as_ref()
+                .and_then(Value::as_str)
+                .ok_or_else(missing)?
+                .to_string(),
+        )),
+        "json" => Ok(DatagenValue::Json(dto.value.clone().ok_or_else(missing)?)),
+        "blob" => Ok(DatagenValue::Blob(DatagenBlobValue {
+            bytes: dto.bytes.clone(),
+            size: dto
+                .size
+                .unwrap_or_else(|| dto.bytes.as_ref().map(|b| b.len() as i64).unwrap_or(0)),
+            checksum: dto.checksum.clone(),
+        })),
+        other => Err(ContextError::InvalidRequest(format!(
+            "unsupported datagen value kind '{other}'"
+        ))),
+    }
+}
+
+fn datagen_value_to_dto(value: &DatagenValue) -> DatagenValueDto {
+    let mut dto = DatagenValueDto {
+        kind: value.kind().to_string(),
+        value: None,
+        bytes: None,
+        size: None,
+        checksum: None,
+    };
+    match value {
+        DatagenValue::Int(inner) => dto.value = Some(Value::from(*inner)),
+        DatagenValue::Float(inner) => dto.value = Some(Value::from(*inner)),
+        DatagenValue::Bool(inner) => dto.value = Some(Value::from(*inner)),
+        DatagenValue::Str(inner) => dto.value = Some(Value::from(inner.clone())),
+        DatagenValue::Json(inner) => dto.value = Some(inner.clone()),
+        DatagenValue::Blob(blob) => {
+            dto.bytes = blob.bytes.clone();
+            dto.size = Some(blob.size);
+            dto.checksum = blob.checksum.clone();
+        }
+    }
+    dto
+}
+
+fn folded_item_to_dto(item: &FoldedDatagenItem) -> FoldedDatagenItemDto {
+    FoldedDatagenItemDto {
+        item_id: item.item_id.to_string(),
+        root_item_id: item.root_item_id.to_string(),
+        parent_item_id: item.parent_item_id.as_ref().map(ToString::to_string),
+        status: item.status.as_str().to_string(),
+        last_item_seq: item.last_item_seq,
+        last_attempt: item.last_attempt,
+        fields: item
+            .fields
+            .iter()
+            .map(|(name, state)| (name.clone(), field_state_to_dto(state)))
+            .collect(),
+        trajectory: item.trajectory.ordered.iter().map(cursor_to_dto).collect(),
+        query_tags: item.query_tags.clone(),
+    }
+}
+
+fn field_state_to_dto(state: &DatagenFieldState) -> DatagenFieldStateDto {
+    match state {
+        DatagenFieldState::Set(value) => DatagenFieldStateDto {
+            mode: "set".to_string(),
+            value: Some(datagen_value_to_dto(value)),
+            values: Vec::new(),
+        },
+        DatagenFieldState::Appended(values) => DatagenFieldStateDto {
+            mode: "append".to_string(),
+            value: None,
+            values: values.iter().map(datagen_value_to_dto).collect(),
+        },
+    }
+}
+
+fn cursor_to_dto(cursor: &DatagenStepCursor) -> DatagenStepCursorDto {
+    DatagenStepCursorDto {
+        step_name: cursor.position.step.name.clone(),
+        step_kind: cursor.position.step.kind.as_str().to_string(),
+        step_index: cursor.position.index,
+        enclosing_step: cursor.position.enclosing.clone(),
+        selector_step: cursor.position.selector.clone(),
+        item_seq: cursor.item_seq,
+    }
+}
+
+fn root_item_statuses_to_dto(
+    statuses: &DatagenRootItemStatuses,
+) -> DatagenRootItemStatusesResponse {
+    DatagenRootItemStatusesResponse {
+        statuses: statuses
+            .iter()
+            .map(|(id, status)| (id.clone(), status.as_str().to_string()))
+            .collect(),
+    }
+}
+
+fn failure_to_dto(failure: &DatagenFailure) -> DatagenFailureDto {
+    DatagenFailureDto {
+        at: cursor_to_dto(&failure.at),
+        run_id: failure.run_id.clone(),
+        attempt: failure.attempt,
+        error_type: failure.error.error_type.clone(),
+        error_dump: failure.error.error_dump.clone(),
+        traceback: failure.error.traceback.clone(),
     }
 }
