@@ -72,11 +72,17 @@ pub async fn maintain_stats(state: &Arc<MasterState>) -> lance::Result<()> {
 
     match outcome {
         Ok((compaction, removal)) => {
+            state.stats_maintenance_failures.store(0, Ordering::Relaxed);
+            state
+                .stats_last_reclaimed_version
+                .store(stats.version(), Ordering::Relaxed);
             metrics::histogram!("master_stats_maintenance_duration_seconds")
                 .record(start.elapsed().as_secs_f64());
             metrics::counter!("master_stats_versions_removed_total")
                 .increment(removal.old_versions);
             metrics::gauge!("master_stats_version").set(stats.version() as f64);
+            metrics::gauge!("master_stats_maintenance_consecutive_failures").set(0.0);
+            metrics::gauge!("master_stats_unreclaimed_versions").set(0.0);
             tracing::info!(
                 fragments_removed = compaction.fragments_removed,
                 fragments_added = compaction.fragments_added,
@@ -87,7 +93,39 @@ pub async fn maintain_stats(state: &Arc<MasterState>) -> lance::Result<()> {
             );
             Ok(())
         }
-        Err(e) => Err(e),
+        Err(e) => {
+            // Failure was previously silent: `master_stats_versions_removed_total`
+            // only moves on success, so a maintenance pass that kept failing
+            // (object-store outage, permissions, a genuinely stuck compaction)
+            // showed up as a counter that stopped incrementing -- indistinguishable
+            // from "nothing to reclaim". Meanwhile versions accumulate again and
+            // the table walks back toward the state this whole path exists to
+            // prevent.
+            //
+            // Export the two things worth alerting on. Note the raw version
+            // *number* is not one of them: it climbs by design and says nothing
+            // about disk. What matters is how many versions have gone unreclaimed
+            // since the last successful pass.
+            let failures = state
+                .stats_maintenance_failures
+                .fetch_add(1, Ordering::Relaxed)
+                + 1;
+            let last_reclaimed = state.stats_last_reclaimed_version.load(Ordering::Relaxed);
+            let unreclaimed = stats.version().saturating_sub(last_reclaimed);
+
+            metrics::counter!("master_stats_maintenance_failures_total").increment(1);
+            metrics::gauge!("master_stats_maintenance_consecutive_failures").set(failures as f64);
+            metrics::gauge!("master_stats_unreclaimed_versions").set(unreclaimed as f64);
+
+            tracing::warn!(
+                error = %e,
+                consecutive_failures = failures,
+                unreclaimed_versions = unreclaimed,
+                version = stats.version(),
+                "stats maintenance failed; old manifests are not being reclaimed"
+            );
+            Err(e)
+        }
     }
 }
 
@@ -305,4 +343,75 @@ pub fn spawn_scanner(state: &Arc<MasterState>) -> Option<JoinHandle<()>> {
             }
         }
     }))
+}
+
+#[cfg(test)]
+mod maintenance_alerting_tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Mirrors the failure bookkeeping in `maintain_stats`, which cannot be
+    /// exercised directly without an etcd-backed `MasterState`.
+    ///
+    /// The property under test: a failing maintenance pass must leave a signal.
+    /// Previously it left none -- `master_stats_versions_removed_total` only
+    /// moves on success, so a pass failing for days looked exactly like a pass
+    /// with nothing to reclaim, while manifests piled back up.
+    struct Bookkeeping {
+        failures: AtomicU64,
+        last_reclaimed_version: AtomicU64,
+    }
+
+    impl Bookkeeping {
+        fn new() -> Self {
+            Self {
+                failures: AtomicU64::new(0),
+                last_reclaimed_version: AtomicU64::new(0),
+            }
+        }
+
+        fn on_success(&self, version: u64) -> (u64, u64) {
+            self.failures.store(0, Ordering::Relaxed);
+            self.last_reclaimed_version
+                .store(version, Ordering::Relaxed);
+            (0, 0)
+        }
+
+        fn on_failure(&self, version: u64) -> (u64, u64) {
+            let failures = self.failures.fetch_add(1, Ordering::Relaxed) + 1;
+            let unreclaimed =
+                version.saturating_sub(self.last_reclaimed_version.load(Ordering::Relaxed));
+            (failures, unreclaimed)
+        }
+    }
+
+    #[test]
+    fn failures_accumulate_and_reset_on_success() {
+        let b = Bookkeeping::new();
+
+        // A first success establishes the reclaim watermark.
+        assert_eq!(b.on_success(10), (0, 0));
+
+        // Each subsequent failure raises the consecutive count, and the
+        // unreclaimed gap tracks versions written since that watermark.
+        assert_eq!(b.on_failure(11), (1, 1));
+        assert_eq!(b.on_failure(12), (2, 2));
+        assert_eq!(b.on_failure(20), (3, 10));
+
+        // One success clears both signals.
+        assert_eq!(b.on_success(20), (0, 0));
+        assert_eq!(b.on_failure(21), (1, 1));
+    }
+
+    /// The watermark starts at 0, so failures before any successful pass still
+    /// report a non-zero gap rather than silently reporting "nothing pending".
+    #[test]
+    fn failure_before_first_success_still_reports_a_gap() {
+        let b = Bookkeeping::new();
+        let (failures, unreclaimed) = b.on_failure(246_000);
+        assert_eq!(failures, 1);
+        assert_eq!(
+            unreclaimed, 246_000,
+            "a bloated table that has never been reclaimed must report its full backlog"
+        );
+    }
 }

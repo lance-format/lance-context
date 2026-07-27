@@ -50,6 +50,17 @@ pub struct MasterState {
     /// first pass times out forever and never recovers. See
     /// [`crate::scanner::maintain_stats`].
     pub stats_maintenance_done: std::sync::atomic::AtomicBool,
+    /// Consecutive `_stats` maintenance failures, for alerting.
+    ///
+    /// Failure was previously silent: the success counter simply stopped
+    /// incrementing, which is indistinguishable from "nothing to reclaim".
+    pub stats_maintenance_failures: std::sync::atomic::AtomicU64,
+    /// `_stats` version at the last successful maintenance pass.
+    ///
+    /// The gap between this and the current version is how many versions are
+    /// going unreclaimed -- the number worth alerting on. The raw version
+    /// number is not: it climbs by design and says nothing about disk usage.
+    pub stats_last_reclaimed_version: std::sync::atomic::AtomicU64,
 }
 
 impl MasterState {
@@ -88,6 +99,8 @@ impl MasterState {
             task_store,
             http: reqwest::Client::new(),
             stats_maintenance_done: std::sync::atomic::AtomicBool::new(false),
+            stats_maintenance_failures: std::sync::atomic::AtomicU64::new(0),
+            stats_last_reclaimed_version: std::sync::atomic::AtomicU64::new(0),
         });
         Ok(state)
     }
