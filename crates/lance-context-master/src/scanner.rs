@@ -173,16 +173,32 @@ async fn scan_once_inner(state: &Arc<MasterState>) -> lance::Result<usize> {
     let live: HashSet<String> = entries.iter().map(|e| e.name.clone()).collect();
     let concurrency = state.config.scan_concurrency.max(1);
 
-    // Observe experiments concurrently (bounded), preserving prior compaction
-    // counters by reading the existing stats row first. `None` means this round
-    // could not observe that experiment; its previous row is carried over below
+    // Read the previous snapshot once, up front. Each experiment's row supplies
+    // both its last observed version (to decide whether a full observation is
+    // needed) and its compaction counters (which are carried forward). This
+    // used to be a `stats.get()` per experiment, taking the stats lock once per
+    // experiment per round.
+    let previous: HashMap<String, StatRow> = {
+        let mut stats = state.stats.lock().await;
+        stats
+            .list(None, usize::MAX, 0)
+            .await?
+            .into_iter()
+            .map(|row| (row.name.clone(), row))
+            .collect()
+    };
+    let previous = Arc::new(previous);
+
+    // Observe experiments concurrently (bounded). `None` means this round could
+    // not observe that experiment; its previous row is carried over below
     // rather than dropped.
-    let observed: Vec<(String, Option<StatRow>)> = stream::iter(entries)
+    let observed: Vec<(String, Option<(StatRow, bool)>)> = stream::iter(entries)
         .map(|entry| {
-            let state = state.clone();
+            let previous = previous.clone();
             async move {
-                match observe_one(&state, &entry.name, &entry.uri).await {
-                    Ok(row) => (entry.name, Some(row)),
+                let prev = previous.get(&entry.name);
+                match observe_one(&entry.name, &entry.uri, prev).await {
+                    Ok(result) => (entry.name, Some(result)),
                     Err(e) => {
                         tracing::warn!(store = %entry.name, error = %e, "scan: observe failed");
                         (entry.name, None)
@@ -195,6 +211,10 @@ async fn scan_once_inner(state: &Arc<MasterState>) -> lance::Result<usize> {
         .await;
 
     let count = observed.iter().filter(|(_, row)| row.is_some()).count();
+    let skipped = observed
+        .iter()
+        .filter(|(_, row)| matches!(row, Some((_, true))))
+        .count();
 
     let mut stats = state.stats.lock().await;
 
@@ -206,16 +226,12 @@ async fn scan_once_inner(state: &Arc<MasterState>) -> lance::Result<usize> {
     // An experiment this round failed to observe keeps its previous row, so a
     // transient storage error does not blank it from the UI or, worse, hide it
     // from the compaction and WAL-merge sweeps that read this table.
-    let previous = stats.list(None, usize::MAX, 0).await?;
-    let mut carry_over: HashMap<String, StatRow> = previous
-        .into_iter()
-        .map(|row| (row.name.clone(), row))
-        .collect();
+    let mut carry_over = (*previous).clone();
 
     let mut snapshot: Vec<StatRow> = Vec::with_capacity(observed.len());
     for (name, row) in observed {
         match row {
-            Some(row) => snapshot.push(row),
+            Some((row, _skipped)) => snapshot.push(row),
             None => {
                 if let Some(stale) = carry_over.remove(&name) {
                     snapshot.push(stale);
@@ -241,6 +257,18 @@ async fn scan_once_inner(state: &Arc<MasterState>) -> lance::Result<usize> {
     }
 
     metrics::histogram!("master_scan_duration_seconds").record(scan_start.elapsed().as_secs_f64());
+    // How much of the round was avoided by the version check. A ratio near 1 is
+    // the healthy state at scale: most experiments are cold and cost only an
+    // open. A ratio trending to 0 means the incremental path is not engaging --
+    // usually a stats table that keeps losing its rows.
+    metrics::gauge!("master_scan_experiments_skipped").set(skipped as f64);
+    metrics::gauge!("master_scan_experiments_observed").set((count - skipped) as f64);
+    tracing::debug!(
+        total = count,
+        skipped,
+        observed = count - skipped,
+        "scan round complete"
+    );
     // Named without a `_total` suffix: these are gauges (current value), and
     // `_total` is the counter convention. Datadog's OpenMetrics check infers
     // type from the name, so `_total` on a gauge was being ingested as a
@@ -258,10 +286,29 @@ async fn scan_once_inner(state: &Arc<MasterState>) -> lance::Result<usize> {
     Ok(count)
 }
 
-/// Open one experiment read-only, observe it, and build its stats row. Preserves
-/// `last_compaction`/`total_compactions` from any existing stats row. Returns
-/// an error on open/observe failure or timeout.
-async fn observe_one(state: &Arc<MasterState>, name: &str, uri: &str) -> lance::Result<StatRow> {
+/// Open one experiment read-only and refresh its stats row, skipping the
+/// expensive observation when nothing can have changed.
+///
+/// `previous` is the row from the last scan, if any.
+///
+/// # Why the version check pays for itself
+///
+/// Opening the dataset reads its manifest, which already carries the current
+/// version — so comparing it against the last observed version is free. If they
+/// match, no write has landed since, and every derived metric (`row_count`,
+/// `fragment_count`, `pending_wal_generations`) is necessarily unchanged. The
+/// previous row is then reused verbatim.
+///
+/// What that skips is the whole cost of `observe`: listing every MemWAL shard
+/// and reading its manifest, opening each flushed generation to count pending
+/// rows, and a `count_rows` over the base table. At tens of thousands of
+/// experiments, almost all of them cold, that is the difference between a scan
+/// that finishes inside its interval and one that never does.
+async fn observe_one(
+    name: &str,
+    uri: &str,
+    previous: Option<&StatRow>,
+) -> lance::Result<(StatRow, bool)> {
     let opts = RolloutStoreOptions::default();
     let open = RolloutStore::open_existing_with_options(uri, opts);
     let store = match tokio::time::timeout(OBSERVE_TIMEOUT, open).await {
@@ -273,6 +320,18 @@ async fn observe_one(state: &Arc<MasterState>, name: &str, uri: &str) -> lance::
             )))
         }
     };
+
+    // Free: the manifest is already in hand from the open above.
+    let current_version = store.version() as i64;
+    if let Some(prev) = previous {
+        if prev.version != StatRow::UNKNOWN_VERSION && prev.version == current_version {
+            let mut row = prev.clone();
+            row.uri = uri.to_string();
+            row.scanned_at = Utc::now().timestamp_millis();
+            return Ok((row, true));
+        }
+    }
+
     let obs = match tokio::time::timeout(OBSERVE_TIMEOUT, store.observe()).await {
         Ok(Ok(obs)) => obs,
         Ok(Err(e)) => return Err(e),
@@ -283,33 +342,41 @@ async fn observe_one(state: &Arc<MasterState>, name: &str, uri: &str) -> lance::
         }
     };
 
-    // Carry compaction counters forward across scans.
-    let (last_compaction, total_compactions) = {
-        let mut stats = state.stats.lock().await;
-        match stats.get(name).await {
-            Ok(Some(prev)) => (prev.last_compaction, prev.total_compactions),
-            _ => (StatRow::NO_COMPACTION, 0),
-        }
-    };
+    // Carry compaction counters forward across scans. Taken from the caller's
+    // snapshot rather than a per-experiment `stats.get()`, which used to take
+    // the stats lock once per experiment per round.
+    let (last_compaction, total_compactions) = previous
+        .map_or((StatRow::NO_COMPACTION, 0), |prev| {
+            (prev.last_compaction, prev.total_compactions)
+        });
 
-    Ok(StatRow {
-        name: name.to_string(),
-        uri: uri.to_string(),
-        row_count: obs.row_count,
-        fragment_count: obs.fragment_count,
-        last_updated: obs.last_updated,
-        pending_wal_generations: obs.pending_wal_generations,
-        last_compaction,
-        total_compactions,
-        scanned_at: Utc::now().timestamp_millis(),
-    })
+    Ok((
+        StatRow {
+            name: name.to_string(),
+            uri: uri.to_string(),
+            row_count: obs.row_count,
+            fragment_count: obs.fragment_count,
+            last_updated: obs.last_updated,
+            pending_wal_generations: obs.pending_wal_generations,
+            last_compaction,
+            total_compactions,
+            scanned_at: Utc::now().timestamp_millis(),
+            version: obs.version as i64,
+        },
+        false,
+    ))
 }
 
 /// Refresh one experiment immediately and persist its new stats row.
+///
+/// Passes `None` as the previous row so this always does a full observation:
+/// callers use it precisely when they believe something just changed (after a
+/// compaction, or on an explicit refresh request), and the version check would
+/// otherwise short-circuit exactly the observation they asked for.
 pub async fn refresh_one(state: &Arc<MasterState>, name: &str, uri: &str) -> lance::Result<()> {
     let guard = state.task_store.coordination_lock("stats-writer").await?;
-    let result = match observe_one(state, name, uri).await {
-        Ok(row) => state.stats.lock().await.upsert(&row).await,
+    let result = match observe_one(name, uri, None).await {
+        Ok((row, _)) => state.stats.lock().await.upsert(&row).await,
         Err(error) => Err(error),
     };
     let release = state.task_store.release_coordination_lock(guard).await;
@@ -413,5 +480,167 @@ mod maintenance_alerting_tests {
             unreclaimed, 246_000,
             "a bloated table that has never been reclaimed must report its full backlog"
         );
+    }
+}
+
+#[cfg(test)]
+mod incremental_scan_tests {
+    use super::*;
+    use lance_context_core::{RolloutRecord, RolloutStore, RolloutStoreOptions, ROLE_ASSISTANT};
+    use tempfile::TempDir;
+
+    fn rec(id: &str) -> RolloutRecord {
+        RolloutRecord {
+            id: id.to_string(),
+            rollout_id: "r".to_string(),
+            problem_id: "p".to_string(),
+            dataset: None,
+            sequence_order: 0,
+            role: ROLE_ASSISTANT.to_string(),
+            created_at: Utc::now(),
+            content: Some("x".to_string()),
+            content_type: "text/plain".to_string(),
+            model_input_string: None,
+            model_output_string: None,
+            rationale: None,
+            problem_text: None,
+            user_metadata: None,
+            input_tokens: None,
+            output_tokens: None,
+            num_input_tokens: None,
+            num_output_tokens: None,
+            output_logprobs: None,
+            input_logprobs: None,
+            ref_logprobs: None,
+            loss_mask: None,
+            advantage: None,
+            reward: None,
+            raw_reward: None,
+            grader_id: None,
+            score: None,
+            include_in_training: None,
+            exclude_reason: None,
+            policy_version: None,
+            relationships: vec![],
+            binary_payload: None,
+            payload_size: None,
+            payload_checksum: None,
+            artifact_type: None,
+            metadata: None,
+        }
+    }
+
+    /// An experiment whose base version has not moved must not be re-observed.
+    ///
+    /// This is the property the whole incremental path rests on: at tens of
+    /// thousands of experiments, almost all cold, a scan that fully observes
+    /// every one cannot finish inside its interval. Opening the dataset is
+    /// unavoidable (it is how the version is read), but everything after it --
+    /// listing MemWAL shards, opening each flushed generation, counting rows --
+    /// must be skipped when nothing has changed.
+    #[tokio::test]
+    async fn unchanged_experiment_is_not_reobserved() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().join("e.lance").to_string_lossy().to_string();
+        {
+            let store = RolloutStore::open_with_options(&uri, RolloutStoreOptions::default())
+                .await
+                .unwrap();
+            store.add(&[rec("a")]).await.unwrap();
+            store.flush().await.unwrap();
+        }
+
+        // First pass: nothing known, so a full observation happens.
+        let (first, skipped) = observe_one("e", &uri, None).await.unwrap();
+        assert!(!skipped, "the first observation cannot be skipped");
+        assert_ne!(first.version, StatRow::UNKNOWN_VERSION);
+
+        // Second pass with the row from the first: the version is unchanged, so
+        // the expensive observation is skipped and the row is reused.
+        let (second, skipped) = observe_one("e", &uri, Some(&first)).await.unwrap();
+        assert!(skipped, "an unchanged experiment must skip re-observation");
+        assert_eq!(second.row_count, first.row_count);
+        assert_eq!(second.fragment_count, first.fragment_count);
+        assert_eq!(second.version, first.version);
+        assert!(
+            second.scanned_at >= first.scanned_at,
+            "a skipped row still refreshes scanned_at so staleness stays visible"
+        );
+    }
+
+    /// A write moves the base version, so the next scan must observe fully and
+    /// pick up the new counts.
+    #[tokio::test]
+    async fn changed_experiment_is_reobserved() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().join("e.lance").to_string_lossy().to_string();
+        let mut store = RolloutStore::open_with_options(&uri, RolloutStoreOptions::default())
+            .await
+            .unwrap();
+        store.add(&[rec("a")]).await.unwrap();
+        store.flush().await.unwrap();
+
+        let (first, _) = observe_one("e", &uri, None).await.unwrap();
+
+        // Merge the WAL into the base table: this advances the base version.
+        store.cleanup_own_shard().await.unwrap();
+
+        let (second, skipped) = observe_one("e", &uri, Some(&first)).await.unwrap();
+        assert!(
+            !skipped,
+            "a changed base version must force a full observation"
+        );
+        assert_ne!(
+            second.version, first.version,
+            "the new row must record the new version"
+        );
+    }
+
+    /// A row from before the `version` column existed carries the sentinel and
+    /// must force one full observation rather than being treated as unchanged.
+    #[tokio::test]
+    async fn unknown_version_forces_observation() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().join("e.lance").to_string_lossy().to_string();
+        {
+            let store = RolloutStore::open_with_options(&uri, RolloutStoreOptions::default())
+                .await
+                .unwrap();
+            store.add(&[rec("a")]).await.unwrap();
+            store.flush().await.unwrap();
+        }
+
+        let (mut legacy, _) = observe_one("e", &uri, None).await.unwrap();
+        legacy.version = StatRow::UNKNOWN_VERSION;
+
+        let (refreshed, skipped) = observe_one("e", &uri, Some(&legacy)).await.unwrap();
+        assert!(
+            !skipped,
+            "an unknown version must not be mistaken for an unchanged one"
+        );
+        assert_ne!(refreshed.version, StatRow::UNKNOWN_VERSION);
+    }
+
+    /// Compaction counters survive a skipped round.
+    #[tokio::test]
+    async fn skipped_round_preserves_compaction_counters() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().join("e.lance").to_string_lossy().to_string();
+        {
+            let store = RolloutStore::open_with_options(&uri, RolloutStoreOptions::default())
+                .await
+                .unwrap();
+            store.add(&[rec("a")]).await.unwrap();
+            store.flush().await.unwrap();
+        }
+
+        let (mut prev, _) = observe_one("e", &uri, None).await.unwrap();
+        prev.last_compaction = 1_700_000_000_000;
+        prev.total_compactions = 7;
+
+        let (next, skipped) = observe_one("e", &uri, Some(&prev)).await.unwrap();
+        assert!(skipped);
+        assert_eq!(next.last_compaction, 1_700_000_000_000);
+        assert_eq!(next.total_compactions, 7);
     }
 }

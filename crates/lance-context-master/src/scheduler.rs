@@ -347,6 +347,7 @@ async fn update_stats_after_compaction(state: &Arc<MasterState>, name: &str, sto
         last_compaction: Utc::now().timestamp_millis(),
         total_compactions: prev_total + 1,
         scanned_at: Utc::now().timestamp_millis(),
+        version: obs.version as i64,
     };
     if let Err(e) = stats.upsert(&row).await {
         tracing::warn!(store = %name, error = %e, "post-compaction stats upsert failed");
@@ -833,6 +834,7 @@ mod tests {
         let state = MasterState::new(cfg).await.unwrap();
 
         let seed = |name: &str, pending: i64| StatRow {
+            version: StatRow::UNKNOWN_VERSION,
             name: name.to_string(),
             uri: state.rollout_uri(name),
             row_count: 0,
