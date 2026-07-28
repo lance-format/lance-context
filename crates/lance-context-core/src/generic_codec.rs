@@ -9,7 +9,8 @@
 //!
 //! The built-in decoders read struct children *positionally*
 //! (`relationships`, `state_metadata`), so reordering fields silently
-//! mis-assigns data. Everything here is keyed by name in both directions.
+//! assigns data to the wrong field. Everything here is keyed by name in both
+//! directions.
 
 use std::collections::HashMap;
 use std::sync::Arc;
