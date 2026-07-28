@@ -12,11 +12,15 @@ use serde_json::{Map, Value};
 use tokio::runtime::Runtime;
 
 use lance_context::{
-    AddRolloutRequest, ColumnSpec, CreateDatagenStoreRequest, CreateGenericStoreRequest,
-    CreateRolloutStoreRequest, DatagenEventDto, DatagenFailureDto, DatagenFieldStateDto,
-    DatagenStepCursorDto, DatagenStore as UnifiedDatagenStore, DatagenStoreApi, DatagenValueDto,
-    FoldedDatagenItemDto, GenericStore as UnifiedGenericStore, GenericStoreApi, RolloutRecordDto,
-    RolloutStore as UnifiedRolloutStore, RolloutStoreApi, SchemaSpec,
+    datagen_event_to_dto, folded_item_to_dto, AddRolloutRequest, ColumnSpec,
+    CreateDatagenStoreRequest, CreateGenericStoreRequest, CreateRolloutStoreRequest,
+    DatagenErrorInfo, DatagenEventDto, DatagenFailureDto, DatagenFieldChange, DatagenFieldStateDto,
+    DatagenItemNode as UnifiedDatagenItemNode, DatagenItemTree as UnifiedDatagenItemTree,
+    DatagenStepCursorDto, DatagenStore as UnifiedDatagenStore, DatagenStoreApi,
+    DatagenStreamPosition, DatagenStreamWriter as CoreDatagenStreamWriter, DatagenValueDto,
+    DatagenWriteContext, FoldedDatagenItemDto, GenericStore as UnifiedGenericStore,
+    GenericStoreApi, RolloutRecordDto, RolloutStore as UnifiedRolloutStore, RolloutStoreApi,
+    SchemaSpec,
 };
 use lance_context_api::{
     AddRecordRequest, CompactRequest, CompactResponse, CompactStatsResponse, ContextStoreApi,
@@ -28,8 +32,10 @@ use lance_context_core::serde::CONTENT_TYPE_TEXT;
 use lance_context_core::{
     datagen_event_id as core_datagen_event_id, CompactionConfig, CompactionMetrics,
     CompactionStats, Context as RustContext, ContextNamespace as RustContextNamespace,
-    ContextRecord, ContextStore, ContextStoreOptions, DistanceMetric, EvalConfig, EvalQuerySet,
-    ExportConfig, ExportTask, GroupBy, IdIndexType, LifecycleQueryOptions, PartitionInfo,
+    ContextRecord, ContextStore, ContextStoreOptions, DatagenBlobValue as CoreDatagenBlobValue,
+    DatagenItemId as CoreDatagenItemId, DatagenNewStream, DatagenStepId, DatagenStepKind,
+    DatagenTerminal, DatagenValue as CoreDatagenValue, DistanceMetric, EvalConfig, EvalQuerySet,
+    ExportConfig, ExportTask, FieldOp, GroupBy, IdIndexType, LifecycleQueryOptions, PartitionInfo,
     PartitionSelector, PartitionSpec, PreferenceForm, ReadProjection, RecordFilters, RecordPatch,
     Relationship, RetrievalMode, RetrieveResult, SearchResult, SplitConfig, StateMetadata,
     DATAGEN_SCHEMA_VERSION, LIFECYCLE_ACTIVE,
@@ -2715,6 +2721,266 @@ impl DatagenStore {
             .map_err(to_py_err)?;
         Ok(bytes.map(|b| PyBytes::new(py, &b).unbind()))
     }
+
+    /// Assemble the inspection tree rooted at `root_item_id`: every projected
+    /// descendant folded to latest state and linked parent->child. Returns a dict
+    /// `{"roots": [item_id, ...], "nodes": {item_id: {"item": folded, "children":
+    /// [item_id, ...]}}}`.
+    fn item_tree(&self, py: Python<'_>, root_item_id: &str) -> PyResult<PyObject> {
+        let tree = py
+            .allow_threads(|| self.runtime.block_on(self.store.item_tree(root_item_id)))
+            .map_err(to_py_err)?;
+        item_tree_to_py(py, &tree)
+    }
+
+    /// Open a fresh stream: persist ITEM_CREATED and return a writer positioned to
+    /// continue after it. `run_id`/`writer_epoch` stamp every event the writer
+    /// emits; `query_tags` (JSON) is captured onto ITEM_CREATED.
+    #[pyo3(signature = (item_id, run_id, writer_epoch, parent_item_id = None, query_tags = None))]
+    fn open_stream(
+        &mut self,
+        py: Python<'_>,
+        item_id: &str,
+        run_id: &str,
+        writer_epoch: &str,
+        parent_item_id: Option<&str>,
+        query_tags: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<DatagenStreamWriter> {
+        let stream = DatagenNewStream {
+            item_id: CoreDatagenItemId::parse(item_id).map_err(to_py_err)?,
+            parent_item_id: parent_item_id
+                .map(CoreDatagenItemId::parse)
+                .transpose()
+                .map_err(to_py_err)?,
+            query_tags: query_tags.map(py_any_to_json).transpose()?,
+        };
+        let context = DatagenWriteContext {
+            run_id: run_id.to_string(),
+            writer_epoch: writer_epoch.to_string(),
+        };
+        let writer = py
+            .allow_threads(|| {
+                self.runtime
+                    .block_on(self.store.open_stream(&stream, &context))
+            })
+            .map_err(to_py_err)?;
+        Ok(DatagenStreamWriter { inner: writer })
+    }
+
+    /// Rebuild a writer to resume an already-started item. Pure — emits nothing.
+    /// Returns `None` if the item never started.
+    fn resume_stream(
+        &self,
+        py: Python<'_>,
+        item_id: &str,
+        run_id: &str,
+        writer_epoch: &str,
+    ) -> PyResult<Option<DatagenStreamWriter>> {
+        let context = DatagenWriteContext {
+            run_id: run_id.to_string(),
+            writer_epoch: writer_epoch.to_string(),
+        };
+        let writer = py
+            .allow_threads(|| {
+                self.runtime
+                    .block_on(self.store.resume_stream(item_id, &context))
+            })
+            .map_err(to_py_err)?;
+        Ok(writer.map(|inner| DatagenStreamWriter { inner }))
+    }
+}
+
+/// A per-stream write handle. Owns the bookkeeping columns the caller should never
+/// touch (`item_seq`, `attempt`, `checkpoint_id`, `event_id`), stamping them onto
+/// every event it emits. Each method returns the event dict(s) to persist — the
+/// caller hands them to `DatagenStore.append`/`append_checkpoint`. Pure and
+/// client-side, so it is identical for embedded and remote stores.
+#[pyclass]
+struct DatagenStreamWriter {
+    inner: CoreDatagenStreamWriter,
+}
+
+#[pymethods]
+impl DatagenStreamWriter {
+    /// The item this writer streams to.
+    #[getter]
+    fn item_id(&self) -> String {
+        self.inner.item_id().to_string()
+    }
+
+    /// The attempt number stamped onto emitted events (0 fresh, `last_attempt + 1`
+    /// on resume).
+    #[getter]
+    fn attempt(&self) -> i32 {
+        self.inner.attempt()
+    }
+
+    /// Emit STEP_STARTED for a driver frame (Sequence/Loop). Returns one event dict.
+    fn step_started(&mut self, py: Python<'_>, position: &Bound<'_, PyDict>) -> PyResult<PyObject> {
+        let position = position_from_dict(position)?;
+        let event = self.inner.step_started(&position);
+        event_dto_to_py(py, &datagen_event_to_dto(&event))
+    }
+
+    /// Emit a checkpoint boundary: the step's field writes plus its STEP_COMPLETED,
+    /// all sharing one `checkpoint_id`. Returns a list of event dicts (the atomic
+    /// unit `append_checkpoint` persists).
+    fn step_completed(
+        &mut self,
+        py: Python<'_>,
+        position: &Bound<'_, PyDict>,
+        fields: &Bound<'_, PyList>,
+    ) -> PyResult<PyObject> {
+        let position = position_from_dict(position)?;
+        let changes = field_changes_from_pylist(fields)?;
+        let events = self.inner.step_completed(&position, &changes);
+        let list = PyList::empty(py);
+        for event in &events {
+            list.append(event_dto_to_py(py, &datagen_event_to_dto(event))?)?;
+        }
+        Ok(list.into_pyobject(py)?.unbind().into())
+    }
+
+    /// Emit TERMINAL — the item reached a lifecycle end. `terminal` is
+    /// `"completed"` or `"filtered"`. Returns one event dict.
+    fn item_terminal(&mut self, py: Python<'_>, terminal: &str) -> PyResult<PyObject> {
+        let terminal = match terminal {
+            "completed" => DatagenTerminal::Completed,
+            "filtered" => DatagenTerminal::Filtered,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "terminal must be 'completed' or 'filtered', got '{other}'"
+                )))
+            }
+        };
+        let event = self.inner.item_terminal(terminal);
+        event_dto_to_py(py, &datagen_event_to_dto(&event))
+    }
+
+    /// Emit FAILED at a step position (failure lens only; does not terminate the
+    /// item). Returns one event dict.
+    #[pyo3(signature = (position, error_type, error_dump = None, traceback = None))]
+    fn item_failed(
+        &mut self,
+        py: Python<'_>,
+        position: &Bound<'_, PyDict>,
+        error_type: &str,
+        error_dump: Option<String>,
+        traceback: Option<String>,
+    ) -> PyResult<PyObject> {
+        let position = position_from_dict(position)?;
+        let error = DatagenErrorInfo {
+            error_type: error_type.to_string(),
+            error_dump,
+            traceback,
+        };
+        let event = self.inner.item_failed(&position, &error);
+        event_dto_to_py(py, &datagen_event_to_dto(&event))
+    }
+}
+
+fn position_from_dict(dict: &Bound<'_, PyDict>) -> PyResult<DatagenStreamPosition> {
+    let step_name = required_item(dict, "step_name", 0)?.extract::<String>()?;
+    let step_kind_raw = required_item(dict, "step_kind", 0)?.extract::<String>()?;
+    let step_kind = DatagenStepKind::parse(&step_kind_raw).map_err(to_py_err)?;
+    let index = required_item(dict, "index", 0)?.extract::<i64>()?;
+    let enclosing = optional_item(dict, "enclosing")?
+        .map(|value| value.extract::<String>())
+        .transpose()?;
+    let selector = optional_item(dict, "selector")?
+        .map(|value| value.extract::<String>())
+        .transpose()?;
+    Ok(DatagenStreamPosition {
+        step: DatagenStepId {
+            name: step_name,
+            kind: step_kind,
+        },
+        index,
+        enclosing,
+        selector,
+    })
+}
+
+fn field_changes_from_pylist(fields: &Bound<'_, PyList>) -> PyResult<Vec<DatagenFieldChange>> {
+    fields
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let dict = item
+                .downcast::<PyDict>()
+                .map_err(|_| PyTypeError::new_err(format!("fields[{index}] must be a dict")))?;
+            field_change_from_dict(dict)
+        })
+        .collect()
+}
+
+fn field_change_from_dict(dict: &Bound<'_, PyDict>) -> PyResult<DatagenFieldChange> {
+    let name = required_item(dict, "name", 0)?.extract::<String>()?;
+    let field_type = required_item(dict, "field_type", 0)?.extract::<String>()?;
+    let codec_version = optional_item(dict, "codec_version")?
+        .map(|value| value.extract::<i32>())
+        .transpose()?
+        .unwrap_or(0);
+    let op = match optional_item(dict, "op")?
+        .map(|value| value.extract::<String>())
+        .transpose()?
+        .as_deref()
+    {
+        Some("append") => FieldOp::Append,
+        Some("set") | None => FieldOp::Set,
+        Some(other) => {
+            return Err(PyValueError::new_err(format!(
+                "field op must be 'set' or 'append', got '{other}'"
+            )))
+        }
+    };
+    let value_dict = required_item(dict, "value", 0)?;
+    let value_dict = value_dict
+        .downcast::<PyDict>()
+        .map_err(|_| PyTypeError::new_err("field 'value' must be a dict"))?;
+    let value = core_value_from_dict(value_dict)?;
+    Ok(DatagenFieldChange {
+        name,
+        field_type,
+        codec_version,
+        op,
+        value,
+    })
+}
+
+fn core_value_from_dict(dict: &Bound<'_, PyDict>) -> PyResult<CoreDatagenValue> {
+    let kind = dict
+        .get_item("kind")?
+        .ok_or_else(|| PyRuntimeError::new_err("field value is missing 'kind'"))?
+        .extract::<String>()?;
+    let inner = || {
+        dict.get_item("value")?
+            .ok_or_else(|| PyRuntimeError::new_err("field value is missing 'value'"))
+    };
+    match kind.as_str() {
+        "int" => Ok(CoreDatagenValue::Int(inner()?.extract::<i64>()?)),
+        "float" => Ok(CoreDatagenValue::Float(inner()?.extract::<f64>()?)),
+        "bool" => Ok(CoreDatagenValue::Bool(inner()?.extract::<bool>()?)),
+        "str" => Ok(CoreDatagenValue::Str(inner()?.extract::<String>()?)),
+        "json" => Ok(CoreDatagenValue::Json(py_any_to_json(&inner()?)?)),
+        "blob" => {
+            let bytes = dict
+                .get_item("bytes")?
+                .filter(|value| !value.is_none())
+                .map(|value| value.extract::<Vec<u8>>())
+                .transpose()?
+                .ok_or_else(|| PyRuntimeError::new_err("blob field value is missing 'bytes'"))?;
+            let size = bytes.len() as i64;
+            Ok(CoreDatagenValue::Blob(CoreDatagenBlobValue {
+                bytes: Some(bytes),
+                size,
+                checksum: None,
+            }))
+        }
+        other => Err(PyRuntimeError::new_err(format!(
+            "unsupported datagen value kind '{other}'"
+        ))),
+    }
 }
 
 /// Deterministic idempotency key for a checkpoint event, so retried batches
@@ -2914,6 +3180,12 @@ fn folded_item_to_py(py: Python<'_>, item: &FoldedDatagenItemDto) -> PyResult<Py
             None => None,
         },
     )?;
+
+    let blob_event_ids = PyDict::new(py);
+    for (field_name, event_id) in &item.blob_event_ids {
+        blob_event_ids.set_item(field_name, event_id)?;
+    }
+    dict.set_item("blob_event_ids", blob_event_ids)?;
     Ok(dict.into_pyobject(py)?.unbind().into())
 }
 
@@ -2952,6 +3224,82 @@ fn failure_to_py(py: Python<'_>, failure: &DatagenFailureDto) -> PyResult<PyObje
     dict.set_item("error_type", &failure.error_type)?;
     dict.set_item("error_dump", failure.error_dump.clone())?;
     dict.set_item("traceback", failure.traceback.clone())?;
+    Ok(dict.into_pyobject(py)?.unbind().into())
+}
+
+/// One event as the dict shape `event_from_dict` accepts, so writer-emitted events
+/// round-trip straight back into `append`/`append_checkpoint`.
+fn event_dto_to_py(py: Python<'_>, event: &DatagenEventDto) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("event_id", &event.event_id)?;
+    dict.set_item("item_id", &event.item_id)?;
+    dict.set_item("root_item_id", &event.root_item_id)?;
+    dict.set_item("parent_item_id", event.parent_item_id.clone())?;
+    dict.set_item("item_seq", event.item_seq)?;
+    dict.set_item("checkpoint_id", &event.checkpoint_id)?;
+    dict.set_item("event_type", &event.event_type)?;
+    dict.set_item("step_name", event.step_name.clone())?;
+    dict.set_item("step_kind", event.step_kind.clone())?;
+    dict.set_item("step_index", event.step_index)?;
+    dict.set_item("enclosing_step", event.enclosing_step.clone())?;
+    dict.set_item("selector_step", event.selector_step.clone())?;
+    dict.set_item("attempt", event.attempt)?;
+    dict.set_item("run_id", &event.run_id)?;
+    dict.set_item("writer_epoch", &event.writer_epoch)?;
+    dict.set_item("field_name", event.field_name.clone())?;
+    dict.set_item("field_type", event.field_type.clone())?;
+    dict.set_item("codec_version", event.codec_version)?;
+    dict.set_item(
+        "value",
+        match &event.value {
+            Some(value) => Some(value_to_py(py, value)?),
+            None => None,
+        },
+    )?;
+    dict.set_item(
+        "query_tags",
+        match &event.query_tags {
+            Some(tags) => Some(json_value_to_py(py, tags)?),
+            None => None,
+        },
+    )?;
+    dict.set_item("status", event.status.clone())?;
+    dict.set_item("error_type", event.error_type.clone())?;
+    dict.set_item("error_dump", event.error_dump.clone())?;
+    dict.set_item("traceback", event.traceback.clone())?;
+    dict.set_item("event_ts", event.event_ts.map(|ts| ts.to_rfc3339()))?;
+    dict.set_item("schema_version", event.schema_version)?;
+    Ok(dict.into_pyobject(py)?.unbind().into())
+}
+
+/// One tree node: the folded item plus its direct children's item_ids.
+fn item_node_to_py(py: Python<'_>, node: &UnifiedDatagenItemNode) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item(
+        "item",
+        folded_item_to_py(py, &folded_item_to_dto(&node.item))?,
+    )?;
+    let children = PyList::empty(py);
+    for child in &node.children {
+        children.append(child.to_string())?;
+    }
+    dict.set_item("children", children)?;
+    Ok(dict.into_pyobject(py)?.unbind().into())
+}
+
+fn item_tree_to_py(py: Python<'_>, tree: &UnifiedDatagenItemTree) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    let roots = PyList::empty(py);
+    for root in tree.roots() {
+        roots.append(root.to_string())?;
+    }
+    dict.set_item("roots", roots)?;
+    let nodes = PyDict::new(py);
+    for item in tree.items() {
+        let node = tree.node(&item.item_id).expect("item is in tree");
+        nodes.set_item(item.item_id.to_string(), item_node_to_py(py, node)?)?;
+    }
+    dict.set_item("nodes", nodes)?;
     Ok(dict.into_pyobject(py)?.unbind().into())
 }
 
@@ -3210,6 +3558,7 @@ fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RemoteContext>()?;
     m.add_class::<RolloutStore>()?;
     m.add_class::<DatagenStore>()?;
+    m.add_class::<DatagenStreamWriter>()?;
     m.add_class::<GenericStore>()?;
     Ok(())
 }

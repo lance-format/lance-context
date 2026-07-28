@@ -567,6 +567,15 @@ impl DatagenStoreApi for RemoteDatagenStore {
         Ok(resp.failures)
     }
 
+    async fn events_for_root(&self, root_item_id: &str) -> ContextResult<Vec<DatagenEventDto>> {
+        let resp = self
+            .client
+            .datagen_events_for_root(&self.store_name, root_item_id)
+            .await
+            .map_err(to_ctx_err)?;
+        Ok(resp.events)
+    }
+
     async fn get_blob(&self, event_id: &str) -> ContextResult<Option<Vec<u8>>> {
         self.client
             .fetch_datagen_blob(&self.store_name, event_id)
@@ -1308,6 +1317,22 @@ impl ContextClient {
             .http
             .get(self.url(&format!("/datagen/{}/root-status", name)))
             .query(&[("ids", root_item_ids.join(","))])
+            .send()
+            .await?;
+        Self::handle_response(resp).await
+    }
+
+    /// Fetch every raw event whose root item is `root_item_id`. The client
+    /// folds these into a tree via `DatagenItemTree::build`; the server does no
+    /// fold/tree work.
+    pub async fn datagen_events_for_root(
+        &self,
+        name: &str,
+        root_item_id: &str,
+    ) -> Result<ListDatagenEventsResponse, ClientError> {
+        let resp = self
+            .http
+            .get(self.url(&format!("/datagen/{}/roots/{}/events", name, root_item_id)))
             .send()
             .await?;
         Self::handle_response(resp).await

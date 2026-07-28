@@ -29,9 +29,11 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::datagen::{
-    datagen_failures, datagen_trajectory, fold_datagen_events, DatagenBlobValue, DatagenEvent,
-    DatagenEventType, DatagenFailure, DatagenItemLookup, DatagenItemStatus,
-    DatagenRootItemStatuses, DatagenStepCursor, DatagenStepKind, DatagenValue,
+    datagen_failures, datagen_trajectory, fold_datagen_events, open_stream_events,
+    DatagenBlobValue, DatagenEvent, DatagenEventType, DatagenFailure, DatagenItemLookup,
+    DatagenItemStatus, DatagenItemTree, DatagenNewStream, DatagenRootItemStatuses,
+    DatagenStepCursor, DatagenStepKind, DatagenStreamWriter, DatagenValue, DatagenWriteContext,
+    FoldedDatagenItem,
 };
 use crate::store::{
     column_as, column_as_optional, timestamp_from_micros, CompactionConfig, CompactionStats,
@@ -152,6 +154,20 @@ impl DatagenStore {
         self.append(events).await
     }
 
+    /// Open a fresh stream: persist its ITEM_CREATED and return a [`DatagenStreamWriter`] positioned
+    /// at `item_seq = 1`, `attempt = 0`. The writer is client-side state; subsequent step batches it
+    /// produces are handed back to [`append`](Self::append)/[`append_checkpoint`](Self::append_checkpoint).
+    pub async fn open_stream(
+        &mut self,
+        stream: &DatagenNewStream,
+        context: &DatagenWriteContext,
+    ) -> LanceResult<DatagenStreamWriter> {
+        let opened = open_stream_events(stream, context);
+        self.append(std::slice::from_ref(&opened.created_event))
+            .await?;
+        Ok(opened.writer)
+    }
+
     /// Gracefully stop this store's resident MemWAL writer.
     pub async fn close(&mut self) -> LanceResult<()> {
         self.base.close().await
@@ -170,6 +186,13 @@ impl DatagenStore {
             escape_sql_literal(root_item_id)
         ))
         .await
+    }
+
+    /// Fold a root and every projected descendant into an inspection tree (parent->child links, each
+    /// item at latest state). Pure over the root's event log; loads no blob bytes.
+    pub async fn item_tree(&self, root_item_id: &str) -> LanceResult<DatagenItemTree> {
+        let events = self.events_for_root(root_item_id).await?;
+        DatagenItemTree::build(&events).map_err(invalid_input)
     }
 
     /// Read failure events directly from the source-of-truth log.
@@ -266,6 +289,23 @@ impl DatagenStore {
         Ok(Self::get_blob_from_dataset(&self.base.dataset, event_id)
             .await?
             .flatten())
+    }
+
+    /// Materialize a folded item's blob field by name, resolving the `event_id` for the caller.
+    ///
+    /// Returns `None` when `field_name` is not a blob field of `folded` (never written, or written
+    /// with a non-blob value); the blob bytes otherwise. This is the convenience wrapper over
+    /// [`FoldedDatagenItem::blob_event_ids`] + [`get_blob`](Self::get_blob) so callers never handle a
+    /// raw `event_id`.
+    pub async fn load_blob(
+        &self,
+        folded: &FoldedDatagenItem,
+        field_name: &str,
+    ) -> LanceResult<Option<Vec<u8>>> {
+        match folded.blob_event_ids.get(field_name) {
+            Some(event_id) => self.get_blob(event_id).await,
+            None => Ok(None),
+        }
     }
 
     /// Number of flushed generations waiting across all writer shards.
@@ -921,8 +961,9 @@ fn invalid_input(message: impl Into<String>) -> LanceError {
 mod tests {
     use super::*;
     use crate::datagen::{
-        datagen_event_id, DatagenFieldState, DatagenItemId, DatagenItemLookup, DatagenItemStatus,
-        DatagenStepKind, DATAGEN_SCHEMA_VERSION,
+        datagen_event_id, DatagenFieldChange, DatagenFieldState, DatagenItemId, DatagenItemLookup,
+        DatagenItemStatus, DatagenStepId, DatagenStepKind, DatagenStreamPosition, DatagenTerminal,
+        FieldOp, DATAGEN_SCHEMA_VERSION,
     };
     use chrono::{TimeZone, Utc};
     use serde_json::json;
@@ -1063,7 +1104,7 @@ mod tests {
             assert_eq!(blob.size, blob_bytes.len() as i64);
             assert_eq!(
                 store.get_blob(&blob_event.event_id).await.unwrap(),
-                Some(blob_bytes)
+                Some(blob_bytes.clone())
             );
 
             let folded = store.fold_item("item-1").await.unwrap();
@@ -1075,6 +1116,14 @@ mod tests {
             );
             assert_eq!(folded.trajectory.ordered.len(), 1);
             assert_eq!(folded.query_tags, Some(json!({"domain": "math"})));
+
+            // load_blob resolves the blob field by name, and is None for a non-blob / absent field.
+            assert_eq!(
+                store.load_blob(folded, "screenshot").await.unwrap(),
+                Some(blob_bytes)
+            );
+            assert_eq!(store.load_blob(folded, "score").await.unwrap(), None);
+            assert_eq!(store.load_blob(folded, "missing").await.unwrap(), None);
 
             let trajectory = store.trajectory("item-1").await.unwrap();
             assert_eq!(trajectory.len(), 1);
@@ -1266,15 +1315,6 @@ mod tests {
             );
         });
     }
-
-    /// A merge must not fence the store's own MemWAL writer.
-    ///
-    /// The merge used to `claim_epoch` to commit the manifest drain, which bumps
-    /// `writer_epoch` and fences every live writer of the shard — including this
-    /// store's own. It papered over that by `close()`ing the writer first and
-    /// reopening lazily. Reusing the shard's current epoch removes the need, so
-    /// the resident writer stays valid across a merge and appends immediately
-    /// after one must still succeed and be readable.
     #[test]
     fn compaction_folds_merged_fragments_and_preserves_reads() {
         // `DatagenStore` had no compaction at all before it moved onto
@@ -1374,6 +1414,92 @@ mod tests {
             assert_eq!(store.pending_wal_generations().await.unwrap(), 0);
             assert_eq!(store.events_for_item("item-1").await.unwrap().len(), 1);
             assert_eq!(store.events_for_item("item-2").await.unwrap().len(), 1);
+        });
+    }
+
+    /// End-to-end through a real Lance store: `open_stream` persists ITEM_CREATED and hands back a
+    /// writer whose step/terminal batches append cleanly, and `item_tree` folds the persisted log
+    /// into a parent->child tree matching the pure-core result.
+    #[test]
+    fn open_stream_writer_appends_and_item_tree_folds_persisted_log() {
+        let directory = TempDir::new().unwrap();
+        let uri = directory.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = DatagenStore::open(&uri).await.unwrap();
+            let context = DatagenWriteContext {
+                run_id: "run-1".to_string(),
+                writer_epoch: "writer-1".to_string(),
+            };
+
+            // Root "9" fans out into child "9/expand:0"; each streamed via its own writer.
+            let root_id = DatagenItemId::from_source_key("9");
+            let mut root_writer = store
+                .open_stream(
+                    &DatagenNewStream {
+                        item_id: root_id.clone(),
+                        parent_item_id: None,
+                        query_tags: Some(json!({"lang": "en"})),
+                    },
+                    &context,
+                )
+                .await
+                .unwrap();
+            assert_eq!(root_writer.attempt(), 0);
+
+            let position = DatagenStreamPosition {
+                step: DatagenStepId {
+                    name: "gen".to_string(),
+                    kind: DatagenStepKind::Leaf,
+                },
+                index: 0,
+                enclosing: None,
+                selector: None,
+            };
+            let checkpoint = root_writer.step_completed(
+                &position,
+                &[DatagenFieldChange {
+                    name: "draft".to_string(),
+                    field_type: "str".to_string(),
+                    codec_version: 1,
+                    op: FieldOp::Set,
+                    value: DatagenValue::Str("v1".into()),
+                }],
+            );
+            store.append_checkpoint(&checkpoint).await.unwrap();
+            let root_terminal = root_writer.item_terminal(DatagenTerminal::Completed);
+            store.append(&[root_terminal]).await.unwrap();
+
+            let child_id = root_id.child("expand", 0);
+            let mut child_writer = store
+                .open_stream(
+                    &DatagenNewStream {
+                        item_id: child_id.clone(),
+                        parent_item_id: Some(root_id.clone()),
+                        query_tags: None,
+                    },
+                    &context,
+                )
+                .await
+                .unwrap();
+            let child_terminal = child_writer.item_terminal(DatagenTerminal::Completed);
+            store.append(&[child_terminal]).await.unwrap();
+
+            let tree = store.item_tree("9").await.unwrap();
+            assert_eq!(tree.roots(), std::slice::from_ref(&root_id));
+
+            let root_node = tree.node(&root_id).unwrap();
+            assert_eq!(root_node.item.status, DatagenItemStatus::Completed);
+            assert_eq!(root_node.children, vec![child_id.clone()]);
+            assert_eq!(root_node.item.query_tags, Some(json!({"lang": "en"})));
+            assert_eq!(
+                root_node.item.fields.get("draft"),
+                Some(&DatagenFieldState::Set(DatagenValue::Str("v1".into())))
+            );
+
+            let child_node = tree.node(&child_id).unwrap();
+            assert_eq!(child_node.item.parent_item_id, Some(root_id));
+            assert!(child_node.children.is_empty());
         });
     }
 }

@@ -173,6 +173,22 @@ pub async fn datagen_item_failures(
     Ok(Json(ListDatagenFailuresResponse { failures }))
 }
 
+/// Dump every raw event whose root item is `root_item_id`. The server does no
+/// fold/tree assembly; the client builds the item tree from these events.
+pub async fn datagen_events_for_root(
+    State(state): State<Arc<AppState>>,
+    Path((name, root_item_id)): Path<(String, String)>,
+) -> Result<Json<lance_context_api::ListDatagenEventsResponse>, AppError> {
+    let store_lock = state.get_or_open_datagen_store(&name).await?;
+    let store = store_lock.read().await;
+    let events = DatagenStoreApi::events_for_root(&*store, &root_item_id)
+        .await
+        .map_err(AppError::from_context)?;
+    Ok(Json(lance_context_api::ListDatagenEventsResponse {
+        events,
+    }))
+}
+
 #[derive(Debug, Default, serde::Deserialize)]
 pub struct RootStatusParams {
     /// Comma-separated list of root item ids to classify.

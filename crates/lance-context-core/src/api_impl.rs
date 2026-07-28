@@ -789,6 +789,13 @@ impl DatagenStoreApi for DatagenStore {
         Ok(failures.iter().map(failure_to_dto).collect())
     }
 
+    async fn events_for_root(&self, root_item_id: &str) -> ContextResult<Vec<DatagenEventDto>> {
+        let events = DatagenStore::events_for_root(self, root_item_id)
+            .await
+            .map_err(to_ctx_err)?;
+        Ok(events.iter().map(datagen_event_to_dto).collect())
+    }
+
     async fn get_blob(&self, event_id: &str) -> ContextResult<Option<Vec<u8>>> {
         DatagenStore::get_blob(self, event_id)
             .await
@@ -800,7 +807,7 @@ impl DatagenStoreApi for DatagenStore {
     }
 }
 
-fn datagen_events_from_dtos(events: &[DatagenEventDto]) -> ContextResult<Vec<DatagenEvent>> {
+pub fn datagen_events_from_dtos(events: &[DatagenEventDto]) -> ContextResult<Vec<DatagenEvent>> {
     events.iter().map(datagen_event_from_dto).collect()
 }
 
@@ -920,7 +927,38 @@ fn datagen_value_to_dto(value: &DatagenValue) -> DatagenValueDto {
     dto
 }
 
-fn folded_item_to_dto(item: &FoldedDatagenItem) -> FoldedDatagenItemDto {
+pub fn datagen_event_to_dto(event: &DatagenEvent) -> DatagenEventDto {
+    DatagenEventDto {
+        event_id: event.event_id.clone(),
+        item_id: event.item_id.clone(),
+        root_item_id: event.root_item_id.clone(),
+        parent_item_id: event.parent_item_id.clone(),
+        item_seq: event.item_seq,
+        checkpoint_id: event.checkpoint_id.clone(),
+        event_type: event.event_type.as_str().to_string(),
+        step_name: event.step_name.clone(),
+        step_kind: event.step_kind.map(|kind| kind.as_str().to_string()),
+        step_index: event.step_index,
+        enclosing_step: event.enclosing_step.clone(),
+        selector_step: event.selector_step.clone(),
+        attempt: event.attempt,
+        run_id: event.run_id.clone(),
+        writer_epoch: event.writer_epoch.clone(),
+        field_name: event.field_name.clone(),
+        field_type: event.field_type.clone(),
+        codec_version: event.codec_version,
+        value: event.value.as_ref().map(datagen_value_to_dto),
+        query_tags: event.query_tags.clone(),
+        status: event.status.map(|status| status.as_str().to_string()),
+        error_type: event.error_type.clone(),
+        error_dump: event.error_dump.clone(),
+        traceback: event.traceback.clone(),
+        event_ts: Some(event.event_ts),
+        schema_version: event.schema_version,
+    }
+}
+
+pub fn folded_item_to_dto(item: &FoldedDatagenItem) -> FoldedDatagenItemDto {
     FoldedDatagenItemDto {
         item_id: item.item_id.to_string(),
         root_item_id: item.root_item_id.to_string(),
@@ -935,6 +973,7 @@ fn folded_item_to_dto(item: &FoldedDatagenItem) -> FoldedDatagenItemDto {
             .collect(),
         trajectory: item.trajectory.ordered.iter().map(cursor_to_dto).collect(),
         query_tags: item.query_tags.clone(),
+        blob_event_ids: item.blob_event_ids.clone(),
     }
 }
 

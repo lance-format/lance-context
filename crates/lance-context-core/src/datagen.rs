@@ -337,6 +337,271 @@ pub struct DatagenTrajectory {
     pub started: HashSet<DatagenStreamPosition>,
 }
 
+/// Per-run write identity, stamped onto every event a writer emits. `run_id` groups a batch job;
+/// `writer_epoch` fences a revived zombie writer (a fresh process gets a fresh epoch).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatagenWriteContext {
+    pub run_id: String,
+    pub writer_epoch: String,
+}
+
+/// The inputs for a fresh stream (Case 3, the `open_stream` path). `query_tags` is captured onto
+/// ITEM_CREATED and is not part of correctness.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DatagenNewStream {
+    pub item_id: DatagenItemId,
+    pub parent_item_id: Option<DatagenItemId>,
+    pub query_tags: Option<Value>,
+}
+
+/// Whether a field write replaces (FIELD_SET) or accumulates (FIELD_APPEND).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldOp {
+    Set,
+    Append,
+}
+
+/// One field write within a checkpoint boundary — the typed input a caller hands the writer instead
+/// of hand-building a FIELD_* event.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DatagenFieldChange {
+    pub name: String,
+    pub field_type: String,
+    pub codec_version: i32,
+    pub op: FieldOp,
+    pub value: DatagenValue,
+}
+
+/// A per-stream write handle. Owns the bookkeeping columns the client should never touch
+/// (`item_seq`, `attempt`, `checkpoint_id`, `event_id`), stamping them onto every event it emits.
+///
+/// Each method returns the event batch to persist rather than performing I/O itself: the store layer
+/// (embedded or remote) appends it. Two ways to obtain one:
+///   - fresh:  [`open_stream_events`] (Case 3) — emits ITEM_CREATED, `next_seq = 1`, `attempt = 0`.
+///   - resume: [`FoldedDatagenItem::resuming_writer`] (Case 2) — pure, emits nothing, `next_seq =
+///     last_item_seq + 1`, `attempt = last_attempt + 1`.
+#[derive(Debug, Clone)]
+pub struct DatagenStreamWriter {
+    item_id: DatagenItemId,
+    root_item_id: DatagenItemId,
+    parent_item_id: Option<DatagenItemId>,
+    context: DatagenWriteContext,
+    next_seq: i64,
+    attempt: i32,
+    checkpoint_ordinal: u32,
+}
+
+/// A fresh stream's ITEM_CREATED event plus the writer positioned to continue after it.
+#[derive(Debug, Clone)]
+pub struct DatagenOpenStream {
+    pub created_event: DatagenEvent,
+    pub writer: DatagenStreamWriter,
+}
+
+impl DatagenStreamWriter {
+    /// The item this writer streams to.
+    #[must_use]
+    pub fn item_id(&self) -> &DatagenItemId {
+        &self.item_id
+    }
+
+    /// The attempt number this writer stamps onto its events (0 fresh, `last_attempt + 1` on resume).
+    #[must_use]
+    pub fn attempt(&self) -> i32 {
+        self.attempt
+    }
+
+    fn resume(
+        item_id: DatagenItemId,
+        root_item_id: DatagenItemId,
+        parent_item_id: Option<DatagenItemId>,
+        context: DatagenWriteContext,
+        next_seq: i64,
+        attempt: i32,
+    ) -> Self {
+        Self {
+            item_id,
+            root_item_id,
+            parent_item_id,
+            context,
+            next_seq,
+            attempt,
+            checkpoint_ordinal: 0,
+        }
+    }
+
+    fn compose_checkpoint_id(&mut self, position: &DatagenStreamPosition) -> String {
+        let ordinal = self.checkpoint_ordinal;
+        self.checkpoint_ordinal += 1;
+        // `attempt` is embedded so a resume re-emitting the same step position produces a distinct
+        // `checkpoint_id` (and thus a distinct `event_id`); otherwise attempt 0 and attempt 1 would
+        // collide on `datagen_event_id` and fold would reject them as reused-with-different-content.
+        format!(
+            "{}\0{}\0{}\0{}\0{}",
+            self.item_id, self.attempt, position.step.name, position.index, ordinal
+        )
+    }
+
+    fn take_seq(&mut self) -> i64 {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        seq
+    }
+
+    fn base_event(
+        &self,
+        event_id: String,
+        item_seq: i64,
+        checkpoint_id: String,
+        event_type: DatagenEventType,
+    ) -> DatagenEvent {
+        DatagenEvent {
+            event_id,
+            item_id: self.item_id.to_string(),
+            root_item_id: self.root_item_id.to_string(),
+            parent_item_id: self.parent_item_id.as_ref().map(DatagenItemId::to_string),
+            item_seq,
+            checkpoint_id,
+            event_type,
+            step_name: None,
+            step_kind: None,
+            step_index: None,
+            enclosing_step: None,
+            selector_step: None,
+            attempt: self.attempt,
+            run_id: self.context.run_id.clone(),
+            writer_epoch: self.context.writer_epoch.clone(),
+            field_name: None,
+            field_type: None,
+            codec_version: None,
+            value: None,
+            query_tags: None,
+            status: None,
+            error_type: None,
+            error_dump: None,
+            traceback: None,
+            event_ts: Utc::now(),
+            schema_version: DATAGEN_SCHEMA_VERSION,
+        }
+    }
+
+    fn stamp_position(event: &mut DatagenEvent, position: &DatagenStreamPosition) {
+        event.step_name = Some(position.step.name.clone());
+        event.step_kind = Some(position.step.kind);
+        event.step_index = Some(position.index);
+        event.enclosing_step = position.enclosing.clone();
+        event.selector_step = position.selector.clone();
+    }
+
+    /// Emit STEP_STARTED for a driver frame (`Sequence`/`Loop`). Structural marker, written once.
+    pub fn step_started(&mut self, position: &DatagenStreamPosition) -> DatagenEvent {
+        let seq = self.take_seq();
+        let checkpoint_id = self.compose_checkpoint_id(position);
+        let event_id = datagen_event_id(&self.item_id.to_string(), &checkpoint_id, 0);
+        let mut event =
+            self.base_event(event_id, seq, checkpoint_id, DatagenEventType::StepStarted);
+        Self::stamp_position(&mut event, position);
+        event
+    }
+
+    /// Emit a checkpoint boundary: the step's field writes plus its STEP_COMPLETED, all sharing one
+    /// `checkpoint_id`. This is the atomic unit `append_checkpoint` persists.
+    pub fn step_completed(
+        &mut self,
+        position: &DatagenStreamPosition,
+        fields: &[DatagenFieldChange],
+    ) -> Vec<DatagenEvent> {
+        let checkpoint_id = self.compose_checkpoint_id(position);
+        let item_id = self.item_id.to_string();
+        let mut events = Vec::with_capacity(fields.len() + 1);
+        for (ordinal, change) in fields.iter().enumerate() {
+            let seq = self.take_seq();
+            let event_id = datagen_event_id(&item_id, &checkpoint_id, ordinal as u32 + 1);
+            let event_type = match change.op {
+                FieldOp::Set => DatagenEventType::FieldSet,
+                FieldOp::Append => DatagenEventType::FieldAppend,
+            };
+            let mut event = self.base_event(event_id, seq, checkpoint_id.clone(), event_type);
+            Self::stamp_position(&mut event, position);
+            event.field_name = Some(change.name.clone());
+            event.field_type = Some(change.field_type.clone());
+            event.codec_version = Some(change.codec_version);
+            event.value = Some(change.value.clone());
+            events.push(event);
+        }
+        let seq = self.take_seq();
+        let event_id = datagen_event_id(&item_id, &checkpoint_id, 0);
+        let mut completed = self.base_event(
+            event_id,
+            seq,
+            checkpoint_id,
+            DatagenEventType::StepCompleted,
+        );
+        Self::stamp_position(&mut completed, position);
+        events.push(completed);
+        events
+    }
+
+    /// Emit TERMINAL — the item reached a lifecycle end (completed/filtered).
+    pub fn item_terminal(&mut self, terminal: DatagenTerminal) -> DatagenEvent {
+        let seq = self.take_seq();
+        let checkpoint_id = format!("{}\0terminal\0{}", self.item_id, seq);
+        let event_id = datagen_event_id(&self.item_id.to_string(), &checkpoint_id, 0);
+        let mut event = self.base_event(event_id, seq, checkpoint_id, DatagenEventType::Terminal);
+        event.status = Some(match terminal {
+            DatagenTerminal::Completed => DatagenItemStatus::Completed,
+            DatagenTerminal::Filtered => DatagenItemStatus::Filtered,
+        });
+        event
+    }
+
+    /// Emit FAILED at a step position. Does not terminate the item (failure lens only).
+    pub fn item_failed(
+        &mut self,
+        position: &DatagenStreamPosition,
+        error: &DatagenErrorInfo,
+    ) -> DatagenEvent {
+        let seq = self.take_seq();
+        let checkpoint_id = self.compose_checkpoint_id(position);
+        let event_id = datagen_event_id(&self.item_id.to_string(), &checkpoint_id, 0);
+        let mut event = self.base_event(event_id, seq, checkpoint_id, DatagenEventType::Failed);
+        Self::stamp_position(&mut event, position);
+        event.status = Some(DatagenItemStatus::Failed);
+        event.error_type = Some(error.error_type.clone());
+        event.error_dump = error.error_dump.clone();
+        event.traceback = error.traceback.clone();
+        event
+    }
+}
+
+/// Build the ITEM_CREATED event + a writer for a fresh stream. Pure; the store persists the event.
+#[must_use]
+pub fn open_stream_events(
+    stream: &DatagenNewStream,
+    context: &DatagenWriteContext,
+) -> DatagenOpenStream {
+    let mut writer = DatagenStreamWriter {
+        item_id: stream.item_id.clone(),
+        root_item_id: stream.item_id.root(),
+        parent_item_id: stream.parent_item_id.clone(),
+        context: context.clone(),
+        next_seq: 1,
+        attempt: 0,
+        checkpoint_ordinal: 0,
+    };
+    let seq = writer.take_seq();
+    let checkpoint_id = format!("{}\0created", stream.item_id);
+    let event_id = datagen_event_id(&stream.item_id.to_string(), &checkpoint_id, 0);
+    let mut created =
+        writer.base_event(event_id, seq, checkpoint_id, DatagenEventType::ItemCreated);
+    created.status = Some(DatagenItemStatus::Running);
+    created.query_tags = stream.query_tags.clone();
+    DatagenOpenStream {
+        created_event: created,
+        writer,
+    }
+}
+
 /// Error payload, shared by the write side (input to `item_failed`) and the read side (composed into
 /// [`DatagenFailure`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -374,6 +639,129 @@ pub struct FoldedDatagenItem {
     /// Internal `field_name -> event_id` map for the folded blob fields, so the store can resolve a
     /// lazy blob without the caller handling an `event_id`.
     pub blob_event_ids: BTreeMap<String, String>,
+}
+
+impl FoldedDatagenItem {
+    /// Build a resume write handle for this already-folded, Running item. Pure — no I/O, emits no
+    /// ITEM_CREATED. The store owns the continuation rules: `next_seq = last_item_seq + 1`,
+    /// `attempt = last_attempt + 1`. The resume counterpart to [`open_stream_events`] (the fresh
+    /// path). `checkpoint_ordinal` restarts at 0 for the new attempt; `checkpoint_id`s stay unique
+    /// across attempts because [`DatagenStreamWriter::compose_checkpoint_id`] embeds `attempt`.
+    #[must_use]
+    pub fn resuming_writer(&self, context: &DatagenWriteContext) -> DatagenStreamWriter {
+        DatagenStreamWriter::resume(
+            self.item_id.clone(),
+            self.root_item_id.clone(),
+            self.parent_item_id.clone(),
+            context.clone(),
+            self.last_item_seq + 1,
+            self.last_attempt + 1,
+        )
+    }
+}
+
+/// One node in a root's inspection tree: a folded item plus the `item_id`s of its direct children.
+/// Children are ordered by `item_id` string for a stable, deterministic walk.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DatagenItemNode {
+    pub item: FoldedDatagenItem,
+    pub children: Vec<DatagenItemId>,
+}
+
+/// A root item and every projected descendant, each folded to latest state and linked parent->child.
+/// Built purely from one root's event log — no I/O. `roots` are the entry item_ids (normally one, the
+/// source root; more only if a log mixes roots). Use [`node`](Self::node) to walk from any item.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DatagenItemTree {
+    nodes: BTreeMap<String, DatagenItemNode>,
+    roots: Vec<DatagenItemId>,
+}
+
+impl DatagenItemTree {
+    /// Fold every item in a root's event log and link them into a tree. Events for different items may
+    /// be interleaved; they are grouped by `item_id` and folded independently. Items with no
+    /// ITEM_CREATED (never started) are skipped. A child whose parent is absent becomes an extra root.
+    pub fn build(events: &[DatagenEvent]) -> Result<Self, String> {
+        let mut by_item: BTreeMap<String, Vec<&DatagenEvent>> = BTreeMap::new();
+        for event in events {
+            by_item
+                .entry(event.item_id.clone())
+                .or_default()
+                .push(event);
+        }
+
+        let mut nodes: BTreeMap<String, DatagenItemNode> = BTreeMap::new();
+        for item_events in by_item.values() {
+            let owned: Vec<DatagenEvent> =
+                item_events.iter().map(|event| (*event).clone()).collect();
+            if let Some(item) = fold_datagen_events(&owned)? {
+                nodes.insert(
+                    item.item_id.to_string(),
+                    DatagenItemNode {
+                        item,
+                        children: Vec::new(),
+                    },
+                );
+            }
+        }
+
+        let mut roots: Vec<DatagenItemId> = Vec::new();
+        let child_ids: Vec<(String, Option<String>)> = nodes
+            .values()
+            .map(|node| {
+                (
+                    node.item.item_id.to_string(),
+                    node.item
+                        .parent_item_id
+                        .as_ref()
+                        .map(DatagenItemId::to_string),
+                )
+            })
+            .collect();
+        for (child_id, parent_id) in child_ids {
+            match parent_id {
+                Some(parent) if nodes.contains_key(&parent) => {
+                    let child = DatagenItemId::parse(&child_id)?;
+                    nodes.get_mut(&parent).unwrap().children.push(child);
+                }
+                _ => roots.push(DatagenItemId::parse(&child_id)?),
+            }
+        }
+        for node in nodes.values_mut() {
+            node.children.sort();
+        }
+        roots.sort();
+
+        Ok(Self { nodes, roots })
+    }
+
+    /// The entry items (normally the single source root).
+    #[must_use]
+    pub fn roots(&self) -> &[DatagenItemId] {
+        &self.roots
+    }
+
+    /// The node for an item, or `None` if it is not in this tree.
+    #[must_use]
+    pub fn node(&self, item_id: &DatagenItemId) -> Option<&DatagenItemNode> {
+        self.nodes.get(&item_id.to_string())
+    }
+
+    /// Total number of folded items in the tree.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
+    /// Every folded item, ordered by `item_id`.
+    pub fn items(&self) -> impl Iterator<Item = &FoldedDatagenItem> {
+        self.nodes.values().map(|node| &node.item)
+    }
 }
 
 /// Result of a resumption fold. `NeverStarted` (no ITEM_CREATED) is the fresh-vs-restore fork the
@@ -925,6 +1313,214 @@ mod tests {
         assert_eq!(failures.len(), 1);
         assert_eq!(failures[0].error.error_type, "ValueError");
         assert_eq!(failures[0].at.position.step.name, "check");
+    }
+
+    #[test]
+    fn resume_second_attempt_overwrites_field_and_advances_last_attempt() {
+        // attempt 0 runs, writes `draft=v1`, then fails. A resume (attempt 1) rewrites the same
+        // field at a higher item_seq and reaches TERMINAL. Fold is a flat replay ordered by
+        // item_seq, so the later attempt's value wins and last_attempt advances.
+        let mut set_a0 = leaf_completed(1, "gen", 0, Some("main"));
+        set_a0.event_type = DatagenEventType::FieldSet;
+        set_a0.field_name = Some("draft".to_string());
+        set_a0.field_type = Some("str".to_string());
+        set_a0.codec_version = Some(1);
+        set_a0.value = Some(DatagenValue::Str("v1".to_string()));
+
+        let mut failed_a0 = leaf_completed(2, "check", 0, Some("main"));
+        failed_a0.event_type = DatagenEventType::Failed;
+        failed_a0.status = Some(DatagenItemStatus::Failed);
+        failed_a0.error_type = Some("ValueError".to_string());
+
+        // Resume: attempt 1, structural events (ITEM_CREATED/STEP_STARTED) are NOT re-emitted.
+        let mut set_a1 = set_a0.clone();
+        set_a1.item_seq = 3;
+        set_a1.attempt = 1;
+        set_a1.checkpoint_id = "c3".to_string();
+        set_a1.event_id = datagen_event_id("5", "c3", 0);
+        set_a1.value = Some(DatagenValue::Str("v2".to_string()));
+
+        let mut terminal_a1 = event(4, DatagenEventType::Terminal);
+        terminal_a1.attempt = 1;
+        terminal_a1.status = Some(DatagenItemStatus::Completed);
+
+        let events = [created(0), set_a0, failed_a0.clone(), set_a1, terminal_a1];
+        let folded = fold_datagen_events(&events).unwrap().unwrap();
+        assert_eq!(folded.status, DatagenItemStatus::Completed);
+        assert_eq!(folded.last_attempt, 1);
+        assert_eq!(folded.last_item_seq, 4);
+        assert_eq!(
+            folded.fields.get("draft"),
+            Some(&DatagenFieldState::Set(DatagenValue::Str("v2".to_string())))
+        );
+
+        // The failure lens still surfaces the attempt-0 failure, tagged with its attempt.
+        let failures = datagen_failures(&events).unwrap();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].attempt, 0);
+    }
+
+    fn write_context() -> DatagenWriteContext {
+        DatagenWriteContext {
+            run_id: "run-1".to_string(),
+            writer_epoch: "writer-1".to_string(),
+        }
+    }
+
+    fn leaf_position(name: &str, index: i64, enclosing: Option<&str>) -> DatagenStreamPosition {
+        DatagenStreamPosition {
+            step: DatagenStepId {
+                name: name.to_string(),
+                kind: DatagenStepKind::Leaf,
+            },
+            index,
+            enclosing: enclosing.map(str::to_string),
+            selector: None,
+        }
+    }
+
+    fn set_field(name: &str, value: DatagenValue) -> DatagenFieldChange {
+        DatagenFieldChange {
+            name: name.to_string(),
+            field_type: "str".to_string(),
+            codec_version: 1,
+            op: FieldOp::Set,
+            value,
+        }
+    }
+
+    #[test]
+    fn open_stream_writer_produces_a_foldable_lifecycle() {
+        let stream = DatagenNewStream {
+            item_id: DatagenItemId::from_source_key("5"),
+            parent_item_id: None,
+            query_tags: Some(json!({"lang": "en"})),
+        };
+        let opened = open_stream_events(&stream, &write_context());
+        let mut writer = opened.writer;
+        assert_eq!(writer.attempt(), 0);
+
+        let position = leaf_position("gen", 0, Some("main"));
+        let checkpoint = writer.step_completed(
+            &position,
+            &[set_field("draft", DatagenValue::Str("v1".into()))],
+        );
+        let terminal = writer.item_terminal(DatagenTerminal::Completed);
+
+        let mut events = vec![opened.created_event];
+        events.extend(checkpoint);
+        events.push(terminal);
+
+        // Contiguous item_seq starting at 1, every event validates.
+        for (offset, ev) in events.iter().enumerate() {
+            ev.validate().unwrap();
+            assert_eq!(ev.item_seq, offset as i64 + 1);
+            assert_eq!(ev.attempt, 0);
+        }
+
+        let folded = fold_datagen_events(&events).unwrap().unwrap();
+        assert_eq!(folded.status, DatagenItemStatus::Completed);
+        assert_eq!(
+            folded.fields.get("draft"),
+            Some(&DatagenFieldState::Set(DatagenValue::Str("v1".into())))
+        );
+        assert_eq!(folded.query_tags, Some(json!({"lang": "en"})));
+    }
+
+    #[test]
+    fn resuming_writer_continues_seq_bumps_attempt_and_avoids_event_id_collision() {
+        let stream = DatagenNewStream {
+            item_id: DatagenItemId::from_source_key("5"),
+            parent_item_id: None,
+            query_tags: None,
+        };
+        let context = write_context();
+        let opened = open_stream_events(&stream, &context);
+        let mut writer = opened.writer;
+        let position = leaf_position("gen", 0, Some("main"));
+        let attempt0 = writer.step_completed(
+            &position,
+            &[set_field("draft", DatagenValue::Str("v1".into()))],
+        );
+
+        let mut events = vec![opened.created_event];
+        events.extend(attempt0.clone());
+
+        // Fold attempt 0, then resume from that folded state.
+        let folded0 = fold_datagen_events(&events).unwrap().unwrap();
+        let mut resumed = folded0.resuming_writer(&context);
+        assert_eq!(resumed.attempt(), 1);
+
+        let attempt1 = resumed.step_completed(
+            &position,
+            &[set_field("draft", DatagenValue::Str("v2".into()))],
+        );
+        let terminal = resumed.item_terminal(DatagenTerminal::Completed);
+
+        // Same step position across attempts must not collide on event_id (embeds attempt).
+        for a0 in &attempt0 {
+            for a1 in &attempt1 {
+                assert_ne!(a0.event_id, a1.event_id);
+                assert_ne!(a0.checkpoint_id, a1.checkpoint_id);
+            }
+        }
+
+        events.extend(attempt1);
+        events.push(terminal);
+        assert!(events[events.len() - 2].item_seq > attempt0.last().unwrap().item_seq);
+
+        let folded = fold_datagen_events(&events).unwrap().unwrap();
+        assert_eq!(folded.status, DatagenItemStatus::Completed);
+        assert_eq!(folded.last_attempt, 1);
+        assert_eq!(
+            folded.fields.get("draft"),
+            Some(&DatagenFieldState::Set(DatagenValue::Str("v2".into())))
+        );
+    }
+
+    #[test]
+    fn item_tree_links_parent_and_child_items() {
+        // Root "5" spawns child "5/expand:0". Build each via its own writer so item_ids/roots are set.
+        let context = write_context();
+        let root_stream = DatagenNewStream {
+            item_id: DatagenItemId::from_source_key("5"),
+            parent_item_id: None,
+            query_tags: None,
+        };
+        let root_open = open_stream_events(&root_stream, &context);
+        let mut root_writer = root_open.writer;
+        let root_terminal = root_writer.item_terminal(DatagenTerminal::Completed);
+
+        let child_id = DatagenItemId::from_source_key("5").child("expand", 0);
+        let child_stream = DatagenNewStream {
+            item_id: child_id.clone(),
+            parent_item_id: Some(DatagenItemId::from_source_key("5")),
+            query_tags: None,
+        };
+        let child_open = open_stream_events(&child_stream, &context);
+        let mut child_writer = child_open.writer;
+        let child_terminal = child_writer.item_terminal(DatagenTerminal::Completed);
+
+        let events = vec![
+            root_open.created_event,
+            root_terminal,
+            child_open.created_event,
+            child_terminal,
+        ];
+        let tree = DatagenItemTree::build(&events).unwrap();
+        assert_eq!(tree.len(), 2);
+        assert_eq!(tree.roots(), &[DatagenItemId::from_source_key("5")]);
+
+        let root_node = tree.node(&DatagenItemId::from_source_key("5")).unwrap();
+        assert_eq!(root_node.item.status, DatagenItemStatus::Completed);
+        assert_eq!(root_node.children, vec![child_id.clone()]);
+
+        let child_node = tree.node(&child_id).unwrap();
+        assert_eq!(
+            child_node.item.parent_item_id,
+            Some(DatagenItemId::from_source_key("5"))
+        );
+        assert!(child_node.children.is_empty());
     }
 
     #[test]

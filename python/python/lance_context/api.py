@@ -19,6 +19,9 @@ from ._internal import (  # pyright: ignore[reportMissingImports]
     DatagenStore as _DatagenStore,
 )
 from ._internal import (  # pyright: ignore[reportMissingImports]
+    DatagenStreamWriter as _DatagenStreamWriter,
+)
+from ._internal import (  # pyright: ignore[reportMissingImports]
     GenericStore as _GenericStore,
 )
 from ._internal import (  # pyright: ignore[reportMissingImports]
@@ -2843,8 +2846,126 @@ class DatagenStore:
         """Materialize one ``FIELD_*`` event's blob bytes by event id, or ``None``."""
         return self._sync.get_blob(event_id)
 
+    def load_blob(self, folded: Mapping[str, Any], field_name: str) -> bytes | None:
+        """Resolve a folded item's blob field by name to its bytes, or ``None``.
+
+        ``folded`` is a dict from :meth:`fold_item`; its ``blob_event_ids`` map points
+        each blob field to the event id that carries the bytes. Returns ``None`` when
+        ``field_name`` is not a blob field of ``folded`` (never written, or written with
+        a non-blob value). Works for embedded and remote stores.
+        """
+        event_id = folded.get("blob_event_ids", {}).get(field_name)
+        if event_id is None:
+            return None
+        return self._sync.get_blob(event_id)
+
+    def item_tree(self, root_item_id: str) -> dict[str, Any]:
+        """Assemble the inspection tree rooted at ``root_item_id``.
+
+        Every projected descendant is folded to its latest state and linked
+        parent->child. Returns ``{"roots": [item_id, ...], "nodes": {item_id: {"item":
+        folded, "children": [item_id, ...]}}}``. Works for embedded and remote stores.
+        """
+        return self._sync.item_tree(root_item_id)
+
+    def open_stream(
+        self,
+        item_id: str,
+        *,
+        run_id: str,
+        writer_epoch: str,
+        parent_item_id: str | None = None,
+        query_tags: Any = None,
+    ) -> "DatagenStreamWriter":
+        """Open a fresh stream: persist ITEM_CREATED, return a writer to continue.
+
+        ``run_id``/``writer_epoch`` stamp every event the writer emits; ``query_tags``
+        is captured onto ITEM_CREATED. The writer is client-side state — hand its
+        emitted events back to :meth:`append`/:meth:`append_checkpoint`. Works for
+        embedded and remote stores.
+        """
+        return DatagenStreamWriter(
+            self._sync.open_stream(
+                item_id, run_id, writer_epoch, parent_item_id, query_tags
+            )
+        )
+
+    def resume_stream(
+        self, item_id: str, *, run_id: str, writer_epoch: str
+    ) -> "DatagenStreamWriter | None":
+        """Rebuild a writer to resume an already-started item, or ``None`` if absent.
+
+        Pure — emits nothing; the returned writer continues the item's ``item_seq`` and
+        bumps ``attempt``. Works for embedded and remote stores.
+        """
+        writer = self._sync.resume_stream(item_id, run_id, writer_epoch)
+        return DatagenStreamWriter(writer) if writer is not None else None
+
     def __repr__(self) -> str:
         return f"DatagenStore(version={self._sync.version()})"
+
+
+class DatagenStreamWriter:
+    """A per-stream write handle over the native writer.
+
+    Owns the bookkeeping columns callers should never touch (``item_seq``, ``attempt``,
+    ``checkpoint_id``, ``event_id``), stamping them onto every event it emits. Each
+    method returns the event dict(s) to persist — hand them to
+    :meth:`DatagenStore.append` or :meth:`DatagenStore.append_checkpoint`. Pure and
+    client-side, identical for embedded and remote stores.
+    """
+
+    def __init__(self, inner: _DatagenStreamWriter) -> None:
+        self._inner = inner
+
+    @property
+    def item_id(self) -> str:
+        """The item this writer streams to."""
+        return self._inner.item_id
+
+    @property
+    def attempt(self) -> int:
+        """Attempt stamped onto events (0 fresh, ``last_attempt + 1`` on resume)."""
+        return self._inner.attempt
+
+    def step_started(self, position: Mapping[str, Any]) -> dict[str, Any]:
+        """Emit STEP_STARTED for a driver frame (Sequence/Loop). Returns one event."""
+        return self._inner.step_started(dict(position))
+
+    def step_completed(
+        self, position: Mapping[str, Any], fields: Sequence[Mapping[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Emit a checkpoint boundary: the step's field writes plus its STEP_COMPLETED.
+
+        All share one ``checkpoint_id``; returns the list of event dicts (the atomic
+        unit :meth:`DatagenStore.append_checkpoint` persists).
+        """
+        return self._inner.step_completed(
+            dict(position), [dict(field) for field in fields]
+        )
+
+    def item_terminal(self, terminal: str) -> dict[str, Any]:
+        """Emit TERMINAL; ``terminal`` is ``"completed"`` or ``"filtered"``."""
+        return self._inner.item_terminal(terminal)
+
+    def item_failed(
+        self,
+        position: Mapping[str, Any],
+        error_type: str,
+        *,
+        error_dump: str | None = None,
+        traceback: str | None = None,
+    ) -> dict[str, Any]:
+        """Emit FAILED at a step position (failure lens; does not terminate)."""
+        return self._inner.item_failed(
+            dict(position), error_type, error_dump, traceback
+        )
+
+    def __repr__(self) -> str:
+        return (
+            f"DatagenStreamWriter(item_id={self._inner.item_id!r}, "
+            f"attempt={self._inner.attempt})"
+        )
 
 
 class GenericStore:
