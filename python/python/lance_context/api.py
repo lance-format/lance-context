@@ -2924,7 +2924,9 @@ class GenericStore:
         """Connect to a remote store, creating it with ``schema`` if absent."""
         opts = dict(storage_options) if storage_options else None
         return cls(
-            _GenericStore.connect_or_create(base_url, name, dict(schema), opts, seal_on_add)
+            _GenericStore.connect_or_create(
+                base_url, name, dict(schema), opts, seal_on_add
+            )
         )
 
     def schema(self) -> dict[str, Any]:
