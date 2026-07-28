@@ -44,16 +44,29 @@ pub struct ServerConfig {
     /// regardless of count, so stale generations are folded in even on
     /// low-traffic shards that never cross the count threshold. `0` (the default)
     /// disables the timer.
+    ///
+    /// # Applies to every store kind, despite the name
+    ///
+    /// The sweeper visits rollout, datagen and generic stores alike — every
+    /// MemWAL-backed store accumulates generations, and only a merge reclaims
+    /// them. The `ROLLOUT_` prefix is historical: these variables predate the
+    /// other store kinds, and renaming them would silently break existing
+    /// deployment manifests for no functional gain.
     #[arg(long, env = "ROLLOUT_CLEANUP_INTERVAL_SECS", default_value = "0")]
     pub rollout_cleanup_interval_secs: u64,
 
-    /// Interval, in seconds, at which the sweeper flushes each resident rollout
-    /// store's active MemWAL memtable into a queryable generation. Rollout
-    /// appends are durable on return (the WAL entry is persisted to object
-    /// storage) but are not visible to reads until the memtable is flushed, so
+    /// Interval, in seconds, at which the sweeper flushes each resident store's
+    /// active MemWAL memtable into a queryable generation. A deferred-seal
+    /// append is durable on return (the WAL entry is persisted to object
+    /// storage) but is not visible to reads until the memtable is flushed, so
     /// this interval bounds read-after-write latency. Decoupling flush from the
-    /// append path is what lets concurrent appends run without serializing behind
-    /// a per-append seal. Default `30`.
+    /// append path is what lets concurrent appends run without serializing
+    /// behind a per-append seal. Default `30`.
+    ///
+    /// Like the cleanup interval, this applies to **every** store kind despite
+    /// the `ROLLOUT_` prefix. Rollout and generic stores default to a deferred
+    /// seal and depend on it; datagen seals on each append, so its pass is a
+    /// no-op in steady state.
     ///
     /// `0` disables periodic flush, leaving the cleanup sweeper
     /// (`ROLLOUT_CLEANUP_INTERVAL_SECS`) as the only thing that seals memtables
@@ -118,5 +131,59 @@ impl ServerConfig {
             .clone()
             .or_else(|| std::env::var("HOSTNAME").ok())
             .filter(|value| !value.is_empty())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// Every tunable must stay an *optional flag* with a default.
+    ///
+    /// Regression guard: dropping a field's `#[arg(..)]` attribute silently
+    /// turns it into a required positional argument, so the binary still
+    /// compiles and every unit test still passes — it just refuses to start
+    /// with the documented flags. That is only caught by actually running the
+    /// server, which nothing in the Rust suite does.
+    #[test]
+    fn every_config_field_is_an_optional_flag() {
+        let command = ServerConfig::command();
+
+        let positionals: Vec<_> = command
+            .get_positionals()
+            .map(|arg| arg.get_id().to_string())
+            .collect();
+        assert!(
+            positionals.is_empty(),
+            "config fields must be flags, not positional args; found {positionals:?} \
+             (a missing #[arg(..)] attribute does this)"
+        );
+
+        for arg in command.get_arguments() {
+            if arg.get_id() == "help" || arg.get_id() == "version" {
+                continue;
+            }
+            assert!(
+                arg.get_long().is_some(),
+                "'{}' has no long flag",
+                arg.get_id()
+            );
+            assert!(
+                arg.get_default_values().len() == 1 || !arg.is_required_set(),
+                "'{}' must have a default or be optional",
+                arg.get_id()
+            );
+        }
+    }
+
+    /// The server must start with no arguments beyond a data directory — the
+    /// documented defaults have to actually be defaults.
+    #[test]
+    fn parses_with_only_a_data_dir() {
+        let config = ServerConfig::try_parse_from(["lance-context-server", "--data-dir", "/tmp/x"])
+            .expect("the documented minimal invocation must parse");
+        assert_eq!(config.rollout_flush_interval_secs, 30);
+        assert_eq!(config.rollout_cleanup_interval_secs, 0);
     }
 }

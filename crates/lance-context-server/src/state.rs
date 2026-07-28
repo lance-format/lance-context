@@ -15,6 +15,7 @@ use tokio::task::JoinHandle;
 
 use crate::config::ServerConfig;
 use crate::error::AppError;
+use crate::sweeper;
 
 /// Default upper bound on resident rollout-store handles when the config does
 /// not specify one. Sized for peak *concurrent* experiments, not the total
@@ -636,9 +637,9 @@ impl AppState {
         }
 
         let uri = self.generic_uri(name);
-        // `seal_on_add` is a per-store property that is not persisted, so a
-        // reopened store takes the server default. Callers needing
-        // read-your-write should flush explicitly.
+        // The seal mode is persisted in the dataset, so `open_existing` restores
+        // whatever the store was created with; the option passed here is only a
+        // fallback for datasets written before that was persisted.
         let opened = GenericStore::open_existing(&uri, self.generic_store_options(false))
             .await
             .map_err(AppError::from_lance)?;
@@ -656,11 +657,14 @@ impl AppState {
     ///
     /// This replaces the former one-timer-per-store model, which does not scale
     /// to hundreds of thousands of per-experiment datasets. On each tick the
-    /// sweeper snapshots the *resident* rollout stores (those in the LRU) and
-    /// folds each one's flushed MemWAL generations into its base table, guarding
-    /// every pass with a timeout so a wedged store cannot stall the sweeper (see
-    /// [`RolloutStore::cleanup_own_shard`] and the timeout added in the periodic
-    /// cleanup hardening).
+    /// sweeper snapshots the *resident* stores of **every kind** (those in the
+    /// LRUs) and folds each one's flushed MemWAL generations into its base
+    /// table, guarding every pass with a timeout so a wedged store cannot stall
+    /// the sweeper.
+    ///
+    /// Covering all kinds is not cosmetic: it previously visited only rollout
+    /// stores, so a datagen store's generations accumulated forever and every
+    /// read unioned all of them.
     ///
     /// Cold stores (evicted from the LRU) are not swept: having no new writes,
     /// they accumulate no new generations, and are swept again the moment a
@@ -683,102 +687,32 @@ impl AppState {
                 let Some(state) = weak.upgrade() else {
                     return;
                 };
-                // Snapshot resident stores without holding the LRU lock across
-                // the awaits below.
-                let resident: Vec<(String, Arc<RwLock<RolloutStore>>)> = {
-                    let cache = state.rollout_stores.lock().await;
-                    cache
-                        .iter()
-                        .map(|(name, store)| (name.clone(), store.clone()))
-                        .collect()
-                };
-                for (name, store) in resident {
-                    // Same read-lock/write-lock split as the flush sweeper: seal
-                    // and read under the shared lock so appends keep flowing,
-                    // then commit under the exclusive lock. Threshold 1 — merge
-                    // whatever is pending, which is what makes this the *time*
-                    // half of the "time OR count" trigger.
-                    let prepared = {
-                        let guard = store.read().await;
-                        match tokio::time::timeout(pass_timeout, guard.prepare_cleanup_merge())
-                            .await
-                        {
-                            Ok(Ok(prepared)) => prepared,
-                            Ok(Err(e)) => {
-                                metrics::counter!("rollout_wal_cleanup_total", "result" => "failed")
-                                    .increment(1);
-                                tracing::warn!(
-                                    store = %name,
-                                    error = %e,
-                                    "global sweeper WAL cleanup failed"
-                                );
-                                continue;
-                            }
-                            Err(_elapsed) => {
-                                metrics::counter!("rollout_wal_cleanup_total", "result" => "timeout")
-                                    .increment(1);
-                                tracing::warn!(
-                                    store = %name,
-                                    "global sweeper WAL cleanup timed out; abandoning this store this tick"
-                                );
-                                continue;
-                            }
-                        }
-                    };
-                    let Some((manifest_store, manifest, prepared)) = prepared else {
-                        continue;
-                    };
-                    let mut guard = store.write().await;
-                    match tokio::time::timeout(
-                        pass_timeout,
-                        guard.commit_prepared_merge(&manifest_store, &manifest, prepared),
-                    )
-                    .await
-                    {
-                        Ok(Ok(n)) => {
-                            metrics::counter!("rollout_wal_cleanup_total", "result" => "merged")
-                                .increment(1);
-                            metrics::counter!("rollout_wal_generations_reclaimed_total")
-                                .increment(n as u64);
-                            tracing::info!(
-                                store = %name,
-                                reclaimed = n,
-                                "global sweeper merged flushed generations"
-                            )
-                        }
-                        Ok(Err(e)) => {
-                            metrics::counter!("rollout_wal_cleanup_total", "result" => "failed")
-                                .increment(1);
-                            tracing::warn!(
-                                store = %name,
-                                error = %e,
-                                "global sweeper WAL cleanup failed"
-                            )
-                        }
-                        Err(_elapsed) => {
-                            metrics::counter!("rollout_wal_cleanup_total", "result" => "timeout")
-                                .increment(1);
-                            tracing::warn!(
-                                store = %name,
-                                "global sweeper WAL cleanup timed out; abandoning this store this tick"
-                            )
-                        }
-                    }
-                }
+                // Every kind, not just rollout: generations accumulate in each
+                // one, and only the base table absorbs them.
+                sweeper::merge_pass(sweeper::resident(&state.rollout_stores).await, pass_timeout)
+                    .await;
+                sweeper::merge_pass(sweeper::resident(&state.datagen_stores).await, pass_timeout)
+                    .await;
+                sweeper::merge_pass(sweeper::resident(&state.generic_stores).await, pass_timeout)
+                    .await;
             }
         }))
     }
 
     /// Spawn the process-wide MemWAL flush sweeper.
     ///
-    /// Rollout appends are durable on return (the WAL entry is persisted) but not
-    /// visible to reads until the active memtable is flushed into a queryable
-    /// generation. Rather than flush on every append — which would serialize
-    /// concurrent writes behind a per-append seal — this sweeper flushes each
-    /// resident store on a fixed interval, bounding read-after-write latency
-    /// while keeping the append path concurrent.
+    /// A deferred-seal append is durable on return (the WAL entry is persisted)
+    /// but not visible to reads until the active memtable is flushed into a
+    /// queryable generation. Rather than flush on every append — which would
+    /// serialize concurrent writes behind a per-append seal — this sweeper
+    /// flushes each resident store on a fixed interval, bounding
+    /// read-after-write latency while keeping the append path concurrent.
     ///
-    /// After flushing a store it also runs the count-triggered merge
+    /// Applies to every store kind. Rollout and generic stores default to a
+    /// deferred seal and genuinely depend on this; datagen seals on each append,
+    /// so its pass is a no-op in steady state and is kept only for symmetry.
+    ///
+    /// For rollout it also runs the count-triggered merge
     /// ([`RolloutStore::maybe_merge_own_shard`]): the read-amplification bound
     /// that formerly lived on the append path now rides this timer. The heavier
     /// time-based cleanup/merge remains on [`Self::spawn_global_sweeper`].
@@ -802,98 +736,19 @@ impl AppState {
                 let Some(state) = weak.upgrade() else {
                     return;
                 };
-                let resident: Vec<(String, Arc<RwLock<RolloutStore>>)> = {
-                    let cache = state.rollout_stores.lock().await;
-                    cache
-                        .iter()
-                        .map(|(name, store)| (name.clone(), store.clone()))
-                        .collect()
-                };
-                for (name, store) in resident {
-                    // Flush under a read lock so concurrent appends are not blocked.
-                    {
-                        let guard = store.read().await;
-                        match tokio::time::timeout(pass_timeout, guard.flush()).await {
-                            Ok(Ok(())) => {}
-                            Ok(Err(e)) => {
-                                metrics::counter!("rollout_wal_flush_total", "result" => "failed")
-                                    .increment(1);
-                                tracing::warn!(store = %name, error = %e, "flush sweeper failed");
-                                continue;
-                            }
-                            Err(_elapsed) => {
-                                metrics::counter!("rollout_wal_flush_total", "result" => "timeout")
-                                    .increment(1);
-                                tracing::warn!(store = %name, "flush sweeper timed out");
-                                continue;
-                            }
-                        }
-                        metrics::counter!("rollout_wal_flush_total", "result" => "ok").increment(1);
-                    }
-                    // Count-triggered merge (no-op unless the threshold is set
-                    // and met).
-                    //
-                    // Split by lock scope: the expensive half (sealing the
-                    // memtable and reading every flushed generation out of
-                    // object storage) runs under the *read* lock, so appends
-                    // keep flowing through it. Only the short commit — append to
-                    // the base table, drain the manifest, delete the merged
-                    // dirs — takes the write lock. Previously the whole merge
-                    // held the write lock, which stalled every concurrent append
-                    // for its full duration.
-                    let threshold = state.rollout_merge_after_generations;
-                    if threshold == 0 {
-                        continue;
-                    }
-                    let prepared = {
-                        let guard = store.read().await;
-                        match tokio::time::timeout(
-                            pass_timeout,
-                            guard.prepare_merge_if_ready(threshold),
-                        )
-                        .await
-                        {
-                            Ok(Ok(prepared)) => prepared,
-                            Ok(Err(e)) => {
-                                tracing::warn!(store = %name, error = %e, "flush sweeper merge failed");
-                                continue;
-                            }
-                            Err(_elapsed) => {
-                                tracing::warn!(store = %name, "flush sweeper merge timed out");
-                                continue;
-                            }
-                        }
-                    };
-                    let Some((manifest_store, manifest, prepared)) = prepared else {
-                        continue;
-                    };
-                    let mut guard = store.write().await;
-                    match tokio::time::timeout(
-                        pass_timeout,
-                        guard.commit_prepared_merge(&manifest_store, &manifest, prepared),
-                    )
-                    .await
-                    {
-                        Ok(Ok(n)) => {
-                            metrics::counter!("rollout_wal_generations_reclaimed_total")
-                                .increment(n as u64);
-                            tracing::info!(
-                                store = %name,
-                                reclaimed = n,
-                                "flush sweeper count-merged flushed generations"
-                            );
-                        }
-                        Ok(Err(e)) => {
-                            tracing::warn!(store = %name, error = %e, "flush sweeper merge failed");
-                        }
-                        Err(_elapsed) => {
-                            tracing::warn!(store = %name, "flush sweeper merge timed out");
-                        }
-                    }
-                }
+                sweeper::flush_pass(sweeper::resident(&state.rollout_stores).await, pass_timeout)
+                    .await;
+                // Datagen seals on every append, so its pass is a no-op in
+                // steady state; generic stores default to a deferred seal and
+                // genuinely depend on this.
+                sweeper::flush_pass(sweeper::resident(&state.datagen_stores).await, pass_timeout)
+                    .await;
+                sweeper::flush_pass(sweeper::resident(&state.generic_stores).await, pass_timeout)
+                    .await;
             }
         }))
     }
+
     ///
     /// [`RolloutStore`]'s writer ([`ShardWriter`]) has no `Drop`, so its
     /// background tasks are only reclaimed by an explicit `close().await`. On the
@@ -1024,6 +879,144 @@ mod tests {
             .spawn_global_sweeper()
             .expect("sweeper spawns when interval > 0");
         handle.abort();
+    }
+
+    /// One minimal, well-formed datagen event.
+    fn datagen_event() -> lance_context_core::DatagenEvent {
+        use lance_context_core::{
+            datagen_event_id, DatagenEvent, DatagenEventType, DatagenStepKind,
+            DATAGEN_SCHEMA_VERSION,
+        };
+        DatagenEvent {
+            event_id: datagen_event_id("item-1", "ckpt-1", 0),
+            item_id: "item-1".to_string(),
+            root_item_id: "item-1".to_string(),
+            parent_item_id: None,
+            item_seq: 1,
+            checkpoint_id: "ckpt-1".to_string(),
+            event_type: DatagenEventType::StepCompleted,
+            step_name: Some("grade".to_string()),
+            step_kind: Some(DatagenStepKind::Leaf),
+            step_index: Some(0),
+            enclosing_step: None,
+            selector_step: None,
+            attempt: 0,
+            run_id: "run-1".to_string(),
+            writer_epoch: "writer-1".to_string(),
+            field_name: None,
+            field_type: None,
+            codec_version: None,
+            value: None,
+            query_tags: None,
+            status: None,
+            error_type: None,
+            error_dump: None,
+            traceback: None,
+            event_ts: chrono::Utc::now(),
+            schema_version: DATAGEN_SCHEMA_VERSION,
+        }
+    }
+
+    /// The sweepers must visit **every** store kind, not just rollout. Before
+    /// this, a datagen store's flushed generations accumulated forever (nothing
+    /// merged them) and a generic store with the default deferred seal stayed
+    /// invisible until someone called `/flush` by hand.
+    ///
+    /// Drives one pass directly rather than waiting on the timer, so the test
+    /// asserts the traversal rather than the tick.
+    #[tokio::test]
+    async fn sweeper_passes_cover_datagen_and_generic_stores() {
+        use lance_context_api::{ColumnSpec, ColumnType, SchemaSpec, ID_COLUMN};
+        use lance_context_core::{DatagenStore, GenericStore, GenericStoreOptions};
+        use std::time::Duration;
+
+        use crate::sweeper;
+
+        let dir = TempDir::new().unwrap();
+        let state = state_with_interval(&dir, 0).await;
+        let timeout = Duration::from_secs(30);
+
+        // --- generic: deferred seal, so the flush pass is what publishes it ---
+        let schema = SchemaSpec::new(vec![(
+            ID_COLUMN.to_string(),
+            ColumnSpec::required(ColumnType::String { large: false }),
+        )]);
+        let generic_uri = state.generic_uri("g1");
+        let generic = GenericStore::open(
+            &generic_uri,
+            schema,
+            GenericStoreOptions {
+                seal_on_add: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut rows = serde_json::Map::new();
+        rows.insert("id".to_string(), serde_json::json!("r1"));
+        generic.add(&[rows]).await.unwrap();
+        assert_eq!(
+            generic.list(None, None).await.unwrap().len(),
+            0,
+            "precondition: a deferred-seal write is not yet visible"
+        );
+
+        let generic = Arc::new(RwLock::new(generic));
+        state
+            .register_generic("g1", &generic_uri, generic.clone())
+            .await
+            .unwrap();
+
+        sweeper::flush_pass(sweeper::resident(&state.generic_stores).await, timeout).await;
+        assert_eq!(
+            generic.read().await.list(None, None).await.unwrap().len(),
+            1,
+            "the flush pass must publish a generic store's buffered rows"
+        );
+
+        // --- datagen: seals on append, so the merge pass is what it needs ---
+        let datagen_uri = state.datagen_uri("d1");
+        let mut datagen = DatagenStore::open(&datagen_uri).await.unwrap();
+        datagen.append(&[datagen_event()]).await.unwrap();
+        assert!(
+            datagen.pending_wal_generations().await.unwrap() > 0,
+            "precondition: datagen seals on append, so a generation is pending"
+        );
+        let datagen = Arc::new(RwLock::new(datagen));
+        state
+            .register_datagen("d1", &datagen_uri, datagen.clone())
+            .await
+            .unwrap();
+
+        // Both kinds have pending generations now; the merge pass drains them.
+        sweeper::merge_pass(sweeper::resident(&state.generic_stores).await, timeout).await;
+        assert_eq!(
+            generic
+                .read()
+                .await
+                .pending_wal_generations()
+                .await
+                .unwrap(),
+            0,
+            "the merge pass must fold a generic store's generations into the base table"
+        );
+        // Rows survive the merge.
+        assert_eq!(
+            generic.read().await.list(None, None).await.unwrap().len(),
+            1
+        );
+
+        sweeper::merge_pass(sweeper::resident(&state.datagen_stores).await, timeout).await;
+        assert_eq!(
+            datagen
+                .read()
+                .await
+                .pending_wal_generations()
+                .await
+                .unwrap(),
+            0,
+            "the merge pass must reach datagen stores too"
+        );
     }
 
     /// `shutdown` drains resident rollout writers by awaiting `close()` on each
