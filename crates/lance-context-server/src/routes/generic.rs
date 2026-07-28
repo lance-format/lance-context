@@ -464,6 +464,105 @@ mod tests {
         assert!(matches!(err, AppError::NotFound(_)), "{err:?}");
     }
 
+    /// The bug this guards: `seal_on_add` used to live only in the open
+    /// options, so a store created with it lost read-your-write the first time
+    /// it was evicted from the LRU and reopened — silently, with no error and
+    /// no data loss, just "sometimes I can't read what I just wrote".
+    #[tokio::test]
+    async fn seal_mode_survives_eviction_and_reopen() {
+        let (state, _dir) = test_state().await;
+        let _ = create_generic_store(
+            State(state.clone()),
+            Json(CreateGenericStoreRequest {
+                name: "s1".to_string(),
+                schema: spec(),
+                storage_options: None,
+                seal_on_add: true,
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Evict, forcing the next request to reopen from object storage. This
+        // is exactly what the LRU does under capacity pressure.
+        state.generic_stores.lock().await.pop("s1");
+
+        let _ = add_rows(
+            State(state.clone()),
+            Path("s1".to_string()),
+            Json(AddRowsRequest {
+                rows: vec![row(serde_json::json!({"id": "r1"}))],
+            }),
+        )
+        .await
+        .unwrap();
+
+        let Json(listed) = list_rows(
+            State(state),
+            Path("s1".to_string()),
+            Query(ListRowsQuery {
+                limit: None,
+                offset: None,
+                filter: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            listed.rows.len(),
+            1,
+            "a reopened store must keep the seal mode it was created with"
+        );
+    }
+
+    /// The mirror case: a store created with the deferred default must not
+    /// start sealing after a reopen either.
+    #[tokio::test]
+    async fn deferred_seal_mode_also_survives_eviction() {
+        let (state, _dir) = test_state().await;
+        let _ = create_generic_store(
+            State(state.clone()),
+            Json(CreateGenericStoreRequest {
+                name: "s1".to_string(),
+                schema: spec(),
+                storage_options: None,
+                seal_on_add: false,
+            }),
+        )
+        .await
+        .unwrap();
+
+        state.generic_stores.lock().await.pop("s1");
+
+        let _ = add_rows(
+            State(state.clone()),
+            Path("s1".to_string()),
+            Json(AddRowsRequest {
+                rows: vec![row(serde_json::json!({"id": "r1"}))],
+            }),
+        )
+        .await
+        .unwrap();
+
+        let query = || ListRowsQuery {
+            limit: None,
+            offset: None,
+            filter: None,
+        };
+        let Json(listed) = list_rows(State(state.clone()), Path("s1".to_string()), Query(query()))
+            .await
+            .unwrap();
+        assert_eq!(listed.rows.len(), 0, "deferred seal must stay deferred");
+
+        flush_generic_store(State(state.clone()), Path("s1".to_string()))
+            .await
+            .unwrap();
+        let Json(after) = list_rows(State(state), Path("s1".to_string()), Query(query()))
+            .await
+            .unwrap();
+        assert_eq!(after.rows.len(), 1);
+    }
+
     #[tokio::test]
     async fn deferred_seal_needs_a_flush_and_wal_merges() {
         let (state, _dir) = test_state().await;

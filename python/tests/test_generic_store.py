@@ -190,3 +190,32 @@ def test_shorthand_and_full_type_forms_agree(tmp_path: Path) -> None:
     )
     shorthand.add([{"id": "a", "n": 7}])
     assert shorthand.list()[0]["n"] == 7
+
+
+def test_seal_mode_survives_a_reopen(tmp_path: Path) -> None:
+    # `seal_on_add` is a property of the store, not of whoever opens it. It used
+    # to live only in the open options, so a reopened store silently reverted to
+    # the caller's default and lost read-your-write with no error.
+    uri = str(tmp_path / "sealed.lance")
+    store = GenericStore.open(uri, schema=SCHEMA, seal_on_add=True)
+    store.add([{"id": "r1"}])
+    del store
+
+    # Reopen with the opposite default: the persisted value must win.
+    reopened = GenericStore.open_existing(uri, seal_on_add=False)
+    reopened.add([{"id": "r2"}])
+    assert len(reopened.list()) == 2, (
+        "a store created with seal_on_add must keep it across a reopen"
+    )
+
+
+def test_deferred_seal_mode_survives_a_reopen(tmp_path: Path) -> None:
+    uri = str(tmp_path / "deferred.lance")
+    GenericStore.open(uri, schema=SCHEMA, seal_on_add=False)
+
+    reopened = GenericStore.open_existing(uri, seal_on_add=True)
+    reopened.add([{"id": "r1"}])
+    assert reopened.list() == [], "a deferred-seal store must stay deferred"
+
+    reopened.flush()
+    assert len(reopened.list()) == 1

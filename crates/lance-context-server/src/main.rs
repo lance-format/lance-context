@@ -2,6 +2,7 @@ mod config;
 mod error;
 mod routes;
 mod state;
+mod sweeper;
 
 use std::sync::Arc;
 
@@ -58,9 +59,10 @@ async fn main() {
     if state.rollout_flush_interval_secs == 0 && state.rollout_cleanup_interval_secs == 0 {
         tracing::warn!(
             "ROLLOUT_FLUSH_INTERVAL_SECS=0 and ROLLOUT_CLEANUP_INTERVAL_SECS=0: \
-             nothing will seal MemWAL memtables, so rollout appends will be durable \
-             but invisible to reads until this process restarts. Set at least one \
-             of them to a non-zero interval."
+             nothing will seal MemWAL memtables, so deferred-seal appends (rollout \
+             and generic stores) will be durable but invisible to reads until this \
+             process restarts. Pending WAL generations will also never be merged, \
+             for every store kind. Set at least one of them to a non-zero interval."
         );
     }
 
