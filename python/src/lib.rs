@@ -18,8 +18,9 @@ use lance_context::{
     DatagenItemNode as UnifiedDatagenItemNode, DatagenItemTree as UnifiedDatagenItemTree,
     DatagenStepCursorDto, DatagenStore as UnifiedDatagenStore, DatagenStoreApi,
     DatagenStreamPosition, DatagenStreamWriter as CoreDatagenStreamWriter, DatagenValueDto,
-    DatagenWriteContext, FoldedDatagenItemDto, GenericStore as UnifiedGenericStore, GenericStoreApi,
-    RolloutRecordDto, RolloutStore as UnifiedRolloutStore, RolloutStoreApi, SchemaSpec,
+    DatagenWriteContext, FoldedDatagenItemDto, GenericStore as UnifiedGenericStore,
+    GenericStoreApi, RolloutRecordDto, RolloutStore as UnifiedRolloutStore, RolloutStoreApi,
+    SchemaSpec,
 };
 use lance_context_api::{
     AddRecordRequest, CompactRequest, CompactResponse, CompactStatsResponse, ContextStoreApi,
