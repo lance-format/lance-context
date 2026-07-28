@@ -22,14 +22,18 @@ mod storage;
 mod store;
 mod store_base;
 
-pub use api_impl::rollout_record_to_dto;
+pub use api_impl::{
+    datagen_event_to_dto, datagen_events_from_dtos, folded_item_to_dto, rollout_record_to_dto,
+};
 pub use context::{Context, ContextEntry, Snapshot};
 pub use datagen::{
-    datagen_event_id, datagen_failures, datagen_trajectory, fold_datagen_events, DatagenBlobValue,
-    DatagenErrorInfo, DatagenEvent, DatagenEventType, DatagenFailure, DatagenFieldState,
-    DatagenItemId, DatagenItemLookup, DatagenItemStatus, DatagenRootItemStatuses,
-    DatagenStepCursor, DatagenStepId, DatagenStepKind, DatagenStreamPosition, DatagenTerminal,
-    DatagenTrajectory, DatagenValue, FoldedDatagenItem, DATAGEN_SCHEMA_VERSION,
+    datagen_event_id, datagen_failures, datagen_trajectory, fold_datagen_events,
+    open_stream_events, DatagenBlobValue, DatagenErrorInfo, DatagenEvent, DatagenEventType,
+    DatagenFailure, DatagenFieldChange, DatagenFieldState, DatagenItemId, DatagenItemLookup,
+    DatagenItemNode, DatagenItemStatus, DatagenItemTree, DatagenNewStream, DatagenOpenStream,
+    DatagenRootItemStatuses, DatagenStepCursor, DatagenStepId, DatagenStepKind,
+    DatagenStreamPosition, DatagenStreamWriter, DatagenTerminal, DatagenTrajectory, DatagenValue,
+    DatagenWriteContext, FieldOp, FoldedDatagenItem, DATAGEN_SCHEMA_VERSION,
 };
 pub use datagen_store::{datagen_log_schema, DatagenStore, DatagenStoreOptions};
 pub use eval::{

@@ -222,6 +222,15 @@ pub trait DatagenStoreApi {
         item_id: &str,
     ) -> impl Future<Output = ContextResult<Vec<DatagenFailureDto>>> + Send;
 
+    /// Raw-dump every event for a root and its projected descendants, oldest
+    /// first. The transport-thin read the inspection tree is folded from
+    /// client-side, so the same `DatagenItemTree` assembly runs for embedded and
+    /// remote without duplicating fold logic on the server.
+    fn events_for_root(
+        &self,
+        root_item_id: &str,
+    ) -> impl Future<Output = ContextResult<Vec<DatagenEventDto>>> + Send;
+
     /// Materialize one FIELD_* event's offloaded blob bytes by event id.
     /// Returns `None` when the event or its payload is absent.
     fn get_blob(
@@ -1046,6 +1055,10 @@ pub struct FoldedDatagenItemDto {
     pub trajectory: Vec<DatagenStepCursorDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query_tags: Option<Value>,
+    /// `field_name -> event_id` for the folded blob fields, so a caller can resolve a blob by field
+    /// name (via `load_blob`) without recomputing an `event_id`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub blob_event_ids: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1076,6 +1089,11 @@ pub struct DatagenFailureDto {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ListDatagenFailuresResponse {
     pub failures: Vec<DatagenFailureDto>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ListDatagenEventsResponse {
+    pub events: Vec<DatagenEventDto>,
 }
 
 // ---------------------------------------------------------------------------
