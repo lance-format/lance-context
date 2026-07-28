@@ -493,7 +493,7 @@ mod tests {
         let selector = selector(&[("tenant", "acme"), ("source", "memory")]);
         let partition = namespace.resolve_partition(&selector).unwrap();
 
-        let mut store = namespace.context(&selector).await.unwrap();
+        let store = namespace.context(&selector).await.unwrap();
         store
             .add(&[record("rec-1", "acme", "memory")])
             .await

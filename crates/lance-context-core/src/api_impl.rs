@@ -41,7 +41,10 @@ impl ContextStoreApi for ContextStore {
         }
 
         let count = core_records.len();
-        let version = self.add(&core_records).await.map_err(to_ctx_err)?;
+        // Disambiguate: the inherent `ContextStore::add`, not this trait method.
+        let version = ContextStore::add(self, &core_records)
+            .await
+            .map_err(to_ctx_err)?;
         Ok(AddRecordsResponse {
             version,
             ids,

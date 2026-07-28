@@ -424,6 +424,11 @@ impl RolloutStore {
                 // claim-check columns), so a WAL merge first evolves an older
                 // base table to the current schema before appending.
                 latest_schema: Some(Arc::new(rollout_schema())),
+                // Rollout defers the seal: high fan-in appends must not
+                // serialize behind a per-append seal, and rollout rows are
+                // immutable so nothing reads back before writing. The server's
+                // flush sweeper (and `?flush=true`) provide visibility.
+                seal_on_put: false,
             },
             create_if_missing,
         )

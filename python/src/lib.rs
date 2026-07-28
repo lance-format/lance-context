@@ -220,6 +220,7 @@ fn context_options_from_py<'py>(
         blob_columns: blob_set,
         id_index_type: id_idx,
         distance_metric: metric,
+        ..Default::default()
     })
 }
 
@@ -773,13 +774,21 @@ impl Context {
         self.inner.snapshot(label)
     }
 
-    fn fork(&self, branch_name: &str) -> Self {
-        Self {
+    fn fork(&self, py: Python<'_>, branch_name: &str) -> PyResult<Self> {
+        // Opens a second handle on the same dataset rather than cloning this
+        // one: `ContextStore` owns a resident MemWAL writer (and a `Drop` that
+        // seals it), so it is deliberately not `Clone` -- two owners would mean
+        // two writers racing for one shard. A fork branches the in-memory
+        // `Context` and shares the underlying dataset, which a fresh handle
+        // gives it.
+        let uri = self.store.uri().to_string();
+        let store = py.allow_threads(|| self.runtime.block_on(ContextStore::open(&uri)));
+        Ok(Self {
             inner: self.inner.fork(branch_name),
-            store: self.store.clone(),
+            store: store.map_err(to_py_err)?,
             runtime: Arc::clone(&self.runtime),
             run_id: new_run_id(),
-        }
+        })
     }
 
     fn checkout(&mut self, py: Python<'_>, version_id: u64) -> PyResult<()> {

@@ -154,6 +154,27 @@ pub(crate) struct StorageBaseOptions {
     /// older base table to it by adding missing nullable columns as all-nulls
     /// (see [`StorageBase::ensure_latest_schema`]). `None` disables evolution.
     pub latest_schema: Option<Arc<Schema>>,
+    /// Whether [`StorageBase::put`] seals the memtable before returning, making
+    /// the rows immediately readable.
+    ///
+    /// This is the one deliberate behavioral difference between the stores, and
+    /// it is a **visibility/throughput trade, not a durability one** — a `put`
+    /// is durable either way.
+    ///
+    /// - `false` (rollout): `put` is a durable WAL append only. Concurrent
+    ///   appends are not serialized behind a per-append seal, but there is **no
+    ///   read-your-write guarantee** — visibility is bounded by whatever drives
+    ///   [`StorageBase::flush`] (the server's flush sweeper, 30s by default), by
+    ///   Lance's own memtable-size thresholds, or by an explicit per-request
+    ///   flush.
+    /// - `true` (context): `put` seals before returning, so a subsequent read
+    ///   sees the rows. Required by any store whose writes read the table back —
+    ///   `ContextStore`'s id/external-id uniqueness validation, upsert, and
+    ///   tombstones all depend on it.
+    ///
+    /// Sealing per write produces a flushed generation per call, which is
+    /// exactly the read amplification the high-fan-in rollout path avoids.
+    pub seal_on_put: bool,
 }
 
 /// Schema-agnostic Lance storage: dataset handle, MemWAL write path, WAL merge,
@@ -175,6 +196,8 @@ pub(crate) struct StorageBase {
     pub key_column: String,
     /// Latest expected schema for merge-time evolution; see the option.
     latest_schema: Option<Arc<Schema>>,
+    /// Whether `put` seals before returning; see [`StorageBaseOptions::seal_on_put`].
+    seal_on_put: bool,
     /// Self-merge threshold; `0` disables it.
     merge_after_generations: usize,
     /// Timestamp of the last successful [`Self::compact`] on this handle.
@@ -227,14 +250,8 @@ impl StorageBase {
             schema,
             key_column,
             latest_schema,
+            seal_on_put,
         } = options;
-
-        if schema.field_with_name(&key_column).is_err() {
-            return Err(ArrowError::SchemaError(format!(
-                "key column '{key_column}' is not present in the store schema"
-            ))
-            .into());
-        }
 
         let dataset =
             match Self::load_with_options(uri, storage_options.clone(), session.clone()).await {
@@ -251,6 +268,48 @@ impl StorageBase {
                 Err(err) => return Err(err),
             };
 
+        Self::from_dataset(
+            dataset,
+            StorageBaseOptions {
+                storage_options,
+                shard_id,
+                merge_after_generations,
+                session,
+                schema,
+                key_column,
+                latest_schema,
+                seal_on_put,
+            },
+        )
+        .await
+    }
+
+    /// Wrap an already-open [`Dataset`].
+    ///
+    /// For stores that must inspect the dataset before they can describe
+    /// themselves: `ContextStore` reads the embedding width and distance metric
+    /// out of the existing schema (and validates them against the caller's
+    /// request) before it knows what schema to hand the base. [`Self::open`] is
+    /// the simpler path when the schema is known up front.
+    pub async fn from_dataset(dataset: Dataset, options: StorageBaseOptions) -> LanceResult<Self> {
+        let StorageBaseOptions {
+            storage_options,
+            shard_id,
+            merge_after_generations,
+            session,
+            schema,
+            key_column,
+            latest_schema,
+            seal_on_put,
+        } = options;
+
+        if schema.field_with_name(&key_column).is_err() {
+            return Err(ArrowError::SchemaError(format!(
+                "key column '{key_column}' is not present in the store schema"
+            ))
+            .into());
+        }
+
         let mut base = Self {
             dataset,
             write_shard: derive_shard_id(shard_id.as_deref()),
@@ -258,6 +317,7 @@ impl StorageBase {
             session,
             key_column,
             latest_schema,
+            seal_on_put,
             merge_after_generations: merge_after_generations.unwrap_or(0),
             last_compaction: None,
             total_compactions: 0,
@@ -302,26 +362,28 @@ impl StorageBase {
 
     /// Durably append `batches` through this instance's MemWAL shard.
     ///
-    /// # Durable on return, *not* visible on return
+    /// # Always durable on return; visible on return only if `seal_on_put`
     ///
-    /// The only per-append work is `put`, which returns once the WAL entry has
-    /// been PUT to object storage. The rows are then **durable** — they survive
-    /// a crash and are replayed on reopen — but they are **not yet readable**,
-    /// by this instance or any other. A row becomes visible only after its
-    /// memtable is sealed into a flushed generation and committed to the shard
-    /// manifest, which happens in [`Self::flush`] (also performed by
-    /// [`Self::close`], and by the merge path).
+    /// `put` returns once the WAL entry has been PUT to object storage. The rows
+    /// are then **durable** — they survive a crash and are replayed on reopen.
+    /// Whether they are also **readable** depends on
+    /// [`StorageBaseOptions::seal_on_put`]:
     ///
-    /// Callers therefore get **no read-your-write guarantee**; a caller that
-    /// needs the row readable immediately must `put(..).await` then
-    /// `flush().await`.
+    /// - `false` (rollout): the rows sit in the active memtable, invisible to
+    ///   every reader including this one, until something seals them into a
+    ///   flushed generation and commits it to the shard manifest — [`Self::flush`]
+    ///   (driven by the server's flush sweeper), [`Self::close`], the merge path,
+    ///   or Lance's own memtable-size thresholds. Callers get **no
+    ///   read-your-write guarantee**.
+    /// - `true` (context): this call seals before returning, so a subsequent
+    ///   read sees the rows.
     ///
-    /// This decoupling is deliberate: sealing on the append path serialized
-    /// concurrent appends behind one seal+drain. Keeping only the durable `put`
-    /// here lets appends run concurrently, and reuses a single resident
-    /// [`ShardWriter`] so the shard epoch is claimed once and the object-store
-    /// connection is pooled, rather than paying a cold DNS resolution +
-    /// TCP/TLS handshake + epoch claim per append.
+    /// Deferring the seal is what lets concurrent appends run without
+    /// serializing behind one seal+drain, and it avoids emitting a flushed
+    /// generation per call. Either way a single resident [`ShardWriter`] is
+    /// reused, so the shard epoch is claimed once and the object-store
+    /// connection is pooled, rather than paying a cold DNS resolution + TCP/TLS
+    /// handshake + epoch claim per append.
     ///
     /// Retried exactly once on a fence: a fence means a merge superseded our
     /// epoch, and invalidating + reopening re-claims the current one. Rows are
@@ -332,7 +394,7 @@ impl StorageBase {
             return Ok(());
         }
         let started = timer_start!();
-        let result = self.put_inner(batches).await;
+        let result = self.put_sealing(batches).await;
         // Success-path latency only. A failed append's *duration* is not
         // actionable, but its *rate* is, so errors increment a flat counter
         // rather than doubling this histogram's series count.
@@ -344,6 +406,19 @@ impl StorageBase {
             Err(_) => count!(crate::metrics::ROLLOUT_ADD_ERRORS),
         }
         result
+    }
+
+    /// [`Self::put_inner`], then seal if this store wants read-your-write.
+    ///
+    /// The seal is inside the timed region because for a `seal_on_put` store it
+    /// is part of what the caller is waiting for; excluding it would understate
+    /// the write latency such a store actually sees.
+    async fn put_sealing(&self, batches: Vec<RecordBatch>) -> LanceResult<()> {
+        self.put_inner(batches).await?;
+        if self.seal_on_put {
+            self.flush().await?;
+        }
+        Ok(())
     }
 
     async fn put_inner(&self, batches: Vec<RecordBatch>) -> LanceResult<()> {
@@ -995,7 +1070,7 @@ impl StorageBase {
 
     /// Reload the base dataset handle through [`Self::load_with_options`], so
     /// the shared session and storage options are never dropped.
-    async fn reload(&mut self) -> LanceResult<()> {
+    pub async fn reload(&mut self) -> LanceResult<()> {
         let uri = self.dataset.uri().to_string();
         self.dataset =
             Self::load_with_options(&uri, self.storage_options.clone(), self.session.clone())
