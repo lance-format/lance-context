@@ -5483,6 +5483,7 @@ dependencies = [
  "arrow-ipc 58.3.0",
  "arrow-json 58.3.0",
  "arrow-schema 58.3.0",
+ "base64",
  "chrono",
  "datafusion 53.1.0",
  "futures",
