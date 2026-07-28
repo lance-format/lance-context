@@ -30,9 +30,9 @@ use lance::session::Session;
 use lance::{Error as LanceError, Result as LanceResult};
 
 use crate::generic_codec::{batch_to_rows, rows_to_batch, Row};
-use crate::schema_spec::{SchemaSpec, ID_COLUMN};
 use crate::store::{CompactionConfig, CompactionStats};
 use crate::store_base::{ListSource, StorageBase, StorageBaseOptions};
+use lance_context_api::schema_spec::{SchemaSpec, ID_COLUMN};
 
 /// Schema-metadata key holding the serialized [`SchemaSpec`], so a store can be
 /// reopened without the caller re-declaring its columns.
@@ -413,9 +413,12 @@ impl GenericStore {
 }
 
 #[cfg(test)]
+// `GenericStore` owns a `Dataset` and is not `Debug`, so `expect_err` (which
+// formats the Ok value) is unavailable; `.err().expect(..)` is the alternative.
+#[allow(clippy::err_expect)]
 mod tests {
     use super::*;
-    use crate::schema_spec::{ColumnSpec, ColumnType};
+    use lance_context_api::schema_spec::{ColumnSpec, ColumnType};
     use serde_json::json;
     use tempfile::TempDir;
 

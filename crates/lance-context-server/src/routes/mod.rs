@@ -1,6 +1,7 @@
 pub mod compact;
 pub mod contexts;
 pub mod datagen;
+pub mod generic;
 pub mod health;
 pub mod records;
 pub mod rollouts;
@@ -145,6 +146,27 @@ pub fn router() -> Router<Arc<AppState>> {
         .route(
             "/api/v1/datagen/{name}/blobs/{event_id}",
             get(datagen::fetch_datagen_blob),
+        )
+        .route("/api/v1/generic", post(generic::create_generic_store))
+        .route("/api/v1/generic", get(generic::list_generic_stores))
+        .route("/api/v1/generic/{name}", get(generic::get_generic_store))
+        .route(
+            "/api/v1/generic/{name}",
+            delete(generic::delete_generic_store),
+        )
+        .route(
+            "/api/v1/generic/{name}/rows",
+            post(generic::add_rows).layer(DefaultBodyLimit::max(generic::MAX_GENERIC_UPLOAD_BYTES)),
+        )
+        .route("/api/v1/generic/{name}/rows", get(generic::list_rows))
+        .route("/api/v1/generic/{name}/rows/{id}", get(generic::get_row))
+        .route(
+            "/api/v1/generic/{name}/flush",
+            post(generic::flush_generic_store),
+        )
+        .route(
+            "/api/v1/generic/{name}/merge-wal",
+            post(generic::merge_generic_wal),
         )
 }
 

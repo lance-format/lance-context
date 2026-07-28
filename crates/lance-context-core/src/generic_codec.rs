@@ -28,7 +28,7 @@ use arrow_array::{
 use arrow_schema::{ArrowError, Schema};
 use serde_json::{Map, Number, Value};
 
-use crate::schema_spec::{ColumnSpec, ColumnType, SchemaSpec, ID_COLUMN};
+use lance_context_api::schema_spec::{ColumnSpec, ColumnType, SchemaSpec, ID_COLUMN};
 
 /// One row: column name to value. Absent keys are written as null, which is why
 /// a nullable column can simply be omitted.
@@ -620,7 +620,7 @@ fn number(value: f64) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema_spec::ColumnSpec;
+    use lance_context_api::schema_spec::ColumnSpec;
     use serde_json::json;
 
     fn spec() -> SchemaSpec {

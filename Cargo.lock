@@ -5457,6 +5457,7 @@ dependencies = [
 name = "lance-context-api"
 version = "0.6.4"
 dependencies = [
+ "arrow-schema 58.3.0",
  "base64",
  "chrono",
  "serde",

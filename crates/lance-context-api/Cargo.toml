@@ -9,6 +9,7 @@ description = "Shared request/response types for the lance-context REST API"
 keywords = ["context", "lance", "api"]
 
 [dependencies]
+arrow-schema = "58"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 serde = { version = "1", features = ["derive"] }

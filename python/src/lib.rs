@@ -4,18 +4,19 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use pyo3::exceptions::{PyRuntimeError, PyTypeError};
+use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyModule, PyType};
 use pyo3::IntoPyObject;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tokio::runtime::Runtime;
 
 use lance_context::{
-    AddRolloutRequest, CreateDatagenStoreRequest, CreateRolloutStoreRequest, DatagenEventDto,
-    DatagenFailureDto, DatagenFieldStateDto, DatagenStepCursorDto,
-    DatagenStore as UnifiedDatagenStore, DatagenStoreApi, DatagenValueDto, FoldedDatagenItemDto,
-    RolloutRecordDto, RolloutStore as UnifiedRolloutStore, RolloutStoreApi,
+    AddRolloutRequest, ColumnSpec, CreateDatagenStoreRequest, CreateGenericStoreRequest,
+    CreateRolloutStoreRequest, DatagenEventDto, DatagenFailureDto, DatagenFieldStateDto,
+    DatagenStepCursorDto, DatagenStore as UnifiedDatagenStore, DatagenStoreApi, DatagenValueDto,
+    FoldedDatagenItemDto, GenericStore as UnifiedGenericStore, GenericStoreApi, RolloutRecordDto,
+    RolloutStore as UnifiedRolloutStore, RolloutStoreApi, SchemaSpec,
 };
 use lance_context_api::{
     AddRecordRequest, CompactRequest, CompactResponse, CompactStatsResponse, ContextStoreApi,
@@ -2954,6 +2955,251 @@ fn failure_to_py(py: Python<'_>, failure: &DatagenFailureDto) -> PyResult<PyObje
     Ok(dict.into_pyobject(py)?.unbind().into())
 }
 
+/// A store over a user-declared schema. Rows are plain dicts; the schema is
+/// declared once at creation and persisted in the dataset.
+#[pyclass]
+struct GenericStore {
+    store: UnifiedGenericStore,
+    runtime: Arc<Runtime>,
+}
+
+impl GenericStore {
+    fn from_store(store: UnifiedGenericStore, runtime: Arc<Runtime>) -> Self {
+        Self { store, runtime }
+    }
+}
+
+/// Convert a Python dict describing a schema into a [`SchemaSpec`].
+///
+/// Accepts the same JSON shape the REST API takes, so the two surfaces cannot
+/// drift: `{"id": {"type": "string", "nullable": false}, ...}`, or the
+/// shorthand `{"id": "string"}` for a nullable column of that type.
+fn schema_spec_from_py(schema: &Bound<'_, PyDict>) -> PyResult<SchemaSpec> {
+    let mut columns = Vec::with_capacity(schema.len());
+    for (key, value) in schema.iter() {
+        let name: String = key.extract()?;
+        // Shorthand: a bare type name means a nullable column of that type.
+        let spec_json = if let Ok(type_name) = value.extract::<String>() {
+            serde_json::json!({ "type": type_name })
+        } else {
+            let encoded = py_dict_to_json(&value)
+                .map_err(|e| PyValueError::new_err(format!("column '{name}': {e}")))?;
+            serde_json::from_str(&encoded)
+                .map_err(|e| PyValueError::new_err(format!("column '{name}': invalid spec: {e}")))?
+        };
+        let column: ColumnSpec = serde_json::from_value(spec_json)
+            .map_err(|e| PyValueError::new_err(format!("column '{name}': invalid spec: {e}")))?;
+        columns.push((name, column));
+    }
+    let spec = SchemaSpec::new(columns);
+    spec.validate().map_err(PyValueError::new_err)?;
+    Ok(spec)
+}
+
+/// Serialize an arbitrary Python object to JSON via the `json` module, so
+/// nested dicts describing a column type round-trip without a hand-written
+/// converter.
+fn py_dict_to_json(value: &Bound<'_, PyAny>) -> PyResult<String> {
+    let json = value.py().import("json")?;
+    json.call_method1("dumps", (value,))?.extract()
+}
+
+/// Convert a Python mapping into one row.
+fn row_from_py(row: &Bound<'_, PyAny>) -> PyResult<Map<String, Value>> {
+    let encoded = py_dict_to_json(row)?;
+    let value: Value = serde_json::from_str(&encoded).map_err(to_py_err)?;
+    match value {
+        Value::Object(map) => Ok(map),
+        other => Err(PyValueError::new_err(format!(
+            "each row must be a mapping, got {other}"
+        ))),
+    }
+}
+
+/// Convert a decoded row back into a Python dict.
+fn row_to_py(py: Python<'_>, row: &Map<String, Value>) -> PyResult<PyObject> {
+    let json = py.import("json")?;
+    let encoded = serde_json::to_string(row).map_err(to_py_err)?;
+    Ok(json.call_method1("loads", (encoded,))?.unbind())
+}
+
+#[pymethods]
+impl GenericStore {
+    /// Open (or create) an embedded store at `uri` with the given schema.
+    ///
+    /// `schema` maps column name to type, e.g.
+    /// `{"id": {"type": "string", "nullable": False}, "score": "float32"}`.
+    /// An `id` column is required.
+    #[classmethod]
+    #[pyo3(signature = (uri, schema, storage_options = None, seal_on_add = false))]
+    fn open(
+        _cls: &Bound<'_, PyType>,
+        py: Python<'_>,
+        uri: &str,
+        schema: &Bound<'_, PyDict>,
+        storage_options: Option<HashMap<String, String>>,
+        seal_on_add: bool,
+    ) -> PyResult<Self> {
+        let spec = schema_spec_from_py(schema)?;
+        let runtime = Arc::new(Runtime::new().map_err(to_py_err)?);
+        let store_res = py.allow_threads(|| {
+            runtime.block_on(UnifiedGenericStore::open_with_options(
+                uri,
+                spec,
+                storage_options,
+                seal_on_add,
+            ))
+        });
+        Ok(Self::from_store(store_res.map_err(to_py_err)?, runtime))
+    }
+
+    /// Open an existing embedded store, reading its schema from the dataset.
+    #[classmethod]
+    #[pyo3(signature = (uri, storage_options = None, seal_on_add = false))]
+    fn open_existing(
+        _cls: &Bound<'_, PyType>,
+        py: Python<'_>,
+        uri: &str,
+        storage_options: Option<HashMap<String, String>>,
+        seal_on_add: bool,
+    ) -> PyResult<Self> {
+        let runtime = Arc::new(Runtime::new().map_err(to_py_err)?);
+        let store_res = py.allow_threads(|| {
+            runtime.block_on(UnifiedGenericStore::open_existing(
+                uri,
+                storage_options,
+                seal_on_add,
+            ))
+        });
+        Ok(Self::from_store(store_res.map_err(to_py_err)?, runtime))
+    }
+
+    /// Connect to an existing store on a remote server.
+    #[classmethod]
+    fn connect(
+        _cls: &Bound<'_, PyType>,
+        py: Python<'_>,
+        base_url: &str,
+        name: &str,
+    ) -> PyResult<Self> {
+        let runtime = Arc::new(Runtime::new().map_err(to_py_err)?);
+        let store_res =
+            py.allow_threads(|| runtime.block_on(UnifiedGenericStore::connect(base_url, name)));
+        Ok(Self::from_store(store_res.map_err(to_py_err)?, runtime))
+    }
+
+    /// Connect to a remote store, creating it with `schema` if absent.
+    #[classmethod]
+    #[pyo3(signature = (base_url, name, schema, storage_options = None, seal_on_add = false))]
+    fn connect_or_create(
+        _cls: &Bound<'_, PyType>,
+        py: Python<'_>,
+        base_url: &str,
+        name: &str,
+        schema: &Bound<'_, PyDict>,
+        storage_options: Option<HashMap<String, String>>,
+        seal_on_add: bool,
+    ) -> PyResult<Self> {
+        let spec = schema_spec_from_py(schema)?;
+        let req = CreateGenericStoreRequest {
+            name: name.to_string(),
+            schema: spec,
+            storage_options,
+            seal_on_add,
+        };
+        let runtime = Arc::new(Runtime::new().map_err(to_py_err)?);
+        let store_res = py.allow_threads(|| {
+            runtime.block_on(UnifiedGenericStore::connect_or_create(base_url, &req))
+        });
+        Ok(Self::from_store(store_res.map_err(to_py_err)?, runtime))
+    }
+
+    /// The store's schema, as a dict keyed by column name.
+    fn schema(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let spec = GenericStoreApi::spec(&self.store);
+        let json = py.import("json")?;
+        let encoded = serde_json::to_string(spec).map_err(to_py_err)?;
+        Ok(json.call_method1("loads", (encoded,))?.unbind())
+    }
+
+    /// Base dataset version.
+    fn version(&self) -> u64 {
+        GenericStoreApi::version(&self.store)
+    }
+
+    /// Append rows. Each row is a dict keyed by column name; omitted nullable
+    /// columns are written as null, and an undeclared column is an error.
+    fn add(&self, py: Python<'_>, rows: &Bound<'_, PyAny>) -> PyResult<u64> {
+        let mut parsed = Vec::new();
+        for row in rows.try_iter()? {
+            parsed.push(row_from_py(&row?)?);
+        }
+        let res = py.allow_threads(|| {
+            self.runtime
+                .block_on(GenericStoreApi::add(&self.store, &parsed))
+        });
+        Ok(res.map_err(to_py_err)?.version)
+    }
+
+    /// Read rows. Blob columns are excluded; use `get` with `columns` to fetch
+    /// them one row at a time.
+    #[pyo3(signature = (limit = None, offset = None, filter = None))]
+    fn list(
+        &self,
+        py: Python<'_>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+        filter: Option<String>,
+    ) -> PyResult<Vec<PyObject>> {
+        let rows = py.allow_threads(|| {
+            self.runtime.block_on(async {
+                match &filter {
+                    Some(filter) => {
+                        GenericStoreApi::list_filtered(&self.store, filter, limit, offset).await
+                    }
+                    None => GenericStoreApi::list(&self.store, limit, offset).await,
+                }
+            })
+        });
+        rows.map_err(to_py_err)?
+            .iter()
+            .map(|row| row_to_py(py, row))
+            .collect()
+    }
+
+    /// Fetch one row by id, or `None`. `columns` selects what to read; omit it
+    /// to read everything except blob columns.
+    #[pyo3(signature = (id, columns = None))]
+    fn get(
+        &self,
+        py: Python<'_>,
+        id: &str,
+        columns: Option<Vec<String>>,
+    ) -> PyResult<Option<PyObject>> {
+        let row = py.allow_threads(|| {
+            self.runtime
+                .block_on(GenericStoreApi::get(&self.store, id, columns.as_deref()))
+        });
+        match row.map_err(to_py_err)? {
+            Some(row) => Ok(Some(row_to_py(py, &row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Seal the active memtable so added rows become readable. Unnecessary when
+    /// the store was opened with `seal_on_add=True`.
+    fn flush(&self, py: Python<'_>) -> PyResult<()> {
+        py.allow_threads(|| self.runtime.block_on(GenericStoreApi::flush(&self.store)))
+            .map_err(to_py_err)
+    }
+
+    /// Merge pending WAL generations into the base table (embedded stores only).
+    fn cleanup_wal(&mut self, py: Python<'_>) -> PyResult<usize> {
+        py.allow_threads(|| self.runtime.block_on(self.store.cleanup_wal()))
+            .map_err(to_py_err)
+    }
+}
+
 #[pymodule]
 fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(version, m)?)?;
@@ -2964,5 +3210,6 @@ fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RemoteContext>()?;
     m.add_class::<RolloutStore>()?;
     m.add_class::<DatagenStore>()?;
+    m.add_class::<GenericStore>()?;
     Ok(())
 }

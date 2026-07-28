@@ -5,16 +5,14 @@ use axum::extract::{Path, Query, State};
 use axum::http::header;
 use axum::response::Response;
 use axum::Json;
-use chrono::Utc;
 use lance_context_api::{
     AddRecordsRequest, AddRecordsResponse, DeleteRecordResponse, GetRecordResponse,
-    ListRecordsResponse, RecordDto, RecordPatchDto, RelationshipDto, StateMetadataDto,
-    UpdateRecordRequest, UpdateRecordResponse, UpsertRecordRequest, UpsertRecordResponse,
-    UpsertRecordsRequest, UpsertRecordsResponse, UpsertResultDto,
+    ListRecordsResponse, RecordDto, UpdateRecordRequest, UpdateRecordResponse, UpsertRecordRequest,
+    UpsertRecordResponse, UpsertRecordsRequest, UpsertRecordsResponse, UpsertResultDto,
 };
 use lance_context_core::{
-    ContextRecord, LifecycleQueryOptions, RecordFilters, RecordPatch, Relationship, StateMetadata,
-    LIFECYCLE_ACTIVE,
+    patch_from_dto, record_from_add_request, record_to_dto, ContextRecord, LifecycleQueryOptions,
+    RecordFilters,
 };
 use uuid::Uuid;
 
@@ -406,139 +404,6 @@ pub async fn related_records(
     Ok(Json(ListRecordsResponse { records: dtos }))
 }
 
-pub fn record_to_dto(r: ContextRecord) -> RecordDto {
-    RecordDto {
-        id: r.id,
-        external_id: r.external_id,
-        run_id: r.run_id,
-        bot_id: r.bot_id,
-        session_id: r.session_id,
-        tenant: r.tenant,
-        source: r.source,
-        created_at: r.created_at,
-        role: r.role,
-        content_type: r.content_type,
-        text_payload: r.text_payload,
-        binary_payload: r.binary_payload,
-        payload_uri: r.payload_uri,
-        payload_size: r.payload_size,
-        payload_checksum: r.payload_checksum,
-        embedding: r.embedding,
-        state_metadata: r.state_metadata.map(|sm| StateMetadataDto {
-            step: sm.step,
-            active_plan_id: sm.active_plan_id,
-            tokens_used: sm.tokens_used,
-            custom: sm.custom,
-        }),
-        metadata: r.metadata,
-        relationships: r
-            .relationships
-            .into_iter()
-            .map(relationship_to_dto)
-            .collect(),
-        expires_at: r.expires_at,
-        retention_policy: r.retention_policy,
-        lifecycle_status: r.lifecycle_status,
-        retired_at: r.retired_at,
-        retired_reason: r.retired_reason,
-        supersedes_id: r.supersedes_id,
-        superseded_by_id: r.superseded_by_id,
-    }
-}
-
-fn dto_to_relationship(r: RelationshipDto) -> Relationship {
-    Relationship {
-        target_id: r.target_id,
-        relation: r.relation,
-        weight: r.weight,
-    }
-}
-
-fn relationship_to_dto(r: Relationship) -> RelationshipDto {
-    RelationshipDto {
-        target_id: r.target_id,
-        relation: r.relation,
-        weight: r.weight,
-    }
-}
-
-fn patch_from_dto(patch: &RecordPatchDto) -> RecordPatch {
-    RecordPatch {
-        bot_id: patch.bot_id.clone(),
-        session_id: patch.session_id.clone(),
-        tenant: patch.tenant.clone(),
-        source: patch.source.clone(),
-        state_metadata: patch.state_metadata.as_ref().map(|sm| StateMetadata {
-            step: sm.step,
-            active_plan_id: sm.active_plan_id.clone(),
-            tokens_used: sm.tokens_used,
-            custom: sm.custom.clone(),
-        }),
-        metadata: patch.metadata.clone(),
-        relationships: patch.relationships.as_ref().map(|relationships| {
-            relationships
-                .iter()
-                .cloned()
-                .map(dto_to_relationship)
-                .collect()
-        }),
-        expires_at: patch.expires_at,
-        retention_policy: patch.retention_policy.clone(),
-        lifecycle_status: patch.lifecycle_status.clone(),
-        retired_at: patch.retired_at,
-        retired_reason: patch.retired_reason.clone(),
-        embedding: patch.embedding.clone(),
-        payload_uri: patch.payload_uri.clone(),
-        payload_size: patch.payload_size,
-        payload_checksum: patch.payload_checksum.clone(),
-    }
-}
-
-fn record_from_add_request(
-    r: &lance_context_api::AddRecordRequest,
-    id: String,
-    run_id: String,
-) -> ContextRecord {
-    ContextRecord {
-        id,
-        external_id: r.external_id.clone(),
-        run_id,
-        bot_id: r.bot_id.clone(),
-        session_id: r.session_id.clone(),
-        tenant: r.tenant.clone(),
-        source: r.source.clone(),
-        created_at: Utc::now(),
-        role: r.role.clone(),
-        state_metadata: r.state_metadata.as_ref().map(|sm| StateMetadata {
-            step: sm.step,
-            active_plan_id: sm.active_plan_id.clone(),
-            tokens_used: sm.tokens_used,
-            custom: sm.custom.clone(),
-        }),
-        metadata: r.metadata.clone(),
-        relationships: r
-            .relationships
-            .iter()
-            .cloned()
-            .map(dto_to_relationship)
-            .collect(),
-        expires_at: r.expires_at,
-        retention_policy: r.retention_policy.clone(),
-        lifecycle_status: LIFECYCLE_ACTIVE.to_string(),
-        retired_at: None,
-        retired_reason: None,
-        supersedes_id: r.supersedes_id.clone(),
-        superseded_by_id: None,
-        content_type: r.content_type.clone(),
-        text_payload: r.text_payload.clone(),
-        binary_payload: r.binary_payload.clone(),
-        payload_uri: r.payload_uri.clone(),
-        payload_size: r.payload_size,
-        payload_checksum: r.payload_checksum.clone(),
-        embedding: r.embedding.clone(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -547,7 +412,7 @@ mod tests {
     use axum::Json;
     use chrono::{Duration, Utc};
     use lance_context_api::{
-        AddRecordRequest, AddRecordsRequest, RecordPatchDto, UpdateRecordRequest,
+        AddRecordRequest, AddRecordsRequest, RecordPatchDto, RelationshipDto, UpdateRecordRequest,
         UpsertRecordRequest, UpsertRecordsRequest,
     };
     use lance_context_core::ContextStore;

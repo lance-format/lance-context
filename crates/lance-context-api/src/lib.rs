@@ -1,7 +1,10 @@
+pub mod schema_spec;
+pub use schema_spec::{ColumnSpec, ColumnType, SchemaSpec, ID_COLUMN};
+
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::future::Future;
 
 // ---------------------------------------------------------------------------
@@ -176,6 +179,118 @@ pub trait RolloutStoreApi {
     fn version(&self) -> u64;
 
     fn checkout(&mut self, version: u64) -> impl Future<Output = ContextResult<()>> + Send;
+}
+
+// ---------------------------------------------------------------------------
+// Generic stores (user-defined schemas)
+// ---------------------------------------------------------------------------
+
+/// Create a store whose columns the caller declares.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreateGenericStoreRequest {
+    /// Portable dataset name: 1-128 ASCII characters matching
+    /// `[A-Za-z0-9_][A-Za-z0-9._-]*`; `_registry` and `_stats` are reserved.
+    pub name: String,
+    /// The store's columns. Must declare an `id` column (non-nullable string);
+    /// see [`SchemaSpec`].
+    pub schema: SchemaSpec,
+    #[serde(default)]
+    pub storage_options: Option<std::collections::HashMap<String, String>>,
+    /// Whether an append seals before returning, making its rows immediately
+    /// readable. Defaults to `false` — durable but not visible until a flush,
+    /// which is what keeps concurrent appends from serializing.
+    #[serde(default)]
+    pub seal_on_add: bool,
+}
+
+/// A generic store's identity and, for single-store lookups, its schema.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GenericStoreInfo {
+    pub name: String,
+    pub uri: String,
+    /// Dataset version. `None` in list responses, which are served without
+    /// opening each dataset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u64>,
+    /// The store's schema. `None` in list responses for the same reason as
+    /// `version`: the schema is stored *in the dataset*, so reporting it means
+    /// opening every store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<SchemaSpec>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ListGenericStoresResponse {
+    pub stores: Vec<GenericStoreInfo>,
+}
+
+/// Rows to append, as JSON objects keyed by column name.
+///
+/// There is deliberately no per-column DTO: the schema is declared at runtime,
+/// so a static struct could not describe it. Values are validated against the
+/// store's schema on the way in — an undeclared key is an error rather than
+/// being dropped, and an omitted nullable column is written as null.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AddRowsRequest {
+    pub rows: Vec<Map<String, Value>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AddRowsResponse {
+    /// Base dataset version after the append. MemWAL appends do not advance it,
+    /// so this identifies the table, not the rows just written.
+    pub version: u64,
+    /// Number of rows accepted.
+    pub count: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ListRowsResponse {
+    pub rows: Vec<Map<String, Value>>,
+}
+
+/// Remote-capable surface of a store over a user-declared schema.
+///
+/// Rows are `serde_json` maps in both directions, so this trait needs no DTO
+/// conversion layer — the wire form *is* the row form.
+pub trait GenericStoreApi {
+    /// The schema this store was created with.
+    fn spec(&self) -> &SchemaSpec;
+
+    /// Append rows. Visibility on return depends on the store's `seal_on_add`.
+    fn add(
+        &self,
+        rows: &[Map<String, Value>],
+    ) -> impl Future<Output = ContextResult<AddRowsResponse>> + Send;
+
+    /// Read rows, newest-write-wins by `id`. Blob columns are projected out.
+    fn list(
+        &self,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> impl Future<Output = ContextResult<Vec<Map<String, Value>>>> + Send;
+
+    /// [`Self::list`], filtered by a SQL predicate over the store's columns.
+    fn list_filtered(
+        &self,
+        filter: &str,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> impl Future<Output = ContextResult<Vec<Map<String, Value>>>> + Send;
+
+    /// Fetch one row by `id`. `columns` selects what to read; `None` reads
+    /// everything except blob columns. Pass an explicit list to fetch a blob —
+    /// that is the intended way to read a large payload.
+    fn get(
+        &self,
+        id: &str,
+        columns: Option<&[String]>,
+    ) -> impl Future<Output = ContextResult<Option<Map<String, Value>>>> + Send;
+
+    /// Seal the active memtable so previously added rows become readable.
+    fn flush(&self) -> impl Future<Output = ContextResult<()>> + Send;
+
+    fn version(&self) -> u64;
 }
 
 // ---------------------------------------------------------------------------
