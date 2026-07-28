@@ -7,6 +7,8 @@ mod datagen;
 mod datagen_store;
 mod eval;
 mod export;
+pub mod generic_codec;
+mod generic_store;
 mod id;
 pub mod metrics;
 mod namespace;
@@ -14,6 +16,7 @@ mod record;
 mod registry;
 mod rollout;
 mod rollout_store;
+pub mod schema_spec;
 pub mod serde;
 mod storage;
 mod store;
@@ -39,6 +42,8 @@ pub use export::{
     RolloutExample, RolloutResponse, SftExample, SplitConfig, SplitManifest, TokenStats,
     EXPORT_SCHEMA_VERSION,
 };
+pub use generic_codec::{batch_to_rows, ids_from_batch, rows_to_batch, Row};
+pub use generic_store::{GenericStore, GenericStoreOptions};
 pub use id::{generate_id, new_uuid};
 pub use namespace::{ContextNamespace, PartitionInfo, PartitionSelector, PartitionSpec};
 pub use record::{
@@ -53,6 +58,7 @@ pub use rollout_store::{
     RolloutStore, RolloutStoreOptions, SqlQueryResult, SQL_MAX_RESULT_ROWS, SQL_MAX_SCAN_ROWS,
     SQL_TABLE_NAME,
 };
+pub use schema_spec::{ColumnSpec, ColumnType, SchemaSpec, ID_COLUMN};
 pub use storage::{create_local_dir_if_needed, join_uri, validate_store_name, MAX_STORE_NAME_LEN};
 pub use store::{
     CompactionConfig, CompactionStats, ContextStore, ContextStoreOptions, DistanceMetric,
