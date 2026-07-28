@@ -1,5 +1,6 @@
 use lance_context_api::*;
 use reqwest::Client;
+use serde_json::{Map, Value};
 
 mod error;
 pub use error::ClientError;
@@ -358,6 +359,121 @@ impl RolloutStoreApi for RemoteRolloutStore {
             .map_err(to_ctx_err)?;
         self.cached_version = resp.version;
         Ok(())
+    }
+}
+
+/// A [`GenericStoreApi`] backed by the REST server.
+///
+/// Caches the schema at connect: unlike the fixed-schema stores there is no
+/// compile-time type describing the columns, and `GenericStoreApi::spec` is
+/// synchronous, so it cannot be fetched on demand.
+pub struct RemoteGenericStore {
+    client: ContextClient,
+    store_name: String,
+    spec: SchemaSpec,
+    cached_version: u64,
+}
+
+impl RemoteGenericStore {
+    pub async fn connect(base_url: &str, store_name: &str) -> Result<Self, ClientError> {
+        let client = ContextClient::new(base_url);
+        let info = client.get_generic_store(store_name).await?;
+        let spec = info.schema.ok_or_else(|| ClientError::Api {
+            status: 500,
+            code: "MISSING_SCHEMA".to_string(),
+            message: "server did not report the store schema".to_string(),
+        })?;
+        Ok(Self {
+            client,
+            store_name: store_name.to_string(),
+            spec,
+            cached_version: info.version.unwrap_or(0),
+        })
+    }
+
+    pub async fn connect_or_create(
+        base_url: &str,
+        req: &CreateGenericStoreRequest,
+    ) -> Result<Self, ClientError> {
+        let client = ContextClient::new(base_url);
+        let info = match client.get_generic_store(&req.name).await {
+            Ok(info) => info,
+            Err(ClientError::Api { status: 404, .. }) => client.create_generic_store(req).await?,
+            Err(e) => return Err(e),
+        };
+        Ok(Self {
+            client,
+            store_name: req.name.clone(),
+            spec: info.schema.unwrap_or_else(|| req.schema.clone()),
+            cached_version: info.version.unwrap_or(0),
+        })
+    }
+
+    /// Seal the store's memtable so added rows become readable.
+    pub async fn flush_remote(&self) -> Result<(), ClientError> {
+        self.client.flush_generic_store(&self.store_name).await
+    }
+}
+
+impl GenericStoreApi for RemoteGenericStore {
+    fn spec(&self) -> &SchemaSpec {
+        &self.spec
+    }
+
+    async fn add(&self, rows: &[Map<String, Value>]) -> ContextResult<AddRowsResponse> {
+        self.client
+            .add_rows(&self.store_name, rows)
+            .await
+            .map_err(to_ctx_err)
+    }
+
+    async fn list(
+        &self,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> ContextResult<Vec<Map<String, Value>>> {
+        Ok(self
+            .client
+            .list_rows(&self.store_name, None, limit, offset)
+            .await
+            .map_err(to_ctx_err)?
+            .rows)
+    }
+
+    async fn list_filtered(
+        &self,
+        filter: &str,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> ContextResult<Vec<Map<String, Value>>> {
+        Ok(self
+            .client
+            .list_rows(&self.store_name, Some(filter), limit, offset)
+            .await
+            .map_err(to_ctx_err)?
+            .rows)
+    }
+
+    async fn get(
+        &self,
+        id: &str,
+        columns: Option<&[String]>,
+    ) -> ContextResult<Option<Map<String, Value>>> {
+        self.client
+            .get_row(&self.store_name, id, columns)
+            .await
+            .map_err(to_ctx_err)
+    }
+
+    async fn flush(&self) -> ContextResult<()> {
+        self.client
+            .flush_generic_store(&self.store_name)
+            .await
+            .map_err(to_ctx_err)
+    }
+
+    fn version(&self) -> u64 {
+        self.cached_version
     }
 }
 
@@ -970,6 +1086,128 @@ impl ContextClient {
             .send()
             .await?;
         Self::handle_response(resp).await
+    }
+
+    // ----------------------------------------------------------- generic
+
+    pub async fn create_generic_store(
+        &self,
+        req: &CreateGenericStoreRequest,
+    ) -> Result<GenericStoreInfo, ClientError> {
+        let resp = self
+            .http
+            .post(self.url("/generic"))
+            .json(req)
+            .send()
+            .await?;
+        Self::handle_response(resp).await
+    }
+
+    pub async fn list_generic_stores(&self) -> Result<ListGenericStoresResponse, ClientError> {
+        let resp = self.http.get(self.url("/generic")).send().await?;
+        Self::handle_response(resp).await
+    }
+
+    pub async fn get_generic_store(&self, name: &str) -> Result<GenericStoreInfo, ClientError> {
+        let resp = self
+            .http
+            .get(self.url(&format!("/generic/{name}")))
+            .send()
+            .await?;
+        Self::handle_response(resp).await
+    }
+
+    pub async fn delete_generic_store(&self, name: &str) -> Result<(), ClientError> {
+        let resp = self
+            .http
+            .delete(self.url(&format!("/generic/{name}")))
+            .send()
+            .await?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(Self::extract_error(resp).await)
+        }
+    }
+
+    /// Append rows. They are validated server-side against the store's schema.
+    pub async fn add_rows(
+        &self,
+        name: &str,
+        rows: &[Map<String, Value>],
+    ) -> Result<AddRowsResponse, ClientError> {
+        let req = AddRowsRequest {
+            rows: rows.to_vec(),
+        };
+        let resp = self
+            .http
+            .post(self.url(&format!("/generic/{name}/rows")))
+            .json(&req)
+            .send()
+            .await?;
+        Self::handle_response(resp).await
+    }
+
+    /// List rows. Blob columns are projected out server-side.
+    pub async fn list_rows(
+        &self,
+        name: &str,
+        filter: Option<&str>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> Result<ListRowsResponse, ClientError> {
+        let mut query: Vec<(String, String)> = Vec::new();
+        if let Some(filter) = filter {
+            query.push(("filter".to_string(), filter.to_string()));
+        }
+        if let Some(limit) = limit {
+            query.push(("limit".to_string(), limit.to_string()));
+        }
+        if let Some(offset) = offset {
+            query.push(("offset".to_string(), offset.to_string()));
+        }
+        let resp = self
+            .http
+            .get(self.url(&format!("/generic/{name}/rows")))
+            .query(&query)
+            .send()
+            .await?;
+        Self::handle_response(resp).await
+    }
+
+    /// Fetch one row. `columns` selects what to read; `None` omits blob
+    /// columns. Name a blob column explicitly to fetch its bytes.
+    pub async fn get_row(
+        &self,
+        name: &str,
+        id: &str,
+        columns: Option<&[String]>,
+    ) -> Result<Option<Map<String, Value>>, ClientError> {
+        let mut request = self
+            .http
+            .get(self.url(&format!("/generic/{name}/rows/{id}")));
+        if let Some(columns) = columns {
+            request = request.query(&[("columns", columns.join(","))]);
+        }
+        let resp = request.send().await?;
+        if resp.status() == 404 {
+            return Ok(None);
+        }
+        Self::handle_response(resp).await.map(Some)
+    }
+
+    /// Seal the store's active memtable so added rows become readable.
+    pub async fn flush_generic_store(&self, name: &str) -> Result<(), ClientError> {
+        let resp = self
+            .http
+            .post(self.url(&format!("/generic/{name}/flush")))
+            .send()
+            .await?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(Self::extract_error(resp).await)
+        }
     }
 
     pub async fn create_datagen_store(

@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use lance_context_core::{
     join_uri, validate_store_name, ContextStore, ContextStoreOptions, DatagenStore,
-    DatagenStoreOptions, RolloutRegistry, RolloutStore, RolloutStoreOptions, Session,
+    DatagenStoreOptions, GenericStore, GenericStoreOptions, RolloutRegistry, RolloutStore,
+    RolloutStoreOptions, Session,
 };
 use lru::LruCache;
 use tokio::sync::{Mutex, RwLock};
@@ -83,6 +84,18 @@ pub struct AppState {
     /// dataset from [`Self::rollout_registry`] so the two store kinds never
     /// collide on a shared name.
     pub datagen_registry: RwLock<RolloutRegistry>,
+    /// Bounded LRU of resident generic-store handles, mirroring
+    /// [`Self::rollout_stores`].
+    pub generic_stores: Mutex<LruCache<String, Arc<RwLock<GenericStore>>>>,
+    /// Durable directory of which generic stores exist.
+    ///
+    /// Records only name and URI: a generic store's **schema is stored in its
+    /// own dataset**, so the registry deliberately does not carry a second
+    /// copy. Two writable copies of a schema is exactly the divergence this
+    /// refactor exists to remove. The cost is that listing stores cannot report
+    /// their schemas without opening each dataset, which is why
+    /// `GenericStoreInfo::schema` is `None` in list responses.
+    pub generic_registry: RwLock<RolloutRegistry>,
 }
 
 /// Process-wide admission control for the total artifact-blob payload held in
@@ -194,6 +207,10 @@ impl AppState {
         let blob_budget = (config.rollout_max_inflight_blob_bytes > 0)
             .then(|| BlobBudget::new(config.rollout_max_inflight_blob_bytes));
         let rollout_session = build_rollout_session(config.rollout_cache_bytes);
+        let generic_registry_uri = join_uri(&base_uri, "_registry.generic.lance");
+        let generic_registry = RolloutRegistry::open_or_create(&generic_registry_uri, None)
+            .await
+            .map_err(AppError::from_lance)?;
         let datagen_registry_uri = join_uri(&base_uri, "_registry.datagen.lance");
         let datagen_registry = RolloutRegistry::open_or_create(&datagen_registry_uri, None)
             .await
@@ -211,6 +228,8 @@ impl AppState {
             rollout_session,
             datagen_stores: Mutex::new(LruCache::new(capacity)),
             datagen_registry: RwLock::new(datagen_registry),
+            generic_stores: Mutex::new(LruCache::new(capacity)),
+            generic_registry: RwLock::new(generic_registry),
         })
     }
 
@@ -237,6 +256,10 @@ impl AppState {
         let registry = RolloutRegistry::open_or_create(&registry_uri, None)
             .await
             .expect("open test registry");
+        let generic_registry_uri = join_uri(&base_uri, "_registry.generic.lance");
+        let generic_registry = RolloutRegistry::open_or_create(&generic_registry_uri, None)
+            .await
+            .expect("open test generic registry");
         let datagen_registry_uri = join_uri(&base_uri, "_registry.datagen.lance");
         let datagen_registry = RolloutRegistry::open_or_create(&datagen_registry_uri, None)
             .await
@@ -254,6 +277,10 @@ impl AppState {
             rollout_flush_interval_secs: 0,
             blob_budget: None,
             rollout_session: build_rollout_session(2 * 1024 * 1024 * 1024),
+            generic_stores: Mutex::new(LruCache::new(
+                std::num::NonZeroUsize::new(DEFAULT_ROLLOUT_CACHE_CAPACITY).unwrap(),
+            )),
+            generic_registry: RwLock::new(generic_registry),
             datagen_stores: Mutex::new(LruCache::new(
                 NonZeroUsize::new(DEFAULT_ROLLOUT_CACHE_CAPACITY).unwrap(),
             )),
@@ -511,6 +538,113 @@ impl AppState {
         let opened = Arc::new(RwLock::new(opened));
 
         let mut cache = self.datagen_stores.lock().await;
+        if let Some(existing) = cache.get(name) {
+            return Ok(existing.clone());
+        }
+        cache.put(name.to_string(), opened.clone());
+        Ok(opened)
+    }
+
+    /// Physical URI of a generic store's dataset.
+    #[must_use]
+    pub fn generic_uri(&self, name: &str) -> String {
+        join_uri(&self.base_uri, &format!("{}.generic.lance", name))
+    }
+
+    fn generic_store_options(&self, seal_on_add: bool) -> GenericStoreOptions {
+        GenericStoreOptions {
+            storage_options: None,
+            shard_id: self.instance_id.clone(),
+            merge_after_generations: (self.rollout_merge_after_generations > 0)
+                .then_some(self.rollout_merge_after_generations),
+            session: self.rollout_session.clone(),
+            seal_on_add,
+        }
+    }
+
+    /// Record that a generic store exists, in both the durable registry and the
+    /// in-memory LRU.
+    pub async fn register_generic(
+        &self,
+        name: &str,
+        uri: &str,
+        store: Arc<RwLock<GenericStore>>,
+    ) -> Result<(), AppError> {
+        Self::validate_name(name)?;
+        self.generic_registry
+            .write()
+            .await
+            .upsert(name, uri)
+            .await
+            .map_err(AppError::from_lance)?;
+        self.generic_stores
+            .lock()
+            .await
+            .put(name.to_string(), store);
+        Ok(())
+    }
+
+    /// Remove a generic store from the registry and evict any resident handle.
+    /// Returns whether the store existed.
+    pub async fn unregister_generic(&self, name: &str) -> Result<bool, AppError> {
+        Self::validate_name(name)?;
+        let existed = self
+            .generic_registry
+            .write()
+            .await
+            .contains(name)
+            .await
+            .map_err(AppError::from_lance)?;
+        if !existed {
+            return Ok(false);
+        }
+        self.generic_registry
+            .write()
+            .await
+            .remove(name)
+            .await
+            .map_err(AppError::from_lance)?;
+        self.generic_stores.lock().await.pop(name);
+        Ok(true)
+    }
+
+    /// Look up a generic store by name, lazily reopening it on a cache miss.
+    ///
+    /// The schema is not passed in: it is read back from the dataset, which is
+    /// where it durably lives. See [`Self::get_or_open_datagen_store`] for the
+    /// residency rationale.
+    pub async fn get_or_open_generic_store(
+        &self,
+        name: &str,
+    ) -> Result<Arc<RwLock<GenericStore>>, AppError> {
+        Self::validate_name(name)?;
+        if let Some(store) = self.generic_stores.lock().await.get(name) {
+            return Ok(store.clone());
+        }
+
+        let exists = self
+            .generic_registry
+            .write()
+            .await
+            .contains(name)
+            .await
+            .map_err(AppError::from_lance)?;
+        if !exists {
+            return Err(AppError::NotFound(format!(
+                "Generic store '{name}' does not exist"
+            )));
+        }
+
+        let uri = self.generic_uri(name);
+        // `seal_on_add` is a per-store property that is not persisted, so a
+        // reopened store takes the server default. Callers needing
+        // read-your-write should flush explicitly.
+        let opened = GenericStore::open_existing(&uri, self.generic_store_options(false))
+            .await
+            .map_err(AppError::from_lance)?;
+        let opened = Arc::new(RwLock::new(opened));
+
+        let mut cache = self.generic_stores.lock().await;
         if let Some(existing) = cache.get(name) {
             return Ok(existing.clone());
         }
@@ -785,6 +919,44 @@ impl AppState {
                     store = %name,
                     error = %e,
                     "failed to close rollout writer during shutdown"
+                );
+            }
+        }
+
+        // Datagen and generic stores hold resident MemWAL writers too. Skipping
+        // them left an unsealed memtable to the best-effort detached close in
+        // `Drop`, so rows could stay durable-but-invisible until the next WAL
+        // replay. Closing here makes shutdown deterministic for every kind.
+        let datagen: Vec<(String, Arc<RwLock<DatagenStore>>)> = {
+            let cache = self.datagen_stores.lock().await;
+            cache
+                .iter()
+                .map(|(name, store)| (name.clone(), store.clone()))
+                .collect()
+        };
+        for (name, store) in datagen {
+            if let Err(e) = store.write().await.close().await {
+                tracing::warn!(
+                    store = %name,
+                    error = %e,
+                    "failed to close datagen writer during shutdown"
+                );
+            }
+        }
+
+        let generic: Vec<(String, Arc<RwLock<GenericStore>>)> = {
+            let cache = self.generic_stores.lock().await;
+            cache
+                .iter()
+                .map(|(name, store)| (name.clone(), store.clone()))
+                .collect()
+        };
+        for (name, store) in generic {
+            if let Err(e) = store.write().await.close().await {
+                tracing::warn!(
+                    store = %name,
+                    error = %e,
+                    "failed to close generic writer during shutdown"
                 );
             }
         }

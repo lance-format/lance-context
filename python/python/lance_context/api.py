@@ -19,6 +19,9 @@ from ._internal import (  # pyright: ignore[reportMissingImports]
     DatagenStore as _DatagenStore,
 )
 from ._internal import (  # pyright: ignore[reportMissingImports]
+    GenericStore as _GenericStore,
+)
+from ._internal import (  # pyright: ignore[reportMissingImports]
     RemoteContext as _RemoteContext,
 )
 from ._internal import (  # pyright: ignore[reportMissingImports]
@@ -38,6 +41,7 @@ __all__ = [
     "AsyncRolloutStore",
     "Context",
     "ContextNamespace",
+    "GenericStore",
     "DatagenStore",
     "EmbeddingProvider",
     "RemoteContext",
@@ -2841,3 +2845,145 @@ class DatagenStore:
 
     def __repr__(self) -> str:
         return f"DatagenStore(version={self._sync.version()})"
+
+
+class GenericStore:
+    """Synchronous store over a schema you declare.
+
+    Unlike the fixed-schema stores, the columns come from you: pass a ``schema``
+    mapping column names to types at creation, then read and write plain dicts.
+    An ``id`` column is required — it is the primary key and the key rows are
+    deduplicated by.
+
+    Types may be written in full form or shorthand::
+
+        store = GenericStore.open(uri, schema={
+            "id":     {"type": "string", "nullable": False},
+            "user":   "string",
+            "score":  "float32",
+            "tags":   {"type": "list", "item": {"type": "string"}},
+            "vec":    {"type": "vector", "dim": 768, "metric": "cosine"},
+            "video":  {"type": "binary", "blob": True},
+        })
+
+    ``blob: True`` does not change where the bytes live — they are stored inline
+    like any other column — it excludes the column from bulk reads. :meth:`list`
+    never materializes a blob column; fetch one per row with
+    ``get(id, columns=["video"])``. That is what keeps a listing cheap on a
+    store holding large payloads.
+    """
+
+    def __init__(self, sync_store: _GenericStore) -> None:
+        self._sync = sync_store
+
+    @classmethod
+    def open(
+        cls,
+        uri: str,
+        schema: Mapping[str, Any],
+        *,
+        storage_options: Mapping[str, str] | None = None,
+        seal_on_add: bool = False,
+    ) -> "GenericStore":
+        """Open (or create) an embedded store at ``uri`` with ``schema``.
+
+        ``seal_on_add=True`` makes rows readable as soon as :meth:`add` returns,
+        at the cost of serializing concurrent appends. The default defers the
+        seal — durable on return, readable after :meth:`flush`.
+        """
+        opts = dict(storage_options) if storage_options else None
+        return cls(_GenericStore.open(uri, dict(schema), opts, seal_on_add))
+
+    @classmethod
+    def open_existing(
+        cls,
+        uri: str,
+        *,
+        storage_options: Mapping[str, str] | None = None,
+        seal_on_add: bool = False,
+    ) -> "GenericStore":
+        """Open an existing embedded store, reading its schema from the dataset."""
+        opts = dict(storage_options) if storage_options else None
+        return cls(_GenericStore.open_existing(uri, opts, seal_on_add))
+
+    @classmethod
+    def connect(cls, base_url: str, name: str) -> "GenericStore":
+        """Connect to an existing store on a remote server."""
+        return cls(_GenericStore.connect(base_url, name))
+
+    @classmethod
+    def connect_or_create(
+        cls,
+        base_url: str,
+        name: str,
+        schema: Mapping[str, Any],
+        *,
+        storage_options: Mapping[str, str] | None = None,
+        seal_on_add: bool = False,
+    ) -> "GenericStore":
+        """Connect to a remote store, creating it with ``schema`` if absent."""
+        opts = dict(storage_options) if storage_options else None
+        return cls(
+            _GenericStore.connect_or_create(
+                base_url, name, dict(schema), opts, seal_on_add
+            )
+        )
+
+    def schema(self) -> dict[str, Any]:
+        """The store's schema, as declared at creation."""
+        return self._sync.schema()
+
+    def version(self) -> int:
+        """Base dataset version."""
+        return self._sync.version()
+
+    def add(self, rows: Iterable[Mapping[str, Any]]) -> int:
+        """Append rows.
+
+        Omitted nullable columns are stored as null; a column the schema does
+        not declare raises, rather than being silently dropped.
+        """
+        return self._sync.add(list(rows))
+
+    def list(
+        self,
+        *,
+        limit: int | None = None,
+        offset: int | None = None,
+        filter: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Read rows, newest write wins per ``id``. Blob columns are excluded.
+
+        ``filter`` is a SQL predicate over your own columns, e.g.
+        ``"score > 0.5 AND user = 'u1'"``.
+        """
+        return self._sync.list(limit, offset, filter)
+
+    def get(
+        self, id: str, *, columns: Sequence[str] | None = None
+    ) -> dict[str, Any] | None:
+        """Fetch one row by ``id``, or ``None``.
+
+        ``columns`` selects what to read; omit it to read everything except blob
+        columns. Name a blob column explicitly to fetch its bytes, which come
+        back base64-encoded.
+        """
+        return self._sync.get(id, list(columns) if columns is not None else None)
+
+    def flush(self) -> None:
+        """Seal buffered rows so they become readable.
+
+        Unnecessary when the store was opened with ``seal_on_add=True``.
+        """
+        self._sync.flush()
+
+    def cleanup_wal(self) -> int:
+        """Merge pending WAL generations into the base table (embedded only).
+
+        Returns how many were reclaimed. Without this, generations accumulate
+        and every read unions all of them.
+        """
+        return self._sync.cleanup_wal()
+
+    def __repr__(self) -> str:
+        return f"GenericStore(version={self._sync.version()})"

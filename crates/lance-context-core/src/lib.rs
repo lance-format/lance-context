@@ -16,13 +16,17 @@ mod record;
 mod registry;
 mod rollout;
 mod rollout_store;
-pub mod schema_spec;
 pub mod serde;
 mod storage;
 mod store;
 mod store_base;
 
-pub use api_impl::rollout_record_to_dto;
+// Request/DTO conversions, exported so the server does not keep its own copies.
+// These were duplicated verbatim between here and `routes/`; see #214.
+pub use api_impl::{
+    dto_to_relationship, patch_from_dto, record_from_add_request, record_to_dto,
+    relationship_to_dto, rollout_record_from_add_request, rollout_record_to_dto,
+};
 pub use context::{Context, ContextEntry, Snapshot};
 pub use datagen::{
     datagen_event_id, datagen_failures, datagen_trajectory, fold_datagen_events, DatagenBlobValue,
@@ -58,7 +62,8 @@ pub use rollout_store::{
     RolloutStore, RolloutStoreOptions, SqlQueryResult, SQL_MAX_RESULT_ROWS, SQL_MAX_SCAN_ROWS,
     SQL_TABLE_NAME,
 };
-pub use schema_spec::{ColumnSpec, ColumnType, SchemaSpec, ID_COLUMN};
+// Schema declaration lives in the API crate: it is part of the wire contract.
+pub use lance_context_api::{ColumnSpec, ColumnType, SchemaSpec, ID_COLUMN};
 pub use storage::{create_local_dir_if_needed, join_uri, validate_store_name, MAX_STORE_NAME_LEN};
 pub use store::{
     CompactionConfig, CompactionStats, ContextStore, ContextStoreOptions, DistanceMetric,
