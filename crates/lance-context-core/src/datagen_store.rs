@@ -1486,7 +1486,7 @@ mod tests {
             store.append(&[child_terminal]).await.unwrap();
 
             let tree = store.item_tree("9").await.unwrap();
-            assert_eq!(tree.roots(), &[root_id.clone()]);
+            assert_eq!(tree.roots(), std::slice::from_ref(&root_id));
 
             let root_node = tree.node(&root_id).unwrap();
             assert_eq!(root_node.item.status, DatagenItemStatus::Completed);
