@@ -6,16 +6,14 @@ use axum::extract::{FromRequest, Multipart, Path, Query, Request, State};
 use axum::http::{header, StatusCode};
 use axum::response::Response;
 use axum::Json;
-use chrono::Utc;
 use lance_context_api::{
     AddRolloutRequest, AddRolloutsRequest, AddRolloutsResponse, CheckoutRequest, CompactRequest,
     CompactResponse, CompactStatsResponse, CreateRolloutStoreRequest, GetRolloutResponse,
-    ListRolloutStoresResponse, ListRolloutsResponse, RelationshipDto, RolloutRecordDto,
-    RolloutStoreInfo, VersionResponse,
+    ListRolloutStoresResponse, ListRolloutsResponse, RolloutStoreInfo, VersionResponse,
 };
+use lance_context_core::{rollout_record_from_add_request, rollout_record_to_dto};
 use lance_context_core::{
-    CompactionConfig, Relationship, RolloutFilters, RolloutRecord, RolloutStore,
-    RolloutStoreOptions,
+    CompactionConfig, RolloutFilters, RolloutRecord, RolloutStore, RolloutStoreOptions,
 };
 use tokio::sync::RwLock;
 
@@ -690,113 +688,6 @@ fn content_type_is(content_type: &str, expected: &str) -> bool {
         .next()
         .map(str::trim)
         .is_some_and(|mime| mime.eq_ignore_ascii_case(expected))
-}
-
-fn dto_to_relationship(r: RelationshipDto) -> Relationship {
-    Relationship {
-        target_id: r.target_id,
-        relation: r.relation,
-        weight: r.weight,
-    }
-}
-
-fn relationship_to_dto(r: Relationship) -> RelationshipDto {
-    RelationshipDto {
-        target_id: r.target_id,
-        relation: r.relation,
-        weight: r.weight,
-    }
-}
-
-fn rollout_record_from_add_request(r: &AddRolloutRequest) -> RolloutRecord {
-    RolloutRecord {
-        id: r.id.clone(),
-        rollout_id: r.rollout_id.clone(),
-        problem_id: r.problem_id.clone().unwrap_or_else(|| r.rollout_id.clone()),
-        dataset: r.dataset.clone(),
-        sequence_order: r.sequence_order,
-        role: r.role.clone(),
-        created_at: r.created_at.unwrap_or_else(Utc::now),
-        content: r.content.clone(),
-        content_type: r.content_type.clone(),
-        model_input_string: r.model_input_string.clone(),
-        model_output_string: r.model_output_string.clone(),
-        rationale: r.rationale.clone(),
-        problem_text: r.problem_text.clone(),
-        user_metadata: r.user_metadata.clone(),
-        input_tokens: r.input_tokens.clone(),
-        output_tokens: r.output_tokens.clone(),
-        num_input_tokens: r.num_input_tokens,
-        num_output_tokens: r.num_output_tokens,
-        output_logprobs: r.output_logprobs.clone(),
-        input_logprobs: r.input_logprobs.clone(),
-        ref_logprobs: r.ref_logprobs.clone(),
-        loss_mask: r.loss_mask.clone(),
-        advantage: r.advantage,
-        reward: r.reward,
-        raw_reward: r.raw_reward,
-        grader_id: r.grader_id.clone(),
-        score: r.score,
-        include_in_training: r.include_in_training,
-        exclude_reason: r.exclude_reason.clone(),
-        policy_version: r.policy_version.clone(),
-        relationships: r
-            .relationships
-            .iter()
-            .cloned()
-            .map(dto_to_relationship)
-            .collect(),
-        binary_payload: r.binary_payload.clone(),
-        payload_size: r.payload_size,
-        payload_checksum: r.payload_checksum.clone(),
-        artifact_type: r.artifact_type.clone(),
-        metadata: r.metadata.clone(),
-    }
-}
-
-fn rollout_record_to_dto(r: RolloutRecord) -> RolloutRecordDto {
-    RolloutRecordDto {
-        id: r.id,
-        rollout_id: r.rollout_id,
-        problem_id: r.problem_id,
-        dataset: r.dataset,
-        sequence_order: r.sequence_order,
-        role: r.role,
-        created_at: r.created_at,
-        content: r.content,
-        content_type: r.content_type,
-        model_input_string: r.model_input_string,
-        model_output_string: r.model_output_string,
-        rationale: r.rationale,
-        problem_text: r.problem_text,
-        user_metadata: r.user_metadata,
-        input_tokens: r.input_tokens,
-        output_tokens: r.output_tokens,
-        num_input_tokens: r.num_input_tokens,
-        num_output_tokens: r.num_output_tokens,
-        output_logprobs: r.output_logprobs,
-        input_logprobs: r.input_logprobs,
-        ref_logprobs: r.ref_logprobs,
-        loss_mask: r.loss_mask,
-        advantage: r.advantage,
-        reward: r.reward,
-        raw_reward: r.raw_reward,
-        grader_id: r.grader_id,
-        score: r.score,
-        include_in_training: r.include_in_training,
-        exclude_reason: r.exclude_reason,
-        policy_version: r.policy_version,
-        relationships: r
-            .relationships
-            .into_iter()
-            .map(relationship_to_dto)
-            .collect(),
-        binary_payload: r.binary_payload,
-        payload_size: r.payload_size,
-        payload_checksum: r.payload_checksum,
-        artifact_type: r.artifact_type,
-        metadata: r.metadata,
-    }
 }
 
 #[cfg(test)]

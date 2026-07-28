@@ -24,6 +24,13 @@
 //! - **Vector columns carry their dimension and metric**, because an index
 //!   cannot be built without them.
 //!
+//! # This type lives in the API crate on purpose
+//!
+//! A schema is part of the wire contract — the server accepts one at store
+//! creation and the client needs the same type to send it — so it belongs
+//! alongside the other request/response types rather than in the storage crate.
+//! It depends only on `arrow-schema` and `serde`, not on Lance.
+//!
 //! # Schema is immutable after creation
 //!
 //! v1 deliberately has no evolution path: the schema is fixed when the store is
@@ -36,8 +43,6 @@ use std::collections::{HashMap, HashSet};
 
 use arrow_schema::{ArrowError, DataType, Field, Schema, TimeUnit};
 use serde::{Deserialize, Serialize};
-
-use crate::store::DistanceMetric;
 
 /// The mandatory primary-key column. Always the LSM merge key.
 pub const ID_COLUMN: &str = "id";
@@ -60,6 +65,11 @@ const BLOB_COLUMN_KEY: &str = "lance-context:blob";
 /// with `_` is reserved wholesale so future Lance internals cannot collide with
 /// a user column.
 const RESERVED_COLUMNS: &[&str] = &["_rowid", "_rowaddr", "_mem_wal", "_distance"];
+
+/// Distance metrics a vector column may declare. Kept in sync with
+/// `lance_context_core::DistanceMetric`, which parses the same identifiers;
+/// duplicated as strings so this crate stays free of a storage dependency.
+const VALID_METRICS: &[&str] = &["l2", "euclidean", "cosine", "dot", "dot_product"];
 
 /// Maximum number of columns in a user schema. A guard against pathological
 /// declarations, not a Lance limit.
@@ -341,12 +351,12 @@ fn validate_column_type(name: &str, column_type: &ColumnType) -> Result<(), Stri
                 ));
             }
             if let Some(metric) = metric {
-                DistanceMetric::parse(metric).map_err(|_| {
-                    format!(
+                if !VALID_METRICS.contains(&metric.to_ascii_lowercase().as_str()) {
+                    return Err(format!(
                         "column '{name}': invalid distance metric '{metric}', expected one of \
-                         'l2', 'cosine', 'dot'"
-                    )
-                })?;
+                         {VALID_METRICS:?}"
+                    ));
+                }
             }
             Ok(())
         }

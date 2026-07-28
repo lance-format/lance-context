@@ -19,18 +19,20 @@ pub use lance_context_core::{
 
 pub use lance_context_api::{
     AddDatagenEventsRequest, AddDatagenEventsResponse, AddRecordRequest, AddRecordsResponse,
-    AddRolloutRequest, AddRolloutsResponse, CompactRequest, CompactResponse, CompactStatsResponse,
-    ContextError, ContextResult, ContextStoreApi, CreateDatagenStoreRequest,
+    AddRolloutRequest, AddRolloutsResponse, AddRowsRequest, AddRowsResponse, ColumnSpec,
+    ColumnType, CompactRequest, CompactResponse, CompactStatsResponse, ContextError, ContextResult,
+    ContextStoreApi, CreateDatagenStoreRequest, CreateGenericStoreRequest,
     CreateRolloutStoreRequest, DatagenEventDto, DatagenFailureDto, DatagenFieldStateDto,
     DatagenRootItemStatusesResponse, DatagenStepCursorDto, DatagenStoreApi, DatagenValueDto,
-    DeleteRecordResponse, FoldedDatagenItemDto, RecordDto, RelationshipDto, RetrieveRequest,
-    RetrieveResponse, RetrieveResultDto, RolloutRecordDto, RolloutStoreApi, SearchResultDto,
-    UpsertRecordRequest, UpsertRecordResponse,
+    DeleteRecordResponse, FoldedDatagenItemDto, GenericStoreApi, GenericStoreInfo, RecordDto,
+    RelationshipDto, RetrieveRequest, RetrieveResponse, RetrieveResultDto, RolloutRecordDto,
+    RolloutStoreApi, SchemaSpec, SearchResultDto, UpsertRecordRequest, UpsertRecordResponse,
+    ID_COLUMN,
 };
 
 #[cfg(feature = "remote")]
 pub use lance_context_client::{
-    ClientError, RemoteContextStore, RemoteDatagenStore, RemoteRolloutStore,
+    ClientError, RemoteContextStore, RemoteDatagenStore, RemoteGenericStore, RemoteRolloutStore,
 };
 
 mod unified;
@@ -41,3 +43,6 @@ pub use unified_rollout::RolloutStore;
 
 mod unified_datagen;
 pub use unified_datagen::DatagenStore;
+
+mod unified_generic;
+pub use unified_generic::GenericStore;

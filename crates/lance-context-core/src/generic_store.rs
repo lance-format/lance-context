@@ -30,13 +30,23 @@ use lance::session::Session;
 use lance::{Error as LanceError, Result as LanceResult};
 
 use crate::generic_codec::{batch_to_rows, rows_to_batch, Row};
-use crate::schema_spec::{SchemaSpec, ID_COLUMN};
 use crate::store::{CompactionConfig, CompactionStats};
 use crate::store_base::{ListSource, StorageBase, StorageBaseOptions};
+use lance_context_api::schema_spec::{SchemaSpec, ID_COLUMN};
 
 /// Schema-metadata key holding the serialized [`SchemaSpec`], so a store can be
 /// reopened without the caller re-declaring its columns.
 const SCHEMA_SPEC_KEY: &str = "lance-context:schema_spec";
+
+/// Schema-metadata key holding the store's seal-on-add mode.
+///
+/// Persisted for the same reason as the schema: it is a property *of the
+/// store*, chosen at creation, not of whoever happens to open it. Without this
+/// a store created with `seal_on_add: true` silently loses read-your-write the
+/// first time it is reopened (after an LRU eviction, or a process restart) —
+/// no error, no data loss, just "sometimes I can't read what I just wrote",
+/// which is close to undiagnosable in production.
+const SEAL_ON_ADD_KEY: &str = "lance-context:seal_on_add";
 
 /// Configuration for opening a [`GenericStore`].
 #[derive(Debug, Clone, Default)]
@@ -71,6 +81,9 @@ pub struct GenericStore {
     /// not against `spec.to_arrow()`, so a dataset whose physical field order
     /// differs still writes correctly.
     schema: Arc<Schema>,
+    /// Whether `add` seals before returning. Resolved from the dataset on a
+    /// reopen, from the caller on a create.
+    seal_on_add: bool,
 }
 
 impl GenericStore {
@@ -116,7 +129,7 @@ impl GenericStore {
         // key column against whatever it is given, and an empty placeholder
         // would fail that check.
         let create_schema = match &spec {
-            Some(spec) => Arc::new(schema_with_spec(spec)?),
+            Some(spec) => Arc::new(schema_with_spec(spec, options.seal_on_add)?),
             None if create_if_missing => {
                 return Err(ArrowError::SchemaError(
                     "a schema is required to create a store".to_string(),
@@ -134,6 +147,14 @@ impl GenericStore {
             }
         };
 
+        // A reopen honors the mode the store was *created* with; only a create
+        // takes it from the caller. Read it before opening, since the base
+        // needs it up front.
+        let seal_on_add = match &spec {
+            Some(_) => options.seal_on_add,
+            None => seal_on_add_from_schema(&create_schema).unwrap_or(options.seal_on_add),
+        };
+
         let base = StorageBase::open(
             uri,
             StorageBaseOptions {
@@ -148,7 +169,7 @@ impl GenericStore {
                 // User schemas are immutable in v1, so there is nothing to
                 // evolve an older base table to.
                 latest_schema: None,
-                seal_on_put: options.seal_on_add,
+                seal_on_put: seal_on_add,
             },
             create_if_missing,
         )
@@ -172,6 +193,7 @@ impl GenericStore {
             base,
             spec: persisted,
             schema,
+            seal_on_add,
         })
     }
 
@@ -179,6 +201,13 @@ impl GenericStore {
     #[must_use]
     pub fn spec(&self) -> &SchemaSpec {
         &self.spec
+    }
+
+    /// Whether `add` seals before returning, so its rows are immediately
+    /// readable. Persisted with the store, so a reopen preserves it.
+    #[must_use]
+    pub fn seal_on_add(&self) -> bool {
+        self.seal_on_add
     }
 
     /// URI of the underlying Lance dataset.
@@ -358,15 +387,26 @@ impl GenericStore {
     }
 }
 
-/// Attach the serialized spec to the Arrow schema so it round-trips on open.
-fn schema_with_spec(spec: &SchemaSpec) -> Result<Schema, ArrowError> {
+/// Attach the serialized spec and the seal mode to the Arrow schema, so both
+/// round-trip on open.
+fn schema_with_spec(spec: &SchemaSpec, seal_on_add: bool) -> Result<Schema, ArrowError> {
     let schema = spec.to_arrow()?;
     let encoded = serde_json::to_string(spec)
         .map_err(|error| ArrowError::SchemaError(format!("could not serialize schema: {error}")))?;
 
     let mut metadata = schema.metadata().clone();
     metadata.insert(SCHEMA_SPEC_KEY.to_string(), encoded);
+    metadata.insert(SEAL_ON_ADD_KEY.to_string(), seal_on_add.to_string());
     Ok(schema.with_metadata(metadata))
+}
+
+/// Read the persisted seal mode. `None` for a store written before this was
+/// persisted, which then falls back to the caller's option.
+fn seal_on_add_from_schema(schema: &Schema) -> Option<bool> {
+    schema
+        .metadata()
+        .get(SEAL_ON_ADD_KEY)
+        .and_then(|raw| raw.parse().ok())
 }
 
 /// Read the spec back out of a dataset's schema metadata.
@@ -413,9 +453,12 @@ impl GenericStore {
 }
 
 #[cfg(test)]
+// `GenericStore` owns a `Dataset` and is not `Debug`, so `expect_err` (which
+// formats the Ok value) is unavailable; `.err().expect(..)` is the alternative.
+#[allow(clippy::err_expect)]
 mod tests {
     use super::*;
-    use crate::schema_spec::{ColumnSpec, ColumnType};
+    use lance_context_api::schema_spec::{ColumnSpec, ColumnType};
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -487,6 +530,63 @@ mod tests {
 
             let reopened = GenericStore::open_existing(&uri, sealing()).await.unwrap();
             assert_eq!(reopened.spec(), &spec());
+            assert_eq!(reopened.list(None, None).await.unwrap().len(), 1);
+        });
+    }
+
+    #[test]
+    fn seal_mode_survives_a_reopen() {
+        // The mode is a property of the store, not of whoever opens it. Before
+        // it was persisted, a reopen silently reverted to the caller's default
+        // and the store lost read-your-write with no error.
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            {
+                let store = GenericStore::open(&uri, spec(), sealing()).await.unwrap();
+                assert!(store.seal_on_add());
+            }
+
+            // Reopen with the *opposite* default: the persisted value wins.
+            let reopened = GenericStore::open_existing(&uri, GenericStoreOptions::default())
+                .await
+                .unwrap();
+            assert!(
+                reopened.seal_on_add(),
+                "a store created with seal_on_add must keep it across a reopen"
+            );
+
+            // And it is behavioral, not just a flag: the write is visible
+            // without an explicit flush.
+            reopened.add(&[row(json!({"id": "r1"}))]).await.unwrap();
+            assert_eq!(reopened.list(None, None).await.unwrap().len(), 1);
+        });
+    }
+
+    #[test]
+    fn deferred_seal_mode_also_survives_a_reopen() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            {
+                GenericStore::open(&uri, spec(), GenericStoreOptions::default())
+                    .await
+                    .unwrap();
+            }
+
+            // Reopen with the opposite default; the persisted `false` wins.
+            let reopened = GenericStore::open_existing(&uri, sealing()).await.unwrap();
+            assert!(!reopened.seal_on_add());
+
+            reopened.add(&[row(json!({"id": "r1"}))]).await.unwrap();
+            assert_eq!(
+                reopened.list(None, None).await.unwrap().len(),
+                0,
+                "a deferred-seal store must not start sealing after a reopen"
+            );
+            reopened.flush().await.unwrap();
             assert_eq!(reopened.list(None, None).await.unwrap().len(), 1);
         });
     }

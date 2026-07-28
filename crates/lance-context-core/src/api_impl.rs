@@ -4,14 +4,14 @@ use uuid::Uuid;
 
 use lance_context_api::{
     AddDatagenEventsResponse, AddRecordRequest, AddRecordsResponse, AddRolloutRequest,
-    AddRolloutsResponse, CompactRequest, CompactResponse, CompactStatsResponse, ContextError,
-    ContextResult, ContextStoreApi, DatagenEventDto, DatagenFailureDto, DatagenFieldStateDto,
-    DatagenRootItemStatusesResponse, DatagenStepCursorDto, DatagenStoreApi, DatagenValueDto,
-    DeleteRecordResponse, FoldedDatagenItemDto, RecordDto, RecordPatchDto, RelationshipDto,
-    RetrieveRequest, RetrieveResultDto, RolloutRecordDto, RolloutStoreApi, SearchRequest,
-    SearchResultDto, StateMetadataDto, UpdateRecordRequest, UpdateRecordResponse,
-    UpsertRecordRequest, UpsertRecordResponse, UpsertRecordsRequest, UpsertRecordsResponse,
-    UpsertResultDto,
+    AddRolloutsResponse, AddRowsResponse, CompactRequest, CompactResponse, CompactStatsResponse,
+    ContextError, ContextResult, ContextStoreApi, DatagenEventDto, DatagenFailureDto,
+    DatagenFieldStateDto, DatagenRootItemStatusesResponse, DatagenStepCursorDto, DatagenStoreApi,
+    DatagenValueDto, DeleteRecordResponse, FoldedDatagenItemDto, GenericStoreApi, RecordDto,
+    RecordPatchDto, RelationshipDto, RetrieveRequest, RetrieveResultDto, RolloutRecordDto,
+    RolloutStoreApi, SchemaSpec, SearchRequest, SearchResultDto, StateMetadataDto,
+    UpdateRecordRequest, UpdateRecordResponse, UpsertRecordRequest, UpsertRecordResponse,
+    UpsertRecordsRequest, UpsertRecordsResponse, UpsertResultDto,
 };
 
 use crate::datagen::{
@@ -20,6 +20,8 @@ use crate::datagen::{
     DatagenStepKind, DatagenValue, FoldedDatagenItem,
 };
 use crate::datagen_store::DatagenStore;
+use crate::generic_codec::Row;
+use crate::generic_store::GenericStore;
 use crate::record::{
     ContextRecord, LifecycleQueryOptions, RecordFilters, RecordPatch, Relationship, StateMetadata,
     LIFECYCLE_ACTIVE,
@@ -381,6 +383,49 @@ impl ContextStoreApi for ContextStore {
     }
 }
 
+impl GenericStoreApi for GenericStore {
+    fn spec(&self) -> &SchemaSpec {
+        GenericStore::spec(self)
+    }
+
+    async fn add(&self, rows: &[Row]) -> ContextResult<AddRowsResponse> {
+        let count = rows.len();
+        let version = GenericStore::add(self, rows).await.map_err(to_ctx_err)?;
+        Ok(AddRowsResponse { version, count })
+    }
+
+    async fn list(&self, limit: Option<usize>, offset: Option<usize>) -> ContextResult<Vec<Row>> {
+        GenericStore::list(self, limit, offset)
+            .await
+            .map_err(to_ctx_err)
+    }
+
+    async fn list_filtered(
+        &self,
+        filter: &str,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> ContextResult<Vec<Row>> {
+        GenericStore::list_filtered(self, filter, limit, offset)
+            .await
+            .map_err(to_ctx_err)
+    }
+
+    async fn get(&self, id: &str, columns: Option<&[String]>) -> ContextResult<Option<Row>> {
+        GenericStore::get(self, id, columns)
+            .await
+            .map_err(to_ctx_err)
+    }
+
+    async fn flush(&self) -> ContextResult<()> {
+        GenericStore::flush(self).await.map_err(to_ctx_err)
+    }
+
+    fn version(&self) -> u64 {
+        GenericStore::version(self)
+    }
+}
+
 impl RolloutStoreApi for RolloutStore {
     async fn add(&mut self, records: &[AddRolloutRequest]) -> ContextResult<AddRolloutsResponse> {
         let mut ids = Vec::with_capacity(records.len());
@@ -457,7 +502,7 @@ impl RolloutStoreApi for RolloutStore {
     }
 }
 
-fn rollout_record_from_add_request(r: &AddRolloutRequest) -> RolloutRecord {
+pub fn rollout_record_from_add_request(r: &AddRolloutRequest) -> RolloutRecord {
     RolloutRecord {
         id: r.id.clone(),
         rollout_id: r.rollout_id.clone(),
@@ -549,7 +594,7 @@ pub fn rollout_record_to_dto(r: RolloutRecord) -> RolloutRecordDto {
     }
 }
 
-fn dto_to_relationship(r: RelationshipDto) -> Relationship {
+pub fn dto_to_relationship(r: RelationshipDto) -> Relationship {
     Relationship {
         target_id: r.target_id,
         relation: r.relation,
@@ -557,7 +602,7 @@ fn dto_to_relationship(r: RelationshipDto) -> Relationship {
     }
 }
 
-fn relationship_to_dto(r: Relationship) -> RelationshipDto {
+pub fn relationship_to_dto(r: Relationship) -> RelationshipDto {
     RelationshipDto {
         target_id: r.target_id,
         relation: r.relation,
@@ -565,7 +610,7 @@ fn relationship_to_dto(r: Relationship) -> RelationshipDto {
     }
 }
 
-fn patch_from_dto(patch: &RecordPatchDto) -> RecordPatch {
+pub fn patch_from_dto(patch: &RecordPatchDto) -> RecordPatch {
     RecordPatch {
         bot_id: patch.bot_id.clone(),
         session_id: patch.session_id.clone(),
@@ -597,7 +642,7 @@ fn patch_from_dto(patch: &RecordPatchDto) -> RecordPatch {
     }
 }
 
-fn record_from_add_request(r: &AddRecordRequest, id: String, run_id: String) -> ContextRecord {
+pub fn record_from_add_request(r: &AddRecordRequest, id: String, run_id: String) -> ContextRecord {
     ContextRecord {
         id,
         external_id: r.external_id.clone(),
@@ -638,7 +683,7 @@ fn record_from_add_request(r: &AddRecordRequest, id: String, run_id: String) -> 
     }
 }
 
-fn record_to_dto(r: ContextRecord) -> RecordDto {
+pub fn record_to_dto(r: ContextRecord) -> RecordDto {
     RecordDto {
         id: r.id,
         external_id: r.external_id,

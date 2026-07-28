@@ -9,8 +9,8 @@ use lance_context_api::{
 use lance_context_core::{LifecycleQueryOptions, RecordFilters};
 
 use crate::error::AppError;
-use crate::routes::records::record_to_dto;
 use crate::state::AppState;
+use lance_context_core::record_to_dto;
 
 pub async fn search(
     State(state): State<Arc<AppState>>,
