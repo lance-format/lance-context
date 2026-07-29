@@ -48,6 +48,13 @@ jobs:
           sudo apt install -y clang libclang-dev protobuf-compiler
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # `--workspace` unions every member's features, so `lance-context` is
+      # always built with `remote` enabled by lance-context-server/-client.
+      # The release job checks the crate on its own (`default = []`), a
+      # combination the line above never exercises. Check it explicitly so
+      # cfg-gated breakage is caught here instead of at release time.
+      - name: Clippy (lance-context, default features)
+        run: cargo clippy --manifest-path crates/lance-context/Cargo.toml --all-targets -- -D warnings
 
   typos:
     name: Spell Check
