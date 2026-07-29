@@ -327,6 +327,16 @@ pub trait DatagenStoreApi {
         item_id: &str,
     ) -> impl Future<Output = ContextResult<Option<FoldedDatagenItemDto>>> + Send;
 
+    /// Like [`DatagenStoreApi::fold_item`], but `load_blobs` selects the blob projection:
+    /// `false` (the `fold_item` default) leaves blob fields lazy — bytes absent, resolved later
+    /// through `get_blob` — while `true` materializes them inline, at the cost of reading the
+    /// payload column.
+    fn fold_item_with_blobs(
+        &self,
+        item_id: &str,
+        load_blobs: bool,
+    ) -> impl Future<Output = ContextResult<Option<FoldedDatagenItemDto>>> + Send;
+
     fn root_item_statuses(
         &self,
         root_item_ids: &[String],
@@ -345,6 +355,10 @@ pub trait DatagenStoreApi {
         &self,
         root_item_id: &str,
     ) -> impl Future<Output = ContextResult<Vec<DatagenEventDto>>> + Send;
+
+    /// Aggregate the whole log into a run overview: per-status root item counts,
+    /// failure counts by error type, and completed-step counts.
+    fn overview(&self) -> impl Future<Output = ContextResult<DatagenRunOverviewDto>> + Send;
 
     /// Materialize one FIELD_* event's offloaded blob bytes by event id.
     /// Returns `None` when the event or its payload is absent.
@@ -1219,6 +1233,38 @@ pub struct DatagenFailureDto {
     pub error_dump: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traceback: Option<String>,
+}
+
+/// Whole-run aggregation over a datagen log. `items` counts root items only
+/// (`running + completed + filtered`); `failures` counts FAILED events, which are
+/// non-terminal, so a failed-then-retried item still counts as `running`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DatagenRunOverviewDto {
+    pub items: usize,
+    pub running: usize,
+    pub completed: usize,
+    pub filtered: usize,
+    pub failures: usize,
+    /// FAILED-event count per `error_type`.
+    #[serde(default)]
+    pub failures_by_error_type: std::collections::BTreeMap<String, usize>,
+    /// Failure roll-up grouped by the `run_id` that emitted the FAILED event.
+    #[serde(default)]
+    pub failures_by_run: std::collections::BTreeMap<String, DatagenFailureBucketDto>,
+    /// STEP_COMPLETED count per step name, across every item.
+    #[serde(default)]
+    pub completed_steps: std::collections::BTreeMap<String, usize>,
+}
+
+/// One `run_id`'s slice of an overview's failure roll-up, with a capped sample of failing root
+/// item ids to drill into.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DatagenFailureBucketDto {
+    pub failures: usize,
+    #[serde(default)]
+    pub failures_by_error_type: std::collections::BTreeMap<String, usize>,
+    #[serde(default)]
+    pub sample_root_item_ids: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

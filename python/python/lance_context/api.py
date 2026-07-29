@@ -16,7 +16,7 @@ from ._internal import (  # pyright: ignore[reportMissingImports]
     ContextNamespace as _ContextNamespace,
 )
 from ._internal import (  # pyright: ignore[reportMissingImports]
-    DatagenItemId as DatagenItemId,
+    DatagenItemId as _DatagenItemId,
 )
 from ._internal import (  # pyright: ignore[reportMissingImports]
     DatagenStore as _DatagenStore,
@@ -48,7 +48,9 @@ __all__ = [
     "Context",
     "ContextNamespace",
     "GenericStore",
+    "DatagenItemId",
     "DatagenStore",
+    "DatagenStreamWriter",
     "EmbeddingProvider",
     "RemoteContext",
     "RolloutStore",
@@ -2830,9 +2832,26 @@ class DatagenStore:
         """Append raw events as one MemWAL generation. Returns the new store version."""
         return self._sync.append(list(events))
 
-    def fold_item(self, item_id: str) -> dict[str, Any] | None:
-        """Fold an item's events into its latest state, or ``None`` if never started."""
-        return self._sync.fold_item(item_id)
+    def fold_item(
+        self, item_id: str, *, load_blobs: bool = False
+    ) -> dict[str, Any] | None:
+        """Fold an item's events into its latest state, or ``None`` if never started.
+
+        ``load_blobs`` materializes blob-field bytes inline; the default leaves them
+        lazy, to be resolved through :meth:`get_blob` / :meth:`load_blob`.
+        """
+        return self._sync.fold_item(item_id, load_blobs)
+
+    def overview(self) -> dict[str, Any]:
+        """Aggregate the whole store into a run overview.
+
+        Returns root-item counts by status (``items`` / ``running`` / ``completed`` /
+        ``filtered``), ``completed_steps`` per step name, and a failure roll-up: total
+        ``failures``, ``failures_by_error_type``, and ``failures_by_run`` — one bucket
+        per ``run_id``, each with its own error-type counts and a small sample of
+        failing root item ids to drill into.
+        """
+        return self._sync.overview()
 
     def root_item_statuses(self, root_item_ids: Sequence[str]) -> dict[str, str]:
         """Classify each root item id by folded lifecycle status.
@@ -2906,6 +2925,70 @@ class DatagenStore:
 
     def __repr__(self) -> str:
         return f"DatagenStore(version={self._sync.version()})"
+
+
+class DatagenItemId:
+    """A structured datagen item id.
+
+    Root ids come from the executor's source key; sub-item ids extend a parent with one
+    fan-out segment (``5/expand:0``). ``str(id)`` is the stored path form. Pure and
+    client-side — composing an id does no I/O.
+    """
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+
+    @classmethod
+    def from_source_key(cls, key: str) -> "DatagenItemId":
+        """A root id for the executor's source key."""
+        return cls(_DatagenItemId.from_source_key(key))
+
+    @classmethod
+    def parse(cls, path: str) -> "DatagenItemId":
+        """Parse a stored path form (``5`` or ``5/expand:0``)."""
+        return cls(_DatagenItemId.parse(path))
+
+    def child(self, origin_step: str, branch_idx: int) -> "DatagenItemId":
+        """The sub-item id forked at ``origin_step`` branch ``branch_idx``."""
+        return DatagenItemId(self._inner.child(origin_step, branch_idx))
+
+    def parent(self) -> "DatagenItemId | None":
+        """The parent id, or ``None`` for a root."""
+        inner = self._inner.parent()
+        return DatagenItemId(inner) if inner is not None else None
+
+    def root(self) -> "DatagenItemId":
+        """The root this id descends from (itself when already a root)."""
+        return DatagenItemId(self._inner.root())
+
+    @property
+    def origin_step(self) -> str | None:
+        """The fan-out step this id was forked at, or ``None`` for a root."""
+        return self._inner.origin_step
+
+    @property
+    def branch_idx(self) -> int | None:
+        """The branch index within ``origin_step``, or ``None`` for a root."""
+        return self._inner.branch_idx
+
+    @property
+    def is_root(self) -> bool:
+        """Whether this id has no fan-out segment."""
+        return self._inner.is_root
+
+    def __str__(self) -> str:
+        return str(self._inner)
+
+    def __repr__(self) -> str:
+        return f"DatagenItemId({str(self._inner)!r})"
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, DatagenItemId):
+            return NotImplemented
+        return bool(self._inner == other._inner)
+
+    def __hash__(self) -> int:
+        return hash(str(self._inner))
 
 
 class DatagenStreamWriter:

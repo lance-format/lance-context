@@ -149,16 +149,39 @@ pub async fn add_datagen_events(
     Ok((StatusCode::CREATED, Json(resp)))
 }
 
+/// Blob projection for the fold endpoint.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct FoldParams {
+    /// When `true`, blob fields are materialized inline instead of left lazy for `get_blob`.
+    #[serde(default)]
+    pub load_blobs: bool,
+}
+
 pub async fn fold_datagen_item(
     State(state): State<Arc<AppState>>,
     Path((name, item_id)): Path<(String, String)>,
+    Query(params): Query<FoldParams>,
 ) -> Result<Json<GetFoldedDatagenItemResponse>, AppError> {
     let store_lock = state.get_or_open_datagen_store(&name).await?;
     let store = store_lock.read().await;
-    let item = DatagenStoreApi::fold_item(&*store, &item_id)
+    let item = DatagenStoreApi::fold_item_with_blobs(&*store, &item_id, params.load_blobs)
         .await
         .map_err(AppError::from_context)?;
     Ok(Json(GetFoldedDatagenItemResponse { item }))
+}
+
+/// Aggregate the whole log into a run overview (per-status root counts, failure
+/// counts by error type, completed-step counts).
+pub async fn datagen_overview(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<lance_context_api::DatagenRunOverviewDto>, AppError> {
+    let store_lock = state.get_or_open_datagen_store(&name).await?;
+    let store = store_lock.read().await;
+    let overview = DatagenStoreApi::overview(&*store)
+        .await
+        .map_err(AppError::from_context)?;
+    Ok(Json(overview))
 }
 
 pub async fn datagen_item_failures(

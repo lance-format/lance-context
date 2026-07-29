@@ -2676,14 +2676,35 @@ impl DatagenStore {
     }
 
     /// Fold an item's events into its latest state, or `None` if never started.
-    fn fold_item(&self, py: Python<'_>, item_id: &str) -> PyResult<Option<PyObject>> {
+    /// `load_blobs` materializes blob-field bytes inline; the default leaves them
+    /// lazy, to be resolved through `get_blob`.
+    #[pyo3(signature = (item_id, load_blobs = false))]
+    fn fold_item(
+        &self,
+        py: Python<'_>,
+        item_id: &str,
+        load_blobs: bool,
+    ) -> PyResult<Option<PyObject>> {
         let item = py
-            .allow_threads(|| self.runtime.block_on(self.store.fold_item(item_id)))
+            .allow_threads(|| {
+                self.runtime
+                    .block_on(self.store.fold_item_with_blobs(item_id, load_blobs))
+            })
             .map_err(to_py_err)?;
         match item {
             None => Ok(None),
             Some(item) => Ok(Some(folded_item_to_py(py, &item)?)),
         }
+    }
+
+    /// Aggregate the whole store into a run overview dict: root-item counts by
+    /// status, completed-step counts, and a failure roll-up by `run_id` (each
+    /// bucket carrying a small sample of failing root item ids).
+    fn overview(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let overview = py
+            .allow_threads(|| self.runtime.block_on(self.store.overview()))
+            .map_err(to_py_err)?;
+        run_overview_to_py(py, &overview)
     }
 
     /// Classify each root item id by folded lifecycle status. Missing ids (never
@@ -3407,6 +3428,54 @@ fn item_tree_to_py(py: Python<'_>, tree: &UnifiedDatagenItemTree) -> PyResult<Py
         nodes.set_item(item.item_id.to_string(), item_node_to_py(py, node)?)?;
     }
     dict.set_item("nodes", nodes)?;
+    Ok(dict.into_pyobject(py)?.unbind().into())
+}
+
+fn run_overview_to_py(
+    py: Python<'_>,
+    overview: &lance_context::DatagenRunOverviewDto,
+) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("items", overview.items)?;
+    dict.set_item("running", overview.running)?;
+    dict.set_item("completed", overview.completed)?;
+    dict.set_item("filtered", overview.filtered)?;
+    dict.set_item("failures", overview.failures)?;
+    dict.set_item(
+        "failures_by_error_type",
+        counts_to_py(py, &overview.failures_by_error_type)?,
+    )?;
+    dict.set_item(
+        "completed_steps",
+        counts_to_py(py, &overview.completed_steps)?,
+    )?;
+    let by_run = PyDict::new(py);
+    for (run_id, bucket) in &overview.failures_by_run {
+        let entry = PyDict::new(py);
+        entry.set_item("failures", bucket.failures)?;
+        entry.set_item(
+            "failures_by_error_type",
+            counts_to_py(py, &bucket.failures_by_error_type)?,
+        )?;
+        let samples = PyList::empty(py);
+        for root in &bucket.sample_root_item_ids {
+            samples.append(root)?;
+        }
+        entry.set_item("sample_root_item_ids", samples)?;
+        by_run.set_item(run_id, entry)?;
+    }
+    dict.set_item("failures_by_run", by_run)?;
+    Ok(dict.into_pyobject(py)?.unbind().into())
+}
+
+fn counts_to_py(
+    py: Python<'_>,
+    counts: &std::collections::BTreeMap<String, usize>,
+) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    for (key, count) in counts {
+        dict.set_item(key, count)?;
+    }
     Ok(dict.into_pyobject(py)?.unbind().into())
 }
 

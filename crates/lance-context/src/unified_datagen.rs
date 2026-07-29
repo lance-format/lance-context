@@ -1,6 +1,6 @@
 use lance_context_api::{
     AddDatagenEventsResponse, ContextError, ContextResult, DatagenEventDto, DatagenFailureDto,
-    DatagenRootItemStatusesResponse, DatagenStoreApi, FoldedDatagenItemDto,
+    DatagenRootItemStatusesResponse, DatagenRunOverviewDto, DatagenStoreApi, FoldedDatagenItemDto,
 };
 use lance_context_core::{
     datagen_event_to_dto, datagen_events_from_dtos, fold_datagen_events, open_stream_events,
@@ -163,11 +163,23 @@ impl DatagenStoreApi for DatagenStore {
         dispatch_ref!(self, fold_item, item_id)
     }
 
+    async fn fold_item_with_blobs(
+        &self,
+        item_id: &str,
+        load_blobs: bool,
+    ) -> ContextResult<Option<FoldedDatagenItemDto>> {
+        dispatch_ref!(self, fold_item_with_blobs, item_id, load_blobs)
+    }
+
     async fn root_item_statuses(
         &self,
         root_item_ids: &[String],
     ) -> ContextResult<DatagenRootItemStatusesResponse> {
         dispatch_ref!(self, root_item_statuses, root_item_ids)
+    }
+
+    async fn overview(&self) -> ContextResult<DatagenRunOverviewDto> {
+        dispatch_ref!(self, overview)
     }
 
     async fn item_failures(&self, item_id: &str) -> ContextResult<Vec<DatagenFailureDto>> {
