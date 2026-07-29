@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 
 use lance_context_api::{
-    AddRowsResponse, ContextError, ContextResult, CreateGenericStoreRequest, GenericStoreApi,
-    SchemaSpec,
+    AddRowsResponse, ContextError, ContextResult, GenericStoreApi, SchemaSpec,
 };
 use lance_context_core::{GenericStore as LocalStore, GenericStoreOptions};
 use serde_json::{Map, Value};
 
+#[cfg(feature = "remote")]
+use lance_context_api::CreateGenericStoreRequest;
 #[cfg(feature = "remote")]
 use lance_context_client::RemoteGenericStore;
 
