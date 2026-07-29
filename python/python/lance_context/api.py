@@ -11,6 +11,14 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from os import PathLike
 
+from ._internal import (  # pyright: ignore[reportMissingImports]
+    AlreadyExistsError,
+    CompactionInProgressError,
+    ContextStoreError,
+    InternalError,
+    InvalidRequestError,
+    NotFoundError,
+)
 from ._internal import Context as _Context  # pyright: ignore[reportMissingImports]
 from ._internal import (  # pyright: ignore[reportMissingImports]
     ContextNamespace as _ContextNamespace,
@@ -43,15 +51,21 @@ from ._internal import version as _version  # pyright: ignore[reportMissingImpor
 from .embeddings import EmbeddingProvider, _build_provider, supports_media
 
 __all__ = [
+    "AlreadyExistsError",
     "AsyncContext",
     "AsyncRolloutStore",
+    "CompactionInProgressError",
     "Context",
     "ContextNamespace",
+    "ContextStoreError",
     "GenericStore",
     "DatagenItemId",
     "DatagenStore",
     "DatagenStreamWriter",
     "EmbeddingProvider",
+    "InternalError",
+    "InvalidRequestError",
+    "NotFoundError",
     "RemoteContext",
     "RolloutStore",
     "__version__",

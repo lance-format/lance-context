@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, SecondsFormat, Utc};
+use pyo3::create_exception;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyModule, PyType};
@@ -23,9 +24,10 @@ use lance_context::{
     RolloutStore as UnifiedRolloutStore, RolloutStoreApi, SchemaSpec,
 };
 use lance_context_api::{
-    AddRecordRequest, CompactRequest, CompactResponse, CompactStatsResponse, ContextStoreApi,
-    RecordDto, RecordPatchDto, RelationshipDto, RetrieveRequest, RetrieveResultDto, SearchRequest,
-    SearchResultDto, StateMetadataDto, UpdateRecordRequest, UpsertRecordRequest,
+    AddRecordRequest, CompactRequest, CompactResponse, CompactStatsResponse, ContextError,
+    ContextStoreApi, RecordDto, RecordPatchDto, RelationshipDto, RetrieveRequest,
+    RetrieveResultDto, SearchRequest, SearchResultDto, StateMetadataDto, UpdateRecordRequest,
+    UpsertRecordRequest,
 };
 use lance_context_client::RemoteContextStore;
 use lance_context_core::serde::CONTENT_TYPE_TEXT;
@@ -2151,6 +2153,64 @@ fn to_py_err<E: std::fmt::Display>(err: E) -> PyErr {
     PyRuntimeError::new_err(err.to_string())
 }
 
+create_exception!(
+    _internal,
+    ContextStoreError,
+    PyRuntimeError,
+    "Base class for every error a context store raises."
+);
+create_exception!(
+    _internal,
+    NotFoundError,
+    ContextStoreError,
+    "The requested store, record, or id does not exist."
+);
+create_exception!(
+    _internal,
+    AlreadyExistsError,
+    ContextStoreError,
+    "The store or record being created already exists."
+);
+create_exception!(
+    _internal,
+    InvalidRequestError,
+    ContextStoreError,
+    "The request was rejected as malformed. Deterministic — retrying cannot help."
+);
+create_exception!(
+    _internal,
+    InternalError,
+    ContextStoreError,
+    "A transport or storage fault. The retryable case: the same call may yet succeed."
+);
+create_exception!(
+    _internal,
+    CompactionInProgressError,
+    ContextStoreError,
+    "A compaction holds the store. Retry once it finishes."
+);
+
+/// Map a [`ContextError`] onto the exception class that says whether retrying can help.
+///
+/// Every variant subclasses `RuntimeError`, which is what this crate raised before these
+/// classes existed, so `except RuntimeError` keeps catching all of them.
+///
+/// `ContextError` already separates a transport or storage fault from a request the store
+/// refused outright; flattening both to `RuntimeError` forced callers to retry a
+/// deterministic rejection until their budget ran out. `InternalError` is the retryable
+/// one — the rest are verdicts about the request itself and will fail again identically.
+fn ctx_to_py_err(err: ContextError) -> PyErr {
+    match err {
+        ContextError::NotFound(msg) => NotFoundError::new_err(msg),
+        ContextError::AlreadyExists(msg) => AlreadyExistsError::new_err(msg),
+        ContextError::InvalidRequest(msg) => InvalidRequestError::new_err(msg),
+        ContextError::Internal(msg) => InternalError::new_err(msg),
+        ContextError::CompactionInProgress => {
+            CompactionInProgressError::new_err(ContextError::CompactionInProgress.to_string())
+        }
+    }
+}
+
 fn content_to_payloads(
     content: &Bound<'_, PyAny>,
     data_type: Option<&str>,
@@ -2608,7 +2668,7 @@ impl DatagenStore {
         let store_res = py.allow_threads(|| {
             runtime.block_on(UnifiedDatagenStore::open_with_options(uri, storage_options))
         });
-        let store = store_res.map_err(to_py_err)?;
+        let store = store_res.map_err(ctx_to_py_err)?;
         Ok(Self::from_store(store, runtime))
     }
 
@@ -2623,7 +2683,7 @@ impl DatagenStore {
         let runtime = Arc::new(Runtime::new().map_err(to_py_err)?);
         let store_res =
             py.allow_threads(|| runtime.block_on(UnifiedDatagenStore::connect(base_url, name)));
-        let store = store_res.map_err(to_py_err)?;
+        let store = store_res.map_err(ctx_to_py_err)?;
         Ok(Self::from_store(store, runtime))
     }
 
@@ -2645,7 +2705,7 @@ impl DatagenStore {
         let store_res = py.allow_threads(|| {
             runtime.block_on(UnifiedDatagenStore::connect_or_create(base_url, &req))
         });
-        let store = store_res.map_err(to_py_err)?;
+        let store = store_res.map_err(ctx_to_py_err)?;
         Ok(Self::from_store(store, runtime))
     }
 
@@ -2661,7 +2721,7 @@ impl DatagenStore {
         let parsed = events_from_pylist(events)?;
         let resp = py
             .allow_threads(|| self.runtime.block_on(self.store.append_checkpoint(&parsed)))
-            .map_err(to_py_err)?;
+            .map_err(ctx_to_py_err)?;
         Ok(resp.version)
     }
 
@@ -2671,7 +2731,7 @@ impl DatagenStore {
         let parsed = events_from_pylist(events)?;
         let resp = py
             .allow_threads(|| self.runtime.block_on(self.store.append(&parsed)))
-            .map_err(to_py_err)?;
+            .map_err(ctx_to_py_err)?;
         Ok(resp.version)
     }
 
@@ -2690,7 +2750,7 @@ impl DatagenStore {
                 self.runtime
                     .block_on(self.store.fold_item_with_blobs(item_id, load_blobs))
             })
-            .map_err(to_py_err)?;
+            .map_err(ctx_to_py_err)?;
         match item {
             None => Ok(None),
             Some(item) => Ok(Some(folded_item_to_py(py, &item)?)),
@@ -2703,7 +2763,7 @@ impl DatagenStore {
     fn overview(&self, py: Python<'_>) -> PyResult<PyObject> {
         let overview = py
             .allow_threads(|| self.runtime.block_on(self.store.overview()))
-            .map_err(to_py_err)?;
+            .map_err(ctx_to_py_err)?;
         run_overview_to_py(py, &overview)
     }
 
@@ -2715,7 +2775,7 @@ impl DatagenStore {
                 self.runtime
                     .block_on(self.store.root_item_statuses(&root_item_ids))
             })
-            .map_err(to_py_err)?;
+            .map_err(ctx_to_py_err)?;
         let dict = PyDict::new(py);
         for (item_id, status) in statuses.statuses.iter() {
             dict.set_item(item_id, status)?;
@@ -2727,7 +2787,7 @@ impl DatagenStore {
     fn item_failures(&self, py: Python<'_>, item_id: &str) -> PyResult<PyObject> {
         let failures = py
             .allow_threads(|| self.runtime.block_on(self.store.item_failures(item_id)))
-            .map_err(to_py_err)?;
+            .map_err(ctx_to_py_err)?;
         let list = PyList::empty(py);
         for failure in &failures {
             list.append(failure_to_py(py, failure)?)?;
@@ -2739,7 +2799,7 @@ impl DatagenStore {
     fn get_blob(&self, py: Python<'_>, event_id: &str) -> PyResult<Option<Py<PyBytes>>> {
         let bytes = py
             .allow_threads(|| self.runtime.block_on(self.store.get_blob(event_id)))
-            .map_err(to_py_err)?;
+            .map_err(ctx_to_py_err)?;
         Ok(bytes.map(|b| PyBytes::new(py, &b).unbind()))
     }
 
@@ -2750,7 +2810,7 @@ impl DatagenStore {
     fn item_tree(&self, py: Python<'_>, root_item_id: &str) -> PyResult<PyObject> {
         let tree = py
             .allow_threads(|| self.runtime.block_on(self.store.item_tree(root_item_id)))
-            .map_err(to_py_err)?;
+            .map_err(ctx_to_py_err)?;
         item_tree_to_py(py, &tree)
     }
 
@@ -2784,7 +2844,7 @@ impl DatagenStore {
                 self.runtime
                     .block_on(self.store.open_stream(&stream, &context))
             })
-            .map_err(to_py_err)?;
+            .map_err(ctx_to_py_err)?;
         Ok(DatagenStreamWriter { inner: writer })
     }
 
@@ -2806,7 +2866,7 @@ impl DatagenStore {
                 self.runtime
                     .block_on(self.store.resume_stream(item_id, &context))
             })
-            .map_err(to_py_err)?;
+            .map_err(ctx_to_py_err)?;
         Ok(writer.map(|inner| DatagenStreamWriter { inner }))
     }
 }
@@ -3737,5 +3797,20 @@ fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<DatagenStreamWriter>()?;
     m.add_class::<DatagenItemId>()?;
     m.add_class::<GenericStore>()?;
+    m.add("ContextStoreError", m.py().get_type::<ContextStoreError>())?;
+    m.add("NotFoundError", m.py().get_type::<NotFoundError>())?;
+    m.add(
+        "AlreadyExistsError",
+        m.py().get_type::<AlreadyExistsError>(),
+    )?;
+    m.add(
+        "InvalidRequestError",
+        m.py().get_type::<InvalidRequestError>(),
+    )?;
+    m.add("InternalError", m.py().get_type::<InternalError>())?;
+    m.add(
+        "CompactionInProgressError",
+        m.py().get_type::<CompactionInProgressError>(),
+    )?;
     Ok(())
 }
