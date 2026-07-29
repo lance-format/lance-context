@@ -1155,6 +1155,19 @@ pub struct DatagenStepCursorDto {
     pub item_seq: i64,
 }
 
+/// A position within one stream's step tree, without the `item_seq` a cursor carries.
+/// Mirrors the Python `StepPosition` wire dict.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatagenStreamPositionDto {
+    pub step_name: String,
+    pub step_kind: String,
+    pub step_index: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enclosing_step: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector_step: Option<String>,
+}
+
 /// An item reconstructed by folding its events into latest state.
 /// Mirrors the Python `FoldedItem` wire dict.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1168,6 +1181,13 @@ pub struct FoldedDatagenItemDto {
     pub last_attempt: i32,
     pub fields: std::collections::BTreeMap<String, DatagenFieldStateDto>,
     pub trajectory: Vec<DatagenStepCursorDto>,
+    /// Positions with a STEP_STARTED — gates driver-frame (re-)opening on resume. `started`
+    /// minus `completed` = frames that were open when the process died.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub started: Vec<DatagenStreamPositionDto>,
+    /// Positions with a STEP_COMPLETED — gates STEP_COMPLETED re-emission on resume.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub completed: Vec<DatagenStreamPositionDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query_tags: Option<Value>,
     /// `field_name -> event_id` for the folded blob fields, so a caller can resolve a blob by field

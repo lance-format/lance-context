@@ -23,11 +23,11 @@ pub use lance_context_api::{
     ColumnType, CompactRequest, CompactResponse, CompactStatsResponse, ContextError, ContextResult,
     ContextStoreApi, CreateDatagenStoreRequest, CreateGenericStoreRequest,
     CreateRolloutStoreRequest, DatagenEventDto, DatagenFailureDto, DatagenFieldStateDto,
-    DatagenRootItemStatusesResponse, DatagenStepCursorDto, DatagenStoreApi, DatagenValueDto,
-    DeleteRecordResponse, FoldedDatagenItemDto, GenericStoreApi, GenericStoreInfo, RecordDto,
-    RelationshipDto, RetrieveRequest, RetrieveResponse, RetrieveResultDto, RolloutRecordDto,
-    RolloutStoreApi, SchemaSpec, SearchResultDto, UpsertRecordRequest, UpsertRecordResponse,
-    ID_COLUMN,
+    DatagenRootItemStatusesResponse, DatagenStepCursorDto, DatagenStoreApi,
+    DatagenStreamPositionDto, DatagenValueDto, DeleteRecordResponse, FoldedDatagenItemDto,
+    GenericStoreApi, GenericStoreInfo, RecordDto, RelationshipDto, RetrieveRequest,
+    RetrieveResponse, RetrieveResultDto, RolloutRecordDto, RolloutStoreApi, SchemaSpec,
+    SearchResultDto, UpsertRecordRequest, UpsertRecordResponse, ID_COLUMN,
 };
 
 #[cfg(feature = "remote")]

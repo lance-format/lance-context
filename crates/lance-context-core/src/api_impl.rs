@@ -7,17 +7,18 @@ use lance_context_api::{
     AddRolloutsResponse, AddRowsResponse, CompactRequest, CompactResponse, CompactStatsResponse,
     ContextError, ContextResult, ContextStoreApi, DatagenEventDto, DatagenFailureDto,
     DatagenFieldStateDto, DatagenRootItemStatusesResponse, DatagenStepCursorDto, DatagenStoreApi,
-    DatagenValueDto, DeleteRecordResponse, FoldedDatagenItemDto, GenericStoreApi, RecordDto,
-    RecordPatchDto, RelationshipDto, RetrieveRequest, RetrieveResultDto, RolloutRecordDto,
-    RolloutStoreApi, SchemaSpec, SearchRequest, SearchResultDto, StateMetadataDto,
-    UpdateRecordRequest, UpdateRecordResponse, UpsertRecordRequest, UpsertRecordResponse,
-    UpsertRecordsRequest, UpsertRecordsResponse, UpsertResultDto,
+    DatagenStreamPositionDto, DatagenValueDto, DeleteRecordResponse, FoldedDatagenItemDto,
+    GenericStoreApi, RecordDto, RecordPatchDto, RelationshipDto, RetrieveRequest,
+    RetrieveResultDto, RolloutRecordDto, RolloutStoreApi, SchemaSpec, SearchRequest,
+    SearchResultDto, StateMetadataDto, UpdateRecordRequest, UpdateRecordResponse,
+    UpsertRecordRequest, UpsertRecordResponse, UpsertRecordsRequest, UpsertRecordsResponse,
+    UpsertResultDto,
 };
 
 use crate::datagen::{
     DatagenBlobValue, DatagenEvent, DatagenEventType, DatagenFailure, DatagenFieldState,
     DatagenItemLookup, DatagenItemStatus, DatagenRootItemStatuses, DatagenStepCursor,
-    DatagenStepKind, DatagenValue, FoldedDatagenItem,
+    DatagenStepKind, DatagenStreamPosition, DatagenValue, FoldedDatagenItem,
 };
 use crate::datagen_store::DatagenStore;
 use crate::generic_codec::Row;
@@ -972,6 +973,8 @@ pub fn folded_item_to_dto(item: &FoldedDatagenItem) -> FoldedDatagenItemDto {
             .map(|(name, state)| (name.clone(), field_state_to_dto(state)))
             .collect(),
         trajectory: item.trajectory.ordered.iter().map(cursor_to_dto).collect(),
+        started: position_set_to_dto(&item.trajectory.started),
+        completed: position_set_to_dto(&item.trajectory.completed),
         query_tags: item.query_tags.clone(),
         blob_event_ids: item.blob_event_ids.clone(),
     }
@@ -1001,6 +1004,38 @@ fn cursor_to_dto(cursor: &DatagenStepCursor) -> DatagenStepCursorDto {
         selector_step: cursor.position.selector.clone(),
         item_seq: cursor.item_seq,
     }
+}
+
+fn position_to_dto(position: &DatagenStreamPosition) -> DatagenStreamPositionDto {
+    DatagenStreamPositionDto {
+        step_name: position.step.name.clone(),
+        step_kind: position.step.kind.as_str().to_string(),
+        step_index: position.index,
+        enclosing_step: position.enclosing.clone(),
+        selector_step: position.selector.clone(),
+    }
+}
+
+/// Project a fold position set to DTOs in a deterministic order (the sets are unordered).
+fn position_set_to_dto(
+    positions: &std::collections::HashSet<DatagenStreamPosition>,
+) -> Vec<DatagenStreamPositionDto> {
+    let mut dtos: Vec<DatagenStreamPositionDto> = positions.iter().map(position_to_dto).collect();
+    dtos.sort_by(|a, b| {
+        (
+            &a.step_name,
+            a.step_index,
+            &a.enclosing_step,
+            &a.selector_step,
+        )
+            .cmp(&(
+                &b.step_name,
+                b.step_index,
+                &b.enclosing_step,
+                &b.selector_step,
+            ))
+    });
+    dtos
 }
 
 fn root_item_statuses_to_dto(

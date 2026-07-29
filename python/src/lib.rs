@@ -17,10 +17,10 @@ use lance_context::{
     DatagenErrorInfo, DatagenEventDto, DatagenFailureDto, DatagenFieldChange, DatagenFieldStateDto,
     DatagenItemNode as UnifiedDatagenItemNode, DatagenItemTree as UnifiedDatagenItemTree,
     DatagenStepCursorDto, DatagenStore as UnifiedDatagenStore, DatagenStoreApi,
-    DatagenStreamPosition, DatagenStreamWriter as CoreDatagenStreamWriter, DatagenValueDto,
-    DatagenWriteContext, FoldedDatagenItemDto, GenericStore as UnifiedGenericStore,
-    GenericStoreApi, RolloutRecordDto, RolloutStore as UnifiedRolloutStore, RolloutStoreApi,
-    SchemaSpec,
+    DatagenStreamPosition, DatagenStreamPositionDto,
+    DatagenStreamWriter as CoreDatagenStreamWriter, DatagenValueDto, DatagenWriteContext,
+    FoldedDatagenItemDto, GenericStore as UnifiedGenericStore, GenericStoreApi, RolloutRecordDto,
+    RolloutStore as UnifiedRolloutStore, RolloutStoreApi, SchemaSpec,
 };
 use lance_context_api::{
     AddRecordRequest, CompactRequest, CompactResponse, CompactStatsResponse, ContextStoreApi,
@@ -3173,6 +3173,18 @@ fn folded_item_to_py(py: Python<'_>, item: &FoldedDatagenItemDto) -> PyResult<Py
     }
     dict.set_item("trajectory", trajectory)?;
 
+    let started = PyList::empty(py);
+    for position in &item.started {
+        started.append(position_to_py(py, position)?)?;
+    }
+    dict.set_item("started", started)?;
+
+    let completed = PyList::empty(py);
+    for position in &item.completed {
+        completed.append(position_to_py(py, position)?)?;
+    }
+    dict.set_item("completed", completed)?;
+
     dict.set_item(
         "query_tags",
         match &item.query_tags {
@@ -3213,6 +3225,16 @@ fn cursor_to_py(py: Python<'_>, cursor: &DatagenStepCursorDto) -> PyResult<PyObj
     dict.set_item("enclosing_step", cursor.enclosing_step.clone())?;
     dict.set_item("selector_step", cursor.selector_step.clone())?;
     dict.set_item("item_seq", cursor.item_seq)?;
+    Ok(dict.into_pyobject(py)?.unbind().into())
+}
+
+fn position_to_py(py: Python<'_>, position: &DatagenStreamPositionDto) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("step_name", &position.step_name)?;
+    dict.set_item("step_kind", &position.step_kind)?;
+    dict.set_item("step_index", position.step_index)?;
+    dict.set_item("enclosing_step", position.enclosing_step.clone())?;
+    dict.set_item("selector_step", position.selector_step.clone())?;
     Ok(dict.into_pyobject(py)?.unbind().into())
 }
 

@@ -1244,6 +1244,26 @@ mod tests {
     }
 
     #[test]
+    fn dto_projection_carries_started_and_completed_sets() {
+        let events = [
+            created(0),
+            driver_started(1, "main", 0, None),
+            leaf_completed(2, "gen", 0, Some("main")),
+        ];
+        let folded = fold_datagen_events(&events).unwrap().unwrap();
+        let dto = crate::api_impl::folded_item_to_dto(&folded);
+
+        // `trajectory` stays the ordered cursor list; the two sets ride alongside it so the
+        // caller can gate STEP_STARTED / STEP_COMPLETED re-emission on resume.
+        assert_eq!(dto.trajectory.len(), 1);
+        assert_eq!(dto.started.len(), 1);
+        assert_eq!(dto.started[0].step_name, "main");
+        assert_eq!(dto.completed.len(), 1);
+        assert_eq!(dto.completed[0].step_name, "gen");
+        assert_eq!(dto.completed[0].enclosing_step.as_deref(), Some("main"));
+    }
+
+    #[test]
     fn field_set_is_last_writer_wins_and_append_accumulates() {
         let mut set_v1 = leaf_completed(1, "gen", 0, Some("main"));
         set_v1.event_type = DatagenEventType::FieldSet;
