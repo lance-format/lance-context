@@ -1069,6 +1069,18 @@ fn apply_event(item: &mut FoldedDatagenItem, event: &DatagenEvent) -> Result<(),
         DatagenEventType::FieldSet => {
             let field_name = event.field_name.clone().unwrap();
             let value = event.value.clone().unwrap();
+            // Group D: a field's value kind is fixed by its first write. A later SET that
+            // drifts to another kind means the pipeline wrote the field inconsistently.
+            if let Some(DatagenFieldState::Set(existing)) = item.fields.get(&field_name) {
+                if existing.kind() != value.kind() {
+                    return Err(format!(
+                        "field '{}' changes value kind from {} to {}",
+                        field_name,
+                        existing.kind(),
+                        value.kind()
+                    ));
+                }
+            }
             record_blob_event_id(item, &field_name, &value, &event.event_id);
             item.fields
                 .insert(field_name, DatagenFieldState::Set(value));
@@ -1077,12 +1089,25 @@ fn apply_event(item: &mut FoldedDatagenItem, event: &DatagenEvent) -> Result<(),
             let field_name = event.field_name.clone().unwrap();
             let value = event.value.clone().unwrap();
             record_blob_event_id(item, &field_name, &value, &event.event_id);
-            match item.fields.entry(field_name) {
+            match item.fields.entry(field_name.clone()) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
                     entry.insert(DatagenFieldState::Appended(vec![value]));
                 }
                 std::collections::btree_map::Entry::Occupied(mut entry) => match entry.get_mut() {
-                    DatagenFieldState::Appended(values) => values.push(value),
+                    DatagenFieldState::Appended(values) => {
+                        // Group D: the same kind rule holds within one appended list.
+                        if let Some(existing) = values.first() {
+                            if existing.kind() != value.kind() {
+                                return Err(format!(
+                                    "field '{}' changes value kind from {} to {}",
+                                    field_name,
+                                    existing.kind(),
+                                    value.kind()
+                                ));
+                            }
+                        }
+                        values.push(value);
+                    }
                     DatagenFieldState::Set(_) => {
                         return Err(format!(
                             "field '{}' mixes FIELD_SET and FIELD_APPEND",
@@ -1304,6 +1329,44 @@ mod tests {
                 DatagenValue::Json(json!({"n": "b"})),
             ]))
         );
+    }
+
+    #[test]
+    fn field_value_kind_drift_is_rejected() {
+        let mut set_str = leaf_completed(1, "gen", 0, Some("main"));
+        set_str.event_type = DatagenEventType::FieldSet;
+        set_str.field_name = Some("draft".to_string());
+        set_str.field_type = Some("str".to_string());
+        set_str.codec_version = Some(1);
+        set_str.value = Some(DatagenValue::Str("v1".to_string()));
+
+        let mut set_int = set_str.clone();
+        set_int.item_seq = 2;
+        set_int.checkpoint_id = "c2".to_string();
+        set_int.event_id = datagen_event_id("5", "c2", 0);
+        set_int.field_type = Some("int".to_string());
+        set_int.value = Some(DatagenValue::Int(7));
+
+        let err = fold_datagen_events(&[created(0), set_str, set_int]).unwrap_err();
+        assert!(err.contains("changes value kind"), "{err}");
+
+        // Same rule inside an appended list.
+        let mut append_str = leaf_completed(3, "b1", 0, Some("body"));
+        append_str.event_type = DatagenEventType::FieldAppend;
+        append_str.field_name = Some("revisions".to_string());
+        append_str.field_type = Some("str".to_string());
+        append_str.codec_version = Some(1);
+        append_str.value = Some(DatagenValue::Str("a".to_string()));
+
+        let mut append_int = append_str.clone();
+        append_int.item_seq = 4;
+        append_int.checkpoint_id = "c4".to_string();
+        append_int.event_id = datagen_event_id("5", "c4", 0);
+        append_int.field_type = Some("int".to_string());
+        append_int.value = Some(DatagenValue::Int(1));
+
+        let err = fold_datagen_events(&[created(0), append_str, append_int]).unwrap_err();
+        assert!(err.contains("changes value kind"), "{err}");
     }
 
     #[test]

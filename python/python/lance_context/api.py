@@ -16,6 +16,9 @@ from ._internal import (  # pyright: ignore[reportMissingImports]
     ContextNamespace as _ContextNamespace,
 )
 from ._internal import (  # pyright: ignore[reportMissingImports]
+    DatagenItemId as DatagenItemId,
+)
+from ._internal import (  # pyright: ignore[reportMissingImports]
     DatagenStore as _DatagenStore,
 )
 from ._internal import (  # pyright: ignore[reportMissingImports]

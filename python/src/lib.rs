@@ -2790,6 +2790,91 @@ impl DatagenStore {
     }
 }
 
+/// A structured datagen item id. Root ids come from the executor's source key; sub-item
+/// ids extend a parent with one fan-out segment (`5/expand:0`). `str(id)` is the stored
+/// path form. Pure and client-side — composing an id does no I/O.
+#[pyclass]
+#[derive(Clone)]
+struct DatagenItemId {
+    inner: CoreDatagenItemId,
+}
+
+#[pymethods]
+impl DatagenItemId {
+    /// Build a root id from the executor's source key.
+    #[staticmethod]
+    fn from_source_key(key: &str) -> Self {
+        Self {
+            inner: CoreDatagenItemId::from_source_key(key),
+        }
+    }
+
+    /// Parse a stored path string (`"5/expand:0"`) back into a structured id.
+    #[staticmethod]
+    fn parse(path: &str) -> PyResult<Self> {
+        Ok(Self {
+            inner: CoreDatagenItemId::parse(path).map_err(to_py_err)?,
+        })
+    }
+
+    /// Extend this id with one fan-out segment -> the sub-item's id.
+    fn child(&self, origin_step: &str, branch_idx: i64) -> Self {
+        Self {
+            inner: self.inner.child(origin_step, branch_idx),
+        }
+    }
+
+    /// The parent stream's id (`None` on a root).
+    fn parent(&self) -> Option<Self> {
+        self.inner.parent().map(|inner| Self { inner })
+    }
+
+    /// The root of this id's tree (== self if root).
+    fn root(&self) -> Self {
+        Self {
+            inner: self.inner.root(),
+        }
+    }
+
+    /// The fan-out step that created this sub-item (`None` on a root).
+    #[getter]
+    fn origin_step(&self) -> Option<String> {
+        self.inner.origin_step().map(str::to_string)
+    }
+
+    /// Which branch this sub-item is (`None` on a root).
+    #[getter]
+    fn branch_idx(&self) -> Option<i64> {
+        self.inner.branch_idx()
+    }
+
+    /// Whether this id names a root stream.
+    #[getter]
+    fn is_root(&self) -> bool {
+        self.inner.is_root()
+    }
+
+    fn __str__(&self) -> String {
+        self.inner.to_string()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("DatagenItemId({:?})", self.inner.to_string())
+    }
+
+    fn __eq__(&self, other: &Self) -> bool {
+        self.inner == other.inner
+    }
+
+    fn __hash__(&self) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        self.inner.hash(&mut hasher);
+        hasher.finish()
+    }
+}
+
 /// A per-stream write handle. Owns the bookkeeping columns the caller should never
 /// touch (`item_seq`, `attempt`, `checkpoint_id`, `event_id`), stamping them onto
 /// every event it emits. Each method returns the event dict(s) to persist — the
@@ -3581,6 +3666,7 @@ fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RolloutStore>()?;
     m.add_class::<DatagenStore>()?;
     m.add_class::<DatagenStreamWriter>()?;
+    m.add_class::<DatagenItemId>()?;
     m.add_class::<GenericStore>()?;
     Ok(())
 }
