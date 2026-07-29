@@ -12,16 +12,17 @@ if TYPE_CHECKING:
     from os import PathLike
 
 from ._internal import (  # pyright: ignore[reportMissingImports]
-    AlreadyExistsError,
-    CompactionInProgressError,
-    ContextStoreError,
-    InternalError,
-    InvalidRequestError,
-    NotFoundError,
+    AlreadyExistsError as _AlreadyExistsError,
+)
+from ._internal import (  # pyright: ignore[reportMissingImports]
+    CompactionInProgressError as _CompactionInProgressError,
 )
 from ._internal import Context as _Context  # pyright: ignore[reportMissingImports]
 from ._internal import (  # pyright: ignore[reportMissingImports]
     ContextNamespace as _ContextNamespace,
+)
+from ._internal import (  # pyright: ignore[reportMissingImports]
+    ContextStoreError as _ContextStoreError,
 )
 from ._internal import (  # pyright: ignore[reportMissingImports]
     DatagenItemId as _DatagenItemId,
@@ -34,6 +35,15 @@ from ._internal import (  # pyright: ignore[reportMissingImports]
 )
 from ._internal import (  # pyright: ignore[reportMissingImports]
     GenericStore as _GenericStore,
+)
+from ._internal import (  # pyright: ignore[reportMissingImports]
+    InternalError as _InternalError,
+)
+from ._internal import (  # pyright: ignore[reportMissingImports]
+    InvalidRequestError as _InvalidRequestError,
+)
+from ._internal import (  # pyright: ignore[reportMissingImports]
+    NotFoundError as _NotFoundError,
 )
 from ._internal import (  # pyright: ignore[reportMissingImports]
     RemoteContext as _RemoteContext,
@@ -74,6 +84,18 @@ __all__ = [
 ]
 
 __version__ = _version()
+
+# The store error hierarchy, re-exported from the native module. `ContextStoreError` is
+# rooted at `RuntimeError` — what this package raised before these classes existed — so
+# `except RuntimeError` still catches every one of them. `InternalError` and
+# `CompactionInProgressError` are the retryable pair; the rest are verdicts on the
+# request itself, which an identical retry can only earn again.
+ContextStoreError = _ContextStoreError
+NotFoundError = _NotFoundError
+AlreadyExistsError = _AlreadyExistsError
+InvalidRequestError = _InvalidRequestError
+InternalError = _InternalError
+CompactionInProgressError = _CompactionInProgressError
 
 
 def generate_id() -> str:
