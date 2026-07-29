@@ -5,8 +5,9 @@ use uuid::Uuid;
 use lance_context_api::{
     AddDatagenEventsResponse, AddRecordRequest, AddRecordsResponse, AddRolloutRequest,
     AddRolloutsResponse, AddRowsResponse, CompactRequest, CompactResponse, CompactStatsResponse,
-    ContextError, ContextResult, ContextStoreApi, DatagenEventDto, DatagenFailureDto,
-    DatagenFieldStateDto, DatagenRootItemStatusesResponse, DatagenStepCursorDto, DatagenStoreApi,
+    ContextError, ContextResult, ContextStoreApi, DatagenEventDto, DatagenFailureBucketDto,
+    DatagenFailureDto, DatagenFieldStateDto, DatagenRootItemStatusesResponse,
+    DatagenRunOverviewDto, DatagenStepCursorDto, DatagenStoreApi, DatagenStreamPositionDto,
     DatagenValueDto, DeleteRecordResponse, FoldedDatagenItemDto, GenericStoreApi, RecordDto,
     RecordPatchDto, RelationshipDto, RetrieveRequest, RetrieveResultDto, RolloutRecordDto,
     RolloutStoreApi, SchemaSpec, SearchRequest, SearchResultDto, StateMetadataDto,
@@ -15,9 +16,10 @@ use lance_context_api::{
 };
 
 use crate::datagen::{
-    DatagenBlobValue, DatagenEvent, DatagenEventType, DatagenFailure, DatagenFieldState,
-    DatagenItemLookup, DatagenItemStatus, DatagenRootItemStatuses, DatagenStepCursor,
-    DatagenStepKind, DatagenValue, FoldedDatagenItem,
+    DatagenBlobProjection, DatagenBlobValue, DatagenEvent, DatagenEventType, DatagenFailure,
+    DatagenFieldState, DatagenItemLookup, DatagenItemStatus, DatagenRootItemStatuses,
+    DatagenRunOverview, DatagenStepCursor, DatagenStepKind, DatagenStreamPosition, DatagenValue,
+    FoldedDatagenItem,
 };
 use crate::datagen_store::DatagenStore;
 use crate::generic_codec::Row;
@@ -771,6 +773,25 @@ impl DatagenStoreApi for DatagenStore {
         })
     }
 
+    async fn fold_item_with_blobs(
+        &self,
+        item_id: &str,
+        load_blobs: bool,
+    ) -> ContextResult<Option<FoldedDatagenItemDto>> {
+        let blobs = if load_blobs {
+            DatagenBlobProjection::Eager
+        } else {
+            DatagenBlobProjection::Lazy
+        };
+        let lookup = DatagenStore::fold_item_with(self, item_id, blobs)
+            .await
+            .map_err(to_ctx_err)?;
+        Ok(match lookup {
+            DatagenItemLookup::NeverStarted => None,
+            DatagenItemLookup::Found(item) => Some(folded_item_to_dto(&item)),
+        })
+    }
+
     async fn root_item_statuses(
         &self,
         root_item_ids: &[String],
@@ -780,6 +801,11 @@ impl DatagenStoreApi for DatagenStore {
             .await
             .map_err(to_ctx_err)?;
         Ok(root_item_statuses_to_dto(&statuses))
+    }
+
+    async fn overview(&self) -> ContextResult<DatagenRunOverviewDto> {
+        let overview = DatagenStore::overview(self).await.map_err(to_ctx_err)?;
+        Ok(run_overview_to_dto(&overview))
     }
 
     async fn item_failures(&self, item_id: &str) -> ContextResult<Vec<DatagenFailureDto>> {
@@ -972,6 +998,8 @@ pub fn folded_item_to_dto(item: &FoldedDatagenItem) -> FoldedDatagenItemDto {
             .map(|(name, state)| (name.clone(), field_state_to_dto(state)))
             .collect(),
         trajectory: item.trajectory.ordered.iter().map(cursor_to_dto).collect(),
+        started: position_set_to_dto(&item.trajectory.started),
+        completed: position_set_to_dto(&item.trajectory.completed),
         query_tags: item.query_tags.clone(),
         blob_event_ids: item.blob_event_ids.clone(),
     }
@@ -1003,6 +1031,38 @@ fn cursor_to_dto(cursor: &DatagenStepCursor) -> DatagenStepCursorDto {
     }
 }
 
+fn position_to_dto(position: &DatagenStreamPosition) -> DatagenStreamPositionDto {
+    DatagenStreamPositionDto {
+        step_name: position.step.name.clone(),
+        step_kind: position.step.kind.as_str().to_string(),
+        step_index: position.index,
+        enclosing_step: position.enclosing.clone(),
+        selector_step: position.selector.clone(),
+    }
+}
+
+/// Project a fold position set to DTOs in a deterministic order (the sets are unordered).
+fn position_set_to_dto(
+    positions: &std::collections::HashSet<DatagenStreamPosition>,
+) -> Vec<DatagenStreamPositionDto> {
+    let mut dtos: Vec<DatagenStreamPositionDto> = positions.iter().map(position_to_dto).collect();
+    dtos.sort_by(|a, b| {
+        (
+            &a.step_name,
+            a.step_index,
+            &a.enclosing_step,
+            &a.selector_step,
+        )
+            .cmp(&(
+                &b.step_name,
+                b.step_index,
+                &b.enclosing_step,
+                &b.selector_step,
+            ))
+    });
+    dtos
+}
+
 fn root_item_statuses_to_dto(
     statuses: &DatagenRootItemStatuses,
 ) -> DatagenRootItemStatusesResponse {
@@ -1011,6 +1071,32 @@ fn root_item_statuses_to_dto(
             .iter()
             .map(|(id, status)| (id.clone(), status.as_str().to_string()))
             .collect(),
+    }
+}
+
+fn run_overview_to_dto(overview: &DatagenRunOverview) -> DatagenRunOverviewDto {
+    DatagenRunOverviewDto {
+        items: overview.items,
+        running: overview.running,
+        completed: overview.completed,
+        filtered: overview.filtered,
+        failures: overview.failures,
+        failures_by_error_type: overview.failures_by_error_type.clone(),
+        failures_by_run: overview
+            .failures_by_run
+            .iter()
+            .map(|(run_id, bucket)| {
+                (
+                    run_id.clone(),
+                    DatagenFailureBucketDto {
+                        failures: bucket.failures,
+                        failures_by_error_type: bucket.failures_by_error_type.clone(),
+                        sample_root_item_ids: bucket.sample_root_item_ids.clone(),
+                    },
+                )
+            })
+            .collect(),
+        completed_steps: overview.completed_steps.clone(),
     }
 }
 

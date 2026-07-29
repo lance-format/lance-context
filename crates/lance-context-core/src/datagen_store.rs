@@ -29,11 +29,11 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::datagen::{
-    datagen_failures, datagen_trajectory, fold_datagen_events, open_stream_events,
-    DatagenBlobValue, DatagenEvent, DatagenEventType, DatagenFailure, DatagenItemLookup,
-    DatagenItemStatus, DatagenItemTree, DatagenNewStream, DatagenRootItemStatuses,
-    DatagenStepCursor, DatagenStepKind, DatagenStreamWriter, DatagenValue, DatagenWriteContext,
-    FoldedDatagenItem,
+    datagen_failures, datagen_trajectory, fold_datagen_events, fold_datagen_events_with,
+    open_stream_events, DatagenBlobProjection, DatagenBlobValue, DatagenEvent, DatagenEventType,
+    DatagenFailure, DatagenItemLookup, DatagenItemStatus, DatagenItemTree, DatagenNewStream,
+    DatagenRootItemStatuses, DatagenRunOverview, DatagenStepCursor, DatagenStepKind,
+    DatagenStreamWriter, DatagenValue, DatagenWriteContext, FoldedDatagenItem,
 };
 use crate::store::{
     column_as, column_as_optional, timestamp_from_micros, CompactionConfig, CompactionStats,
@@ -215,6 +215,36 @@ impl DatagenStore {
             Some(item) => Ok(DatagenItemLookup::Found(item)),
             None => Ok(DatagenItemLookup::NeverStarted),
         }
+    }
+
+    /// Reconstruct one item's latest state under an explicit blob projection.
+    ///
+    /// `DatagenBlobProjection::Eager` scans the log's blob column too, so the folded blob fields
+    /// carry their bytes and no `get_blob` round trip is needed. That reads the whole payload —
+    /// prefer the lazy [`fold_item`](Self::fold_item) unless the caller wants every blob anyway.
+    pub async fn fold_item_with(
+        &self,
+        item_id: &str,
+        blobs: DatagenBlobProjection,
+    ) -> LanceResult<DatagenItemLookup> {
+        let events = match blobs {
+            DatagenBlobProjection::Lazy => self.events_for_item(item_id).await?,
+            DatagenBlobProjection::Eager => {
+                self.events_with_blobs(&format!("item_id = '{}'", escape_sql_literal(item_id)))
+                    .await?
+            }
+        };
+        match fold_datagen_events_with(&events, blobs).map_err(invalid_input)? {
+            Some(item) => Ok(DatagenItemLookup::Found(item)),
+            None => Ok(DatagenItemLookup::NeverStarted),
+        }
+    }
+
+    /// Aggregate the whole log into a run overview: per-status root item counts, failure counts by
+    /// error type, and completed-step counts. Reads every event once; loads no blob bytes.
+    pub async fn overview(&self) -> LanceResult<DatagenRunOverview> {
+        let events = self.filtered_events("event_type IS NOT NULL").await?;
+        DatagenRunOverview::build(&events).map_err(invalid_input)
     }
 
     /// Classify every root item that shares `root_item_id` with the given roots by folded lifecycle
@@ -406,10 +436,31 @@ impl DatagenStore {
         }))
     }
 
+    /// Like [`filtered_events`](Self::filtered_events) but projects the blob column in, so field
+    /// blob bytes arrive with the events instead of needing a per-field `get_blob`.
+    async fn events_with_blobs(&self, filter: &str) -> LanceResult<Vec<DatagenEvent>> {
+        self.scan_events(filter, None).await
+    }
+
     async fn filtered_events(&self, filter: &str) -> LanceResult<Vec<DatagenEvent>> {
         let columns = self.non_blob_columns();
-        let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
-        let scanner = self.lsm_scanner().await?.project(&refs).filter(filter)?;
+        self.scan_events(filter, Some(&columns)).await
+    }
+
+    /// Scan events matching `filter`, projecting `columns` when given (all columns otherwise), and
+    /// order them by `(item_id, item_seq, event_id)`.
+    async fn scan_events(
+        &self,
+        filter: &str,
+        columns: Option<&[String]>,
+    ) -> LanceResult<Vec<DatagenEvent>> {
+        let scanner = match columns {
+            Some(columns) => {
+                let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+                self.lsm_scanner().await?.project(&refs).filter(filter)?
+            }
+            None => self.lsm_scanner().await?.filter(filter)?,
+        };
         let mut stream = scanner.try_into_stream().await?;
         let mut events = Vec::new();
         while let Some(batch) = stream.try_next().await? {
@@ -1128,6 +1179,89 @@ mod tests {
             let trajectory = store.trajectory("item-1").await.unwrap();
             assert_eq!(trajectory.len(), 1);
             assert_eq!(trajectory[0].position.step.name, "grade");
+        });
+    }
+
+    #[test]
+    fn eager_fold_materializes_blob_bytes_and_overview_aggregates_the_store() {
+        let directory = TempDir::new().unwrap();
+        let uri = directory.path().to_string_lossy().to_string();
+        let blob_bytes = b"eager-screenshot".to_vec();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = DatagenStore::open(&uri).await.unwrap();
+            store
+                .append(&[event(
+                    "item-1",
+                    0,
+                    "created",
+                    0,
+                    DatagenEventType::ItemCreated,
+                )])
+                .await
+                .unwrap();
+            store
+                .append_checkpoint(&[
+                    field_event(
+                        1,
+                        0,
+                        DatagenEventType::FieldSet,
+                        "screenshot",
+                        "image",
+                        DatagenValue::Blob(DatagenBlobValue {
+                            bytes: Some(blob_bytes.clone()),
+                            size: blob_bytes.len() as i64,
+                            checksum: None,
+                        }),
+                    ),
+                    completed_step(2, 1),
+                ])
+                .await
+                .unwrap();
+
+            // Lazy (the default) leaves the bytes behind; eager projects them into the fold.
+            let lazy = store.fold_item("item-1").await.unwrap();
+            let DatagenFieldState::Set(DatagenValue::Blob(lazy_blob)) =
+                lazy.folded().unwrap().fields.get("screenshot").unwrap()
+            else {
+                panic!("screenshot should be a blob");
+            };
+            assert!(lazy_blob.bytes.is_none());
+
+            let eager = store
+                .fold_item_with("item-1", DatagenBlobProjection::Eager)
+                .await
+                .unwrap();
+            let DatagenFieldState::Set(DatagenValue::Blob(eager_blob)) =
+                eager.folded().unwrap().fields.get("screenshot").unwrap()
+            else {
+                panic!("screenshot should be a blob");
+            };
+            assert_eq!(eager_blob.bytes.as_ref(), Some(&blob_bytes));
+
+            // A second root that fails, so the overview has something in every bucket.
+            let mut created = event("item-2", 0, "created-2", 0, DatagenEventType::ItemCreated);
+            created.item_id = "item-2".to_string();
+            created.root_item_id = "item-2".to_string();
+            store.append(&[created]).await.unwrap();
+            let mut failed = completed_step(1, 0);
+            failed.item_id = "item-2".to_string();
+            failed.root_item_id = "item-2".to_string();
+            failed.checkpoint_id = "failed-2".to_string();
+            failed.event_id = datagen_event_id("item-2", "failed-2", 0);
+            failed.event_type = DatagenEventType::Failed;
+            failed.error_type = Some("ValueError".to_string());
+            store.append(&[failed]).await.unwrap();
+
+            let overview = store.overview().await.unwrap();
+            assert_eq!(overview.items, 2);
+            assert_eq!(overview.running, 2);
+            assert_eq!(overview.failures, 1);
+            assert_eq!(overview.failures_by_error_type["ValueError"], 1);
+            assert_eq!(overview.completed_steps["grade"], 1);
+            let bucket = overview.failures_by_run.values().next().unwrap();
+            assert_eq!(bucket.failures, 1);
+            assert_eq!(bucket.sample_root_item_ids, vec!["item-2".to_string()]);
         });
     }
 

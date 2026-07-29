@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, SecondsFormat, Utc};
+use pyo3::create_exception;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyModule, PyType};
@@ -17,15 +18,16 @@ use lance_context::{
     DatagenErrorInfo, DatagenEventDto, DatagenFailureDto, DatagenFieldChange, DatagenFieldStateDto,
     DatagenItemNode as UnifiedDatagenItemNode, DatagenItemTree as UnifiedDatagenItemTree,
     DatagenStepCursorDto, DatagenStore as UnifiedDatagenStore, DatagenStoreApi,
-    DatagenStreamPosition, DatagenStreamWriter as CoreDatagenStreamWriter, DatagenValueDto,
-    DatagenWriteContext, FoldedDatagenItemDto, GenericStore as UnifiedGenericStore,
-    GenericStoreApi, RolloutRecordDto, RolloutStore as UnifiedRolloutStore, RolloutStoreApi,
-    SchemaSpec,
+    DatagenStreamPosition, DatagenStreamPositionDto,
+    DatagenStreamWriter as CoreDatagenStreamWriter, DatagenValueDto, DatagenWriteContext,
+    FoldedDatagenItemDto, GenericStore as UnifiedGenericStore, GenericStoreApi, RolloutRecordDto,
+    RolloutStore as UnifiedRolloutStore, RolloutStoreApi, SchemaSpec,
 };
 use lance_context_api::{
-    AddRecordRequest, CompactRequest, CompactResponse, CompactStatsResponse, ContextStoreApi,
-    RecordDto, RecordPatchDto, RelationshipDto, RetrieveRequest, RetrieveResultDto, SearchRequest,
-    SearchResultDto, StateMetadataDto, UpdateRecordRequest, UpsertRecordRequest,
+    AddRecordRequest, CompactRequest, CompactResponse, CompactStatsResponse, ContextError,
+    ContextStoreApi, RecordDto, RecordPatchDto, RelationshipDto, RetrieveRequest,
+    RetrieveResultDto, SearchRequest, SearchResultDto, StateMetadataDto, UpdateRecordRequest,
+    UpsertRecordRequest,
 };
 use lance_context_client::RemoteContextStore;
 use lance_context_core::serde::CONTENT_TYPE_TEXT;
@@ -2151,6 +2153,64 @@ fn to_py_err<E: std::fmt::Display>(err: E) -> PyErr {
     PyRuntimeError::new_err(err.to_string())
 }
 
+create_exception!(
+    _internal,
+    ContextStoreError,
+    PyRuntimeError,
+    "Base class for every error a context store raises."
+);
+create_exception!(
+    _internal,
+    NotFoundError,
+    ContextStoreError,
+    "The requested store, record, or id does not exist."
+);
+create_exception!(
+    _internal,
+    AlreadyExistsError,
+    ContextStoreError,
+    "The store or record being created already exists."
+);
+create_exception!(
+    _internal,
+    InvalidRequestError,
+    ContextStoreError,
+    "The request was rejected as malformed. Deterministic — retrying cannot help."
+);
+create_exception!(
+    _internal,
+    InternalError,
+    ContextStoreError,
+    "A transport or storage fault. The retryable case: the same call may yet succeed."
+);
+create_exception!(
+    _internal,
+    CompactionInProgressError,
+    ContextStoreError,
+    "A compaction holds the store. Retry once it finishes."
+);
+
+/// Map a [`ContextError`] onto the exception class that says whether retrying can help.
+///
+/// Every variant subclasses `RuntimeError`, which is what this crate raised before these
+/// classes existed, so `except RuntimeError` keeps catching all of them.
+///
+/// `ContextError` already separates a transport or storage fault from a request the store
+/// refused outright; flattening both to `RuntimeError` forced callers to retry a
+/// deterministic rejection until their budget ran out. `InternalError` is the retryable
+/// one — the rest are verdicts about the request itself and will fail again identically.
+fn ctx_to_py_err(err: ContextError) -> PyErr {
+    match err {
+        ContextError::NotFound(msg) => NotFoundError::new_err(msg),
+        ContextError::AlreadyExists(msg) => AlreadyExistsError::new_err(msg),
+        ContextError::InvalidRequest(msg) => InvalidRequestError::new_err(msg),
+        ContextError::Internal(msg) => InternalError::new_err(msg),
+        ContextError::CompactionInProgress => {
+            CompactionInProgressError::new_err(ContextError::CompactionInProgress.to_string())
+        }
+    }
+}
+
 fn content_to_payloads(
     content: &Bound<'_, PyAny>,
     data_type: Option<&str>,
@@ -2608,7 +2668,7 @@ impl DatagenStore {
         let store_res = py.allow_threads(|| {
             runtime.block_on(UnifiedDatagenStore::open_with_options(uri, storage_options))
         });
-        let store = store_res.map_err(to_py_err)?;
+        let store = store_res.map_err(ctx_to_py_err)?;
         Ok(Self::from_store(store, runtime))
     }
 
@@ -2623,7 +2683,7 @@ impl DatagenStore {
         let runtime = Arc::new(Runtime::new().map_err(to_py_err)?);
         let store_res =
             py.allow_threads(|| runtime.block_on(UnifiedDatagenStore::connect(base_url, name)));
-        let store = store_res.map_err(to_py_err)?;
+        let store = store_res.map_err(ctx_to_py_err)?;
         Ok(Self::from_store(store, runtime))
     }
 
@@ -2645,7 +2705,7 @@ impl DatagenStore {
         let store_res = py.allow_threads(|| {
             runtime.block_on(UnifiedDatagenStore::connect_or_create(base_url, &req))
         });
-        let store = store_res.map_err(to_py_err)?;
+        let store = store_res.map_err(ctx_to_py_err)?;
         Ok(Self::from_store(store, runtime))
     }
 
@@ -2661,7 +2721,7 @@ impl DatagenStore {
         let parsed = events_from_pylist(events)?;
         let resp = py
             .allow_threads(|| self.runtime.block_on(self.store.append_checkpoint(&parsed)))
-            .map_err(to_py_err)?;
+            .map_err(ctx_to_py_err)?;
         Ok(resp.version)
     }
 
@@ -2671,19 +2731,40 @@ impl DatagenStore {
         let parsed = events_from_pylist(events)?;
         let resp = py
             .allow_threads(|| self.runtime.block_on(self.store.append(&parsed)))
-            .map_err(to_py_err)?;
+            .map_err(ctx_to_py_err)?;
         Ok(resp.version)
     }
 
     /// Fold an item's events into its latest state, or `None` if never started.
-    fn fold_item(&self, py: Python<'_>, item_id: &str) -> PyResult<Option<PyObject>> {
+    /// `load_blobs` materializes blob-field bytes inline; the default leaves them
+    /// lazy, to be resolved through `get_blob`.
+    #[pyo3(signature = (item_id, load_blobs = false))]
+    fn fold_item(
+        &self,
+        py: Python<'_>,
+        item_id: &str,
+        load_blobs: bool,
+    ) -> PyResult<Option<PyObject>> {
         let item = py
-            .allow_threads(|| self.runtime.block_on(self.store.fold_item(item_id)))
-            .map_err(to_py_err)?;
+            .allow_threads(|| {
+                self.runtime
+                    .block_on(self.store.fold_item_with_blobs(item_id, load_blobs))
+            })
+            .map_err(ctx_to_py_err)?;
         match item {
             None => Ok(None),
             Some(item) => Ok(Some(folded_item_to_py(py, &item)?)),
         }
+    }
+
+    /// Aggregate the whole store into a run overview dict: root-item counts by
+    /// status, completed-step counts, and a failure roll-up by `run_id` (each
+    /// bucket carrying a small sample of failing root item ids).
+    fn overview(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let overview = py
+            .allow_threads(|| self.runtime.block_on(self.store.overview()))
+            .map_err(ctx_to_py_err)?;
+        run_overview_to_py(py, &overview)
     }
 
     /// Classify each root item id by folded lifecycle status. Missing ids (never
@@ -2694,7 +2775,7 @@ impl DatagenStore {
                 self.runtime
                     .block_on(self.store.root_item_statuses(&root_item_ids))
             })
-            .map_err(to_py_err)?;
+            .map_err(ctx_to_py_err)?;
         let dict = PyDict::new(py);
         for (item_id, status) in statuses.statuses.iter() {
             dict.set_item(item_id, status)?;
@@ -2706,7 +2787,7 @@ impl DatagenStore {
     fn item_failures(&self, py: Python<'_>, item_id: &str) -> PyResult<PyObject> {
         let failures = py
             .allow_threads(|| self.runtime.block_on(self.store.item_failures(item_id)))
-            .map_err(to_py_err)?;
+            .map_err(ctx_to_py_err)?;
         let list = PyList::empty(py);
         for failure in &failures {
             list.append(failure_to_py(py, failure)?)?;
@@ -2718,7 +2799,7 @@ impl DatagenStore {
     fn get_blob(&self, py: Python<'_>, event_id: &str) -> PyResult<Option<Py<PyBytes>>> {
         let bytes = py
             .allow_threads(|| self.runtime.block_on(self.store.get_blob(event_id)))
-            .map_err(to_py_err)?;
+            .map_err(ctx_to_py_err)?;
         Ok(bytes.map(|b| PyBytes::new(py, &b).unbind()))
     }
 
@@ -2729,7 +2810,7 @@ impl DatagenStore {
     fn item_tree(&self, py: Python<'_>, root_item_id: &str) -> PyResult<PyObject> {
         let tree = py
             .allow_threads(|| self.runtime.block_on(self.store.item_tree(root_item_id)))
-            .map_err(to_py_err)?;
+            .map_err(ctx_to_py_err)?;
         item_tree_to_py(py, &tree)
     }
 
@@ -2763,7 +2844,7 @@ impl DatagenStore {
                 self.runtime
                     .block_on(self.store.open_stream(&stream, &context))
             })
-            .map_err(to_py_err)?;
+            .map_err(ctx_to_py_err)?;
         Ok(DatagenStreamWriter { inner: writer })
     }
 
@@ -2785,8 +2866,93 @@ impl DatagenStore {
                 self.runtime
                     .block_on(self.store.resume_stream(item_id, &context))
             })
-            .map_err(to_py_err)?;
+            .map_err(ctx_to_py_err)?;
         Ok(writer.map(|inner| DatagenStreamWriter { inner }))
+    }
+}
+
+/// A structured datagen item id. Root ids come from the executor's source key; sub-item
+/// ids extend a parent with one fan-out segment (`5/expand:0`). `str(id)` is the stored
+/// path form. Pure and client-side — composing an id does no I/O.
+#[pyclass]
+#[derive(Clone)]
+struct DatagenItemId {
+    inner: CoreDatagenItemId,
+}
+
+#[pymethods]
+impl DatagenItemId {
+    /// Build a root id from the executor's source key.
+    #[staticmethod]
+    fn from_source_key(key: &str) -> Self {
+        Self {
+            inner: CoreDatagenItemId::from_source_key(key),
+        }
+    }
+
+    /// Parse a stored path string (`"5/expand:0"`) back into a structured id.
+    #[staticmethod]
+    fn parse(path: &str) -> PyResult<Self> {
+        Ok(Self {
+            inner: CoreDatagenItemId::parse(path).map_err(to_py_err)?,
+        })
+    }
+
+    /// Extend this id with one fan-out segment -> the sub-item's id.
+    fn child(&self, origin_step: &str, branch_idx: i64) -> Self {
+        Self {
+            inner: self.inner.child(origin_step, branch_idx),
+        }
+    }
+
+    /// The parent stream's id (`None` on a root).
+    fn parent(&self) -> Option<Self> {
+        self.inner.parent().map(|inner| Self { inner })
+    }
+
+    /// The root of this id's tree (== self if root).
+    fn root(&self) -> Self {
+        Self {
+            inner: self.inner.root(),
+        }
+    }
+
+    /// The fan-out step that created this sub-item (`None` on a root).
+    #[getter]
+    fn origin_step(&self) -> Option<String> {
+        self.inner.origin_step().map(str::to_string)
+    }
+
+    /// Which branch this sub-item is (`None` on a root).
+    #[getter]
+    fn branch_idx(&self) -> Option<i64> {
+        self.inner.branch_idx()
+    }
+
+    /// Whether this id names a root stream.
+    #[getter]
+    fn is_root(&self) -> bool {
+        self.inner.is_root()
+    }
+
+    fn __str__(&self) -> String {
+        self.inner.to_string()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("DatagenItemId({:?})", self.inner.to_string())
+    }
+
+    fn __eq__(&self, other: &Self) -> bool {
+        self.inner == other.inner
+    }
+
+    fn __hash__(&self) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        self.inner.hash(&mut hasher);
+        hasher.finish()
     }
 }
 
@@ -3173,6 +3339,18 @@ fn folded_item_to_py(py: Python<'_>, item: &FoldedDatagenItemDto) -> PyResult<Py
     }
     dict.set_item("trajectory", trajectory)?;
 
+    let started = PyList::empty(py);
+    for position in &item.started {
+        started.append(position_to_py(py, position)?)?;
+    }
+    dict.set_item("started", started)?;
+
+    let completed = PyList::empty(py);
+    for position in &item.completed {
+        completed.append(position_to_py(py, position)?)?;
+    }
+    dict.set_item("completed", completed)?;
+
     dict.set_item(
         "query_tags",
         match &item.query_tags {
@@ -3213,6 +3391,16 @@ fn cursor_to_py(py: Python<'_>, cursor: &DatagenStepCursorDto) -> PyResult<PyObj
     dict.set_item("enclosing_step", cursor.enclosing_step.clone())?;
     dict.set_item("selector_step", cursor.selector_step.clone())?;
     dict.set_item("item_seq", cursor.item_seq)?;
+    Ok(dict.into_pyobject(py)?.unbind().into())
+}
+
+fn position_to_py(py: Python<'_>, position: &DatagenStreamPositionDto) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("step_name", &position.step_name)?;
+    dict.set_item("step_kind", &position.step_kind)?;
+    dict.set_item("step_index", position.step_index)?;
+    dict.set_item("enclosing_step", position.enclosing_step.clone())?;
+    dict.set_item("selector_step", position.selector_step.clone())?;
     Ok(dict.into_pyobject(py)?.unbind().into())
 }
 
@@ -3300,6 +3488,54 @@ fn item_tree_to_py(py: Python<'_>, tree: &UnifiedDatagenItemTree) -> PyResult<Py
         nodes.set_item(item.item_id.to_string(), item_node_to_py(py, node)?)?;
     }
     dict.set_item("nodes", nodes)?;
+    Ok(dict.into_pyobject(py)?.unbind().into())
+}
+
+fn run_overview_to_py(
+    py: Python<'_>,
+    overview: &lance_context::DatagenRunOverviewDto,
+) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("items", overview.items)?;
+    dict.set_item("running", overview.running)?;
+    dict.set_item("completed", overview.completed)?;
+    dict.set_item("filtered", overview.filtered)?;
+    dict.set_item("failures", overview.failures)?;
+    dict.set_item(
+        "failures_by_error_type",
+        counts_to_py(py, &overview.failures_by_error_type)?,
+    )?;
+    dict.set_item(
+        "completed_steps",
+        counts_to_py(py, &overview.completed_steps)?,
+    )?;
+    let by_run = PyDict::new(py);
+    for (run_id, bucket) in &overview.failures_by_run {
+        let entry = PyDict::new(py);
+        entry.set_item("failures", bucket.failures)?;
+        entry.set_item(
+            "failures_by_error_type",
+            counts_to_py(py, &bucket.failures_by_error_type)?,
+        )?;
+        let samples = PyList::empty(py);
+        for root in &bucket.sample_root_item_ids {
+            samples.append(root)?;
+        }
+        entry.set_item("sample_root_item_ids", samples)?;
+        by_run.set_item(run_id, entry)?;
+    }
+    dict.set_item("failures_by_run", by_run)?;
+    Ok(dict.into_pyobject(py)?.unbind().into())
+}
+
+fn counts_to_py(
+    py: Python<'_>,
+    counts: &std::collections::BTreeMap<String, usize>,
+) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    for (key, count) in counts {
+        dict.set_item(key, count)?;
+    }
     Ok(dict.into_pyobject(py)?.unbind().into())
 }
 
@@ -3559,6 +3795,22 @@ fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RolloutStore>()?;
     m.add_class::<DatagenStore>()?;
     m.add_class::<DatagenStreamWriter>()?;
+    m.add_class::<DatagenItemId>()?;
     m.add_class::<GenericStore>()?;
+    m.add("ContextStoreError", m.py().get_type::<ContextStoreError>())?;
+    m.add("NotFoundError", m.py().get_type::<NotFoundError>())?;
+    m.add(
+        "AlreadyExistsError",
+        m.py().get_type::<AlreadyExistsError>(),
+    )?;
+    m.add(
+        "InvalidRequestError",
+        m.py().get_type::<InvalidRequestError>(),
+    )?;
+    m.add("InternalError", m.py().get_type::<InternalError>())?;
+    m.add(
+        "CompactionInProgressError",
+        m.py().get_type::<CompactionInProgressError>(),
+    )?;
     Ok(())
 }

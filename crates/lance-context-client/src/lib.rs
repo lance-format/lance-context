@@ -548,12 +548,32 @@ impl DatagenStoreApi for RemoteDatagenStore {
         Ok(resp.item)
     }
 
+    async fn fold_item_with_blobs(
+        &self,
+        item_id: &str,
+        load_blobs: bool,
+    ) -> ContextResult<Option<FoldedDatagenItemDto>> {
+        let resp = self
+            .client
+            .fold_datagen_item_with_blobs(&self.store_name, item_id, load_blobs)
+            .await
+            .map_err(to_ctx_err)?;
+        Ok(resp.item)
+    }
+
     async fn root_item_statuses(
         &self,
         root_item_ids: &[String],
     ) -> ContextResult<DatagenRootItemStatusesResponse> {
         self.client
             .datagen_root_item_statuses(&self.store_name, root_item_ids)
+            .await
+            .map_err(to_ctx_err)
+    }
+
+    async fn overview(&self) -> ContextResult<DatagenRunOverviewDto> {
+        self.client
+            .datagen_overview(&self.store_name)
             .await
             .map_err(to_ctx_err)
     }
@@ -1287,9 +1307,22 @@ impl ContextClient {
         name: &str,
         item_id: &str,
     ) -> Result<GetFoldedDatagenItemResponse, ClientError> {
+        self.fold_datagen_item_with_blobs(name, item_id, false)
+            .await
+    }
+
+    /// Fold an item, choosing the blob projection: `load_blobs` materializes blob bytes inline
+    /// instead of leaving them to a later `get_blob`.
+    pub async fn fold_datagen_item_with_blobs(
+        &self,
+        name: &str,
+        item_id: &str,
+        load_blobs: bool,
+    ) -> Result<GetFoldedDatagenItemResponse, ClientError> {
         let resp = self
             .http
             .get(self.url(&format!("/datagen/{}/items/{}", name, item_id)))
+            .query(&[("load_blobs", load_blobs)])
             .send()
             .await?;
         Self::handle_response(resp).await
@@ -1303,6 +1336,16 @@ impl ContextClient {
         let resp = self
             .http
             .get(self.url(&format!("/datagen/{}/items/{}/failures", name, item_id)))
+            .send()
+            .await?;
+        Self::handle_response(resp).await
+    }
+
+    /// Aggregate the whole datagen log into a run overview.
+    pub async fn datagen_overview(&self, name: &str) -> Result<DatagenRunOverviewDto, ClientError> {
+        let resp = self
+            .http
+            .get(self.url(&format!("/datagen/{}/overview", name)))
             .send()
             .await?;
         Self::handle_response(resp).await

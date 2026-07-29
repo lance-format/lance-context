@@ -764,6 +764,108 @@ impl DatagenItemTree {
     }
 }
 
+/// Whole-run aggregation over a datagen log: how many items are in each lifecycle state, how far
+/// they got, and where they failed. Built purely from events — no I/O.
+///
+/// `items` counts *root* items only (fan-out sub-items roll up under their root), so
+/// `running + completed + filtered` equals the number of roots the log has seen. `failures` counts
+/// FAILED events, which are non-terminal: a failed-then-retried item still counts as `running`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DatagenRunOverview {
+    /// Root items seen in the log (`running + completed + filtered`).
+    pub items: usize,
+    pub running: usize,
+    pub completed: usize,
+    pub filtered: usize,
+    /// Total FAILED events across every item, including sub-items and retried attempts.
+    pub failures: usize,
+    /// FAILED-event count per `error_type`, so the dominant failure mode is one lookup away.
+    pub failures_by_error_type: BTreeMap<String, usize>,
+    /// Failure roll-up grouped by the `run_id` that emitted the FAILED event. One store spans every
+    /// attempt at an experiment, so this separates "this run's failures" from historical ones.
+    pub failures_by_run: BTreeMap<String, DatagenFailureBucket>,
+    /// STEP_COMPLETED count per step name, across every item — the run's step-level progress.
+    pub completed_steps: BTreeMap<String, usize>,
+}
+
+/// One `run_id`'s slice of the failure roll-up: how many, of what kind, and a handful of root item
+/// ids to open next. The sample is capped at [`FAILURE_SAMPLE_LIMIT`] and is deterministic (roots in
+/// id order), so an overview stays small no matter how wide the run is.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DatagenFailureBucket {
+    pub failures: usize,
+    pub failures_by_error_type: BTreeMap<String, usize>,
+    /// Up to [`FAILURE_SAMPLE_LIMIT`] distinct root item ids that failed under this run.
+    pub sample_root_item_ids: Vec<String>,
+}
+
+/// How many root item ids each [`DatagenFailureBucket`] samples.
+pub const FAILURE_SAMPLE_LIMIT: usize = 5;
+
+impl DatagenRunOverview {
+    /// Aggregate a whole run's events. Events for many items may be interleaved; they are grouped by
+    /// `item_id` and folded independently, exactly like [`DatagenItemTree::build`].
+    pub fn build(events: &[DatagenEvent]) -> Result<Self, String> {
+        let mut by_item: BTreeMap<String, Vec<DatagenEvent>> = BTreeMap::new();
+        for event in events {
+            by_item
+                .entry(event.item_id.clone())
+                .or_default()
+                .push(event.clone());
+        }
+
+        let mut overview = Self::default();
+        for item_events in by_item.values() {
+            let Some(item) = fold_datagen_events(item_events)? else {
+                continue;
+            };
+            for cursor in &item.trajectory.ordered {
+                *overview
+                    .completed_steps
+                    .entry(cursor.position.step.name.clone())
+                    .or_default() += 1;
+            }
+            for failure in datagen_failures(item_events)? {
+                overview.failures += 1;
+                *overview
+                    .failures_by_error_type
+                    .entry(failure.error.error_type.clone())
+                    .or_default() += 1;
+                let bucket = overview
+                    .failures_by_run
+                    .entry(failure.run_id.clone())
+                    .or_default();
+                bucket.failures += 1;
+                *bucket
+                    .failures_by_error_type
+                    .entry(failure.error.error_type.clone())
+                    .or_default() += 1;
+                // Items are visited in id order, so the sample is the same on every rebuild.
+                let root = item.root_item_id.to_string();
+                if bucket.sample_root_item_ids.len() < FAILURE_SAMPLE_LIMIT
+                    && !bucket.sample_root_item_ids.contains(&root)
+                {
+                    bucket.sample_root_item_ids.push(root);
+                }
+            }
+            // Only roots are counted as items; a sub-item's outcome rolls up under its root.
+            if item.parent_item_id.is_some() {
+                continue;
+            }
+            overview.items += 1;
+            match item.status {
+                DatagenItemStatus::Running => overview.running += 1,
+                DatagenItemStatus::Completed => overview.completed += 1,
+                DatagenItemStatus::Filtered => overview.filtered += 1,
+                // A folded status is never Failed (failures live in the failure lens), but count it
+                // as still running rather than silently dropping the item from `items`.
+                DatagenItemStatus::Failed => overview.running += 1,
+            }
+        }
+        Ok(overview)
+    }
+}
+
 /// Result of a resumption fold. `NeverStarted` (no ITEM_CREATED) is the fresh-vs-restore fork the
 /// executor acts on; `Found` carries the folded item (whose `status` is the lifecycle status).
 #[derive(Debug, Clone, PartialEq)]
@@ -943,9 +1045,35 @@ pub fn datagen_event_id(item_id: &str, checkpoint_id: &str, ordinal: u32) -> Str
     Uuid::new_v5(&Uuid::NAMESPACE_OID, input.as_bytes()).to_string()
 }
 
+/// Whether a fold keeps blob field bytes it happens to have, or drops them to a pointer.
+///
+/// The log's `value_blob` column is normally projected away on read, so a folded blob field is a
+/// lazy pointer resolved through `blob_event_ids` + `get_blob`. `Eager` keeps whatever bytes the
+/// events already carry, which lets a caller that scanned the blob column fold the payload in one
+/// pass instead of one `get_blob` round trip per field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DatagenBlobProjection {
+    /// Blob fields fold to a pointer: `bytes` is dropped even when present. The default.
+    #[default]
+    Lazy,
+    /// Blob fields keep the bytes the events carry (`None` when the scan projected them away).
+    Eager,
+}
+
 /// Fold an item's events into its latest state. Returns `None` if there is no ITEM_CREATED (the item
-/// was never started).
+/// was never started). Blob fields fold lazily — see [`fold_datagen_events_with`] to keep bytes.
 pub fn fold_datagen_events(events: &[DatagenEvent]) -> Result<Option<FoldedDatagenItem>, String> {
+    fold_datagen_events_with(events, DatagenBlobProjection::Lazy)
+}
+
+/// Fold an item's events under an explicit blob projection.
+///
+/// `DatagenBlobProjection::Eager` is only useful when the events were read with the blob column
+/// projected in; with the default read path it folds identically to `Lazy`.
+pub fn fold_datagen_events_with(
+    events: &[DatagenEvent],
+    blobs: DatagenBlobProjection,
+) -> Result<Option<FoldedDatagenItem>, String> {
     let ordered = normalize_events(events)?;
     let Some(first) = ordered.first() else {
         return Ok(None);
@@ -957,7 +1085,26 @@ pub fn fold_datagen_events(events: &[DatagenEvent]) -> Result<Option<FoldedDatag
     for event in ordered {
         apply_event(&mut item, event)?;
     }
+    if blobs == DatagenBlobProjection::Lazy {
+        drop_blob_bytes(&mut item);
+    }
     Ok(Some(item))
+}
+
+/// Replace every folded blob field's inline bytes with a pointer (`bytes: None`), keeping its
+/// `size` / `checksum`. `blob_event_ids` still resolves the payload through `get_blob`.
+fn drop_blob_bytes(item: &mut FoldedDatagenItem) {
+    fn strip(value: &mut DatagenValue) {
+        if let DatagenValue::Blob(blob) = value {
+            blob.bytes = None;
+        }
+    }
+    for state in item.fields.values_mut() {
+        match state {
+            DatagenFieldState::Set(value) => strip(value),
+            DatagenFieldState::Appended(values) => values.iter_mut().for_each(strip),
+        }
+    }
 }
 
 /// The ordered completed-step cursors of an item, in `item_seq` order.
@@ -1069,6 +1216,18 @@ fn apply_event(item: &mut FoldedDatagenItem, event: &DatagenEvent) -> Result<(),
         DatagenEventType::FieldSet => {
             let field_name = event.field_name.clone().unwrap();
             let value = event.value.clone().unwrap();
+            // Group D: a field's value kind is fixed by its first write. A later SET that
+            // drifts to another kind means the pipeline wrote the field inconsistently.
+            if let Some(DatagenFieldState::Set(existing)) = item.fields.get(&field_name) {
+                if existing.kind() != value.kind() {
+                    return Err(format!(
+                        "field '{}' changes value kind from {} to {}",
+                        field_name,
+                        existing.kind(),
+                        value.kind()
+                    ));
+                }
+            }
             record_blob_event_id(item, &field_name, &value, &event.event_id);
             item.fields
                 .insert(field_name, DatagenFieldState::Set(value));
@@ -1077,12 +1236,25 @@ fn apply_event(item: &mut FoldedDatagenItem, event: &DatagenEvent) -> Result<(),
             let field_name = event.field_name.clone().unwrap();
             let value = event.value.clone().unwrap();
             record_blob_event_id(item, &field_name, &value, &event.event_id);
-            match item.fields.entry(field_name) {
+            match item.fields.entry(field_name.clone()) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
                     entry.insert(DatagenFieldState::Appended(vec![value]));
                 }
                 std::collections::btree_map::Entry::Occupied(mut entry) => match entry.get_mut() {
-                    DatagenFieldState::Appended(values) => values.push(value),
+                    DatagenFieldState::Appended(values) => {
+                        // Group D: the same kind rule holds within one appended list.
+                        if let Some(existing) = values.first() {
+                            if existing.kind() != value.kind() {
+                                return Err(format!(
+                                    "field '{}' changes value kind from {} to {}",
+                                    field_name,
+                                    existing.kind(),
+                                    value.kind()
+                                ));
+                            }
+                        }
+                        values.push(value);
+                    }
                     DatagenFieldState::Set(_) => {
                         return Err(format!(
                             "field '{}' mixes FIELD_SET and FIELD_APPEND",
@@ -1244,6 +1416,26 @@ mod tests {
     }
 
     #[test]
+    fn dto_projection_carries_started_and_completed_sets() {
+        let events = [
+            created(0),
+            driver_started(1, "main", 0, None),
+            leaf_completed(2, "gen", 0, Some("main")),
+        ];
+        let folded = fold_datagen_events(&events).unwrap().unwrap();
+        let dto = crate::api_impl::folded_item_to_dto(&folded);
+
+        // `trajectory` stays the ordered cursor list; the two sets ride alongside it so the
+        // caller can gate STEP_STARTED / STEP_COMPLETED re-emission on resume.
+        assert_eq!(dto.trajectory.len(), 1);
+        assert_eq!(dto.started.len(), 1);
+        assert_eq!(dto.started[0].step_name, "main");
+        assert_eq!(dto.completed.len(), 1);
+        assert_eq!(dto.completed[0].step_name, "gen");
+        assert_eq!(dto.completed[0].enclosing_step.as_deref(), Some("main"));
+    }
+
+    #[test]
     fn field_set_is_last_writer_wins_and_append_accumulates() {
         let mut set_v1 = leaf_completed(1, "gen", 0, Some("main"));
         set_v1.event_type = DatagenEventType::FieldSet;
@@ -1284,6 +1476,44 @@ mod tests {
                 DatagenValue::Json(json!({"n": "b"})),
             ]))
         );
+    }
+
+    #[test]
+    fn field_value_kind_drift_is_rejected() {
+        let mut set_str = leaf_completed(1, "gen", 0, Some("main"));
+        set_str.event_type = DatagenEventType::FieldSet;
+        set_str.field_name = Some("draft".to_string());
+        set_str.field_type = Some("str".to_string());
+        set_str.codec_version = Some(1);
+        set_str.value = Some(DatagenValue::Str("v1".to_string()));
+
+        let mut set_int = set_str.clone();
+        set_int.item_seq = 2;
+        set_int.checkpoint_id = "c2".to_string();
+        set_int.event_id = datagen_event_id("5", "c2", 0);
+        set_int.field_type = Some("int".to_string());
+        set_int.value = Some(DatagenValue::Int(7));
+
+        let err = fold_datagen_events(&[created(0), set_str, set_int]).unwrap_err();
+        assert!(err.contains("changes value kind"), "{err}");
+
+        // Same rule inside an appended list.
+        let mut append_str = leaf_completed(3, "b1", 0, Some("body"));
+        append_str.event_type = DatagenEventType::FieldAppend;
+        append_str.field_name = Some("revisions".to_string());
+        append_str.field_type = Some("str".to_string());
+        append_str.codec_version = Some(1);
+        append_str.value = Some(DatagenValue::Str("a".to_string()));
+
+        let mut append_int = append_str.clone();
+        append_int.item_seq = 4;
+        append_int.checkpoint_id = "c4".to_string();
+        append_int.event_id = datagen_event_id("5", "c4", 0);
+        append_int.field_type = Some("int".to_string());
+        append_int.value = Some(DatagenValue::Int(1));
+
+        let err = fold_datagen_events(&[created(0), append_str, append_int]).unwrap_err();
+        assert!(err.contains("changes value kind"), "{err}");
     }
 
     #[test]
@@ -1671,5 +1901,125 @@ mod tests {
             .collect();
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].step.name, "refine");
+    }
+
+    /// A blob-valued FIELD_SET on item "5", at `seq`.
+    fn blob_set(seq: i64, field: &str, bytes: &[u8]) -> DatagenEvent {
+        let mut set = leaf_completed(seq, "gen", 0, Some("main"));
+        set.event_type = DatagenEventType::FieldSet;
+        set.field_name = Some(field.to_string());
+        set.field_type = Some("blob".to_string());
+        set.codec_version = Some(1);
+        set.value = Some(DatagenValue::Blob(DatagenBlobValue {
+            bytes: Some(bytes.to_vec()),
+            size: bytes.len() as i64,
+            checksum: None,
+        }));
+        set
+    }
+
+    #[test]
+    fn blob_projection_selects_lazy_or_eager_bytes() {
+        let events = vec![created(0), blob_set(1, "image", b"png-bytes")];
+
+        let lazy = fold_datagen_events_with(&events, DatagenBlobProjection::Lazy)
+            .unwrap()
+            .unwrap();
+        let DatagenFieldState::Set(DatagenValue::Blob(lazy_blob)) =
+            lazy.fields.get("image").unwrap()
+        else {
+            panic!("expected a blob field");
+        };
+        assert_eq!(lazy_blob.bytes, None);
+        assert_eq!(lazy_blob.size, 9);
+        // The default fold is the lazy one.
+        assert_eq!(fold_datagen_events(&events).unwrap().unwrap(), lazy);
+
+        let eager = fold_datagen_events_with(&events, DatagenBlobProjection::Eager)
+            .unwrap()
+            .unwrap();
+        let DatagenFieldState::Set(DatagenValue::Blob(eager_blob)) =
+            eager.fields.get("image").unwrap()
+        else {
+            panic!("expected a blob field");
+        };
+        assert_eq!(eager_blob.bytes.as_deref(), Some(&b"png-bytes"[..]));
+    }
+
+    #[test]
+    fn overview_counts_roots_and_rolls_failures_up_by_run() {
+        // Two roots: "5" completes; "9" stays running with two failures, one of them under a
+        // second run_id. "5/expand:0" is a sub-item and must not inflate the root counts.
+        let mut events = vec![created(0), leaf_completed(1, "gen", 0, Some("main"))];
+        let mut terminal = event(2, DatagenEventType::Terminal);
+        terminal.status = Some(DatagenItemStatus::Completed);
+        events.push(terminal);
+
+        let mut sub_created = created(0);
+        sub_created.item_id = "5/expand:0".to_string();
+        sub_created.parent_item_id = Some("5".to_string());
+        sub_created.event_id = datagen_event_id("5/expand:0", "checkpoint-0", 0);
+        events.push(sub_created);
+
+        let mut other_created = created(0);
+        other_created.item_id = "9".to_string();
+        other_created.root_item_id = "9".to_string();
+        other_created.event_id = datagen_event_id("9", "checkpoint-0", 0);
+        events.push(other_created);
+        for (seq, run_id, error_type) in [(1, "run-1", "ValueError"), (2, "run-2", "KeyError")] {
+            let mut failed = leaf_completed(seq, "score", 0, Some("main"));
+            failed.item_id = "9".to_string();
+            failed.root_item_id = "9".to_string();
+            failed.event_id = datagen_event_id("9", &format!("checkpoint-{seq}"), 0);
+            failed.event_type = DatagenEventType::Failed;
+            failed.run_id = run_id.to_string();
+            failed.error_type = Some(error_type.to_string());
+            events.push(failed);
+        }
+
+        let overview = DatagenRunOverview::build(&events).unwrap();
+        assert_eq!(overview.items, 2);
+        assert_eq!(overview.completed, 1);
+        assert_eq!(overview.running, 1);
+        assert_eq!(overview.filtered, 0);
+        assert_eq!(overview.failures, 2);
+        assert_eq!(overview.failures_by_error_type["ValueError"], 1);
+        assert_eq!(overview.completed_steps["gen"], 1);
+
+        // Failures group by the run_id that emitted them, each carrying a root-id sample.
+        assert_eq!(overview.failures_by_run.len(), 2);
+        let run1 = &overview.failures_by_run["run-1"];
+        assert_eq!(run1.failures, 1);
+        assert_eq!(run1.failures_by_error_type["ValueError"], 1);
+        assert_eq!(run1.sample_root_item_ids, vec!["9".to_string()]);
+        assert_eq!(overview.failures_by_run["run-2"].failures, 1);
+    }
+
+    #[test]
+    fn overview_failure_sample_is_capped() {
+        let mut events = Vec::new();
+        for idx in 0..(FAILURE_SAMPLE_LIMIT + 3) {
+            let item_id = format!("item-{idx:02}");
+            let mut item_created = created(0);
+            item_created.item_id = item_id.clone();
+            item_created.root_item_id = item_id.clone();
+            item_created.event_id = datagen_event_id(&item_id, "checkpoint-0", 0);
+            events.push(item_created);
+
+            let mut failed = leaf_completed(1, "score", 0, Some("main"));
+            failed.item_id = item_id.clone();
+            failed.root_item_id = item_id.clone();
+            failed.event_id = datagen_event_id(&item_id, "checkpoint-1", 0);
+            failed.event_type = DatagenEventType::Failed;
+            failed.error_type = Some("ValueError".to_string());
+            events.push(failed);
+        }
+
+        let overview = DatagenRunOverview::build(&events).unwrap();
+        assert_eq!(overview.failures, FAILURE_SAMPLE_LIMIT + 3);
+        let bucket = &overview.failures_by_run["run-1"];
+        assert_eq!(bucket.sample_root_item_ids.len(), FAILURE_SAMPLE_LIMIT);
+        // Items are folded in id order, so the sample is deterministic.
+        assert_eq!(bucket.sample_root_item_ids[0], "item-00");
     }
 }
