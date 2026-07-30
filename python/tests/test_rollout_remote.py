@@ -3,7 +3,8 @@
 Spins up a real `lance-context-server` subprocess and drives it through the
 async `AsyncRolloutStore` wrapper — the path RL generation workers and the
 learner use in a deployed setup. Skips gracefully if the server binary has not
-been built (e.g. a pure-Python CI job).
+been built locally; in CI (``CI`` env var set) a missing binary is a hard
+failure rather than a silent skip.
 """
 
 from __future__ import annotations
@@ -65,7 +66,13 @@ async def _eventually(fn, predicate, timeout: float = 15.0):
 @pytest.fixture()
 def server():
     if not _SERVER_BIN.exists():
-        pytest.skip(f"server binary not built at {_SERVER_BIN}")
+        # Locally a missing binary is a fair reason to skip. In CI it is not:
+        # this file is the only coverage of the remote/HTTP client path, so a
+        # silent skip would hide a regression. Fail loudly instead.
+        msg = f"server binary not built at {_SERVER_BIN}"
+        if os.environ.get("CI"):
+            pytest.fail(f"{msg} (run `cargo build -p lance-context-server`)")
+        pytest.skip(msg)
     port = _free_port()
     with tempfile.TemporaryDirectory() as data_dir:
         # Rows are durable on `add` but only become visible when the server's

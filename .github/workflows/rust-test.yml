@@ -69,10 +69,68 @@ jobs:
           done
           cat /tmp/etcd.log
           exit 1
-      - name: Run etcd scheduler integration test
+      # CI already pays to download and start etcd, so restricting this step to a
+      # single named test left the other 18 ignored tests — the scheduler,
+      # routes, and state etcd paths — completely untested. Run the whole suite.
+      - name: Run etcd-backed HA test suite
+        env:
+          ETCD_TEST_ENDPOINTS: http://127.0.0.1:2379
+        run: cargo test -p lance-context-master --lib -- --ignored
+
+  coverage:
+    runs-on: ubuntu-24.04
+    # Coverage builds are much slower than the plain test job: instrumentation
+    # defeats most caching wins and the core crate's suite alone is ~6.5 min.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup rust toolchain
+        run: |
+          rustup toolchain install stable
+          rustup default stable
+          rustup component add llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "lance-context-coverage"
+          workspaces: "."
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y clang libclang-dev protobuf-compiler
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Start etcd for HA scheduler test
+        run: |
+          ETCD_VERSION=3.7.0
+          curl -fsSL -o /tmp/etcd.tar.gz \
+            "https://github.com/etcd-io/etcd/releases/download/v${ETCD_VERSION}/etcd-v${ETCD_VERSION}-linux-amd64.tar.gz"
+          mkdir -p /tmp/etcd
+          tar -xzf /tmp/etcd.tar.gz -C /tmp/etcd --strip-components=1
+          nohup /tmp/etcd/etcd \
+            --data-dir /tmp/etcd-data \
+            --listen-client-urls http://127.0.0.1:2379 \
+            --advertise-client-urls http://127.0.0.1:2379 \
+            >/tmp/etcd.log 2>&1 &
+          for _ in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:2379/health && exit 0
+            sleep 1
+          done
+          cat /tmp/etcd.log
+          exit 1
+      - name: Clean stale coverage profile data
+        run: cargo llvm-cov clean --workspace
+      - name: Collect coverage (unit and integration tests)
+        run: cargo llvm-cov --no-report --workspace --all-features
+      - name: Collect coverage (etcd-backed ignored tests)
         env:
           ETCD_TEST_ENDPOINTS: http://127.0.0.1:2379
         run: |
-          cargo test -p lance-context-master \
-            task_store::tests::etcd_coordinates_dedupe_claims_and_target_locks \
-            -- --ignored --exact
+          cargo llvm-cov --no-report --all-features \
+            -p lance-context-master --lib -- --ignored
+      - name: Merge coverage reports
+        run: cargo llvm-cov report --lcov --output-path lcov.info
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}

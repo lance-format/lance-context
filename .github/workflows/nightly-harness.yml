@@ -1,0 +1,45 @@
+name: Nightly E2E Harness
+on:
+  schedule:
+    # 06:37 UTC — off-peak, and off the minute-0 spike where GitHub's scheduler
+    # queues (and delays) the bulk of the world's cron jobs.
+    - cron: "37 6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    # test/docker-compose.yml builds the Rust workspace from source (release
+    # profile, protoc + openssl) for the master and both workers. The README
+    # warns the first `up.sh` is a full release build, so this needs far more
+    # headroom than the cargo jobs, which get a warm Swatinem cache.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      # smoke.sh drives the API with curl and asserts on the JSON with jq.
+      # Both are present on ubuntu-24.04 runners today, but the harness fails
+      # in a confusing way if either goes missing, so assert them explicitly.
+      - name: Install harness dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y curl jq
+      - name: Bring up the test stack
+        run: test/harness/up.sh
+      - name: Run end-to-end smoke test
+        run: test/harness/smoke.sh
+      # A bare `docker compose down` in the teardown step hides why the stack
+      # failed, so grab the logs before anything is removed.
+      - name: Dump container logs
+        if: failure()
+        run: |
+          docker compose -f test/docker-compose.yml ps
+          docker compose -f test/docker-compose.yml logs --no-color --tail=500
+      # Runners are ephemeral, but leaving the stack up on failure would leak
+      # into any later step and mask the real error, so always tear down.
+      - name: Tear down the test stack
+        if: always()
+        run: test/harness/down.sh
