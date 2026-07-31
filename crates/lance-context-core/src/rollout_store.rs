@@ -44,7 +44,7 @@
 //! (e.g. by `policy_version`), not a table snapshot — reproducible because the
 //! rows never change. `checkout` remains available for base-table time-travel.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::builder::{
@@ -81,7 +81,8 @@ use crate::store::{
     CompactionStats, RELATIONSHIPS_COLUMN,
 };
 use crate::store_base::{
-    is_not_found_error, StorageBase, StorageBaseOptions, DEFAULT_OBSERVE_CONCURRENCY,
+    align_batch_to_schema, is_not_found_error, StorageBase, StorageBaseOptions,
+    DEFAULT_OBSERVE_CONCURRENCY,
 };
 
 // `ListSource` and `PreparedMerge` are schema-agnostic and now live in
@@ -749,9 +750,11 @@ impl RolloutStore {
     ///
     /// Reads one row beyond the requested page to report `has_more`, avoiding
     /// an unbounded full-table count on every UI request. Each source is read in
-    /// one projected, filtered, bounded scan. In particular, fragments use the
-    /// base [`Dataset`] scanner directly so Lance can push limit/offset into the
-    /// scan instead of sorting the full projection through [`LsmScanner`].
+    /// one projected, filtered, bounded scan. Fragments use the base [`Dataset`]
+    /// scanner directly so Lance can push limit/offset into the scan. WAL-backed
+    /// reads page through a narrow `id`-only LSM scan, then take the selected
+    /// rows directly from their physical datasets so wide text columns never
+    /// participate in the full LSM sort.
     ///
     /// [`ListSource::Fragments`] skips MemWAL manifest discovery entirely, so its
     /// latency is independent of how far the merge backlog has grown.
@@ -766,6 +769,31 @@ impl RolloutStore {
         let columns = self.non_blob_columns();
         let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
         let page_limit = limit.saturating_add(1);
+
+        if matches!(source, ListSource::Wal | ListSource::All) {
+            let shard_snapshots = self.wal_shard_snapshots().await?;
+            let mut scanner = self
+                .lsm_scanner_for_source(source, shard_snapshots.clone())
+                .project(&["id"]);
+            if let Some(filter) = &filter {
+                scanner = scanner.filter(filter)?;
+            }
+            scanner = scanner.limit(page_limit, Some(offset));
+
+            let mut page_ids = Vec::with_capacity(page_limit);
+            let mut stream = scanner.try_into_stream().await?;
+            while let Some(batch) = stream.try_next().await? {
+                let ids = column_as::<StringArray>(&batch, "id")?;
+                page_ids.extend((0..ids.len()).map(|row| ids.value(row).to_string()));
+            }
+
+            let has_more = page_ids.len() > limit;
+            page_ids.truncate(limit);
+            let records = self
+                .take_lsm_page_rows(source, shard_snapshots, page_ids)
+                .await?;
+            return Ok(RolloutPage { records, has_more });
+        }
 
         let mut stream: datafusion::physical_plan::SendableRecordBatchStream = match source {
             ListSource::Fragments => {
@@ -793,17 +821,7 @@ impl RolloutStore {
                 scanner.limit(Some(scan_limit), Some(scan_offset))?;
                 scanner.try_into_stream().await?.into()
             }
-            ListSource::Wal | ListSource::All => {
-                let shard_snapshots = self.wal_shard_snapshots().await?;
-                let mut scanner = self
-                    .lsm_scanner_for_source(source, shard_snapshots)
-                    .project(&refs);
-                if let Some(filter) = &filter {
-                    scanner = scanner.filter(filter)?;
-                }
-                scanner = scanner.limit(page_limit, Some(offset));
-                scanner.try_into_stream().await?
-            }
+            ListSource::Wal | ListSource::All => unreachable!("handled above"),
         };
 
         let mut records = Vec::with_capacity(page_limit);
@@ -813,6 +831,114 @@ impl RolloutStore {
         let has_more = records.len() > limit;
         records.truncate(limit);
         Ok(RolloutPage { records, has_more })
+    }
+
+    /// Resolve an LSM page's ids against the physical base/WAL datasets and
+    /// take only those rows' non-blob columns.
+    async fn take_lsm_page_rows(
+        &self,
+        source: ListSource,
+        shard_snapshots: Vec<ShardSnapshot>,
+        page_ids: Vec<String>,
+    ) -> LanceResult<Vec<RolloutRecord>> {
+        if page_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let columns = Arc::new(self.non_blob_columns());
+        let target_schema = Arc::new(projected_arrow_schema(&self.base.dataset, &columns)?);
+        let id_filter = Arc::new(format!("id IN ({})", sql_quoted_list(&page_ids)));
+        let wanted: HashSet<String> = page_ids.iter().cloned().collect();
+
+        let mut records_by_id = HashMap::with_capacity(page_ids.len());
+        if source == ListSource::All {
+            for record in Self::take_page_rows_from_dataset(
+                self.base.dataset.clone(),
+                id_filter.clone(),
+                columns.clone(),
+                target_schema.clone(),
+            )
+            .await?
+            {
+                records_by_id.insert(record.id.clone(), record);
+            }
+        }
+
+        let mut generation_uris = Vec::new();
+        for snapshot in shard_snapshots {
+            for generation in snapshot.flushed_generations {
+                generation_uris
+                    .push(self.flushed_generation_uri(snapshot.shard_id, &generation.path));
+            }
+        }
+        let mut generation_rows = stream::iter(generation_uris)
+            .map(|uri| {
+                let columns = columns.clone();
+                let target_schema = target_schema.clone();
+                let id_filter = id_filter.clone();
+                async move {
+                    let dataset = match self.open_flushed_dataset(&uri).await {
+                        Ok(dataset) => dataset,
+                        Err(err) if is_not_found_error(&err) => return Ok(Vec::new()),
+                        Err(err) => return Err(err),
+                    };
+                    Self::take_page_rows_from_dataset(dataset, id_filter, columns, target_schema)
+                        .await
+                }
+            })
+            .buffer_unordered(DEFAULT_OBSERVE_CONCURRENCY);
+
+        while let Some(rows) = generation_rows.try_next().await? {
+            for record in rows {
+                if wanted.contains(&record.id) {
+                    records_by_id.entry(record.id.clone()).or_insert(record);
+                }
+            }
+        }
+
+        page_ids
+            .iter()
+            .map(|id| {
+                records_by_id.remove(id).ok_or_else(|| {
+                    LanceError::from(ArrowError::InvalidArgumentError(format!(
+                        "rollout row '{id}' disappeared while reading its page"
+                    )))
+                })
+            })
+            .collect()
+    }
+
+    async fn take_page_rows_from_dataset(
+        dataset: Dataset,
+        id_filter: Arc<String>,
+        columns: Arc<Vec<String>>,
+        target_schema: Arc<Schema>,
+    ) -> LanceResult<Vec<RolloutRecord>> {
+        let mut scanner = dataset.scan();
+        scanner
+            .project(&["id"])?
+            .filter(id_filter.as_str())?
+            .with_row_id();
+
+        let mut row_ids = Vec::new();
+        let mut stream = scanner.try_into_stream().await?;
+        while let Some(batch) = stream.try_next().await? {
+            let ids = column_as::<StringArray>(&batch, "id")?;
+            let row_id_array = column_as::<UInt64Array>(&batch, "_rowid")?;
+            row_ids.extend(
+                (0..batch.num_rows())
+                    .filter(|row| !ids.is_null(*row))
+                    .map(|row| row_id_array.value(row)),
+            );
+        }
+        if row_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let projection = projected_dataset_schema(&dataset, &columns)?;
+        let batch = dataset.take_rows(&row_ids, projection).await?;
+        let aligned = align_batch_to_schema(batch, target_schema)?;
+        batch_to_rollout_records(&aligned)
     }
 
     /// Run a read-only `SELECT` against this experiment's rollout records.
@@ -1579,6 +1705,32 @@ fn append_i8_list(builder: &mut ListBuilder<Int8Builder>, values: Option<&[i8]>)
     }
 }
 
+fn projected_dataset_schema(
+    dataset: &Dataset,
+    columns: &[String],
+) -> LanceResult<lance::datatypes::Schema> {
+    let field_paths = dataset.schema().field_paths();
+    let available_columns: Vec<&str> = columns
+        .iter()
+        .map(String::as_str)
+        .filter(|column| field_paths.iter().any(|path| path == column))
+        .collect();
+    dataset.schema().project(&available_columns)
+}
+
+fn projected_arrow_schema(dataset: &Dataset, columns: &[String]) -> LanceResult<Schema> {
+    let projection = projected_dataset_schema(dataset, columns)?;
+    Ok((&projection).into())
+}
+
+fn sql_quoted_list(values: &[String]) -> String {
+    values
+        .iter()
+        .map(|value| format!("'{}'", value.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn batch_to_rollout_records(batch: &RecordBatch) -> LanceResult<Vec<RolloutRecord>> {
     let id_array = column_as::<StringArray>(batch, "id")?;
     let rollout_id_array = column_as::<StringArray>(batch, "rollout_id")?;
@@ -1823,8 +1975,7 @@ mod tests {
     use crate::record::Relationship;
     use crate::rollout::{ROLE_ARTIFACT, ROLE_ASSISTANT};
     use crate::store_base::{
-        align_batch_to_schema, DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
-        ID_INDEX_NAME as ROLLOUT_ID_INDEX_NAME,
+        DEFAULT_MANIFEST_SCAN_BATCH_SIZE, ID_INDEX_NAME as ROLLOUT_ID_INDEX_NAME,
     };
     use chrono::{TimeZone, Utc};
     use serde_json::json;
@@ -3721,6 +3872,95 @@ mod tests {
                 "wal must be empty after a merge"
             );
             assert_eq!(list_ids(&store, ListSource::All).await, vec!["g-0", "g-1"]);
+        });
+    }
+
+    #[test]
+    fn wal_and_all_pagination_take_only_page_rows() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    shard_id: Some("rollout-pagination".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+            let make_record = |id: &str| {
+                let mut record = assistant_record(id);
+                record.rationale = Some(format!("wide-rationale-{id}-{}", "x".repeat(64 * 1024)));
+                record
+            };
+
+            let mut base_rows = ["row-000", "row-002", "row-004"].map(make_record).to_vec();
+            base_rows[1].policy_version = Some("other-policy".to_string());
+            store.add(&base_rows).await.unwrap();
+            store.flush().await.unwrap();
+            store.cleanup_own_shard().await.unwrap();
+
+            let mut wal_rows = ["row-001", "row-003", "row-005"].map(make_record).to_vec();
+            wal_rows[1].policy_version = Some("other-policy".to_string());
+            store.add(&wal_rows).await.unwrap();
+            store.flush().await.unwrap();
+            assert_eq!(flushed_generation_count(&store).await, 1);
+
+            let all_page = store
+                .list_filtered_source(&RolloutFilters::default(), 2, 1, ListSource::All)
+                .await
+                .unwrap();
+            assert!(all_page.has_more);
+            assert_eq!(
+                all_page
+                    .records
+                    .iter()
+                    .map(|record| record.id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["row-001", "row-002"]
+            );
+            assert!(all_page.records.iter().all(|record| {
+                record
+                    .rationale
+                    .as_deref()
+                    .is_some_and(|value| value.starts_with("wide-rationale-"))
+            }));
+
+            let wal_page = store
+                .list_filtered_source(&RolloutFilters::default(), 1, 1, ListSource::Wal)
+                .await
+                .unwrap();
+            assert!(wal_page.has_more);
+            assert_eq!(wal_page.records[0].id, "row-003");
+            assert!(wal_page.records[0]
+                .rationale
+                .as_deref()
+                .is_some_and(|value| value.starts_with("wide-rationale-row-003")));
+
+            let filtered_page = store
+                .list_filtered_source(
+                    &RolloutFilters {
+                        policy_version: Some("other-policy".to_string()),
+                        ..Default::default()
+                    },
+                    1,
+                    0,
+                    ListSource::All,
+                )
+                .await
+                .unwrap();
+            assert!(filtered_page.has_more);
+            assert_eq!(filtered_page.records[0].id, "row-002");
+
+            let final_page = store
+                .list_filtered_source(&RolloutFilters::default(), 2, 5, ListSource::All)
+                .await
+                .unwrap();
+            assert!(!final_page.has_more);
+            assert_eq!(final_page.records[0].id, "row-005");
         });
     }
 
