@@ -193,6 +193,16 @@ mod tests {
         assert_eq!(entries[0].uri, uri.to_string_lossy().to_string());
     }
 
+    /// A master that dies mid-task leaves the record in `Running`. Once its
+    /// etcd lease expires the claim key vanishes, and the next master's startup
+    /// `recover_orphaned` pass must return the task to `Queued` — otherwise an
+    /// interrupted task is stranded in `Running` forever.
+    ///
+    /// The crash is simulated by revoking the claim's lease rather than just
+    /// dropping the claim: dropping stops lease *renewal*, but etcd holds the
+    /// claim key for the remainder of the TTL, during which the task is
+    /// legitimately still considered running. Revoking reaches the same key
+    /// state without sleeping out `etcd_lease_ttl_secs`.
     #[tokio::test]
     #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn startup_requeues_interrupted_local_tasks() {
@@ -206,7 +216,11 @@ mod tests {
             .unwrap();
         let claim = first.task_store.claim_next().await.unwrap().unwrap();
         assert_eq!(claim.task.state, TaskState::Running);
-        drop(claim);
+        first
+            .task_store
+            .abandon_claim_for_test(claim)
+            .await
+            .unwrap();
         drop(first);
 
         let state = MasterState::new(config).await.unwrap();

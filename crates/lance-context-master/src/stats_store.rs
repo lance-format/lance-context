@@ -258,11 +258,26 @@ impl StatsStore {
     /// failed would otherwise blank the table, which both empties the UI and
     /// silently stops the compaction and WAL-merge sweeps — they read this
     /// table to decide what to enqueue. Remove experiments explicitly via
-    /// [`Self::remove`].
+    /// [`Self::remove`], or use [`Self::replace_snapshot`] when the caller can
+    /// prove the emptiness is legitimate (every experiment deregistered).
     pub async fn write_snapshot(&mut self, rows: &[StatRow]) -> LanceResult<()> {
         if rows.is_empty() {
             return Ok(());
         }
+        self.replace_snapshot(rows).await
+    }
+
+    /// Overwrite the table with `rows`, **including** an empty `rows`.
+    ///
+    /// [`Self::write_snapshot`] refuses an empty snapshot because it cannot
+    /// tell "every observe failed this round" from "every experiment was
+    /// legitimately deregistered", and the former must not blank the table.
+    /// A caller that *can* distinguish the two — the scanner, which knows how
+    /// many observations failed — calls this instead, so that draining the
+    /// registry to zero actually clears the stats table rather than leaving
+    /// rows for experiments that no longer exist (which the compaction and
+    /// WAL-merge sweeps would keep acting on).
+    pub async fn replace_snapshot(&mut self, rows: &[StatRow]) -> LanceResult<()> {
         let batch = Self::rows_to_batch(rows)?;
         let schema = Arc::new(stats_schema());
         let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema);
@@ -788,6 +803,25 @@ mod scale_tests {
             s.count(None).await.unwrap(),
             1,
             "an empty snapshot must be a no-op, not a wipe"
+        );
+    }
+
+    /// The escape hatch for the case `write_snapshot` cannot distinguish: a
+    /// caller that knows the emptiness is legitimate (every experiment
+    /// deregistered) must be able to clear the table, or rows for experiments
+    /// that no longer exist are served forever.
+    #[tokio::test]
+    async fn replace_snapshot_clears_the_table() {
+        let dir = TempDir::new().unwrap();
+        let mut s = store(&dir).await;
+        s.write_snapshot(&[sample("a", 1)]).await.unwrap();
+
+        s.replace_snapshot(&[]).await.unwrap();
+
+        assert_eq!(
+            s.count(None).await.unwrap(),
+            0,
+            "replace_snapshot must honour an empty snapshot"
         );
     }
 

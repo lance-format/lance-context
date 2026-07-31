@@ -849,6 +849,11 @@ mod tests {
             ])
             .await
             .unwrap();
+        // `add` only appends to this handle's in-memory memtable; the rows
+        // become visible to the separate handle the endpoint opens only once
+        // the memtable is sealed into a committed WAL generation. Flush rather
+        // than relaxing the assertions below.
+        store.flush().await.unwrap();
         state
             .registry
             .write()
@@ -919,6 +924,11 @@ mod tests {
             ])
             .await
             .unwrap();
+        // `add` only appends to this handle's in-memory memtable; the rows
+        // become visible to the separate handle the endpoint opens only once
+        // the memtable is sealed into a committed WAL generation. Flush rather
+        // than relaxing the assertions below.
+        store.flush().await.unwrap();
         state
             .registry
             .write()
@@ -994,6 +1004,9 @@ mod tests {
             ])
             .await
             .unwrap();
+        // See the note in `records_endpoint_...`: rows are only visible to the
+        // handle the endpoint opens after the memtable is sealed.
+        store.flush().await.unwrap();
         state
             .registry
             .write()

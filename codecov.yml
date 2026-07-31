@@ -1,0 +1,20 @@
+# Codecov configuration.
+#
+# Coverage is INFORMATIONAL ONLY right now: no status check can fail the build.
+# We want a stable baseline from a few runs of the `coverage` job in
+# .github/workflows/rust-test.yml before enforcing anything. Once that baseline
+# exists, drop `informational: true` and set an explicit `target`/`threshold` to
+# turn these into real gates.
+coverage:
+  status:
+    project:
+      default:
+        informational: true
+    patch:
+      default:
+        informational: true
+
+comment:
+  layout: "reach, diff, flags, files"
+  behavior: default
+  require_changes: false

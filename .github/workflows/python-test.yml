@@ -97,7 +97,9 @@ jobs:
 
   test:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # Raised from 30: this job now also builds lance-context-server so that
+    # tests/test_rollout_remote.py actually runs instead of skipping itself.
+    timeout-minutes: 45
     needs: build-wheel
     strategy:
       matrix:
@@ -115,7 +117,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "lance-context-deps"
+          # The root workspace entry covers `cargo build -p lance-context-server`
+          # below; without it that build cache-misses on every run.
           workspaces: |
+            .
             crates/lance-context-core
             python
       - name: Install dependencies
@@ -152,6 +157,12 @@ jobs:
           source .venv/bin/activate
           WHEEL=$(ls dist/*.whl)
           uv pip install "${WHEEL}[lance-python,tests]"
+
+      - name: Build server binary
+        # tests/test_rollout_remote.py spins up target/debug/lance-context-server
+        # as a subprocess -- it is the only coverage of the remote/HTTP client
+        # path, and without this step the whole file skips itself.
+        run: cargo build -p lance-context-server
 
       - name: Run tests
         working-directory: python

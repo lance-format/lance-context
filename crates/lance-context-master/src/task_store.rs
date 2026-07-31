@@ -171,6 +171,21 @@ impl TaskStore {
         self.inner.recover_orphaned().await
     }
 
+    /// Simulate a master crash while `claim` was in flight.
+    ///
+    /// Dropping a `TaskClaim` only stops *renewal*; etcd keeps the claim and
+    /// target-lock keys until the lease TTL elapses, which is exactly why a
+    /// task remains `Running` for up to `etcd_lease_ttl_secs` after its owner
+    /// dies. Revoking the lease collapses that TTL wait to zero, producing the
+    /// same key state a real crash reaches once the lease expires, so recovery
+    /// tests need not sleep out the TTL.
+    #[cfg(test)]
+    pub(crate) async fn abandon_claim_for_test(&self, claim: TaskClaim) -> lance::Result<()> {
+        let lease_id = claim.backend.lease_id;
+        drop(claim);
+        self.inner.revoke_lease(lease_id).await
+    }
+
     async fn prune_terminal_history(&self) -> lance::Result<usize> {
         let tasks = self.list().await?;
         let ttl_cutoff = if self.history_ttl_secs > 0 {

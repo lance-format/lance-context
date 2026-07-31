@@ -217,6 +217,7 @@ async fn scan_once_inner(state: &Arc<MasterState>) -> lance::Result<usize> {
         .await;
 
     let count = observed.iter().filter(|(_, row)| row.is_some()).count();
+    let failed = observed.len() - count;
     let skipped = observed
         .iter()
         .filter(|(_, row)| matches!(row, Some((_, true))))
@@ -273,7 +274,21 @@ async fn scan_once_inner(state: &Arc<MasterState>) -> lance::Result<usize> {
         }
     }
 
-    if let Err(e) = stats.write_snapshot(&snapshot).await {
+    // An empty snapshot is ambiguous at the store layer, so disambiguate here
+    // where the inputs are in scope. `carry_over` above already re-adds the
+    // previous row for every experiment that is still registered but failed to
+    // observe, so an empty snapshot with `failed > 0` means the failures were
+    // total -- refuse that wipe (write_snapshot no-ops). Empty with no failures
+    // means the registry drained to zero, or everything left was retired: a
+    // legitimate wipe that must be written through, otherwise rows for
+    // deregistered experiments persist forever and keep feeding the compaction
+    // and WAL-merge sweeps.
+    let write = if snapshot.is_empty() && failed == 0 {
+        stats.replace_snapshot(&snapshot).await
+    } else {
+        stats.write_snapshot(&snapshot).await
+    };
+    if let Err(e) = write {
         tracing::warn!(error = %e, "stats snapshot write failed");
     }
 
