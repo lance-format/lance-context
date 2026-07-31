@@ -44,16 +44,6 @@ use crate::task_store::TaskClaim;
 /// anything still over the threshold is picked up by the next tick.
 const MAX_SWEEP_ENQUEUE: usize = 256;
 
-/// Build the [`CompactionConfig`] the scheduler applies, from master config.
-pub fn compaction_config(state: &MasterState) -> CompactionConfig {
-    CompactionConfig {
-        enabled: true,
-        min_fragments: state.config.min_fragments,
-        target_rows_per_fragment: state.config.target_rows_per_fragment,
-        ..Default::default()
-    }
-}
-
 fn kind_label(kind: TaskKind) -> &'static str {
     match kind {
         TaskKind::Compact => "compact",
@@ -177,7 +167,13 @@ async fn index_id_inner(state: &Arc<MasterState>, name: &str) -> Result<String, 
 
 async fn compact_inner(state: &Arc<MasterState>, name: &str) -> Result<String, String> {
     let uri = state.rollout_uri(name);
-    let config = compaction_config(state);
+    let config = state.compaction_config();
+    let _permit = state
+        .compaction_permits
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| "compaction semaphore closed".to_string())?;
 
     let mut store = RolloutStore::open_existing_with_options(&uri, state.rollout_store_options())
         .await
@@ -377,7 +373,7 @@ pub async fn sweep_candidates(state: &Arc<MasterState>) -> lance::Result<usize> 
 }
 
 async fn sweep_candidates_inner(state: &Arc<MasterState>) -> lance::Result<usize> {
-    let config = compaction_config(state);
+    let config = state.compaction_config();
     // Quiet-hours gate applies to the whole sweep.
     if in_quiet_hours(&config) {
         return Ok(0);
@@ -559,6 +555,11 @@ mod tests {
             // Low threshold so a handful of appends crosses it.
             min_fragments: 2,
             target_rows_per_fragment: 1_048_576,
+            compaction_concurrency: 1,
+            compaction_threads: 1,
+            compaction_batch_size: 8,
+            compaction_max_source_fragments: 32,
+            compaction_max_bytes_per_file: 1024 * 1024 * 1024,
             merge_wal_interval_secs: 0,
             merge_wal_min_generations: 2,
             worker_endpoints: vec![],

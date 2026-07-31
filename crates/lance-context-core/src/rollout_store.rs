@@ -3055,8 +3055,23 @@ mod tests {
                 ..CompactionConfig::default()
             }));
 
-            let metrics = store.compact(None).await.unwrap();
+            let metrics = store
+                .compact(Some(CompactionConfig {
+                    min_fragments: 2,
+                    num_threads: Some(1),
+                    max_bytes_per_file: Some(1024 * 1024),
+                    batch_size: Some(1),
+                    max_source_fragments: Some(4),
+                    try_binary_copy: true,
+                    ..Default::default()
+                }))
+                .await
+                .unwrap();
             assert!(metrics.fragments_removed > 0);
+            assert!(
+                metrics.fragments_removed <= 4,
+                "one incremental pass must honor max_source_fragments"
+            );
 
             let after = store.base.dataset.count_fragments();
             assert!(

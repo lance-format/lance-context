@@ -13,7 +13,8 @@ use std::time::Duration;
 
 use chrono::Utc;
 use futures::stream::{self, StreamExt};
-use lance_context_core::{RolloutStore, RolloutStoreOptions};
+use lance_context_core::{CompactionConfig, RolloutStore, RolloutStoreOptions};
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
 use crate::state::MasterState;
@@ -263,6 +264,8 @@ async fn scan_once_inner(state: &Arc<MasterState>) -> lance::Result<usize> {
         retire_after,
         Utc::now().timestamp_millis(),
         state.rollout_store_options(),
+        state.compaction_config(),
+        state.compaction_permits.clone(),
     )
     .await;
     if !retired.is_empty() {
@@ -436,6 +439,8 @@ async fn retire_cold_experiments(
     retire_after: Duration,
     now_ms: i64,
     options: RolloutStoreOptions,
+    compaction_config: CompactionConfig,
+    compaction_permits: Arc<Semaphore>,
 ) -> HashSet<String> {
     if retire_after.is_zero() {
         return HashSet::new();
@@ -447,7 +452,15 @@ async fn retire_cold_experiments(
         if row.last_updated > cutoff_ms {
             continue;
         }
-        match prepare_for_retirement(&row.name, &row.uri, options.clone()).await {
+        match prepare_for_retirement(
+            &row.name,
+            &row.uri,
+            options.clone(),
+            compaction_config.clone(),
+            compaction_permits.clone(),
+        )
+        .await
+        {
             Ok(true) => {
                 retired.insert(row.name.clone());
                 metrics::counter!("master_stats_experiments_retired_total").increment(1);
@@ -485,6 +498,8 @@ async fn prepare_for_retirement(
     name: &str,
     uri: &str,
     options: RolloutStoreOptions,
+    compaction_config: CompactionConfig,
+    compaction_permits: Arc<Semaphore>,
 ) -> lance::Result<bool> {
     let mut store = match tokio::time::timeout(
         OBSERVE_TIMEOUT,
@@ -509,7 +524,11 @@ async fn prepare_for_retirement(
 
     // 2. Compact, so the retired table is not left as many small fragments that
     //    nothing will ever come back to tidy.
-    tokio::time::timeout(RETIRE_TIMEOUT, store.compact(None))
+    let _permit = compaction_permits
+        .acquire_owned()
+        .await
+        .map_err(|_| lance::Error::io("compaction semaphore closed"))?;
+    tokio::time::timeout(RETIRE_TIMEOUT, store.compact(Some(compaction_config)))
         .await
         .map_err(|_| lance::Error::io(format!("compaction timed out retiring '{name}'")))??;
 
@@ -904,6 +923,20 @@ mod retirement_tests {
         }
     }
 
+    fn compaction_limits() -> (CompactionConfig, Arc<Semaphore>) {
+        (
+            CompactionConfig {
+                num_threads: Some(1),
+                batch_size: Some(8),
+                max_source_fragments: Some(32),
+                max_bytes_per_file: Some(1024 * 1024 * 1024),
+                try_binary_copy: true,
+                ..Default::default()
+            },
+            Arc::new(Semaphore::new(1)),
+        )
+    }
+
     /// Retirement must drain the WAL before dropping the row.
     ///
     /// The sweeps read the stats table and nothing else, so a retired
@@ -932,11 +965,14 @@ mod retirement_tests {
 
         let now = Utc::now().timestamp_millis();
         let old = now - Duration::from_secs(30 * 86_400).as_millis() as i64;
+        let (compaction_config, compaction_permits) = compaction_limits();
         let retired = retire_cold_experiments(
             &[row("e", &uri, old)],
             Duration::from_secs(7 * 86_400),
             now,
             RolloutStoreOptions::default(),
+            compaction_config,
+            compaction_permits,
         )
         .await;
 
@@ -969,11 +1005,14 @@ mod retirement_tests {
         }
 
         let now = Utc::now().timestamp_millis();
+        let (compaction_config, compaction_permits) = compaction_limits();
         let retired = retire_cold_experiments(
             &[row("e", &uri, now)],
             Duration::from_secs(7 * 86_400),
             now,
             RolloutStoreOptions::default(),
+            compaction_config,
+            compaction_permits,
         )
         .await;
         assert!(
@@ -986,11 +1025,14 @@ mod retirement_tests {
     #[tokio::test]
     async fn zero_window_disables_retirement() {
         let now = Utc::now().timestamp_millis();
+        let (compaction_config, compaction_permits) = compaction_limits();
         let retired = retire_cold_experiments(
             &[row("e", "/nonexistent", 0)],
             Duration::from_secs(0),
             now,
             RolloutStoreOptions::default(),
+            compaction_config,
+            compaction_permits,
         )
         .await;
         assert!(retired.is_empty());
@@ -1002,11 +1044,14 @@ mod retirement_tests {
     async fn unpreparable_experiment_is_kept() {
         let now = Utc::now().timestamp_millis();
         let old = now - Duration::from_secs(30 * 86_400).as_millis() as i64;
+        let (compaction_config, compaction_permits) = compaction_limits();
         let retired = retire_cold_experiments(
             &[row("gone", "/no/such/dataset.lance", old)],
             Duration::from_secs(7 * 86_400),
             now,
             RolloutStoreOptions::default(),
+            compaction_config,
+            compaction_permits,
         )
         .await;
         assert!(

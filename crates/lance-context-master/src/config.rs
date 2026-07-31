@@ -82,6 +82,31 @@ pub struct MasterConfig {
     #[arg(long, env = "TARGET_ROWS_PER_FRAGMENT", default_value_t = 1_048_576)]
     pub target_rows_per_fragment: usize,
 
+    /// Maximum number of compactions executing in this master process.
+    #[arg(long, env = "COMPACTION_CONCURRENCY", default_value_t = 1)]
+    pub compaction_concurrency: usize,
+
+    /// Lance rewrite tasks executing inside one compaction.
+    #[arg(long, env = "COMPACTION_THREADS", default_value_t = 1)]
+    pub compaction_threads: usize,
+
+    /// Rows per input batch when compaction must decode and re-encode data.
+    #[arg(long, env = "COMPACTION_BATCH_SIZE", default_value_t = 8)]
+    pub compaction_batch_size: usize,
+
+    /// Maximum source fragments rewritten by one compaction task. `0` disables
+    /// the incremental limit.
+    #[arg(long, env = "COMPACTION_MAX_SOURCE_FRAGMENTS", default_value_t = 32)]
+    pub compaction_max_source_fragments: usize,
+
+    /// Maximum bytes per compacted output file. `0` uses Lance's default.
+    #[arg(
+        long,
+        env = "COMPACTION_MAX_BYTES_PER_FILE",
+        default_value_t = 1_073_741_824
+    )]
+    pub compaction_max_bytes_per_file: usize,
+
     /// Interval, in seconds, between automatic WAL-merge sweeps. Each sweep
     /// enqueues a `MergeWal` task for every experiment whose pending MemWAL
     /// generation count crosses `merge_wal_min_generations`; the task fans out
@@ -210,5 +235,15 @@ mod tests {
             MasterConfig::try_parse_from(["lance-context-master", "--rollout-cache-bytes", "0"])
                 .unwrap();
         assert_eq!(disabled.rollout_cache_bytes, 0);
+    }
+
+    #[test]
+    fn compaction_defaults_bound_parallelism_and_rewrite_size() {
+        let config = MasterConfig::try_parse_from(["lance-context-master"]).unwrap();
+        assert_eq!(config.compaction_concurrency, 1);
+        assert_eq!(config.compaction_threads, 1);
+        assert_eq!(config.compaction_batch_size, 8);
+        assert_eq!(config.compaction_max_source_fragments, 32);
+        assert_eq!(config.compaction_max_bytes_per_file, 1024 * 1024 * 1024);
     }
 }

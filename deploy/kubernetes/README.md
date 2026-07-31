@@ -36,7 +36,13 @@ master replica sees current stats.
 Two periodic sweeps run on the master and feed the shared scheduler queue:
 
 - **Compaction** (`COMPACTION_INTERVAL_SECS`, `MIN_FRAGMENTS`) rewrites an
-  experiment's base-table fragments locally on the master.
+  experiment's base-table fragments locally on the master. Large inline blobs
+  make row decoding expensive, so master compaction first attempts Lance
+  binary-copy and otherwise uses bounded input batches. Keep
+  `COMPACTION_CONCURRENCY=1` and `COMPACTION_THREADS=1` unless the pod memory
+  limit is sized for parallel rewrites. `COMPACTION_MAX_SOURCE_FRAGMENTS`
+  makes large stores converge incrementally across sweeps, while
+  `COMPACTION_MAX_BYTES_PER_FILE` prevents giant output files.
 - **WAL merge** (`MERGE_WAL_INTERVAL_SECS`, `MERGE_WAL_MIN_GENERATIONS`) enqueues
   a `MergeWal` task for every experiment whose pending MemWAL generation count
   (from the periodically-scanned stats table) crosses the threshold. The task

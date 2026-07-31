@@ -42,10 +42,14 @@ use arrow_array::{new_null_array, RecordBatch, RecordBatchIterator};
 use arrow_schema::{ArrowError, Schema};
 use chrono::{DateTime, Utc};
 use futures::{stream, StreamExt, TryStreamExt};
+use lance::dataset::index::DatasetIndexRemapperOptions;
 use lance::dataset::mem_wal::{
     DatasetMemWalExt, LsmScanner, ShardManifestStore, ShardSnapshot, ShardWriter, ShardWriterConfig,
 };
-use lance::dataset::optimize::{compact_files, CompactionMetrics, CompactionOptions};
+use lance::dataset::optimize::{
+    commit_compaction, compact_files, plan_compaction, CompactionMetrics, CompactionMode,
+    CompactionOptions,
+};
 use lance::dataset::{
     builder::DatasetBuilder, Dataset, NewColumnTransform, WriteMode, WriteParams,
 };
@@ -69,6 +73,55 @@ pub(crate) const DEFAULT_MANIFEST_SCAN_BATCH_SIZE: usize = 16;
 /// Maximum number of shard manifests or flushed-generation datasets opened
 /// concurrently while collecting observability metrics.
 pub(crate) const DEFAULT_OBSERVE_CONCURRENCY: usize = 16;
+
+/// Execute only the first `max_source_fragments` from a Lance compaction plan.
+///
+/// Lance's built-in `max_source_fragments` stops before a whole planned task
+/// that exceeds the budget. A long run of tiny fragments can therefore produce
+/// one oversized task and compact nothing. Truncating the public task data
+/// keeps the rewrite contiguous while guaranteeing incremental progress.
+async fn compact_files_incremental(
+    dataset: &mut Dataset,
+    mut options: CompactionOptions,
+    max_source_fragments: usize,
+) -> LanceResult<CompactionMetrics> {
+    options.max_source_fragments = None;
+    let plan = plan_compaction(dataset, &options).await?;
+    let mut remaining = max_source_fragments;
+    let mut tasks = Vec::new();
+    for mut task in plan.compaction_tasks() {
+        if remaining == 0 {
+            break;
+        }
+        task.task.fragments.truncate(remaining);
+        remaining -= task.task.fragments.len();
+        if !task.task.fragments.is_empty() {
+            tasks.push(task);
+        }
+    }
+    if tasks.is_empty() {
+        return Ok(CompactionMetrics::default());
+    }
+
+    let concurrency = options.num_threads.unwrap_or(1).max(1);
+    let dataset_snapshot = dataset.clone();
+    let completed = stream::iter(tasks)
+        .map(|task| {
+            let dataset_snapshot = dataset_snapshot.clone();
+            async move { task.execute(&dataset_snapshot).await }
+        })
+        .buffer_unordered(concurrency)
+        .try_collect()
+        .await?;
+
+    commit_compaction(
+        dataset,
+        completed,
+        Arc::new(DatasetIndexRemapperOptions::default()),
+        &options,
+    )
+    .await
+}
 
 /// Name of the scalar index on the base table's key column. One name across
 /// every store, so all tables index their primary key identically.
@@ -967,6 +1020,12 @@ impl StorageBase {
             materialize_deletions: config.materialize_deletions,
             materialize_deletions_threshold: config.materialize_deletions_threshold,
             num_threads: config.num_threads,
+            max_bytes_per_file: config.max_bytes_per_file,
+            batch_size: config.batch_size,
+            max_source_fragments: config.max_source_fragments,
+            compaction_mode: config
+                .try_binary_copy
+                .then_some(CompactionMode::TryBinaryCopy),
             // Every base table here carries a MemWAL index, which is fieldless
             // (it tracks shard/generation bookkeeping, not a data column).
             // Lance's inline index remap panics on a fieldless index ("An index
@@ -977,7 +1036,19 @@ impl StorageBase {
             ..Default::default()
         };
 
-        match compact_files(&mut self.dataset, lance_options, None).await {
+        let result = match config.max_source_fragments {
+            Some(max_source_fragments) => {
+                compact_files_incremental(
+                    &mut self.dataset,
+                    lance_options,
+                    max_source_fragments.max(1),
+                )
+                .await
+            }
+            None => compact_files(&mut self.dataset, lance_options, None).await,
+        };
+
+        match result {
             Ok(metrics) => {
                 // Reload the handle so the caller (and subsequent reads on this
                 // instance) observe the compacted version.
