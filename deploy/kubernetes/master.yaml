@@ -40,6 +40,10 @@ spec:
               value: /lance-context/master
             - name: ETCD_LEASE_TTL_SECS
               value: "30"
+            # Shared process-wide Lance index/metadata cache budget. Keep this
+            # below the pod memory limit to leave room for query working sets.
+            - name: ROLLOUT_CACHE_BYTES
+              value: "536870912"
             - name: ETCD_USERNAME
               valueFrom:
                 secretKeyRef:

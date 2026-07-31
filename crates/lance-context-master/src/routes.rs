@@ -165,7 +165,7 @@ pub async fn list_experiments(
         // thousands of datasets to render one page.
         let want = params.limit.saturating_sub(experiments.len());
         for entry in matches.into_iter().take(want) {
-            match scanner::observe_cold(&entry.name, &entry.uri).await {
+            match scanner::observe_cold(&state, &entry.name, &entry.uri).await {
                 Ok(summary) => experiments.push(summary),
                 Err(e) => {
                     tracing::warn!(
@@ -225,7 +225,7 @@ pub async fn get_experiment(
         .await
         .map_err(MasterError::from_lance)?
         .ok_or_else(|| MasterError::NotFound(format!("experiment '{}' does not exist", name)))?;
-    let summary = scanner::observe_cold(&entry.name, &entry.uri)
+    let summary = scanner::observe_cold(&state, &entry.name, &entry.uri)
         .await
         .map_err(MasterError::from_lance)?;
     Ok(Json(ExperimentDetail { summary }))
@@ -605,6 +605,7 @@ mod tests {
             port: 0,
             stats_scan_interval_secs: 0,
             scan_concurrency: 4,
+            rollout_cache_bytes: 2 * 1024 * 1024 * 1024,
             stats_maintenance_every_n_scans: 0,
             stats_history_ttl_secs: 3_600,
             stats_cold_retire_secs: 0,

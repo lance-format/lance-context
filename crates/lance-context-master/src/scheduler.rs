@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use lance_context_api::{TaskKind, TaskRecord};
-use lance_context_core::{CompactionConfig, RolloutStore, RolloutStoreOptions};
+use lance_context_core::{CompactionConfig, RolloutStore};
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
@@ -165,8 +165,7 @@ async fn run_index_id(state: &Arc<MasterState>, name: &str) -> Result<String, St
 
 async fn index_id_inner(state: &Arc<MasterState>, name: &str) -> Result<String, String> {
     let uri = state.rollout_uri(name);
-    let opts = RolloutStoreOptions::default();
-    let mut store = RolloutStore::open_existing_with_options(&uri, opts)
+    let mut store = RolloutStore::open_existing_with_options(&uri, state.rollout_store_options())
         .await
         .map_err(|e| e.to_string())?;
     store
@@ -179,9 +178,8 @@ async fn index_id_inner(state: &Arc<MasterState>, name: &str) -> Result<String, 
 async fn compact_inner(state: &Arc<MasterState>, name: &str) -> Result<String, String> {
     let uri = state.rollout_uri(name);
     let config = compaction_config(state);
-    let opts = RolloutStoreOptions::default();
 
-    let mut store = RolloutStore::open_existing_with_options(&uri, opts)
+    let mut store = RolloutStore::open_existing_with_options(&uri, state.rollout_store_options())
         .await
         .map_err(|e| e.to_string())?;
     let metrics = store
@@ -553,6 +551,7 @@ mod tests {
             port: 0,
             stats_scan_interval_secs: 0,
             scan_concurrency: 4,
+            rollout_cache_bytes: 2 * 1024 * 1024 * 1024,
             stats_maintenance_every_n_scans: 0,
             stats_history_ttl_secs: 3_600,
             stats_cold_retire_secs: 0,
