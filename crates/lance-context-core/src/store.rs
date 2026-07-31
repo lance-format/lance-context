@@ -67,6 +67,14 @@ pub struct CompactionConfig {
     pub materialize_deletions_threshold: f32,
     /// Number of threads for compaction (None = auto).
     pub num_threads: Option<usize>,
+    /// Maximum bytes per output file (None = Lance default).
+    pub max_bytes_per_file: Option<usize>,
+    /// Rows per input scan batch (None = Lance default).
+    pub batch_size: Option<usize>,
+    /// Maximum source fragments rewritten by one compaction run.
+    pub max_source_fragments: Option<usize>,
+    /// Try page-level binary copy before falling back to row decoding.
+    pub try_binary_copy: bool,
     /// Interval in seconds between compaction checks.
     pub check_interval_secs: u64,
     /// Quiet hours during which compaction is skipped [(start_hour, end_hour)].
@@ -83,6 +91,10 @@ impl Default for CompactionConfig {
             materialize_deletions: true,
             materialize_deletions_threshold: 0.1,
             num_threads: None,
+            max_bytes_per_file: None,
+            batch_size: None,
+            max_source_fragments: None,
+            try_binary_copy: false,
             check_interval_secs: 300,
             quiet_hours: vec![],
         }

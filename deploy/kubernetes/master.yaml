@@ -44,6 +44,19 @@ spec:
             # below the pod memory limit to leave room for query working sets.
             - name: ROLLOUT_CACHE_BYTES
               value: "536870912"
+            # Compaction is process-wide serialized and incrementally rewrites
+            # small batches of source fragments. These defaults keep large
+            # inline payloads from multiplying into unbounded rewrite buffers.
+            - name: COMPACTION_CONCURRENCY
+              value: "1"
+            - name: COMPACTION_THREADS
+              value: "1"
+            - name: COMPACTION_BATCH_SIZE
+              value: "8"
+            - name: COMPACTION_MAX_SOURCE_FRAGMENTS
+              value: "32"
+            - name: COMPACTION_MAX_BYTES_PER_FILE
+              value: "1073741824"
             - name: ETCD_USERNAME
               valueFrom:
                 secretKeyRef:

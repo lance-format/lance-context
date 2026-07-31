@@ -3,9 +3,11 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use lance_context_core::{join_uri, RolloutRegistry, RolloutStore, RolloutStoreOptions, Session};
+use lance_context_core::{
+    join_uri, CompactionConfig, RolloutRegistry, RolloutStore, RolloutStoreOptions, Session,
+};
 use lru::LruCache;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, Semaphore};
 
 use crate::config::MasterConfig;
 use crate::discovery;
@@ -30,6 +32,22 @@ fn build_rollout_session(cache_bytes: usize) -> Option<Arc<Session>> {
     let metadata_bytes = cache_bytes / 7;
     let index_bytes = cache_bytes - metadata_bytes;
     Some(RolloutStore::build_session(index_bytes, metadata_bytes))
+}
+
+fn build_compaction_config(config: &MasterConfig) -> CompactionConfig {
+    CompactionConfig {
+        enabled: true,
+        min_fragments: config.min_fragments,
+        target_rows_per_fragment: config.target_rows_per_fragment,
+        num_threads: Some(config.compaction_threads.max(1)),
+        max_bytes_per_file: (config.compaction_max_bytes_per_file > 0)
+            .then_some(config.compaction_max_bytes_per_file),
+        batch_size: Some(config.compaction_batch_size.max(1)),
+        max_source_fragments: (config.compaction_max_source_fragments > 0)
+            .then_some(config.compaction_max_source_fragments),
+        try_binary_copy: true,
+        ..Default::default()
+    }
 }
 
 /// Shared state for the master process.
@@ -59,6 +77,8 @@ pub struct MasterState {
     pub task_store: TaskStore,
     /// Shared HTTP client for fanning `MergeWal` tasks out to worker endpoints.
     pub http: reqwest::Client,
+    /// Process-wide compaction permits shared by scheduler and retirement work.
+    pub(crate) compaction_permits: Arc<Semaphore>,
     /// Whether this process has already run one `_stats` maintenance pass.
     ///
     /// The first pass runs without a timeout so a deployment carrying a version
@@ -93,6 +113,7 @@ impl MasterState {
         };
         let base_uri = config.data_dir.clone();
         let rollout_session = build_rollout_session(config.rollout_cache_bytes);
+        let compaction_concurrency = config.compaction_concurrency.max(1);
         let registry_uri = join_uri(&base_uri, "_registry.rollout.lance");
         let stats_uri = join_uri(&base_uri, "_stats.rollout.lance");
         let mut registry = RolloutRegistry::open_or_create(&registry_uri, None).await?;
@@ -116,6 +137,7 @@ impl MasterState {
             config,
             task_store,
             http: reqwest::Client::new(),
+            compaction_permits: Arc::new(Semaphore::new(compaction_concurrency)),
             stats_maintenance_done: std::sync::atomic::AtomicBool::new(false),
             stats_maintenance_failures: std::sync::atomic::AtomicU64::new(0),
             stats_last_reclaimed_version: std::sync::atomic::AtomicU64::new(0),
@@ -135,6 +157,11 @@ impl MasterState {
             session: self.rollout_session.clone(),
             ..Default::default()
         }
+    }
+
+    /// Memory-bounded compaction settings for every master-initiated rewrite.
+    pub(crate) fn compaction_config(&self) -> CompactionConfig {
+        build_compaction_config(&self.config)
     }
 
     /// Return a cached rollout handle for the master records browser, opening
@@ -185,6 +212,11 @@ mod tests {
             compaction_interval_secs: 0,
             min_fragments: 16,
             target_rows_per_fragment: 1_048_576,
+            compaction_concurrency: 1,
+            compaction_threads: 1,
+            compaction_batch_size: 8,
+            compaction_max_source_fragments: 32,
+            compaction_max_bytes_per_file: 1024 * 1024 * 1024,
             merge_wal_interval_secs: 0,
             merge_wal_min_generations: 8,
             worker_endpoints: vec![],
@@ -209,6 +241,23 @@ mod tests {
     fn rollout_session_can_be_disabled() {
         assert!(build_rollout_session(0).is_none());
         assert!(build_rollout_session(7).is_some());
+    }
+
+    #[test]
+    fn compaction_config_maps_bounds_and_zero_disables_optional_limits() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config(&dir);
+        config.compaction_threads = 0;
+        config.compaction_batch_size = 0;
+        config.compaction_max_source_fragments = 0;
+        config.compaction_max_bytes_per_file = 0;
+
+        let compaction = build_compaction_config(&config);
+        assert_eq!(compaction.num_threads, Some(1));
+        assert_eq!(compaction.batch_size, Some(1));
+        assert_eq!(compaction.max_source_fragments, None);
+        assert_eq!(compaction.max_bytes_per_file, None);
+        assert!(compaction.try_binary_copy);
     }
 
     #[tokio::test]
