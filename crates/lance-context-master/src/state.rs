@@ -3,7 +3,7 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use lance_context_core::{join_uri, RolloutRegistry, RolloutStore, RolloutStoreOptions};
+use lance_context_core::{join_uri, RolloutRegistry, RolloutStore, RolloutStoreOptions, Session};
 use lru::LruCache;
 use tokio::sync::{Mutex, RwLock};
 
@@ -14,10 +14,23 @@ use crate::task_store::TaskStore;
 
 /// Bounded number of rollout handles retained by the master data browser.
 ///
-/// Each handle keeps a Lance session whose fragment/file metadata caches are
-/// valuable across pagination requests. The bound prevents a master managing a
-/// very large registry from retaining one handle per experiment indefinitely.
+/// Each handle reuses the process-wide Lance session whose fragment/file
+/// metadata caches are valuable across pagination requests. The bound prevents
+/// a master managing a very large registry from retaining one handle per
+/// experiment indefinitely.
 const RECORD_STORE_CACHE_CAPACITY: usize = 128;
+
+/// Build the process-wide rollout session from one total cache budget.
+///
+/// The 6:1 index:metadata split mirrors Lance's default cache ratio.
+fn build_rollout_session(cache_bytes: usize) -> Option<Arc<Session>> {
+    if cache_bytes == 0 {
+        return None;
+    }
+    let metadata_bytes = cache_bytes / 7;
+    let index_bytes = cache_bytes - metadata_bytes;
+    Some(RolloutStore::build_session(index_bytes, metadata_bytes))
+}
 
 /// Shared state for the master process.
 ///
@@ -34,6 +47,9 @@ pub struct MasterState {
     /// Read handles used by the records browser, retained to reuse Lance
     /// session and fragment metadata caches across requests.
     record_stores: Mutex<LruCache<String, Arc<RwLock<RolloutStore>>>>,
+    /// Process-wide Lance cache session attached to every rollout store opened
+    /// by this master. `None` is only used when the configured budget is `0`.
+    rollout_session: Option<Arc<Session>>,
     /// Shared data directory / object-store prefix.
     pub base_uri: String,
     /// Effective configuration.
@@ -76,6 +92,7 @@ impl MasterState {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         };
         let base_uri = config.data_dir.clone();
+        let rollout_session = build_rollout_session(config.rollout_cache_bytes);
         let registry_uri = join_uri(&base_uri, "_registry.rollout.lance");
         let stats_uri = join_uri(&base_uri, "_stats.rollout.lance");
         let mut registry = RolloutRegistry::open_or_create(&registry_uri, None).await?;
@@ -94,6 +111,7 @@ impl MasterState {
             record_stores: Mutex::new(LruCache::new(
                 NonZeroUsize::new(RECORD_STORE_CACHE_CAPACITY).unwrap(),
             )),
+            rollout_session,
             base_uri,
             config,
             task_store,
@@ -111,6 +129,14 @@ impl MasterState {
         join_uri(&self.base_uri, &format!("{}.rollout.lance", name))
     }
 
+    /// Options for every rollout store opened by the master.
+    pub(crate) fn rollout_store_options(&self) -> RolloutStoreOptions {
+        RolloutStoreOptions {
+            session: self.rollout_session.clone(),
+            ..Default::default()
+        }
+    }
+
     /// Return a cached rollout handle for the master records browser, opening
     /// it without holding the cache lock on a miss.
     pub async fn get_or_open_record_store(
@@ -125,7 +151,7 @@ impl MasterState {
         metrics::counter!("master_record_store_cache_misses_total").increment(1);
 
         let opened = Arc::new(RwLock::new(
-            RolloutStore::open_existing_with_options(uri, RolloutStoreOptions::default()).await?,
+            RolloutStore::open_existing_with_options(uri, self.rollout_store_options()).await?,
         ));
 
         let mut cache = self.record_stores.lock().await;
@@ -152,6 +178,7 @@ mod tests {
             port: 0,
             stats_scan_interval_secs: 0,
             scan_concurrency: 4,
+            rollout_cache_bytes: 2 * 1024 * 1024 * 1024,
             stats_maintenance_every_n_scans: 0,
             stats_history_ttl_secs: 3_600,
             stats_cold_retire_secs: 0,
@@ -176,6 +203,12 @@ mod tests {
             task_history_ttl_secs: 86_400,
             ui_dir: None,
         }
+    }
+
+    #[test]
+    fn rollout_session_can_be_disabled() {
+        assert!(build_rollout_session(0).is_none());
+        assert!(build_rollout_session(7).is_some());
     }
 
     #[tokio::test]

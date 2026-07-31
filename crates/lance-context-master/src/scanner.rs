@@ -194,6 +194,7 @@ async fn scan_once_inner(state: &Arc<MasterState>) -> lance::Result<usize> {
             .collect()
     };
     let previous = Arc::new(previous);
+    let rollout_options = state.rollout_store_options();
 
     // Observe experiments concurrently (bounded). `None` means this round could
     // not observe that experiment; its previous row is carried over below
@@ -201,9 +202,10 @@ async fn scan_once_inner(state: &Arc<MasterState>) -> lance::Result<usize> {
     let observed: Vec<(String, Option<(StatRow, bool)>)> = stream::iter(entries)
         .map(|entry| {
             let previous = previous.clone();
+            let rollout_options = rollout_options.clone();
             async move {
                 let prev = previous.get(&entry.name);
-                match observe_one(&entry.name, &entry.uri, prev).await {
+                match observe_one(&entry.name, &entry.uri, prev, rollout_options).await {
                     Ok(result) => (entry.name, Some(result)),
                     Err(e) => {
                         tracing::warn!(store = %entry.name, error = %e, "scan: observe failed");
@@ -256,8 +258,13 @@ async fn scan_once_inner(state: &Arc<MasterState>) -> lance::Result<usize> {
     // Done before the snapshot is written so a retirement takes effect in the
     // same commit rather than leaving a round where the row is stale.
     let retire_after = Duration::from_secs(state.config.stats_cold_retire_secs);
-    let retired =
-        retire_cold_experiments(&snapshot, retire_after, Utc::now().timestamp_millis()).await;
+    let retired = retire_cold_experiments(
+        &snapshot,
+        retire_after,
+        Utc::now().timestamp_millis(),
+        state.rollout_store_options(),
+    )
+    .await;
     if !retired.is_empty() {
         snapshot.retain(|row| !retired.contains(&row.name));
     }
@@ -344,9 +351,9 @@ async fn observe_one(
     name: &str,
     uri: &str,
     previous: Option<&StatRow>,
+    options: RolloutStoreOptions,
 ) -> lance::Result<(StatRow, bool)> {
-    let opts = RolloutStoreOptions::default();
-    let open = RolloutStore::open_existing_with_options(uri, opts);
+    let open = RolloutStore::open_existing_with_options(uri, options);
     let store = match tokio::time::timeout(OBSERVE_TIMEOUT, open).await {
         Ok(Ok(store)) => store,
         Ok(Err(e)) => return Err(e),
@@ -428,6 +435,7 @@ async fn retire_cold_experiments(
     rows: &[StatRow],
     retire_after: Duration,
     now_ms: i64,
+    options: RolloutStoreOptions,
 ) -> HashSet<String> {
     if retire_after.is_zero() {
         return HashSet::new();
@@ -439,7 +447,7 @@ async fn retire_cold_experiments(
         if row.last_updated > cutoff_ms {
             continue;
         }
-        match prepare_for_retirement(&row.name, &row.uri).await {
+        match prepare_for_retirement(&row.name, &row.uri, options.clone()).await {
             Ok(true) => {
                 retired.insert(row.name.clone());
                 metrics::counter!("master_stats_experiments_retired_total").increment(1);
@@ -473,11 +481,14 @@ async fn retire_cold_experiments(
 /// Merge, compact, and verify one experiment is quiescent.
 ///
 /// `Ok(true)` means it is safe to drop from the stats table.
-async fn prepare_for_retirement(name: &str, uri: &str) -> lance::Result<bool> {
-    let opts = RolloutStoreOptions::default();
+async fn prepare_for_retirement(
+    name: &str,
+    uri: &str,
+    options: RolloutStoreOptions,
+) -> lance::Result<bool> {
     let mut store = match tokio::time::timeout(
         OBSERVE_TIMEOUT,
-        RolloutStore::open_existing_with_options(uri, opts),
+        RolloutStore::open_existing_with_options(uri, options),
     )
     .await
     {
@@ -517,8 +528,20 @@ async fn prepare_for_retirement(name: &str, uri: &str) -> lance::Result<bool> {
 /// reading about a cold experiment must not make it hot again, or browsing the
 /// UI would undo retirement and the table would creep back toward holding
 /// everything.
-pub async fn observe_cold(name: &str, uri: &str) -> lance::Result<ExperimentSummary> {
-    let (row, _) = observe_one(name, uri, None).await?;
+pub async fn observe_cold(
+    state: &MasterState,
+    name: &str,
+    uri: &str,
+) -> lance::Result<ExperimentSummary> {
+    observe_cold_with_options(name, uri, state.rollout_store_options()).await
+}
+
+async fn observe_cold_with_options(
+    name: &str,
+    uri: &str,
+    options: RolloutStoreOptions,
+) -> lance::Result<ExperimentSummary> {
+    let (row, _) = observe_one(name, uri, None, options).await?;
     Ok(row.into_summary())
 }
 
@@ -530,7 +553,7 @@ pub async fn observe_cold(name: &str, uri: &str) -> lance::Result<ExperimentSumm
 /// otherwise short-circuit exactly the observation they asked for.
 pub async fn refresh_one(state: &Arc<MasterState>, name: &str, uri: &str) -> lance::Result<()> {
     let guard = state.task_store.coordination_lock("stats-writer").await?;
-    let result = match observe_one(name, uri, None).await {
+    let result = match observe_one(name, uri, None, state.rollout_store_options()).await {
         Ok((row, _)) => state.stats.lock().await.upsert(&row).await,
         Err(error) => Err(error),
     };
@@ -706,13 +729,18 @@ mod incremental_scan_tests {
         }
 
         // First pass: nothing known, so a full observation happens.
-        let (first, skipped) = observe_one("e", &uri, None).await.unwrap();
+        let (first, skipped) = observe_one("e", &uri, None, RolloutStoreOptions::default())
+            .await
+            .unwrap();
         assert!(!skipped, "the first observation cannot be skipped");
         assert_ne!(first.version, StatRow::UNKNOWN_VERSION);
 
         // Second pass with the row from the first: the version is unchanged, so
         // the expensive observation is skipped and the row is reused.
-        let (second, skipped) = observe_one("e", &uri, Some(&first)).await.unwrap();
+        let (second, skipped) =
+            observe_one("e", &uri, Some(&first), RolloutStoreOptions::default())
+                .await
+                .unwrap();
         assert!(skipped, "an unchanged experiment must skip re-observation");
         assert_eq!(second.row_count, first.row_count);
         assert_eq!(second.fragment_count, first.fragment_count);
@@ -735,12 +763,17 @@ mod incremental_scan_tests {
         store.add(&[rec("a")]).await.unwrap();
         store.flush().await.unwrap();
 
-        let (first, _) = observe_one("e", &uri, None).await.unwrap();
+        let (first, _) = observe_one("e", &uri, None, RolloutStoreOptions::default())
+            .await
+            .unwrap();
 
         // Merge the WAL into the base table: this advances the base version.
         store.cleanup_own_shard().await.unwrap();
 
-        let (second, skipped) = observe_one("e", &uri, Some(&first)).await.unwrap();
+        let (second, skipped) =
+            observe_one("e", &uri, Some(&first), RolloutStoreOptions::default())
+                .await
+                .unwrap();
         assert!(
             !skipped,
             "a changed base version must force a full observation"
@@ -765,10 +798,15 @@ mod incremental_scan_tests {
             store.flush().await.unwrap();
         }
 
-        let (mut legacy, _) = observe_one("e", &uri, None).await.unwrap();
+        let (mut legacy, _) = observe_one("e", &uri, None, RolloutStoreOptions::default())
+            .await
+            .unwrap();
         legacy.version = StatRow::UNKNOWN_VERSION;
 
-        let (refreshed, skipped) = observe_one("e", &uri, Some(&legacy)).await.unwrap();
+        let (refreshed, skipped) =
+            observe_one("e", &uri, Some(&legacy), RolloutStoreOptions::default())
+                .await
+                .unwrap();
         assert!(
             !skipped,
             "an unknown version must not be mistaken for an unchanged one"
@@ -789,11 +827,15 @@ mod incremental_scan_tests {
             store.flush().await.unwrap();
         }
 
-        let (mut prev, _) = observe_one("e", &uri, None).await.unwrap();
+        let (mut prev, _) = observe_one("e", &uri, None, RolloutStoreOptions::default())
+            .await
+            .unwrap();
         prev.last_compaction = 1_700_000_000_000;
         prev.total_compactions = 7;
 
-        let (next, skipped) = observe_one("e", &uri, Some(&prev)).await.unwrap();
+        let (next, skipped) = observe_one("e", &uri, Some(&prev), RolloutStoreOptions::default())
+            .await
+            .unwrap();
         assert!(skipped);
         assert_eq!(next.last_compaction, 1_700_000_000_000);
         assert_eq!(next.total_compactions, 7);
@@ -890,9 +932,13 @@ mod retirement_tests {
 
         let now = Utc::now().timestamp_millis();
         let old = now - Duration::from_secs(30 * 86_400).as_millis() as i64;
-        let retired =
-            retire_cold_experiments(&[row("e", &uri, old)], Duration::from_secs(7 * 86_400), now)
-                .await;
+        let retired = retire_cold_experiments(
+            &[row("e", &uri, old)],
+            Duration::from_secs(7 * 86_400),
+            now,
+            RolloutStoreOptions::default(),
+        )
+        .await;
 
         assert!(retired.contains("e"), "a cold experiment should retire");
 
@@ -923,9 +969,13 @@ mod retirement_tests {
         }
 
         let now = Utc::now().timestamp_millis();
-        let retired =
-            retire_cold_experiments(&[row("e", &uri, now)], Duration::from_secs(7 * 86_400), now)
-                .await;
+        let retired = retire_cold_experiments(
+            &[row("e", &uri, now)],
+            Duration::from_secs(7 * 86_400),
+            now,
+            RolloutStoreOptions::default(),
+        )
+        .await;
         assert!(
             retired.is_empty(),
             "a hot experiment must stay in the table"
@@ -936,9 +986,13 @@ mod retirement_tests {
     #[tokio::test]
     async fn zero_window_disables_retirement() {
         let now = Utc::now().timestamp_millis();
-        let retired =
-            retire_cold_experiments(&[row("e", "/nonexistent", 0)], Duration::from_secs(0), now)
-                .await;
+        let retired = retire_cold_experiments(
+            &[row("e", "/nonexistent", 0)],
+            Duration::from_secs(0),
+            now,
+            RolloutStoreOptions::default(),
+        )
+        .await;
         assert!(retired.is_empty());
     }
 
@@ -952,6 +1006,7 @@ mod retirement_tests {
             &[row("gone", "/no/such/dataset.lance", old)],
             Duration::from_secs(7 * 86_400),
             now,
+            RolloutStoreOptions::default(),
         )
         .await;
         assert!(
@@ -978,17 +1033,18 @@ mod retirement_tests {
             store.flush().await.unwrap();
         }
 
-        let summary = observe_cold("e", &uri).await.unwrap();
+        let summary = observe_cold_with_options("e", &uri, RolloutStoreOptions::default())
+            .await
+            .unwrap();
         assert_eq!(summary.name, "e");
         assert_eq!(
             summary.row_count, 1,
             "a cold read still reports real counts"
         );
 
-        // `observe_cold` takes no `MasterState`, so it structurally cannot
-        // write to the stats table -- asserted here so a future refactor that
-        // hands it one has to justify itself.
-        let second = observe_cold("e", &uri).await.unwrap();
+        let second = observe_cold_with_options("e", &uri, RolloutStoreOptions::default())
+            .await
+            .unwrap();
         assert_eq!(second.row_count, summary.row_count);
     }
 
@@ -996,8 +1052,12 @@ mod retirement_tests {
     /// hit on a registry entry whose data is gone degrades to one skipped row.
     #[tokio::test]
     async fn observe_cold_errors_on_missing_dataset() {
-        assert!(observe_cold("gone", "/no/such/dataset.lance")
-            .await
-            .is_err());
+        assert!(observe_cold_with_options(
+            "gone",
+            "/no/such/dataset.lance",
+            RolloutStoreOptions::default(),
+        )
+        .await
+        .is_err());
     }
 }

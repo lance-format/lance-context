@@ -27,6 +27,18 @@ pub struct MasterConfig {
     #[arg(long, env = "SCAN_CONCURRENCY", default_value_t = 8)]
     pub scan_concurrency: usize,
 
+    /// Total byte budget for the Lance metadata/index caches, shared across
+    /// every rollout store opened by this master process.
+    ///
+    /// Without an explicit shared session, Lance gives each store a fresh
+    /// session with caches defaulting to 6 GiB index + 1 GiB metadata. The
+    /// master opens stores for scans, browsing, compaction, and indexing, so
+    /// per-store sessions make RSS grow with the experiments touched. This
+    /// budget is split internally 6:1 (index:metadata), matching Lance's
+    /// default ratio. `0` restores Lance's per-store default sessions.
+    #[arg(long, env = "ROLLOUT_CACHE_BYTES", default_value = "2147483648")]
+    pub rollout_cache_bytes: usize,
+
     /// Run maintenance (compaction + old-version cleanup) on the `_stats`
     /// dataset every Nth stats-scan round. `_stats` is written delete-then-
     /// append, so each scan adds versions and fragments per experiment; without
@@ -152,4 +164,51 @@ pub struct MasterConfig {
     /// exposed.
     #[arg(long, env = "UI_DIR")]
     pub ui_dir: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn every_config_field_is_an_optional_flag() {
+        let command = MasterConfig::command();
+
+        let positionals: Vec<_> = command
+            .get_positionals()
+            .map(|arg| arg.get_id().to_string())
+            .collect();
+        assert!(
+            positionals.is_empty(),
+            "config fields must be flags, not positional args; found {positionals:?}"
+        );
+
+        for arg in command.get_arguments() {
+            if arg.get_id() == "help" || arg.get_id() == "version" {
+                continue;
+            }
+            assert!(
+                arg.get_long().is_some(),
+                "'{}' has no long flag",
+                arg.get_id()
+            );
+            assert!(
+                arg.get_default_values().len() == 1 || !arg.is_required_set(),
+                "'{}' must have a default or be optional",
+                arg.get_id()
+            );
+        }
+    }
+
+    #[test]
+    fn rollout_cache_defaults_to_two_gib_and_can_be_disabled() {
+        let default = MasterConfig::try_parse_from(["lance-context-master"]).unwrap();
+        assert_eq!(default.rollout_cache_bytes, 2 * 1024 * 1024 * 1024);
+
+        let disabled =
+            MasterConfig::try_parse_from(["lance-context-master", "--rollout-cache-bytes", "0"])
+                .unwrap();
+        assert_eq!(disabled.rollout_cache_bytes, 0);
+    }
 }
