@@ -468,7 +468,7 @@ impl DatagenStore {
         let scanner = match columns {
             Some(columns) => {
                 let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
-                self.lsm_scanner().await?.project(&refs).filter(filter)?
+                self.lsm_scanner().await?.project(&refs)?.filter(filter)?
             }
             None => self.lsm_scanner().await?.filter(filter)?,
         };

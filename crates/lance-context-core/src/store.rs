@@ -1311,7 +1311,7 @@ impl ContextStore {
             let scanner = self
                 .lsm_scanner()
                 .await?
-                .project(&["id", "content_type"])
+                .project(&["id", "content_type"])?
                 .filter(&filter)?;
             let mut stream = scanner.try_into_stream().await?;
             while let Some(batch) = stream.try_next().await? {
@@ -1334,7 +1334,7 @@ impl ContextStore {
             let scanner = self
                 .lsm_scanner()
                 .await?
-                .project(&["external_id", "content_type"])
+                .project(&["external_id", "content_type"])?
                 .filter(&filter)?;
             let mut stream = scanner.try_into_stream().await?;
             while let Some(batch) = stream.try_next().await? {
@@ -1535,6 +1535,12 @@ impl ContextStore {
         if let Some(filters) = filters.filter(|filters| !filters.is_empty()) {
             results.retain(|record| filters.matches(record));
         }
+
+        results.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
 
         if let Some(offset) = offset {
             results = results.into_iter().skip(offset).collect();
@@ -1840,7 +1846,7 @@ impl ContextStore {
         }
         let columns = self.projected_columns(projection);
         let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
-        Ok(scanner.project(&refs))
+        scanner.project(&refs)
     }
 
     /// Fetch a single record's `binary_payload` on demand, without loading it
@@ -1851,7 +1857,7 @@ impl ContextStore {
         let scanner = self
             .lsm_scanner()
             .await?
-            .project(&["id", "binary_payload"])
+            .project(&["id", "binary_payload"])?
             .filter(&filter)?;
         let mut stream = scanner.try_into_stream().await?;
         while let Some(batch) = stream.try_next().await? {

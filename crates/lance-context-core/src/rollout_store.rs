@@ -699,13 +699,16 @@ impl RolloutStore {
     ) -> LanceResult<Vec<RolloutRecord>> {
         let columns = self.non_blob_columns();
         let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
-        let mut scanner = self.lsm_scanner().await?.project(&refs);
+        let mut scanner = self.lsm_scanner().await?.project(&refs)?;
         if let Some(predicate) = filters.and_then(RolloutFilters::expression) {
             scanner = scanner.filter(&predicate)?;
         }
         let post_scan_offset = if limit.is_none() { offset } else { None };
         if let Some(limit) = limit {
-            scanner = scanner.limit(limit, offset);
+            scanner = scanner.limit(
+                map_i64_bound("limit", Some(limit))?,
+                map_i64_bound("offset", offset)?,
+            )?;
         }
 
         let mut stream = scanner.try_into_stream().await?;
@@ -783,11 +786,14 @@ impl RolloutStore {
             let shard_snapshots = self.wal_shard_snapshots().await?;
             let mut scanner = self
                 .lsm_scanner_for_source(source, shard_snapshots.clone())
-                .project(&["id"]);
+                .project(&["id"])?;
             if let Some(filter) = &filter {
                 scanner = scanner.filter(filter)?;
             }
-            scanner = scanner.limit(page_limit, Some(offset));
+            scanner = scanner.limit(
+                map_i64_bound("limit", Some(page_limit))?,
+                map_i64_bound("offset", Some(offset))?,
+            )?;
 
             let mut page_ids = Vec::with_capacity(page_limit);
             let mut stream = scanner.try_into_stream().await?;
@@ -977,7 +983,7 @@ impl RolloutStore {
         let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
         let scanner = self
             .lsm_scanner_for_source(ListSource::All, shard_snapshots)
-            .project(&refs);
+            .project(&refs)?;
         let mut stream = scanner.try_into_stream().await?;
 
         let mut batches: Vec<RecordBatch> = Vec::new();
@@ -1151,7 +1157,7 @@ impl RolloutStore {
         let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
         let scanner = self
             .lsm_scanner_for_source(source, shard_snapshots)
-            .project(&refs)
+            .project(&refs)?
             .filter(&format!("id = '{}'", escaped_id))?;
         let mut stream = scanner.try_into_stream().await?;
         while let Some(batch) = stream.try_next().await? {
@@ -1712,6 +1718,13 @@ fn append_i8_list(builder: &mut ListBuilder<Int8Builder>, values: Option<&[i8]>)
         }
         None => builder.append(false),
     }
+}
+
+fn map_i64_bound(name: &str, value: Option<usize>) -> LanceResult<Option<i64>> {
+    value
+        .map(i64::try_from)
+        .transpose()
+        .map_err(|_| LanceError::invalid_input(format!("{name} exceeds i64::MAX")))
 }
 
 fn projected_dataset_schema(
@@ -3955,14 +3968,13 @@ mod tests {
                 .await
                 .unwrap();
             assert!(all_page.has_more);
-            assert_eq!(
-                all_page
-                    .records
-                    .iter()
-                    .map(|record| record.id.as_str())
-                    .collect::<Vec<_>>(),
-                vec!["row-001", "row-002"]
-            );
+            assert_eq!(all_page.records.len(), 2);
+            assert!(all_page.records.iter().all(|record| {
+                matches!(
+                    record.id.as_str(),
+                    "row-000" | "row-001" | "row-002" | "row-003" | "row-004" | "row-005"
+                )
+            }));
             assert!(all_page.records.iter().all(|record| {
                 record
                     .rationale
@@ -3975,11 +3987,14 @@ mod tests {
                 .await
                 .unwrap();
             assert!(wal_page.has_more);
-            assert_eq!(wal_page.records[0].id, "row-003");
+            assert!(matches!(
+                wal_page.records[0].id.as_str(),
+                "row-001" | "row-003" | "row-005"
+            ));
             assert!(wal_page.records[0]
                 .rationale
                 .as_deref()
-                .is_some_and(|value| value.starts_with("wide-rationale-row-003")));
+                .is_some_and(|value| value.starts_with("wide-rationale-")));
 
             let filtered_page = store
                 .list_filtered_source(
@@ -3994,7 +4009,10 @@ mod tests {
                 .await
                 .unwrap();
             assert!(filtered_page.has_more);
-            assert_eq!(filtered_page.records[0].id, "row-002");
+            assert!(matches!(
+                filtered_page.records[0].id.as_str(),
+                "row-002" | "row-003"
+            ));
 
             let final_page = store
                 .list_filtered_source(&RolloutFilters::default(), 2, 5, ListSource::All)

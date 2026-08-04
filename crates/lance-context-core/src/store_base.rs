@@ -44,7 +44,8 @@ use chrono::{DateTime, Utc};
 use futures::{stream, StreamExt, TryStreamExt};
 use lance::dataset::index::DatasetIndexRemapperOptions;
 use lance::dataset::mem_wal::{
-    DatasetMemWalExt, LsmScanner, ShardManifestStore, ShardSnapshot, ShardWriter, ShardWriterConfig,
+    DatasetMemWalExt, LsmScanner, ShardManifestStore, ShardSnapshot, ShardWriter,
+    ShardWriterConfig, TOMBSTONE,
 };
 use lance::dataset::optimize::{
     commit_compaction, compact_files, plan_compaction, CompactionMetrics, CompactionMode,
@@ -1515,6 +1516,9 @@ pub(crate) fn align_batch_to_schema(
     let source_schema = batch.schema();
 
     for source_field in source_schema.fields() {
+        if source_field.name() == TOMBSTONE {
+            continue;
+        }
         if target_schema.field_with_name(source_field.name()).is_err() {
             return Err(ArrowError::SchemaError(format!(
                 "WAL generation column '{}' does not exist in the base table schema",
