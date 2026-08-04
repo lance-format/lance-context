@@ -54,8 +54,9 @@ pub struct AppState {
     pub rollout_registry: RwLock<RolloutRegistry>,
     pub base_uri: String,
     /// Stable identity of this server instance, used as the MemWAL shard key for
-    /// rollout writes so each instance owns exactly one shard. `None` falls back
-    /// to a single shared shard (single-instance deployments only).
+    /// every server-managed store so each instance owns exactly one shard.
+    /// `None` falls back to a single shared shard (single-instance deployments
+    /// only).
     pub instance_id: Option<String>,
     /// Count-triggered self-merge threshold for rollout MemWAL shards; `0`
     /// disables it. See `RolloutStoreOptions::merge_after_generations`.
@@ -236,6 +237,14 @@ impl AppState {
 
     pub fn context_uri(&self, name: &str) -> String {
         join_uri(&self.base_uri, &format!("{}.lance", name))
+    }
+
+    /// Options shared by every context-store open path in this server.
+    pub(crate) fn context_store_options(&self) -> ContextStoreOptions {
+        ContextStoreOptions {
+            shard_id: self.instance_id.clone(),
+            ..Default::default()
+        }
     }
 
     /// Build a default-configured `AppState` rooted at `base_path`, for tests.
@@ -426,7 +435,7 @@ impl AppState {
         }
 
         let uri = self.context_uri(name);
-        let opened = ContextStore::open_existing_with_options(&uri, ContextStoreOptions::default())
+        let opened = ContextStore::open_existing_with_options(&uri, self.context_store_options())
             .await
             .map_err(AppError::from_lance)?;
         let opened = Arc::new(RwLock::new(opened));

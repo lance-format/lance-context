@@ -52,7 +52,7 @@ pub async fn create_context(
         blob_columns,
         id_index_type,
         distance_metric,
-        ..Default::default()
+        ..state.context_store_options()
     };
 
     let store = ContextStore::open_with_options(&uri, options)
@@ -128,6 +128,9 @@ pub async fn delete_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::routes::records::add_records;
+    use lance_context_api::{AddRecordRequest, AddRecordsRequest};
+    use std::time::Duration;
     use tempfile::TempDir;
 
     fn create_request(name: &str) -> CreateContextRequest {
@@ -165,5 +168,70 @@ mod tests {
             Err(err) => err,
         };
         assert!(matches!(err, AppError::InvalidRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn server_instances_write_contexts_to_distinct_wal_shards() {
+        let dir = TempDir::new().unwrap();
+        let context_name = "shared";
+        let state_a = Arc::new(
+            AppState::new_for_test_with_instance(
+                dir.path().to_path_buf(),
+                Some("context-0".to_string()),
+            )
+            .await,
+        );
+
+        let (_, Json(_)) =
+            create_context(State(state_a.clone()), Json(create_request(context_name)))
+                .await
+                .unwrap();
+        add_text_record(state_a, context_name, "from context-0").await;
+
+        // A second server lazily opens the same dataset. Its instance id must
+        // select a different shard instead of fencing the first server's writer.
+        let state_b = Arc::new(
+            AppState::new_for_test_with_instance(
+                dir.path().to_path_buf(),
+                Some("context-1".to_string()),
+            )
+            .await,
+        );
+        add_text_record(state_b.clone(), context_name, "from context-1").await;
+
+        let store = state_b
+            .get_or_open_context_store(context_name)
+            .await
+            .unwrap();
+        assert_eq!(store.read().await.list(None, None).await.unwrap().len(), 2);
+
+        let mem_wal = dir
+            .path()
+            .join(format!("{context_name}.lance"))
+            .join("_mem_wal");
+        let shard_count = std::fs::read_dir(mem_wal)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .count();
+        assert_eq!(shard_count, 2, "each server instance must own one shard");
+    }
+
+    async fn add_text_record(state: Arc<AppState>, context_name: &str, text: &str) {
+        let request = AddRecordsRequest {
+            records: vec![AddRecordRequest {
+                role: "user".to_string(),
+                content_type: "text/plain".to_string(),
+                text_payload: Some(text.to_string()),
+                ..Default::default()
+            }],
+        };
+        let (_, Json(_)) = tokio::time::timeout(
+            Duration::from_secs(30),
+            add_records(State(state), Path(context_name.to_string()), Json(request)),
+        )
+        .await
+        .expect("context write must not hang on shard contention")
+        .unwrap();
     }
 }
