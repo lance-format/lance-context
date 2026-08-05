@@ -60,6 +60,11 @@ use arrow_array::{
 };
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Schema, TimeUnit};
 use datafusion::datasource::MemTable;
+use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_plan::expressions::PhysicalSortExpr;
+use datafusion::physical_plan::limit::GlobalLimitExec;
+use datafusion::physical_plan::sorts::sort::SortExec;
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
 use datafusion::sql::parser::{DFParser, Statement as DFStatement};
 use datafusion::sql::sqlparser::ast::Statement as SqlStatement;
@@ -764,9 +769,9 @@ impl RolloutStore {
     /// an unbounded full-table count on every UI request. Each source is read in
     /// one projected, filtered, bounded scan. Fragments use the base [`Dataset`]
     /// scanner directly so Lance can push limit/offset into the scan. WAL-backed
-    /// reads page through a narrow `id`-only LSM scan, then take the selected
-    /// rows directly from their physical datasets so wide text columns never
-    /// participate in the full LSM sort.
+    /// reads page through a narrow, deterministic `id`-only top-K sort, then
+    /// take the selected rows directly from their physical datasets so wide
+    /// text columns never participate in the full LSM sort.
     ///
     /// [`ListSource::Fragments`] skips MemWAL manifest discovery entirely, so its
     /// latency is independent of how far the merge backlog has grown.
@@ -790,13 +795,33 @@ impl RolloutStore {
             if let Some(filter) = &filter {
                 scanner = scanner.filter(filter)?;
             }
-            scanner = scanner.limit(
-                map_i64_bound("limit", Some(page_limit))?,
-                map_i64_bound("offset", Some(offset))?,
-            )?;
+
+            // Lance 9's block-list LSM plan is intentionally unordered. Page
+            // boundaries must not inherit that internal union order: otherwise
+            // repeated offset requests can skip or repeat records. Sort only
+            // the narrow key plan and retain at most the requested prefix.
+            let plan = scanner.create_plan().await?;
+            let id_index = plan.schema().index_of("id")?;
+            let fetch = offset.saturating_add(page_limit);
+            let sorted = SortExec::new(
+                [PhysicalSortExpr::new_default(Arc::new(Column::new(
+                    "id", id_index,
+                )))]
+                .into(),
+                plan,
+            )
+            .with_fetch(Some(fetch));
+            let page_plan = Arc::new(GlobalLimitExec::new(
+                Arc::new(sorted),
+                offset,
+                Some(page_limit),
+            ));
+            let ctx = SessionContext::new();
 
             let mut page_ids = Vec::with_capacity(page_limit);
-            let mut stream = scanner.try_into_stream().await?;
+            let mut stream = page_plan
+                .execute(0, ctx.task_ctx())
+                .map_err(|err| LanceError::from(ArrowError::from_external_error(Box::new(err))))?;
             while let Some(batch) = stream.try_next().await? {
                 let ids = column_as::<StringArray>(&batch, "id")?;
                 page_ids.extend((0..ids.len()).map(|row| ids.value(row).to_string()));
@@ -3968,13 +3993,14 @@ mod tests {
                 .await
                 .unwrap();
             assert!(all_page.has_more);
-            assert_eq!(all_page.records.len(), 2);
-            assert!(all_page.records.iter().all(|record| {
-                matches!(
-                    record.id.as_str(),
-                    "row-000" | "row-001" | "row-002" | "row-003" | "row-004" | "row-005"
-                )
-            }));
+            assert_eq!(
+                all_page
+                    .records
+                    .iter()
+                    .map(|record| record.id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["row-001", "row-002"]
+            );
             assert!(all_page.records.iter().all(|record| {
                 record
                     .rationale
@@ -3987,14 +4013,11 @@ mod tests {
                 .await
                 .unwrap();
             assert!(wal_page.has_more);
-            assert!(matches!(
-                wal_page.records[0].id.as_str(),
-                "row-001" | "row-003" | "row-005"
-            ));
+            assert_eq!(wal_page.records[0].id, "row-003");
             assert!(wal_page.records[0]
                 .rationale
                 .as_deref()
-                .is_some_and(|value| value.starts_with("wide-rationale-")));
+                .is_some_and(|value| value.starts_with("wide-rationale-row-003")));
 
             let filtered_page = store
                 .list_filtered_source(
@@ -4009,10 +4032,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(filtered_page.has_more);
-            assert!(matches!(
-                filtered_page.records[0].id.as_str(),
-                "row-002" | "row-003"
-            ));
+            assert_eq!(filtered_page.records[0].id, "row-002");
 
             let final_page = store
                 .list_filtered_source(&RolloutFilters::default(), 2, 5, ListSource::All)

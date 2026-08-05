@@ -760,7 +760,7 @@ mod tests {
         let uri = dir.path().to_string_lossy().to_string();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let store = GenericStore::open(&uri, spec(), sealing()).await.unwrap();
+            let mut store = GenericStore::open(&uri, spec(), sealing()).await.unwrap();
             store
                 .add(&[row(json!({"id": "r1", "user_id": "first"}))])
                 .await
@@ -773,6 +773,15 @@ mod tests {
             let rows = store.list(None, None).await.unwrap();
             assert_eq!(rows.len(), 1, "id is the merge key, so rows dedup");
             assert_eq!(rows[0]["user_id"], json!("second"));
+
+            store.cleanup_wal().await.unwrap();
+            let rows = store.list(None, None).await.unwrap();
+            assert_eq!(rows.len(), 1, "cleanup must not duplicate the merge key");
+            assert_eq!(
+                rows[0]["user_id"],
+                json!("second"),
+                "cleanup must retain the newest WAL value"
+            );
         });
     }
 
