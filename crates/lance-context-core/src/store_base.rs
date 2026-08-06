@@ -259,6 +259,12 @@ pub(crate) struct StorageBase {
     total_compactions: u64,
     /// Error message from the most recent failed compaction on this handle.
     last_compaction_error: Option<String>,
+    /// Explicit time-travel version selected by [`Self::checkout`].
+    ///
+    /// A point-read miss may refresh an ordinary long-lived handle to avoid a
+    /// false negative from a stale manifest, but must never advance a handle
+    /// whose caller deliberately selected a historical version.
+    pinned_version: Option<u64>,
     /// Resident MemWAL writer for this instance's shard, wrapped for `&self`
     /// concurrent access. The [`tokio::sync::Mutex`] is held only to
     /// fetch-or-open and clone the `Arc` (see [`Self::resident_writer`]) and to
@@ -375,6 +381,7 @@ impl StorageBase {
             last_compaction: None,
             total_compactions: 0,
             last_compaction_error: None,
+            pinned_version: None,
             write_writer: tokio::sync::Mutex::new(None),
         };
         // `ensure_mem_wal` may reload the dataset on a concurrent first-writer
@@ -398,7 +405,14 @@ impl StorageBase {
     /// Check out a specific base dataset version (time travel).
     pub async fn checkout(&mut self, version_id: u64) -> LanceResult<()> {
         self.dataset = self.dataset.checkout_version(version_id).await?;
+        self.pinned_version = Some(version_id);
         Ok(())
+    }
+
+    /// Whether this handle was explicitly checked out to a historical version.
+    #[must_use]
+    pub fn is_version_pinned(&self) -> bool {
+        self.pinned_version.is_some()
     }
 
     /// Refresh this handle to the latest base-table manifest while retaining its
@@ -408,7 +422,15 @@ impl StorageBase {
     /// WAL merges committed by another process become visible without paying the
     /// cost of reopening the dataset and rebuilding all session caches.
     pub async fn refresh_latest(&mut self) -> LanceResult<()> {
-        self.dataset.checkout_latest().await
+        self.dataset.checkout_latest().await?;
+        self.pinned_version = None;
+        Ok(())
+    }
+
+    /// Mark this handle as no longer pinned after a concrete store mutates the
+    /// dataset directly.
+    pub(crate) fn clear_version_pin(&mut self) {
+        self.pinned_version = None;
     }
 
     // ---------------------------------------------------------------- writes
@@ -822,6 +844,7 @@ impl StorageBase {
                 "append",
                 self.append_merged_batches(batches, merge_schema).await
             )?;
+            self.pinned_version = None;
         }
 
         // Reuse the shard's *current* epoch rather than claiming a new one:
@@ -849,7 +872,9 @@ impl StorageBase {
                 .await
         )?;
 
-        self.delete_merged_generation_dirs(&merged_paths).await
+        self.delete_merged_generation_dirs(&merged_paths).await?;
+        self.pinned_version = None;
+        Ok(())
     }
 
     /// Delete the merged generations' directories now that no manifest
@@ -966,7 +991,7 @@ impl StorageBase {
         let Some(latest_schema) = self.latest_schema.clone() else {
             return Ok(());
         };
-        self.dataset.checkout_latest().await?;
+        self.refresh_latest().await?;
 
         let base_schema: Arc<Schema> = Arc::new(self.dataset.schema().into());
         align_batch_to_schema(
@@ -1146,6 +1171,7 @@ impl StorageBase {
         self.dataset =
             Self::load_with_options(&uri, self.storage_options.clone(), self.session.clone())
                 .await?;
+        self.pinned_version = None;
         Ok(())
     }
 

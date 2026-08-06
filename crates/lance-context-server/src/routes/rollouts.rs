@@ -478,14 +478,57 @@ pub async fn list_rollouts(
     }))
 }
 
+/// Run the normal shared-lock point lookup first, then refresh and retry under
+/// the exclusive lock only when it would otherwise return a false miss from a
+/// stale cached base dataset.
+async fn get_rollout_refreshing_on_miss(
+    store_lock: &RwLock<RolloutStore>,
+    id: &str,
+) -> Result<Option<RolloutRecord>, AppError> {
+    {
+        let store = store_lock.read().await;
+        let record = store.get_by_id(id).await.map_err(AppError::from_lance)?;
+        if record.is_some() || store.is_version_pinned() {
+            return Ok(record);
+        }
+    }
+
+    let mut store = store_lock.write().await;
+    if !store.is_version_pinned() {
+        store.refresh_latest().await.map_err(AppError::from_lance)?;
+    }
+    store.get_by_id(id).await.map_err(AppError::from_lance)
+}
+
+/// Blob equivalent of [`get_rollout_refreshing_on_miss`]. A successful payload
+/// hit stays on the shared-lock fast path; only `None` pays the manifest refresh
+/// and retry.
+async fn get_rollout_blob_refreshing_on_miss(
+    store_lock: &RwLock<RolloutStore>,
+    id: &str,
+) -> Result<Option<Vec<u8>>, AppError> {
+    {
+        let store = store_lock.read().await;
+        let payload = store.get_blob(id).await.map_err(AppError::from_lance)?;
+        if payload.is_some() || store.is_version_pinned() {
+            return Ok(payload);
+        }
+    }
+
+    let mut store = store_lock.write().await;
+    if !store.is_version_pinned() {
+        store.refresh_latest().await.map_err(AppError::from_lance)?;
+    }
+    store.get_blob(id).await.map_err(AppError::from_lance)
+}
+
 pub async fn get_rollout(
     State(state): State<Arc<AppState>>,
     Path((name, id)): Path<(String, String)>,
 ) -> Result<Json<GetRolloutResponse>, AppError> {
     let store_lock = state.get_or_open_rollout_store(&name).await?;
 
-    let store = store_lock.read().await;
-    let record = store.get_by_id(&id).await.map_err(AppError::from_lance)?;
+    let record = get_rollout_refreshing_on_miss(&store_lock, &id).await?;
 
     Ok(Json(GetRolloutResponse {
         record: record.map(rollout_record_to_dto),
@@ -506,11 +549,8 @@ pub async fn fetch_rollout_blob(
 ) -> Result<Response, AppError> {
     let store_lock = state.get_or_open_rollout_store(&name).await?;
 
-    let store = store_lock.read().await;
-    let bytes = store
-        .get_blob(&id)
-        .await
-        .map_err(AppError::from_lance)?
+    let bytes = get_rollout_blob_refreshing_on_miss(&store_lock, &id)
+        .await?
         .ok_or_else(|| AppError::NotFound(format!("Rollout '{}' has no payload", id)))?;
 
     // Reserve now that the payload size is known, and hold the reservation for
@@ -518,7 +558,6 @@ pub async fn fetch_rollout_blob(
     // blob resident until the last frame flushes, so the budget must account for
     // it until then. Reject with 503 if the budget is currently exhausted.
     let reservation = acquire_blob_budget(&state, bytes.len())?;
-    drop(store);
 
     let len = bytes.len();
     Response::builder()
@@ -764,6 +803,116 @@ mod tests {
         .await
         .expect("create rollout store");
         (state, dir)
+    }
+
+    #[tokio::test]
+    async fn point_lookup_routes_refresh_stale_base_only_after_a_miss() {
+        let (state, _dir) = rollout_state().await;
+        let cached = state.get_or_open_rollout_store("rl").await.unwrap();
+        let uri = state.rollout_uri("rl");
+        let mut writer = RolloutStore::open_existing_with_options(
+            &uri,
+            RolloutStoreOptions {
+                shard_id: Some("external-writer".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let first = rollout_record_from_add_request(&record_with_size("merged-record", None));
+        writer.add(std::slice::from_ref(&first)).await.unwrap();
+        writer.flush().await.unwrap();
+        assert_eq!(writer.cleanup_own_shard().await.unwrap(), 1);
+        assert_eq!(writer.pending_wal_generations().await.unwrap(), 0);
+        assert!(writer.version() > cached.read().await.version());
+
+        let Json(found) = get_rollout(
+            State(state.clone()),
+            Path(("rl".to_string(), first.id.clone())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(found.record.unwrap().id, first.id);
+        assert_eq!(cached.read().await.version(), writer.version());
+
+        let cached_version = cached.read().await.version();
+        let payload = b"externally-merged-blob".to_vec();
+        let mut blob_request = record_with_size("merged-blob", Some(payload.len() as i64));
+        blob_request.binary_payload = Some(payload.clone());
+        let blob_record = rollout_record_from_add_request(&blob_request);
+        writer
+            .add(std::slice::from_ref(&blob_record))
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        assert_eq!(writer.cleanup_own_shard().await.unwrap(), 1);
+        assert!(writer.version() > cached_version);
+
+        // A hit in the cached base remains on the shared-lock fast path and
+        // does not advance the handle just because a newer version exists.
+        let Json(found) = get_rollout(
+            State(state.clone()),
+            Path(("rl".to_string(), first.id.clone())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(found.record.unwrap().id, first.id);
+        assert_eq!(cached.read().await.version(), cached_version);
+
+        let response = fetch_rollout_blob(
+            State(state.clone()),
+            Path(("rl".to_string(), blob_record.id)),
+        )
+        .await
+        .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_ref(), payload.as_slice());
+        assert_eq!(cached.read().await.version(), writer.version());
+    }
+
+    #[tokio::test]
+    async fn point_lookup_miss_preserves_explicit_checkout() {
+        let (state, _dir) = rollout_state().await;
+        let cached = state.get_or_open_rollout_store("rl").await.unwrap();
+        let pinned_version = cached.read().await.version();
+        let uri = state.rollout_uri("rl");
+        let mut writer = RolloutStore::open_existing_with_options(
+            &uri,
+            RolloutStoreOptions {
+                shard_id: Some("external-writer".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let record = rollout_record_from_add_request(&record_with_size("future-record", None));
+        writer.add(std::slice::from_ref(&record)).await.unwrap();
+        writer.flush().await.unwrap();
+        assert_eq!(writer.cleanup_own_shard().await.unwrap(), 1);
+        assert!(writer.version() > pinned_version);
+
+        let Json(version) = checkout_rollout(
+            State(state.clone()),
+            Path("rl".to_string()),
+            Json(CheckoutRequest {
+                version: pinned_version,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(version.version, pinned_version);
+        assert!(cached.read().await.is_version_pinned());
+
+        let Json(missing) = get_rollout(State(state), Path(("rl".to_string(), record.id)))
+            .await
+            .unwrap();
+        assert!(missing.record.is_none());
+        let cached = cached.read().await;
+        assert_eq!(cached.version(), pinned_version);
+        assert!(cached.is_version_pinned());
     }
 
     /// Build a JSON append request for `add_rollouts`, with an optional query.

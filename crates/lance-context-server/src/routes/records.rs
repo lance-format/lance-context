@@ -11,13 +11,100 @@ use lance_context_api::{
     UpsertRecordResponse, UpsertRecordsRequest, UpsertRecordsResponse, UpsertResultDto,
 };
 use lance_context_core::{
-    patch_from_dto, record_from_add_request, record_to_dto, ContextRecord, LifecycleQueryOptions,
-    RecordFilters,
+    patch_from_dto, record_from_add_request, record_to_dto, ContextRecord, ContextStore,
+    LifecycleQueryOptions, RecordFilters,
 };
+use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::error::AppError;
 use crate::state::AppState;
+
+async fn get_context_record_refreshing_on_miss(
+    store_lock: &RwLock<ContextStore>,
+    id: &str,
+) -> Result<Option<ContextRecord>, AppError> {
+    {
+        let store = store_lock.read().await;
+        let record = store.get(id).await.map_err(AppError::from_lance)?;
+        if record.is_some() || store.is_version_pinned() {
+            return Ok(record);
+        }
+    }
+
+    let mut store = store_lock.write().await;
+    if !store.is_version_pinned() {
+        store.refresh_latest().await.map_err(AppError::from_lance)?;
+    }
+    store.get(id).await.map_err(AppError::from_lance)
+}
+
+async fn materialize_context_payload(
+    store: &ContextStore,
+    record: Option<ContextRecord>,
+    id: &str,
+) -> Result<Option<(ContextRecord, Vec<u8>)>, AppError> {
+    let Some(record) = record else {
+        return Ok(None);
+    };
+    if record.payload_uri.is_none() {
+        return Err(AppError::InvalidRequest(format!(
+            "record '{}' has no external payload reference to fetch",
+            id
+        )));
+    }
+    let bytes = store
+        .fetch_payload(id)
+        .await
+        .map_err(AppError::from_lance)?
+        .ok_or_else(|| AppError::NotFound(format!("Record '{}' does not exist", id)))?;
+    Ok(Some((record, bytes)))
+}
+
+async fn fetch_context_payload_refreshing_on_miss(
+    store_lock: &RwLock<ContextStore>,
+    id: &str,
+) -> Result<Option<(ContextRecord, Vec<u8>)>, AppError> {
+    {
+        let store = store_lock.read().await;
+        let record = store.get_by_id(id).await.map_err(AppError::from_lance)?;
+        if record.is_some() || store.is_version_pinned() {
+            return materialize_context_payload(&store, record, id).await;
+        }
+    }
+
+    let mut store = store_lock.write().await;
+    if !store.is_version_pinned() {
+        store.refresh_latest().await.map_err(AppError::from_lance)?;
+    }
+    let record = store.get_by_id(id).await.map_err(AppError::from_lance)?;
+    materialize_context_payload(&store, record, id).await
+}
+
+async fn get_context_by_external_id_refreshing_on_miss(
+    store_lock: &RwLock<ContextStore>,
+    external_id: &str,
+) -> Result<Option<ContextRecord>, AppError> {
+    {
+        let store = store_lock.read().await;
+        let record = store
+            .get_by_external_id(external_id)
+            .await
+            .map_err(AppError::from_lance)?;
+        if record.is_some() || store.is_version_pinned() {
+            return Ok(record);
+        }
+    }
+
+    let mut store = store_lock.write().await;
+    if !store.is_version_pinned() {
+        store.refresh_latest().await.map_err(AppError::from_lance)?;
+    }
+    store
+        .get_by_external_id(external_id)
+        .await
+        .map_err(AppError::from_lance)
+}
 
 pub async fn add_records(
     State(state): State<Arc<AppState>>,
@@ -219,8 +306,7 @@ pub async fn get_record(
 ) -> Result<Json<GetRecordResponse>, AppError> {
     let store_lock = state.get_or_open_context_store(&name).await?;
 
-    let store = store_lock.read().await;
-    let record = store.get(&id).await.map_err(AppError::from_lance)?;
+    let record = get_context_record_refreshing_on_miss(&store_lock, &id).await?;
 
     Ok(Json(GetRecordResponse {
         record: record.map(record_to_dto),
@@ -238,22 +324,8 @@ pub async fn fetch_payload(
 ) -> Result<Response, AppError> {
     let store_lock = state.get_or_open_context_store(&name).await?;
 
-    let store = store_lock.read().await;
-    let record = store
-        .get_by_id(&id)
-        .await
-        .map_err(AppError::from_lance)?
-        .ok_or_else(|| AppError::NotFound(format!("Record '{}' does not exist", id)))?;
-    if record.payload_uri.is_none() {
-        return Err(AppError::InvalidRequest(format!(
-            "record '{}' has no external payload reference to fetch",
-            id
-        )));
-    }
-    let bytes = store
-        .fetch_payload(&id)
-        .await
-        .map_err(AppError::from_lance)?
+    let (record, bytes) = fetch_context_payload_refreshing_on_miss(&store_lock, &id)
+        .await?
         .ok_or_else(|| AppError::NotFound(format!("Record '{}' does not exist", id)))?;
 
     let content_type = if record.content_type.is_empty() {
@@ -279,11 +351,8 @@ pub async fn get_record_by_external_id(
 ) -> Result<Json<GetRecordResponse>, AppError> {
     let store_lock = state.get_or_open_context_store(&name).await?;
 
-    let store = store_lock.read().await;
-    let record = store
-        .get_by_external_id(&params.external_id)
-        .await
-        .map_err(AppError::from_lance)?;
+    let record =
+        get_context_by_external_id_refreshing_on_miss(&store_lock, &params.external_id).await?;
 
     Ok(Json(GetRecordResponse {
         record: record.map(record_to_dto),
@@ -415,7 +484,7 @@ mod tests {
         AddRecordRequest, AddRecordsRequest, RecordPatchDto, RelationshipDto, UpdateRecordRequest,
         UpsertRecordRequest, UpsertRecordsRequest,
     };
-    use lance_context_core::ContextStore;
+    use lance_context_core::{ContextStore, ContextStoreOptions};
     use tempfile::TempDir;
     use tokio::sync::RwLock;
 
@@ -446,6 +515,54 @@ mod tests {
             text_payload: Some(text.to_string()),
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn point_reads_refresh_a_base_advanced_by_an_external_writer() {
+        let context_name = "ctx";
+        let (state, _dir) = test_state(context_name).await;
+        let cached = state.get_or_open_context_store(context_name).await.unwrap();
+        let mut writer = ContextStore::open_existing_with_options(
+            &state.context_uri(context_name),
+            ContextStoreOptions {
+                shard_id: Some("external-writer".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut request = text_record("externally merged");
+        request.external_id = Some("external-record".to_string());
+        let record = record_from_add_request(
+            &request,
+            "merged-context-record".to_string(),
+            "external-run".to_string(),
+        );
+        writer.add(std::slice::from_ref(&record)).await.unwrap();
+        assert_eq!(writer.cleanup_wal().await.unwrap(), 1);
+        assert_eq!(writer.pending_wal_generations().await.unwrap(), 0);
+        assert!(writer.version() > cached.read().await.version());
+
+        let Json(found) = get_record(
+            State(state.clone()),
+            Path((context_name.to_string(), record.id.clone())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(found.record.unwrap().id, record.id);
+        assert_eq!(cached.read().await.version(), writer.version());
+
+        let Json(found) = get_record_by_external_id(
+            State(state),
+            Path(context_name.to_string()),
+            Query(ExternalIdParams {
+                external_id: "external-record".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(found.record.unwrap().id, record.id);
     }
 
     #[tokio::test]
