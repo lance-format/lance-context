@@ -16,6 +16,12 @@ export interface ExperimentSummary {
 export interface ExperimentListResponse {
   experiments: ExperimentSummary[];
   total: number;
+  /**
+   * Set when the master served this list from its in-memory snapshot because
+   * the stats table was busy. Rows are then at most one scan interval old, and
+   * a search may omit retired experiments.
+   */
+  stale?: boolean;
 }
 
 export interface Relationship {

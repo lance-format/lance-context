@@ -226,8 +226,6 @@ async fn scan_once_inner(state: &Arc<MasterState>) -> lance::Result<usize> {
         .filter(|(_, row)| matches!(row, Some((_, true))))
         .count();
 
-    let mut stats = state.stats.lock().await;
-
     // Build the round's snapshot. This replaces the whole table in one commit
     // instead of two commits per experiment, and subsumes the old
     // reconcile-remove pass: an experiment absent from the registry is simply
@@ -256,9 +254,23 @@ async fn scan_once_inner(state: &Arc<MasterState>) -> lance::Result<usize> {
     // dropped, because a row absent from this table is invisible to both
     // auto-sweeps forever. See `retire_cold_experiments`.
     //
-    // Done before the snapshot is written so a retirement takes effect in the
-    // same commit rather than leaving a round where the row is stale.
+    // # This must not hold the stats lock
+    //
+    // Retirement genuinely rewrites data: per experiment it opens the store,
+    // runs `cleanup_own_shard` (up to `RETIRE_TIMEOUT`, 600s), waits on the
+    // process-wide compaction semaphore, and compacts (another 600s). It is a
+    // serial loop over every cold row. Running that while holding
+    // `state.stats` put up to `N_cold x ~20min` of object-store IO inside the
+    // mutex that `GET /experiments` needs for its only data source -- and
+    // blocked on a semaphore *inside* a mutex, so a slow compaction elsewhere
+    // in the process extended the hold further. That is the wedge behind
+    // `/experiments` hanging in production.
+    //
+    // Nothing here needs the lock: the loop reads `snapshot` (a local) and
+    // returns a set of names. Taking the lock afterwards, for the write alone,
+    // is equivalent and keeps the critical section to one commit.
     let retire_after = Duration::from_secs(state.config.stats_cold_retire_secs);
+    let retire_start = std::time::Instant::now();
     let retired = retire_cold_experiments(
         &snapshot,
         retire_after,
@@ -271,7 +283,11 @@ async fn scan_once_inner(state: &Arc<MasterState>) -> lance::Result<usize> {
     if !retired.is_empty() {
         snapshot.retain(|row| !retired.contains(&row.name));
     }
+    metrics::histogram!("master_stats_retire_duration_seconds")
+        .record(retire_start.elapsed().as_secs_f64());
     metrics::gauge!("master_stats_hot_experiments").set(snapshot.len() as f64);
+
+    let mut stats = state.stats.lock().await;
 
     let mut total_rows: i64 = 0;
     let mut total_fragments: i64 = 0;
@@ -301,6 +317,13 @@ async fn scan_once_inner(state: &Arc<MasterState>) -> lance::Result<usize> {
     if let Err(e) = write {
         tracing::warn!(error = %e, "stats snapshot write failed");
     }
+
+    // Publish the round's snapshot for the read path. Done after the write so
+    // the cache never advertises rows that failed to commit, and while still
+    // holding the stats lock so a concurrent round cannot interleave and
+    // publish an older snapshot over a newer one.
+    *state.stats_cache.write().await = Arc::new(snapshot);
+    drop(stats);
 
     metrics::histogram!("master_scan_duration_seconds").record(scan_start.elapsed().as_secs_f64());
     // How much of the round was avoided by the version check. A ratio near 1 is

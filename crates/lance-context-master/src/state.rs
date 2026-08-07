@@ -11,7 +11,7 @@ use tokio::sync::{Mutex, RwLock, Semaphore};
 
 use crate::config::MasterConfig;
 use crate::discovery;
-use crate::stats_store::StatsStore;
+use crate::stats_store::{StatRow, StatsStore};
 use crate::task_store::TaskStore;
 
 /// Bounded number of rollout handles retained by the master data browser.
@@ -62,6 +62,21 @@ pub struct MasterState {
     pub registry: RwLock<RolloutRegistry>,
     /// Periodically-refreshed per-experiment metrics (master-owned).
     pub stats: Mutex<StatsStore>,
+    /// Last snapshot written to the stats table, kept in memory so
+    /// `GET /experiments` can answer without touching `stats`.
+    ///
+    /// `stats` is an exclusive `Mutex` because every `StatsStore` read method
+    /// takes `&mut self`, so the read path has no way to run concurrently with
+    /// a scan round. When a round is slow, requests queued on that mutex with
+    /// no timeout and no fallback -- the handler simply hung, which is how a
+    /// wedged scan turned into a wedged UI.
+    ///
+    /// This cache is the fallback. The handler tries the lock, and on
+    /// contention serves the last snapshot and marks the response `stale`. A
+    /// slightly-old list beats an unbounded hang, and the staleness is visible
+    /// to the caller rather than silent.
+    pub stats_cache: RwLock<Arc<Vec<StatRow>>>,
+
     /// Read handles used by the records browser, retained to reuse Lance
     /// session and fragment metadata caches across requests.
     record_stores: Mutex<LruCache<String, Arc<RwLock<RolloutStore>>>>,
@@ -129,6 +144,7 @@ impl MasterState {
         let state = Arc::new(Self {
             registry: RwLock::new(registry),
             stats: Mutex::new(stats),
+            stats_cache: RwLock::new(Arc::new(Vec::new())),
             record_stores: Mutex::new(LruCache::new(
                 NonZeroUsize::new(RECORD_STORE_CACHE_CAPACITY).unwrap(),
             )),
@@ -221,6 +237,7 @@ mod tests {
             merge_wal_min_generations: 8,
             worker_endpoints: vec![],
             task_concurrency: 4,
+            merge_wal_concurrency: 4,
             etcd_endpoints: std::env::var("ETCD_TEST_ENDPOINTS")
                 .map(|value| value.split(',').map(str::to_string).collect())
                 .unwrap_or_default(),

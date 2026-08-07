@@ -941,6 +941,7 @@ mod tests {
             merge_wal_min_generations: 8,
             worker_endpoints: vec![],
             task_concurrency: 4,
+            merge_wal_concurrency: 4,
             etcd_endpoints: vec![],
             etcd_prefix: "/test".to_string(),
             etcd_username: None,

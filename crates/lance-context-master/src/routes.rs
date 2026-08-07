@@ -23,6 +23,7 @@ use crate::error::MasterError;
 use crate::scanner;
 use crate::scheduler;
 use crate::state::MasterState;
+use crate::stats_store::StatRow;
 
 /// Query params for the experiment listing.
 #[derive(Debug, Deserialize)]
@@ -130,56 +131,101 @@ pub async fn list_experiments(
 ) -> Result<Json<ExperimentListResponse>, MasterError> {
     let search = params.search.as_deref().filter(|s| !s.is_empty());
 
-    let (mut experiments, mut total) = {
-        let mut stats = state.stats.lock().await;
-        let total = stats.count(search).await.map_err(MasterError::from_lance)?;
-        let rows = stats
-            .list(search, params.limit, params.offset)
-            .await
-            .map_err(MasterError::from_lance)?;
-        let experiments: Vec<ExperimentSummary> =
-            rows.into_iter().map(|r| r.into_summary()).collect();
-        (experiments, total)
+    // Try the authoritative table, but never block on it.
+    //
+    // `state.stats` is an exclusive mutex held for the whole write phase of a
+    // scan round. This handler is the only source for the default view, so a
+    // bare `lock().await` here -- with no timeout, no fallback, and no
+    // `TimeoutLayer` on the router -- meant a slow round wedged the UI
+    // outright. Serving the previous snapshot with `stale: true` is strictly
+    // better: the data is at most one scan interval old, and the caller can
+    // see that it is.
+    let (mut experiments, mut total, stale) = match state.stats.try_lock() {
+        Ok(mut stats) => {
+            let total = stats.count(search).await.map_err(MasterError::from_lance)?;
+            let rows = stats
+                .list(search, params.limit, params.offset)
+                .await
+                .map_err(MasterError::from_lance)?;
+            let experiments: Vec<ExperimentSummary> =
+                rows.into_iter().map(|r| r.into_summary()).collect();
+            (experiments, total, false)
+        }
+        Err(_) => {
+            metrics::counter!("master_experiments_served_stale_total").increment(1);
+            let cached = state.stats_cache.read().await.clone();
+            let matching: Vec<&StatRow> = cached
+                .iter()
+                .filter(|row| search.is_none_or(|q| row.name.contains(q)))
+                .collect();
+            let total = matching.len() as i64;
+            let experiments: Vec<ExperimentSummary> = matching
+                .into_iter()
+                .skip(params.offset)
+                .take(params.limit)
+                .map(|row| row.clone().into_summary())
+                .collect();
+            tracing::debug!(
+                returned = experiments.len(),
+                "stats lock busy; serving cached experiment list"
+            );
+            (experiments, total, true)
+        }
     };
 
     if let Some(query) = search {
         // Retired experiments have no stats row, so a search that only consulted
         // the stats table would silently omit them. The registry is the
         // authoritative list of what exists.
-        let known: HashSet<String> = experiments.iter().map(|e| e.name.clone()).collect();
-        let matches: Vec<_> = state
-            .registry
-            .write()
-            .await
-            .list()
-            .await
-            .map_err(MasterError::from_lance)?
-            .into_iter()
-            .filter(|entry| entry.name.contains(query) && !known.contains(&entry.name))
-            .collect();
+        //
+        // Skipped when serving stale: this branch takes the registry write lock
+        // and then opens datasets on demand via `observe_cold`. We are already
+        // here because the process is busy, so doing the most expensive work in
+        // the handler is exactly wrong -- it would turn lock contention into a
+        // second, slower stall. Retired experiments are simply omitted from a
+        // degraded search; the next uncontended request finds them.
+        if stale {
+            tracing::debug!("stats lock busy; skipping registry search fallback");
+        } else {
+            let known: HashSet<String> = experiments.iter().map(|e| e.name.clone()).collect();
+            let matches: Vec<_> = state
+                .registry
+                .write()
+                .await
+                .list()
+                .await
+                .map_err(MasterError::from_lance)?
+                .into_iter()
+                .filter(|entry| entry.name.contains(query) && !known.contains(&entry.name))
+                .collect();
 
-        total += matches.len() as i64;
+            total += matches.len() as i64;
 
-        // Observe the retired matches this page needs. Bounded by the page
-        // size: a search matching thousands of cold experiments must not open
-        // thousands of datasets to render one page.
-        let want = params.limit.saturating_sub(experiments.len());
-        for entry in matches.into_iter().take(want) {
-            match scanner::observe_cold(&state, &entry.name, &entry.uri).await {
-                Ok(summary) => experiments.push(summary),
-                Err(e) => {
-                    tracing::warn!(
-                        store = %entry.name,
-                        error = %e,
-                        "search: failed to observe retired experiment"
-                    );
+            // Observe the retired matches this page needs. Bounded by the page
+            // size: a search matching thousands of cold experiments must not open
+            // thousands of datasets to render one page.
+            let want = params.limit.saturating_sub(experiments.len());
+            for entry in matches.into_iter().take(want) {
+                match scanner::observe_cold(&state, &entry.name, &entry.uri).await {
+                    Ok(summary) => experiments.push(summary),
+                    Err(e) => {
+                        tracing::warn!(
+                            store = %entry.name,
+                            error = %e,
+                            "search: failed to observe retired experiment"
+                        );
+                    }
                 }
             }
         }
         experiments.sort_by(|a, b| a.name.cmp(&b.name));
     }
 
-    Ok(Json(ExperimentListResponse { experiments, total }))
+    Ok(Json(ExperimentListResponse {
+        experiments,
+        total,
+        stale,
+    }))
 }
 
 /// `GET /api/v1/experiments/{name}`
@@ -621,6 +667,7 @@ mod tests {
             merge_wal_min_generations: 8,
             worker_endpoints: vec![],
             task_concurrency: 4,
+            merge_wal_concurrency: 4,
             etcd_endpoints: test_etcd_endpoints(),
             etcd_prefix: format!("/lance-context/test/{}", generate_id()),
             etcd_username: None,
@@ -735,6 +782,92 @@ mod tests {
         .unwrap();
         assert_eq!(one.total, 1);
         assert_eq!(one.experiments[0].name, "exp-1");
+    }
+
+    /// `/experiments` must answer even while a scan round holds the stats lock.
+    ///
+    /// This is the production wedge: the handler's only data source is an
+    /// exclusive `Mutex`, so a slow scan round (retirement, first-pass
+    /// maintenance) used to make the endpoint hang with no timeout and no
+    /// fallback. Holding the lock for the duration of the call reproduces that
+    /// exactly; the assertion is that we get a bounded, flagged response
+    /// instead of blocking.
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn list_experiments_serves_cache_when_stats_lock_is_held() {
+        let dir = TempDir::new().unwrap();
+        let state = MasterState::new(test_config(&dir)).await.unwrap();
+
+        for i in 0..2 {
+            let name = format!("exp-{i}");
+            let uri = state.rollout_uri(&name);
+            RolloutStore::open(&uri).await.unwrap();
+            state
+                .registry
+                .write()
+                .await
+                .upsert(&name, &uri)
+                .await
+                .unwrap();
+        }
+        // Populates both the stats table and the in-memory cache.
+        scanner::scan_once(&state).await.unwrap();
+
+        // Simulate a scan round in its write phase.
+        let held = state.stats.lock().await;
+
+        let listed = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            list_experiments(
+                State(state.clone()),
+                Query(ListParams {
+                    search: None,
+                    limit: 50,
+                    offset: 0,
+                }),
+            ),
+        )
+        .await
+        .expect("must not block on the stats lock");
+
+        let Json(resp) = listed.unwrap();
+        assert!(resp.stale, "a cache-served response must be flagged stale");
+        assert_eq!(resp.total, 2);
+        assert_eq!(resp.experiments.len(), 2);
+
+        // Pagination and search still apply to the cached rows.
+        let Json(page) = list_experiments(
+            State(state.clone()),
+            Query(ListParams {
+                search: Some("exp-1".to_string()),
+                limit: 50,
+                offset: 0,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(page.stale);
+        assert_eq!(page.experiments.len(), 1);
+        assert_eq!(page.experiments[0].name, "exp-1");
+
+        drop(held);
+
+        // Once the lock frees, the authoritative path is used again.
+        let Json(fresh) = list_experiments(
+            State(state.clone()),
+            Query(ListParams {
+                search: None,
+                limit: 50,
+                offset: 0,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !fresh.stale,
+            "an uncontended request must read the stats table"
+        );
+        assert_eq!(fresh.total, 2);
     }
 
     #[tokio::test]

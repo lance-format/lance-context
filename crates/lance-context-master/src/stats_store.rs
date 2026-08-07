@@ -411,6 +411,23 @@ impl StatsStore {
     ///
     /// `column` is a fixed identifier chosen by the two callers above, never
     /// caller input, so it is safe to interpolate; `threshold` is an `i64`.
+    ///
+    /// # Why the limit is not pushed into the scan
+    ///
+    /// It used to be: `scanner.limit(limit)` ran *before* any ordering, and the
+    /// rows were then sorted by `name`. Which `limit` rows came back was
+    /// therefore scan order — effectively arbitrary. During a backlog that is
+    /// actively harmful: an experiment with 15k fragments had no better chance
+    /// of being swept than one with 17, so the worst offenders could go
+    /// untouched for many sweeps while the cap was spent on nearly-clean
+    /// experiments.
+    ///
+    /// The predicate is still pushed down, so the scan reads only rows above
+    /// the threshold — the property that pushdown was added for. Ordering by
+    /// the threshold column descending means each sweep spends its budget on
+    /// the largest backlogs first. The materialised set is bounded by how many
+    /// experiments are genuinely above the threshold, and each row is a handful
+    /// of scalars.
     async fn list_above(
         &mut self,
         column: &str,
@@ -420,13 +437,18 @@ impl StatsStore {
         self.dataset.checkout_latest().await?;
         let mut scanner = self.dataset.scan();
         scanner.filter(&format!("{column} >= {threshold}"))?;
-        scanner.limit(Some(limit as i64), None)?;
         let mut stream = scanner.try_into_stream().await?;
         let mut rows = Vec::new();
         while let Some(batch) = stream.try_next().await? {
             rows.extend(Self::batch_to_rows(&batch)?);
         }
-        rows.sort_by(|a, b| a.name.cmp(&b.name));
+        // Worst backlog first; `name` only breaks ties, so pagination-style
+        // stability is preserved among equal counts.
+        let key = |row: &StatRow| match column {
+            "pending_wal_generations" => row.pending_wal_generations,
+            _ => row.fragment_count,
+        };
+        rows.sort_by(|a, b| key(b).cmp(&key(a)).then_with(|| a.name.cmp(&b.name)));
         rows.truncate(limit);
         Ok(rows)
     }
@@ -681,6 +703,75 @@ mod tests {
         with.last_compaction = 123;
         assert_eq!(with.into_summary().last_compaction, Some(123));
     }
+
+    /// The sweeps' budget must be spent on the worst backlogs.
+    ///
+    /// The limit used to be pushed into the scan and applied *before* the sort,
+    /// so which rows came back was scan order. During a real backlog that meant
+    /// a 15k-fragment experiment could lose its slot to a 17-fragment one for
+    /// many sweeps in a row.
+    #[tokio::test]
+    async fn list_above_fragment_count_returns_worst_backlog_first() {
+        let dir = TempDir::new().unwrap();
+        let mut s = new_store(&dir).await;
+
+        // Inserted in ascending order so a scan-order result would return the
+        // smallest first, and name order would return "exp-a" (the smallest).
+        for (name, fragments) in [("exp-a", 20), ("exp-b", 5_000), ("exp-c", 15_000)] {
+            let mut row = sample(name, 100);
+            row.fragment_count = fragments;
+            s.upsert(&row).await.unwrap();
+        }
+
+        let rows = s.list_above_fragment_count(16, 2).await.unwrap();
+        assert_eq!(rows.len(), 2, "the cap must still be honored");
+        assert_eq!(
+            rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            vec!["exp-c", "exp-b"],
+            "the two largest backlogs must be swept first, not the first two scanned"
+        );
+    }
+
+    /// Rows below the threshold must stay excluded — ordering by backlog must
+    /// not accidentally widen what the sweep acts on.
+    #[tokio::test]
+    async fn list_above_fragment_count_still_applies_threshold() {
+        let dir = TempDir::new().unwrap();
+        let mut s = new_store(&dir).await;
+        for (name, fragments) in [("small", 2), ("big", 900)] {
+            let mut row = sample(name, 10);
+            row.fragment_count = fragments;
+            s.upsert(&row).await.unwrap();
+        }
+        let rows = s.list_above_fragment_count(16, 10).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "big");
+    }
+
+    /// The WAL sweep orders by its own column, not by `fragment_count`.
+    #[tokio::test]
+    async fn list_above_pending_wal_orders_by_generations() {
+        let dir = TempDir::new().unwrap();
+        let mut s = new_store(&dir).await;
+
+        // `worst` has the most pending generations but the fewest fragments, so
+        // ordering by the wrong column puts it last.
+        let mut worst = sample("worst", 10);
+        worst.pending_wal_generations = 98;
+        worst.fragment_count = 1;
+        let mut mild = sample("mild", 10);
+        mild.pending_wal_generations = 9;
+        mild.fragment_count = 9_000;
+        s.upsert(&worst).await.unwrap();
+        s.upsert(&mild).await.unwrap();
+
+        let rows = s.list_above_pending_wal(8, 1).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].name, "worst",
+            "the WAL sweep must rank by pending generations, not fragments"
+        );
+    }
 }
 
 /// Tests pinning the write-amplification and pagination properties that make
@@ -854,8 +945,9 @@ mod scale_tests {
                 .iter()
                 .map(|r| r.fragment_count)
                 .collect::<Vec<_>>(),
-            vec![16, 17, 18, 19],
-            "threshold query must return exactly the rows over the threshold"
+            vec![19, 18, 17, 16],
+            "threshold query must return exactly the rows over the threshold, \
+             worst backlog first"
         );
 
         let mergeable = s.list_above_pending_wal(30, 100).await.unwrap();
