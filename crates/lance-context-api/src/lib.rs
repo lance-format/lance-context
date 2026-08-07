@@ -1388,6 +1388,15 @@ pub struct ExperimentListResponse {
     /// Total number of experiments matching the (optional) search filter,
     /// ignoring pagination.
     pub total: i64,
+    /// Whether this response was served from the master's in-memory snapshot
+    /// because the stats table was busy.
+    ///
+    /// The rows are then at most one scan interval old, and a `search` may omit
+    /// retired experiments that an uncontended request would have found.
+    /// Defaults to `false` so older clients and stored payloads deserialize
+    /// unchanged.
+    #[serde(default)]
+    pub stale: bool,
 }
 
 /// Paginated rollout records for one experiment in the master data browser.

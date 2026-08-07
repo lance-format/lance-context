@@ -133,8 +133,29 @@ pub struct MasterConfig {
     /// the *same* experiment is always serialized regardless of this value
     /// (two `Rewrite`s on one dataset conflict); this only bounds how many
     /// *distinct* experiments/tasks run at once.
+    ///
+    /// This is a per-process limit, not a cluster-wide one: N master replicas
+    /// run up to `N * task_concurrency` tasks between them. Correctness does
+    /// not depend on the value -- etcd claims and per-target locks already
+    /// prevent two replicas touching one experiment -- so it is purely a
+    /// throughput/resource knob.
     #[arg(long, env = "TASK_CONCURRENCY", default_value_t = 4)]
     pub task_concurrency: usize,
+
+    /// Maximum `MergeWal` tasks executing concurrently in this process.
+    ///
+    /// WAL merge shares the scheduler's dispatch loop with compaction but is a
+    /// different kind of work: it is an HTTP fan-out to every worker endpoint,
+    /// so it is slow in wall-clock terms while costing this process almost
+    /// nothing. Drawing from the single `task_concurrency` pool let a backlog
+    /// of slow fan-outs occupy every slot and starve compaction -- exactly when
+    /// both backlogs are growing and both need to drain. Giving merge its own
+    /// budget decouples them.
+    ///
+    /// `0` disables the separate budget and falls back to sharing the general
+    /// `task_concurrency` pool.
+    #[arg(long, env = "MERGE_WAL_CONCURRENCY", default_value_t = 4)]
+    pub merge_wal_concurrency: usize,
 
     /// Comma-separated etcd v3 endpoints. Scheduler state (task queue,
     /// lease-based claims, per-experiment write locks) lives in etcd so several

@@ -1133,6 +1133,7 @@ function ExperimentsList() {
   const total = list.data?.total ?? 0;
   const maxPage = Math.max(0, Math.ceil(total / pageSize) - 1);
   const rows = list.data?.experiments ?? [];
+  const stale = list.data?.stale ?? false;
 
   // Aggregate the visible page for the stat strip.
   const pageRows = rows.reduce((a, e) => a + e.row_count, 0);
@@ -1158,6 +1159,15 @@ function ExperimentsList() {
           />
         </div>
         <div className="topbar__spacer" />
+        {stale && (
+          <span
+            className="pill pill--stale"
+            title="The master is busy scanning; this list is served from its last snapshot and may be up to one scan interval old. A search may also omit retired experiments."
+          >
+            <span className="pill__dot" />
+            cached
+          </span>
+        )}
         <span className="toolbar__count">{fmtInt(total)} total</span>
       </div>
 

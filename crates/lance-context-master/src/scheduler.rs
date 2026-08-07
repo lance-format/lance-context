@@ -489,13 +489,24 @@ pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
 
     let concurrency = state.config.task_concurrency.max(1);
     let sem = Arc::new(Semaphore::new(concurrency));
+    // WAL merge draws from its own budget so a backlog of slow HTTP fan-outs
+    // cannot occupy every general slot and starve compaction. `0` opts back
+    // into the shared pool.
+    let merge_sem = (state.config.merge_wal_concurrency > 0)
+        .then(|| Arc::new(Semaphore::new(state.config.merge_wal_concurrency)));
     let dispatch_state = state.clone();
     tokio::spawn(async move {
         loop {
             if let Ok(queued) = dispatch_state.task_store.queue_depth().await {
                 metrics::gauge!("master_task_queue_depth").set(queued as f64);
             }
-            while sem.available_permits() > 0 {
+            // Poll while *either* pool can accept work; the claimed task's kind
+            // decides which one it draws from below.
+            while sem.available_permits() > 0
+                || merge_sem
+                    .as_ref()
+                    .is_some_and(|s| s.available_permits() > 0)
+            {
                 let claim_start = std::time::Instant::now();
                 match dispatch_state.task_store.claim_next().await {
                     Ok(Some(claim)) => {
@@ -505,11 +516,11 @@ pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
                         // spent here is a claimed-but-idle task holding its
                         // per-experiment lock — worth seeing separately.
                         let permit_start = std::time::Instant::now();
-                        let permit = sem
-                            .clone()
-                            .acquire_owned()
-                            .await
-                            .expect("semaphore never closed");
+                        let pool = match (claim.task.kind, merge_sem.as_ref()) {
+                            (TaskKind::MergeWal, Some(merge)) => merge.clone(),
+                            _ => sem.clone(),
+                        };
+                        let permit = pool.acquire_owned().await.expect("semaphore never closed");
                         let timing = TaskClaimTiming {
                             claim: claim_elapsed,
                             permit_wait: permit_start.elapsed(),
@@ -564,6 +575,7 @@ mod tests {
             merge_wal_min_generations: 2,
             worker_endpoints: vec![],
             task_concurrency: 4,
+            merge_wal_concurrency: 4,
             etcd_endpoints: std::env::var("ETCD_TEST_ENDPOINTS")
                 .map(|value| value.split(',').map(str::to_string).collect())
                 .unwrap_or_default(),
