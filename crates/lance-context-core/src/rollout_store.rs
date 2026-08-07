@@ -465,6 +465,15 @@ impl RolloutStore {
         self.base.checkout(version_id).await
     }
 
+    /// Whether this handle was explicitly checked out to a dataset version.
+    ///
+    /// Serving layers use this to preserve time-travel reads instead of
+    /// automatically advancing a pinned handle when a point lookup misses.
+    #[must_use]
+    pub fn is_version_pinned(&self) -> bool {
+        self.base.is_version_pinned()
+    }
+
     /// Refresh this handle to the latest base-table manifest while retaining
     /// its session and metadata caches.
     ///
@@ -2840,6 +2849,23 @@ mod tests {
                 ids,
                 HashSet::from(["row-0".to_string(), "row-1".to_string()])
             );
+        });
+    }
+
+    #[test]
+    fn explicit_checkout_pins_until_latest_refresh() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open(&uri).await.unwrap();
+            assert!(!store.is_version_pinned());
+
+            store.checkout(store.version()).await.unwrap();
+            assert!(store.is_version_pinned());
+
+            store.refresh_latest().await.unwrap();
+            assert!(!store.is_version_pinned());
         });
     }
 

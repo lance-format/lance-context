@@ -201,6 +201,26 @@ pub struct GetRowQuery {
     pub columns: Option<String>,
 }
 
+async fn get_generic_row_refreshing_on_miss(
+    store_lock: &RwLock<GenericStore>,
+    id: &str,
+    columns: Option<&[String]>,
+) -> Result<Option<serde_json::Map<String, serde_json::Value>>, AppError> {
+    {
+        let store = store_lock.read().await;
+        let row = store.get(id, columns).await.map_err(AppError::from_lance)?;
+        if row.is_some() || store.is_version_pinned() {
+            return Ok(row);
+        }
+    }
+
+    let mut store = store_lock.write().await;
+    if !store.is_version_pinned() {
+        store.refresh_latest().await.map_err(AppError::from_lance)?;
+    }
+    store.get(id, columns).await.map_err(AppError::from_lance)
+}
+
 /// `GET /api/v1/generic/{name}/rows/{id}`
 pub async fn get_row(
     State(state): State<Arc<AppState>>,
@@ -208,7 +228,6 @@ pub async fn get_row(
     Query(query): Query<GetRowQuery>,
 ) -> Result<Json<serde_json::Map<String, serde_json::Value>>, AppError> {
     let store = state.get_or_open_generic_store(&name).await?;
-    let guard = store.read().await;
 
     let columns: Option<Vec<String>> = query.columns.as_ref().map(|raw| {
         raw.split(',')
@@ -218,10 +237,8 @@ pub async fn get_row(
             .collect()
     });
 
-    let row = guard
-        .get(&id, columns.as_deref())
-        .await
-        .map_err(AppError::from_lance)?
+    let row = get_generic_row_refreshing_on_miss(&store, &id, columns.as_deref())
+        .await?
         .ok_or_else(|| AppError::NotFound(format!("Row '{id}' does not exist")))?;
     Ok(Json(row))
 }
@@ -289,6 +306,52 @@ mod tests {
 
     fn row(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
         value.as_object().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn point_read_refreshes_a_base_advanced_by_an_external_writer() {
+        let (state, _dir) = test_state().await;
+        let _ = create_generic_store(
+            State(state.clone()),
+            Json(CreateGenericStoreRequest {
+                name: "s1".to_string(),
+                schema: spec(),
+                storage_options: None,
+                seal_on_add: true,
+            }),
+        )
+        .await
+        .unwrap();
+        let cached = state.get_or_open_generic_store("s1").await.unwrap();
+        let mut writer = GenericStore::open_existing(
+            &state.generic_uri("s1"),
+            GenericStoreOptions {
+                shard_id: Some("external-writer".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        writer
+            .add(&[row(
+                serde_json::json!({"id": "merged-row", "user": "external"}),
+            )])
+            .await
+            .unwrap();
+        assert_eq!(writer.cleanup_wal().await.unwrap(), 1);
+        assert_eq!(writer.pending_wal_generations().await.unwrap(), 0);
+        assert!(writer.version() > cached.read().await.version());
+
+        let Json(found) = get_row(
+            State(state),
+            Path(("s1".to_string(), "merged-row".to_string())),
+            Query(GetRowQuery { columns: None }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(found["user"], serde_json::json!("external"));
+        assert_eq!(cached.read().await.version(), writer.version());
     }
 
     #[tokio::test]

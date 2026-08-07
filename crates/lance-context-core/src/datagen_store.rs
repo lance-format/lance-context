@@ -125,6 +125,17 @@ impl DatagenStore {
         self.base.version()
     }
 
+    /// Whether this handle was explicitly checked out to a dataset version.
+    #[must_use]
+    pub fn is_version_pinned(&self) -> bool {
+        self.base.is_version_pinned()
+    }
+
+    /// Refresh this handle to the latest base-table manifest.
+    pub async fn refresh_latest(&mut self) -> LanceResult<()> {
+        self.base.refresh_latest().await
+    }
+
     /// Append one or more complete checkpoint batches.
     ///
     /// The supplied slice is persisted as one MemWAL generation. Callers should

@@ -222,6 +222,17 @@ impl GenericStore {
         self.base.version()
     }
 
+    /// Whether this handle was explicitly checked out to a dataset version.
+    #[must_use]
+    pub fn is_version_pinned(&self) -> bool {
+        self.base.is_version_pinned()
+    }
+
+    /// Refresh this handle to the latest base-table manifest.
+    pub async fn refresh_latest(&mut self) -> LanceResult<()> {
+        self.base.refresh_latest().await
+    }
+
     /// Append rows.
     ///
     /// Rows are matched to columns by name; an undeclared key is an error, and

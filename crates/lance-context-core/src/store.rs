@@ -1310,14 +1310,24 @@ impl ContextStore {
             .dataset
             .add_columns(NewColumnTransform::AllNulls(schema), None, None)
             .await?;
+        self.base.clear_version_pin();
         Ok(true)
     }
 
     /// Checkout a specific dataset version.
     pub async fn checkout(&mut self, version_id: u64) -> LanceResult<()> {
-        let dataset = self.base.dataset.checkout_version(version_id).await?;
-        self.base.dataset = dataset;
-        Ok(())
+        self.base.checkout(version_id).await
+    }
+
+    /// Whether this handle was explicitly checked out to a dataset version.
+    #[must_use]
+    pub fn is_version_pinned(&self) -> bool {
+        self.base.is_version_pinned()
+    }
+
+    /// Refresh this handle to the latest base-table manifest.
+    pub async fn refresh_latest(&mut self) -> LanceResult<()> {
+        self.base.refresh_latest().await
     }
 
     /// Retrieve a single record by its unique ID.
