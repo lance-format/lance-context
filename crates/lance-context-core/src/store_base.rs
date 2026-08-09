@@ -38,6 +38,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use arrow_array::{new_null_array, RecordBatch, RecordBatchIterator, UInt32Array};
 use arrow_schema::{ArrowError, Schema};
 use arrow_select::take::take;
@@ -264,7 +265,12 @@ pub(crate) struct StorageBaseOptions {
 pub(crate) struct StorageBase {
     /// The base table. `pub(crate)` because concrete stores build their own
     /// schema-specific scans and projections directly against it.
-    pub dataset: Dataset,
+    ///
+    /// Wrapped in [`ArcSwap`] so a merge/compact/reload can publish a new
+    /// handle without requiring exclusive `&mut` for every reader.
+    pub dataset: ArcSwap<Dataset>,
+    /// Dataset URI; stable for the lifetime of this handle.
+    uri: String,
     /// MemWAL shard this instance writes to (derived from `shard_id`).
     pub write_shard: Uuid,
     /// Object-store options, retained so a self-merge can re-append flushed
@@ -402,8 +408,10 @@ impl StorageBase {
             .into());
         }
 
+        let uri = dataset.uri().to_string();
         let mut base = Self {
-            dataset,
+            dataset: ArcSwap::from_pointee(dataset),
+            uri,
             write_shard: derive_shard_id(shard_id.as_deref()),
             storage_options,
             session,
@@ -427,18 +435,22 @@ impl StorageBase {
     /// URI of the underlying Lance dataset.
     #[must_use]
     pub fn uri(&self) -> &str {
-        self.dataset.uri()
+        &self.uri
     }
 
     /// Current base dataset manifest version.
     #[must_use]
     pub fn version(&self) -> u64 {
-        self.dataset.manifest.version
+        self.current_dataset().manifest.version
     }
 
     /// Check out a specific base dataset version (time travel).
     pub async fn checkout(&mut self, version_id: u64) -> LanceResult<()> {
-        self.dataset = self.dataset.checkout_version(version_id).await?;
+        let dataset = self
+            .current_dataset()
+            .checkout_version(version_id)
+            .await?;
+        self.set_dataset(dataset);
         self.pinned_version = Some(version_id);
         Ok(())
     }
@@ -456,7 +468,9 @@ impl StorageBase {
     /// WAL merges committed by another process become visible without paying the
     /// cost of reopening the dataset and rebuilding all session caches.
     pub async fn refresh_latest(&mut self) -> LanceResult<()> {
-        self.dataset.checkout_latest().await?;
+        let mut dataset = (*self.current_dataset()).clone();
+        dataset.checkout_latest().await?;
+        self.set_dataset(dataset);
         self.pinned_version = None;
         Ok(())
     }
@@ -465,6 +479,18 @@ impl StorageBase {
     /// dataset directly.
     pub(crate) fn clear_version_pin(&mut self) {
         self.pinned_version = None;
+    }
+
+    /// Current dataset snapshot (`Arc` clone; cheap).
+    #[inline]
+    pub(crate) fn current_dataset(&self) -> Arc<Dataset> {
+        self.dataset.load_full()
+    }
+
+    /// Publish a replacement dataset handle after a mutating Lance op.
+    #[inline]
+    pub(crate) fn set_dataset(&self, dataset: Dataset) {
+        self.dataset.store(Arc::new(dataset));
     }
 
     // ---------------------------------------------------------------- writes
@@ -560,7 +586,7 @@ impl StorageBase {
             ..Default::default()
         };
         let writer = Arc::new(
-            self.dataset
+            self.current_dataset()
                 .mem_wal_writer(self.write_shard, config)
                 .await?,
         );
@@ -765,8 +791,9 @@ impl StorageBase {
             // Materialize anything buffered so it is eligible for this pass.
             self.flush().await?;
         }
-        let object_store = self.dataset.object_store(None).await?;
-        let branch_location = self.dataset.branch_location();
+        let dataset = self.current_dataset();
+        let object_store = dataset.object_store(None).await?;
+        let branch_location = dataset.branch_location();
         let manifest_store = ShardManifestStore::new(
             object_store,
             &branch_location.path,
@@ -939,8 +966,9 @@ impl StorageBase {
     /// only leaks one directory.
     async fn delete_merged_generation_dirs(&self, merged_paths: &[String]) -> LanceResult<()> {
         let phase = timer_start!();
-        let object_store = self.dataset.object_store(None).await?;
-        let branch_path = self.dataset.branch_location().path.clone();
+        let dataset = self.current_dataset();
+        let object_store = dataset.object_store(None).await?;
+        let branch_path = dataset.branch_location().path.clone();
         for path in merged_paths {
             let gen_dir = branch_path
                 .clone()
@@ -978,11 +1006,12 @@ impl StorageBase {
         &self,
         manifest: &ShardManifest,
     ) -> LanceResult<(HashSet<u64>, Vec<String>, Vec<RecordBatch>, Arc<Schema>)> {
-        let base_uri = self.dataset.uri().trim_end_matches('/').to_string();
+        let dataset = self.current_dataset();
+        let base_uri = dataset.uri().trim_end_matches('/').to_string();
         let mut merged_generations: HashSet<u64> = HashSet::new();
         let mut merged_paths: Vec<String> = Vec::new();
         let mut generation_batches: Vec<(u64, Vec<RecordBatch>)> = Vec::new();
-        let merge_schema: Arc<Schema> = Arc::new(self.dataset.schema().into());
+        let merge_schema: Arc<Schema> = Arc::new(dataset.schema().into());
 
         // Read at most `merge_max_generations` generations per pass.
         //
@@ -1058,13 +1087,13 @@ impl StorageBase {
             merge_schema,
         );
         let mut builder = MergeInsertBuilder::try_new(
-            Arc::new(self.dataset.clone()),
+            self.current_dataset(),
             vec![self.key_column.clone()],
         )?;
         builder.when_matched(WhenMatched::UpdateAll);
         let job = builder.try_build()?;
         let (dataset, _) = job.execute_reader(reader).await?;
-        self.dataset = Arc::unwrap_or_clone(dataset);
+        self.set_dataset(Arc::unwrap_or_clone(dataset));
         Ok(())
     }
 
@@ -1079,7 +1108,7 @@ impl StorageBase {
         };
         self.refresh_latest().await?;
 
-        let base_schema: Arc<Schema> = Arc::new(self.dataset.schema().into());
+        let base_schema: Arc<Schema> = Arc::new(self.current_dataset().schema().into());
         align_batch_to_schema(
             RecordBatch::new_empty(base_schema.clone()),
             latest_schema.clone(),
@@ -1092,13 +1121,15 @@ impl StorageBase {
             .cloned()
             .collect::<Vec<_>>();
         if !missing_fields.is_empty() {
-            self.dataset
+            let mut dataset = (*self.current_dataset()).clone();
+            dataset
                 .add_columns(
                     NewColumnTransform::AllNulls(Arc::new(Schema::new(missing_fields))),
                     None,
                     None,
                 )
                 .await?;
+            self.set_dataset(dataset);
         }
         Ok(())
     }
@@ -1147,17 +1178,19 @@ impl StorageBase {
             ..Default::default()
         };
 
+        let mut dataset = (*self.current_dataset()).clone();
         let result = match config.max_source_fragments {
             Some(max_source_fragments) => {
                 compact_files_incremental(
-                    &mut self.dataset,
+                    &mut dataset,
                     lance_options,
                     max_source_fragments.max(1),
                 )
                 .await
             }
-            None => compact_files(&mut self.dataset, lance_options, None).await,
+            None => compact_files(&mut dataset, lance_options, None).await,
         };
+        self.set_dataset(dataset);
 
         match result {
             Ok(metrics) => {
@@ -1199,7 +1232,8 @@ impl StorageBase {
     /// scan of those generations.
     pub async fn create_key_zonemap_index(&mut self) -> LanceResult<()> {
         info!(column = %self.key_column, "creating ZoneMap index on key column");
-        self.dataset
+        let mut dataset = (*self.current_dataset()).clone();
+        dataset
             .create_index_builder(
                 &[self.key_column.as_str()],
                 IndexType::ZoneMap,
@@ -1208,6 +1242,7 @@ impl StorageBase {
             .name(ID_INDEX_NAME.to_string())
             .replace(true)
             .await?;
+        self.set_dataset(dataset);
         // Reload the handle so subsequent reads on this instance observe the new
         // index (mirrors the reload done after `compact`).
         self.reload().await
@@ -1219,7 +1254,7 @@ impl StorageBase {
     /// same config it would pass to [`Self::compact`].
     #[must_use]
     pub fn should_compact(&self, config: &CompactionConfig) -> bool {
-        if self.dataset.count_fragments() < config.min_fragments {
+        if self.current_dataset().count_fragments() < config.min_fragments {
             return false;
         }
         if !config.quiet_hours.is_empty() {
@@ -1242,7 +1277,7 @@ impl StorageBase {
     #[must_use]
     pub fn compaction_stats(&self) -> CompactionStats {
         CompactionStats {
-            total_fragments: self.dataset.count_fragments(),
+            total_fragments: self.current_dataset().count_fragments(),
             is_compacting: false,
             last_compaction: self.last_compaction,
             last_error: self.last_compaction_error.clone(),
@@ -1253,10 +1288,13 @@ impl StorageBase {
     /// Reload the base dataset handle through [`Self::load_with_options`], so
     /// the shared session and storage options are never dropped.
     pub async fn reload(&mut self) -> LanceResult<()> {
-        let uri = self.dataset.uri().to_string();
-        self.dataset =
-            Self::load_with_options(&uri, self.storage_options.clone(), self.session.clone())
-                .await?;
+        let dataset = Self::load_with_options(
+            &self.uri,
+            self.storage_options.clone(),
+            self.session.clone(),
+        )
+        .await?;
+        self.set_dataset(dataset);
         self.pinned_version = None;
         Ok(())
     }
@@ -1278,14 +1316,17 @@ impl StorageBase {
         if self.mem_wal_index_present().await? {
             return Ok(());
         }
-        match self
-            .dataset
+        let mut dataset = (*self.current_dataset()).clone();
+        match dataset
             .initialize_mem_wal()
             .unsharded()
             .execute()
             .await
         {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.set_dataset(dataset);
+                Ok(())
+            }
             Err(err) => {
                 // A concurrent first-writer may have created the index between
                 // our check and our commit. Reload and accept it if so.
@@ -1300,7 +1341,7 @@ impl StorageBase {
     }
 
     async fn mem_wal_index_present(&self) -> LanceResult<bool> {
-        let indices = self.dataset.load_indices().await?;
+        let indices = self.current_dataset().load_indices().await?;
         Ok(indices.iter().any(|i| i.name == MEM_WAL_INDEX_NAME))
     }
 
@@ -1309,14 +1350,14 @@ impl StorageBase {
     pub fn flushed_generation_uri(&self, shard_id: Uuid, path: &str) -> String {
         format!(
             "{}/_mem_wal/{shard_id}/{path}",
-            self.dataset.uri().trim_end_matches('/')
+            self.uri.trim_end_matches('/')
         )
     }
 
     /// Open a flushed generation dataset, inheriting the base dataset's session
     /// and this store's storage options.
     pub async fn open_flushed_dataset(&self, uri: &str) -> LanceResult<Dataset> {
-        let mut builder = DatasetBuilder::from_uri(uri).with_session(self.dataset.session());
+        let mut builder = DatasetBuilder::from_uri(uri).with_session(self.current_dataset().session());
         if let Some(options) = self.storage_options.clone() {
             builder = builder.with_storage_options(options);
         }
@@ -1327,9 +1368,10 @@ impl StorageBase {
     /// bounded-concurrent so stores with many writer instances do not pay one
     /// object-store round trip per shard serially.
     pub async fn wal_shard_snapshots(&self) -> LanceResult<Vec<ShardSnapshot>> {
-        let object_store = self.dataset.object_store(None).await?;
-        let branch_path = self.dataset.branch_location().path.clone();
-        let shard_ids = self.dataset.list_mem_wal_latest_shard_ids().await?;
+        let dataset = self.current_dataset();
+        let object_store = dataset.object_store(None).await?;
+        let branch_path = dataset.branch_location().path.clone();
+        let shard_ids = dataset.list_mem_wal_latest_shard_ids().await?;
 
         let snapshots: Vec<Option<ShardSnapshot>> = stream::iter(shard_ids)
             .map(|shard_id| {
@@ -1385,7 +1427,7 @@ impl StorageBase {
                 })
             })
             .collect();
-        let session = self.dataset.session();
+        let session = self.current_dataset().session();
         let storage_options = self.storage_options.clone();
 
         stream::iter(generation_paths)
@@ -1431,22 +1473,19 @@ impl StorageBase {
         shard_snapshots: Vec<ShardSnapshot>,
     ) -> LsmScanner {
         let merge_key = vec![self.key_column.clone()];
+        let dataset = self.current_dataset();
         match source {
-            ListSource::Fragments => {
-                LsmScanner::new(Arc::new(self.dataset.clone()), Vec::new(), merge_key)
-            }
-            ListSource::All => {
-                LsmScanner::new(Arc::new(self.dataset.clone()), shard_snapshots, merge_key)
-            }
+            ListSource::Fragments => LsmScanner::new(dataset, Vec::new(), merge_key),
+            ListSource::All => LsmScanner::new(dataset, shard_snapshots, merge_key),
             ListSource::Wal => {
-                let arrow_schema: Schema = self.dataset.schema().into();
+                let arrow_schema: Schema = dataset.schema().into();
                 LsmScanner::without_base_table(
                     Arc::new(arrow_schema),
-                    self.dataset.uri().trim_end_matches('/').to_string(),
+                    dataset.uri().trim_end_matches('/').to_string(),
                     shard_snapshots,
                     merge_key,
                 )
-                .with_session(self.dataset.session())
+                .with_session(dataset.session())
             }
         }
     }

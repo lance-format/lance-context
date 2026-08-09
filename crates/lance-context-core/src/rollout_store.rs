@@ -687,12 +687,12 @@ impl RolloutStore {
     /// writer owns and merges its own WAL shard.
     pub async fn observe(&self) -> LanceResult<RolloutObservation> {
         let shard_snapshots = self.wal_shard_snapshots().await?;
-        let base_rows = self.base.dataset.count_rows(None).await? as u64;
+        let base_rows = self.base.current_dataset().count_rows(None).await? as u64;
         let pending_rows = self.base.pending_wal_rows(&shard_snapshots).await?;
         let row_count = (base_rows + pending_rows) as i64;
-        let fragment_count = self.base.dataset.count_fragments() as i64;
-        let version = self.base.dataset.manifest.version;
-        let last_updated = self.base.dataset.manifest.timestamp().timestamp_millis();
+        let fragment_count = self.base.current_dataset().count_fragments() as i64;
+        let version = self.base.current_dataset().manifest.version;
+        let last_updated = self.base.current_dataset().manifest.timestamp().timestamp_millis();
         let pending_wal_generations = shard_snapshots
             .iter()
             .map(|snapshot| snapshot.flushed_generations.len() as i64)
@@ -876,13 +876,13 @@ impl RolloutStore {
                         "pagination offset exceeds i64::MAX".to_string(),
                     ))
                 })?;
-                let mut scanner = self.base.dataset.scan();
+                let mut scanner = self.base.current_dataset().scan();
                 scanner.project(&refs)?;
                 // Lance 7's late take path can panic on nested list columns.
                 // Keep those early while deferring only potentially large text.
                 scanner.materialization_style(MaterializationStyle::all_early_except(
                     &PAGINATION_LATE_COLUMNS,
-                    self.base.dataset.schema(),
+                    self.base.current_dataset().schema(),
                 )?);
                 if let Some(filter) = &filter {
                     scanner.filter(filter)?;
@@ -978,14 +978,14 @@ impl RolloutStore {
         }
 
         let columns = Arc::new(self.non_blob_columns());
-        let target_schema = Arc::new(projected_arrow_schema(&self.base.dataset, &columns)?);
+        let target_schema = Arc::new(projected_arrow_schema(self.base.current_dataset().as_ref(), &columns)?);
         let id_filter = Arc::new(format!("id IN ({})", sql_quoted_list(&page_ids)));
         let wanted: HashSet<String> = page_ids.iter().cloned().collect();
 
         let mut records_by_id = HashMap::with_capacity(page_ids.len());
         if source == ListSource::All {
             for record in Self::take_page_rows_from_dataset(
-                self.base.dataset.clone(),
+                (*self.base.current_dataset()).clone(),
                 id_filter.clone(),
                 columns.clone(),
                 target_schema.clone(),
@@ -1125,7 +1125,7 @@ impl RolloutStore {
         let schema = match table_schema {
             Some(schema) => schema,
             None => {
-                let full: Schema = self.base.dataset.schema().into();
+                let full: Schema = self.base.current_dataset().schema().into();
                 let projected: Vec<FieldRef> = full
                     .fields()
                     .iter()
@@ -1234,7 +1234,7 @@ impl RolloutStore {
     ) -> LanceResult<Option<(RolloutRecord, Option<Vec<u8>>)>> {
         // Base table first — no manifest reads, no per-generation opens.
         if let Some(record) = self.scan_one_by_id(id, ListSource::Fragments).await? {
-            let payload = Self::get_blob_from_dataset(&self.base.dataset, id)
+            let payload = Self::get_blob_from_dataset(self.base.current_dataset().as_ref(), id)
                 .await?
                 .flatten();
             return Ok(Some((record, payload)));
@@ -1318,7 +1318,7 @@ impl RolloutStore {
     pub async fn get_blob(&self, id: &str) -> LanceResult<Option<Vec<u8>>> {
         // Base-table-first: an already-merged row is found here with no MemWAL
         // manifest reads and no per-generation opens.
-        if let Some(payload) = Self::get_blob_from_dataset(&self.base.dataset, id).await? {
+        if let Some(payload) = Self::get_blob_from_dataset(self.base.current_dataset().as_ref(), id).await? {
             return Ok(payload);
         }
 
@@ -1411,7 +1411,7 @@ impl RolloutStore {
     /// never materialize artifact bytes.
     fn non_blob_columns(&self) -> Vec<String> {
         self.base
-            .dataset
+            .current_dataset()
             .schema()
             .fields
             .iter()
@@ -1436,7 +1436,7 @@ impl RolloutStore {
     }
 
     fn records_to_batch(&self, records: &[RolloutRecord]) -> LanceResult<RecordBatch> {
-        let field_paths = self.base.dataset.schema().field_paths();
+        let field_paths = self.base.current_dataset().schema().field_paths();
         let has = |name: &str| field_paths.iter().any(|path| path == name);
         let include_relationships = has(RELATIONSHIPS_COLUMN);
         let include_metadata = has("metadata");
@@ -1691,7 +1691,7 @@ impl RolloutStore {
             arrays_by_name.insert("metadata".to_string(), Arc::new(metadata_builder.finish()));
         }
 
-        let schema: Arc<Schema> = Arc::new(self.base.dataset.schema().into());
+        let schema: Arc<Schema> = Arc::new(self.base.current_dataset().schema().into());
         let arrays = schema
             .fields()
             .iter()
@@ -2286,7 +2286,11 @@ mod tests {
             vec![Ok::<RecordBatch, ArrowError>(base_batch)].into_iter(),
             base_schema,
         );
-        store.base.dataset.append(base_reader, None).await.unwrap();
+        {
+            let mut dataset = (*store.base.current_dataset()).clone();
+            dataset.append(base_reader, None).await.unwrap();
+            store.base.set_dataset(dataset);
+        }
 
         store.add(&[assistant_record("legacy-wal")]).await.unwrap();
         store.flush().await.unwrap();
@@ -2300,16 +2304,18 @@ mod tests {
                 .filter(|field| legacy_schema.field_with_name(field.name()).is_err())
                 .cloned()
                 .collect::<Vec<_>>();
-            store
-                .base
-                .dataset
-                .add_columns(
-                    NewColumnTransform::AllNulls(Arc::new(Schema::new(claim_check_fields))),
-                    None,
-                    None,
-                )
-                .await
-                .unwrap();
+            {
+                let mut dataset = (*store.base.current_dataset()).clone();
+                dataset
+                    .add_columns(
+                        NewColumnTransform::AllNulls(Arc::new(Schema::new(claim_check_fields))),
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                store.base.set_dataset(dataset);
+            }
         }
 
         (dir, store)
@@ -3050,8 +3056,8 @@ mod tests {
     /// Read the number of un-merged flushed generations recorded for a store's
     /// own write shard. Used by merge tests to assert the manifest drains.
     async fn flushed_generation_count(store: &RolloutStore) -> usize {
-        let object_store = store.base.dataset.object_store(None).await.unwrap();
-        let branch_location = store.base.dataset.branch_location();
+        let object_store = store.base.current_dataset().object_store(None).await.unwrap();
+        let branch_location = store.base.current_dataset().branch_location();
         let manifest_store = ShardManifestStore::new(
             object_store,
             &branch_location.path,
@@ -3070,8 +3076,8 @@ mod tests {
     /// Used to assert the resident writer claims the epoch once instead of
     /// bumping it on every append.
     async fn shard_writer_epoch(store: &RolloutStore) -> u64 {
-        let object_store = store.base.dataset.object_store(None).await.unwrap();
-        let branch_location = store.base.dataset.branch_location();
+        let object_store = store.base.current_dataset().object_store(None).await.unwrap();
+        let branch_location = store.base.current_dataset().branch_location();
         let manifest_store = ShardManifestStore::new(
             object_store,
             &branch_location.path,
@@ -3355,7 +3361,7 @@ mod tests {
             store.flush().await.unwrap();
             store.maybe_merge_own_shard().await.unwrap();
 
-            let before = store.base.dataset.count_fragments();
+            let before = store.base.current_dataset().count_fragments();
             assert!(before > 1, "expected several fragments, got {before}");
             assert!(store.should_compact(&CompactionConfig {
                 min_fragments: 2,
@@ -3380,7 +3386,7 @@ mod tests {
                 "one incremental pass must honor max_source_fragments"
             );
 
-            let after = store.base.dataset.count_fragments();
+            let after = store.base.current_dataset().count_fragments();
             assert!(
                 after < before,
                 "compaction should reduce fragments: {before} -> {after}"
@@ -3426,7 +3432,7 @@ mod tests {
             .unwrap();
             store.add(&[assistant_record("a-0")]).await.unwrap();
 
-            let frags = store.base.dataset.count_fragments();
+            let frags = store.base.current_dataset().count_fragments();
             // A threshold above the current fragment count says "don't compact".
             assert!(!store.should_compact(&CompactionConfig {
                 min_fragments: frags + 1,
@@ -3702,7 +3708,7 @@ mod tests {
 
             assert_eq!(store.cleanup_own_shard().await.unwrap(), 1);
             assert_eq!(flushed_generation_count(&store).await, 0);
-            let field_paths = store.base.dataset.schema().field_paths();
+            let field_paths = store.base.current_dataset().schema().field_paths();
             for column in CLAIM_CHECK_COLUMNS {
                 assert!(field_paths.iter().any(|path| path == column));
             }
@@ -3743,18 +3749,17 @@ mod tests {
             let generation_batch = current_store.records_to_batch(&[record]).unwrap();
 
             legacy_store.base.ensure_latest_schema().await.unwrap();
-            let merge_schema: Arc<Schema> = Arc::new(legacy_store.base.dataset.schema().into());
+            let merge_schema: Arc<Schema> = Arc::new(legacy_store.base.current_dataset().schema().into());
             let aligned = align_batch_to_schema(generation_batch, merge_schema.clone()).unwrap();
             let reader = RecordBatchIterator::new(
                 vec![Ok::<RecordBatch, ArrowError>(aligned)].into_iter(),
                 merge_schema,
             );
-            legacy_store
-                .base
-                .dataset
-                .append(reader, None)
-                .await
-                .unwrap();
+            {
+                let mut dataset = (*legacy_store.base.current_dataset()).clone();
+                dataset.append(reader, None).await.unwrap();
+                legacy_store.base.set_dataset(dataset);
+            }
 
             let merged = legacy_store
                 .get_by_id_source("current-generation", ListSource::Fragments)
@@ -3825,7 +3830,7 @@ mod tests {
 
             store.create_id_zonemap_index().await.unwrap();
             let has_id_index = |s: &RolloutStore| {
-                let dataset = s.base.dataset.clone();
+                let dataset = s.base.current_dataset();
                 async move {
                     dataset
                         .load_indices()

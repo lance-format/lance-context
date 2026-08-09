@@ -184,7 +184,7 @@ impl GenericStore {
         )
         .await?;
 
-        let schema: Arc<Schema> = Arc::new(base.dataset.schema().into());
+        let schema: Arc<Schema> = Arc::new(base.current_dataset().schema().into());
         let persisted = spec_from_schema(&schema)?;
 
         // Reopening with a different schema would reinterpret existing data.
@@ -406,7 +406,7 @@ impl GenericStore {
     /// Row count of the base table. Excludes rows still in unmerged
     /// generations or buffered in the writer.
     pub async fn count_base_rows(&self) -> LanceResult<usize> {
-        self.base.dataset.count_rows(None).await
+        self.base.current_dataset().count_rows(None).await
     }
 }
 
