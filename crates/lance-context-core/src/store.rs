@@ -194,7 +194,14 @@ struct CompactionState {
     total_compactions: u64,
 }
 
-/// Valid column names that may use blob encoding.
+/// Field metadata marking columns excluded from default bulk-read projections.
+///
+/// Deliberately distinct from `lance-encoding:blob`: MemWAL's LSM scanner does
+/// not materialize blob-v2 values, so context payloads must remain inline.
+const BLOB_COLUMN_METADATA_KEY: &str = "lance-context:blob";
+const LANCE_BLOB_ENCODING_KEY: &str = "lance-encoding:blob";
+
+/// Valid column names that may be treated as lazy blob payloads.
 const VALID_BLOB_COLUMNS: &[&str] = &["text_payload", "binary_payload"];
 
 /// Open a store handle for the background compactor, with the recursion broken.
@@ -246,7 +253,11 @@ pub struct ContextStoreOptions {
     /// Width of the fixed-size embedding vector for newly-created datasets.
     /// Existing datasets always use the dimension persisted in their schema.
     pub embedding_dim: Option<i32>,
-    /// Column names that should use Lance V1 blob encoding.
+    /// Inline payload columns to exclude from default bulk-read projections.
+    ///
+    /// The values remain ordinary `LargeBinary` columns so they round-trip
+    /// through MemWAL. Use an explicit [`ReadProjection`] or
+    /// [`ContextStore::get_blob`] to materialize them on demand.
     /// Valid values: `"text_payload"`, `"binary_payload"`.
     pub blob_columns: HashSet<String>,
     /// Type of scalar index to create on the `id` column.
@@ -314,6 +325,65 @@ impl ContextStoreOptions {
     }
 }
 
+fn payload_field(name: &str, data_type: DataType, blob_columns: &HashSet<String>) -> Field {
+    let field = Field::new(name, data_type, true);
+    if !blob_columns.contains(name) {
+        return field;
+    }
+
+    field.with_metadata(HashMap::from([(
+        BLOB_COLUMN_METADATA_KEY.to_string(),
+        "true".to_string(),
+    )]))
+}
+
+fn blob_columns_from_schema(schema: &Schema) -> HashSet<String> {
+    VALID_BLOB_COLUMNS
+        .iter()
+        .filter(|name| {
+            schema.field_with_name(name).is_ok_and(|field| {
+                field
+                    .metadata()
+                    .get(BLOB_COLUMN_METADATA_KEY)
+                    .is_some_and(|value| value == "true")
+            })
+        })
+        .map(|name| (*name).to_string())
+        .collect()
+}
+
+fn reject_blob_v2_schema(schema: &Schema) -> LanceResult<()> {
+    let legacy_columns: HashSet<String> = VALID_BLOB_COLUMNS
+        .iter()
+        .filter(|name| {
+            schema.field_with_name(name).is_ok_and(|field| {
+                field
+                    .metadata()
+                    .get(LANCE_BLOB_ENCODING_KEY)
+                    .is_some_and(|value| value == "true")
+            })
+        })
+        .map(|name| (*name).to_string())
+        .collect();
+    if legacy_columns.is_empty() {
+        return Ok(());
+    }
+
+    Err(ArrowError::InvalidArgumentError(format!(
+        "context dataset uses unsupported blob-v2 encoding for columns {:?}; \
+         MemWAL cannot read or merge those values, so create a new context \
+         with inline blob columns",
+        sorted_strings(&legacy_columns)
+    ))
+    .into())
+}
+
+fn sorted_strings(values: &HashSet<String>) -> Vec<String> {
+    let mut values: Vec<String> = values.iter().cloned().collect();
+    values.sort();
+    values
+}
+
 fn relationship_struct_fields() -> Vec<Field> {
     vec![
         Field::new("target_id", DataType::Utf8, true),
@@ -369,8 +439,9 @@ struct ExternalIdState {
 /// Excluding `binary` (and optionally `text` / `embedding`) lets metadata and
 /// search queries avoid materializing large media bytes; the omitted fields
 /// come back as `None`. Fetch a single record's bytes on demand with
-/// [`ContextStore::get_blob`]. Defaults to loading everything (backward
-/// compatible).
+/// [`ContextStore::get_blob`]. An explicit default projection loads everything;
+/// unprojected `list`/`search` calls additionally omit columns configured in
+/// [`ContextStoreOptions::blob_columns`].
 #[derive(Debug, Clone, Copy)]
 pub struct ReadProjection {
     pub text: bool,
@@ -464,14 +535,14 @@ impl ContextStore {
             None => DEFAULT_EMBEDDING_DIM,
         };
         let storage_options = options.storage_options();
-        let blob_columns = options.blob_columns.clone();
+        let requested_blob_columns = options.blob_columns.clone();
         let (dataset, created) = match Self::load_with_options(uri, storage_options.clone()).await {
             Ok(dataset) => (dataset, false),
             Err(LanceError::DatasetNotFound { .. }) if create_if_missing => {
                 let dataset = Self::create_with_options(
                     uri,
                     storage_options.clone(),
-                    &blob_columns,
+                    &requested_blob_columns,
                     requested_embedding_dim,
                     options.distance_metric.unwrap_or_default(),
                 )
@@ -481,6 +552,19 @@ impl ContextStore {
             Err(err) => return Err(err),
         };
         let arrow_schema: Schema = dataset.schema().into();
+        reject_blob_v2_schema(&arrow_schema)?;
+        let persisted_blob_columns = blob_columns_from_schema(&arrow_schema);
+        if !created
+            && !requested_blob_columns.is_empty()
+            && requested_blob_columns != persisted_blob_columns
+        {
+            return Err(LanceError::from(ArrowError::InvalidArgumentError(format!(
+                "existing context blob columns {:?} do not match requested columns {:?}",
+                sorted_strings(&persisted_blob_columns),
+                sorted_strings(&requested_blob_columns)
+            ))));
+        }
+        let blob_columns = persisted_blob_columns;
         let embedding_dim = embedding_dim_from_schema(&arrow_schema)?;
         if !created && options.embedding_dim.is_some() && embedding_dim != requested_embedding_dim {
             return Err(LanceError::from(ArrowError::InvalidArgumentError(format!(
@@ -971,7 +1055,12 @@ impl ContextStore {
             )
             .into());
         }
-        let Some(existing) = self.get_by_id(id).await? else {
+        let Some(existing) = self
+            .list_with_all_payloads()
+            .await?
+            .into_iter()
+            .find(|record| record.id == id)
+        else {
             return Ok(None);
         };
         self.update_visible_record(existing, patch).await.map(Some)
@@ -993,7 +1082,7 @@ impl ContextStore {
         }
 
         let matches: Vec<ContextRecord> = self
-            .list(None, None)
+            .list_with_all_payloads()
             .await?
             .into_iter()
             .filter(|existing| existing.external_id.as_deref() == Some(external_id))
@@ -1377,7 +1466,8 @@ impl ContextStore {
             .await
     }
 
-    /// List records matching filters, applying lifecycle visibility before offset/limit.
+    /// List records matching filters, applying lifecycle visibility before
+    /// offset/limit and leaving configured blob columns lazy.
     pub async fn list_filtered_with_options(
         &self,
         limit: Option<usize>,
@@ -1385,8 +1475,27 @@ impl ContextStore {
         filters: Option<&RecordFilters>,
         options: LifecycleQueryOptions,
     ) -> LanceResult<Vec<ContextRecord>> {
-        self.list_filtered_projected(limit, offset, filters, options, ReadProjection::default())
-            .await
+        self.list_filtered_projected(
+            limit,
+            offset,
+            filters,
+            options,
+            self.default_read_projection(),
+        )
+        .await
+    }
+
+    /// Internal mutation reads must preserve payloads that are not being
+    /// patched. Public/default reads can leave configured blob columns lazy.
+    async fn list_with_all_payloads(&self) -> LanceResult<Vec<ContextRecord>> {
+        self.list_filtered_projected(
+            None,
+            None,
+            None,
+            LifecycleQueryOptions::default(),
+            ReadProjection::default(),
+        )
+        .await
     }
 
     /// Like [`Self::list_filtered_with_options`] but with column projection, so
@@ -1436,7 +1545,9 @@ impl ContextStore {
         Ok(results)
     }
 
-    /// Find a record by its internal storage id.
+    /// Find a record by its internal storage id. Payload columns configured as
+    /// blobs remain lazy and come back as `None`; use [`Self::get_blob`] or an
+    /// explicit projected read to materialize them.
     pub async fn get_by_id(&self, id: &str) -> LanceResult<Option<ContextRecord>> {
         Ok(self
             .list(None, None)
@@ -1526,7 +1637,8 @@ impl ContextStore {
             .await
     }
 
-    /// Perform nearest-neighbor search after applying filters and lifecycle visibility.
+    /// Perform nearest-neighbor search after applying filters and lifecycle
+    /// visibility, leaving configured blob columns lazy.
     pub async fn search_filtered_with_options(
         &self,
         query: &[f32],
@@ -1534,8 +1646,14 @@ impl ContextStore {
         filters: Option<&RecordFilters>,
         options: LifecycleQueryOptions,
     ) -> LanceResult<Vec<SearchResult>> {
-        self.search_filtered_projected(query, limit, filters, options, ReadProjection::default())
-            .await
+        self.search_filtered_projected(
+            query,
+            limit,
+            filters,
+            options,
+            self.default_read_projection(),
+        )
+        .await
     }
 
     /// Like [`Self::search_filtered_with_options`] but with column projection on
@@ -1610,8 +1728,12 @@ impl ContextStore {
             return Ok(Vec::new());
         }
 
+        let mut projection = self.default_read_projection();
+        // Lexical retrieval necessarily reads text to score it. Vector-only
+        // retrieval keeps a configured text blob lazy.
+        projection.text |= has_text;
         let records = self
-            .list_filtered_with_options(None, None, filters, options)
+            .list_filtered_projected(None, None, filters, options, projection)
             .await?;
         let mut candidates: HashMap<String, RetrieveResult> = HashMap::new();
 
@@ -1682,6 +1804,14 @@ impl ContextStore {
     /// MemWAL generations, deduplicating by `id`.
     async fn lsm_scanner(&self) -> LanceResult<LsmScanner> {
         self.base.lsm_scanner().await
+    }
+
+    fn default_read_projection(&self) -> ReadProjection {
+        ReadProjection {
+            text: !self.blob_columns.contains("text_payload"),
+            binary: !self.blob_columns.contains("binary_payload"),
+            embedding: true,
+        }
     }
 
     /// Top-level column names to read for a projection (drops the excluded
@@ -2027,9 +2157,9 @@ impl ContextStore {
 
     /// Lance schema for the context store.
     ///
-    /// When `blob_columns` contains a column name, that column is stored using
-    /// Lance V1 blob encoding (out-of-line binary buffers). For `text_payload`,
-    /// this also changes the Arrow type from `LargeUtf8` to `LargeBinary`.
+    /// `blob_columns` remain inline but are marked for exclusion from default
+    /// bulk-read projections. For `text_payload`, this also changes the Arrow
+    /// type from `LargeUtf8` to `LargeBinary`.
     pub fn schema(blob_columns: &HashSet<String>) -> Schema {
         Self::schema_with_embedding_dim(blob_columns, DEFAULT_EMBEDDING_DIM)
     }
@@ -2065,21 +2195,13 @@ impl ContextStore {
             "true".to_string(),
         );
 
-        let text_field = if blob_columns.contains("text_payload") {
-            let mut metadata = HashMap::new();
-            metadata.insert("lance-encoding:blob".to_string(), "true".to_string());
-            Field::new("text_payload", DataType::LargeBinary, true).with_metadata(metadata)
+        let text_type = if blob_columns.contains("text_payload") {
+            DataType::LargeBinary
         } else {
-            Field::new("text_payload", DataType::LargeUtf8, true)
+            DataType::LargeUtf8
         };
-
-        let binary_field = if blob_columns.contains("binary_payload") {
-            let mut metadata = HashMap::new();
-            metadata.insert("lance-encoding:blob".to_string(), "true".to_string());
-            Field::new("binary_payload", DataType::LargeBinary, true).with_metadata(metadata)
-        } else {
-            Field::new("binary_payload", DataType::LargeBinary, true)
-        };
+        let text_field = payload_field("text_payload", text_type, blob_columns);
+        let binary_field = payload_field("binary_payload", DataType::LargeBinary, blob_columns);
 
         let mut fields = vec![Field::new("id", DataType::Utf8, false).with_metadata(id_metadata)];
         if include_external_id {
@@ -5003,18 +5125,218 @@ mod tests {
             record.binary_payload = Some(vec![0xDE, 0xAD, 0xBE, 0xEF]);
             store.add(std::slice::from_ref(&record)).await.unwrap();
 
-            // Verify schema has blob metadata on binary_payload
+            // The marker controls projection only; blob-v2 offload would make
+            // the value unreadable through the LSM scanner.
             let schema = ContextStore::schema(&store.blob_columns);
             let field = schema.field_with_name("binary_payload").unwrap();
             assert_eq!(
-                field.metadata().get("lance-encoding:blob"),
+                field.metadata().get(BLOB_COLUMN_METADATA_KEY),
                 Some(&"true".to_string()),
             );
+            assert!(field.metadata().get(LANCE_BLOB_ENCODING_KEY).is_none());
             // text_payload should remain LargeUtf8 without blob metadata
             let text_field = schema.field_with_name("text_payload").unwrap();
             assert_eq!(text_field.data_type(), &DataType::LargeUtf8);
-            assert!(text_field.metadata().get("lance-encoding:blob").is_none());
+            assert!(text_field
+                .metadata()
+                .get(BLOB_COLUMN_METADATA_KEY)
+                .is_none());
+
+            let listed = store.list(None, None).await.unwrap();
+            assert!(listed[0].binary_payload.is_none());
         });
+    }
+
+    #[test]
+    fn blob_binary_payload_round_trips_and_survives_wal_merge() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        runtime.block_on(async {
+            let options = ContextStoreOptions {
+                blob_columns: HashSet::from(["binary_payload".to_string()]),
+                ..Default::default()
+            };
+            let mut store = ContextStore::open_with_options(&uri, options)
+                .await
+                .unwrap();
+
+            let payload = vec![0xDE, 0xAD, 0xBE, 0xEF];
+            let mut record = text_record("blob-roundtrip", 0.0);
+            record.binary_payload = Some(payload.clone());
+            store.add(&[record]).await.unwrap();
+
+            assert_eq!(
+                store.get_blob("blob-roundtrip").await.unwrap(),
+                Some(payload.clone())
+            );
+            let listed = store
+                .list_filtered_projected(
+                    None,
+                    None,
+                    None,
+                    LifecycleQueryOptions::default(),
+                    ReadProjection::default(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(listed[0].binary_payload, Some(payload.clone()));
+
+            assert!(store.cleanup_wal().await.unwrap() > 0);
+            assert_eq!(
+                store.get_blob("blob-roundtrip").await.unwrap(),
+                Some(payload)
+            );
+        });
+    }
+
+    #[test]
+    fn blob_projection_configuration_survives_reopen() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        runtime.block_on(async {
+            let blob_columns =
+                HashSet::from(["text_payload".to_string(), "binary_payload".to_string()]);
+            let mut store = ContextStore::open_with_options(
+                &uri,
+                ContextStoreOptions {
+                    blob_columns: blob_columns.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let mut record = text_record("persisted-blob-config", 0.0);
+            record.text_payload = Some("large text".to_string());
+            record.binary_payload = Some(vec![1, 2, 3]);
+            store.add(&[record]).await.unwrap();
+            store.close().await.unwrap();
+            drop(store);
+
+            // Reopening without options must recover projection behavior from
+            // the schema, as the server's lazy-open path does.
+            let reopened = ContextStore::open(&uri).await.unwrap();
+            assert_eq!(reopened.blob_columns, blob_columns);
+            let default_read = reopened.list(None, None).await.unwrap();
+            assert!(default_read[0].text_payload.is_none());
+            assert!(default_read[0].binary_payload.is_none());
+
+            let explicit_read = reopened
+                .list_filtered_projected(
+                    None,
+                    None,
+                    None,
+                    LifecycleQueryOptions::default(),
+                    ReadProjection::default(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(explicit_read[0].text_payload.as_deref(), Some("large text"));
+            assert_eq!(
+                explicit_read[0].binary_payload.as_deref(),
+                Some(&[1, 2, 3][..])
+            );
+        });
+    }
+
+    #[test]
+    fn partial_update_preserves_lazy_blob_payload() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        runtime.block_on(async {
+            let mut store = ContextStore::open_with_options(
+                &uri,
+                ContextStoreOptions {
+                    blob_columns: HashSet::from(["binary_payload".to_string()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let payload = vec![9, 8, 7, 6];
+            let mut record = text_record("blob-update", 0.0);
+            record.binary_payload = Some(payload.clone());
+            store.add(&[record]).await.unwrap();
+
+            let updated = store
+                .update_by_id(
+                    "blob-update",
+                    RecordPatch {
+                        source: Some("patched".to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(updated.record.binary_payload, Some(payload.clone()));
+            assert_eq!(
+                store.get_blob(&updated.record.id).await.unwrap(),
+                Some(payload)
+            );
+        });
+    }
+
+    #[test]
+    fn text_retrieval_materializes_lazy_text_for_scoring() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        runtime.block_on(async {
+            let store = ContextStore::open_with_options(
+                &uri,
+                ContextStoreOptions {
+                    blob_columns: HashSet::from(["text_payload".to_string()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let mut record = text_record("lazy-text", 0.0);
+            record.text_payload = Some("unique retrieval needle".to_string());
+            store.add(&[record]).await.unwrap();
+
+            assert!(store.list(None, None).await.unwrap()[0]
+                .text_payload
+                .is_none());
+            let hits = store
+                .retrieve_filtered_with_options(
+                    Some("needle"),
+                    None,
+                    Some(1),
+                    None,
+                    LifecycleQueryOptions::default(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(hits[0].record.id, "lazy-text");
+            assert_eq!(
+                hits[0].record.text_payload.as_deref(),
+                Some("unique retrieval needle")
+            );
+        });
+    }
+
+    #[test]
+    fn legacy_blob_v2_schema_is_rejected() {
+        let field = Field::new("binary_payload", DataType::LargeBinary, true).with_metadata(
+            HashMap::from([(LANCE_BLOB_ENCODING_KEY.to_string(), "true".to_string())]),
+        );
+        let schema = Schema::new(vec![field]);
+
+        let error = reject_blob_v2_schema(&schema).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("unsupported blob-v2 encoding"),
+            "{message}"
+        );
+        assert!(message.contains("binary_payload"), "{message}");
     }
 
     #[test]
@@ -5034,6 +5356,9 @@ mod tests {
 
             let record = text_record("blob-txt-1", 0.0);
             store.add(std::slice::from_ref(&record)).await.unwrap();
+
+            let listed = store.list(None, None).await.unwrap();
+            assert!(listed[0].text_payload.is_none());
 
             // Roundtrip: records_to_batch -> batch_to_records
             let batch = store
@@ -5078,18 +5403,20 @@ mod tests {
             record.binary_payload = Some(b"hello binary".to_vec());
             store.add(std::slice::from_ref(&record)).await.unwrap();
 
-            // Both columns should have blob metadata
+            // Both columns are inline and marked for lazy projection.
             let schema = ContextStore::schema(&store.blob_columns);
             let text_field = schema.field_with_name("text_payload").unwrap();
             let bin_field = schema.field_with_name("binary_payload").unwrap();
             assert_eq!(
-                text_field.metadata().get("lance-encoding:blob"),
+                text_field.metadata().get(BLOB_COLUMN_METADATA_KEY),
                 Some(&"true".to_string()),
             );
             assert_eq!(
-                bin_field.metadata().get("lance-encoding:blob"),
+                bin_field.metadata().get(BLOB_COLUMN_METADATA_KEY),
                 Some(&"true".to_string()),
             );
+            assert!(text_field.metadata().get(LANCE_BLOB_ENCODING_KEY).is_none());
+            assert!(bin_field.metadata().get(LANCE_BLOB_ENCODING_KEY).is_none());
 
             // Roundtrip via batch
             let batch = store
@@ -5110,9 +5437,12 @@ mod tests {
         let bin_field = schema.field_with_name("binary_payload").unwrap();
 
         assert_eq!(text_field.data_type(), &DataType::LargeUtf8);
-        assert!(text_field.metadata().get("lance-encoding:blob").is_none());
+        assert!(text_field
+            .metadata()
+            .get(BLOB_COLUMN_METADATA_KEY)
+            .is_none());
         assert_eq!(bin_field.data_type(), &DataType::LargeBinary);
-        assert!(bin_field.metadata().get("lance-encoding:blob").is_none());
+        assert!(bin_field.metadata().get(BLOB_COLUMN_METADATA_KEY).is_none());
     }
 
     #[test]
@@ -5124,20 +5454,22 @@ mod tests {
         let text_field = schema.field_with_name("text_payload").unwrap();
         assert_eq!(text_field.data_type(), &DataType::LargeBinary);
         assert_eq!(
-            text_field.metadata().get("lance-encoding:blob"),
+            text_field.metadata().get(BLOB_COLUMN_METADATA_KEY),
             Some(&"true".to_string()),
         );
+        assert!(text_field.metadata().get(LANCE_BLOB_ENCODING_KEY).is_none());
 
         let bin_field = schema.field_with_name("binary_payload").unwrap();
         assert_eq!(bin_field.data_type(), &DataType::LargeBinary);
         assert_eq!(
-            bin_field.metadata().get("lance-encoding:blob"),
+            bin_field.metadata().get(BLOB_COLUMN_METADATA_KEY),
             Some(&"true".to_string()),
         );
+        assert!(bin_field.metadata().get(LANCE_BLOB_ENCODING_KEY).is_none());
 
         // Non-blob fields should have no blob metadata
         let id_field = schema.field_with_name("id").unwrap();
-        assert!(id_field.metadata().get("lance-encoding:blob").is_none());
+        assert!(id_field.metadata().get(BLOB_COLUMN_METADATA_KEY).is_none());
     }
 
     #[test]
