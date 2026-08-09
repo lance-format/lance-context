@@ -658,7 +658,7 @@ impl ContextStore {
 
     /// URI of the underlying Lance dataset.
     #[must_use]
-    pub fn uri(&self) -> &str {
+    pub fn uri(&self) -> String {
         self.base.uri()
     }
 
@@ -2102,7 +2102,7 @@ impl ContextStore {
         // have exactly one owner. A second handle is the right model anyway --
         // compaction only rewrites base-table fragments and takes `&mut`, so
         // sharing a handle with the write path would mean contending for it.
-        let uri = self.uri().to_string();
+        let uri = self.uri();
         let interval_secs = self.compaction_config.check_interval_secs;
         let options = ContextStoreOptions {
             storage_options: self.base.storage_options.clone(),

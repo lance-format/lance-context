@@ -221,7 +221,7 @@ impl GenericStore {
 
     /// URI of the underlying Lance dataset.
     #[must_use]
-    pub fn uri(&self) -> &str {
+    pub fn uri(&self) -> String {
         self.base.uri()
     }
 
