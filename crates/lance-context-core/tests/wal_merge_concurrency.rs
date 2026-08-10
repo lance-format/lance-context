@@ -414,3 +414,106 @@ async fn append_is_not_blocked_for_the_duration_of_a_merge() {
     );
     assert_eq!(ids.len(), 26, "all rows readable exactly once");
 }
+
+/// Issue #198 / the ~17s production stall, measured as lock phases.
+///
+/// Old shape: one `RwLock::write()` spanned seal + generation reads + append +
+/// drain, so every concurrent `add` waited for the whole merge (~17s on abfss).
+/// New shape (same as the server sweeper): prepare under a *read* lock, write
+/// lock only for the short commit.
+///
+/// This test records those two durations and races an append against prepare.
+/// It fails if the exclusive lock is held for most of the merge again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn merge_write_lock_is_only_held_for_short_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().to_string_lossy().to_string();
+    let store = Arc::new(RwLock::new(
+        RolloutStore::open_with_options(&uri, opts("solo"))
+            .await
+            .unwrap(),
+    ));
+
+    // Fat generations so prepare (read every flushed gen) dominates wall time
+    // even on a fast local disk — otherwise the assertion becomes vacuous.
+    let fat = "x".repeat(64 * 1024);
+    for i in 0..20 {
+        let mut r: RolloutRecord = rec(&format!("bulk-{i}"));
+        r.content = Some(fat.clone());
+        store.read().await.add(&[r]).await.unwrap();
+        store.read().await.flush().await.unwrap();
+    }
+
+    let store_for_merge = store.clone();
+    let merge_handle = tokio::spawn(async move {
+        let prepare_start = Instant::now();
+        let prepared = {
+            let guard = store_for_merge.read().await;
+            guard.prepare_cleanup_merge().await.unwrap()
+        };
+        let prepare_elapsed = prepare_start.elapsed();
+
+        let Some((manifest_store, manifest, prepared)) = prepared else {
+            panic!("expected pending generations to merge");
+        };
+
+        let write_start = Instant::now();
+        let reclaimed = {
+            let mut guard = store_for_merge.write().await;
+            guard
+                .commit_prepared_merge(&manifest_store, &manifest, prepared)
+                .await
+                .unwrap()
+        };
+        let write_lock_elapsed = write_start.elapsed();
+        (reclaimed, prepare_elapsed, write_lock_elapsed)
+    });
+
+    // While prepare should be holding only a *shared* lock, appends must land
+    // quickly — this is the user-visible half of the ~17s stall.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let append_start = Instant::now();
+    store
+        .read()
+        .await
+        .add(&[rec("during-prepare")])
+        .await
+        .unwrap();
+    let append_elapsed = append_start.elapsed();
+
+    let (reclaimed, prepare_elapsed, write_lock_elapsed) = merge_handle.await.unwrap();
+
+    eprintln!(
+        "merge phases: prepare={prepare_elapsed:?} write_lock={write_lock_elapsed:?} \
+         append_during_prepare={append_elapsed:?} reclaimed={reclaimed}"
+    );
+
+    assert!(reclaimed > 0, "merge should reclaim generations");
+    assert!(
+        prepare_elapsed > Duration::from_millis(5),
+        "prepare should do measurable work so the lock split is observable; \
+         got prepare={prepare_elapsed:?}"
+    );
+    // Exclusive lock must be the short phase. In the old bug it ≈ prepare.
+    assert!(
+        write_lock_elapsed * 3 < prepare_elapsed
+            || write_lock_elapsed < Duration::from_millis(100),
+        "write lock held {write_lock_elapsed:?} but prepare took {prepare_elapsed:?}; \
+         exclusive lock appears to cover the expensive merge work again (#198 / ~17s stall)"
+    );
+    assert!(
+        append_elapsed < prepare_elapsed
+            && (append_elapsed * 2 < prepare_elapsed
+                || append_elapsed < Duration::from_millis(200)),
+        "append during prepare took {append_elapsed:?} while prepare took {prepare_elapsed:?}; \
+         append was blocked as if the merge held the write lock"
+    );
+
+    store.read().await.flush().await.unwrap();
+    let ids = read_ids(&store).await;
+    assert!(
+        ids.contains(&"during-prepare".to_string()),
+        "row appended under the shared prepare lock must be readable"
+    );
+    assert_eq!(ids.len(), 21, "all rows readable exactly once: {ids:?}");
+}
