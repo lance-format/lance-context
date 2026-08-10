@@ -25,18 +25,17 @@ use std::time::{Duration, Instant};
 use lance_context_core::{RolloutRecord, RolloutStore, RolloutStoreOptions, ROLE_ASSISTANT};
 use tokio::sync::RwLock;
 
-/// Run one full merge exactly the way the server's sweepers do: seal + read the
-/// generations under a **read** lock (so appends keep running), then take the
-/// write lock only for the short commit. Returns generations reclaimed.
+/// Run one full merge: seal + read generations, then commit. Both phases use
+/// `&self` on the store (dataset handle is ArcSwap), so callers only need a
+/// shared lock — appends are not blocked. Returns generations reclaimed.
 ///
 /// Every test drives merges through this helper so the lock discipline under
-/// test is the same one production uses -- a test that merged under a single
-/// exclusive lock would pass while the real stall persisted.
+/// test matches production.
 async fn merge_like_sweeper(store: &Arc<RwLock<RolloutStore>>) -> usize {
     let prepared = { store.read().await.prepare_cleanup_merge().await.unwrap() };
     match prepared {
         Some((manifest_store, manifest, prepared)) => store
-            .write()
+            .read()
             .await
             .commit_prepared_merge(&manifest_store, &manifest, prepared)
             .await
@@ -419,11 +418,11 @@ async fn append_is_not_blocked_for_the_duration_of_a_merge() {
 ///
 /// Old shape: one `RwLock::write()` spanned seal + generation reads + append +
 /// drain, so every concurrent `add` waited for the whole merge (~17s on abfss).
-/// New shape (same as the server sweeper): prepare under a *read* lock, write
-/// lock only for the short commit.
+/// New shape: prepare and commit both use shared locks (`&self` + ArcSwap), so
+/// appends are never blocked by merge.
 ///
-/// This test records those two durations and races an append against prepare.
-/// It fails if the exclusive lock is held for most of the merge again.
+/// This test records prepare vs commit durations and races an append against
+/// prepare. It fails if append appears serialized behind the merge again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn merge_write_lock_is_only_held_for_short_commit() {
     let tmp = tempfile::tempdir().unwrap();
@@ -457,16 +456,16 @@ async fn merge_write_lock_is_only_held_for_short_commit() {
             panic!("expected pending generations to merge");
         };
 
-        let write_start = Instant::now();
+        let commit_start = Instant::now();
         let reclaimed = {
-            let mut guard = store_for_merge.write().await;
+            let guard = store_for_merge.read().await;
             guard
                 .commit_prepared_merge(&manifest_store, &manifest, prepared)
                 .await
                 .unwrap()
         };
-        let write_lock_elapsed = write_start.elapsed();
-        (reclaimed, prepare_elapsed, write_lock_elapsed)
+        let commit_elapsed = commit_start.elapsed();
+        (reclaimed, prepare_elapsed, commit_elapsed)
     });
 
     // While prepare should be holding only a *shared* lock, appends must land
@@ -481,10 +480,10 @@ async fn merge_write_lock_is_only_held_for_short_commit() {
         .unwrap();
     let append_elapsed = append_start.elapsed();
 
-    let (reclaimed, prepare_elapsed, write_lock_elapsed) = merge_handle.await.unwrap();
+    let (reclaimed, prepare_elapsed, commit_elapsed) = merge_handle.await.unwrap();
 
     eprintln!(
-        "merge phases: prepare={prepare_elapsed:?} write_lock={write_lock_elapsed:?} \
+        "merge phases: prepare={prepare_elapsed:?} commit={commit_elapsed:?} \
          append_during_prepare={append_elapsed:?} reclaimed={reclaimed}"
     );
 
@@ -494,19 +493,18 @@ async fn merge_write_lock_is_only_held_for_short_commit() {
         "prepare should do measurable work so the lock split is observable; \
          got prepare={prepare_elapsed:?}"
     );
-    // Exclusive lock must be the short phase. In the old bug it ≈ prepare.
+    // Commit must be the short phase. In the old bug exclusive work ≈ prepare.
     assert!(
-        write_lock_elapsed * 3 < prepare_elapsed
-            || write_lock_elapsed < Duration::from_millis(100),
-        "write lock held {write_lock_elapsed:?} but prepare took {prepare_elapsed:?}; \
-         exclusive lock appears to cover the expensive merge work again (#198 / ~17s stall)"
+        commit_elapsed * 3 < prepare_elapsed || commit_elapsed < Duration::from_millis(100),
+        "commit took {commit_elapsed:?} but prepare took {prepare_elapsed:?}; \
+         expensive merge work appears serialized again (#198 / ~17s stall)"
     );
     assert!(
         append_elapsed < prepare_elapsed
             && (append_elapsed * 2 < prepare_elapsed
                 || append_elapsed < Duration::from_millis(200)),
         "append during prepare took {append_elapsed:?} while prepare took {prepare_elapsed:?}; \
-         append was blocked as if the merge held the write lock"
+         append was blocked as if the merge held an exclusive store lock"
     );
 
     store.read().await.flush().await.unwrap();

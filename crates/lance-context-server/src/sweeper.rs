@@ -25,11 +25,9 @@ use tokio::sync::{Mutex, RwLock};
 /// A store the sweepers can maintain.
 ///
 /// Implemented on `Arc<RwLock<Store>>` rather than on the store itself so each
-/// kind decides its own locking. That is load-bearing for rollout, whose merge
-/// deliberately splits into a shared-lock prepare (the expensive object-storage
-/// reads, during which appends keep flowing) and a brief exclusive-lock commit.
-/// A trait over `&mut Store` would have forced the exclusive lock across the
-/// whole merge and quietly stalled the write path.
+/// kind decides its own locking. Merge/flush/commit are `&self` on the store
+/// (dataset handle is ArcSwap), so these impls only need a shared lock —
+/// concurrent appends keep flowing.
 pub(crate) trait Sweepable: Send + Sync + 'static {
     /// Human-readable kind, for log and metric labels.
     fn kind() -> &'static str;
@@ -48,14 +46,13 @@ impl Sweepable for Arc<RwLock<RolloutStore>> {
     }
 
     async fn flush(&self) -> Result<(), String> {
-        // Read lock: `flush` is `&self`, so concurrent appends are not blocked.
         let guard = self.read().await;
         let result = guard.flush().await.map_err(|e| e.to_string());
         if result.is_ok() {
             // The count-triggered merge rides this timer; it is a no-op unless
             // the threshold is configured and met.
             drop(guard);
-            let mut guard = self.write().await;
+            let guard = self.read().await;
             guard
                 .maybe_merge_own_shard()
                 .await
@@ -65,9 +62,6 @@ impl Sweepable for Arc<RwLock<RolloutStore>> {
     }
 
     async fn merge_wal(&self) -> Result<usize, String> {
-        // The prepare/commit split: seal and read every flushed generation
-        // under the *shared* lock so appends keep running, then take the
-        // exclusive lock only for the short commit.
         let prepared = {
             let guard = self.read().await;
             guard
@@ -78,7 +72,7 @@ impl Sweepable for Arc<RwLock<RolloutStore>> {
         let Some((manifest_store, manifest, prepared)) = prepared else {
             return Ok(0);
         };
-        let mut guard = self.write().await;
+        let guard = self.read().await;
         guard
             .commit_prepared_merge(&manifest_store, &manifest, prepared)
             .await
@@ -99,7 +93,7 @@ impl Sweepable for Arc<RwLock<DatagenStore>> {
     }
 
     async fn merge_wal(&self) -> Result<usize, String> {
-        let mut guard = self.write().await;
+        let guard = self.read().await;
         guard.cleanup_own_shard().await.map_err(|e| e.to_string())
     }
 }
@@ -115,7 +109,7 @@ impl Sweepable for Arc<RwLock<GenericStore>> {
     }
 
     async fn merge_wal(&self) -> Result<usize, String> {
-        let mut guard = self.write().await;
+        let guard = self.read().await;
         guard.cleanup_wal().await.map_err(|e| e.to_string())
     }
 }

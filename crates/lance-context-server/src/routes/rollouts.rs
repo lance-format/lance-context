@@ -494,7 +494,7 @@ async fn get_rollout_refreshing_on_miss(
         }
     }
 
-    let mut store = store_lock.write().await;
+    let store = store_lock.read().await;
     if !store.is_version_pinned() {
         store.refresh_latest().await.map_err(AppError::from_lance)?;
     }
@@ -516,7 +516,7 @@ async fn get_rollout_blob_refreshing_on_miss(
         }
     }
 
-    let mut store = store_lock.write().await;
+    let store = store_lock.read().await;
     if !store.is_version_pinned() {
         store.refresh_latest().await.map_err(AppError::from_lance)?;
     }
@@ -575,7 +575,7 @@ pub async fn checkout_rollout(
 ) -> Result<Json<VersionResponse>, AppError> {
     let store_lock = state.get_or_open_rollout_store(&name).await?;
 
-    let mut store = store_lock.write().await;
+    let store = store_lock.read().await;
     store
         .checkout(req.version)
         .await
@@ -613,7 +613,7 @@ pub async fn compact_rollout(
     };
 
     let lock_start = std::time::Instant::now();
-    let mut store = store_lock.write().await;
+    let store = store_lock.read().await;
     ::metrics::histogram!("rollout_compaction_lock_wait_seconds")
         .record(lock_start.elapsed().as_secs_f64());
     let compact_start = std::time::Instant::now();
@@ -692,7 +692,7 @@ pub async fn merge_wal(
     let merge_start = std::time::Instant::now();
     let reclaimed = match prepared {
         Some((manifest_store, manifest, prepared)) => {
-            let mut store = store_lock.write().await;
+            let store = store_lock.read().await;
             match store
                 .commit_prepared_merge(&manifest_store, &manifest, prepared)
                 .await

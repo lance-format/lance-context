@@ -238,7 +238,7 @@ impl GenericStore {
     }
 
     /// Refresh this handle to the latest base-table manifest.
-    pub async fn refresh_latest(&mut self) -> LanceResult<()> {
+    pub async fn refresh_latest(&self) -> LanceResult<()> {
         self.base.refresh_latest().await
     }
 
@@ -356,19 +356,19 @@ impl GenericStore {
     }
 
     /// Close the resident writer, draining its background tasks. Idempotent.
-    pub async fn close(&mut self) -> LanceResult<()> {
+    pub async fn close(&self) -> LanceResult<()> {
         self.base.close().await
     }
 
     /// Merge flushed generations into the base table once the count trigger is
     /// met. Returns how many were reclaimed.
-    pub async fn maybe_merge_wal(&mut self) -> LanceResult<usize> {
+    pub async fn maybe_merge_wal(&self) -> LanceResult<usize> {
         self.base.maybe_merge_own_shard().await
     }
 
     /// Seal, then merge **every** pending generation into the base table — the
     /// time half of the "time OR count" trigger.
-    pub async fn cleanup_wal(&mut self) -> LanceResult<usize> {
+    pub async fn cleanup_wal(&self) -> LanceResult<usize> {
         self.base.cleanup_own_shard().await
     }
 
@@ -380,7 +380,7 @@ impl GenericStore {
     /// Compact the base table's small fragments. Drive from a single external
     /// trigger, not per worker — see [`StorageBase::compact`].
     pub async fn compact(
-        &mut self,
+        &self,
         options: Option<CompactionConfig>,
     ) -> LanceResult<CompactionMetrics> {
         self.base.compact(options).await
@@ -399,7 +399,7 @@ impl GenericStore {
     }
 
     /// Build a ZoneMap scalar index on `id`. Idempotent.
-    pub async fn create_id_index(&mut self) -> LanceResult<()> {
+    pub async fn create_id_index(&self) -> LanceResult<()> {
         self.base.create_key_zonemap_index().await
     }
 

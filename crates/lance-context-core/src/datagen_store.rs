@@ -141,7 +141,7 @@ impl DatagenStore {
     }
 
     /// Refresh this handle to the latest base-table manifest.
-    pub async fn refresh_latest(&mut self) -> LanceResult<()> {
+    pub async fn refresh_latest(&self) -> LanceResult<()> {
         self.base.refresh_latest().await
     }
 
@@ -150,7 +150,7 @@ impl DatagenStore {
     /// The supplied slice is persisted as one MemWAL generation. Callers should
     /// include FIELD_* events and the corresponding STEP_COMPLETED marker in
     /// the same call so a crash cannot expose a partially checkpointed step.
-    pub async fn append(&mut self, events: &[DatagenEvent]) -> LanceResult<u64> {
+    pub async fn append(&self, events: &[DatagenEvent]) -> LanceResult<u64> {
         if events.is_empty() {
             return Ok(self.base.version());
         }
@@ -189,7 +189,7 @@ impl DatagenStore {
     }
 
     /// Gracefully stop this store's resident MemWAL writer.
-    pub async fn close(&mut self) -> LanceResult<()> {
+    pub async fn close(&self) -> LanceResult<()> {
         self.base.close().await
     }
 
@@ -365,7 +365,7 @@ impl DatagenStore {
 
     /// Merge every currently flushed generation owned by this writer into the
     /// base table.
-    pub async fn cleanup_own_shard(&mut self) -> LanceResult<usize> {
+    pub async fn cleanup_own_shard(&self) -> LanceResult<usize> {
         self.base.cleanup_own_shard().await
     }
 
@@ -380,7 +380,7 @@ impl DatagenStore {
     /// the shared base table and Lance treats two concurrent `Rewrite` commits
     /// as a conflict.
     pub async fn compact(
-        &mut self,
+        &self,
         options: Option<CompactionConfig>,
     ) -> LanceResult<CompactionMetrics> {
         self.base.compact(options).await
@@ -402,7 +402,7 @@ impl DatagenStore {
     /// Build a ZoneMap scalar index on `event_id`, the table's key column.
     /// Idempotent. Datagen previously had no scalar index, so every point
     /// lookup by event id scanned.
-    pub async fn create_event_id_index(&mut self) -> LanceResult<()> {
+    pub async fn create_event_id_index(&self) -> LanceResult<()> {
         self.base.create_key_zonemap_index().await
     }
 

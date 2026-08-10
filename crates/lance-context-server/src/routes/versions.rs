@@ -26,7 +26,7 @@ pub async fn checkout(
 ) -> Result<Json<VersionResponse>, AppError> {
     let store_lock = state.get_or_open_context_store(&name).await?;
 
-    let mut store = store_lock.write().await;
+    let store = store_lock.read().await;
     store
         .checkout(req.version)
         .await

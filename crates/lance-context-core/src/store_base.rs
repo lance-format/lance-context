@@ -36,7 +36,8 @@
 //! latest schema to evolve a base table to — via [`StorageBaseOptions`].
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
 use arrow_array::{new_null_array, RecordBatch, RecordBatchIterator, UInt32Array};
@@ -183,7 +184,7 @@ pub enum ListSource {
 ///
 /// Produced by `StorageBase::prepare_merge_if_ready` under `&self` (so appends
 /// keep running while it reads object storage) and consumed by
-/// `StorageBase::commit_prepared_merge` under `&mut self`. `PreparedMerge` is
+/// `StorageBase::commit_prepared_merge` (also `&self`). `PreparedMerge` is
 /// public because it appears in [`RolloutStore`]'s prepare/commit split, but
 /// its fields are opaque.
 ///
@@ -260,6 +261,14 @@ pub(crate) struct StorageBaseOptions {
     pub seal_on_put: bool,
 }
 
+/// Per-handle compaction counters/timestamps.
+#[derive(Debug, Default)]
+struct CompactionState {
+    last_compaction: Option<DateTime<Utc>>,
+    total_compactions: u64,
+    last_error: Option<String>,
+}
+
 /// Schema-agnostic Lance storage: dataset handle, MemWAL write path, WAL merge,
 /// compaction, indexing, and LSM reads. See the module docs.
 pub(crate) struct StorageBase {
@@ -287,18 +296,17 @@ pub(crate) struct StorageBase {
     /// Self-merge threshold; `0` disables it.
     merge_after_generations: usize,
     merge_max_generations: usize,
-    /// Timestamp of the last successful [`Self::compact`] on this handle.
-    last_compaction: Option<DateTime<Utc>>,
-    /// Number of successful compactions performed by this handle.
-    total_compactions: u64,
-    /// Error message from the most recent failed compaction on this handle.
-    last_compaction_error: Option<String>,
+    /// Compaction bookkeeping for this handle (interior-mutable so [`Self::compact`] can be `&self`).
+    compaction: Mutex<CompactionState>,
     /// Explicit time-travel version selected by [`Self::checkout`].
     ///
     /// A point-read miss may refresh an ordinary long-lived handle to avoid a
     /// false negative from a stale manifest, but must never advance a handle
     /// whose caller deliberately selected a historical version.
-    pinned_version: Option<u64>,
+    ///
+    /// `0` means unpinned; any other value is the pinned manifest version.
+    /// (Lance dataset versions are 1-based, so `0` is never a real pin.)
+    pinned_version: AtomicU64,
     /// Resident MemWAL writer for this instance's shard, wrapped for `&self`
     /// concurrent access. The [`tokio::sync::Mutex`] is held only to
     /// fetch-or-open and clone the `Arc` (see [`Self::resident_writer`]) and to
@@ -406,7 +414,7 @@ impl StorageBase {
             .into());
         }
 
-        let mut base = Self {
+        let base = Self {
             dataset: ArcSwap::from_pointee(dataset),
             write_shard: derive_shard_id(shard_id.as_deref()),
             storage_options,
@@ -416,14 +424,12 @@ impl StorageBase {
             seal_on_put,
             merge_after_generations: merge_after_generations.unwrap_or(0),
             merge_max_generations: merge_max_generations.unwrap_or(DEFAULT_MERGE_MAX_GENERATIONS),
-            last_compaction: None,
-            total_compactions: 0,
-            last_compaction_error: None,
-            pinned_version: None,
+            compaction: Mutex::new(CompactionState::default()),
+            pinned_version: AtomicU64::new(0),
             write_writer: tokio::sync::Mutex::new(None),
         };
         // `ensure_mem_wal` may reload the dataset on a concurrent first-writer
-        // race, which is why it must run here where we hold `&mut`.
+        // race; it publishes the new handle via ArcSwap.
         base.ensure_mem_wal().await?;
         Ok(base)
     }
@@ -441,20 +447,28 @@ impl StorageBase {
     }
 
     /// Check out a specific base dataset version (time travel).
-    pub async fn checkout(&mut self, version_id: u64) -> LanceResult<()> {
+    ///
+    /// `version_id` must be non-zero (`0` is reserved to mean "unpinned").
+    pub async fn checkout(&self, version_id: u64) -> LanceResult<()> {
+        if version_id == 0 {
+            return Err(ArrowError::InvalidArgumentError(
+                "dataset version 0 is reserved; pin a real manifest version (>= 1)".to_string(),
+            )
+            .into());
+        }
         let dataset = self
             .current_dataset()
             .checkout_version(version_id)
             .await?;
         self.set_dataset(dataset);
-        self.pinned_version = Some(version_id);
+        self.pinned_version.store(version_id, Ordering::Release);
         Ok(())
     }
 
     /// Whether this handle was explicitly checked out to a historical version.
     #[must_use]
     pub fn is_version_pinned(&self) -> bool {
-        self.pinned_version.is_some()
+        self.pinned_version.load(Ordering::Acquire) != 0
     }
 
     /// Refresh this handle to the latest base-table manifest while retaining its
@@ -463,18 +477,18 @@ impl StorageBase {
     /// Long-lived read handles call this before a new request so compaction or
     /// WAL merges committed by another process become visible without paying the
     /// cost of reopening the dataset and rebuilding all session caches.
-    pub async fn refresh_latest(&mut self) -> LanceResult<()> {
+    pub async fn refresh_latest(&self) -> LanceResult<()> {
         let mut dataset = (*self.current_dataset()).clone();
         dataset.checkout_latest().await?;
         self.set_dataset(dataset);
-        self.pinned_version = None;
+        self.clear_version_pin();
         Ok(())
     }
 
     /// Mark this handle as no longer pinned after a concrete store mutates the
     /// dataset directly.
-    pub(crate) fn clear_version_pin(&mut self) {
-        self.pinned_version = None;
+    pub(crate) fn clear_version_pin(&self) {
+        self.pinned_version.store(0, Ordering::Release);
     }
 
     /// Current dataset snapshot (`Arc` clone; cheap).
@@ -663,9 +677,9 @@ impl StorageBase {
     /// by an explicit `close().await`. Call this before dropping a store on a
     /// path that can `await` (e.g. an LRU eviction that owns the last handle).
     /// Idempotent: a no-op when no writer is resident.
-    pub async fn close(&mut self) -> LanceResult<()> {
-        // `&mut self` gives exclusive access, so `get_mut` avoids an async lock.
-        if let Some(writer) = self.write_writer.get_mut().take() {
+    pub async fn close(&self) -> LanceResult<()> {
+        let writer = self.write_writer.lock().await.take();
+        if let Some(writer) = writer {
             match Arc::try_unwrap(writer) {
                 // Sole owner: drain the writer's background tasks gracefully.
                 Ok(writer) => writer.close().await?,
@@ -703,7 +717,7 @@ impl StorageBase {
     /// Merge this instance's flushed generations into the base table **if** the
     /// shard has accumulated at least `merge_after_generations` of them (the
     /// count trigger; `0` disables it). No-op otherwise.
-    pub async fn maybe_merge_own_shard(&mut self) -> LanceResult<usize> {
+    pub async fn maybe_merge_own_shard(&self) -> LanceResult<usize> {
         if self.merge_after_generations == 0 {
             return Ok(0);
         }
@@ -726,7 +740,7 @@ impl StorageBase {
     /// would stay empty, so the threshold check would return `0` and never reach
     /// the merge — leaving rows durable but permanently invisible until a
     /// process restart replayed the WAL.
-    pub async fn cleanup_own_shard(&mut self) -> LanceResult<usize> {
+    pub async fn cleanup_own_shard(&self) -> LanceResult<usize> {
         self.flush().await?;
         // Threshold `1`: merge whenever at least one generation is pending. The
         // time trigger must not depend on the count threshold — that is what
@@ -734,7 +748,7 @@ impl StorageBase {
         self.merge_own_shard_if_ready(1).await
     }
 
-    async fn merge_own_shard_if_ready(&mut self, threshold: usize) -> LanceResult<usize> {
+    async fn merge_own_shard_if_ready(&self, threshold: usize) -> LanceResult<usize> {
         let Some((manifest_store, manifest, prepared)) =
             self.prepare_merge_if_ready(threshold).await?
         else {
@@ -758,7 +772,7 @@ impl StorageBase {
     /// ```ignore
     /// let prepared = { store.read().await.prepare_merge_if_ready(1).await? };
     /// if let Some((manifest_store, manifest, prepared)) = prepared {
-    ///     store.write().await.commit_prepared_merge(&manifest_store, &manifest, prepared).await?;
+    ///     store.commit_prepared_merge(&manifest_store, &manifest, prepared).await?;
     /// }
     /// ```
     pub async fn prepare_merge_if_ready(
@@ -811,7 +825,7 @@ impl StorageBase {
 
     /// Commit a merge prepared by [`Self::prepare_merge_if_ready`].
     pub async fn commit_prepared_merge(
-        &mut self,
+        &self,
         manifest_store: &ShardManifestStore,
         manifest: &ShardManifest,
         prepared: PreparedMerge,
@@ -861,9 +875,8 @@ impl StorageBase {
         }))
     }
 
-    /// The `&mut self` half of a merge: append the prepared rows to the base
-    /// table, drain the merged generations from the manifest, and delete their
-    /// directories.
+    /// Append the prepared rows to the base table, drain the merged generations
+    /// from the manifest, and delete their directories.
     ///
     /// # Surgical drain, not blanket clear
     ///
@@ -884,7 +897,7 @@ impl StorageBase {
     /// of appending physical duplicates. The next attempt can then drain the
     /// manifest without relying on a particular Lance read-plan shape.
     async fn commit_merge(
-        &mut self,
+        &self,
         manifest_store: &ShardManifestStore,
         manifest: &ShardManifest,
         prepared: PreparedMerge,
@@ -917,7 +930,7 @@ impl StorageBase {
                 "append",
                 self.merge_prepared_batches(batches, merge_schema).await
             )?;
-            self.pinned_version = None;
+            self.clear_version_pin();
         }
 
         // Reuse the shard's *current* epoch rather than claiming a new one:
@@ -946,7 +959,7 @@ impl StorageBase {
         )?;
 
         self.delete_merged_generation_dirs(&merged_paths).await?;
-        self.pinned_version = None;
+        self.clear_version_pin();
         Ok(true)
     }
 
@@ -1074,7 +1087,7 @@ impl StorageBase {
     /// row per key. `UpdateAll` preserves normal LSM last-write-wins semantics
     /// while also making a retry after an interrupted manifest drain idempotent.
     async fn merge_prepared_batches(
-        &mut self,
+        &self,
         batches: Vec<RecordBatch>,
         merge_schema: Arc<Schema>,
     ) -> LanceResult<()> {
@@ -1098,7 +1111,7 @@ impl StorageBase {
     /// Missing nullable columns are added as all-null arrays. Existing unknown
     /// columns, type changes, and missing required columns remain hard errors.
     /// A no-op when the store declared no `latest_schema`.
-    pub async fn ensure_latest_schema(&mut self) -> LanceResult<()> {
+    pub async fn ensure_latest_schema(&self) -> LanceResult<()> {
         let Some(latest_schema) = self.latest_schema.clone() else {
             return Ok(());
         };
@@ -1147,7 +1160,7 @@ impl StorageBase {
     /// to call while other workers are appending or WAL-merging: `Append` vs
     /// `Rewrite` is non-conflicting in Lance's matrix.
     pub async fn compact(
-        &mut self,
+        &self,
         options: Option<CompactionConfig>,
     ) -> LanceResult<CompactionMetrics> {
         let config = options.unwrap_or_default();
@@ -1193,9 +1206,12 @@ impl StorageBase {
                 // Reload the handle so the caller (and subsequent reads on this
                 // instance) observe the compacted version.
                 self.reload().await?;
-                self.last_compaction = Some(Utc::now());
-                self.total_compactions += 1;
-                self.last_compaction_error = None;
+                {
+                    let mut state = self.compaction.lock().unwrap_or_else(|e| e.into_inner());
+                    state.last_compaction = Some(Utc::now());
+                    state.total_compactions += 1;
+                    state.last_error = None;
+                }
                 info!(
                     fragments_removed = metrics.fragments_removed,
                     fragments_added = metrics.fragments_added,
@@ -1205,7 +1221,10 @@ impl StorageBase {
             }
             Err(e) => {
                 warn!(error = %e, "base-table compaction failed");
-                self.last_compaction_error = Some(e.to_string());
+                {
+                    let mut state = self.compaction.lock().unwrap_or_else(|e| e.into_inner());
+                    state.last_error = Some(e.to_string());
+                }
                 Err(e)
             }
         }
@@ -1226,7 +1245,7 @@ impl StorageBase {
     /// only ever needs to describe the base table's already-merged fragments —
     /// rows still living in unmerged WAL generations are found by the normal
     /// scan of those generations.
-    pub async fn create_key_zonemap_index(&mut self) -> LanceResult<()> {
+    pub async fn create_key_zonemap_index(&self) -> LanceResult<()> {
         info!(column = %self.key_column, "creating ZoneMap index on key column");
         let mut dataset = (*self.current_dataset()).clone();
         dataset
@@ -1267,23 +1286,23 @@ impl StorageBase {
 
     /// Current compaction statistics for the base table.
     ///
-    /// `is_compacting` is always `false`: compaction runs synchronously under
-    /// the caller's `&mut self`, so a stats read cannot observe an in-flight
-    /// compaction on this handle.
+    /// `is_compacting` is always `false`: compaction runs synchronously on this
+    /// handle, so a stats read cannot observe an in-flight compaction here.
     #[must_use]
     pub fn compaction_stats(&self) -> CompactionStats {
+        let state = self.compaction.lock().unwrap_or_else(|e| e.into_inner());
         CompactionStats {
             total_fragments: self.current_dataset().count_fragments(),
             is_compacting: false,
-            last_compaction: self.last_compaction,
-            last_error: self.last_compaction_error.clone(),
-            total_compactions: self.total_compactions,
+            last_compaction: state.last_compaction,
+            last_error: state.last_error.clone(),
+            total_compactions: state.total_compactions,
         }
     }
 
     /// Reload the base dataset handle through [`Self::load_with_options`], so
     /// the shared session and storage options are never dropped.
-    pub async fn reload(&mut self) -> LanceResult<()> {
+    pub async fn reload(&self) -> LanceResult<()> {
         let uri = self.uri();
         let dataset = Self::load_with_options(
             &uri,
@@ -1292,7 +1311,7 @@ impl StorageBase {
         )
         .await?;
         self.set_dataset(dataset);
-        self.pinned_version = None;
+        self.clear_version_pin();
         Ok(())
     }
 
@@ -1309,7 +1328,7 @@ impl StorageBase {
     /// `RetryableCommitConflict`. That is benign here — the winner created
     /// exactly the index we wanted — so we reload and treat "index now present"
     /// as success. Any other error propagates.
-    async fn ensure_mem_wal(&mut self) -> LanceResult<()> {
+    async fn ensure_mem_wal(&self) -> LanceResult<()> {
         if self.mem_wal_index_present().await? {
             return Ok(());
         }

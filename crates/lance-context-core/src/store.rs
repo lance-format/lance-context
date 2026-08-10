@@ -1399,7 +1399,7 @@ impl ContextStore {
     ///
     /// Existing rows are stored as null in the new column and read back as an
     /// empty relationship list.
-    pub async fn migrate_relationships_column(&mut self) -> LanceResult<bool> {
+    pub async fn migrate_relationships_column(&self) -> LanceResult<bool> {
         if self.has_relationships_column() {
             return Ok(false);
         }
@@ -1415,7 +1415,7 @@ impl ContextStore {
     }
 
     /// Checkout a specific dataset version.
-    pub async fn checkout(&mut self, version_id: u64) -> LanceResult<()> {
+    pub async fn checkout(&self, version_id: u64) -> LanceResult<()> {
         self.base.checkout(version_id).await
     }
 
@@ -1426,7 +1426,7 @@ impl ContextStore {
     }
 
     /// Refresh this handle to the latest base-table manifest.
-    pub async fn refresh_latest(&mut self) -> LanceResult<()> {
+    pub async fn refresh_latest(&self) -> LanceResult<()> {
         self.base.refresh_latest().await
     }
 
@@ -1888,7 +1888,7 @@ impl ContextStore {
 
     /// Manually trigger compaction to merge small fragments.
     pub async fn compact(
-        &mut self,
+        &self,
         options: Option<CompactionConfig>,
     ) -> LanceResult<CompactionMetrics> {
         let config = options.unwrap_or_else(|| self.compaction_config.clone());
@@ -1971,7 +1971,7 @@ impl ContextStore {
 
     /// Gracefully close the resident MemWAL writer, draining its background
     /// tasks and sealing whatever it still buffers. Idempotent.
-    pub async fn close(&mut self) -> LanceResult<()> {
+    pub async fn close(&self) -> LanceResult<()> {
         self.base.close().await
     }
 
@@ -1985,14 +1985,14 @@ impl ContextStore {
     /// unioned all of them, so read cost grew without bound in the number of
     /// writes. Merging is what keeps that bounded — drive it from a sweeper, or
     /// use [`Self::cleanup_wal`] for the time-based trigger.
-    pub async fn maybe_merge_wal(&mut self) -> LanceResult<usize> {
+    pub async fn maybe_merge_wal(&self) -> LanceResult<usize> {
         self.base.maybe_merge_own_shard().await
     }
 
     /// Seal, then fold **every** pending flushed generation into the base table.
     /// The time half of the "time OR count" trigger, so deliberately not gated
     /// by the count threshold. Returns the number of generations reclaimed.
-    pub async fn cleanup_wal(&mut self) -> LanceResult<usize> {
+    pub async fn cleanup_wal(&self) -> LanceResult<usize> {
         self.base.cleanup_own_shard().await
     }
 
@@ -2040,7 +2040,7 @@ impl ContextStore {
     }
 
     /// Ensure the configured id index exists on the dataset.
-    async fn ensure_id_index(&mut self) -> LanceResult<()> {
+    async fn ensure_id_index(&self) -> LanceResult<()> {
         if self.id_index_type == IdIndexType::None {
             return Ok(());
         }
@@ -2054,7 +2054,7 @@ impl ContextStore {
     }
 
     /// Create (or replace) the scalar index on the `id` column.
-    pub async fn create_id_index(&mut self) -> LanceResult<()> {
+    pub async fn create_id_index(&self) -> LanceResult<()> {
         let index_type = match self.id_index_type {
             IdIndexType::ZoneMap => IndexType::ZoneMap,
             IdIndexType::BTree => IndexType::BTree,
