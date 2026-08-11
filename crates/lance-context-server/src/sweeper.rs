@@ -26,8 +26,8 @@ use tokio::sync::{Mutex, RwLock};
 ///
 /// Implemented on `Arc<RwLock<Store>>` rather than on the store itself so each
 /// kind decides its own locking. Merge/flush/commit are `&self` on the store
-/// (dataset handle is ArcSwap), so these impls only need a shared lock —
-/// concurrent appends keep flowing.
+/// (dataset handle is ArcSwap; merge exclusivity is an internal `try_lock`), so
+/// these impls only need a shared store lock — concurrent appends keep flowing.
 pub(crate) trait Sweepable: Send + Sync + 'static {
     /// Human-readable kind, for log and metric labels.
     fn kind() -> &'static str;

@@ -254,8 +254,9 @@ async fn generation_sealed_during_merge_is_not_dropped() {
 
 /// Two merges racing must not append the same generations twice.
 ///
-/// Merges are serialized by an internal mutex (not the store lock, which would
-/// also exclude appends); the loser returns 0 rather than waiting.
+/// Merges are serialized by `StorageBase`'s internal `merge_lock` (prepare
+/// through commit). A `try_lock` loser gets `prepare_* -> None` / reclaim `0`
+/// rather than waiting — appends never take this lock.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_merges_do_not_duplicate_rows() {
     let tmp = tempfile::tempdir().unwrap();

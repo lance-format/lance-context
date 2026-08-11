@@ -175,12 +175,12 @@ fn describe_metrics() {
     describe_histogram!(
         "rollout_wal_merge_lock_wait_seconds",
         Unit::Seconds,
-        "Time waiting for the store write lock before a WAL merge (blocks all ingest)."
+        "Time waiting for the store shared lock before a WAL merge prepare."
     );
     describe_histogram!(
         "rollout_compaction_lock_wait_seconds",
         Unit::Seconds,
-        "Time waiting for the store write lock before compaction."
+        "Time waiting for the store shared lock before compaction."
     );
 
     // Master task lifecycle.

@@ -182,11 +182,12 @@ pub enum ListSource {
 /// Rows read out of the flushed generations, ready to be appended to the base
 /// table and drained from the shard manifest.
 ///
-/// Produced by `StorageBase::prepare_merge_if_ready` under `&self` (so appends
-/// keep running while it reads object storage) and consumed by
-/// `StorageBase::commit_prepared_merge` (also `&self`). `PreparedMerge` is
-/// public because it appears in [`RolloutStore`]'s prepare/commit split, but
-/// its fields are opaque.
+/// Produced by `StorageBase::prepare_merge_if_ready` / `prepare_cleanup_merge`
+/// and consumed by `StorageBase::commit_prepared_merge`. Holding a value of this
+/// type retains the store's internal merge lock until it is committed or
+/// dropped, so callers of the prepare/commit split do not need to lock
+/// externally. `PreparedMerge` is public because it appears in
+/// [`RolloutStore`]'s prepare/commit split, but its fields are opaque.
 ///
 /// [`RolloutStore`]: crate::RolloutStore
 pub struct PreparedMerge {
@@ -194,6 +195,9 @@ pub struct PreparedMerge {
     merged_paths: Vec<String>,
     batches: Vec<RecordBatch>,
     merge_schema: Arc<Schema>,
+    /// Serializes this prepare+commit against other merges on the same store.
+    /// Released when `PreparedMerge` is dropped (after commit or on abandon).
+    _merge_guard: tokio::sync::OwnedMutexGuard<()>,
 }
 
 impl PreparedMerge {
@@ -298,6 +302,10 @@ pub(crate) struct StorageBase {
     merge_max_generations: usize,
     /// Compaction bookkeeping for this handle (interior-mutable so [`Self::compact`] can be `&self`).
     compaction: Mutex<CompactionState>,
+    /// Serializes WAL→base merge (prepare through commit). Taken with
+    /// `try_lock_owned`: a loser no-ops (`Ok(0)` / `Ok(None)`). Not held by
+    /// `add`/`flush`, so appends keep running while a merge is in flight.
+    merge_lock: Arc<tokio::sync::Mutex<()>>,
     /// Explicit time-travel version selected by [`Self::checkout`].
     ///
     /// A point-read miss may refresh an ordinary long-lived handle to avoid a
@@ -425,6 +433,7 @@ impl StorageBase {
             merge_after_generations: merge_after_generations.unwrap_or(0),
             merge_max_generations: merge_max_generations.unwrap_or(DEFAULT_MERGE_MAX_GENERATIONS),
             compaction: Mutex::new(CompactionState::default()),
+            merge_lock: Arc::new(tokio::sync::Mutex::new(())),
             pinned_version: AtomicU64::new(0),
             write_writer: tokio::sync::Mutex::new(None),
         };
@@ -761,16 +770,16 @@ impl StorageBase {
         Ok(if committed { pending } else { 0 })
     }
 
-    /// The shared-lock half of a merge: decide whether one is due and read the
-    /// flushed generations into memory.
+    /// Prepare half of a merge: decide whether one is due and read the flushed
+    /// generations into memory.
     ///
-    /// Takes `&self`, so a caller holding a *read* lock can run the expensive
-    /// part while appends continue, then take the write lock only to hand the
-    /// result to [`Self::commit_prepared_merge`]. Returns `None` when nothing is
-    /// due.
+    /// Acquires the internal merge lock with `try_lock` (returned inside
+    /// [`PreparedMerge`]) so prepare+commit stay exclusive without blocking
+    /// `add`. Returns `None` when nothing is due **or** another merge already
+    /// holds the lock.
     ///
     /// ```ignore
-    /// let prepared = { store.read().await.prepare_merge_if_ready(1).await? };
+    /// let prepared = store.prepare_merge_if_ready(1).await?;
     /// if let Some((manifest_store, manifest, prepared)) = prepared {
     ///     store.commit_prepared_merge(&manifest_store, &manifest, prepared).await?;
     /// }
@@ -797,6 +806,12 @@ impl StorageBase {
         threshold: usize,
         seal_first: bool,
     ) -> LanceResult<Option<(ShardManifestStore, ShardManifest, PreparedMerge)>> {
+        // Exclusive for the whole prepare→commit lifetime (guard lives in
+        // PreparedMerge). Losers no-op: the holder will drain current gens.
+        let Ok(merge_guard) = Arc::clone(&self.merge_lock).try_lock_owned() else {
+            return Ok(None);
+        };
+
         if seal_first {
             // Materialize anything buffered so it is eligible for this pass.
             self.flush().await?;
@@ -817,13 +832,15 @@ impl StorageBase {
         if pending == 0 || pending < threshold.max(1) {
             return Ok(None);
         }
-        let Some(prepared) = self.prepare_merge(&manifest).await? else {
+        let Some(prepared) = self.prepare_merge(&manifest, merge_guard).await? else {
             return Ok(None);
         };
         Ok(Some((manifest_store, manifest, prepared)))
     }
 
     /// Commit a merge prepared by [`Self::prepare_merge_if_ready`].
+    ///
+    /// Consumes [`PreparedMerge`], releasing the merge lock when it returns.
     pub async fn commit_prepared_merge(
         &self,
         manifest_store: &ShardManifestStore,
@@ -837,21 +854,21 @@ impl StorageBase {
         Ok(if committed { pending } else { 0 })
     }
 
-    /// The `&self` half of a merge: everything that can run while appends
-    /// continue — sealing the memtable and reading every flushed generation
-    /// into memory.
+    /// Seal + read every flushed generation into a [`PreparedMerge`].
     ///
-    /// # Concurrency: the expensive phase does not need exclusive access
+    /// # Concurrency
     ///
-    /// A merge only ever touches *sealed* generations — history — while a `put`
-    /// writes the active memtable at the WAL tail. They operate on disjoint
-    /// data, which is the whole point of an LSM, so a merge must not stop the
-    /// write path. Notably the merge does **not** `claim_epoch`: the epoch is an
-    /// *ownership* token, not a per-commit token, and
+    /// Caller already holds [`Self::merge_lock`] via `merge_guard`. A merge only
+    /// ever touches *sealed* generations — history — while a `put` writes the
+    /// active memtable at the WAL tail, so appends keep running. The merge does
+    /// **not** `claim_epoch`: the epoch is an *ownership* token, and
     /// [`ShardManifestStore::commit_update`] only rejects a writer whose epoch is
-    /// **older** than the stored one. Reusing the shard's current epoch commits
-    /// the drain and leaves the live writer untouched.
-    async fn prepare_merge(&self, manifest: &ShardManifest) -> LanceResult<Option<PreparedMerge>> {
+    /// **older** than the stored one.
+    async fn prepare_merge(
+        &self,
+        manifest: &ShardManifest,
+        merge_guard: tokio::sync::OwnedMutexGuard<()>,
+    ) -> LanceResult<Option<PreparedMerge>> {
         if manifest.flushed_generations.is_empty() {
             return Ok(None);
         }
@@ -862,8 +879,8 @@ impl StorageBase {
         observe_phase!("seal", self.flush().await)?;
 
         // The expensive phase: pull every flushed generation out of object
-        // storage. Buffered in memory, so this is the part that must not hold an
-        // exclusive lock.
+        // storage. Runs under the merge lock so a second merge cannot prepare
+        // the same generations concurrently.
         let (merged_generations, merged_paths, batches, merge_schema) =
             observe_phase!("read", self.read_flushed_generations(manifest).await)?;
 
@@ -872,6 +889,7 @@ impl StorageBase {
             merged_paths,
             batches,
             merge_schema,
+            _merge_guard: merge_guard,
         }))
     }
 
@@ -907,6 +925,7 @@ impl StorageBase {
             merged_paths,
             batches,
             merge_schema,
+            _merge_guard,
         } = prepared;
 
         // Several sweepers can prepare the same immutable generations under a

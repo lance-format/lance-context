@@ -307,7 +307,7 @@ pub async fn add_rollouts(
 
     // A read lock: `add` is `&self` and MemWAL appends are internally
     // concurrent, so multiple ingest requests to the same store run in parallel.
-    // Mutating ops (merge, compact, checkout, close) still take the write lock.
+    // Merge exclusivity is `StorageBase::merge_lock`, not this outer write lock.
     let store = store_lock.read().await;
 
     // Times only the store work (`add` + optional `flush`), excluding body
@@ -671,10 +671,11 @@ pub async fn merge_wal(
     Path(name): Path<String>,
 ) -> Result<Json<MergeWalResponse>, AppError> {
     let store_lock = state.get_or_open_rollout_store(&name).await?;
-    // Split by lock scope: seal + read every flushed generation under the
-    // *read* lock so ingest on this store keeps running, then take the write
-    // lock only for the short commit. Holding the write lock across the whole
-    // merge is what used to stall every concurrent append for its duration.
+    // Store `RwLock` is shared (read) only so we can call `&self` APIs while
+    // ingest keeps running. Merge exclusivity is `StorageBase::merge_lock`
+    // inside prepare→commit (`try_lock`; a loser returns `reclaimed: 0`), not
+    // this outer write lock — holding write across the whole merge is what used
+    // to stall every concurrent append.
     let lock_start = std::time::Instant::now();
     let prepared = {
         let store = store_lock.read().await;

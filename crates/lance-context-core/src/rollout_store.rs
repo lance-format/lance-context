@@ -606,8 +606,9 @@ impl RolloutStore {
         self.base.maybe_merge_own_shard().await
     }
 
-    /// The shared-lock half of a merge; see `StorageBase::prepare_merge_if_ready`
-    /// for the intended read-lock/write-lock split.
+    /// Prepare half of a merge; see `StorageBase::prepare_merge_if_ready`.
+    /// Merge exclusivity is the base's internal `merge_lock` (held inside the
+    /// returned [`PreparedMerge`]), not an outer store write lock.
     pub async fn prepare_merge_if_ready(
         &self,
         threshold: usize,
@@ -624,6 +625,8 @@ impl RolloutStore {
     }
 
     /// Commit a merge prepared by [`Self::prepare_merge_if_ready`].
+    ///
+    /// Consumes [`PreparedMerge`], releasing the base's merge lock when done.
     pub async fn commit_prepared_merge(
         &self,
         manifest_store: &ShardManifestStore,
