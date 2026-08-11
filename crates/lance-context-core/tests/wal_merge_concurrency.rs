@@ -23,7 +23,9 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use lance_context_core::{RolloutRecord, RolloutStore, RolloutStoreOptions, ROLE_ASSISTANT};
+use lance_context_core::{
+    CompactionConfig, RolloutRecord, RolloutStore, RolloutStoreOptions, ROLE_ASSISTANT,
+};
 use tokio::sync::RwLock;
 
 /// Run one full merge: seal + read generations, then commit. Both phases use
@@ -612,6 +614,86 @@ async fn merge_write_lock_is_only_held_for_short_commit() {
     assert!(
         ids.contains(&"during-prepare".to_string()),
         "row appended under the shared prepare lock must be readable"
+    );
+    assert_eq!(ids.len(), 21, "all rows readable exactly once: {ids:?}");
+}
+
+/// Compact is `&self` (ArcSwap dataset handle) and must not take the outer
+/// store write lock — otherwise every concurrent `add` waits for the whole
+/// rewrite. Assert append finishes within a timeout and remains readable; do
+/// not compare wall times to compact (flaky on fast disks).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn append_is_not_blocked_for_the_duration_of_a_compact() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().to_string_lossy().to_string();
+    let store = Arc::new(RwLock::new(
+        RolloutStore::open_with_options(&uri, opts("solo"))
+            .await
+            .unwrap(),
+    ));
+
+    // Many small base-table fragments so compact has real rewrite work.
+    for i in 0..20 {
+        store
+            .read()
+            .await
+            .add(&[rec(&format!("bulk-{i}"))])
+            .await
+            .unwrap();
+        store.read().await.flush().await.unwrap();
+        // Fold each generation into the base table as its own fragment.
+        assert!(merge_like_sweeper(&store).await > 0);
+    }
+
+    let fragments_before = store.read().await.observe().await.unwrap().fragment_count;
+    assert!(
+        fragments_before > 1,
+        "need several base fragments to compact, got {fragments_before}"
+    );
+
+    let compactor = {
+        let store = store.clone();
+        tokio::spawn(async move {
+            let guard = store.read().await;
+            guard
+                .compact(Some(CompactionConfig {
+                    min_fragments: 2,
+                    num_threads: Some(1),
+                    batch_size: Some(1),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap()
+        })
+    };
+
+    // Give compact a moment to enter the rewrite.
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    // Fail only on multi-second stalls — not on wall-clock ratios vs compact.
+    const APPEND_NOT_STALLED: Duration = Duration::from_secs(5);
+    tokio::time::timeout(APPEND_NOT_STALLED, async {
+        store
+            .read()
+            .await
+            .add(&[rec("during-compact")])
+            .await
+            .unwrap();
+    })
+    .await
+    .expect("append during compact stalled; it appears blocked behind compact");
+
+    let metrics = compactor.await.unwrap();
+    assert!(
+        metrics.fragments_removed > 0,
+        "compact should have rewritten fragments"
+    );
+
+    store.read().await.flush().await.unwrap();
+    let ids = read_ids(&store).await;
+    assert!(
+        ids.contains(&"during-compact".to_string()),
+        "the row appended during compact must be readable"
     );
     assert_eq!(ids.len(), 21, "all rows readable exactly once: {ids:?}");
 }
