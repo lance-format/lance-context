@@ -433,7 +433,7 @@ impl DatagenStore {
                 let Some(store) = weak.upgrade() else {
                     return;
                 };
-                let mut guard = store.write().await;
+                let guard = store.write().await;
                 match tokio::time::timeout(pass_timeout, guard.cleanup_own_shard()).await {
                     Ok(Ok(0)) => {}
                     Ok(Ok(reclaimed)) => info!(
@@ -1323,7 +1323,7 @@ mod tests {
         let uri = directory.path().to_string_lossy().to_string();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let mut writer_a = DatagenStore::open_with_options(
+            let writer_a = DatagenStore::open_with_options(
                 &uri,
                 DatagenStoreOptions {
                     storage_options: None,
@@ -1333,7 +1333,7 @@ mod tests {
             )
             .await
             .unwrap();
-            let mut writer_b = DatagenStore::open_with_options(
+            let writer_b = DatagenStore::open_with_options(
                 &uri,
                 DatagenStoreOptions {
                     storage_options: None,
@@ -1424,7 +1424,7 @@ mod tests {
         let uri = directory.path().to_string_lossy().to_string();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let mut store = DatagenStore::open(&uri).await.unwrap();
+            let store = DatagenStore::open(&uri).await.unwrap();
 
             // Root item "7" fans out into one sub-item "7/solve_twice:0".
             let mut root_created = event("7", 0, "created-root", 0, DatagenEventType::ItemCreated);
@@ -1478,7 +1478,7 @@ mod tests {
         let uri = dir.path().to_string_lossy().to_string();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let mut store = DatagenStore::open(&uri).await.unwrap();
+            let store = DatagenStore::open(&uri).await.unwrap();
 
             // One cleanup pass appends one fragment, so merge after each append
             // to accumulate several -- this is exactly the growth pattern that
@@ -1519,7 +1519,7 @@ mod tests {
         let uri = directory.path().to_string_lossy().to_string();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let mut store = DatagenStore::open_with_options(
+            let store = DatagenStore::open_with_options(
                 &uri,
                 DatagenStoreOptions {
                     storage_options: None,

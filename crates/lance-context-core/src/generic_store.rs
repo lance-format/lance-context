@@ -699,7 +699,7 @@ mod tests {
         let uri = dir.path().to_string_lossy().to_string();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let mut store = GenericStore::open(&uri, spec(), sealing()).await.unwrap();
+            let store = GenericStore::open(&uri, spec(), sealing()).await.unwrap();
             let payload: Vec<u8> = (0..4 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
             store
                 .add(&[row(json!({"id": "big", "payload": payload}))])
@@ -745,7 +745,7 @@ mod tests {
         let uri = dir.path().to_string_lossy().to_string();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let mut store = GenericStore::open(&uri, spec(), sealing()).await.unwrap();
+            let store = GenericStore::open(&uri, spec(), sealing()).await.unwrap();
             for i in 0..3 {
                 store
                     .add(&[row(json!({"id": format!("r{i}")}))])
