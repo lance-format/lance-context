@@ -15,7 +15,8 @@
 //!
 //! 1. appends succeed while a merge runs, and no row is lost;
 //! 2. a generation sealed *during* a merge is not silently dropped by the drain;
-//! 3. concurrent merges do not duplicate rows;
+//! 3. concurrent merges do not duplicate rows, and `merge_lock` excludes a
+//!    second prepare while the first `PreparedMerge` is still live;
 //! 4. an interrupted merge loses nothing (rows stay readable exactly once);
 //! 5. `add` is not blocked for the merge's duration.
 
@@ -285,10 +286,22 @@ async fn concurrent_merges_do_not_duplicate_rows() {
             async move { merge_like_sweeper(&store).await },
         ));
     }
+    let mut reclaimed = Vec::new();
     for h in handles {
         // None may error; a loser simply reports 0.
-        h.await.unwrap();
+        reclaimed.push(h.await.unwrap());
     }
+
+    let winners: Vec<usize> = reclaimed.iter().copied().filter(|&n| n > 0).collect();
+    assert_eq!(
+        winners.len(),
+        1,
+        "exactly one merge may reclaim; got reclaimed={reclaimed:?}"
+    );
+    assert_eq!(
+        winners[0], 10,
+        "winner should reclaim every pending generation; got reclaimed={reclaimed:?}"
+    );
 
     let ids = read_ids(&store).await;
     let mut deduped = ids.clone();
@@ -298,6 +311,92 @@ async fn concurrent_merges_do_not_duplicate_rows() {
         "the read path must not surface duplicate ids after racing merges"
     );
     assert_eq!(ids.len(), 10, "all rows readable exactly once: {ids:?}");
+}
+
+/// Direct mutual-exclusion check for `merge_lock`: while one `PreparedMerge`
+/// is live (prepare done, commit not yet), a second `prepare_*` must lose
+/// `try_lock` and return `None` — even though both only hold the outer store
+/// `RwLock` for shared/`read` access.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn second_merge_prepare_is_rejected_while_first_holds_prepared_merge() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().to_string_lossy().to_string();
+    let store = Arc::new(RwLock::new(
+        RolloutStore::open_with_options(&uri, opts("solo"))
+            .await
+            .unwrap(),
+    ));
+
+    for i in 0..4 {
+        store
+            .read()
+            .await
+            .add(&[rec(&format!("row-{i}"))])
+            .await
+            .unwrap();
+        store.read().await.flush().await.unwrap();
+    }
+
+    let first = {
+        let guard = store.read().await;
+        guard.prepare_cleanup_merge().await.unwrap()
+    };
+    let Some((manifest_store, manifest, prepared)) = first else {
+        panic!("expected pending generations for the first prepare");
+    };
+
+    // Outer store lock is already dropped; only `_merge_guard` inside
+    // `prepared` serializes merges. A concurrent prepare must no-op.
+    let second = {
+        let guard = store.read().await;
+        guard.prepare_cleanup_merge().await.unwrap()
+    };
+    assert!(
+        second.is_none(),
+        "second prepare must lose merge_lock try_lock while PreparedMerge is live"
+    );
+
+    // Appends must still flow under the held merge lock.
+    store
+        .read()
+        .await
+        .add(&[rec("during-held-merge")])
+        .await
+        .unwrap();
+
+    let reclaimed = {
+        let guard = store.read().await;
+        guard
+            .commit_prepared_merge(&manifest_store, &manifest, prepared)
+            .await
+            .unwrap()
+    };
+    assert_eq!(reclaimed, 4);
+
+    // Lock released with PreparedMerge; nothing left to merge until a new seal.
+    let after_commit = {
+        let guard = store.read().await;
+        guard.prepare_cleanup_merge().await.unwrap()
+    };
+    // prepare_cleanup_merge seals first, so the during-held-merge row becomes
+    // one pending generation — that prepare must succeed now that the lock is free.
+    assert!(
+        after_commit.is_some(),
+        "after commit, merge_lock must be free for a new prepare"
+    );
+    let (manifest_store, manifest, prepared) = after_commit.unwrap();
+    let reclaimed = {
+        let guard = store.read().await;
+        guard
+            .commit_prepared_merge(&manifest_store, &manifest, prepared)
+            .await
+            .unwrap()
+    };
+    assert_eq!(reclaimed, 1);
+
+    let ids = read_ids(&store).await;
+    assert_eq!(ids.len(), 5, "all rows readable exactly once: {ids:?}");
+    assert!(ids.contains(&"during-held-merge".to_string()));
 }
 
 /// A merge abandoned partway (the sweeper's timeout does exactly this) must not
