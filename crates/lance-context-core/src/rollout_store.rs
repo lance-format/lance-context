@@ -695,7 +695,12 @@ impl RolloutStore {
         let row_count = (base_rows + pending_rows) as i64;
         let fragment_count = self.base.current_dataset().count_fragments() as i64;
         let version = self.base.current_dataset().manifest.version;
-        let last_updated = self.base.current_dataset().manifest.timestamp().timestamp_millis();
+        let last_updated = self
+            .base
+            .current_dataset()
+            .manifest
+            .timestamp()
+            .timestamp_millis();
         let pending_wal_generations = shard_snapshots
             .iter()
             .map(|snapshot| snapshot.flushed_generations.len() as i64)
@@ -981,7 +986,10 @@ impl RolloutStore {
         }
 
         let columns = Arc::new(self.non_blob_columns());
-        let target_schema = Arc::new(projected_arrow_schema(self.base.current_dataset().as_ref(), &columns)?);
+        let target_schema = Arc::new(projected_arrow_schema(
+            self.base.current_dataset().as_ref(),
+            &columns,
+        )?);
         let id_filter = Arc::new(format!("id IN ({})", sql_quoted_list(&page_ids)));
         let wanted: HashSet<String> = page_ids.iter().cloned().collect();
 
@@ -1321,7 +1329,9 @@ impl RolloutStore {
     pub async fn get_blob(&self, id: &str) -> LanceResult<Option<Vec<u8>>> {
         // Base-table-first: an already-merged row is found here with no MemWAL
         // manifest reads and no per-generation opens.
-        if let Some(payload) = Self::get_blob_from_dataset(self.base.current_dataset().as_ref(), id).await? {
+        if let Some(payload) =
+            Self::get_blob_from_dataset(self.base.current_dataset().as_ref(), id).await?
+        {
             return Ok(payload);
         }
 
@@ -3059,7 +3069,12 @@ mod tests {
     /// Read the number of un-merged flushed generations recorded for a store's
     /// own write shard. Used by merge tests to assert the manifest drains.
     async fn flushed_generation_count(store: &RolloutStore) -> usize {
-        let object_store = store.base.current_dataset().object_store(None).await.unwrap();
+        let object_store = store
+            .base
+            .current_dataset()
+            .object_store(None)
+            .await
+            .unwrap();
         let branch_location = store.base.current_dataset().branch_location();
         let manifest_store = ShardManifestStore::new(
             object_store,
@@ -3079,7 +3094,12 @@ mod tests {
     /// Used to assert the resident writer claims the epoch once instead of
     /// bumping it on every append.
     async fn shard_writer_epoch(store: &RolloutStore) -> u64 {
-        let object_store = store.base.current_dataset().object_store(None).await.unwrap();
+        let object_store = store
+            .base
+            .current_dataset()
+            .object_store(None)
+            .await
+            .unwrap();
         let branch_location = store.base.current_dataset().branch_location();
         let manifest_store = ShardManifestStore::new(
             object_store,
@@ -3752,7 +3772,8 @@ mod tests {
             let generation_batch = current_store.records_to_batch(&[record]).unwrap();
 
             legacy_store.base.ensure_latest_schema().await.unwrap();
-            let merge_schema: Arc<Schema> = Arc::new(legacy_store.base.current_dataset().schema().into());
+            let merge_schema: Arc<Schema> =
+                Arc::new(legacy_store.base.current_dataset().schema().into());
             let aligned = align_batch_to_schema(generation_batch, merge_schema.clone()).unwrap();
             let reader = RecordBatchIterator::new(
                 vec![Ok::<RecordBatch, ArrowError>(aligned)].into_iter(),

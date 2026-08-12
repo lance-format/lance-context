@@ -336,9 +336,11 @@ impl DatagenStore {
             }
         }
 
-        Ok(Self::get_blob_from_dataset(self.base.current_dataset().as_ref(), event_id)
-            .await?
-            .flatten())
+        Ok(
+            Self::get_blob_from_dataset(self.base.current_dataset().as_ref(), event_id)
+                .await?
+                .flatten(),
+        )
     }
 
     /// Materialize a folded item's blob field by name, resolving the `event_id` for the caller.
