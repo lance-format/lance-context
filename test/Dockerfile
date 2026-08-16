@@ -29,8 +29,13 @@ RUN npm run build
 FROM rust:1-bookworm AS builder
 # Native deps mirror what CI installs: protoc for the lance protobufs, openssl
 # for etcd TLS + object-store, make/perl for the openssl-sys vendored build.
+# libprotobuf-dev is not optional here: Debian's protobuf-compiler ships only
+# the protoc binary, and the well-known types (google/protobuf/empty.proto and
+# friends, which the lance-* protos import) live in libprotobuf-dev. It is a
+# Recommends, so --no-install-recommends drops it and lance-encoding's build
+# script fails with "google/protobuf/empty.proto: File not found".
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        protobuf-compiler libssl-dev pkg-config make perl ca-certificates \
+        protobuf-compiler libprotobuf-dev libssl-dev pkg-config make perl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 COPY . .
