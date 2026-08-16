@@ -36,6 +36,7 @@ impl DatagenStore {
             // the core `DatagenStore` directly.
             shard_id: None,
             merge_after_generations: None,
+            merge_max_generations: None,
             cleanup_interval_secs: None,
         };
         let store = LocalStore::open_with_options(uri, options)

@@ -74,6 +74,22 @@ pub(crate) const DEFAULT_MANIFEST_SCAN_BATCH_SIZE: usize = 16;
 /// concurrently while collecting observability metrics.
 pub(crate) const DEFAULT_OBSERVE_CONCURRENCY: usize = 16;
 
+/// Flushed generations folded into the base table by one merge pass, by default.
+///
+/// A merge buffers every row of every generation it takes before appending, and
+/// rollout rows store `binary_payload` inline, so the pass's peak memory is the
+/// total blob volume of the generations it took. Unbounded, a worker merging a
+/// backlog materialised several GiB at once; freed to glibc but retained in its
+/// arenas, that ratcheted RSS up a step per merge until the pod was OOMKilled.
+///
+/// 8 is deliberately well under the deployed `ROLLOUT_MERGE_AFTER_GENERATIONS`
+/// (50 in the deployment that OOMed), so the cap actually binds there, while
+/// staying high enough that a merge still amortises its fixed costs -- manifest
+/// CAS, base-table commit, directory deletes -- over a useful number of
+/// generations. Leftovers are not dropped: they stay pending and the next pass
+/// takes them.
+pub(crate) const DEFAULT_MERGE_MAX_GENERATIONS: usize = 8;
+
 /// Execute only the first `max_source_fragments` from a Lance compaction plan.
 ///
 /// Lance's built-in `max_source_fragments` stops before a whole planned task
@@ -194,6 +210,15 @@ pub(crate) struct StorageBaseOptions {
     pub shard_id: Option<String>,
     /// Count-triggered self-merge threshold; `None`/`0` disables it.
     pub merge_after_generations: Option<usize>,
+    /// Maximum flushed generations folded into the base table by one merge
+    /// pass. `None`/`0` means unbounded (every pending generation at once).
+    ///
+    /// This bounds peak merge memory. `read_flushed_generations` buffers every
+    /// row of every generation it takes, and rollout rows carry `binary_payload`
+    /// inline, so an unbounded pass over a backlog materialises the full blob
+    /// volume at once -- the worker OOM this exists to prevent. Leftover
+    /// generations stay pending and the next pass takes them.
+    pub merge_max_generations: Option<usize>,
     /// Shared, capacity-bounded Lance session. `None` preserves Lance's
     /// per-open default (a fresh 6 GiB index + 1 GiB metadata session *per
     /// store*, which is the source of unbounded per-append RSS growth).
@@ -253,6 +278,7 @@ pub(crate) struct StorageBase {
     seal_on_put: bool,
     /// Self-merge threshold; `0` disables it.
     merge_after_generations: usize,
+    merge_max_generations: usize,
     /// Timestamp of the last successful [`Self::compact`] on this handle.
     last_compaction: Option<DateTime<Utc>>,
     /// Number of successful compactions performed by this handle.
@@ -305,6 +331,7 @@ impl StorageBase {
             storage_options,
             shard_id,
             merge_after_generations,
+            merge_max_generations,
             session,
             schema,
             key_column,
@@ -333,6 +360,7 @@ impl StorageBase {
                 storage_options,
                 shard_id,
                 merge_after_generations,
+                merge_max_generations,
                 session,
                 schema,
                 key_column,
@@ -355,6 +383,7 @@ impl StorageBase {
             storage_options,
             shard_id,
             merge_after_generations,
+            merge_max_generations,
             session,
             schema,
             key_column,
@@ -378,6 +407,7 @@ impl StorageBase {
             latest_schema,
             seal_on_put,
             merge_after_generations: merge_after_generations.unwrap_or(0),
+            merge_max_generations: merge_max_generations.unwrap_or(DEFAULT_MERGE_MAX_GENERATIONS),
             last_compaction: None,
             total_compactions: 0,
             last_compaction_error: None,
@@ -933,7 +963,40 @@ impl StorageBase {
         let mut merged_paths: Vec<String> = Vec::new();
         let mut batches: Vec<RecordBatch> = Vec::new();
         let merge_schema: Arc<Schema> = Arc::new(self.dataset.schema().into());
-        for flushed in &manifest.flushed_generations {
+
+        // Read at most `merge_max_generations` generations per pass.
+        //
+        // Every row of every generation is buffered here and stays resident in
+        // `PreparedMerge.batches` until the commit appends it, so peak memory
+        // for one merge is the *total* size of the generations taken. Rollout
+        // rows carry `binary_payload` inline (blob-v2 offload reads back as
+        // `None` through the LSM scanner, so it cannot be used here), which
+        // means multi-MB artifacts are in these batches. Unbounded, one pass
+        // over a large backlog materialises hundreds of MB to several GiB; on
+        // glibc that memory is freed logically but retained in the allocator's
+        // arenas, so worker RSS ratchets up a step per merge and never returns.
+        //
+        // Capping the *count* is what bounds it, and it is safe because a merge
+        // of a subset is already a first-class case: `commit_merge` drains only
+        // the generation ids it actually merged (a relative, retain-not-in-set
+        // edit) and deletes only those directories, precisely so a concurrent
+        // flush is not clobbered. Whatever is left over stays pending and the
+        // next pass takes it -- the same incremental-progress shape as the
+        // master-side compaction budget in #229.
+        //
+        // Generations are the granularity because the drain removes whole ids;
+        // splitting one generation's rows across two passes would leave rows
+        // committed to the base table with the generation still listed. That is
+        // read-safe (the LSM dedups by key) but would re-read and re-append
+        // those rows on the next pass, so the budget stops at a generation
+        // boundary.
+        let budget = if self.merge_max_generations == 0 {
+            manifest.flushed_generations.len()
+        } else {
+            self.merge_max_generations
+        };
+
+        for flushed in manifest.flushed_generations.iter().take(budget) {
             let gen_uri = format!(
                 "{}/_mem_wal/{}/{}",
                 base_uri, self.write_shard, flushed.path

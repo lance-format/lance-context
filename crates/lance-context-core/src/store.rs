@@ -283,6 +283,14 @@ pub struct ContextStoreOptions {
     /// and every read unions all of them — the read amplification that
     /// previously had no bound at all on this store.
     pub merge_after_generations: Option<usize>,
+    /// Maximum flushed generations folded into the base table by one merge
+    /// pass. `None` uses the crate default (8); `Some(0)` means unbounded.
+    ///
+    /// A merge buffers every row of every generation it takes before appending,
+    /// so this caps peak merge memory. Leftover generations stay pending for the
+    /// next pass. Raise it only if merge commits are the bottleneck and the
+    /// rows are known to be small.
+    pub merge_max_generations: Option<usize>,
     /// Whether [`ContextStore::add`] seals the memtable before returning, so the
     /// rows it wrote are immediately readable.
     ///
@@ -312,6 +320,7 @@ impl Default for ContextStoreOptions {
             distance_metric: None,
             shard_id: None,
             merge_after_generations: None,
+            merge_max_generations: None,
             // Read-your-write by default; see the field docs.
             seal_on_add: true,
         }
@@ -591,6 +600,7 @@ impl ContextStore {
                 storage_options,
                 shard_id: options.shard_id.clone(),
                 merge_after_generations: options.merge_after_generations,
+                merge_max_generations: options.merge_max_generations,
                 session: None,
                 schema: Arc::new(arrow_schema.clone()),
                 key_column: "id".to_string(),
@@ -2102,6 +2112,7 @@ impl ContextStore {
             distance_metric: Some(self.distance_metric),
             shard_id: None,
             merge_after_generations: None,
+            merge_max_generations: None,
             // A compactor never appends, so the seal mode is irrelevant to it;
             // deferring keeps it from ever emitting a generation.
             seal_on_add: false,

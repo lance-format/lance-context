@@ -37,6 +37,27 @@ pub struct ServerConfig {
     #[arg(long, env = "ROLLOUT_MERGE_AFTER_GENERATIONS", default_value = "0")]
     pub rollout_merge_after_generations: usize,
 
+    /// Maximum flushed MemWAL generations folded into the base table by a single
+    /// merge pass. `0` means unbounded (every pending generation at once).
+    ///
+    /// # Why this is capped
+    ///
+    /// A merge reads every row of every generation it takes into memory before
+    /// appending, and rollout rows carry `binary_payload` inline (blob-v2
+    /// offload reads back as `None` through the MemWAL scanner, so it cannot be
+    /// used). Peak memory for one pass is therefore the total artifact volume of
+    /// the generations it took. Unbounded, a worker draining a backlog
+    /// materialised multiple GiB at once; glibc frees that logically but retains
+    /// it in its arenas, so RSS ratcheted up a step per merge and workers were
+    /// eventually OOMKilled.
+    ///
+    /// Leftover generations are not dropped -- they stay pending and the next
+    /// pass takes them. This bounds *per-pass* memory, so it is the knob that
+    /// matters for RSS; `--rollout-merge-after-generations` only controls when
+    /// the count trigger fires, and the time-based cleanup ignores it entirely.
+    #[arg(long, env = "ROLLOUT_MERGE_MAX_GENERATIONS", default_value = "8")]
+    pub rollout_merge_max_generations: usize,
+
     /// Interval, in seconds, for the periodic per-shard WAL cleanup task. When
     /// non-zero, the global sweeper folds this instance's flushed MemWAL
     /// generations into the base table on a schedule — the *time* half of the
