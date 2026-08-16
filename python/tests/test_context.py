@@ -1,9 +1,12 @@
+import uuid
+
 import lance_context as lc
 
 
 def test_context_create_and_add():
-    ctx = lc.Context.create("memory://test")
-    assert ctx.uri() == "memory://test"
+    uri = f"shared-memory://test-{uuid.uuid4().hex}"
+    ctx = lc.Context.create(uri)
+    assert ctx.uri() == uri
     assert ctx.branch() == "main"
     assert ctx.entries() == 0
 
@@ -16,7 +19,7 @@ def test_context_create_and_add():
 
 
 def test_context_snapshot_and_fork():
-    ctx = lc.Context.create("memory://test")
+    ctx = lc.Context.create(f"shared-memory://test-{uuid.uuid4().hex}")
     ctx.add("user", "hello")
 
     snap = ctx.snapshot()

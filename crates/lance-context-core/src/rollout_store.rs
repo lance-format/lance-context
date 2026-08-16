@@ -8,10 +8,9 @@
 //! # Artifact bytes are stored inline, not blob-v2 offloaded
 //!
 //! `binary_payload` holds artifact bytes (spec §6) as a plain inline
-//! `LargeBinary` column, *not* a blob-v2 offloaded column. Rollout reads go
-//! exclusively through the MemWAL LSM scanner
-//! ([`RolloutStore::lsm_scanner`]), which has no blob-materialization step: a
-//! blob-v2 (`lance-encoding:blob`) column reads back as `None` through it, so
+//! `LargeBinary` column, *not* a blob-v2 offloaded column. Rollout reads use
+//! MemWAL-aware paths with no blob-materialization step: a blob-v2
+//! (`lance-encoding:blob`) column reads back as `None` through them, so
 //! [`RolloutStore::get_blob`] could never return the bytes. Inline storage is
 //! therefore the only encoding that round-trips. To keep the "learner doesn't
 //! pay for artifacts" property (spec §2), list-style scans project the column
@@ -29,10 +28,9 @@
 //! instances. See `docs/src/specs/rollout-deployment.md`.
 //!
 //! `MemWAL close-per-append` makes each write durable on object storage before
-//! `add` returns, and the read path ([`RolloutStore::lsm_scanner`]) rebuilds
-//! purely from object storage (base table ∪ every shard's flushed
-//! generations). So any instance reads every instance's writes — reads are not
-//! pinned to the writer node.
+//! `add` returns, and the read path rebuilds purely from object storage (base
+//! table ∪ every shard's flushed generations). So any instance reads every
+//! instance's writes — reads are not pinned to the writer node.
 //!
 //! # Reproducibility without `checkout`
 //!
@@ -60,6 +58,11 @@ use arrow_array::{
 };
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Schema, TimeUnit};
 use datafusion::datasource::MemTable;
+use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_plan::expressions::PhysicalSortExpr;
+use datafusion::physical_plan::limit::GlobalLimitExec;
+use datafusion::physical_plan::sorts::sort::SortExec;
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
 use datafusion::sql::parser::{DFParser, Statement as DFStatement};
 use datafusion::sql::sqlparser::ast::Statement as SqlStatement;
@@ -211,6 +214,40 @@ impl RolloutFilters {
             clauses.push(format!("include_in_training = {value}"));
         }
         (!clauses.is_empty()).then(|| clauses.join(" AND "))
+    }
+
+    fn matches_record(&self, record: &RolloutRecord) -> bool {
+        fn matches_required(actual: &str, expected: Option<&str>) -> bool {
+            match expected {
+                Some(expected) if !expected.is_empty() => actual == expected,
+                _ => true,
+            }
+        }
+
+        fn matches_optional(actual: Option<&str>, expected: Option<&str>) -> bool {
+            match expected {
+                Some(expected) if !expected.is_empty() => actual == Some(expected),
+                _ => true,
+            }
+        }
+
+        matches_required(&record.id, self.id.as_deref())
+            && matches_required(&record.rollout_id, self.rollout_id.as_deref())
+            && matches_required(&record.problem_id, self.problem_id.as_deref())
+            && matches_optional(record.dataset.as_deref(), self.dataset.as_deref())
+            && matches_required(&record.role, self.role.as_deref())
+            && matches_required(&record.content_type, self.content_type.as_deref())
+            && matches_optional(
+                record.policy_version.as_deref(),
+                self.policy_version.as_deref(),
+            )
+            && matches_optional(
+                record.artifact_type.as_deref(),
+                self.artifact_type.as_deref(),
+            )
+            && self
+                .include_in_training
+                .is_none_or(|expected| record.include_in_training == Some(expected))
     }
 }
 
@@ -697,26 +734,16 @@ impl RolloutStore {
         offset: Option<usize>,
         filters: Option<&RolloutFilters>,
     ) -> LanceResult<Vec<RolloutRecord>> {
-        let columns = self.non_blob_columns();
-        let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
-        let mut scanner = self.lsm_scanner().await?.project(&refs);
-        if let Some(predicate) = filters.and_then(RolloutFilters::expression) {
-            scanner = scanner.filter(&predicate)?;
-        }
-        let post_scan_offset = if limit.is_none() { offset } else { None };
-        if let Some(limit) = limit {
-            scanner = scanner.limit(limit, offset);
+        let mut results = self.list_all_non_blob_records().await?;
+        if let Some(filters) = filters {
+            results.retain(|record| filters.matches_record(record));
         }
 
-        let mut stream = scanner.try_into_stream().await?;
-        let mut results = Vec::new();
-        while let Some(batch) = stream.try_next().await? {
-            results.extend(batch_to_rollout_records(&batch)?);
-        }
-
-        if let Some(offset) = post_scan_offset {
-            results = results.into_iter().skip(offset).collect();
-        }
+        let offset = offset.unwrap_or(0);
+        let results = match limit {
+            Some(limit) => results.into_iter().skip(offset).take(limit).collect(),
+            None => results.into_iter().skip(offset).collect(),
+        };
         Ok(results)
     }
 
@@ -761,9 +788,9 @@ impl RolloutStore {
     /// an unbounded full-table count on every UI request. Each source is read in
     /// one projected, filtered, bounded scan. Fragments use the base [`Dataset`]
     /// scanner directly so Lance can push limit/offset into the scan. WAL-backed
-    /// reads page through a narrow `id`-only LSM scan, then take the selected
-    /// rows directly from their physical datasets so wide text columns never
-    /// participate in the full LSM sort.
+    /// reads page through a narrow, deterministic `id`-only top-K sort, then
+    /// take the selected rows directly from their physical datasets so wide
+    /// text columns never participate in the full LSM sort.
     ///
     /// [`ListSource::Fragments`] skips MemWAL manifest discovery entirely, so its
     /// latency is independent of how far the merge backlog has grown.
@@ -783,14 +810,37 @@ impl RolloutStore {
             let shard_snapshots = self.wal_shard_snapshots().await?;
             let mut scanner = self
                 .lsm_scanner_for_source(source, shard_snapshots.clone())
-                .project(&["id"]);
+                .project(&["id"])?;
             if let Some(filter) = &filter {
                 scanner = scanner.filter(filter)?;
             }
-            scanner = scanner.limit(page_limit, Some(offset));
+
+            // Lance 9's block-list LSM plan is intentionally unordered. Page
+            // boundaries must not inherit that internal union order: otherwise
+            // repeated offset requests can skip or repeat records. Sort only
+            // the narrow key plan and retain at most the requested prefix.
+            let plan = scanner.create_plan().await?;
+            let id_index = plan.schema().index_of("id")?;
+            let fetch = offset.saturating_add(page_limit);
+            let sorted = SortExec::new(
+                [PhysicalSortExpr::new_default(Arc::new(Column::new(
+                    "id", id_index,
+                )))]
+                .into(),
+                plan,
+            )
+            .with_fetch(Some(fetch));
+            let page_plan = Arc::new(GlobalLimitExec::new(
+                Arc::new(sorted),
+                offset,
+                Some(page_limit),
+            ));
+            let ctx = SessionContext::new();
 
             let mut page_ids = Vec::with_capacity(page_limit);
-            let mut stream = scanner.try_into_stream().await?;
+            let mut stream = page_plan
+                .execute(0, ctx.task_ctx())
+                .map_err(|err| LanceError::from(ArrowError::from_external_error(Box::new(err))))?;
             while let Some(batch) = stream.try_next().await? {
                 let ids = column_as::<StringArray>(&batch, "id")?;
                 page_ids.extend((0..ids.len()).map(|row| ids.value(row).to_string()));
@@ -840,6 +890,69 @@ impl RolloutStore {
         let has_more = records.len() > limit;
         records.truncate(limit);
         Ok(RolloutPage { records, has_more })
+    }
+
+    async fn list_all_non_blob_records(&self) -> LanceResult<Vec<RolloutRecord>> {
+        let columns = Arc::new(self.non_blob_columns());
+        let target_schema = Arc::new(projected_arrow_schema(&self.base.dataset, &columns)?);
+        let mut records_by_id = HashMap::new();
+        let mut records = Vec::new();
+
+        Self::append_non_blob_records_from_dataset(
+            self.base.dataset.clone(),
+            columns.clone(),
+            target_schema.clone(),
+            &mut records_by_id,
+            &mut records,
+        )
+        .await?;
+
+        for snapshot in self.wal_shard_snapshots().await? {
+            for generation in snapshot.flushed_generations {
+                let uri = self.flushed_generation_uri(snapshot.shard_id, &generation.path);
+                let dataset = match self.open_flushed_dataset(&uri).await {
+                    Ok(dataset) => dataset,
+                    Err(err) if is_not_found_error(&err) => continue,
+                    Err(err) => return Err(err),
+                };
+                Self::append_non_blob_records_from_dataset(
+                    dataset,
+                    columns.clone(),
+                    target_schema.clone(),
+                    &mut records_by_id,
+                    &mut records,
+                )
+                .await?;
+            }
+        }
+
+        Ok(records)
+    }
+
+    async fn append_non_blob_records_from_dataset(
+        dataset: Dataset,
+        columns: Arc<Vec<String>>,
+        target_schema: Arc<Schema>,
+        records_by_id: &mut HashMap<String, usize>,
+        records: &mut Vec<RolloutRecord>,
+    ) -> LanceResult<()> {
+        let refs = projected_column_refs(&dataset, &columns);
+        let mut scanner = dataset.scan();
+        scanner.project(&refs)?;
+
+        let mut stream = scanner.try_into_stream().await?;
+        while let Some(batch) = stream.try_next().await? {
+            let aligned = align_batch_to_schema(batch, target_schema.clone())?;
+            for record in batch_to_rollout_records(&aligned)? {
+                if let Some(index) = records_by_id.get(&record.id).copied() {
+                    records[index] = record;
+                } else {
+                    records_by_id.insert(record.id.clone(), records.len());
+                    records.push(record);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Resolve an LSM page's ids against the physical base/WAL datasets and
@@ -977,7 +1090,7 @@ impl RolloutStore {
         let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
         let scanner = self
             .lsm_scanner_for_source(ListSource::All, shard_snapshots)
-            .project(&refs);
+            .project(&refs)?;
         let mut stream = scanner.try_into_stream().await?;
 
         let mut batches: Vec<RecordBatch> = Vec::new();
@@ -1151,7 +1264,7 @@ impl RolloutStore {
         let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
         let scanner = self
             .lsm_scanner_for_source(source, shard_snapshots)
-            .project(&refs)
+            .project(&refs)?
             .filter(&format!("id = '{}'", escaped_id))?;
         let mut stream = scanner.try_into_stream().await?;
         while let Some(batch) = stream.try_next().await? {
@@ -1295,13 +1408,6 @@ impl RolloutStore {
             .map(|field| field.name.clone())
             .filter(|name| name != "binary_payload")
             .collect()
-    }
-
-    /// Build an LSM scanner over the base table unioned with every shard's
-    /// flushed MemWAL generations. Deduplicates by `id`. See
-    /// `StorageBase::lsm_scanner`.
-    async fn lsm_scanner(&self) -> LanceResult<LsmScanner> {
-        self.base.lsm_scanner().await
     }
 
     /// Build a paginating scanner for the requested [`ListSource`]. See
@@ -1714,16 +1820,20 @@ fn append_i8_list(builder: &mut ListBuilder<Int8Builder>, values: Option<&[i8]>)
     }
 }
 
+fn projected_column_refs<'a>(dataset: &Dataset, columns: &'a [String]) -> Vec<&'a str> {
+    let field_paths = dataset.schema().field_paths();
+    columns
+        .iter()
+        .map(String::as_str)
+        .filter(|column| field_paths.iter().any(|path| path == column))
+        .collect()
+}
+
 fn projected_dataset_schema(
     dataset: &Dataset,
     columns: &[String],
 ) -> LanceResult<lance::datatypes::Schema> {
-    let field_paths = dataset.schema().field_paths();
-    let available_columns: Vec<&str> = columns
-        .iter()
-        .map(String::as_str)
-        .filter(|column| field_paths.iter().any(|path| path == column))
-        .collect();
+    let available_columns = projected_column_refs(dataset, columns);
     dataset.schema().project(&available_columns)
 }
 

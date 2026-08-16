@@ -299,12 +299,15 @@ impl GenericStore {
         columns: &[String],
     ) -> LanceResult<Vec<Row>> {
         let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
-        let mut scanner = self.base.lsm_scanner().await?.project(&refs);
+        let mut scanner = self.base.lsm_scanner().await?.project(&refs)?;
         if let Some(filter) = filter {
             scanner = scanner.filter(filter)?;
         }
         if limit.is_some() || offset.is_some() {
-            scanner = scanner.limit(limit.unwrap_or(usize::MAX), offset);
+            scanner = scanner.limit(
+                map_i64_bound("limit", limit)?,
+                map_i64_bound("offset", offset)?,
+            )?;
         }
 
         let mut stream = scanner.try_into_stream().await?;
@@ -327,7 +330,7 @@ impl GenericStore {
         let scanner = self
             .base
             .lsm_scanner_for_source(source, snapshots)
-            .project(&refs);
+            .project(&refs)?;
 
         let mut stream = scanner.try_into_stream().await?;
         let mut rows = Vec::new();
@@ -434,6 +437,13 @@ fn spec_from_schema(schema: &Schema) -> Result<SchemaSpec, ArrowError> {
 /// Escape single quotes for a SQL string literal.
 fn escape_sql_literal(value: &str) -> String {
     value.replace('\'', "''")
+}
+
+fn map_i64_bound(name: &str, value: Option<usize>) -> LanceResult<Option<i64>> {
+    value
+        .map(i64::try_from)
+        .transpose()
+        .map_err(|_| LanceError::invalid_input(format!("{name} exceeds i64::MAX")))
 }
 
 /// Row batches, for callers that already have Arrow data.
@@ -750,7 +760,7 @@ mod tests {
         let uri = dir.path().to_string_lossy().to_string();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let store = GenericStore::open(&uri, spec(), sealing()).await.unwrap();
+            let mut store = GenericStore::open(&uri, spec(), sealing()).await.unwrap();
             store
                 .add(&[row(json!({"id": "r1", "user_id": "first"}))])
                 .await
@@ -763,6 +773,15 @@ mod tests {
             let rows = store.list(None, None).await.unwrap();
             assert_eq!(rows.len(), 1, "id is the merge key, so rows dedup");
             assert_eq!(rows[0]["user_id"], json!("second"));
+
+            store.cleanup_wal().await.unwrap();
+            let rows = store.list(None, None).await.unwrap();
+            assert_eq!(rows.len(), 1, "cleanup must not duplicate the merge key");
+            assert_eq!(
+                rows[0]["user_id"],
+                json!("second"),
+                "cleanup must retain the newest WAL value"
+            );
         });
     }
 

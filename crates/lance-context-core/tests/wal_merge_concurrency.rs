@@ -301,9 +301,8 @@ async fn concurrent_merges_do_not_duplicate_rows() {
 }
 
 /// A merge abandoned partway (the sweeper's timeout does exactly this) must not
-/// lose data. Rows may be physically duplicated in the base table — the read
-/// path de-dups by id — but nothing may disappear, and a later merge must still
-/// converge.
+/// lose data. A retry merge-inserts by id, so nothing may disappear or remain
+/// duplicated after a later merge converges.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn interrupted_merge_loses_nothing_and_next_merge_converges() {
     let tmp = tempfile::tempdir().unwrap();

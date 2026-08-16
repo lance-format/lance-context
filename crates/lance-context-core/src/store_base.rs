@@ -38,20 +38,24 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use arrow_array::{new_null_array, RecordBatch, RecordBatchIterator};
+use arrow_array::{new_null_array, RecordBatch, RecordBatchIterator, UInt32Array};
 use arrow_schema::{ArrowError, Schema};
+use arrow_select::take::take;
 use chrono::{DateTime, Utc};
+use datafusion::common::ScalarValue;
 use futures::{stream, StreamExt, TryStreamExt};
 use lance::dataset::index::DatasetIndexRemapperOptions;
 use lance::dataset::mem_wal::{
-    DatasetMemWalExt, LsmScanner, ShardManifestStore, ShardSnapshot, ShardWriter, ShardWriterConfig,
+    DatasetMemWalExt, LsmScanner, ShardManifestStore, ShardSnapshot, ShardWriter,
+    ShardWriterConfig, TOMBSTONE,
 };
 use lance::dataset::optimize::{
     commit_compaction, compact_files, plan_compaction, CompactionMetrics, CompactionMode,
     CompactionOptions,
 };
 use lance::dataset::{
-    builder::DatasetBuilder, Dataset, NewColumnTransform, WriteMode, WriteParams,
+    builder::DatasetBuilder, Dataset, MergeInsertBuilder, NewColumnTransform, WhenMatched,
+    WriteMode, WriteParams,
 };
 use lance::index::DatasetIndexExt;
 use lance::io::{ObjectStoreParams, StorageOptionsAccessor};
@@ -685,9 +689,10 @@ impl StorageBase {
             return Ok(0);
         };
         let pending = prepared.generation_count();
-        self.commit_merge(&manifest_store, &manifest, prepared)
+        let committed = self
+            .commit_merge(&manifest_store, &manifest, prepared)
             .await?;
-        Ok(pending)
+        Ok(if committed { pending } else { 0 })
     }
 
     /// The shared-lock half of a merge: decide whether one is due and read the
@@ -759,9 +764,10 @@ impl StorageBase {
         prepared: PreparedMerge,
     ) -> LanceResult<usize> {
         let pending = prepared.generation_count();
-        self.commit_merge(manifest_store, manifest, prepared)
+        let committed = self
+            .commit_merge(manifest_store, manifest, prepared)
             .await?;
-        Ok(pending)
+        Ok(if committed { pending } else { 0 })
     }
 
     /// The `&self` half of a merge: everything that can run while appends
@@ -819,17 +825,17 @@ impl StorageBase {
     /// `replay_after_wal_entry_position` and `wal_entry_position_last_seen`,
     /// which a concurrent flush advances; `..current.clone()` carries them.
     ///
-    /// Rows are de-duplicated by the key column at read time, so even if a crash
-    /// interrupts the sequence (data appended to base but manifest not yet
-    /// drained), a subsequent read simply sees the rows via both the base table
-    /// and the still-listed generation and de-dups them — no double counting.
-    /// The next merge attempt then drains the manifest.
+    /// The base write is a merge-insert keyed by `key_column`, so even if a
+    /// crash interrupts the sequence (data committed but the shard manifest not
+    /// yet drained), retrying the same generations replaces those keys instead
+    /// of appending physical duplicates. The next attempt can then drain the
+    /// manifest without relying on a particular Lance read-plan shape.
     async fn commit_merge(
         &mut self,
         manifest_store: &ShardManifestStore,
         manifest: &ShardManifest,
         prepared: PreparedMerge,
-    ) -> LanceResult<()> {
+    ) -> LanceResult<bool> {
         let PreparedMerge {
             merged_generations,
             merged_paths,
@@ -837,12 +843,26 @@ impl StorageBase {
             merge_schema,
         } = prepared;
 
+        // Several sweepers can prepare the same immutable generations under a
+        // shared lock. Once the first commit drains them, later prepared copies
+        // are stale and must not write the same rows again.
+        let Some(current_manifest) = manifest_store.read_latest().await? else {
+            return Ok(false);
+        };
+        if !current_manifest
+            .flushed_generations
+            .iter()
+            .any(|generation| merged_generations.contains(&generation.generation))
+        {
+            return Ok(false);
+        }
+
         self.ensure_latest_schema().await?;
 
         if !batches.is_empty() {
             observe_phase!(
                 "append",
-                self.append_merged_batches(batches, merge_schema).await
+                self.merge_prepared_batches(batches, merge_schema).await
             )?;
             self.pinned_version = None;
         }
@@ -874,7 +894,7 @@ impl StorageBase {
 
         self.delete_merged_generation_dirs(&merged_paths).await?;
         self.pinned_version = None;
-        Ok(())
+        Ok(true)
     }
 
     /// Delete the merged generations' directories now that no manifest
@@ -931,7 +951,7 @@ impl StorageBase {
         let base_uri = self.dataset.uri().trim_end_matches('/').to_string();
         let mut merged_generations: HashSet<u64> = HashSet::new();
         let mut merged_paths: Vec<String> = Vec::new();
-        let mut batches: Vec<RecordBatch> = Vec::new();
+        let mut generation_batches: Vec<(u64, Vec<RecordBatch>)> = Vec::new();
         let merge_schema: Arc<Schema> = Arc::new(self.dataset.schema().into());
         for flushed in &manifest.flushed_generations {
             let gen_uri = format!(
@@ -944,20 +964,28 @@ impl StorageBase {
                 self.session.clone(),
             )
             .await?;
+            let mut current_batches = Vec::new();
             let mut stream = gen_dataset.scan().try_into_stream().await?;
             while let Some(batch) = stream.try_next().await? {
                 if batch.num_rows() > 0 {
-                    batches.push(align_batch_to_schema(batch, merge_schema.clone())?);
+                    current_batches.push(align_batch_to_schema(batch, merge_schema.clone())?);
                 }
             }
+            generation_batches.push((flushed.generation, current_batches));
             merged_generations.insert(flushed.generation);
             merged_paths.push(flushed.path.clone());
         }
+        let batches =
+            dedupe_merge_batches(generation_batches, &self.key_column, merge_schema.clone())?;
         Ok((merged_generations, merged_paths, batches, merge_schema))
     }
 
-    /// Append merged WAL rows into the base table with this store's credentials.
-    async fn append_merged_batches(
+    /// Merge prepared WAL rows into the base table by primary key.
+    ///
+    /// `read_flushed_generations` has already reduced the source to one newest
+    /// row per key. `UpdateAll` preserves normal LSM last-write-wins semantics
+    /// while also making a retry after an interrupted manifest drain idempotent.
+    async fn merge_prepared_batches(
         &mut self,
         batches: Vec<RecordBatch>,
         merge_schema: Arc<Schema>,
@@ -966,19 +994,14 @@ impl StorageBase {
             batches.into_iter().map(Ok::<RecordBatch, ArrowError>),
             merge_schema,
         );
-        let mut params = WriteParams {
-            mode: WriteMode::Append,
-            ..Default::default()
-        };
-        if let Some(options) = &self.storage_options {
-            params.store_params = Some(ObjectStoreParams {
-                storage_options_accessor: Some(Arc::new(
-                    StorageOptionsAccessor::with_static_options(options.clone()),
-                )),
-                ..Default::default()
-            });
-        }
-        self.dataset.append(reader, Some(params)).await?;
+        let mut builder = MergeInsertBuilder::try_new(
+            Arc::new(self.dataset.clone()),
+            vec![self.key_column.clone()],
+        )?;
+        builder.when_matched(WhenMatched::UpdateAll);
+        let job = builder.try_build()?;
+        let (dataset, _) = job.execute_reader(reader).await?;
+        self.dataset = Arc::unwrap_or_clone(dataset);
         Ok(())
     }
 
@@ -1502,6 +1525,62 @@ pub(crate) fn is_not_found_error(err: &LanceError) -> bool {
     text.contains("was not found") || text.contains("not found") || text.contains("NotFound")
 }
 
+/// Keep the newest prepared row for each merge key.
+///
+/// Generations are ordered newest-first and rows within each generation are
+/// visited in reverse physical order, matching the LSM scanner's last-write-
+/// wins behavior. Returning a duplicate-free source also keeps Lance's
+/// merge-insert semantics deterministic when one key was retried before seal.
+fn dedupe_merge_batches(
+    mut generation_batches: Vec<(u64, Vec<RecordBatch>)>,
+    key_column: &str,
+    target_schema: Arc<Schema>,
+) -> LanceResult<Vec<RecordBatch>> {
+    generation_batches.sort_by_key(|batch| std::cmp::Reverse(batch.0));
+
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::new();
+    for (_, batches) in generation_batches {
+        for batch in batches.into_iter().rev() {
+            let key_index = batch.schema().index_of(key_column)?;
+            let key_array = batch.column(key_index);
+            let mut selected = Vec::new();
+            for row in (0..batch.num_rows()).rev() {
+                let key = ScalarValue::try_from_array(key_array, row)
+                    .map_err(|err| ArrowError::ComputeError(err.to_string()))?;
+                if key.is_null() {
+                    return Err(ArrowError::InvalidArgumentError(format!(
+                        "merge key column '{key_column}' contains a null value"
+                    ))
+                    .into());
+                }
+                if seen.insert(key) {
+                    selected.push(u32::try_from(row).map_err(|_| {
+                        ArrowError::InvalidArgumentError(
+                            "merge batch row index exceeds u32::MAX".to_string(),
+                        )
+                    })?);
+                }
+            }
+            if selected.is_empty() {
+                continue;
+            }
+
+            // Restore source order within each retained batch. Cross-batch
+            // ordering no longer affects results because keys are now unique.
+            selected.reverse();
+            let indices = UInt32Array::from(selected);
+            let columns = batch
+                .columns()
+                .iter()
+                .map(|column| take(column.as_ref(), &indices, None))
+                .collect::<Result<Vec<_>, _>>()?;
+            deduped.push(RecordBatch::try_new(target_schema.clone(), columns)?);
+        }
+    }
+    Ok(deduped)
+}
+
 /// Align a flushed-generation batch with the base table schema before append.
 ///
 /// Nullable columns added after the generation was written are materialized as
@@ -1515,6 +1594,9 @@ pub(crate) fn align_batch_to_schema(
     let source_schema = batch.schema();
 
     for source_field in source_schema.fields() {
+        if source_field.name() == TOMBSTONE {
+            continue;
+        }
         if target_schema.field_with_name(source_field.name()).is_err() {
             return Err(ArrowError::SchemaError(format!(
                 "WAL generation column '{}' does not exist in the base table schema",
