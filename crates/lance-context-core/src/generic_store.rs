@@ -60,6 +60,14 @@ pub struct GenericStoreOptions {
     /// Fold this instance's flushed generations into the base table once it has
     /// accumulated this many. `None`/`0` disables the count trigger.
     pub merge_after_generations: Option<usize>,
+    /// Maximum flushed generations folded into the base table by one merge
+    /// pass. `None` uses the crate default (8); `Some(0)` means unbounded.
+    ///
+    /// A merge buffers every row of every generation it takes before appending,
+    /// so this caps peak merge memory. Leftover generations stay pending for the
+    /// next pass. Raise it only if merge commits are the bottleneck and the
+    /// rows are known to be small.
+    pub merge_max_generations: Option<usize>,
     /// Shared, capacity-bounded Lance session.
     pub session: Option<Arc<Session>>,
     /// Whether [`GenericStore::add`] seals before returning, making the rows it
@@ -161,6 +169,7 @@ impl GenericStore {
                 storage_options: options.storage_options,
                 shard_id: options.shard_id,
                 merge_after_generations: options.merge_after_generations,
+                merge_max_generations: options.merge_max_generations,
                 session: options.session,
                 schema: create_schema,
                 // Always `id`: the LSM merge key, which `SchemaSpec::validate`

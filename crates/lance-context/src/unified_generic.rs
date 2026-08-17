@@ -39,6 +39,7 @@ impl GenericStore {
             // the core `GenericStore` directly.
             shard_id: None,
             merge_after_generations: None,
+            merge_max_generations: None,
             session: None,
             seal_on_add,
         };
@@ -58,6 +59,7 @@ impl GenericStore {
             storage_options,
             shard_id: None,
             merge_after_generations: None,
+            merge_max_generations: None,
             session: None,
             seal_on_add,
         };

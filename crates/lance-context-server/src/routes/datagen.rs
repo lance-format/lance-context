@@ -45,6 +45,7 @@ pub async fn create_datagen_store(
         storage_options: req.storage_options,
         shard_id: state.instance_id.clone(),
         merge_after_generations: None,
+        merge_max_generations: Some(state.rollout_merge_max_generations),
         cleanup_interval_secs: None,
     };
     let store = DatagenStore::open_with_options(&uri, options)

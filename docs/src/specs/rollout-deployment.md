@@ -164,9 +164,15 @@ By default (`--rollout-merge-after-generations 0`) there is no compaction step: 
 
 To bound this, an instance can **merge its own shard back into the base table** on a size trigger. Set `--rollout-merge-after-generations N` (env `ROLLOUT_MERGE_AFTER_GENERATIONS`, or `RolloutStoreOptions::merge_after_generations`). After an append flushes a generation, if this instance's shard has accumulated ≥ N un-merged generations, the same `add` call synchronously:
 
-1. reads every flushed generation (each is a self-contained Lance dataset under `_mem_wal/{shard}/`),
+1. reads up to `--rollout-merge-max-generations M` flushed generations, oldest first (each is a self-contained Lance dataset under `_mem_wal/{shard}/`),
 2. appends their rows to the **base table** (`Dataset::append`), and
-3. `commit_update`s the shard manifest to drain `flushed_generations` back to empty — leaving `replay_after_wal_entry_position` untouched, so a reopened writer never re-replays already-merged WAL entries.
+3. `commit_update`s the shard manifest to drain **exactly the generations it merged** out of `flushed_generations` — leaving `replay_after_wal_entry_position` untouched, so a reopened writer never re-replays already-merged WAL entries.
+
+**Bounding merge memory (`--rollout-merge-max-generations`, env `ROLLOUT_MERGE_MAX_GENERATIONS`, default 8).** Step 1 buffers the rows it is about to append **entirely in memory** — `Dataset::append` takes a synchronous `RecordBatchReader`, so the batches cannot be streamed lazily off object storage without pushing that IO into the writer's commit window. Peak merge memory is therefore proportional to the bytes in the generations folded by one pass, and rollout rows carry inline `binary_payload` blobs. Left unbounded, a shard that accumulated many large generations makes a single merge allocate the whole shard at once — the failure mode that OOM-killed workers in production.
+
+`M` caps that: one pass folds at most `M` generations and leaves the rest pending for the next pass. This is safe because the step-3 drain is *surgical* — it removes only the generations actually merged, rather than clearing the list — so a partial merge is just a smaller version of a full one, with the same crash-safety argument below. Repeated passes drain the backlog incrementally at bounded peak memory. `M = 0` restores the unbounded "fold everything in one pass" behavior.
+
+Note that `M` binds independently of `N`: the time-triggered cleanup path merges at a threshold of 1 generation, so it does not consult `N` at all, but it is still capped by `M`.
 
 This is the "external compactor" path that Lance's MemWAL LSM design explicitly anticipates. Two properties make it safe under the §2 deployment model:
 

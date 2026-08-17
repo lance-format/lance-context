@@ -374,6 +374,14 @@ pub struct RolloutStoreOptions {
     /// `None` or `0` disables self-merge (the 0.6.0 behavior: generations
     /// accumulate and are unioned at read time).
     pub merge_after_generations: Option<usize>,
+    /// Maximum flushed generations folded into the base table by one merge
+    /// pass. `None` uses the crate default (8); `Some(0)` means unbounded.
+    ///
+    /// A merge buffers every row of every generation it takes before appending,
+    /// so this caps peak merge memory. Leftover generations stay pending for the
+    /// next pass. Raise it only if merge commits are the bottleneck and the
+    /// rows are known to be small.
+    pub merge_max_generations: Option<usize>,
     /// Shared Lance [`Session`] used to open this store's base dataset (and,
     /// transitively, every flushed MemWAL generation it reads — those inherit
     /// the base dataset's session).
@@ -458,6 +466,7 @@ impl RolloutStore {
             storage_options,
             shard_id,
             merge_after_generations,
+            merge_max_generations,
             session,
         } = options;
         let base = StorageBase::open(
@@ -466,6 +475,7 @@ impl RolloutStore {
                 storage_options,
                 shard_id,
                 merge_after_generations,
+                merge_max_generations,
                 session,
                 schema: Arc::new(rollout_schema()),
                 key_column: "id".to_string(),
@@ -2573,6 +2583,7 @@ mod tests {
                     // Count trigger disabled: cleanup is the only path that can
                     // make this row visible, exactly as with flush interval 0.
                     merge_after_generations: Some(0),
+                    merge_max_generations: None,
                 },
             )
             .await
@@ -2615,6 +2626,7 @@ mod tests {
                 session: None,
                 shard_id: Some("evicted-0".to_string()),
                 merge_after_generations: None,
+                merge_max_generations: None,
             };
 
             {
@@ -2662,6 +2674,7 @@ mod tests {
                     session: None,
                     shard_id: Some("observe-0".to_string()),
                     merge_after_generations: None,
+                    merge_max_generations: None,
                 },
             )
             .await
@@ -2711,6 +2724,7 @@ mod tests {
                 session: None,
                 shard_id: Some(shard.to_string()),
                 merge_after_generations: None,
+                merge_max_generations: None,
             };
 
             let instance_a = RolloutStore::open_with_options(&uri, options("rollout-0"))
@@ -2930,6 +2944,7 @@ mod tests {
                 RolloutStoreOptions {
                     shard_id: Some("refresh-writer".to_string()),
                     merge_after_generations: Some(1),
+                    merge_max_generations: None,
                     ..Default::default()
                 },
             )
@@ -2990,6 +3005,7 @@ mod tests {
                 RolloutStoreOptions {
                     shard_id: Some("trajectory-test".to_string()),
                     merge_after_generations: Some(1),
+                    merge_max_generations: None,
                     ..Default::default()
                 },
             )
@@ -3088,6 +3104,7 @@ mod tests {
                     session: None,
                     shard_id: Some("rollout-0".to_string()),
                     merge_after_generations: None, // no merge → epoch never reclaimed
+                    merge_max_generations: None,
                 },
             )
             .await
@@ -3144,6 +3161,7 @@ mod tests {
                     // Merge on every append → epoch is reclaimed each time, so
                     // the following append always hits the reopen path.
                     merge_after_generations: Some(1),
+                    merge_max_generations: None,
                 },
             )
             .await
@@ -3181,6 +3199,7 @@ mod tests {
                     session: None,
                     shard_id: Some("rollout-0".to_string()),
                     merge_after_generations: None,
+                    merge_max_generations: None,
                 },
             )
             .await
@@ -3315,6 +3334,7 @@ mod tests {
                     shard_id: Some("rollout-0".to_string()),
                     // Merge every append into base so each forms its own fragment.
                     merge_after_generations: Some(1),
+                    merge_max_generations: None,
                 },
             )
             .await
@@ -3399,6 +3419,7 @@ mod tests {
                     session: None,
                     shard_id: Some("rollout-0".to_string()),
                     merge_after_generations: Some(1),
+                    merge_max_generations: None,
                 },
             )
             .await
@@ -3444,6 +3465,7 @@ mod tests {
                     session: None,
                     shard_id: Some("rollout-0".to_string()),
                     merge_after_generations: Some(1),
+                    merge_max_generations: None,
                 },
             )
             .await
@@ -3511,6 +3533,7 @@ mod tests {
                     session: None,
                     shard_id: Some("rollout-0".to_string()),
                     merge_after_generations: Some(3),
+                    merge_max_generations: None,
                 },
             )
             .await
@@ -3546,6 +3569,7 @@ mod tests {
                     session: None,
                     shard_id: Some("rollout-0".to_string()),
                     merge_after_generations: Some(3),
+                    merge_max_generations: None,
                 },
             )
             .await
@@ -3602,6 +3626,7 @@ mod tests {
                         session: None,
                         shard_id: Some("rollout-0".to_string()),
                         merge_after_generations: Some(2),
+                        merge_max_generations: None,
                     },
                 )
                 .await
@@ -3641,6 +3666,7 @@ mod tests {
                     session: None,
                     shard_id: Some("rollout-0".to_string()),
                     merge_after_generations: None, // count trigger off
+                    merge_max_generations: None,
                 },
             )
             .await
@@ -4138,6 +4164,7 @@ mod tests {
                 RolloutStoreOptions {
                     shard_id: Some("pagination-benchmark".to_string()),
                     merge_after_generations: Some(1),
+                    merge_max_generations: None,
                     ..Default::default()
                 },
             )
@@ -4234,6 +4261,7 @@ mod tests {
                     session: None,
                     shard_id: Some("rollout-0".to_string()),
                     merge_after_generations: None, // disabled
+                    merge_max_generations: None,
                 },
             )
             .await
@@ -4264,6 +4292,7 @@ mod tests {
                     session: None,
                     shard_id: Some("rollout-0".to_string()),
                     merge_after_generations: Some(1),
+                    merge_max_generations: None,
                 },
             )
             .await

@@ -143,3 +143,133 @@ async fn serial_merge_deletes_merged_generation_dirs() {
          leaked their blob directories"
     );
 }
+
+/// One merge pass must fold at most `merge_max_generations`, and the leftovers
+/// must survive to be merged by later passes.
+///
+/// A merge buffers every row of every generation it takes before appending, and
+/// rollout rows carry `binary_payload` inline, so an unbounded pass over a
+/// backlog materialises the whole artifact volume at once. That is what drove
+/// worker RSS up a step per merge (glibc retains the freed bulk allocation in
+/// its arenas) until pods were OOMKilled.
+///
+/// Capping the pass is only safe because merging a *subset* is already a
+/// first-class case: the drain removes just the generation ids it merged and
+/// deletes just those directories. This test pins both halves of that -- the
+/// cap binds, and nothing is lost to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn merge_pass_is_bounded_and_leftovers_survive() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().to_string_lossy().to_string();
+
+    // Count trigger off: drive merges explicitly so the assertions are about
+    // one pass, not about when a pass fires.
+    let opts = RolloutStoreOptions {
+        shard_id: Some("bounded".to_string()),
+        merge_after_generations: None,
+        merge_max_generations: Some(3),
+        ..Default::default()
+    };
+
+    let mut store = RolloutStore::open_with_options(&uri, opts).await.unwrap();
+
+    // Ten generations pending, well over the cap of 3.
+    let n = 10;
+    for i in 0..n {
+        store.add(&[rec(&format!("row-{i}"))]).await.unwrap();
+        store.flush().await.unwrap();
+    }
+    let pending_before = store.observe().await.unwrap().pending_wal_generations;
+    assert_eq!(
+        pending_before, n as i64,
+        "each append should seal one generation"
+    );
+
+    // `cleanup_own_shard` is the time-triggered path: threshold 1, so without a
+    // per-pass cap it would take all ten at once. It must take exactly 3.
+    let reclaimed = store.cleanup_own_shard().await.unwrap();
+    assert_eq!(
+        reclaimed, 3,
+        "one pass must fold at most merge_max_generations (3), not the whole backlog"
+    );
+
+    // `cleanup_own_shard` seals first, which can add a generation; what matters
+    // is that the cap removed exactly 3 and the rest are still pending.
+    let pending_after = store.observe().await.unwrap().pending_wal_generations;
+    assert_eq!(
+        pending_after,
+        pending_before - 3,
+        "leftover generations must stay pending, not be dropped"
+    );
+
+    // Draining takes several passes, and every row survives all of them.
+    let mut passes = 1;
+    loop {
+        let reclaimed = store.cleanup_own_shard().await.unwrap();
+        if reclaimed == 0 {
+            break;
+        }
+        assert!(
+            reclaimed <= 3,
+            "every pass must respect the cap; got {reclaimed}"
+        );
+        passes += 1;
+        assert!(passes < 20, "merge failed to converge");
+    }
+    assert!(
+        passes >= 4,
+        "10 generations at 3 per pass must take at least 4 passes; took {passes}"
+    );
+
+    assert_eq!(
+        store.observe().await.unwrap().pending_wal_generations,
+        0,
+        "repeated passes must fully drain the backlog"
+    );
+
+    // No row was lost or duplicated across the multi-pass drain.
+    let listed = store.list(None, None).await.unwrap();
+    let mut ids: Vec<String> = listed.iter().map(|r| r.id.clone()).collect();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(
+        ids.len(),
+        n,
+        "every appended row must survive a bounded merge"
+    );
+
+    // The subset drain must still delete what it merged.
+    let on_disk = count_gen_dirs_on_disk(Path::new(&uri));
+    assert_eq!(
+        on_disk, 0,
+        "a bounded merge must still delete merged generation dirs"
+    );
+}
+
+/// `merge_max_generations: Some(0)` restores the unbounded behavior, so a
+/// deployment can opt out without reverting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zero_max_generations_merges_everything_in_one_pass() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().to_string_lossy().to_string();
+
+    let opts = RolloutStoreOptions {
+        shard_id: Some("unbounded".to_string()),
+        merge_after_generations: None,
+        merge_max_generations: Some(0),
+        ..Default::default()
+    };
+    let mut store = RolloutStore::open_with_options(&uri, opts).await.unwrap();
+
+    for i in 0..6 {
+        store.add(&[rec(&format!("row-{i}"))]).await.unwrap();
+        store.flush().await.unwrap();
+    }
+
+    let reclaimed = store.cleanup_own_shard().await.unwrap();
+    assert_eq!(
+        reclaimed, 6,
+        "0 must mean unbounded: one pass takes all six"
+    );
+    assert_eq!(store.observe().await.unwrap().pending_wal_generations, 0);
+}
