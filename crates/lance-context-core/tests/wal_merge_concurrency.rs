@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! Concurrency tests for WAL self-merge: a merge must never block or corrupt
 //! concurrent appends.
 //!
@@ -18,8 +20,16 @@
 //! 3. concurrent merges do not duplicate rows, and `merge_lock` excludes a
 //!    second prepare while the first `PreparedMerge` is still live;
 //! 4. an interrupted merge loses nothing (rows stay readable exactly once);
-//! 5. `add` is not blocked for the merge's duration.
+//! 5. `add` is not blocked for the merge's duration;
+//! 6. `add` is not blocked for a base-table compact's duration;
+//! 7. concurrent `refresh_latest` cannot roll the in-memory dataset handle
+//!    backwards over a merge's published version (`write_writer` serializes
+//!    handle publish);
+//! 8. same handle monotonicity under concurrent refresh vs compact;
+//! 9. merge and compact can run together without losing rows;
+//! 10. `get_by_id` does not flaky-miss merged rows under a refresh storm.
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -594,4 +604,290 @@ async fn append_is_not_blocked_for_the_duration_of_a_compact() {
         "the row appended during compact must be readable"
     );
     assert_eq!(ids.len(), 21, "all rows readable exactly once: {ids:?}");
+}
+
+/// Blind `ArcSwap::store` after load→modify→await lets `refresh_latest` publish
+/// an older handle over a concurrent merge append. That rolls the in-memory
+/// version backwards: object storage still has the merge, but `get_by_id` on
+/// the base handle can flaky-miss until the next refresh (#234 class).
+///
+/// Exclusive `write_writer` serializes handle publish so sampled versions never
+/// decrease and merged rows stay visible immediately after commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn refresh_cannot_roll_back_dataset_handle_over_merge() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().to_string_lossy().to_string();
+    let store = Arc::new(RwLock::new(
+        RolloutStore::open_with_options(&uri, opts("solo"))
+            .await
+            .unwrap(),
+    ));
+
+    for i in 0..12 {
+        store
+            .read()
+            .await
+            .add(&[rec(&format!("row-{i}"))])
+            .await
+            .unwrap();
+        store.read().await.flush().await.unwrap();
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let max_seen = Arc::new(AtomicU64::new(store.read().await.version()));
+    let dips = Arc::new(AtomicU64::new(0));
+    let refresher = {
+        let store = store.clone();
+        let stop = stop.clone();
+        let max_seen = max_seen.clone();
+        let dips = dips.clone();
+        tokio::spawn(async move {
+            while !stop.load(Ordering::Acquire) {
+                store.read().await.refresh_latest().await.unwrap();
+                let v = store.read().await.version();
+                let prev_max = max_seen.fetch_max(v, Ordering::SeqCst);
+                if v < prev_max {
+                    dips.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        })
+    };
+
+    let mut extra = 0usize;
+    for _ in 0..3 {
+        for _ in 0..4 {
+            store
+                .read()
+                .await
+                .add(&[rec(&format!("extra-{extra}"))])
+                .await
+                .unwrap();
+            store.read().await.flush().await.unwrap();
+            extra += 1;
+        }
+        let reclaimed = merge_like_sweeper(&store).await;
+        assert!(reclaimed > 0, "merge should reclaim pending generations");
+        let v = store.read().await.version();
+        let prev_max = max_seen.fetch_max(v, Ordering::SeqCst);
+        assert!(
+            v >= prev_max,
+            "merge published version {v} below previously seen max {prev_max}"
+        );
+    }
+
+    stop.store(true, Ordering::Release);
+    refresher.await.unwrap();
+
+    assert_eq!(
+        dips.load(Ordering::SeqCst),
+        0,
+        "in-memory dataset version went backwards under concurrent refresh_latest"
+    );
+
+    let ids = read_ids(&store).await;
+    for i in 0..12 {
+        assert!(
+            ids.contains(&format!("row-{i}")),
+            "merged row-{i} missing from handle after refresh race: {ids:?}"
+        );
+    }
+}
+
+async fn track_version_dips(
+    store: Arc<RwLock<RolloutStore>>,
+    stop: Arc<AtomicBool>,
+    max_seen: Arc<AtomicU64>,
+    dips: Arc<AtomicU64>,
+) {
+    while !stop.load(Ordering::Acquire) {
+        // Compact can briefly make a concurrent checkout_latest miss a
+        // mid-rewrite manifest; retry rather than failing the storm.
+        if store.read().await.refresh_latest().await.is_err() {
+            continue;
+        }
+        let v = store.read().await.version();
+        let prev_max = max_seen.fetch_max(v, Ordering::SeqCst);
+        if v < prev_max {
+            dips.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Compact publishes a new handle (then reloads); concurrent refresh must not
+/// roll the in-memory version backwards over that publish.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn refresh_cannot_roll_back_dataset_handle_over_compact() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().to_string_lossy().to_string();
+    let store = Arc::new(RwLock::new(
+        RolloutStore::open_with_options(&uri, opts("solo"))
+            .await
+            .unwrap(),
+    ));
+
+    for i in 0..12 {
+        store
+            .read()
+            .await
+            .add(&[rec(&format!("row-{i}"))])
+            .await
+            .unwrap();
+        store.read().await.flush().await.unwrap();
+        assert!(merge_like_sweeper(&store).await > 0);
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let max_seen = Arc::new(AtomicU64::new(store.read().await.version()));
+    let dips = Arc::new(AtomicU64::new(0));
+    let refresher = tokio::spawn(track_version_dips(
+        store.clone(),
+        stop.clone(),
+        max_seen.clone(),
+        dips.clone(),
+    ));
+
+    let metrics = {
+        let guard = store.read().await;
+        guard
+            .compact(Some(CompactionConfig {
+                min_fragments: 2,
+                num_threads: Some(1),
+                batch_size: Some(1),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+    };
+    assert!(
+        metrics.fragments_removed > 0,
+        "compact should rewrite fragments, got removed={} added={}",
+        metrics.fragments_removed,
+        metrics.fragments_added
+    );
+    let v = store.read().await.version();
+    let prev_max = max_seen.fetch_max(v, Ordering::SeqCst);
+    assert!(
+        v >= prev_max,
+        "compact published version {v} below previously seen max {prev_max}"
+    );
+
+    stop.store(true, Ordering::Release);
+    refresher.await.unwrap();
+    assert_eq!(
+        dips.load(Ordering::SeqCst),
+        0,
+        "in-memory dataset version went backwards under concurrent refresh vs compact"
+    );
+    assert_eq!(read_ids(&store).await.len(), 12);
+}
+
+/// Lance treats Append (WAL merge) vs Rewrite (compact) as non-conflicting;
+/// both must succeed and conserve rows under shared store locks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn merge_and_compact_concurrently_preserve_rows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().to_string_lossy().to_string();
+    let store = Arc::new(RwLock::new(
+        RolloutStore::open_with_options(&uri, opts("solo"))
+            .await
+            .unwrap(),
+    ));
+
+    for i in 0..8 {
+        store
+            .read()
+            .await
+            .add(&[rec(&format!("base-{i}"))])
+            .await
+            .unwrap();
+        store.read().await.flush().await.unwrap();
+        assert!(merge_like_sweeper(&store).await > 0);
+    }
+    for i in 0..6 {
+        store
+            .read()
+            .await
+            .add(&[rec(&format!("wal-{i}"))])
+            .await
+            .unwrap();
+        store.read().await.flush().await.unwrap();
+    }
+
+    let merger = {
+        let store = store.clone();
+        tokio::spawn(async move { merge_like_sweeper(&store).await })
+    };
+    let compactor = {
+        let store = store.clone();
+        tokio::spawn(async move {
+            store
+                .read()
+                .await
+                .compact(Some(CompactionConfig {
+                    min_fragments: 2,
+                    num_threads: Some(1),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap()
+        })
+    };
+
+    let reclaimed = merger.await.unwrap();
+    let metrics = compactor.await.unwrap();
+    assert!(reclaimed > 0, "merge should reclaim WAL generations");
+    let _ = metrics;
+
+    let ids = read_ids(&store).await;
+    assert_eq!(ids.len(), 14, "all rows readable exactly once: {ids:?}");
+    for i in 0..8 {
+        assert!(ids.contains(&format!("base-{i}")));
+    }
+    for i in 0..6 {
+        assert!(ids.contains(&format!("wal-{i}")));
+    }
+}
+
+/// Production symptom of handle rollback: merged id briefly missing from
+/// `get_by_id` while refresh races merge. Exclusive handle publish keeps the
+/// id visible once merge returns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn get_by_id_sees_merged_rows_under_refresh_storm() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().to_string_lossy().to_string();
+    let store = Arc::new(RwLock::new(
+        RolloutStore::open_with_options(&uri, opts("solo"))
+            .await
+            .unwrap(),
+    ));
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let refresher = {
+        let store = store.clone();
+        let stop = stop.clone();
+        tokio::spawn(async move {
+            while !stop.load(Ordering::Acquire) {
+                store.read().await.refresh_latest().await.unwrap();
+            }
+        })
+    };
+
+    store.read().await.add(&[rec("target")]).await.unwrap();
+    store.read().await.flush().await.unwrap();
+    assert!(merge_like_sweeper(&store).await > 0);
+
+    for _ in 0..30 {
+        let hit = store
+            .read()
+            .await
+            .get_by_id("target")
+            .await
+            .unwrap()
+            .is_some();
+        assert!(hit, "merged target must remain visible under refresh storm");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+
+    stop.store(true, Ordering::Release);
+    refresher.await.unwrap();
 }

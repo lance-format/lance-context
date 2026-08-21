@@ -506,8 +506,10 @@ impl RolloutStore {
         self.base.version()
     }
 
-    /// Checkout a specific dataset version — recovers the exact rollout set that
-    /// trained a checkpoint (spec §3, reproducibility).
+    /// Checkout a specific base-table version (time travel over the base table
+    /// only). Rollout training does not use this — reproduce a checkpoint by
+    /// filtering immutable rows (`policy_version`), not by pinning a dataset
+    /// version. See `docs/src/specs/rollout-deployment.md` §7.
     pub async fn checkout(&self, version_id: u64) -> LanceResult<()> {
         self.base.checkout(version_id).await
     }
