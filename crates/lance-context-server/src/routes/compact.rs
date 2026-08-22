@@ -28,7 +28,7 @@ pub async fn compact(
         None
     };
 
-    let mut store = store_lock.write().await;
+    let store = store_lock.read().await;
     let metrics = store.compact(config).await.map_err(AppError::from_lance)?;
 
     Ok(Json(CompactResponse {
