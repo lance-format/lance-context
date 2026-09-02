@@ -34,7 +34,7 @@ use tokio::task::JoinHandle;
 
 use crate::state::MasterState;
 use crate::stats_store::StatRow;
-use crate::task_store::TaskClaim;
+use crate::task_store::{TaskClaim, TaskKinds};
 
 /// Maximum tasks a single auto-sweep may enqueue.
 ///
@@ -447,7 +447,14 @@ async fn sweep_merge_wal_inner(state: &Arc<MasterState>) -> lance::Result<usize>
     Ok(queued)
 }
 
-/// Spawn the scheduler poller plus the optional periodic auto-sweep.
+/// Spawn the scheduler pollers plus the optional periodic auto-sweep.
+///
+/// Returns the handle of the *general* poller only. When a separate WAL-merge
+/// budget is configured there is also a second poller (and the auto-sweep task)
+/// whose handles are dropped: like the sweep, they are meant to live as long as
+/// the process. Aborting the returned handle therefore stops general dispatch,
+/// not every scheduler task -- adequate for tests, which drop the whole
+/// `MasterState` immediately after.
 pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
     // Optional periodic compaction auto-sweep feeds the same queue.
     let interval_secs = state.config.compaction_interval_secs;
@@ -494,38 +501,84 @@ pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
     // into the shared pool.
     let merge_sem = (state.config.merge_wal_concurrency > 0)
         .then(|| Arc::new(Semaphore::new(state.config.merge_wal_concurrency)));
-    let dispatch_state = state.clone();
+
+    // One poller per pool, each claiming only the kinds its pool runs.
+    //
+    // A single poller drawing from one unfiltered `claim_next` could not keep
+    // the pools independent, because claiming is destructive: it deletes the
+    // queue key, grants a lease, and takes the per-experiment target lock. The
+    // claimed task's kind then decided which pool it drew from, so a claim made
+    // on behalf of an idle pool could return a task belonging to a saturated
+    // one and park it on `acquire_owned()` -- holding its target lock while
+    // idle. With `MergeWal` numerically dominant (the 600s sweep enqueues one
+    // per over-threshold experiment), nearly every claim returned a MergeWal,
+    // and the loop's own `while` guard stayed true only because the *general*
+    // pool had permits. The result was a dispatcher that spun claiming MergeWal
+    // tasks it could not run while a lone `Compact` sat queued behind them --
+    // starvation that adding replicas or raising `task_concurrency` could not
+    // fix, since every added slot was filled the same way.
+    //
+    // Splitting the pollers makes each one claim only what it can run, so a
+    // free compaction slot reaches past any number of queued MergeWal tasks.
+    // FIFO order within a kind is unchanged.
+    let general = spawn_pool_poller(
+        state.clone(),
+        sem,
+        if merge_sem.is_some() {
+            TaskKinds::GENERAL
+        } else {
+            // No separate merge budget: the general pool runs everything, so it
+            // must still be allowed to claim MergeWal.
+            TaskKinds::ANY
+        },
+        true,
+    );
+    if let Some(merge) = merge_sem {
+        spawn_pool_poller(state.clone(), merge, TaskKinds::MERGE_WAL, false);
+    }
+    general
+}
+
+/// Spawn one dispatch loop bound to a single execution pool.
+///
+/// `kinds` restricts what this loop will claim; `report_depth` designates the
+/// one loop that publishes the shared queue-depth gauge, so running several
+/// pollers does not multiply that metric.
+fn spawn_pool_poller(
+    state: Arc<MasterState>,
+    pool: Arc<Semaphore>,
+    kinds: TaskKinds,
+    report_depth: bool,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            if let Ok(queued) = dispatch_state.task_store.queue_depth().await {
-                metrics::gauge!("master_task_queue_depth").set(queued as f64);
+            if report_depth {
+                if let Ok(queued) = state.task_store.queue_depth().await {
+                    metrics::gauge!("master_task_queue_depth").set(queued as f64);
+                }
             }
-            // Poll while *either* pool can accept work; the claimed task's kind
-            // decides which one it draws from below.
-            while sem.available_permits() > 0
-                || merge_sem
-                    .as_ref()
-                    .is_some_and(|s| s.available_permits() > 0)
-            {
+            while pool.available_permits() > 0 {
                 let claim_start = std::time::Instant::now();
-                match dispatch_state.task_store.claim_next().await {
+                match state.task_store.claim_next_of_kinds(kinds).await {
                     Ok(Some(claim)) => {
                         let claim_elapsed = claim_start.elapsed();
                         // The task is already claimed at this point (queue key
                         // deleted, lease granted, target lock held), so time
                         // spent here is a claimed-but-idle task holding its
-                        // per-experiment lock — worth seeing separately.
+                        // per-experiment lock — worth seeing separately. This
+                        // loop only claims kinds its own pool runs, so the wait
+                        // is now bounded by that pool's own occupancy.
                         let permit_start = std::time::Instant::now();
-                        let pool = match (claim.task.kind, merge_sem.as_ref()) {
-                            (TaskKind::MergeWal, Some(merge)) => merge.clone(),
-                            _ => sem.clone(),
-                        };
-                        let permit = pool.acquire_owned().await.expect("semaphore never closed");
+                        let permit = pool
+                            .clone()
+                            .acquire_owned()
+                            .await
+                            .expect("semaphore never closed");
                         let timing = TaskClaimTiming {
                             claim: claim_elapsed,
                             permit_wait: permit_start.elapsed(),
                         };
-                        let st = dispatch_state.clone();
+                        let st = state.clone();
                         tokio::spawn(async move {
                             run_task(&st, claim, timing).await;
                             drop(permit);
@@ -753,6 +806,98 @@ mod tests {
         let detail = status.detail.unwrap();
         assert!(detail.contains("merged 5 generations"), "detail: {detail}");
         assert!(detail.contains("2/2 workers"), "detail: {detail}");
+        worker.abort();
+    }
+
+    /// A `Compact` runs even while every `MergeWal` slot is occupied by slow
+    /// fan-outs and the queue is dominated by MergeWal tasks.
+    ///
+    /// This is the end-to-end form of the starvation bug: the merge pool is
+    /// saturated by stub workers that never return, and 20 MergeWal tasks are
+    /// enqueued *ahead* of the Compact. Before the split-poller fix the single
+    /// dispatch loop kept claiming MergeWal tasks (parking them on the merge
+    /// semaphore while they held their locks) and the trailing Compact was
+    /// never reached, so this test would hang to its timeout.
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn compact_runs_while_merge_wal_pool_is_saturated() {
+        use axum::{routing::post, Router};
+
+        // A worker that accepts the merge call and then never responds, so the
+        // MergeWal task occupies its slot for the duration of the test.
+        let hang = Router::new().route(
+            "/api/v1/internal/merge-wal/{name}",
+            post(|| async {
+                std::future::pending::<()>().await;
+                String::new()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, hang).await.unwrap() });
+
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.worker_endpoints = vec![format!("http://{addr}")];
+        cfg.merge_wal_concurrency = 2;
+        cfg.task_concurrency = 2;
+        let state = MasterState::new(cfg).await.unwrap();
+
+        // Build a compactable store before the dispatcher starts.
+        let name = "starved";
+        let uri = state.rollout_uri(name);
+        {
+            let mut store = RolloutStore::open(&uri).await.unwrap();
+            for i in 0..4 {
+                let rec = rollout_record(&format!("r{i}"));
+                store.add(&[rec]).await.unwrap();
+                store.cleanup_own_shard().await.unwrap();
+            }
+        }
+        state
+            .registry
+            .write()
+            .await
+            .upsert(name, &uri)
+            .await
+            .unwrap();
+        crate::scanner::scan_once(&state).await.unwrap();
+
+        // Saturate and over-fill the merge queue *before* the Compact.
+        for i in 0..20 {
+            enqueue(&state, TaskKind::MergeWal, &format!("exp-{i}"))
+                .await
+                .unwrap();
+        }
+        let compact = enqueue(&state, TaskKind::Compact, name).await.unwrap();
+
+        let worker = spawn_scheduler(&state);
+
+        let status = await_terminal(&state, &compact.id).await;
+        assert_eq!(
+            status.state,
+            TaskState::Done,
+            "Compact must drain while MergeWal saturates its own pool: {status:?}"
+        );
+
+        // Sanity: the merge backlog really is still stuck, i.e. the Compact did
+        // not simply win because the MergeWal tasks all completed.
+        let stuck = state
+            .task_store
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|t| {
+                t.kind == TaskKind::MergeWal
+                    && matches!(t.state, TaskState::Queued | TaskState::Running)
+            })
+            .count();
+        assert!(
+            stuck > 0,
+            "test must leave MergeWal work outstanding, else it proves nothing"
+        );
+
         worker.abort();
     }
 

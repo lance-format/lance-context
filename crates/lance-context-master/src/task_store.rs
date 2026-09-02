@@ -25,6 +25,48 @@ use crate::config::MasterConfig;
 
 const TASK_POLL_BATCH: usize = 256;
 
+/// A set of [`TaskKind`]s a claim is allowed to return.
+///
+/// Small enough to copy; used to let each scheduler execution pool claim only
+/// the kinds it can actually run, so a saturated pool's backlog never hides a
+/// runnable task belonging to an idle pool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TaskKinds {
+    compact: bool,
+    merge_wal: bool,
+    index_id: bool,
+}
+
+impl TaskKinds {
+    /// Every kind -- the unfiltered claim used outside the scheduler.
+    pub const ANY: Self = Self {
+        compact: true,
+        merge_wal: true,
+        index_id: true,
+    };
+    /// Only `MergeWal`, the kind with its own dedicated budget.
+    pub const MERGE_WAL: Self = Self {
+        compact: false,
+        merge_wal: true,
+        index_id: false,
+    };
+    /// Everything the general pool runs: `Compact` and `IndexId`.
+    pub const GENERAL: Self = Self {
+        compact: true,
+        merge_wal: false,
+        index_id: true,
+    };
+
+    #[must_use]
+    pub fn contains(self, kind: TaskKind) -> bool {
+        match kind {
+            TaskKind::Compact => self.compact,
+            TaskKind::MergeWal => self.merge_wal,
+            TaskKind::IndexId => self.index_id,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct TaskStore {
     inner: Arc<EtcdTaskStore>,
@@ -116,8 +158,25 @@ impl TaskStore {
     /// Claim the oldest runnable task. The queued->running update, claim lease,
     /// and per-experiment write lock are one etcd transaction.
     pub async fn claim_next(&self) -> lance::Result<Option<TaskClaim>> {
+        self.claim_next_of_kinds(TaskKinds::ANY).await
+    }
+
+    /// Claim the oldest runnable task whose kind is in `kinds`, skipping over
+    /// queued tasks of other kinds instead of stopping at them.
+    ///
+    /// The scheduler needs this because it runs several execution pools with
+    /// separate budgets. Claiming is destructive -- it deletes the queue key,
+    /// grants a lease, and takes the per-experiment target lock -- so claiming a
+    /// task the caller has no free slot for does not merely waste a poll: it
+    /// parks a claimed task on a semaphore while it holds its target lock. With
+    /// one kind numerically dominant, an unfiltered claim returns that kind
+    /// nearly every time, so a scarce kind can wait behind it indefinitely even
+    /// though its own pool is idle. Filtering at claim time keeps the queue's
+    /// FIFO order within each kind while letting an idle pool reach past a
+    /// saturated one.
+    pub async fn claim_next_of_kinds(&self, kinds: TaskKinds) -> lance::Result<Option<TaskClaim>> {
         self.inner.recover_orphaned().await?;
-        let (claim, dependency_failed) = self.inner.claim_next().await?;
+        let (claim, dependency_failed) = self.inner.claim_next(kinds).await?;
         if dependency_failed {
             if let Err(error) = self.prune_terminal_history().await {
                 tracing::warn!(error = %error, "failed to prune task history");
@@ -395,7 +454,7 @@ impl EtcdTaskStore {
             .map_err(|_| lance::Error::io("etcd returned an invalid queue count"))
     }
 
-    async fn claim_next(&self) -> lance::Result<(Option<TaskClaim>, bool)> {
+    async fn claim_next(&self, kinds: TaskKinds) -> lance::Result<(Option<TaskClaim>, bool)> {
         let prefix = self.queue_prefix();
         let range_end = prefix_range_end(prefix.as_bytes());
         let mut start_key = prefix.into_bytes();
@@ -427,6 +486,12 @@ impl EtcdTaskStore {
                 .collect::<lance::Result<Vec<_>>>()?;
 
             for mut task in queued {
+                // Skip kinds this caller cannot run *before* the dependency
+                // probe: an unrunnable kind should cost nothing, and this is
+                // what lets a scarce kind be found behind a dominant one.
+                if !kinds.contains(task.kind) {
+                    continue;
+                }
                 match self.dependency_status(&task).await? {
                     DependencyStatus::Ready => {}
                     DependencyStatus::Waiting => continue,
@@ -1125,6 +1190,88 @@ mod tests {
             .finish(recovered, Ok("recovered".to_string()))
             .await
             .unwrap();
+
+        let mut client = Client::connect(cfg.etcd_endpoints, None).await.unwrap();
+        client
+            .delete(
+                cfg.etcd_prefix,
+                Some(etcd_client::DeleteOptions::new().with_prefix()),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// A kind-filtered claim reaches past a large backlog of another kind.
+    ///
+    /// This is the starvation fix in miniature: many `MergeWal` tasks are
+    /// enqueued *before* a single `Compact`, so the `Compact` is last in the
+    /// queue's FIFO order. An unfiltered claim returns MergeWal every time --
+    /// asserted below, so the test still describes the old behavior -- while a
+    /// `GENERAL`-filtered claim must skip all of them and find the Compact.
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn filtered_claim_reaches_compact_behind_merge_wal_backlog() {
+        let endpoint = std::env::var("ETCD_TEST_ENDPOINTS")
+            .expect("ETCD_TEST_ENDPOINTS must point to a test etcd");
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.etcd_endpoints = endpoint.split(',').map(str::to_string).collect();
+        cfg.etcd_prefix = format!("/lance-context/test/{}", generate_id());
+        cfg.etcd_lease_ttl_secs = 5;
+
+        let store = TaskStore::open(&cfg).await.unwrap();
+
+        // 30 MergeWal tasks (distinct targets, so dedupe keeps them all), then
+        // the Compact last -- worst case for FIFO order.
+        for i in 0..30 {
+            store
+                .enqueue(TaskKind::MergeWal, &format!("exp-{i}"), Vec::new())
+                .await
+                .unwrap();
+        }
+        let compact = store
+            .enqueue(TaskKind::Compact, "starved", Vec::new())
+            .await
+            .unwrap();
+
+        // Unfiltered: FIFO hands back a MergeWal, never the trailing Compact.
+        let any = store.claim_next().await.unwrap().unwrap();
+        assert_eq!(
+            any.task.kind,
+            TaskKind::MergeWal,
+            "the backlog head must still be MergeWal -- otherwise this test is \
+             not exercising the starvation scenario"
+        );
+        store.finish(any, Ok("done".to_string())).await.unwrap();
+
+        // Filtered to what the general pool runs: must skip the whole backlog.
+        let claimed = store
+            .claim_next_of_kinds(TaskKinds::GENERAL)
+            .await
+            .unwrap()
+            .expect("a Compact behind a MergeWal backlog must still be claimable");
+        assert_eq!(claimed.task.kind, TaskKind::Compact);
+        assert_eq!(claimed.task.id, compact.id);
+        store.finish(claimed, Ok("done".to_string())).await.unwrap();
+
+        // And with no Compact left, the general filter reports empty rather
+        // than falling back to the still-large MergeWal backlog.
+        assert!(
+            store
+                .claim_next_of_kinds(TaskKinds::GENERAL)
+                .await
+                .unwrap()
+                .is_none(),
+            "GENERAL must not claim MergeWal"
+        );
+        // The merge poller still sees its own backlog.
+        let merge = store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .expect("MergeWal backlog must remain claimable by its own pool");
+        assert_eq!(merge.task.kind, TaskKind::MergeWal);
+        store.finish(merge, Ok("done".to_string())).await.unwrap();
 
         let mut client = Client::connect(cfg.etcd_endpoints, None).await.unwrap();
         client

@@ -152,8 +152,17 @@ pub struct MasterConfig {
     /// both backlogs are growing and both need to drain. Giving merge its own
     /// budget decouples them.
     ///
+    /// The budget alone was not sufficient: it bounds concurrency, not
+    /// admission order. Because `MergeWal` is numerically dominant (the
+    /// `merge_wal_interval_secs` sweep enqueues one per over-threshold
+    /// experiment), a single unfiltered poller kept claiming MergeWal tasks and
+    /// a queued `Compact` was never reached. The scheduler therefore runs one
+    /// poller per pool, each claiming only the kinds it can run, so this budget
+    /// now also determines admission.
+    ///
     /// `0` disables the separate budget and falls back to sharing the general
-    /// `task_concurrency` pool.
+    /// `task_concurrency` pool -- which also reinstates the single-poller
+    /// behavior, so prefer a non-zero value when both kinds are in play.
     #[arg(long, env = "MERGE_WAL_CONCURRENCY", default_value_t = 4)]
     pub merge_wal_concurrency: usize,
 
