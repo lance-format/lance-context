@@ -174,7 +174,7 @@ async fn fold_datagen_item_refreshing_on_miss(
         }
     }
 
-    let mut store = store_lock.write().await;
+    let store = store_lock.read().await;
     if !store.is_version_pinned() {
         store.refresh_latest().await.map_err(AppError::from_lance)?;
     }
@@ -197,7 +197,7 @@ async fn datagen_failures_refreshing_on_empty(
         }
     }
 
-    let mut store = store_lock.write().await;
+    let store = store_lock.read().await;
     if !store.is_version_pinned() {
         store.refresh_latest().await.map_err(AppError::from_lance)?;
     }
@@ -220,7 +220,7 @@ async fn datagen_events_for_root_refreshing_on_empty(
         }
     }
 
-    let mut store = store_lock.write().await;
+    let store = store_lock.read().await;
     if !store.is_version_pinned() {
         store.refresh_latest().await.map_err(AppError::from_lance)?;
     }
@@ -243,7 +243,7 @@ async fn datagen_root_statuses_refreshing_on_missing(
         }
     }
 
-    let mut store = store_lock.write().await;
+    let store = store_lock.read().await;
     if !store.is_version_pinned() {
         store.refresh_latest().await.map_err(AppError::from_lance)?;
     }
@@ -266,7 +266,7 @@ async fn get_datagen_blob_refreshing_on_miss(
         }
     }
 
-    let mut store = store_lock.write().await;
+    let store = store_lock.read().await;
     if !store.is_version_pinned() {
         store.refresh_latest().await.map_err(AppError::from_lance)?;
     }

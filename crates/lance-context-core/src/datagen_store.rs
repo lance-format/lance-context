@@ -125,8 +125,8 @@ impl DatagenStore {
     }
 
     #[must_use]
-    pub fn uri(&self) -> &str {
-        self.base.dataset.uri()
+    pub fn uri(&self) -> String {
+        self.base.uri()
     }
 
     #[must_use]
@@ -141,7 +141,7 @@ impl DatagenStore {
     }
 
     /// Refresh this handle to the latest base-table manifest.
-    pub async fn refresh_latest(&mut self) -> LanceResult<()> {
+    pub async fn refresh_latest(&self) -> LanceResult<()> {
         self.base.refresh_latest().await
     }
 
@@ -150,7 +150,7 @@ impl DatagenStore {
     /// The supplied slice is persisted as one MemWAL generation. Callers should
     /// include FIELD_* events and the corresponding STEP_COMPLETED marker in
     /// the same call so a crash cannot expose a partially checkpointed step.
-    pub async fn append(&mut self, events: &[DatagenEvent]) -> LanceResult<u64> {
+    pub async fn append(&self, events: &[DatagenEvent]) -> LanceResult<u64> {
         if events.is_empty() {
             return Ok(self.base.version());
         }
@@ -189,7 +189,7 @@ impl DatagenStore {
     }
 
     /// Gracefully stop this store's resident MemWAL writer.
-    pub async fn close(&mut self) -> LanceResult<()> {
+    pub async fn close(&self) -> LanceResult<()> {
         self.base.close().await
     }
 
@@ -336,9 +336,11 @@ impl DatagenStore {
             }
         }
 
-        Ok(Self::get_blob_from_dataset(&self.base.dataset, event_id)
-            .await?
-            .flatten())
+        Ok(
+            Self::get_blob_from_dataset(self.base.current_dataset().as_ref(), event_id)
+                .await?
+                .flatten(),
+        )
     }
 
     /// Materialize a folded item's blob field by name, resolving the `event_id` for the caller.
@@ -365,7 +367,7 @@ impl DatagenStore {
 
     /// Merge every currently flushed generation owned by this writer into the
     /// base table.
-    pub async fn cleanup_own_shard(&mut self) -> LanceResult<usize> {
+    pub async fn cleanup_own_shard(&self) -> LanceResult<usize> {
         self.base.cleanup_own_shard().await
     }
 
@@ -380,7 +382,7 @@ impl DatagenStore {
     /// the shared base table and Lance treats two concurrent `Rewrite` commits
     /// as a conflict.
     pub async fn compact(
-        &mut self,
+        &self,
         options: Option<CompactionConfig>,
     ) -> LanceResult<CompactionMetrics> {
         self.base.compact(options).await
@@ -402,7 +404,7 @@ impl DatagenStore {
     /// Build a ZoneMap scalar index on `event_id`, the table's key column.
     /// Idempotent. Datagen previously had no scalar index, so every point
     /// lookup by event id scanned.
-    pub async fn create_event_id_index(&mut self) -> LanceResult<()> {
+    pub async fn create_event_id_index(&self) -> LanceResult<()> {
         self.base.create_key_zonemap_index().await
     }
 
@@ -433,7 +435,7 @@ impl DatagenStore {
                 let Some(store) = weak.upgrade() else {
                     return;
                 };
-                let mut guard = store.write().await;
+                let guard = store.write().await;
                 match tokio::time::timeout(pass_timeout, guard.cleanup_own_shard()).await {
                     Ok(Ok(0)) => {}
                     Ok(Ok(reclaimed)) => info!(
@@ -529,7 +531,7 @@ impl DatagenStore {
 
     fn non_blob_columns(&self) -> Vec<String> {
         self.base
-            .dataset
+            .current_dataset()
             .schema()
             .fields
             .iter()
@@ -1323,7 +1325,7 @@ mod tests {
         let uri = directory.path().to_string_lossy().to_string();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let mut writer_a = DatagenStore::open_with_options(
+            let writer_a = DatagenStore::open_with_options(
                 &uri,
                 DatagenStoreOptions {
                     storage_options: None,
@@ -1333,7 +1335,7 @@ mod tests {
             )
             .await
             .unwrap();
-            let mut writer_b = DatagenStore::open_with_options(
+            let writer_b = DatagenStore::open_with_options(
                 &uri,
                 DatagenStoreOptions {
                     storage_options: None,
@@ -1424,7 +1426,7 @@ mod tests {
         let uri = directory.path().to_string_lossy().to_string();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let mut store = DatagenStore::open(&uri).await.unwrap();
+            let store = DatagenStore::open(&uri).await.unwrap();
 
             // Root item "7" fans out into one sub-item "7/solve_twice:0".
             let mut root_created = event("7", 0, "created-root", 0, DatagenEventType::ItemCreated);
@@ -1478,7 +1480,7 @@ mod tests {
         let uri = dir.path().to_string_lossy().to_string();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let mut store = DatagenStore::open(&uri).await.unwrap();
+            let store = DatagenStore::open(&uri).await.unwrap();
 
             // One cleanup pass appends one fragment, so merge after each append
             // to accumulate several -- this is exactly the growth pattern that
@@ -1519,7 +1521,7 @@ mod tests {
         let uri = directory.path().to_string_lossy().to_string();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let mut store = DatagenStore::open_with_options(
+            let store = DatagenStore::open_with_options(
                 &uri,
                 DatagenStoreOptions {
                     storage_options: None,

@@ -792,7 +792,7 @@ impl AppState {
                 .collect()
         };
         for (name, store) in resident {
-            if let Err(e) = store.write().await.close().await {
+            if let Err(e) = store.read().await.close().await {
                 tracing::warn!(
                     store = %name,
                     error = %e,
@@ -813,7 +813,7 @@ impl AppState {
                 .collect()
         };
         for (name, store) in datagen {
-            if let Err(e) = store.write().await.close().await {
+            if let Err(e) = store.read().await.close().await {
                 tracing::warn!(
                     store = %name,
                     error = %e,
@@ -830,7 +830,7 @@ impl AppState {
                 .collect()
         };
         for (name, store) in generic {
-            if let Err(e) = store.write().await.close().await {
+            if let Err(e) = store.read().await.close().await {
                 tracing::warn!(
                     store = %name,
                     error = %e,
@@ -999,7 +999,7 @@ mod tests {
 
         // --- datagen: seals on append, so the merge pass is what it needs ---
         let datagen_uri = state.datagen_uri("d1");
-        let mut datagen = DatagenStore::open(&datagen_uri).await.unwrap();
+        let datagen = DatagenStore::open(&datagen_uri).await.unwrap();
         datagen.append(&[datagen_event()]).await.unwrap();
         assert!(
             datagen.pending_wal_generations().await.unwrap() > 0,
@@ -1074,6 +1074,6 @@ mod tests {
 
         // The handle survives shutdown (shutdown only drains the writer); a
         // fresh close is still a no-op.
-        store.write().await.close().await.unwrap();
+        store.read().await.close().await.unwrap();
     }
 }

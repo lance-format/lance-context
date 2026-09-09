@@ -184,7 +184,7 @@ impl GenericStore {
         )
         .await?;
 
-        let schema: Arc<Schema> = Arc::new(base.dataset.schema().into());
+        let schema: Arc<Schema> = Arc::new(base.current_dataset().schema().into());
         let persisted = spec_from_schema(&schema)?;
 
         // Reopening with a different schema would reinterpret existing data.
@@ -221,7 +221,7 @@ impl GenericStore {
 
     /// URI of the underlying Lance dataset.
     #[must_use]
-    pub fn uri(&self) -> &str {
+    pub fn uri(&self) -> String {
         self.base.uri()
     }
 
@@ -238,7 +238,7 @@ impl GenericStore {
     }
 
     /// Refresh this handle to the latest base-table manifest.
-    pub async fn refresh_latest(&mut self) -> LanceResult<()> {
+    pub async fn refresh_latest(&self) -> LanceResult<()> {
         self.base.refresh_latest().await
     }
 
@@ -356,19 +356,19 @@ impl GenericStore {
     }
 
     /// Close the resident writer, draining its background tasks. Idempotent.
-    pub async fn close(&mut self) -> LanceResult<()> {
+    pub async fn close(&self) -> LanceResult<()> {
         self.base.close().await
     }
 
     /// Merge flushed generations into the base table once the count trigger is
     /// met. Returns how many were reclaimed.
-    pub async fn maybe_merge_wal(&mut self) -> LanceResult<usize> {
+    pub async fn maybe_merge_wal(&self) -> LanceResult<usize> {
         self.base.maybe_merge_own_shard().await
     }
 
     /// Seal, then merge **every** pending generation into the base table — the
     /// time half of the "time OR count" trigger.
-    pub async fn cleanup_wal(&mut self) -> LanceResult<usize> {
+    pub async fn cleanup_wal(&self) -> LanceResult<usize> {
         self.base.cleanup_own_shard().await
     }
 
@@ -380,7 +380,7 @@ impl GenericStore {
     /// Compact the base table's small fragments. Drive from a single external
     /// trigger, not per worker — see [`StorageBase::compact`].
     pub async fn compact(
-        &mut self,
+        &self,
         options: Option<CompactionConfig>,
     ) -> LanceResult<CompactionMetrics> {
         self.base.compact(options).await
@@ -399,14 +399,14 @@ impl GenericStore {
     }
 
     /// Build a ZoneMap scalar index on `id`. Idempotent.
-    pub async fn create_id_index(&mut self) -> LanceResult<()> {
+    pub async fn create_id_index(&self) -> LanceResult<()> {
         self.base.create_key_zonemap_index().await
     }
 
     /// Row count of the base table. Excludes rows still in unmerged
     /// generations or buffered in the writer.
     pub async fn count_base_rows(&self) -> LanceResult<usize> {
-        self.base.dataset.count_rows(None).await
+        self.base.current_dataset().count_rows(None).await
     }
 }
 
@@ -699,7 +699,7 @@ mod tests {
         let uri = dir.path().to_string_lossy().to_string();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let mut store = GenericStore::open(&uri, spec(), sealing()).await.unwrap();
+            let store = GenericStore::open(&uri, spec(), sealing()).await.unwrap();
             let payload: Vec<u8> = (0..4 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
             store
                 .add(&[row(json!({"id": "big", "payload": payload}))])
@@ -745,7 +745,7 @@ mod tests {
         let uri = dir.path().to_string_lossy().to_string();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let mut store = GenericStore::open(&uri, spec(), sealing()).await.unwrap();
+            let store = GenericStore::open(&uri, spec(), sealing()).await.unwrap();
             for i in 0..3 {
                 store
                     .add(&[row(json!({"id": format!("r{i}")}))])

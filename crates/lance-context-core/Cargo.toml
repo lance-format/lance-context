@@ -18,6 +18,7 @@ default = ["metrics"]
 metrics = ["dep:metrics"]
 
 [dependencies]
+arc-swap = "1"
 base64 = "0.22"
 arrow-array = "58"
 arrow-ipc = "58"

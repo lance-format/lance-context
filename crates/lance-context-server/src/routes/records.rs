@@ -32,7 +32,7 @@ async fn get_context_record_refreshing_on_miss(
         }
     }
 
-    let mut store = store_lock.write().await;
+    let store = store_lock.read().await;
     if !store.is_version_pinned() {
         store.refresh_latest().await.map_err(AppError::from_lance)?;
     }
@@ -73,7 +73,7 @@ async fn fetch_context_payload_refreshing_on_miss(
         }
     }
 
-    let mut store = store_lock.write().await;
+    let store = store_lock.read().await;
     if !store.is_version_pinned() {
         store.refresh_latest().await.map_err(AppError::from_lance)?;
     }
@@ -96,7 +96,7 @@ async fn get_context_by_external_id_refreshing_on_miss(
         }
     }
 
-    let mut store = store_lock.write().await;
+    let store = store_lock.read().await;
     if !store.is_version_pinned() {
         store.refresh_latest().await.map_err(AppError::from_lance)?;
     }

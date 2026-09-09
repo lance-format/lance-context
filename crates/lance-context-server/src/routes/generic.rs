@@ -215,7 +215,7 @@ async fn get_generic_row_refreshing_on_miss(
         }
     }
 
-    let mut store = store_lock.write().await;
+    let store = store_lock.read().await;
     if !store.is_version_pinned() {
         store.refresh_latest().await.map_err(AppError::from_lance)?;
     }
@@ -267,7 +267,10 @@ pub async fn merge_generic_wal(
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let store = state.get_or_open_generic_store(&name).await?;
-    let mut guard = store.write().await;
+    // Shared read only: `cleanup_wal` is `&self`. Merge exclusivity is
+    // `StorageBase::merge_lock`, not this outer write lock — holding write
+    // across the merge used to stall concurrent appends.
+    let guard = store.read().await;
     let reclaimed = guard.cleanup_wal().await.map_err(AppError::from_lance)?;
     Ok(Json(serde_json::json!({ "reclaimed": reclaimed })))
 }
@@ -324,7 +327,7 @@ mod tests {
         .await
         .unwrap();
         let cached = state.get_or_open_generic_store("s1").await.unwrap();
-        let mut writer = GenericStore::open_existing(
+        let writer = GenericStore::open_existing(
             &state.generic_uri("s1"),
             GenericStoreOptions {
                 shard_id: Some("external-writer".to_string()),

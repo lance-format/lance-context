@@ -83,7 +83,7 @@ async fn serial_merge_deletes_merged_generation_dirs() {
         ..Default::default()
     };
 
-    let mut store = RolloutStore::open_with_options(&uri, opts.clone())
+    let store = RolloutStore::open_with_options(&uri, opts.clone())
         .await
         .unwrap();
 

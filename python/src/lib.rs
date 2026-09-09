@@ -790,7 +790,7 @@ impl Context {
         // two writers racing for one shard. A fork branches the in-memory
         // `Context` and shares the underlying dataset, which a fresh handle
         // gives it.
-        let uri = self.store.uri().to_string();
+        let uri = self.store.uri();
         let store = py.allow_threads(|| self.runtime.block_on(ContextStore::open(&uri)));
         Ok(Self {
             inner: self.inner.fork(branch_name),

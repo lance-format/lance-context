@@ -6344,6 +6344,7 @@ dependencies = [
 name = "lance-context-core"
 version = "0.6.5"
 dependencies = [
+ "arc-swap",
  "arrow-array 58.3.0",
  "arrow-ipc 58.3.0",
  "arrow-json 58.3.0",
