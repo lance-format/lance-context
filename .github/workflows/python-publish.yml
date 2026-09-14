@@ -47,7 +47,7 @@ jobs:
             extra-args: ""
     env:
       CARGO_TERM_COLOR: always
-      RUSTFLAGS: "-C debuginfo=1"
+      RUSTFLAGS: "-C debuginfo=0"
       RUST_BACKTRACE: "1"
       CARGO_INCREMENTAL: "0"
       MACOSX_DEPLOYMENT_TARGET: "11.0"
@@ -65,7 +65,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           command: build
-          args: --release --out dist ${{ matrix.extra-args }}
+          args: --release --strip --out dist ${{ matrix.extra-args }}
           working-directory: python
           manylinux: ${{ matrix.manylinux }}
           target: ${{ matrix.target }}
@@ -92,7 +92,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           command: build
-          args: --release --out dist ${{ matrix.extra-args }}
+          args: --release --strip --out dist ${{ matrix.extra-args }}
           working-directory: python
           target: ${{ matrix.target }}
           rust-toolchain: stable
@@ -126,6 +126,35 @@ jobs:
           pattern: python-dist-*
           path: python/dist
           merge-multiple: true
+
+      - name: Check distribution sizes before publishing
+        working-directory: python
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          # PyPI reports this limit as "100 MB", but enforces it in MiB.
+          max_bytes = 100 * 1024 * 1024
+          distributions = sorted(Path("dist").glob("*.whl")) + sorted(
+              Path("dist").glob("*.tar.gz")
+          )
+          if not distributions:
+              raise SystemExit("No distributions found in dist/")
+
+          oversized = False
+          for path in distributions:
+              size = path.stat().st_size
+              print(f"{path.name}: {size:,} bytes ({size / 1024**2:.2f} MiB)")
+              if size > max_bytes:
+                  print(
+                      f"::error::{path.name} exceeds the PyPI per-file limit "
+                      f"of {max_bytes:,} bytes (100 MiB)"
+                  )
+                  oversized = True
+
+          if oversized:
+              raise SystemExit("Distribution size check failed; nothing was uploaded")
+          PY
 
       - name: Publish to PyPI
         if: >
