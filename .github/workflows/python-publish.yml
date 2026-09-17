@@ -7,6 +7,9 @@ on:
   pull_request:
     paths:
       - .github/workflows/python-publish.yml
+      - Cargo.lock
+      - python/Cargo.lock
+      - python/pyproject.toml
   workflow_dispatch:
     inputs:
       mode:
@@ -96,6 +99,29 @@ jobs:
           working-directory: python
           target: ${{ matrix.target }}
           rust-toolchain: stable
+
+      - name: Verify sdist workspace lockfile
+        if: matrix.name == 'linux-x86_64'
+        run: |
+          python3 - <<'PY'
+          import tarfile
+          from pathlib import Path
+
+          archives = list(Path("python/dist").glob("*.tar.gz"))
+          if len(archives) != 1:
+              raise SystemExit(f"Expected one source distribution, found {len(archives)}")
+          archive = archives[0]
+          with tarfile.open(archive) as source:
+              root = archive.name.removesuffix(".tar.gz")
+              if f"{root}/Cargo.lock" not in source.getnames():
+                  raise SystemExit("Source distribution is missing the workspace Cargo.lock")
+              lock = source.extractfile(f"{root}/Cargo.lock")
+              if lock is None or lock.read() != Path("Cargo.lock").read_bytes():
+                  raise SystemExit("Source distribution must contain the workspace Cargo.lock")
+              if f"{root}/python/Cargo.lock" in source.getnames():
+                  raise SystemExit("Source distribution contains an obsolete nested Cargo.lock")
+          print("Source distribution preserves the workspace Cargo.lock")
+          PY
 
       - name: Verify wheel tag
         run: |
