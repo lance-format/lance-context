@@ -25,13 +25,15 @@ use std::sync::Arc;
 use arrow_array::RecordBatch;
 use arrow_schema::{ArrowError, Schema};
 use futures::TryStreamExt;
+use lance::dataset::mem_wal::ShardManifestStore;
 use lance::dataset::optimize::CompactionMetrics;
 use lance::session::Session;
 use lance::{Error as LanceError, Result as LanceResult};
+use lance_index::mem_wal::ShardManifest;
 
 use crate::generic_codec::{batch_to_rows, rows_to_batch, Row};
 use crate::store::{CompactionConfig, CompactionStats};
-use crate::store_base::{ListSource, StorageBase, StorageBaseOptions};
+use crate::store_base::{ListSource, PreparedMerge, StorageBase, StorageBaseOptions};
 use lance_context_api::schema_spec::{SchemaSpec, ID_COLUMN};
 
 /// Schema-metadata key holding the serialized [`SchemaSpec`], so a store can be
@@ -378,6 +380,28 @@ impl GenericStore {
     /// time half of the "time OR count" trigger.
     pub async fn cleanup_wal(&mut self) -> LanceResult<usize> {
         self.base.cleanup_own_shard().await
+    }
+
+    /// The shared-lock half of [`Self::cleanup_wal`]: seal, then read a
+    /// budgeted prefix of flushed generations into memory. Callers holding a
+    /// read lock run this while appends continue, then take the write lock
+    /// only for [`Self::commit_prepared_merge`].
+    pub async fn prepare_cleanup_merge(
+        &self,
+    ) -> LanceResult<Option<(ShardManifestStore, ShardManifest, PreparedMerge)>> {
+        self.base.prepare_cleanup_merge().await
+    }
+
+    /// Commit a merge prepared by [`Self::prepare_cleanup_merge`].
+    pub async fn commit_prepared_merge(
+        &mut self,
+        manifest_store: &ShardManifestStore,
+        manifest: &ShardManifest,
+        prepared: PreparedMerge,
+    ) -> LanceResult<usize> {
+        self.base
+            .commit_prepared_merge(manifest_store, manifest, prepared)
+            .await
     }
 
     /// Generations pending merge across all shards. Read-only.

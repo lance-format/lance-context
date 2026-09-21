@@ -110,13 +110,38 @@ impl Sweepable for Arc<RwLock<GenericStore>> {
     }
 
     async fn flush(&self) -> Result<(), String> {
+        // Same shape as rollout: generic stores default to a deferred seal and
+        // take the same one-row-per-append traffic, so the count-triggered
+        // merge rides this timer too. Without it a hot generic store depends
+        // entirely on the slower cleanup sweeper reaching it.
         let guard = self.read().await;
-        guard.flush().await.map_err(|e| e.to_string())
+        let result = guard.flush().await.map_err(|e| e.to_string());
+        if result.is_ok() {
+            drop(guard);
+            let mut guard = self.write().await;
+            guard.maybe_merge_wal().await.map_err(|e| e.to_string())?;
+        }
+        result
     }
 
     async fn merge_wal(&self) -> Result<usize, String> {
+        // Prepare under the shared lock so appends and reads keep running while
+        // generations are read; hold the exclusive lock only for the commit.
+        let prepared = {
+            let guard = self.read().await;
+            guard
+                .prepare_cleanup_merge()
+                .await
+                .map_err(|e| e.to_string())?
+        };
+        let Some((manifest_store, manifest, prepared)) = prepared else {
+            return Ok(0);
+        };
         let mut guard = self.write().await;
-        guard.cleanup_wal().await.map_err(|e| e.to_string())
+        guard
+            .commit_prepared_merge(&manifest_store, &manifest, prepared)
+            .await
+            .map_err(|e| e.to_string())
     }
 }
 
