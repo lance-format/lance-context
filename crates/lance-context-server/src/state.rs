@@ -908,13 +908,17 @@ impl AppState {
                     return;
                 };
                 // Every kind, not just rollout: generations accumulate in each
-                // one, and only the base table absorbs them.
-                sweeper::merge_pass(sweeper::resident(&state.rollout_stores).await, pass_timeout)
-                    .await;
-                sweeper::merge_pass(sweeper::resident(&state.datagen_stores).await, pass_timeout)
-                    .await;
-                sweeper::merge_pass(sweeper::resident(&state.generic_stores).await, pass_timeout)
-                    .await;
+                // one, and only the base table absorbs them. The kinds run
+                // concurrently: each pass is a serial walk with a per-store
+                // timeout of several minutes, so with hundreds of resident
+                // rollout stores a serial kind order let generic stores go
+                // unswept for hours while their generations piled into the
+                // tens of thousands and every read re-opened all of them.
+                tokio::join!(
+                    sweeper::merge_pass(sweeper::resident(&state.rollout_stores).await, pass_timeout),
+                    sweeper::merge_pass(sweeper::resident(&state.datagen_stores).await, pass_timeout),
+                    sweeper::merge_pass(sweeper::resident(&state.generic_stores).await, pass_timeout),
+                );
             }
         }))
     }
