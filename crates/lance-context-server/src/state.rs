@@ -915,9 +915,18 @@ impl AppState {
                 // unswept for hours while their generations piled into the
                 // tens of thousands and every read re-opened all of them.
                 tokio::join!(
-                    sweeper::merge_pass(sweeper::resident(&state.rollout_stores).await, pass_timeout),
-                    sweeper::merge_pass(sweeper::resident(&state.datagen_stores).await, pass_timeout),
-                    sweeper::merge_pass(sweeper::resident(&state.generic_stores).await, pass_timeout),
+                    sweeper::merge_pass(
+                        sweeper::resident(&state.rollout_stores).await,
+                        pass_timeout
+                    ),
+                    sweeper::merge_pass(
+                        sweeper::resident(&state.datagen_stores).await,
+                        pass_timeout
+                    ),
+                    sweeper::merge_pass(
+                        sweeper::resident(&state.generic_stores).await,
+                        pass_timeout
+                    ),
                 );
             }
         }))
