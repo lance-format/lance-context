@@ -302,6 +302,11 @@ pub struct ContextStoreOptions {
     /// reaches the budget, or the generation-count cap, whichever comes first.
     /// A generation is indivisible, so even an oversized one is fully merged.
     pub merge_max_bytes: Option<usize>,
+    /// Warn when one MemWAL shard has at least this many flushed generations
+    /// pending merge, sampled on every read. `None` uses the crate default
+    /// (256); `Some(0)` disables the warn. The `rollout_wal_pending_generations`
+    /// histogram is emitted regardless.
+    pub pending_generations_warn: Option<usize>,
     /// Whether [`ContextStore::add`] seals the memtable before returning, so the
     /// rows it wrote are immediately readable.
     ///
@@ -333,6 +338,7 @@ impl Default for ContextStoreOptions {
             merge_after_generations: None,
             merge_max_generations: None,
             merge_max_bytes: None,
+            pending_generations_warn: None,
             // Read-your-write by default; see the field docs.
             seal_on_add: true,
         }
@@ -614,6 +620,7 @@ impl ContextStore {
                 merge_after_generations: options.merge_after_generations,
                 merge_max_generations: options.merge_max_generations,
                 merge_max_bytes: options.merge_max_bytes,
+                pending_generations_warn: options.pending_generations_warn,
                 session: None,
                 schema: Arc::new(arrow_schema.clone()),
                 key_column: "id".to_string(),
@@ -2237,6 +2244,7 @@ impl ContextStore {
             merge_after_generations: None,
             merge_max_generations: None,
             merge_max_bytes: None,
+            pending_generations_warn: None,
             // A compactor never appends, so the seal mode is irrelevant to it;
             // deferring keeps it from ever emitting a generation.
             seal_on_add: false,

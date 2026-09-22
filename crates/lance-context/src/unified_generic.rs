@@ -41,6 +41,7 @@ impl GenericStore {
             merge_after_generations: None,
             merge_max_generations: None,
             merge_max_bytes: None,
+            pending_generations_warn: None,
             session: None,
             seal_on_add,
         };
@@ -62,6 +63,7 @@ impl GenericStore {
             merge_after_generations: None,
             merge_max_generations: None,
             merge_max_bytes: None,
+            pending_generations_warn: None,
             session: None,
             seal_on_add,
         };
