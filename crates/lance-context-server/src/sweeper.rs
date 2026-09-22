@@ -37,8 +37,16 @@ pub(crate) trait Sweepable: Send + Sync + 'static {
     /// Seal the active memtable. A no-op for a store that seals on write.
     fn flush(&self) -> impl std::future::Future<Output = Result<(), String>> + Send;
 
-    /// Fold pending flushed generations into the base table; returns how many
-    /// were reclaimed.
+    /// Fold this instance's pending generations into the base table **if** the
+    /// count trigger is configured and met; returns how many were reclaimed.
+    /// Rides the flush timer so read amplification is bounded between the
+    /// slower time-triggered passes. Default: no count trigger.
+    fn merge_if_due(&self) -> impl std::future::Future<Output = Result<usize, String>> + Send {
+        async { Ok(0) }
+    }
+
+    /// Fold **every** pending flushed generation into the base table; returns
+    /// how many were reclaimed.
     fn merge_wal(&self) -> impl std::future::Future<Output = Result<usize, String>> + Send;
 }
 
@@ -50,24 +58,29 @@ impl Sweepable for Arc<RwLock<RolloutStore>> {
     async fn flush(&self) -> Result<(), String> {
         // Read lock: `flush` is `&self`, so concurrent appends are not blocked.
         let guard = self.read().await;
-        let result = guard.flush().await.map_err(|e| e.to_string());
-        if result.is_ok() {
-            // The count-triggered merge rides this timer; it is a no-op unless
-            // the threshold is configured and met.
-            drop(guard);
-            let mut guard = self.write().await;
+        guard.flush().await.map_err(|e| e.to_string())
+    }
+
+    async fn merge_if_due(&self) -> Result<usize, String> {
+        let prepared = {
+            let guard = self.read().await;
             guard
-                .maybe_merge_own_shard()
+                .prepare_count_merge()
                 .await
-                .map_err(|e| e.to_string())?;
-        }
-        result
+                .map_err(|e| e.to_string())?
+        };
+        // Only now take the write lock, and only for the short commit.
+        let Some((manifest_store, manifest, prepared)) = prepared else {
+            return Ok(0);
+        };
+        let mut guard = self.write().await;
+        guard
+            .commit_prepared_merge(&manifest_store, &manifest, prepared)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     async fn merge_wal(&self) -> Result<usize, String> {
-        // The prepare/commit split: seal and read every flushed generation
-        // under the *shared* lock so appends keep running, then take the
-        // exclusive lock only for the short commit.
         let prepared = {
             let guard = self.read().await;
             guard
@@ -75,6 +88,7 @@ impl Sweepable for Arc<RwLock<RolloutStore>> {
                 .await
                 .map_err(|e| e.to_string())?
         };
+        // Only now take the write lock, and only for the short commit.
         let Some((manifest_store, manifest, prepared)) = prepared else {
             return Ok(0);
         };
@@ -110,23 +124,34 @@ impl Sweepable for Arc<RwLock<GenericStore>> {
     }
 
     async fn flush(&self) -> Result<(), String> {
-        // Same shape as rollout: generic stores default to a deferred seal and
-        // take the same one-row-per-append traffic, so the count-triggered
-        // merge rides this timer too. Without it a hot generic store depends
-        // entirely on the slower cleanup sweeper reaching it.
         let guard = self.read().await;
-        let result = guard.flush().await.map_err(|e| e.to_string());
-        if result.is_ok() {
-            drop(guard);
-            let mut guard = self.write().await;
-            guard.maybe_merge_wal().await.map_err(|e| e.to_string())?;
-        }
-        result
+        guard.flush().await.map_err(|e| e.to_string())
+    }
+
+    async fn merge_if_due(&self) -> Result<usize, String> {
+        // Generic stores default to a deferred seal and take the same
+        // one-row-per-append traffic as rollout, so the count trigger rides
+        // this timer too. Without it a hot generic store depends entirely on
+        // the slower cleanup sweeper reaching it.
+        let prepared = {
+            let guard = self.read().await;
+            guard
+                .prepare_count_merge()
+                .await
+                .map_err(|e| e.to_string())?
+        };
+        // Only now take the write lock, and only for the short commit.
+        let Some((manifest_store, manifest, prepared)) = prepared else {
+            return Ok(0);
+        };
+        let mut guard = self.write().await;
+        guard
+            .commit_prepared_merge(&manifest_store, &manifest, prepared)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     async fn merge_wal(&self) -> Result<usize, String> {
-        // Prepare under the shared lock so appends and reads keep running while
-        // generations are read; hold the exclusive lock only for the commit.
         let prepared = {
             let guard = self.read().await;
             guard
@@ -134,6 +159,7 @@ impl Sweepable for Arc<RwLock<GenericStore>> {
                 .await
                 .map_err(|e| e.to_string())?
         };
+        // Only now take the write lock, and only for the short commit.
         let Some((manifest_store, manifest, prepared)) = prepared else {
             return Ok(0);
         };
@@ -170,6 +196,15 @@ pub(crate) async fn flush_pass<S: Sweepable>(stores: Vec<(String, S)>, pass_time
             Ok(Ok(())) => {
                 metrics::counter!("rollout_wal_flush_total", "result" => "ok", "kind" => kind)
                     .increment(1);
+                // The count-triggered merge rides this timer, but it is a merge,
+                // not a flush: its outcome is reported under the cleanup
+                // counters so a failing merge cannot masquerade as a failing
+                // flush on the dashboards.
+                report_merge(
+                    &name,
+                    kind,
+                    tokio::time::timeout(pass_timeout, store.merge_if_due()).await,
+                );
             }
             Ok(Err(error)) => {
                 metrics::counter!("rollout_wal_flush_total", "result" => "failed", "kind" => kind)
@@ -189,34 +224,169 @@ pub(crate) async fn flush_pass<S: Sweepable>(stores: Vec<(String, S)>, pass_time
 pub(crate) async fn merge_pass<S: Sweepable>(stores: Vec<(String, S)>, pass_timeout: Duration) {
     let kind = S::kind();
     for (name, store) in stores {
-        match tokio::time::timeout(pass_timeout, store.merge_wal()).await {
-            Ok(Ok(0)) => {}
-            Ok(Ok(reclaimed)) => {
-                metrics::counter!("rollout_wal_cleanup_total", "result" => "merged", "kind" => kind)
-                    .increment(1);
-                metrics::counter!("rollout_wal_generations_reclaimed_total", "kind" => kind)
-                    .increment(reclaimed as u64);
-                tracing::info!(
-                    store = %name,
-                    kind,
-                    reclaimed,
-                    "sweeper merged flushed generations"
-                );
-            }
-            Ok(Err(error)) => {
-                metrics::counter!("rollout_wal_cleanup_total", "result" => "failed", "kind" => kind)
-                    .increment(1);
-                tracing::warn!(store = %name, kind, %error, "sweeper WAL cleanup failed");
-            }
-            Err(_elapsed) => {
-                metrics::counter!("rollout_wal_cleanup_total", "result" => "timeout", "kind" => kind)
-                    .increment(1);
-                tracing::warn!(
-                    store = %name,
-                    kind,
-                    "sweeper WAL cleanup timed out; abandoning this store this tick"
-                );
-            }
+        report_merge(
+            &name,
+            kind,
+            tokio::time::timeout(pass_timeout, store.merge_wal()).await,
+        );
+    }
+}
+
+/// Record one merge attempt's outcome on the cleanup counters and log.
+fn report_merge(
+    name: &str,
+    kind: &'static str,
+    outcome: Result<Result<usize, String>, tokio::time::error::Elapsed>,
+) {
+    match outcome {
+        Ok(Ok(0)) => {}
+        Ok(Ok(reclaimed)) => {
+            metrics::counter!("rollout_wal_cleanup_total", "result" => "merged", "kind" => kind)
+                .increment(1);
+            metrics::counter!("rollout_wal_generations_reclaimed_total", "kind" => kind)
+                .increment(reclaimed as u64);
+            tracing::info!(store = %name, kind, reclaimed, "sweeper merged flushed generations");
         }
+        Ok(Err(error)) => {
+            metrics::counter!("rollout_wal_cleanup_total", "result" => "failed", "kind" => kind)
+                .increment(1);
+            tracing::warn!(store = %name, kind, %error, "sweeper WAL cleanup failed");
+        }
+        Err(_elapsed) => {
+            metrics::counter!("rollout_wal_cleanup_total", "result" => "timeout", "kind" => kind)
+                .increment(1);
+            tracing::warn!(
+                store = %name,
+                kind,
+                "sweeper WAL cleanup timed out; abandoning this store this tick"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lance_context_api::{ColumnSpec, ColumnType, SchemaSpec, ID_COLUMN};
+    use lance_context_core::GenericStoreOptions;
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    fn spec() -> SchemaSpec {
+        SchemaSpec::new(vec![(
+            ID_COLUMN.to_string(),
+            ColumnSpec::required(ColumnType::String { large: false }),
+        )])
+    }
+
+    async fn generic_with_pending(
+        dir: &TempDir,
+        merge_after_generations: usize,
+        pending: usize,
+    ) -> Arc<RwLock<GenericStore>> {
+        let uri = dir.path().to_string_lossy().to_string();
+        let store = GenericStore::open(
+            &uri,
+            spec(),
+            GenericStoreOptions {
+                merge_after_generations: Some(merge_after_generations),
+                seal_on_add: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        for i in 0..pending {
+            store
+                .add(&[json!({"id": format!("r{i}")}).as_object().unwrap().clone()])
+                .await
+                .unwrap();
+        }
+        assert_eq!(store.pending_wal_generations().await.unwrap(), pending);
+        Arc::new(RwLock::new(store))
+    }
+
+    /// The count trigger is what bounds read amplification between the slower
+    /// time-triggered passes; a generic store at the threshold must merge on a
+    /// flush tick. This is the path #256 added and #257 fixed the locking of.
+    #[tokio::test]
+    async fn generic_merge_if_due_folds_pending_generations_at_threshold() {
+        let dir = TempDir::new().unwrap();
+        let store = generic_with_pending(&dir, 3, 3).await;
+
+        let reclaimed = store.merge_if_due().await.unwrap();
+
+        assert_eq!(reclaimed, 3);
+        assert_eq!(
+            store.read().await.pending_wal_generations().await.unwrap(),
+            0
+        );
+        assert_eq!(store.read().await.count_base_rows().await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn generic_merge_if_due_is_a_noop_below_threshold() {
+        let dir = TempDir::new().unwrap();
+        let store = generic_with_pending(&dir, 5, 2).await;
+
+        assert_eq!(store.merge_if_due().await.unwrap(), 0);
+        assert_eq!(
+            store.read().await.pending_wal_generations().await.unwrap(),
+            2
+        );
+    }
+
+    /// `merge_after_generations = 0` means "count trigger off". It must not be
+    /// read as "threshold 0, merge every tick" — which is what the underlying
+    /// `threshold.max(1)` would do if the zero were passed straight through.
+    #[tokio::test]
+    async fn generic_merge_if_due_respects_disabled_count_trigger() {
+        let dir = TempDir::new().unwrap();
+        let store = generic_with_pending(&dir, 0, 4).await;
+
+        assert_eq!(store.merge_if_due().await.unwrap(), 0);
+        assert_eq!(
+            store.read().await.pending_wal_generations().await.unwrap(),
+            4
+        );
+        // The time trigger is unaffected and still drains everything.
+        assert_eq!(store.merge_wal().await.unwrap(), 4);
+        assert_eq!(
+            store.read().await.pending_wal_generations().await.unwrap(),
+            0
+        );
+    }
+
+    /// The expensive half of a merge must not hold the exclusive lock: a
+    /// concurrent reader takes the shared lock while `prepare` is in flight.
+    /// If `merge_if_due` held the write lock across the read, this would
+    /// deadlock (the reader waits on the merge, the merge holds the lock).
+    #[tokio::test]
+    async fn generic_merge_if_due_does_not_block_readers_during_prepare() {
+        let dir = TempDir::new().unwrap();
+        let store = generic_with_pending(&dir, 3, 3).await;
+
+        // Hold a read lock for the whole merge. With the prepare/commit split,
+        // prepare proceeds under a second shared lock and commit waits only for
+        // this guard to drop; without the split the merge would need the write
+        // lock up front and this test would hang.
+        let reader = store.read().await;
+        let merge = tokio::spawn({
+            let store = store.clone();
+            async move { store.merge_if_due().await }
+        });
+        // Give the merge time to reach the commit phase (it needs the write
+        // lock there), proving prepare completed under the shared lock.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!merge.is_finished(), "commit must wait for the live reader");
+        assert_eq!(reader.pending_wal_generations().await.unwrap(), 3);
+        drop(reader);
+
+        let reclaimed = tokio::time::timeout(Duration::from_secs(30), merge)
+            .await
+            .expect("merge must finish once the reader releases the lock")
+            .unwrap()
+            .unwrap();
+        assert_eq!(reclaimed, 3);
     }
 }

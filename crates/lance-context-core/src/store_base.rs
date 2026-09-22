@@ -804,6 +804,22 @@ impl StorageBase {
         self.prepare_merge_if_ready_inner(threshold, false).await
     }
 
+    /// The shared-lock half of the *count*-triggered merge: prepare only if the
+    /// shard has at least `merge_after_generations` flushed generations pending
+    /// (`0` disables the trigger, so this returns `None`). Same threshold as
+    /// [`Self::maybe_merge_own_shard`], but split so the expensive generation
+    /// read runs under a read lock and only [`Self::commit_prepared_merge`]
+    /// needs the write lock.
+    pub async fn prepare_count_merge(
+        &self,
+    ) -> LanceResult<Option<(ShardManifestStore, ShardManifest, PreparedMerge)>> {
+        if self.merge_after_generations == 0 {
+            return Ok(None);
+        }
+        self.prepare_merge_if_ready_inner(self.merge_after_generations, false)
+            .await
+    }
+
     /// [`Self::prepare_merge_if_ready`], but seals the active memtable *before*
     /// consulting the manifest — the time-triggered (`threshold = 1`) behavior
     /// of [`Self::cleanup_own_shard`]. See that method for why the ordering is

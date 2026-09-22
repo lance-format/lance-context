@@ -272,8 +272,25 @@ pub async fn merge_generic_wal(
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let store = state.get_or_open_generic_store(&name).await?;
-    let mut guard = store.write().await;
-    let reclaimed = guard.cleanup_wal().await.map_err(AppError::from_lance)?;
+    // Same prepare/commit split as the sweeper: the object-storage read of the
+    // generations runs under the shared lock so the store keeps serving.
+    let prepared = {
+        let guard = store.read().await;
+        guard
+            .prepare_cleanup_merge()
+            .await
+            .map_err(AppError::from_lance)?
+    };
+    let reclaimed = match prepared {
+        Some((manifest_store, manifest, prepared)) => {
+            let mut guard = store.write().await;
+            guard
+                .commit_prepared_merge(&manifest_store, &manifest, prepared)
+                .await
+                .map_err(AppError::from_lance)?
+        }
+        None => 0,
+    };
     Ok(Json(serde_json::json!({ "reclaimed": reclaimed })))
 }
 

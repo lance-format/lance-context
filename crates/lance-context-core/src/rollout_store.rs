@@ -636,6 +636,14 @@ impl RolloutStore {
         self.base.prepare_merge_if_ready(threshold).await
     }
 
+    /// The shared-lock half of [`Self::maybe_merge_own_shard`]: `None` unless
+    /// the count trigger is configured and met.
+    pub async fn prepare_count_merge(
+        &self,
+    ) -> LanceResult<Option<(ShardManifestStore, ShardManifest, PreparedMerge)>> {
+        self.base.prepare_count_merge().await
+    }
+
     /// [`Self::prepare_merge_if_ready`], but seals the active memtable first —
     /// the time-triggered behavior of [`Self::cleanup_own_shard`].
     pub async fn prepare_cleanup_merge(

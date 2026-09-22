@@ -389,6 +389,14 @@ impl GenericStore {
         self.base.cleanup_own_shard().await
     }
 
+    /// The shared-lock half of [`Self::maybe_merge_wal`]: `None` unless the
+    /// count trigger is configured and met.
+    pub async fn prepare_count_merge(
+        &self,
+    ) -> LanceResult<Option<(ShardManifestStore, ShardManifest, PreparedMerge)>> {
+        self.base.prepare_count_merge().await
+    }
+
     /// The shared-lock half of [`Self::cleanup_wal`]: seal, then read a
     /// budgeted prefix of flushed generations into memory. Callers holding a
     /// read lock run this while appends continue, then take the write lock
