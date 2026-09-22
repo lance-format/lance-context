@@ -945,8 +945,8 @@ impl AppState {
     /// deferred seal and genuinely depend on this; datagen seals on each append,
     /// so its pass is a no-op in steady state and is kept only for symmetry.
     ///
-    /// For rollout it also runs the count-triggered merge
-    /// ([`RolloutStore::maybe_merge_own_shard`]): the read-amplification bound
+    /// For rollout and generic it also runs the count-triggered merge
+    /// ([`sweeper::Sweepable::merge_if_due`]): the read-amplification bound
     /// that formerly lived on the append path now rides this timer. The heavier
     /// time-based cleanup/merge remains on [`Self::spawn_global_sweeper`].
     ///
@@ -969,15 +969,26 @@ impl AppState {
                 let Some(state) = weak.upgrade() else {
                     return;
                 };
-                sweeper::flush_pass(sweeper::resident(&state.rollout_stores).await, pass_timeout)
-                    .await;
-                // Datagen seals on every append, so its pass is a no-op in
-                // steady state; generic stores default to a deferred seal and
-                // genuinely depend on this.
-                sweeper::flush_pass(sweeper::resident(&state.datagen_stores).await, pass_timeout)
-                    .await;
-                sweeper::flush_pass(sweeper::resident(&state.generic_stores).await, pass_timeout)
-                    .await;
+                // Kinds run concurrently for the same reason the cleanup sweeper
+                // does: this pass now carries the count-triggered merge, so a
+                // slow walk over hundreds of rollout stores must not delay
+                // generic's tick. Datagen seals on every append, so its pass is
+                // a no-op in steady state; generic stores default to a deferred
+                // seal and genuinely depend on this.
+                tokio::join!(
+                    sweeper::flush_pass(
+                        sweeper::resident(&state.rollout_stores).await,
+                        pass_timeout
+                    ),
+                    sweeper::flush_pass(
+                        sweeper::resident(&state.datagen_stores).await,
+                        pass_timeout
+                    ),
+                    sweeper::flush_pass(
+                        sweeper::resident(&state.generic_stores).await,
+                        pass_timeout
+                    ),
+                );
             }
         }))
     }
