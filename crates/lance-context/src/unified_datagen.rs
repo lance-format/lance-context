@@ -38,6 +38,7 @@ impl DatagenStore {
             merge_after_generations: None,
             merge_max_generations: None,
             merge_max_bytes: None,
+            pending_generations_warn: None,
             cleanup_interval_secs: None,
         };
         let store = LocalStore::open_with_options(uri, options)

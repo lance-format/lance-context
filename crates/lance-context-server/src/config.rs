@@ -50,6 +50,18 @@ pub struct ServerConfig {
     #[arg(long, env = "ROLLOUT_MERGE_MAX_BYTES", default_value = "1073741824")]
     pub rollout_merge_max_bytes: usize,
 
+    /// Warn when one MemWAL shard has at least this many flushed generations
+    /// pending merge, sampled on every LSM read of any store kind. Every
+    /// pending generation is a separate dataset a read must open, so this is
+    /// the read-amplification alarm; `0` disables the warn. The
+    /// `rollout_wal_pending_generations` histogram is emitted regardless.
+    #[arg(
+        long,
+        env = "ROLLOUT_WAL_PENDING_WARN_GENERATIONS",
+        default_value = "256"
+    )]
+    pub rollout_wal_pending_warn_generations: usize,
+
     /// Interval, in seconds, for the periodic per-shard WAL cleanup task. When
     /// non-zero, the global sweeper folds this instance's flushed MemWAL
     /// generations into the base table on a schedule — the *time* half of the
@@ -213,6 +225,7 @@ mod tests {
         let config = ServerConfig::try_parse_from(["lance-context-server", "--data-dir", "/tmp/x"])
             .expect("the documented minimal invocation must parse");
         assert_eq!(config.rollout_merge_max_bytes, 1024 * 1024 * 1024);
+        assert_eq!(config.rollout_wal_pending_warn_generations, 256);
         assert_eq!(config.rollout_flush_interval_secs, 30);
         assert_eq!(config.rollout_cleanup_interval_secs, 0);
     }

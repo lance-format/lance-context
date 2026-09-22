@@ -54,6 +54,17 @@ pub const ROLLOUT_WAL_MERGE_DURATION: &str = "rollout_wal_merge_duration_seconds
 /// aborts on the first failing phase, so this also identifies where it died.
 pub const ROLLOUT_WAL_MERGE_ERRORS: &str = "rollout_wal_merge_errors_total";
 
+/// Flushed MemWAL generations pending merge on one shard, sampled once per
+/// shard on every LSM read (`wal_shard_snapshots`). Unlabelled: the store and
+/// shard go on the accompanying `warn!` span, not on the series.
+///
+/// This is the read-amplification signal. Every pending generation is a
+/// separate dataset the read path must open, so a shard whose count climbs into
+/// the hundreds means its owner's merge has stopped keeping up — the failure
+/// that took a worker fleet down at ~12k pending generations across 20 shards
+/// before it was noticed in crash logs.
+pub const ROLLOUT_WAL_PENDING_GENERATIONS: &str = "rollout_wal_pending_generations";
+
 /// Emit a histogram sample in seconds. No-op without the `metrics` feature.
 #[cfg(feature = "metrics")]
 macro_rules! observe_duration {
@@ -66,6 +77,22 @@ macro_rules! observe_duration {
 macro_rules! observe_duration {
     ($name:expr, $elapsed:expr $(, $k:expr => $v:expr)* $(,)?) => {{
         let _ = &$elapsed;
+    }};
+}
+
+/// Emit a histogram sample of a plain value (a count, not a duration). No-op
+/// without the `metrics` feature.
+#[cfg(feature = "metrics")]
+macro_rules! observe_value {
+    ($name:expr, $value:expr $(, $k:expr => $v:expr)* $(,)?) => {
+        ::metrics::histogram!($name $(, $k => $v)*).record($value as f64)
+    };
+}
+
+#[cfg(not(feature = "metrics"))]
+macro_rules! observe_value {
+    ($name:expr, $value:expr $(, $k:expr => $v:expr)* $(,)?) => {{
+        let _ = &$value;
     }};
 }
 
@@ -144,4 +171,6 @@ macro_rules! observe_phase {
     }};
 }
 
-pub(crate) use {count, observe_duration, observe_phase, timer_elapsed, timer_start};
+pub(crate) use {
+    count, observe_duration, observe_phase, observe_value, timer_elapsed, timer_start,
+};

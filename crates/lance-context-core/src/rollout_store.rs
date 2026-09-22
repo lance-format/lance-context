@@ -383,6 +383,11 @@ pub struct RolloutStoreOptions {
     /// reaches the budget, or the generation-count cap, whichever comes first.
     /// A generation is indivisible, so even an oversized one is fully merged.
     pub merge_max_bytes: Option<usize>,
+    /// Warn when one MemWAL shard has at least this many flushed generations
+    /// pending merge, sampled on every read. `None` uses the crate default
+    /// (256); `Some(0)` disables the warn. The `rollout_wal_pending_generations`
+    /// histogram is emitted regardless.
+    pub pending_generations_warn: Option<usize>,
     /// Shared Lance [`Session`] used to open this store's base dataset (and,
     /// transitively, every flushed MemWAL generation it reads — those inherit
     /// the base dataset's session).
@@ -469,6 +474,7 @@ impl RolloutStore {
             merge_after_generations,
             merge_max_generations,
             merge_max_bytes,
+            pending_generations_warn,
             session,
         } = options;
         let mut base = StorageBase::open(
@@ -479,6 +485,7 @@ impl RolloutStore {
                 merge_after_generations,
                 merge_max_generations,
                 merge_max_bytes,
+                pending_generations_warn,
                 session,
                 schema: Arc::new(rollout_schema()),
                 key_column: "id".to_string(),
@@ -2487,6 +2494,7 @@ mod tests {
                     merge_after_generations: None,
                     merge_max_generations: None,
                     merge_max_bytes: None,
+                    pending_generations_warn: None,
                     session: None,
                     schema: legacy_schema.clone(),
                     key_column: "id".to_string(),
@@ -2806,6 +2814,7 @@ mod tests {
                     merge_after_generations: Some(0),
                     merge_max_generations: None,
                     merge_max_bytes: None,
+                    pending_generations_warn: None,
                 },
             )
             .await
@@ -2850,6 +2859,7 @@ mod tests {
                 merge_after_generations: None,
                 merge_max_generations: None,
                 merge_max_bytes: None,
+                pending_generations_warn: None,
             };
 
             {
@@ -2899,6 +2909,7 @@ mod tests {
                     merge_after_generations: None,
                     merge_max_generations: None,
                     merge_max_bytes: None,
+                    pending_generations_warn: None,
                 },
             )
             .await
@@ -2950,6 +2961,7 @@ mod tests {
                 merge_after_generations: None,
                 merge_max_generations: None,
                 merge_max_bytes: None,
+                pending_generations_warn: None,
             };
 
             let instance_a = RolloutStore::open_with_options(&uri, options("rollout-0"))
@@ -3171,6 +3183,7 @@ mod tests {
                     merge_after_generations: Some(1),
                     merge_max_generations: None,
                     merge_max_bytes: None,
+                    pending_generations_warn: None,
                     ..Default::default()
                 },
             )
@@ -3233,6 +3246,7 @@ mod tests {
                     merge_after_generations: Some(1),
                     merge_max_generations: None,
                     merge_max_bytes: None,
+                    pending_generations_warn: None,
                     ..Default::default()
                 },
             )
@@ -3333,6 +3347,7 @@ mod tests {
                     merge_after_generations: None, // no merge → epoch never reclaimed
                     merge_max_generations: None,
                     merge_max_bytes: None,
+                    pending_generations_warn: None,
                 },
             )
             .await
@@ -3391,6 +3406,7 @@ mod tests {
                     merge_after_generations: Some(1),
                     merge_max_generations: None,
                     merge_max_bytes: None,
+                    pending_generations_warn: None,
                 },
             )
             .await
@@ -3430,6 +3446,7 @@ mod tests {
                     merge_after_generations: None,
                     merge_max_generations: None,
                     merge_max_bytes: None,
+                    pending_generations_warn: None,
                 },
             )
             .await
@@ -3566,6 +3583,7 @@ mod tests {
                     merge_after_generations: Some(1),
                     merge_max_generations: None,
                     merge_max_bytes: None,
+                    pending_generations_warn: None,
                 },
             )
             .await
@@ -3652,6 +3670,7 @@ mod tests {
                     merge_after_generations: Some(1),
                     merge_max_generations: None,
                     merge_max_bytes: None,
+                    pending_generations_warn: None,
                 },
             )
             .await
@@ -3699,6 +3718,7 @@ mod tests {
                     merge_after_generations: Some(1),
                     merge_max_generations: None,
                     merge_max_bytes: None,
+                    pending_generations_warn: None,
                 },
             )
             .await
@@ -3768,6 +3788,7 @@ mod tests {
                     merge_after_generations: Some(3),
                     merge_max_generations: None,
                     merge_max_bytes: None,
+                    pending_generations_warn: None,
                 },
             )
             .await
@@ -3805,6 +3826,7 @@ mod tests {
                     merge_after_generations: Some(3),
                     merge_max_generations: None,
                     merge_max_bytes: None,
+                    pending_generations_warn: None,
                 },
             )
             .await
@@ -3863,6 +3885,7 @@ mod tests {
                         merge_after_generations: Some(2),
                         merge_max_generations: None,
                         merge_max_bytes: None,
+                        pending_generations_warn: None,
                     },
                 )
                 .await
@@ -3904,6 +3927,7 @@ mod tests {
                     merge_after_generations: None, // count trigger off
                     merge_max_generations: None,
                     merge_max_bytes: None,
+                    pending_generations_warn: None,
                 },
             )
             .await
@@ -4403,6 +4427,7 @@ mod tests {
                     merge_after_generations: Some(1),
                     merge_max_generations: None,
                     merge_max_bytes: None,
+                    pending_generations_warn: None,
                     ..Default::default()
                 },
             )
@@ -4501,6 +4526,7 @@ mod tests {
                     merge_after_generations: None, // disabled
                     merge_max_generations: None,
                     merge_max_bytes: None,
+                    pending_generations_warn: None,
                 },
             )
             .await
@@ -4533,6 +4559,7 @@ mod tests {
                     merge_after_generations: Some(1),
                     merge_max_generations: None,
                     merge_max_bytes: None,
+                    pending_generations_warn: None,
                 },
             )
             .await

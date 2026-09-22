@@ -59,6 +59,7 @@ pub async fn create_generic_store(
         merge_after_generations: None,
         merge_max_generations: Some(state.rollout_merge_max_generations),
         merge_max_bytes: Some(state.rollout_merge_max_bytes),
+        pending_generations_warn: Some(state.rollout_wal_pending_warn_generations),
         session: None,
         seal_on_add: req.seal_on_add,
     };

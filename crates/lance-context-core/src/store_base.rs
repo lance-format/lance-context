@@ -67,7 +67,9 @@ use lance_index::IndexType;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::metrics::{count, observe_duration, observe_phase, timer_elapsed, timer_start};
+use crate::metrics::{
+    count, observe_duration, observe_phase, observe_value, timer_elapsed, timer_start,
+};
 use crate::store::{CompactionConfig, CompactionStats};
 
 /// Number of shard manifest files to scan per batch when discovering the latest
@@ -96,6 +98,14 @@ pub(crate) const DEFAULT_MERGE_MAX_GENERATIONS: usize = 8;
 
 /// Buffered Arrow array bytes per merge pass, checked at generation boundaries.
 pub(crate) const DEFAULT_MERGE_MAX_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Default per-shard pending-generation count at which an LSM read warns.
+///
+/// Sized well above the count trigger (`merge_after_generations`, 50 in the
+/// reference deployment) and the per-pass cap (`merge_max_generations`, 8), so a
+/// healthy store never trips it, while sitting far below the counts that make a
+/// read unaffordable: at ~1,500 per shard, reads exhausted a 32 GiB worker.
+pub(crate) const DEFAULT_PENDING_GENERATIONS_WARN: usize = 256;
 
 /// Execute only the first `max_source_fragments` from a Lance compaction plan.
 ///
@@ -226,6 +236,10 @@ pub(crate) struct StorageBaseOptions {
     /// reaches the budget, or the generation-count cap, whichever comes first.
     /// A generation is indivisible, so even an oversized one is fully merged.
     pub merge_max_bytes: Option<usize>,
+    /// Warn when a single shard has at least this many flushed generations
+    /// pending merge (sampled on every LSM read). `None` uses the crate default
+    /// (256); `Some(0)` disables the warning. The metric is always emitted.
+    pub pending_generations_warn: Option<usize>,
     /// Shared, capacity-bounded Lance session. `None` preserves Lance's
     /// per-open default (a fresh 6 GiB index + 1 GiB metadata session *per
     /// store*, which is the source of unbounded per-append RSS growth).
@@ -287,6 +301,8 @@ pub(crate) struct StorageBase {
     merge_after_generations: usize,
     merge_max_generations: usize,
     merge_max_bytes: usize,
+    /// Per-shard pending-generation count at which reads warn; `0` disables.
+    pending_generations_warn: usize,
     /// Timestamp of the last successful [`Self::compact`] on this handle.
     last_compaction: Option<DateTime<Utc>>,
     /// Number of successful compactions performed by this handle.
@@ -343,6 +359,7 @@ impl StorageBase {
             merge_after_generations,
             merge_max_generations,
             merge_max_bytes,
+            pending_generations_warn,
             session,
             schema,
             key_column,
@@ -373,6 +390,7 @@ impl StorageBase {
                 merge_after_generations,
                 merge_max_generations,
                 merge_max_bytes,
+                pending_generations_warn,
                 session,
                 schema,
                 key_column,
@@ -397,6 +415,7 @@ impl StorageBase {
             merge_after_generations,
             merge_max_generations,
             merge_max_bytes,
+            pending_generations_warn,
             session,
             schema,
             key_column,
@@ -422,6 +441,8 @@ impl StorageBase {
             merge_after_generations: merge_after_generations.unwrap_or(0),
             merge_max_generations: merge_max_generations.unwrap_or(DEFAULT_MERGE_MAX_GENERATIONS),
             merge_max_bytes: merge_max_bytes.unwrap_or(DEFAULT_MERGE_MAX_BYTES),
+            pending_generations_warn: pending_generations_warn
+                .unwrap_or(DEFAULT_PENDING_GENERATIONS_WARN),
             last_compaction: None,
             total_compactions: 0,
             last_compaction_error: None,
@@ -1386,11 +1407,14 @@ impl StorageBase {
         let object_store = self.dataset.object_store(None).await?;
         let branch_path = self.dataset.branch_location().path.clone();
         let shard_ids = self.dataset.list_mem_wal_latest_shard_ids().await?;
+        let warn_at = self.pending_generations_warn;
+        let uri: Arc<str> = Arc::from(self.dataset.uri());
 
         let snapshots: Vec<Option<ShardSnapshot>> = stream::iter(shard_ids)
             .map(|shard_id| {
                 let object_store = object_store.clone();
                 let branch_path = branch_path.clone();
+                let uri = uri.clone();
                 async move {
                     let manifest_store = ShardManifestStore::new(
                         object_store,
@@ -1401,6 +1425,21 @@ impl StorageBase {
                     let Some(manifest) = manifest_store.read_latest().await? else {
                         return Ok(None);
                     };
+                    let pending = manifest.flushed_generations.len();
+                    observe_value!(crate::metrics::ROLLOUT_WAL_PENDING_GENERATIONS, pending);
+                    if warn_at != 0 && pending >= warn_at {
+                        // Every pending generation is one more dataset this read
+                        // must open; past this point the shard's owner has stopped
+                        // keeping up and reads are on their way to exhausting memory.
+                        warn!(
+                            uri = %uri,
+                            shard = %shard_id,
+                            pending,
+                            warn_at,
+                            "MemWAL shard has many flushed generations pending merge; \
+                             reads open every one of them"
+                        );
+                    }
                     let mut snapshot = ShardSnapshot::new(shard_id)
                         .with_spec_id(manifest.shard_spec_id)
                         .with_current_generation(manifest.current_generation);

@@ -71,6 +71,12 @@ pub struct GenericStoreOptions {
     /// reaches the budget, or the generation-count cap, whichever comes first.
     /// A generation is indivisible, so even an oversized one is fully merged.
     pub merge_max_bytes: Option<usize>,
+    /// Warn when one MemWAL shard has at least this many flushed generations
+    /// pending merge, sampled on every read. Every pending generation is a
+    /// separate dataset a read must open, so this is the read-amplification
+    /// alarm. `None` uses the crate default (256); `Some(0)` disables the warn.
+    /// The `rollout_wal_pending_generations` histogram is emitted regardless.
+    pub pending_generations_warn: Option<usize>,
     /// Shared, capacity-bounded Lance session.
     pub session: Option<Arc<Session>>,
     /// Whether [`GenericStore::add`] seals before returning, making the rows it
@@ -174,6 +180,7 @@ impl GenericStore {
                 merge_after_generations: options.merge_after_generations,
                 merge_max_generations: options.merge_max_generations,
                 merge_max_bytes: options.merge_max_bytes,
+                pending_generations_warn: options.pending_generations_warn,
                 session: options.session,
                 schema: create_schema,
                 // Always `id`: the LSM merge key, which `SchemaSpec::validate`
@@ -792,6 +799,54 @@ mod tests {
             assert_eq!(store.count_base_rows().await.unwrap(), 3);
             assert_eq!(store.list(None, None).await.unwrap().len(), 3);
         });
+    }
+
+    /// Every LSM read samples each shard's pending-generation count. This is
+    /// the signal that would have caught a store at 12k pending generations
+    /// days before it OOMKilled its readers, so a read must emit it.
+    #[test]
+    fn reads_sample_pending_generations_per_shard() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use metrics_util::MetricKind;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let store = GenericStore::open(&uri, spec(), sealing()).await.unwrap();
+                // Three sealed adds leave three flushed generations pending on
+                // this instance's single shard.
+                for i in 0..3 {
+                    store
+                        .add(&[row(json!({"id": format!("r{i}")}))])
+                        .await
+                        .unwrap();
+                }
+                store.list(None, None).await.unwrap();
+            });
+        });
+
+        let samples: Vec<f64> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(key, _, _, _)| {
+                key.kind() == MetricKind::Histogram
+                    && key.key().name() == crate::metrics::ROLLOUT_WAL_PENDING_GENERATIONS
+            })
+            .flat_map(|(_, _, _, value)| match value {
+                DebugValue::Histogram(v) => v.into_iter().map(|s| s.into_inner()).collect(),
+                _ => Vec::new(),
+            })
+            .collect();
+        assert!(
+            samples.contains(&3.0),
+            "a read must sample the shard's 3 pending generations; got {samples:?}"
+        );
     }
 
     #[test]

@@ -62,6 +62,15 @@ const JOB_LATENCY_METRICS: &[&str] = &[
     "rollout_wal_merge_lock_wait_seconds",
 ];
 
+/// Buckets (upper bounds, generation counts) for `rollout_wal_pending_generations`.
+///
+/// Powers of two from the per-pass merge cap (8) up past the point where a read
+/// is unaffordable (~1,500 per shard exhausted a 32 GiB worker), so both the
+/// healthy band and the runaway band resolve. 9 buckets, same cardinality
+/// reasoning as [`REQUEST_LATENCY_BUCKETS`].
+const PENDING_GENERATIONS_BUCKETS: &[f64] =
+    &[8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 4096.0];
+
 /// Handle used to render the Prometheus exposition text on demand, plus a
 /// process-resource collector that is refreshed on each scrape.
 #[derive(Clone)]
@@ -92,6 +101,12 @@ pub fn install_recorder() -> MetricsHandle {
             .set_buckets_for_metric(Matcher::Full((*name).to_string()), JOB_LATENCY_BUCKETS)
             .expect("job latency buckets are non-empty");
     }
+    builder = builder
+        .set_buckets_for_metric(
+            Matcher::Full("rollout_wal_pending_generations".to_string()),
+            PENDING_GENERATIONS_BUCKETS,
+        )
+        .expect("pending generation buckets are non-empty");
     let prometheus = builder
         .install_recorder()
         .expect("failed to install Prometheus recorder");
