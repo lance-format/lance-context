@@ -83,3 +83,10 @@ def server() -> Iterator[str]:
                     proc.wait(timeout=10)
                 log.seek(0)
                 print(log.read().decode(errors="replace"))
+                if os.name == "posix":
+                    # Popen.terminate sends SIGTERM on POSIX. A clean exit
+                    # proves the server reached its graceful-shutdown path.
+                    assert proc.returncode == 0, (
+                        "server did not handle SIGTERM gracefully "
+                        f"(exit code {proc.returncode})"
+                    )
