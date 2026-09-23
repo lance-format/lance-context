@@ -13,10 +13,13 @@ use std::time::Duration;
 
 use chrono::Utc;
 use futures::stream::{self, StreamExt};
-use lance_context_core::{CompactionConfig, RolloutStore, RolloutStoreOptions};
+use lance_context_core::{
+    CompactionConfig, GenericStore, GenericStoreOptions, RolloutStore, RolloutStoreOptions,
+};
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
+use crate::scheduler::generic_target;
 use crate::state::MasterState;
 use crate::stats_store::StatRow;
 use lance_context_api::ExperimentSummary;
@@ -176,7 +179,37 @@ async fn try_scan_once(state: &Arc<MasterState>, maintain: bool) -> lance::Resul
 
 async fn scan_once_inner(state: &Arc<MasterState>) -> lance::Result<usize> {
     let scan_start = std::time::Instant::now();
-    let entries = state.registry.write().await.list().await?;
+    // Rollout experiments under their bare name; generic stores under the
+    // `generic:` task-target prefix, so they occupy distinct rows and the
+    // WAL-merge sweep enqueues them as generic tasks. Their MemWAL merges
+    // depend on this: the sweep reads nothing but this table.
+    let mut entries: Vec<ScanEntry> = state
+        .registry
+        .write()
+        .await
+        .list()
+        .await?
+        .into_iter()
+        .map(|e| ScanEntry {
+            name: e.name,
+            uri: e.uri,
+            kind: ScanKind::Rollout,
+        })
+        .collect();
+    entries.extend(
+        state
+            .generic_registry
+            .write()
+            .await
+            .list()
+            .await?
+            .into_iter()
+            .map(|e| ScanEntry {
+                name: generic_target(&e.name),
+                uri: e.uri,
+                kind: ScanKind::Generic,
+            }),
+    );
     let live: HashSet<String> = entries.iter().map(|e| e.name.clone()).collect();
     let concurrency = state.config.scan_concurrency.max(1);
 
@@ -196,6 +229,7 @@ async fn scan_once_inner(state: &Arc<MasterState>) -> lance::Result<usize> {
     };
     let previous = Arc::new(previous);
     let rollout_options = state.rollout_store_options();
+    let generic_options = state.generic_store_options();
 
     // Observe experiments concurrently (bounded). `None` means this round could
     // not observe that experiment; its previous row is carried over below
@@ -204,9 +238,18 @@ async fn scan_once_inner(state: &Arc<MasterState>) -> lance::Result<usize> {
         .map(|entry| {
             let previous = previous.clone();
             let rollout_options = rollout_options.clone();
+            let generic_options = generic_options.clone();
             async move {
                 let prev = previous.get(&entry.name);
-                match observe_one(&entry.name, &entry.uri, prev, rollout_options).await {
+                let observed = match entry.kind {
+                    ScanKind::Rollout => {
+                        observe_one(&entry.name, &entry.uri, prev, rollout_options).await
+                    }
+                    ScanKind::Generic => {
+                        observe_generic(&entry.name, &entry.uri, prev, generic_options).await
+                    }
+                };
+                match observed {
                     Ok(result) => (entry.name, Some(result)),
                     Err(e) => {
                         tracing::warn!(store = %entry.name, error = %e, "scan: observe failed");
@@ -271,8 +314,15 @@ async fn scan_once_inner(state: &Arc<MasterState>) -> lance::Result<usize> {
     // is equivalent and keeps the critical section to one commit.
     let retire_after = Duration::from_secs(state.config.stats_cold_retire_secs);
     let retire_start = std::time::Instant::now();
+    // Retirement opens each row through the rollout store; generic rows are
+    // observed only, never retired by the master.
+    let rollout_rows: Vec<StatRow> = snapshot
+        .iter()
+        .filter(|row| !row.name.starts_with("generic:"))
+        .cloned()
+        .collect();
     let retired = retire_cold_experiments(
-        &snapshot,
+        &rollout_rows,
         retire_after,
         Utc::now().timestamp_millis(),
         state.rollout_store_options(),
@@ -373,6 +423,90 @@ async fn scan_once_inner(state: &Arc<MasterState>) -> lance::Result<usize> {
 /// rows, and a `count_rows` over the base table. At tens of thousands of
 /// experiments, almost all of them cold, that is the difference between a scan
 /// that finishes inside its interval and one that never does.
+/// Which registry a scan entry came from, which decides how it is opened.
+#[derive(Debug, Clone, Copy)]
+enum ScanKind {
+    Rollout,
+    Generic,
+}
+
+/// One store to observe this round. `name` is the stats-row / task-target
+/// name (prefixed for generic stores); `uri` is the physical dataset.
+struct ScanEntry {
+    name: String,
+    uri: String,
+    kind: ScanKind,
+}
+
+/// Observe one generic store. Only the fields the WAL-merge sweep and the UI
+/// need: version (for the skip-if-unchanged shortcut), base row count,
+/// fragment count and pending MemWAL generations. Compaction counters stay at
+/// their carried-over values because the master does not compact generic
+/// stores.
+async fn observe_generic(
+    name: &str,
+    uri: &str,
+    previous: Option<&StatRow>,
+    options: GenericStoreOptions,
+) -> lance::Result<(StatRow, bool)> {
+    let open = GenericStore::open_existing(uri, options);
+    let store = match tokio::time::timeout(OBSERVE_TIMEOUT, open).await {
+        Ok(Ok(store)) => store,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            return Err(lance::Error::io(format!(
+                "open timed out for store '{name}'"
+            )))
+        }
+    };
+
+    let current_version = store.version() as i64;
+    if let Some(prev) = previous {
+        if prev.version != StatRow::UNKNOWN_VERSION && prev.version == current_version {
+            let mut row = prev.clone();
+            row.uri = uri.to_string();
+            row.scanned_at = Utc::now().timestamp_millis();
+            return Ok((row, true));
+        }
+    }
+
+    let observe = async {
+        let pending = store.pending_wal_generations().await?;
+        let rows = store.count_base_rows().await?;
+        Ok::<_, lance::Error>((pending, rows))
+    };
+    let (pending, rows) = match tokio::time::timeout(OBSERVE_TIMEOUT, observe).await {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            return Err(lance::Error::io(format!(
+                "observe timed out for store '{name}'"
+            )));
+        }
+    };
+    let compaction = store.compaction_stats();
+    let (last_compaction, total_compactions) = previous
+        .map_or((StatRow::NO_COMPACTION, 0), |prev| {
+            (prev.last_compaction, prev.total_compactions)
+        });
+
+    Ok((
+        StatRow {
+            name: name.to_string(),
+            uri: uri.to_string(),
+            row_count: rows as i64,
+            fragment_count: compaction.total_fragments as i64,
+            last_updated: Utc::now().timestamp_millis(),
+            pending_wal_generations: pending as i64,
+            last_compaction,
+            total_compactions,
+            scanned_at: Utc::now().timestamp_millis(),
+            version: current_version,
+        },
+        false,
+    ))
+}
+
 async fn observe_one(
     name: &str,
     uri: &str,
@@ -791,6 +925,65 @@ mod incremental_scan_tests {
             second.scanned_at >= first.scanned_at,
             "a skipped row still refreshes scanned_at so staleness stays visible"
         );
+    }
+
+    /// A generic store's pending MemWAL generations are observed and written
+    /// under its `generic:` target name. This is the row the WAL-merge sweep
+    /// reads; without it the master never schedules a generic store's merge
+    /// and 20 workers race to commit into its base table on their own timers.
+    #[tokio::test]
+    async fn generic_store_is_observed_with_pending_wal() {
+        use lance_context_api::{ColumnSpec, ColumnType, SchemaSpec, ID_COLUMN};
+        use lance_context_core::{GenericStore, GenericStoreOptions};
+
+        let dir = TempDir::new().unwrap();
+        let uri = dir
+            .path()
+            .join("g.generic.lance")
+            .to_string_lossy()
+            .to_string();
+        let spec = SchemaSpec::new(vec![(
+            ID_COLUMN.to_string(),
+            ColumnSpec::required(ColumnType::String { large: false }),
+        )]);
+        {
+            let store = GenericStore::open(
+                &uri,
+                spec,
+                GenericStoreOptions {
+                    seal_on_add: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            for i in 0..3 {
+                store
+                    .add(&[serde_json::json!({"id": format!("r{i}")})
+                        .as_object()
+                        .unwrap()
+                        .clone()])
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let name = generic_target("g");
+        let (row, skipped) = observe_generic(&name, &uri, None, GenericStoreOptions::default())
+            .await
+            .unwrap();
+        assert!(!skipped);
+        assert_eq!(row.name, "generic:g");
+        assert_eq!(row.pending_wal_generations, 3);
+        assert_ne!(row.version, StatRow::UNKNOWN_VERSION);
+
+        // Unchanged version: skipped like rollout, row reused.
+        let (again, skipped) =
+            observe_generic(&name, &uri, Some(&row), GenericStoreOptions::default())
+                .await
+                .unwrap();
+        assert!(skipped);
+        assert_eq!(again.pending_wal_generations, 3);
     }
 
     /// A write moves the base version, so the next scan must observe fully and
