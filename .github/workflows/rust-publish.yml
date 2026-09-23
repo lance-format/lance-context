@@ -7,6 +7,8 @@ on:
   pull_request:
     paths:
       - .github/workflows/rust-publish.yml
+      - Cargo.toml
+      - crates/**/Cargo.toml
   workflow_dispatch:
     inputs:
       mode:
@@ -45,6 +47,31 @@ jobs:
           cache: false
 
       - uses: rui314/setup-mold@v1
+
+      - name: Validate registry metadata
+        run: |
+          python3 - <<'PY'
+          import json
+          import subprocess
+
+          metadata = json.loads(
+              subprocess.check_output(
+                  ["cargo", "metadata", "--no-deps", "--format-version", "1", "--locked"],
+                  text=True,
+              )
+          )
+          errors = []
+          for package in metadata["packages"]:
+              if package["publish"] == []:
+                  continue
+              if not (package.get("description") or "").strip():
+                  errors.append(f"{package['name']}: missing description")
+              if not package.get("license") and not package.get("license_file"):
+                  errors.append(f"{package['name']}: missing license or license-file")
+          if errors:
+              raise SystemExit("\n".join(errors))
+          print("All publishable crates have the required registry metadata")
+          PY
 
       - name: Validate Rust crate packages
         if: github.event_name == 'pull_request'

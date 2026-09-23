@@ -1,6 +1,7 @@
 [package]
 name = "lance-context-metrics"
 version = "0.1.0"
+description = "Shared Prometheus metrics and HTTP instrumentation for lance-context"
 edition.workspace = true
 license.workspace = true
 
