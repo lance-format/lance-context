@@ -44,6 +44,35 @@ use crate::task_store::{TaskClaim, TaskKinds};
 /// anything still over the threshold is picked up by the next tick.
 const MAX_SWEEP_ENQUEUE: usize = 256;
 
+/// Task-target prefix marking a generic store. Store names match
+/// `[A-Za-z0-9_][A-Za-z0-9._-]*`, so a `:` can never appear in a bare name
+/// and the prefix is unambiguous. Carrying the kind in the target string --
+/// rather than adding a field to `TaskRecord` -- keeps the etcd task schema,
+/// dedupe keys and per-target locks exactly as they are: a generic store's
+/// MergeWal is locked and de-duped under `generic:<name>`, so it can never
+/// collide with a rollout experiment of the same name.
+const GENERIC_TARGET_PREFIX: &str = "generic:";
+
+/// Which store kind a task target names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoreKind {
+    Rollout,
+    Generic,
+}
+
+/// Split a task target into its store kind and bare name.
+fn parse_target(target: &str) -> (StoreKind, &str) {
+    match target.strip_prefix(GENERIC_TARGET_PREFIX) {
+        Some(name) => (StoreKind::Generic, name),
+        None => (StoreKind::Rollout, target),
+    }
+}
+
+/// Build the task target for a generic store.
+pub(crate) fn generic_target(name: &str) -> String {
+    format!("{GENERIC_TARGET_PREFIX}{name}")
+}
+
 fn kind_label(kind: TaskKind) -> &'static str {
     match kind {
         TaskKind::Compact => "compact",
@@ -141,7 +170,14 @@ async fn run_task(state: &Arc<MasterState>, claim: TaskClaim, timing: TaskClaimT
 
 /// Compact one experiment. The task-store claim owns the per-experiment write
 /// lock for the full execution.
-async fn run_compaction(state: &Arc<MasterState>, name: &str) -> Result<String, String> {
+async fn run_compaction(state: &Arc<MasterState>, target: &str) -> Result<String, String> {
+    let (kind, name) = parse_target(target);
+    if kind != StoreKind::Rollout {
+        // Base-table compaction of generic stores is not scheduled by the
+        // master yet; only WAL merges are. Refuse rather than open the store
+        // through the rollout code path with the wrong URI and schema.
+        return Err(format!("compaction is not scheduled for {kind:?} stores"));
+    }
     compact_inner(state, name).await
 }
 
@@ -149,7 +185,11 @@ async fn run_compaction(state: &Arc<MasterState>, name: &str) -> Result<String, 
 /// per-name base-table write gate with [`run_compaction`] so an `IndexId` and a
 /// `Compact` for the same experiment never commit concurrently (`CreateIndex`
 /// vs `Rewrite` can conflict). Distinct experiments index concurrently.
-async fn run_index_id(state: &Arc<MasterState>, name: &str) -> Result<String, String> {
+async fn run_index_id(state: &Arc<MasterState>, target: &str) -> Result<String, String> {
+    let (kind, name) = parse_target(target);
+    if kind != StoreKind::Rollout {
+        return Err(format!("id indexing is not scheduled for {kind:?} stores"));
+    }
     index_id_inner(state, name).await
 }
 
@@ -199,19 +239,25 @@ struct MergeWalReply {
 /// its own shard; a worker that owns no data for `name` reports 0 (or 404, which
 /// we tolerate). Succeeds if at least one endpoint responded; fails only when
 /// there are no endpoints or every one errored.
-async fn run_merge_wal(state: &Arc<MasterState>, name: &str) -> Result<String, String> {
+async fn run_merge_wal(state: &Arc<MasterState>, target: &str) -> Result<String, String> {
     let endpoints = &state.config.worker_endpoints;
     if endpoints.is_empty() {
         return Err("no worker endpoints configured (--worker-endpoints)".to_string());
     }
+    let (kind, name) = parse_target(target);
+    let route = match kind {
+        StoreKind::Rollout => "api/v1/internal/merge-wal",
+        StoreKind::Generic => "api/v1/generic",
+    };
 
     let calls = endpoints.iter().map(|ep| {
         let http = state.http.clone();
-        let url = format!(
-            "{}/api/v1/internal/merge-wal/{}",
-            ep.trim_end_matches('/'),
-            name
-        );
+        let url = match kind {
+            StoreKind::Rollout => format!("{}/{}/{}", ep.trim_end_matches('/'), route, name),
+            StoreKind::Generic => {
+                format!("{}/{}/{}/merge-wal", ep.trim_end_matches('/'), route, name)
+            }
+        };
         async move {
             // Per-worker timing: `join_all` means the slowest worker sets the
             // whole task's latency, so without this one straggler is
@@ -236,7 +282,18 @@ async fn run_merge_wal(state: &Arc<MasterState>, name: &str) -> Result<String, S
         }
     });
 
-    let results = futures::future::join_all(calls).await;
+    // Serial, not `join_all`: every worker's merge commits a new version of
+    // the *same* base table, and Lance's commit-conflict retry gives up after
+    // 30s of wall clock. Fanning out to 20 workers at once is 20 writers
+    // racing one commit point -- on a throttled object store the retries
+    // cannot complete in time and most of them fail with "Too many concurrent
+    // writers". The etcd target lock already guarantees one MergeWal task per
+    // store; this makes the task itself one writer at a time, which is the
+    // whole point of routing merges through the master.
+    let mut results = Vec::with_capacity(endpoints.len());
+    for call in calls {
+        results.push(call.await);
+    }
     let total_workers = results.len();
     let mut reclaimed = 0usize;
     let mut ok_workers = 0usize;
@@ -390,6 +447,12 @@ async fn sweep_candidates_inner(state: &Arc<MasterState>) -> lance::Result<usize
         .await?;
     let mut queued = 0;
     for row in rows {
+        // Generic rows share the stats table (their name carries the
+        // `generic:` prefix) so the WAL-merge sweep sees them; compaction of
+        // generic stores is not master-scheduled, so they are skipped here.
+        if parse_target(&row.name).0 != StoreKind::Rollout {
+            continue;
+        }
         enqueue(state, TaskKind::Compact, &row.name).await?;
         queued += 1;
     }
@@ -809,6 +872,153 @@ mod tests {
         worker.abort();
     }
 
+    /// A generic-store MergeWal task fans out to the generic route on each
+    /// worker, not the rollout one. Targets carry the kind as a prefix so the
+    /// etcd task schema is unchanged.
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn merge_wal_routes_generic_targets_to_the_generic_endpoint() {
+        use axum::{extract::Path, routing::post, Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let rollout_hits = Arc::new(AtomicUsize::new(0));
+        let generic_hits = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/api/v1/internal/merge-wal/{name}", {
+                let hits = rollout_hits.clone();
+                post(move |Path(_name): Path<String>| async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({ "reclaimed": 1 }))
+                })
+            })
+            .route("/api/v1/generic/{name}/merge-wal", {
+                let hits = generic_hits.clone();
+                post(move |Path(name): Path<String>| async move {
+                    assert_eq!(
+                        name, "gs",
+                        "the bare name reaches the worker, not the prefix"
+                    );
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({ "reclaimed": 4 }))
+                })
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.worker_endpoints = vec![format!("http://{addr}")];
+        let state = MasterState::new(cfg).await.unwrap();
+        let worker = spawn_scheduler(&state);
+
+        let rec = enqueue(&state, TaskKind::MergeWal, &generic_target("gs"))
+            .await
+            .unwrap();
+        let status = await_terminal(&state, &rec.id).await;
+        assert_eq!(status.state, TaskState::Done, "got {status:?}");
+        assert!(status.detail.unwrap().contains("merged 4 generations"));
+        assert_eq!(generic_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(rollout_hits.load(Ordering::SeqCst), 0);
+        worker.abort();
+    }
+
+    /// Workers are called one at a time. Every worker's merge commits to the
+    /// same base table and Lance's commit-conflict retry gives up after 30s, so
+    /// concurrent fan-out is N writers racing one commit point -- the failure
+    /// the master exists to prevent.
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn merge_wal_calls_workers_serially() {
+        use axum::{routing::post, Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Each stub records the max number of in-flight calls it observed
+        // across the fleet through a shared counter.
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let max_inflight = Arc::new(AtomicUsize::new(0));
+        async fn spawn_stub(inflight: Arc<AtomicUsize>, max_inflight: Arc<AtomicUsize>) -> String {
+            let app = Router::new().route(
+                "/api/v1/internal/merge-wal/{name}",
+                post(move || {
+                    let inflight = inflight.clone();
+                    let max_inflight = max_inflight.clone();
+                    async move {
+                        let now = inflight.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_inflight.fetch_max(now, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+                        inflight.fetch_sub(1, Ordering::SeqCst);
+                        Json(serde_json::json!({ "reclaimed": 1 }))
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            format!("http://{addr}")
+        }
+
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.worker_endpoints = vec![
+            spawn_stub(inflight.clone(), max_inflight.clone()).await,
+            spawn_stub(inflight.clone(), max_inflight.clone()).await,
+            spawn_stub(inflight.clone(), max_inflight.clone()).await,
+        ];
+        let state = MasterState::new(cfg).await.unwrap();
+        let worker = spawn_scheduler(&state);
+
+        let rec = enqueue(&state, TaskKind::MergeWal, "exp").await.unwrap();
+        let status = await_terminal(&state, &rec.id).await;
+        assert_eq!(status.state, TaskState::Done, "got {status:?}");
+        assert!(status.detail.unwrap().contains("3/3 workers"));
+        assert_eq!(
+            max_inflight.load(Ordering::SeqCst),
+            1,
+            "fan-out must never have more than one worker merging at a time"
+        );
+        worker.abort();
+    }
+
+    /// The compaction sweep must not enqueue generic rows: the master does not
+    /// compact generic stores, and `run_compaction` would otherwise open the
+    /// wrong URI through the rollout code path.
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn compaction_sweep_skips_generic_rows() {
+        use crate::stats_store::StatRow;
+
+        let dir = TempDir::new().unwrap();
+        let state = MasterState::new(config(&dir)).await.unwrap();
+        let seed = |name: String, uri: String| StatRow {
+            version: StatRow::UNKNOWN_VERSION,
+            name,
+            uri,
+            row_count: 0,
+            fragment_count: 50,
+            last_updated: 0,
+            pending_wal_generations: 0,
+            last_compaction: StatRow::NO_COMPACTION,
+            total_compactions: 0,
+            scanned_at: 0,
+        };
+        {
+            let mut stats = state.stats.lock().await;
+            stats
+                .upsert(&seed("r".to_string(), state.rollout_uri("r")))
+                .await
+                .unwrap();
+            stats
+                .upsert(&seed(generic_target("g"), state.generic_uri("g")))
+                .await
+                .unwrap();
+        }
+        let queued = sweep_candidates(&state).await.unwrap();
+        assert_eq!(queued, 1, "only the rollout row is compacted");
+        let tasks = state.task_store.list().await.unwrap();
+        assert!(tasks.iter().all(|t| t.target == "r"), "{tasks:?}");
+    }
+
     /// A `Compact` runs even while every `MergeWal` slot is occupied by slow
     /// fan-outs and the queue is dominated by MergeWal tasks.
     ///
@@ -1007,18 +1217,27 @@ mod tests {
             let mut stats = state.stats.lock().await;
             stats.upsert(&seed("hot", 5)).await.unwrap(); // >= threshold
             stats.upsert(&seed("cold", 1)).await.unwrap(); // < threshold
+                                                           // A generic store over threshold is swept too, as a generic task.
+            let mut g = seed(&generic_target("ghot"), 7);
+            g.uri = state.generic_uri("ghot");
+            stats.upsert(&g).await.unwrap();
         }
 
         let queued = sweep_merge_wal_candidates(&state).await.unwrap();
-        assert_eq!(queued, 1, "only the over-threshold experiment is swept");
+        assert_eq!(
+            queued, 2,
+            "both over-threshold stores are swept, rollout and generic"
+        );
 
         let tasks = state.task_store.list().await.unwrap();
         let merge_tasks: Vec<_> = tasks
             .iter()
             .filter(|t| t.kind == TaskKind::MergeWal)
             .collect();
-        assert_eq!(merge_tasks.len(), 1);
-        assert_eq!(merge_tasks[0].target, "hot");
+        assert_eq!(merge_tasks.len(), 2);
+        let mut targets: Vec<&str> = merge_tasks.iter().map(|t| t.target.as_str()).collect();
+        targets.sort();
+        assert_eq!(targets, vec!["generic:ghot", "hot"]);
 
         // Second sweep must de-dupe against the still-queued MergeWal.
         sweep_merge_wal_candidates(&state).await.unwrap();
@@ -1030,7 +1249,7 @@ mod tests {
             .into_iter()
             .filter(|t| t.kind == TaskKind::MergeWal)
             .count();
-        assert_eq!(merge_after, 1, "duplicate MergeWal is de-duped");
+        assert_eq!(merge_after, 2, "duplicate MergeWal is de-duped");
     }
 
     /// Minimal rollout record builder for tests (the core struct has no    /// `Default`).

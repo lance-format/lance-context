@@ -4,7 +4,8 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use lance_context_core::{
-    join_uri, CompactionConfig, RolloutRegistry, RolloutStore, RolloutStoreOptions, Session,
+    join_uri, CompactionConfig, GenericStoreOptions, RolloutRegistry, RolloutStore,
+    RolloutStoreOptions, Session,
 };
 use lru::LruCache;
 use tokio::sync::{Mutex, RwLock, Semaphore};
@@ -60,6 +61,15 @@ fn build_compaction_config(config: &MasterConfig) -> CompactionConfig {
 pub struct MasterState {
     /// Durable directory of which rollout stores exist.
     pub registry: RwLock<RolloutRegistry>,
+    /// Durable directory of which generic stores exist. Same registry format
+    /// as rollout (the data plane writes `_registry.generic.lance` with the
+    /// same `RolloutRegistry` type); read here so the stats scan and the
+    /// WAL-merge sweep cover generic stores. Without this, generic stores'
+    /// MemWAL merges were left to each worker's own timer, so 20 shards raced
+    /// to commit into one base table and lost to `Too many concurrent writers`
+    /// while the master -- whose etcd-locked MergeWal task exists to serialize
+    /// exactly that -- never heard of them.
+    pub generic_registry: RwLock<RolloutRegistry>,
     /// Periodically-refreshed per-experiment metrics (master-owned).
     pub stats: Mutex<StatsStore>,
     /// Last snapshot written to the stats table, kept in memory so
@@ -130,8 +140,10 @@ impl MasterState {
         let rollout_session = build_rollout_session(config.rollout_cache_bytes);
         let compaction_concurrency = config.compaction_concurrency.max(1);
         let registry_uri = join_uri(&base_uri, "_registry.rollout.lance");
+        let generic_registry_uri = join_uri(&base_uri, "_registry.generic.lance");
         let stats_uri = join_uri(&base_uri, "_stats.rollout.lance");
         let mut registry = RolloutRegistry::open_or_create(&registry_uri, None).await?;
+        let generic_registry = RolloutRegistry::open_or_create(&generic_registry_uri, None).await?;
         let backfilled = discovery::backfill_registry(&config.data_dir, &mut registry).await?;
         if backfilled > 0 {
             tracing::info!(
@@ -143,6 +155,7 @@ impl MasterState {
         task_store.release_coordination_lock(init_guard).await?;
         let state = Arc::new(Self {
             registry: RwLock::new(registry),
+            generic_registry: RwLock::new(generic_registry),
             stats: Mutex::new(stats),
             stats_cache: RwLock::new(Arc::new(Vec::new())),
             record_stores: Mutex::new(LruCache::new(
@@ -165,6 +178,21 @@ impl MasterState {
     /// `rollout_uri` convention (`{name}.rollout.lance`).
     pub fn rollout_uri(&self, name: &str) -> String {
         join_uri(&self.base_uri, &format!("{}.rollout.lance", name))
+    }
+
+    /// Physical generic dataset URI for `name`, matching the data-plane's
+    /// `generic_uri` convention (`{name}.generic.lance`).
+    pub fn generic_uri(&self, name: &str) -> String {
+        join_uri(&self.base_uri, &format!("{}.generic.lance", name))
+    }
+
+    /// Options for every generic store opened by the master (read-only
+    /// observation; the master never writes a generic store's WAL).
+    pub(crate) fn generic_store_options(&self) -> GenericStoreOptions {
+        GenericStoreOptions {
+            session: self.rollout_session.clone(),
+            ..Default::default()
+        }
     }
 
     /// Options for every rollout store opened by the master.
