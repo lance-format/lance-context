@@ -60,6 +60,7 @@ const JOB_LATENCY_METRICS: &[&str] = &[
     "rollout_wal_merge_duration_seconds",
     "rollout_wal_merge_request_duration_seconds",
     "rollout_wal_merge_lock_wait_seconds",
+    "rollout_merge_budget_wait_seconds",
 ];
 
 /// Buckets (upper bounds, generation counts) for `rollout_wal_pending_generations`.

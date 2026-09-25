@@ -32,6 +32,7 @@ use lance::{Error as LanceError, Result as LanceResult};
 use lance_index::mem_wal::ShardManifest;
 
 use crate::generic_codec::{batch_to_rows, rows_to_batch, Row};
+use crate::merge_budget::MergeMemoryBudget;
 use crate::store::{CompactionConfig, CompactionStats};
 use crate::store_base::{ListSource, PreparedMerge, StorageBase, StorageBaseOptions};
 use lance_context_api::schema_spec::{SchemaSpec, ID_COLUMN};
@@ -77,6 +78,10 @@ pub struct GenericStoreOptions {
     /// alarm. `None` uses the crate default (256); `Some(0)` disables the warn.
     /// The `rollout_wal_pending_generations` histogram is emitted regardless.
     pub pending_generations_warn: Option<usize>,
+    /// Process-wide byte budget shared by every merge this process runs; a
+    /// merge that cannot fit waits for another to release. `None` disables
+    /// the bound. See [`crate::merge_budget`] for the design.
+    pub merge_budget: Option<Arc<MergeMemoryBudget>>,
     /// Shared, capacity-bounded Lance session.
     pub session: Option<Arc<Session>>,
     /// Whether [`GenericStore::add`] seals before returning, making the rows it
@@ -181,6 +186,7 @@ impl GenericStore {
                 merge_max_generations: options.merge_max_generations,
                 merge_max_bytes: options.merge_max_bytes,
                 pending_generations_warn: options.pending_generations_warn,
+                merge_budget: options.merge_budget.clone(),
                 session: options.session,
                 schema: create_schema,
                 // Always `id`: the LSM merge key, which `SchemaSpec::validate`
@@ -783,6 +789,87 @@ mod tests {
 
             store.flush().await.unwrap();
             assert_eq!(store.list(None, None).await.unwrap().len(), 1);
+        });
+    }
+
+    /// Two stores share one process-wide merge budget sized so that only one
+    /// merge's initial reservation fits. The second merge must wait until the
+    /// first commits and releases, then complete. This is the bound that was
+    /// missing when 17 of 20 production workers OOMKilled at once: each merge
+    /// was capped, their sum was not.
+    #[test]
+    fn concurrent_merges_queue_on_the_shared_memory_budget() {
+        use crate::merge_budget::MergeMemoryBudget;
+        use std::time::Duration;
+        use tokio::sync::oneshot;
+
+        let dir = TempDir::new().unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            // 1 MiB budget, and each merge asks for min(merge_max_bytes, budget)
+            // up front, so the budget admits exactly one merge at a time.
+            let budget = MergeMemoryBudget::new(1024 * 1024);
+            let opts = |shard: &str| GenericStoreOptions {
+                seal_on_add: true,
+                shard_id: Some(shard.to_string()),
+                merge_max_bytes: Some(1024 * 1024),
+                merge_budget: Some(budget.clone()),
+                ..Default::default()
+            };
+            let uri_a = dir.path().join("a").to_string_lossy().to_string();
+            let uri_b = dir.path().join("b").to_string_lossy().to_string();
+            let a = GenericStore::open(&uri_a, spec(), opts("a")).await.unwrap();
+            let b = GenericStore::open(&uri_b, spec(), opts("b")).await.unwrap();
+            for i in 0..3 {
+                a.add(&[row(json!({"id": format!("a{i}")}))]).await.unwrap();
+                b.add(&[row(json!({"id": format!("b{i}")}))]).await.unwrap();
+            }
+
+            // Prepare A's merge: it takes the whole budget and holds it inside
+            // the PreparedMerge until we commit.
+            let prepared_a = a
+                .prepare_cleanup_merge()
+                .await
+                .unwrap()
+                .expect("A has pending");
+            assert_eq!(budget.reserved(), 1024 * 1024);
+
+            // B's prepare must block on the budget.
+            let (started_tx, started_rx) = oneshot::channel();
+            let b_task = tokio::spawn(async move {
+                started_tx.send(()).unwrap();
+                let prepared = b
+                    .prepare_cleanup_merge()
+                    .await
+                    .unwrap()
+                    .expect("B has pending");
+                (b, prepared)
+            });
+            started_rx.await.unwrap();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(
+                !b_task.is_finished(),
+                "B's merge must wait while A holds the whole budget"
+            );
+
+            // Commit A: consumes the batches and releases the reservation.
+            let mut a = a;
+            let (ms, m, p) = prepared_a;
+            a.commit_prepared_merge(&ms, &m, p).await.unwrap();
+            assert_eq!(a.pending_wal_generations().await.unwrap(), 0);
+
+            // B proceeds now.
+            let (mut b, (ms, m, p)) = tokio::time::timeout(Duration::from_secs(30), b_task)
+                .await
+                .expect("B must proceed once A releases its reservation")
+                .unwrap();
+            b.commit_prepared_merge(&ms, &m, p).await.unwrap();
+            assert_eq!(b.pending_wal_generations().await.unwrap(), 0);
+            assert_eq!(
+                budget.reserved(),
+                0,
+                "everything released after both commits"
+            );
         });
     }
 

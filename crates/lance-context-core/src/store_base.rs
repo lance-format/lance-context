@@ -67,6 +67,7 @@ use lance_index::IndexType;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::merge_budget::{MergeMemoryBudget, MergeReservation};
 use crate::metrics::{
     count, observe_duration, observe_phase, observe_value, timer_elapsed, timer_start,
 };
@@ -205,6 +206,10 @@ pub struct PreparedMerge {
     merged_paths: Vec<String>,
     batches: Vec<RecordBatch>,
     merge_schema: Arc<Schema>,
+    /// Bytes reserved from the process-wide merge budget for `batches`.
+    /// Released when this is dropped, i.e. right after the commit consumes
+    /// the batches. `None` when no budget is configured.
+    reservation: Option<MergeReservation>,
 }
 
 impl PreparedMerge {
@@ -240,6 +245,11 @@ pub(crate) struct StorageBaseOptions {
     /// pending merge (sampled on every LSM read). `None` uses the crate default
     /// (256); `Some(0)` disables the warning. The metric is always emitted.
     pub pending_generations_warn: Option<usize>,
+    /// Process-wide byte budget shared by every merge this process runs.
+    /// `merge_max_bytes` bounds one merge; this bounds all of them together,
+    /// and a merge that cannot fit waits for another to release. `None`
+    /// disables the bound. See [`crate::merge_budget`].
+    pub merge_budget: Option<Arc<MergeMemoryBudget>>,
     /// Shared, capacity-bounded Lance session. `None` preserves Lance's
     /// per-open default (a fresh 6 GiB index + 1 GiB metadata session *per
     /// store*, which is the source of unbounded per-append RSS growth).
@@ -303,6 +313,8 @@ pub(crate) struct StorageBase {
     merge_max_bytes: usize,
     /// Per-shard pending-generation count at which reads warn; `0` disables.
     pending_generations_warn: usize,
+    /// Process-wide merge byte budget; `None` means unbounded.
+    merge_budget: Option<Arc<MergeMemoryBudget>>,
     /// Timestamp of the last successful [`Self::compact`] on this handle.
     last_compaction: Option<DateTime<Utc>>,
     /// Number of successful compactions performed by this handle.
@@ -360,6 +372,7 @@ impl StorageBase {
             merge_max_generations,
             merge_max_bytes,
             pending_generations_warn,
+            merge_budget,
             session,
             schema,
             key_column,
@@ -391,6 +404,7 @@ impl StorageBase {
                 merge_max_generations,
                 merge_max_bytes,
                 pending_generations_warn,
+                merge_budget,
                 session,
                 schema,
                 key_column,
@@ -416,6 +430,7 @@ impl StorageBase {
             merge_max_generations,
             merge_max_bytes,
             pending_generations_warn,
+            merge_budget,
             session,
             schema,
             key_column,
@@ -443,6 +458,7 @@ impl StorageBase {
             merge_max_bytes: merge_max_bytes.unwrap_or(DEFAULT_MERGE_MAX_BYTES),
             pending_generations_warn: pending_generations_warn
                 .unwrap_or(DEFAULT_PENDING_GENERATIONS_WARN),
+            merge_budget,
             last_compaction: None,
             total_compactions: 0,
             last_compaction_error: None,
@@ -905,7 +921,7 @@ impl StorageBase {
         // The expensive phase: pull a budgeted prefix of generations out of object
         // storage. Buffered in memory, so this is the part that must not hold an
         // exclusive lock.
-        let (merged_generations, merged_paths, batches, merge_schema) =
+        let (merged_generations, merged_paths, batches, merge_schema, reservation) =
             observe_phase!("read", self.read_flushed_generations(manifest).await)?;
 
         Ok(Some(PreparedMerge {
@@ -913,6 +929,7 @@ impl StorageBase {
             merged_paths,
             batches,
             merge_schema,
+            reservation,
         }))
     }
 
@@ -953,6 +970,7 @@ impl StorageBase {
             merged_paths,
             batches,
             merge_schema,
+            reservation,
         } = prepared;
 
         // Several sweepers can prepare the same immutable generations under a
@@ -978,6 +996,9 @@ impl StorageBase {
             )?;
             self.pinned_version = None;
         }
+        // The batches are consumed; give the bytes back before the manifest
+        // drain and directory deletes, which hold no merge data.
+        drop(reservation);
 
         // Reuse the shard's *current* epoch rather than claiming a new one:
         // claiming would fence our own live writer. `commit_update` still fails
@@ -1059,7 +1080,35 @@ impl StorageBase {
     async fn read_flushed_generations(
         &self,
         manifest: &ShardManifest,
-    ) -> LanceResult<(HashSet<u64>, Vec<String>, Vec<RecordBatch>, Arc<Schema>)> {
+    ) -> LanceResult<(
+        HashSet<u64>,
+        Vec<String>,
+        Vec<RecordBatch>,
+        Arc<Schema>,
+        Option<MergeReservation>,
+    )> {
+        // Reserve the whole per-merge allowance from the process budget before
+        // reading anything. Taken in one acquire so a merge never holds part
+        // of what it needs while waiting for the rest (see `merge_budget`).
+        // With the count cap disabled and no byte cap, the allowance is the
+        // full budget: the merge may read everything pending, alone.
+        let mut reservation = match &self.merge_budget {
+            Some(budget) => {
+                let want = if self.merge_max_bytes == 0 {
+                    budget.limit()
+                } else {
+                    self.merge_max_bytes.min(budget.limit())
+                };
+                let wait = timer_start!();
+                let reservation = budget.reserve(want).await;
+                observe_duration!(
+                    crate::metrics::ROLLOUT_MERGE_BUDGET_WAIT,
+                    timer_elapsed!(wait)
+                );
+                Some(reservation)
+            }
+            None => None,
+        };
         let base_uri = self.dataset.uri().trim_end_matches('/').to_string();
         let mut merged_generations: HashSet<u64> = HashSet::new();
         let mut merged_paths: Vec<String> = Vec::new();
@@ -1099,6 +1148,13 @@ impl StorageBase {
                 if batch.num_rows() > 0 {
                     let batch = align_batch_to_schema(batch, merge_schema.clone())?;
                     buffered_bytes = buffered_bytes.saturating_add(batch.get_array_memory_size());
+                    // Only an oversized first generation reads past the initial
+                    // reservation (a generation is indivisible). Grow to cover
+                    // it; the holder already has at least as much as anyone
+                    // else could be waiting for, so this cannot deadlock.
+                    if let Some(reservation) = reservation.as_mut() {
+                        reservation.grow_to(buffered_bytes).await;
+                    }
                     current_batches.push(batch);
                 }
             }
@@ -1111,7 +1167,13 @@ impl StorageBase {
         }
         let batches =
             dedupe_merge_batches(generation_batches, &self.key_column, merge_schema.clone())?;
-        Ok((merged_generations, merged_paths, batches, merge_schema))
+        Ok((
+            merged_generations,
+            merged_paths,
+            batches,
+            merge_schema,
+            reservation,
+        ))
     }
 
     /// Merge prepared WAL rows into the base table by primary key.

@@ -33,6 +33,7 @@ use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+use crate::merge_budget::MergeMemoryBudget;
 use crate::record::{
     ContextRecord, LifecycleQueryOptions, RecordFilters, RecordPatch, Relationship, RetrieveResult,
     SearchResult, StateMetadata, UpdateResult, UpsertResult, LIFECYCLE_ACTIVE,
@@ -307,6 +308,10 @@ pub struct ContextStoreOptions {
     /// (256); `Some(0)` disables the warn. The `rollout_wal_pending_generations`
     /// histogram is emitted regardless.
     pub pending_generations_warn: Option<usize>,
+    /// Process-wide byte budget shared by every merge this process runs; a
+    /// merge that cannot fit waits for another to release. `None` disables
+    /// the bound. See [`crate::merge_budget`] for the design.
+    pub merge_budget: Option<Arc<MergeMemoryBudget>>,
     /// Whether [`ContextStore::add`] seals the memtable before returning, so the
     /// rows it wrote are immediately readable.
     ///
@@ -339,6 +344,7 @@ impl Default for ContextStoreOptions {
             merge_max_generations: None,
             merge_max_bytes: None,
             pending_generations_warn: None,
+            merge_budget: None,
             // Read-your-write by default; see the field docs.
             seal_on_add: true,
         }
@@ -621,6 +627,7 @@ impl ContextStore {
                 merge_max_generations: options.merge_max_generations,
                 merge_max_bytes: options.merge_max_bytes,
                 pending_generations_warn: options.pending_generations_warn,
+                merge_budget: options.merge_budget.clone(),
                 session: None,
                 schema: Arc::new(arrow_schema.clone()),
                 key_column: "id".to_string(),
@@ -2245,6 +2252,7 @@ impl ContextStore {
             merge_max_generations: None,
             merge_max_bytes: None,
             pending_generations_warn: None,
+            merge_budget: None,
             // A compactor never appends, so the seal mode is irrelevant to it;
             // deferring keeps it from ever emitting a generation.
             seal_on_add: false,

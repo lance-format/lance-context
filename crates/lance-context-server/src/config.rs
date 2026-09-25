@@ -62,6 +62,16 @@ pub struct ServerConfig {
     )]
     pub rollout_wal_pending_warn_generations: usize,
 
+    /// Process-wide byte budget for MemWAL merges, shared by every merge
+    /// this worker runs regardless of what triggered it (its own sweepers, the
+    /// count trigger, the manual route, or the master's fan-out).
+    /// ROLLOUT_MERGE_MAX_BYTES bounds ONE merge; this bounds all of them
+    /// together, so the number of masters or concurrent tasks no longer
+    /// decides the worker's peak memory. A merge that cannot fit waits for
+    /// another to release instead of failing. Default 3 GiB; `0` disables.
+    #[arg(long, env = "ROLLOUT_MERGE_MEMORY_BYTES", default_value = "3221225472")]
+    pub rollout_merge_memory_bytes: usize,
+
     /// Interval, in seconds, for the periodic per-shard WAL cleanup task. When
     /// non-zero, the global sweeper folds this instance's flushed MemWAL
     /// generations into the base table on a schedule — the *time* half of the
@@ -226,6 +236,7 @@ mod tests {
             .expect("the documented minimal invocation must parse");
         assert_eq!(config.rollout_merge_max_bytes, 1024 * 1024 * 1024);
         assert_eq!(config.rollout_wal_pending_warn_generations, 256);
+        assert_eq!(config.rollout_merge_memory_bytes, 3 * 1024 * 1024 * 1024);
         assert_eq!(config.rollout_flush_interval_secs, 30);
         assert_eq!(config.rollout_cleanup_interval_secs, 0);
     }

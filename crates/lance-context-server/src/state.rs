@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use lance_context_core::{
     join_uri, validate_store_name, ContextStore, ContextStoreOptions, DatagenStore,
-    DatagenStoreOptions, GenericStore, GenericStoreOptions, RolloutRegistry, RolloutStore,
-    RolloutStoreOptions, Session,
+    DatagenStoreOptions, GenericStore, GenericStoreOptions, MergeMemoryBudget, RolloutRegistry,
+    RolloutStore, RolloutStoreOptions, Session,
 };
 use lru::LruCache;
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
@@ -123,6 +123,9 @@ pub struct AppState {
     pub rollout_merge_max_bytes: usize,
     /// Per-shard pending-generation count at which reads warn; `0` disables.
     pub rollout_wal_pending_warn_generations: usize,
+    /// Process-wide merge memory budget shared by every store; `None` when
+    /// disabled. See `lance_context_core::merge_budget`.
+    pub merge_budget: Option<Arc<MergeMemoryBudget>>,
     /// Periodic per-shard WAL-cleanup interval in seconds; `0` disables the
     /// global sweeper. See [`Self::spawn_global_sweeper`].
     pub rollout_cleanup_interval_secs: u64,
@@ -315,6 +318,8 @@ impl AppState {
             rollout_merge_max_generations: config.rollout_merge_max_generations,
             rollout_merge_max_bytes: config.rollout_merge_max_bytes,
             rollout_wal_pending_warn_generations: config.rollout_wal_pending_warn_generations,
+            merge_budget: (config.rollout_merge_memory_bytes > 0)
+                .then(|| MergeMemoryBudget::new(config.rollout_merge_memory_bytes)),
             rollout_cleanup_interval_secs: config.rollout_cleanup_interval_secs,
             rollout_flush_interval_secs: config.rollout_flush_interval_secs,
             blob_budget,
@@ -381,6 +386,7 @@ impl AppState {
             rollout_merge_max_generations: 8,
             rollout_merge_max_bytes: 1024 * 1024 * 1024,
             rollout_wal_pending_warn_generations: 256,
+            merge_budget: None,
             rollout_cleanup_interval_secs: 0,
             rollout_flush_interval_secs: 0,
             blob_budget: None,
@@ -417,6 +423,7 @@ impl AppState {
             merge_max_generations: Some(self.rollout_merge_max_generations),
             merge_max_bytes: Some(self.rollout_merge_max_bytes),
             pending_generations_warn: Some(self.rollout_wal_pending_warn_generations),
+            merge_budget: self.merge_budget.clone(),
             session: self.rollout_session.clone(),
         }
     }
@@ -606,6 +613,7 @@ impl AppState {
             merge_max_generations: Some(self.rollout_merge_max_generations),
             merge_max_bytes: Some(self.rollout_merge_max_bytes),
             pending_generations_warn: Some(self.rollout_wal_pending_warn_generations),
+            merge_budget: self.merge_budget.clone(),
             cleanup_interval_secs: None,
         }
     }
@@ -749,6 +757,7 @@ impl AppState {
             merge_max_generations: Some(self.rollout_merge_max_generations),
             merge_max_bytes: Some(self.rollout_merge_max_bytes),
             pending_generations_warn: Some(self.rollout_wal_pending_warn_generations),
+            merge_budget: self.merge_budget.clone(),
             session: self.rollout_session.clone(),
             seal_on_add,
         }
