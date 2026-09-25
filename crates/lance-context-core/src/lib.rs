@@ -10,6 +10,7 @@ mod export;
 pub mod generic_codec;
 mod generic_store;
 mod id;
+pub mod merge_budget;
 pub mod metrics;
 mod namespace;
 mod record;
@@ -52,6 +53,7 @@ pub use export::{
 pub use generic_codec::{batch_to_rows, ids_from_batch, rows_to_batch, Row};
 pub use generic_store::{GenericStore, GenericStoreOptions};
 pub use id::{generate_id, new_uuid};
+pub use merge_budget::{MergeMemoryBudget, MergeReservation};
 pub use namespace::{ContextNamespace, PartitionInfo, PartitionSelector, PartitionSpec};
 pub use record::{
     ContextRecord, LifecycleQueryOptions, MetadataFilter, RecordFilters, RecordPatch, Relationship,

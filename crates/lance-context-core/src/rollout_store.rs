@@ -77,6 +77,7 @@ use lance_index::mem_wal::ShardManifest;
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::merge_budget::MergeMemoryBudget;
 use crate::rollout::RolloutRecord;
 use crate::store::{
     column_as, column_as_optional, relationship_field, relationship_list_item_field,
@@ -388,6 +389,10 @@ pub struct RolloutStoreOptions {
     /// (256); `Some(0)` disables the warn. The `rollout_wal_pending_generations`
     /// histogram is emitted regardless.
     pub pending_generations_warn: Option<usize>,
+    /// Process-wide byte budget shared by every merge this process runs; a
+    /// merge that cannot fit waits for another to release. `None` disables
+    /// the bound. See [`crate::merge_budget`] for the design.
+    pub merge_budget: Option<Arc<MergeMemoryBudget>>,
     /// Shared Lance [`Session`] used to open this store's base dataset (and,
     /// transitively, every flushed MemWAL generation it reads — those inherit
     /// the base dataset's session).
@@ -475,6 +480,7 @@ impl RolloutStore {
             merge_max_generations,
             merge_max_bytes,
             pending_generations_warn,
+            merge_budget,
             session,
         } = options;
         let mut base = StorageBase::open(
@@ -486,6 +492,7 @@ impl RolloutStore {
                 merge_max_generations,
                 merge_max_bytes,
                 pending_generations_warn,
+                merge_budget,
                 session,
                 schema: Arc::new(rollout_schema()),
                 key_column: "id".to_string(),
@@ -2503,6 +2510,7 @@ mod tests {
                     merge_max_generations: None,
                     merge_max_bytes: None,
                     pending_generations_warn: None,
+                    merge_budget: None,
                     session: None,
                     schema: legacy_schema.clone(),
                     key_column: "id".to_string(),
@@ -2823,6 +2831,7 @@ mod tests {
                     merge_max_generations: None,
                     merge_max_bytes: None,
                     pending_generations_warn: None,
+                    merge_budget: None,
                 },
             )
             .await
@@ -2868,6 +2877,7 @@ mod tests {
                 merge_max_generations: None,
                 merge_max_bytes: None,
                 pending_generations_warn: None,
+                merge_budget: None,
             };
 
             {
@@ -2918,6 +2928,7 @@ mod tests {
                     merge_max_generations: None,
                     merge_max_bytes: None,
                     pending_generations_warn: None,
+                    merge_budget: None,
                 },
             )
             .await
@@ -2970,6 +2981,7 @@ mod tests {
                 merge_max_generations: None,
                 merge_max_bytes: None,
                 pending_generations_warn: None,
+                merge_budget: None,
             };
 
             let instance_a = RolloutStore::open_with_options(&uri, options("rollout-0"))
@@ -3192,6 +3204,7 @@ mod tests {
                     merge_max_generations: None,
                     merge_max_bytes: None,
                     pending_generations_warn: None,
+                    merge_budget: None,
                     ..Default::default()
                 },
             )
@@ -3255,6 +3268,7 @@ mod tests {
                     merge_max_generations: None,
                     merge_max_bytes: None,
                     pending_generations_warn: None,
+                    merge_budget: None,
                     ..Default::default()
                 },
             )
@@ -3356,6 +3370,7 @@ mod tests {
                     merge_max_generations: None,
                     merge_max_bytes: None,
                     pending_generations_warn: None,
+                    merge_budget: None,
                 },
             )
             .await
@@ -3415,6 +3430,7 @@ mod tests {
                     merge_max_generations: None,
                     merge_max_bytes: None,
                     pending_generations_warn: None,
+                    merge_budget: None,
                 },
             )
             .await
@@ -3455,6 +3471,7 @@ mod tests {
                     merge_max_generations: None,
                     merge_max_bytes: None,
                     pending_generations_warn: None,
+                    merge_budget: None,
                 },
             )
             .await
@@ -3592,6 +3609,7 @@ mod tests {
                     merge_max_generations: None,
                     merge_max_bytes: None,
                     pending_generations_warn: None,
+                    merge_budget: None,
                 },
             )
             .await
@@ -3679,6 +3697,7 @@ mod tests {
                     merge_max_generations: None,
                     merge_max_bytes: None,
                     pending_generations_warn: None,
+                    merge_budget: None,
                 },
             )
             .await
@@ -3727,6 +3746,7 @@ mod tests {
                     merge_max_generations: None,
                     merge_max_bytes: None,
                     pending_generations_warn: None,
+                    merge_budget: None,
                 },
             )
             .await
@@ -3797,6 +3817,7 @@ mod tests {
                     merge_max_generations: None,
                     merge_max_bytes: None,
                     pending_generations_warn: None,
+                    merge_budget: None,
                 },
             )
             .await
@@ -3835,6 +3856,7 @@ mod tests {
                     merge_max_generations: None,
                     merge_max_bytes: None,
                     pending_generations_warn: None,
+                    merge_budget: None,
                 },
             )
             .await
@@ -3894,6 +3916,7 @@ mod tests {
                         merge_max_generations: None,
                         merge_max_bytes: None,
                         pending_generations_warn: None,
+                        merge_budget: None,
                     },
                 )
                 .await
@@ -3936,6 +3959,7 @@ mod tests {
                     merge_max_generations: None,
                     merge_max_bytes: None,
                     pending_generations_warn: None,
+                    merge_budget: None,
                 },
             )
             .await
@@ -4436,6 +4460,7 @@ mod tests {
                     merge_max_generations: None,
                     merge_max_bytes: None,
                     pending_generations_warn: None,
+                    merge_budget: None,
                     ..Default::default()
                 },
             )
@@ -4535,6 +4560,7 @@ mod tests {
                     merge_max_generations: None,
                     merge_max_bytes: None,
                     pending_generations_warn: None,
+                    merge_budget: None,
                 },
             )
             .await
@@ -4568,6 +4594,7 @@ mod tests {
                     merge_max_generations: None,
                     merge_max_bytes: None,
                     pending_generations_warn: None,
+                    merge_budget: None,
                 },
             )
             .await

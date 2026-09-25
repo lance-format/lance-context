@@ -65,6 +65,12 @@ pub const ROLLOUT_WAL_MERGE_ERRORS: &str = "rollout_wal_merge_errors_total";
 /// before it was noticed in crash logs.
 pub const ROLLOUT_WAL_PENDING_GENERATIONS: &str = "rollout_wal_pending_generations";
 
+/// Time a merge spent waiting for its initial reservation from the
+/// process-wide merge memory budget. Near zero when the budget is not the
+/// bottleneck; a rising tail means merges are queueing on memory, which is the
+/// intended behaviour under load rather than an error.
+pub const ROLLOUT_MERGE_BUDGET_WAIT: &str = "rollout_merge_budget_wait_seconds";
+
 /// Emit a histogram sample in seconds. No-op without the `metrics` feature.
 #[cfg(feature = "metrics")]
 macro_rules! observe_duration {
