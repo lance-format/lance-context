@@ -1360,6 +1360,32 @@ mod tests {
         // A manual enqueue is not gated.
         let manual = enqueue(&state, TaskKind::MergeWal, "broken").await.unwrap();
         assert_eq!(manual.target, "broken");
+        assert_eq!(
+            await_terminal(&state, &manual.id).await.state,
+            TaskState::Failed
+        );
+
+        // The count keeps climbing across windows: that third failure (the
+        // manual one) is recorded as failure 3, not a fresh 1, so the window
+        // doubles. This is what stops every master re-probing the target the
+        // instant a window closes.
+        let mut cd = None;
+        for _ in 0..40 {
+            let cs = state.task_store.list_cooldowns().await.unwrap();
+            if let Some(c) = cs.iter().find(|c| c.target == "broken" && c.failures >= 3) {
+                cd = Some(c.clone());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let cd = cd.expect("cooldown record must carry the cumulative count");
+        assert_eq!(cd.failures, 3);
+        let window_ms = cd.until_ms.unwrap() - chrono::Utc::now().timestamp_millis();
+        assert!(
+            window_ms > 3600 * 1000 * 3 / 2,
+            "third failure must get a doubled (2h) window, got {}s",
+            window_ms / 1000
+        );
 
         worker.abort();
     }
