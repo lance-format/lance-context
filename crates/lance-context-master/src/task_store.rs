@@ -256,11 +256,14 @@ impl TaskStore {
         }
         // Below the threshold the record only carries the failure count; it is
         // a cooldown only once `until_ms` is set.
+        // The record outlives the cooldown window so the failure count keeps
+        // climbing across windows; only `until_ms` says whether we are inside
+        // one right now.
         Ok(self
             .inner
             .get_cooldown(kind, target)
             .await?
-            .is_some_and(|c| c.until_ms.is_some()))
+            .is_some_and(|c| c.until_ms.is_some_and(|until| until > now_ms())))
     }
 
     /// Every target currently in cooldown, for operators.
@@ -958,11 +961,14 @@ impl EtcdTaskStore {
             .transpose()
     }
 
-    /// Bump the consecutive-failure count and, past the threshold, write the
-    /// cooldown key under a lease that expires when the cooldown does. The
-    /// count itself lives in the same key, so a target that keeps failing
-    /// after its cooldown lapses starts again from the threshold rather than
-    /// from zero -- the lease is the only thing that ages the record out.
+    /// Bump the consecutive-failure count and, past the threshold, set the
+    /// cooldown window. The record is leased for `policy.max` regardless of
+    /// the window, so the count survives the window lapsing: a target that
+    /// fails again right after its cooldown ends is on failure N+1 and gets
+    /// a doubled window, not a fresh threshold. Without that, every master's
+    /// sweep re-probed the target the instant the window closed (a burst of
+    /// one task per master), it failed the threshold again, and the window
+    /// never grew. Only a success clears the record.
     async fn record_failure(
         &self,
         kind: TaskKind,
@@ -977,13 +983,7 @@ impl EtcdTaskStore {
             .saturating_add(1);
         let now = now_ms();
         let cooling = failures >= policy.after_failures;
-        let duration = if cooling {
-            policy.duration_for(failures)
-        } else {
-            // Below the threshold, remember the count for a bounded time so a
-            // slow trickle of unrelated failures does not accumulate forever.
-            policy.max
-        };
+        let duration = policy.duration_for(failures);
         let record = TaskCooldown {
             kind,
             target: target.to_string(),
@@ -995,9 +995,11 @@ impl EtcdTaskStore {
             },
             last_error: error.chars().take(512).collect(),
         };
+        // Lease for the longest window so the count outlives any single
+        // cooldown; a slow trickle of unrelated failures still ages out.
         let mut client = self.client.clone();
         let lease = client
-            .lease_grant(duration.as_secs().max(1) as i64, None)
+            .lease_grant(policy.max.as_secs().max(1) as i64, None)
             .await
             .map_err(etcd_error("grant cooldown lease"))?
             .id();
@@ -1050,7 +1052,7 @@ impl EtcdTaskStore {
                 serde_json::from_slice::<TaskCooldown>(kv.value())
                     .map_err(|e| lance::Error::io(format!("decode cooldown: {e}")))
             })
-            .filter(|r| !matches!(r, Ok(c) if c.until_ms.is_none()))
+            .filter(|r| !matches!(r, Ok(c) if !c.until_ms.is_some_and(|until| until > now_ms())))
             .collect()
     }
 
