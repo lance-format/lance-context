@@ -278,6 +278,9 @@ mod tests {
             etcd_lease_ttl_secs: 5,
             task_history_limit: 1_000,
             task_history_ttl_secs: 86_400,
+            task_cooldown_after_failures: 3,
+            task_cooldown_base_secs: 600,
+            task_cooldown_max_secs: 21_600,
             ui_dir: None,
         }
     }

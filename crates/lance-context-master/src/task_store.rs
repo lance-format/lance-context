@@ -16,7 +16,7 @@ use etcd_client::{
     Certificate, Client, Compare, CompareOp, ConnectOptions, GetOptions, Identity, PutOptions,
     TlsOptions, Txn, TxnOp,
 };
-use lance_context_api::{TaskKind, TaskRecord, TaskState};
+use lance_context_api::{TaskCooldown, TaskKind, TaskRecord, TaskState};
 use lance_context_core::generate_id;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -72,6 +72,36 @@ pub struct TaskStore {
     inner: Arc<EtcdTaskStore>,
     history_limit: usize,
     history_ttl_secs: u64,
+    cooldown: CooldownPolicy,
+}
+
+/// When to stop re-enqueueing a target that keeps failing, and for how long.
+///
+/// A store whose base-table manifest names a fragment that no longer exists
+/// fails every merge and every compaction at the same point, forever. Without
+/// memory of that, each sweep re-enqueued it, each attempt fanned out to
+/// every worker before failing, and five such stores consumed roughly half
+/// the fleet's task slots while healthy stores queued behind them.
+#[derive(Debug, Clone, Copy)]
+pub struct CooldownPolicy {
+    /// Consecutive failures before a target is cooled down; `0` disables.
+    pub after_failures: u32,
+    /// Cooldown after the threshold is first reached; doubles per further failure.
+    pub base: Duration,
+    /// Longest cooldown.
+    pub max: Duration,
+}
+
+impl CooldownPolicy {
+    fn duration_for(&self, failures: u32) -> Duration {
+        let over = failures.saturating_sub(self.after_failures);
+        let secs = self
+            .base
+            .as_secs()
+            .saturating_mul(1u64 << over.min(20))
+            .min(self.max.as_secs());
+        Duration::from_secs(secs)
+    }
 }
 
 struct EtcdTaskStore {
@@ -124,6 +154,11 @@ impl TaskStore {
             inner: Arc::new(EtcdTaskStore::connect(config).await?),
             history_limit: config.task_history_limit.max(1),
             history_ttl_secs: config.task_history_ttl_secs,
+            cooldown: CooldownPolicy {
+                after_failures: config.task_cooldown_after_failures,
+                base: Duration::from_secs(config.task_cooldown_base_secs),
+                max: Duration::from_secs(config.task_cooldown_max_secs),
+            },
         };
         store.recover_orphaned().await?;
         store.prune_terminal_history().await?;
@@ -191,8 +226,46 @@ impl TaskStore {
         claim: TaskClaim,
         outcome: Result<String, String>,
     ) -> lance::Result<()> {
+        let kind = claim.task.kind;
+        let target = claim.task.target.clone();
+        let failed = outcome.as_ref().err().cloned();
         self.inner.finish(claim, outcome).await?;
+        // Cooldown bookkeeping is best-effort and never fails the completion:
+        // the task's terminal state is already committed above.
+        if self.cooldown.after_failures > 0 {
+            let result = match failed {
+                Some(error) => {
+                    self.inner
+                        .record_failure(kind, &target, &error, self.cooldown)
+                        .await
+                }
+                None => self.inner.clear_cooldown(kind, &target).await,
+            };
+            if let Err(error) = result {
+                tracing::warn!(kind = ?kind, target = %target, %error, "cooldown bookkeeping failed");
+            }
+        }
         self.prune_terminal_history().await.map(|_| ())
+    }
+
+    /// Whether the sweeps should skip this target for now because it has
+    /// failed repeatedly. Manual enqueues are not gated by this.
+    pub async fn is_cooling_down(&self, kind: TaskKind, target: &str) -> lance::Result<bool> {
+        if self.cooldown.after_failures == 0 {
+            return Ok(false);
+        }
+        // Below the threshold the record only carries the failure count; it is
+        // a cooldown only once `until_ms` is set.
+        Ok(self
+            .inner
+            .get_cooldown(kind, target)
+            .await?
+            .is_some_and(|c| c.until_ms.is_some()))
+    }
+
+    /// Every target currently in cooldown, for operators.
+    pub async fn list_cooldowns(&self) -> lance::Result<Vec<TaskCooldown>> {
+        self.inner.list_cooldowns().await
     }
 
     /// Try to acquire a named coordination lock without waiting. This is used
@@ -852,6 +925,135 @@ impl EtcdTaskStore {
         format!("{}/target-locks/{}", self.prefix, encode_segment(target))
     }
 
+    fn cooldown_prefix(&self) -> String {
+        format!("{}/cooldown/", self.prefix)
+    }
+
+    fn cooldown_key(&self, kind: TaskKind, target: &str) -> String {
+        format!(
+            "{}{}/{}",
+            self.cooldown_prefix(),
+            kind_label(kind),
+            encode_segment(target)
+        )
+    }
+
+    async fn get_cooldown(
+        &self,
+        kind: TaskKind,
+        target: &str,
+    ) -> lance::Result<Option<TaskCooldown>> {
+        let mut client = self.client.clone();
+        let response = client
+            .get(self.cooldown_key(kind, target), None)
+            .await
+            .map_err(etcd_error("get cooldown"))?;
+        response
+            .kvs()
+            .first()
+            .map(|kv| {
+                serde_json::from_slice::<TaskCooldown>(kv.value())
+                    .map_err(|e| lance::Error::io(format!("decode cooldown: {e}")))
+            })
+            .transpose()
+    }
+
+    /// Bump the consecutive-failure count and, past the threshold, write the
+    /// cooldown key under a lease that expires when the cooldown does. The
+    /// count itself lives in the same key, so a target that keeps failing
+    /// after its cooldown lapses starts again from the threshold rather than
+    /// from zero -- the lease is the only thing that ages the record out.
+    async fn record_failure(
+        &self,
+        kind: TaskKind,
+        target: &str,
+        error: &str,
+        policy: CooldownPolicy,
+    ) -> lance::Result<()> {
+        let failures = self
+            .get_cooldown(kind, target)
+            .await?
+            .map_or(0, |c| c.failures)
+            .saturating_add(1);
+        let now = now_ms();
+        let cooling = failures >= policy.after_failures;
+        let duration = if cooling {
+            policy.duration_for(failures)
+        } else {
+            // Below the threshold, remember the count for a bounded time so a
+            // slow trickle of unrelated failures does not accumulate forever.
+            policy.max
+        };
+        let record = TaskCooldown {
+            kind,
+            target: target.to_string(),
+            failures,
+            until_ms: if cooling {
+                Some(now + duration.as_millis() as i64)
+            } else {
+                None
+            },
+            last_error: error.chars().take(512).collect(),
+        };
+        let mut client = self.client.clone();
+        let lease = client
+            .lease_grant(duration.as_secs().max(1) as i64, None)
+            .await
+            .map_err(etcd_error("grant cooldown lease"))?
+            .id();
+        client
+            .put(
+                self.cooldown_key(kind, target),
+                serde_json::to_vec(&record)
+                    .map_err(|e| lance::Error::io(format!("encode cooldown: {e}")))?,
+                Some(PutOptions::new().with_lease(lease)),
+            )
+            .await
+            .map_err(etcd_error("put cooldown"))?;
+        if cooling {
+            metrics::counter!("master_task_cooldowns_total", "kind" => kind_label(kind))
+                .increment(1);
+            tracing::warn!(
+                kind = ?kind,
+                target = %target,
+                failures,
+                cooldown_secs = duration.as_secs(),
+                last_error = %record.last_error,
+                "target failed repeatedly; sweeps will skip it until the cooldown lapses"
+            );
+        }
+        Ok(())
+    }
+
+    async fn clear_cooldown(&self, kind: TaskKind, target: &str) -> lance::Result<()> {
+        let mut client = self.client.clone();
+        client
+            .delete(self.cooldown_key(kind, target), None)
+            .await
+            .map_err(etcd_error("clear cooldown"))?;
+        Ok(())
+    }
+
+    async fn list_cooldowns(&self) -> lance::Result<Vec<TaskCooldown>> {
+        let mut client = self.client.clone();
+        let response = client
+            .get(
+                self.cooldown_prefix(),
+                Some(GetOptions::new().with_prefix()),
+            )
+            .await
+            .map_err(etcd_error("list cooldowns"))?;
+        response
+            .kvs()
+            .iter()
+            .map(|kv| {
+                serde_json::from_slice::<TaskCooldown>(kv.value())
+                    .map_err(|e| lance::Error::io(format!("decode cooldown: {e}")))
+            })
+            .filter(|r| !matches!(r, Ok(c) if c.until_ms.is_none()))
+            .collect()
+    }
+
     fn dedupe_key(&self, kind: TaskKind, target: &str, depends_on: &[String]) -> Option<String> {
         should_dedupe(kind, depends_on).then(|| {
             format!(
@@ -1017,6 +1219,9 @@ mod tests {
             etcd_lease_ttl_secs: 30,
             task_history_limit: 1_000,
             task_history_ttl_secs: 86_400,
+            task_cooldown_after_failures: 3,
+            task_cooldown_base_secs: 600,
+            task_cooldown_max_secs: 21_600,
             ui_dir: None,
         }
     }

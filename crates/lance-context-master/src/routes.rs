@@ -13,8 +13,8 @@ use serde::Deserialize;
 
 use lance_context_api::{
     CompactJobStatus, EnqueueTaskRequest, ExperimentDetail, ExperimentListResponse,
-    ExperimentRecordsResponse, ExperimentSummary, SqlQueryRequest, SqlQueryResponse, TaskKind,
-    TaskListResponse, TaskRecord, TaskState,
+    ExperimentRecordsResponse, ExperimentSummary, SqlQueryRequest, SqlQueryResponse, TaskCooldown,
+    TaskKind, TaskListResponse, TaskRecord, TaskState,
 };
 use lance_context_core::{rollout_record_to_dto, ListSource, RolloutFilters, RolloutStore};
 use tokio::sync::RwLock;
@@ -532,6 +532,22 @@ pub async fn enqueue_task(
     Ok((StatusCode::ACCEPTED, Json(task)))
 }
 
+/// `GET /api/v1/scheduler/cooldowns` — targets the auto-sweeps are skipping
+/// because they failed repeatedly, with the failure count, when the cooldown
+/// lapses, and the last error. A store in this list is broken in a way that
+/// retrying will not fix (a manifest naming a missing fragment, for example);
+/// a manual `POST /tasks` still enqueues it.
+pub async fn list_cooldowns(
+    State(state): State<Arc<MasterState>>,
+) -> Result<Json<Vec<TaskCooldown>>, MasterError> {
+    state
+        .task_store
+        .list_cooldowns()
+        .await
+        .map(Json)
+        .map_err(MasterError::from_lance)
+}
+
 /// `GET /api/v1/tasks` — paginated tasks (queue + recent history), newest first.
 pub async fn list_tasks(
     State(state): State<Arc<MasterState>>,
@@ -584,6 +600,7 @@ pub fn api_router() -> Router<Arc<MasterState>> {
         .route("/experiments/{name}/compact", post(compact_experiment))
         .route("/experiments/{name}/compact/status", get(compact_status))
         .route("/tasks", post(enqueue_task).get(list_tasks))
+        .route("/scheduler/cooldowns", get(list_cooldowns))
         .route("/tasks/{id}", get(get_task))
         .route("/rescan", post(rescan))
 }
@@ -678,6 +695,9 @@ mod tests {
             etcd_lease_ttl_secs: 5,
             task_history_limit: 1_000,
             task_history_ttl_secs: 86_400,
+            task_cooldown_after_failures: 3,
+            task_cooldown_base_secs: 600,
+            task_cooldown_max_secs: 21_600,
             ui_dir: None,
         }
     }

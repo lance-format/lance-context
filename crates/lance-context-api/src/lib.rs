@@ -1504,6 +1504,21 @@ pub enum TaskState {
 }
 
 /// One unit of scheduled work plus its lifecycle, as surfaced to the queue UI.
+/// A task target the master's sweeps are skipping because it has failed
+/// repeatedly. Reported by `GET /api/v1/scheduler/cooldowns`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskCooldown {
+    pub kind: TaskKind,
+    pub target: String,
+    /// Consecutive failures observed.
+    pub failures: u32,
+    /// When the cooldown lapses (ms since epoch). `None` while still below
+    /// the failure threshold (the record only tracks the count).
+    pub until_ms: Option<i64>,
+    /// The most recent failure's error, truncated.
+    pub last_error: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TaskRecord {
     /// Time-ordered unique id (UUIDv7).

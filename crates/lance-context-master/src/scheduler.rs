@@ -453,6 +453,13 @@ async fn sweep_candidates_inner(state: &Arc<MasterState>) -> lance::Result<usize
         if parse_target(&row.name).0 != StoreKind::Rollout {
             continue;
         }
+        if state
+            .task_store
+            .is_cooling_down(TaskKind::Compact, &row.name)
+            .await?
+        {
+            continue;
+        }
         enqueue(state, TaskKind::Compact, &row.name).await?;
         queued += 1;
     }
@@ -504,6 +511,13 @@ async fn sweep_merge_wal_inner(state: &Arc<MasterState>) -> lance::Result<usize>
         .await?;
     let mut queued = 0;
     for row in rows {
+        if state
+            .task_store
+            .is_cooling_down(TaskKind::MergeWal, &row.name)
+            .await?
+        {
+            continue;
+        }
         enqueue(state, TaskKind::MergeWal, &row.name).await?;
         queued += 1;
     }
@@ -692,6 +706,9 @@ mod tests {
             worker_endpoints: vec![],
             task_concurrency: 4,
             merge_wal_concurrency: 4,
+            task_cooldown_after_failures: 3,
+            task_cooldown_base_secs: 600,
+            task_cooldown_max_secs: 21_600,
             etcd_endpoints: std::env::var("ETCD_TEST_ENDPOINTS")
                 .map(|value| value.split(',').map(str::to_string).collect())
                 .unwrap_or_default(),
@@ -1190,6 +1207,104 @@ mod tests {
 
     /// The WAL-merge sweep enqueues a `MergeWal` only for experiments whose
     /// pending generation count is at or above the threshold, and de-dupes so a
+    /// A target that keeps failing is skipped by the sweep after the cooldown
+    /// threshold, so a permanently broken store stops consuming task slots
+    /// and blocking healthy stores behind it. Manual enqueue bypasses the
+    /// cooldown, and a later success clears it.
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn repeated_failures_cool_the_target_down_and_sweeps_skip_it() {
+        use crate::stats_store::StatRow;
+
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.merge_wal_min_generations = 1;
+        cfg.task_cooldown_after_failures = 2;
+        cfg.task_cooldown_base_secs = 3600;
+        // No worker endpoints: every MergeWal fails immediately.
+        cfg.worker_endpoints = vec![];
+        let state = MasterState::new(cfg).await.unwrap();
+        let worker = spawn_scheduler(&state);
+
+        {
+            let mut stats = state.stats.lock().await;
+            stats
+                .upsert(&StatRow {
+                    version: StatRow::UNKNOWN_VERSION,
+                    name: "broken".to_string(),
+                    uri: state.rollout_uri("broken"),
+                    row_count: 0,
+                    fragment_count: 0,
+                    last_updated: 0,
+                    pending_wal_generations: 50,
+                    last_compaction: StatRow::NO_COMPACTION,
+                    total_compactions: 0,
+                    scanned_at: 0,
+                })
+                .await
+                .unwrap();
+        }
+
+        // Two sweeps, two failures: the target crosses the threshold.
+        for round in 0..2 {
+            assert!(
+                !state
+                    .task_store
+                    .is_cooling_down(TaskKind::MergeWal, "broken")
+                    .await
+                    .unwrap(),
+                "round {round}: must not cool down below the failure threshold"
+            );
+            assert_eq!(sweep_merge_wal_candidates(&state).await.unwrap(), 1);
+            let id = state
+                .task_store
+                .list()
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|t| t.kind == TaskKind::MergeWal && t.target == "broken")
+                .max_by_key(|t| t.enqueued_at)
+                .unwrap()
+                .id;
+            assert_eq!(await_terminal(&state, &id).await.state, TaskState::Failed);
+        }
+        // `finish` commits the task's terminal state first and then records the
+        // failure; `await_terminal` returns on the former, so give the latter a
+        // moment.
+        let mut cooling = false;
+        for _ in 0..40 {
+            if state
+                .task_store
+                .is_cooling_down(TaskKind::MergeWal, "broken")
+                .await
+                .unwrap()
+            {
+                cooling = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(cooling, "target must be cooling down after 2 failures");
+        let cooldowns = state.task_store.list_cooldowns().await.unwrap();
+        assert_eq!(cooldowns.len(), 1);
+        assert_eq!(cooldowns[0].target, "broken");
+        assert_eq!(cooldowns[0].failures, 2);
+        assert!(cooldowns[0].until_ms.is_some());
+
+        // The sweep now skips it.
+        assert_eq!(
+            sweep_merge_wal_candidates(&state).await.unwrap(),
+            0,
+            "a cooled-down target must not be re-enqueued by the sweep"
+        );
+
+        // A manual enqueue is not gated.
+        let manual = enqueue(&state, TaskKind::MergeWal, "broken").await.unwrap();
+        assert_eq!(manual.target, "broken");
+
+        worker.abort();
+    }
+
     /// second sweep does not pile up a duplicate for the same target.
     #[tokio::test]
     #[ignore = "requires ETCD_TEST_ENDPOINTS"]
