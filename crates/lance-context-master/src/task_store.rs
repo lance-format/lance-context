@@ -1052,7 +1052,7 @@ impl EtcdTaskStore {
                 serde_json::from_slice::<TaskCooldown>(kv.value())
                     .map_err(|e| lance::Error::io(format!("decode cooldown: {e}")))
             })
-            .filter(|r| !matches!(r, Ok(c) if !c.until_ms.is_some_and(|until| until > now_ms())))
+            .filter(|r| !matches!(r, Ok(c) if c.until_ms.is_none_or(|until| until <= now_ms())))
             .collect()
     }
 
