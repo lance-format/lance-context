@@ -946,6 +946,19 @@ impl EtcdTaskStore {
         kind: TaskKind,
         target: &str,
     ) -> lance::Result<Option<TaskCooldown>> {
+        Ok(self
+            .get_cooldown_versioned(kind, target)
+            .await?
+            .map(|(record, _)| record))
+    }
+
+    /// The cooldown record plus the key's etcd `mod_revision` (0 when absent),
+    /// so a writer can update it with a compare-and-swap.
+    async fn get_cooldown_versioned(
+        &self,
+        kind: TaskKind,
+        target: &str,
+    ) -> lance::Result<Option<(TaskCooldown, i64)>> {
         let mut client = self.client.clone();
         let response = client
             .get(self.cooldown_key(kind, target), None)
@@ -956,6 +969,7 @@ impl EtcdTaskStore {
             .first()
             .map(|kv| {
                 serde_json::from_slice::<TaskCooldown>(kv.value())
+                    .map(|record| (record, kv.mod_revision()))
                     .map_err(|e| lance::Error::io(format!("decode cooldown: {e}")))
             })
             .transpose()
@@ -976,55 +990,87 @@ impl EtcdTaskStore {
         error: &str,
         policy: CooldownPolicy,
     ) -> lance::Result<()> {
-        let failures = self
-            .get_cooldown(kind, target)
-            .await?
-            .map_or(0, |c| c.failures)
-            .saturating_add(1);
-        let now = now_ms();
-        let cooling = failures >= policy.after_failures;
-        let duration = policy.duration_for(failures);
-        let record = TaskCooldown {
-            kind,
-            target: target.to_string(),
-            failures,
-            until_ms: if cooling {
-                Some(now + duration.as_millis() as i64)
-            } else {
-                None
-            },
-            last_error: error.chars().take(512).collect(),
-        };
-        // Lease for the longest window so the count outlives any single
-        // cooldown; a slow trickle of unrelated failures still ages out.
-        let mut client = self.client.clone();
-        let lease = client
-            .lease_grant(policy.max.as_secs().max(1) as i64, None)
-            .await
-            .map_err(etcd_error("grant cooldown lease"))?
-            .id();
-        client
-            .put(
-                self.cooldown_key(kind, target),
-                serde_json::to_vec(&record)
-                    .map_err(|e| lance::Error::io(format!("encode cooldown: {e}")))?,
-                Some(PutOptions::new().with_lease(lease)),
-            )
-            .await
-            .map_err(etcd_error("put cooldown"))?;
-        if cooling {
-            metrics::counter!("master_task_cooldowns_total", "kind" => kind_label(kind))
-                .increment(1);
-            tracing::warn!(
-                kind = ?kind,
-                target = %target,
+        // Several masters finish a failing task for the same target within
+        // seconds of each other (they all swept it at the same instant), so
+        // the count is bumped with a compare-and-swap on the key's revision.
+        // A plain get/put would let two of them read the same count and both
+        // write count+1, losing a failure and delaying the cooldown.
+        let key = self.cooldown_key(kind, target);
+        for attempt in 0..64u32 {
+            if attempt > 0 {
+                // Contention is bounded by the number of masters (a handful),
+                // so a short jittered backoff is enough to let the others land.
+                let jitter = (now_ms() as u64 ^ u64::from(attempt)) % 20;
+                tokio::time::sleep(Duration::from_millis(5 + jitter)).await;
+            }
+            let (prev_failures, revision) = self
+                .get_cooldown_versioned(kind, target)
+                .await?
+                .map_or((0, 0), |(c, rev)| (c.failures, rev));
+            let failures = prev_failures.saturating_add(1);
+            let now = now_ms();
+            let cooling = failures >= policy.after_failures;
+            let duration = policy.duration_for(failures);
+            let record = TaskCooldown {
+                kind,
+                target: target.to_string(),
                 failures,
-                cooldown_secs = duration.as_secs(),
-                last_error = %record.last_error,
-                "target failed repeatedly; sweeps will skip it until the cooldown lapses"
-            );
+                until_ms: if cooling {
+                    Some(now + duration.as_millis() as i64)
+                } else {
+                    None
+                },
+                last_error: error.chars().take(512).collect(),
+            };
+            // Lease for the longest window so the count outlives any single
+            // cooldown; a slow trickle of unrelated failures still ages out.
+            let mut client = self.client.clone();
+            let lease = client
+                .lease_grant(policy.max.as_secs().max(1) as i64, None)
+                .await
+                .map_err(etcd_error("grant cooldown lease"))?
+                .id();
+            let value = serde_json::to_vec(&record)
+                .map_err(|e| lance::Error::io(format!("encode cooldown: {e}")))?;
+            let committed = client
+                .txn(
+                    Txn::new()
+                        .when([Compare::mod_revision(
+                            key.as_str(),
+                            CompareOp::Equal,
+                            revision,
+                        )])
+                        .and_then([TxnOp::put(
+                            key.as_str(),
+                            value,
+                            Some(PutOptions::new().with_lease(lease)),
+                        )]),
+                )
+                .await
+                .map_err(etcd_error("put cooldown"))?
+                .succeeded();
+            if !committed {
+                // Someone else bumped it first; re-read and try again.
+                let _ = client.lease_revoke(lease).await;
+                continue;
+            }
+            if cooling {
+                metrics::counter!("master_task_cooldowns_total", "kind" => kind_label(kind))
+                    .increment(1);
+                tracing::warn!(
+                    kind = ?kind,
+                    target = %target,
+                    failures,
+                    cooldown_secs = duration.as_secs(),
+                    last_error = %record.last_error,
+                    "target failed repeatedly; sweeps will skip it until the cooldown lapses"
+                );
+            }
+            return Ok(());
         }
-        Ok(())
+        Err(lance::Error::io(format!(
+            "cooldown for {kind:?} '{target}' contended past 64 attempts"
+        )))
     }
 
     async fn clear_cooldown(&self, kind: TaskKind, target: &str) -> lance::Result<()> {
@@ -1303,6 +1349,47 @@ mod tests {
         ];
         // TTL None + generous cap → nothing pruned even though timestamps are old.
         assert!(prunable_terminal_ids(tasks, 10, None).is_empty());
+    }
+
+    /// Several masters finish a failing task for the same target within
+    /// seconds of one another. Their failure bookkeeping must not lose counts
+    /// to a read-modify-write race, or a broken store takes longer to cool
+    /// down than the policy says.
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn concurrent_failure_records_are_not_lost() {
+        let endpoint = std::env::var("ETCD_TEST_ENDPOINTS")
+            .expect("ETCD_TEST_ENDPOINTS must point to a test etcd");
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.etcd_endpoints = endpoint.split(',').map(str::to_string).collect();
+        cfg.etcd_prefix = format!("/lance-context/test/{}", generate_id());
+        cfg.task_cooldown_after_failures = 100; // stay below threshold; count only
+
+        let store = TaskStore::open(&cfg).await.unwrap();
+        let policy = store.cooldown;
+        let n = 12;
+        let calls = (0..n).map(|_| {
+            let inner = store.inner.clone();
+            async move {
+                inner
+                    .record_failure(TaskKind::MergeWal, "racy", "boom", policy)
+                    .await
+                    .unwrap();
+            }
+        });
+        futures::future::join_all(calls).await;
+
+        let record = store
+            .inner
+            .get_cooldown(TaskKind::MergeWal, "racy")
+            .await
+            .unwrap()
+            .expect("record exists");
+        assert_eq!(
+            record.failures, n,
+            "every concurrent failure must be counted; a lost update means a broken store cools down late"
+        );
     }
 
     #[tokio::test]
