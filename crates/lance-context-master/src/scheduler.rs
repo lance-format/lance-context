@@ -297,6 +297,7 @@ async fn run_merge_wal(state: &Arc<MasterState>, target: &str) -> Result<String,
     let total_workers = results.len();
     let mut reclaimed = 0usize;
     let mut ok_workers = 0usize;
+    let mut failed_workers = 0usize;
     let mut last_err = None;
     for r in results {
         match r {
@@ -307,14 +308,29 @@ async fn run_merge_wal(state: &Arc<MasterState>, target: &str) -> Result<String,
             Ok(WorkerMerge::NotFound) => {
                 ok_workers += 1;
             }
-            Err(e) => last_err = Some(e.to_string()),
+            Err(e) => {
+                failed_workers += 1;
+                last_err = Some(e.to_string());
+            }
         }
     }
 
     metrics::counter!("master_merge_wal_generations_reclaimed_total").increment(reclaimed as u64);
 
-    if ok_workers == 0 {
-        return Err(last_err.unwrap_or_else(|| "all workers failed".to_string()));
+    // A worker that owns no shard for this store answers 404 or reclaims 0,
+    // and that is fine -- but it must not launder a real failure elsewhere
+    // into success. If any worker errored and the task as a whole made no
+    // progress, it failed: this is what a store with a broken base table
+    // looks like (the one worker holding its data 500s, the rest have
+    // nothing), and it is what the failure cooldown needs to see. Partial
+    // progress with some errors is still success; the next sweep retries
+    // the stragglers.
+    if ok_workers == 0 || (failed_workers > 0 && reclaimed == 0) {
+        return Err(format!(
+            "{}/{total_workers} workers failed and nothing was merged: {}",
+            failed_workers,
+            last_err.unwrap_or_else(|| "all workers failed".to_string())
+        ));
     }
     Ok(format!(
         "merged {reclaimed} generations across {ok_workers}/{total_workers} workers"
@@ -937,6 +953,49 @@ mod tests {
         assert!(status.detail.unwrap().contains("merged 4 generations"));
         assert_eq!(generic_hits.load(Ordering::SeqCst), 1);
         assert_eq!(rollout_hits.load(Ordering::SeqCst), 0);
+        worker.abort();
+    }
+
+    /// A worker that reclaims nothing plus a worker that errors is a failed
+    /// task, not "merged 0 across 1/2 workers": that shape is exactly a store
+    /// whose base table is broken (the shard owner 500s, the others have no
+    /// data), and the failure cooldown can only act on it if it is reported
+    /// as a failure.
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn merge_wal_with_an_erroring_worker_and_no_progress_fails() {
+        use axum::{http::StatusCode, routing::post, Json, Router};
+
+        async fn spawn(ok: bool) -> String {
+            let app = Router::new().route(
+                "/api/v1/internal/merge-wal/{name}",
+                post(move || async move {
+                    if ok {
+                        (StatusCode::OK, Json(serde_json::json!({ "reclaimed": 0 })))
+                    } else {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({ "error": "Not found: data/frag.lance" })),
+                        )
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            format!("http://{addr}")
+        }
+
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.worker_endpoints = vec![spawn(true).await, spawn(false).await];
+        let state = MasterState::new(cfg).await.unwrap();
+        let worker = spawn_scheduler(&state);
+
+        let rec = enqueue(&state, TaskKind::MergeWal, "broken").await.unwrap();
+        let status = await_terminal(&state, &rec.id).await;
+        assert_eq!(status.state, TaskState::Failed, "got {status:?}");
+        assert!(status.error.unwrap().contains("nothing was merged"));
         worker.abort();
     }
 
