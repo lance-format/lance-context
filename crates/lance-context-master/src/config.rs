@@ -215,6 +215,22 @@ pub struct MasterConfig {
     #[arg(long, env = "TASK_HISTORY_TTL_SECS", default_value_t = 86_400)]
     pub task_history_ttl_secs: u64,
 
+    /// Consecutive failures of the same (kind, target) after which the
+    /// auto-sweeps stop re-enqueueing it for a while. A store whose manifest
+    /// names a fragment that no longer exists fails every merge and compaction
+    /// forever; without this, each sweep re-enqueued it and each attempt held a
+    /// task slot through a full worker fan-out before failing. `0` disables.
+    #[arg(long, env = "TASK_COOLDOWN_AFTER_FAILURES", default_value_t = 3)]
+    pub task_cooldown_after_failures: u32,
+
+    /// Cooldown after the threshold is reached; doubles per further failure.
+    #[arg(long, env = "TASK_COOLDOWN_BASE_SECS", default_value_t = 600)]
+    pub task_cooldown_base_secs: u64,
+
+    /// Longest cooldown. A success resets the count.
+    #[arg(long, env = "TASK_COOLDOWN_MAX_SECS", default_value_t = 21_600)]
+    pub task_cooldown_max_secs: u64,
+
     /// Directory of built UI assets to serve. When unset, only the JSON API is
     /// exposed.
     #[arg(long, env = "UI_DIR")]
