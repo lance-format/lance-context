@@ -4750,6 +4750,82 @@ mod tests {
     }
 
     #[test]
+    fn merge_budget_contention_preserves_complete_generations_and_payloads() {
+        const MIB: usize = 1024 * 1024;
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            // The first case fits a complete generation before growth fails;
+            // the other cases cannot fit even the first complete generation,
+            // including one larger than the entire budget.
+            for payload_len in [700 * 1024, 1400 * 1024, 3 * MIB] {
+                let dir = TempDir::new().unwrap();
+                let uri = dir.path().to_string_lossy().to_string();
+                let budget = MergeMemoryBudget::new(2 * MIB);
+                let held = budget.reserve(MIB).await;
+                let mut store = RolloutStore::open_with_options(
+                    &uri,
+                    RolloutStoreOptions {
+                        shard_id: Some("budget-contention".to_string()),
+                        merge_max_generations: Some(0),
+                        merge_max_bytes: Some(MIB),
+                        merge_budget: Some(budget.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+                let payload = vec![42; payload_len];
+                for i in 0..3 {
+                    store
+                        .add(&[artifact_record(&format!("g-{i}"), &payload)])
+                        .await
+                        .unwrap();
+                    store.flush().await.unwrap();
+                }
+                let outcome = tokio::time::timeout(
+                    std::time::Duration::from_secs(15),
+                    store.cleanup_own_shard(),
+                )
+                .await
+                .expect("memory growth contention must not hang");
+                let remaining = if payload_len < MIB {
+                    assert_eq!(outcome.unwrap(), 1);
+                    2
+                } else {
+                    assert!(outcome
+                        .unwrap_err()
+                        .to_string()
+                        .contains("merge memory budget busy"));
+                    3
+                };
+                assert_eq!(flushed_generation_count(&store).await, remaining);
+                assert_eq!(budget.reserved(), MIB);
+                drop(held);
+                for _ in 0..3 {
+                    let reclaimed = store.cleanup_own_shard().await.unwrap();
+                    if reclaimed == 0 {
+                        break;
+                    }
+                }
+                assert_eq!(flushed_generation_count(&store).await, 0);
+                assert_eq!(budget.reserved(), 0);
+                let mut ids: Vec<_> = store
+                    .list(None, None)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|record| record.id)
+                    .collect();
+                ids.sort();
+                assert_eq!(ids, ["g-0", "g-1", "g-2"]);
+                for id in ids {
+                    assert_eq!(store.get_blob(&id).await.unwrap().unwrap(), payload);
+                }
+            }
+        });
+    }
+
+    #[test]
     fn list_source_splits_base_and_wal() {
         // Rows appended but not yet merged live only in the WAL, not the base
         // table. `Fragments` must omit them; `Wal` must show exactly them; `All`

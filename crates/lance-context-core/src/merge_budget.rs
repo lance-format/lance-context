@@ -18,18 +18,14 @@
 //! [`crate::store_base::PreparedMerge`], so it is released exactly when the
 //! merged batches are dropped after commit.
 //!
-//! # Why it cannot deadlock
+//! # Growth must never wait while holding a reservation
 //!
-//! Every merge takes its full initial reservation --
-//! `min(merge_max_bytes, budget)` -- **before** it reads anything, in one
-//! atomic acquire. A merge therefore never holds part of what it needs while
-//! waiting for the rest. The only case that grows a reservation mid-read is a
-//! single generation larger than `merge_max_bytes`, which the merge folds whole
-//! (a generation is indivisible). At that point it already holds at least as
-//! much as any other merge could be waiting for, so growing cannot form a
-//! cycle. If it needs more than the whole budget it is admitted anyway once it
-//! is the sole holder, mirroring the "lone oversized request" rule of the blob
-//! budget: an oversized generation must make progress or the shard wedges.
+//! Atomic initial reservations do not prevent a hold-and-wait cycle: six
+//! 2-GiB readers can fill a 12-GiB budget, then all need one more batch to
+//! finish their last generation. Growth therefore uses a nonblocking acquire.
+//! On contention the caller must discard the incomplete generation and commit
+//! an already complete prefix, or release the read and retry if no prefix fits.
+//! An oversized generation can still proceed when it is the sole holder.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -123,24 +119,20 @@ impl MergeReservation {
         self.bytes
     }
 
-    /// Grow the reservation to cover `new_total` bytes, waiting for the
-    /// additional permits if the budget is exhausted. A no-op when `new_total`
-    /// does not exceed what is already held. The extra is capped at the budget:
-    /// a reservation never needs more permits than exist, and a holder that
-    /// already has them all is the sole merge in flight.
-    pub async fn grow_to(&mut self, new_total: usize) {
+    /// Try to cover `new_total` without waiting while holding permits.
+    /// False leaves the reservation unchanged. The caller must release any
+    /// unaccounted batches and either commit a complete prefix or retry later.
+    #[must_use]
+    pub fn try_grow_to(&mut self, new_total: usize) -> bool {
         if new_total <= self.bytes {
-            return;
+            return true;
         }
         let want_total = MergeMemoryBudget::permits_for(new_total).min(self.budget.permits_total());
         let extra = want_total.saturating_sub(self.permits);
         if extra > 0 {
-            let permit = self
-                .budget
-                .permits
-                .acquire_many(extra)
-                .await
-                .expect("merge memory budget semaphore is never closed");
+            let Ok(permit) = self.budget.permits.try_acquire_many(extra) else {
+                return false;
+            };
             permit.forget();
             self.permits += extra;
         }
@@ -148,6 +140,7 @@ impl MergeReservation {
             .reserved
             .fetch_add(new_total - self.bytes, Ordering::AcqRel);
         self.bytes = new_total;
+        true
     }
 }
 
@@ -209,31 +202,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn grow_to_waits_for_the_extra_and_is_idempotent_downward() {
-        let budget = MergeMemoryBudget::new(3 * PERMIT_BYTES);
-        let mut a = budget.reserve(PERMIT_BYTES).await;
-        let b = budget.reserve(2 * PERMIT_BYTES).await;
+    async fn full_budget_growth_fails_without_holding_and_waiting() {
+        let budget = MergeMemoryBudget::new(12 * PERMIT_BYTES);
+        let mut held = Vec::new();
+        for _ in 0..6 {
+            held.push(budget.reserve(2 * PERMIT_BYTES).await);
+        }
+        for reservation in &mut held {
+            assert!(!reservation.try_grow_to(2 * PERMIT_BYTES + 1));
+            assert_eq!(reservation.bytes(), 2 * PERMIT_BYTES);
+        }
+        assert_eq!(budget.reserved(), 12 * PERMIT_BYTES);
+        drop(held.pop());
+        assert!(held[0].try_grow_to(2 * PERMIT_BYTES + 1));
+        drop(held);
+        assert_eq!(budget.reserved(), 0);
+        assert_eq!(budget.permits.available_permits(), 12);
+    }
 
-        let grow = {
-            // Growing `a` to 2 MiB needs one more permit; none free until `b` drops.
-            let handle = tokio::spawn(async move {
-                a.grow_to(2 * PERMIT_BYTES).await;
-                a
-            });
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            assert!(!handle.is_finished());
-            handle
-        };
-        drop(b);
-        let a = tokio::time::timeout(Duration::from_secs(5), grow)
+    #[tokio::test]
+    async fn queued_initial_reservation_cannot_deadlock_a_growing_holder() {
+        let budget = MergeMemoryBudget::new(3 * PERMIT_BYTES);
+        let mut held = budget.reserve(2 * PERMIT_BYTES).await;
+        let waiter_budget = budget.clone();
+        let waiter = tokio::spawn(async move { waiter_budget.reserve(2 * PERMIT_BYTES).await });
+        tokio::task::yield_now().await;
+        // The fair semaphore may have assigned the free permit to the waiter.
+        assert!(!held.try_grow_to(3 * PERMIT_BYTES));
+        drop(held);
+        let mut next = tokio::time::timeout(Duration::from_secs(1), waiter)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(a.bytes(), 2 * PERMIT_BYTES);
-        assert_eq!(budget.reserved(), 2 * PERMIT_BYTES);
-
-        let mut a = a;
-        a.grow_to(PERMIT_BYTES).await; // smaller: no-op
-        assert_eq!(a.bytes(), 2 * PERMIT_BYTES);
+        assert!(next.try_grow_to(10 * PERMIT_BYTES));
+        assert!(next.try_grow_to(PERMIT_BYTES));
+        assert_eq!(next.bytes(), 10 * PERMIT_BYTES);
+        drop(next);
+        assert_eq!(budget.reserved(), 0);
+        assert_eq!(budget.permits.available_permits(), 3);
     }
 }

@@ -1137,8 +1137,8 @@ impl StorageBase {
         Option<MergeReservation>,
     )> {
         // Reserve the whole per-merge allowance from the process budget before
-        // reading anything. Taken in one acquire so a merge never holds part
-        // of what it needs while waiting for the rest (see `merge_budget`).
+        // reading anything. Growth beyond this allowance must be nonblocking:
+        // concurrent readers can fill the initial budget (see `merge_budget`).
         // With the count cap disabled and no byte cap, the allowance is the
         // full budget: the merge may read everything pending, alone.
         let mut reservation = match &self.merge_budget {
@@ -1180,7 +1180,7 @@ impl StorageBase {
             self.merge_max_generations
         };
 
-        for flushed in manifest.flushed_generations.iter().take(budget) {
+        'generations: for flushed in manifest.flushed_generations.iter().take(budget) {
             let gen_uri = format!(
                 "{}/_mem_wal/{}/{}",
                 base_uri, self.write_shard, flushed.path
@@ -1197,12 +1197,20 @@ impl StorageBase {
                 if batch.num_rows() > 0 {
                     let batch = align_batch_to_schema(batch, merge_schema.clone())?;
                     buffered_bytes = buffered_bytes.saturating_add(batch.get_array_memory_size());
-                    // Only an oversized first generation reads past the initial
-                    // reservation (a generation is indivisible). Grow to cover
-                    // it; the holder already has at least as much as anyone
-                    // else could be waiting for, so this cannot deadlock.
+                    // Never wait for more permits while holding a reservation:
+                    // all concurrent readers may need to grow simultaneously.
                     if let Some(reservation) = reservation.as_mut() {
-                        reservation.grow_to(buffered_bytes).await;
+                        if !reservation.try_grow_to(buffered_bytes) {
+                            if merged_generations.is_empty() {
+                                return Err(LanceError::io(
+                                    "merge memory budget busy while reading first generation; retry".to_string(),
+                                ));
+                            }
+                            // This generation is incomplete. Drop its batches,
+                            // keep it in the manifest, and commit only the fully
+                            // read prefix so the current reservation is released.
+                            break 'generations;
+                        }
                     }
                     current_batches.push(batch);
                 }
