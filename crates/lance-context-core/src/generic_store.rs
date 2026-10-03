@@ -411,6 +411,11 @@ impl GenericStore {
         self.base.count_merge_due().await
     }
 
+    /// Check this shard's pending metadata without enabling local self-merge.
+    pub async fn count_merge_due_at(&self, threshold: usize) -> LanceResult<bool> {
+        self.base.count_merge_due_at(threshold).await
+    }
+
     /// The shared-lock half of [`Self::cleanup_wal`]: seal, then read a
     /// budgeted prefix of flushed generations into memory. Callers holding a
     /// read lock run this while appends continue, then take the write lock

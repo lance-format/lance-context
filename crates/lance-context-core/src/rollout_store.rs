@@ -662,6 +662,11 @@ impl RolloutStore {
         self.base.count_merge_due().await
     }
 
+    /// Check this shard's pending metadata without enabling local self-merge.
+    pub async fn count_merge_due_at(&self, threshold: usize) -> LanceResult<bool> {
+        self.base.count_merge_due_at(threshold).await
+    }
+
     /// [`Self::prepare_merge_if_ready`], but seals the active memtable first —
     /// the time-triggered behavior of [`Self::cleanup_own_shard`].
     pub async fn prepare_cleanup_merge(

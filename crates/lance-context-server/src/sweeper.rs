@@ -46,7 +46,10 @@ pub(crate) trait Sweepable: Send + Sync + 'static {
     }
 
     /// Cheap metadata-only predicate used when the master owns execution.
-    fn count_merge_due(&self) -> impl std::future::Future<Output = Result<bool, String>> + Send {
+    fn count_merge_due(
+        &self,
+        _threshold: usize,
+    ) -> impl std::future::Future<Output = Result<bool, String>> + Send {
         async { Ok(false) }
     }
 
@@ -66,10 +69,10 @@ impl Sweepable for Arc<RwLock<RolloutStore>> {
         guard.flush().await.map_err(|e| e.to_string())
     }
 
-    async fn count_merge_due(&self) -> Result<bool, String> {
+    async fn count_merge_due(&self, threshold: usize) -> Result<bool, String> {
         self.read()
             .await
-            .count_merge_due()
+            .count_merge_due_at(threshold)
             .await
             .map_err(|e| e.to_string())
     }
@@ -141,10 +144,10 @@ impl Sweepable for Arc<RwLock<GenericStore>> {
         guard.flush().await.map_err(|e| e.to_string())
     }
 
-    async fn count_merge_due(&self) -> Result<bool, String> {
+    async fn count_merge_due(&self, threshold: usize) -> Result<bool, String> {
         self.read()
             .await
-            .count_merge_due()
+            .count_merge_due_at(threshold)
             .await
             .map_err(|e| e.to_string())
     }
@@ -339,7 +342,11 @@ async fn route_merge<S: Sweepable>(
     if !state.merge_executions.owned(&target) {
         return Ok(false);
     }
-    if !count_trigger || store.count_merge_due().await? {
+    if !count_trigger
+        || store
+            .count_merge_due(state.merge_executions.merge_after_generations)
+            .await?
+    {
         state.merge_executions.request_merge(&target).await?;
         metrics::counter!("rollout_wal_coordinated_merge_requests_total", "kind" => S::kind())
             .increment(1);
@@ -403,7 +410,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
-    async fn owned_count_trigger_enqueues_without_bypassing_slots_or_preparing_payloads() {
+    async fn owned_count_trigger_works_with_legacy_trigger_disabled_and_slots_occupied() {
         let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
         let client = etcd_client::Client::connect([endpoint], None)
             .await
@@ -421,9 +428,12 @@ mod tests {
             .rollout
             .owned_targets
             .push("generic:s".into());
+        state.merge_executions.merge_after_generations = 2;
         let state = Arc::new(state);
         let dir = TempDir::new().unwrap();
-        let store = generic_with_pending(&dir, 2, 2).await;
+        let store = generic_with_pending(&dir, 0, 2).await;
+        assert!(!store.count_merge_due(3).await.unwrap());
+        assert!(!store.count_merge_due(0).await.unwrap());
         let slots = Arc::new(Semaphore::new(1));
         let _held = slots.clone().acquire_owned().await.unwrap();
         flush_pass_coordinated(

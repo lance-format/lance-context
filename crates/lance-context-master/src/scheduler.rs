@@ -1126,6 +1126,59 @@ mod tests {
         assert!(coordinator.request_page(None).await.unwrap().0.is_empty());
     }
 
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn historical_batches_continue_without_new_writes_and_yield_between_passes() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.merge_rollout.owned_targets = vec!["hot".into()];
+        cfg.merge_wal_interval_secs = 0;
+        let state = MasterState::new(cfg).await.unwrap();
+        let coordinator = state.task_store.merge_coordinator();
+        enqueue(&state, TaskKind::MergeWal, "hot").await.unwrap();
+        // There are no worker threshold requests and no stats sweep. Only
+        // releasing successful batches can arrange the remaining work.
+        for reclaimed in [3, 2, 0] {
+            let claim = state.task_store.claim_next().await.unwrap().unwrap();
+            assert_eq!(claim.task.target, "hot");
+            let proof = state.task_store.merge_claim(&claim);
+            let execution = lance_context_merge::Execution::new("hot", "worker", "boot", 600);
+            assert!(coordinator.reserve(&proof, &execution).await.unwrap());
+            let running = coordinator.start(&execution).await.unwrap().unwrap();
+            assert!(coordinator.finish(&running, Ok(reclaimed)).await.unwrap());
+            let finished = coordinator.get("hot").await.unwrap().unwrap();
+            assert!(coordinator.release(&proof, &finished).await.unwrap());
+            if reclaimed > 0 {
+                let request = coordinator.request_page(None).await.unwrap().0.remove(0);
+                enqueue_merge_request(&state, &coordinator, &request)
+                    .await
+                    .unwrap();
+                assert_eq!(coordinator.request_page(None).await.unwrap().0.len(), 1);
+            }
+            // Another table already waiting must run before the continuation.
+            enqueue(&state, TaskKind::MergeWal, "other").await.unwrap();
+            state
+                .task_store
+                .finish(claim, Ok("batch complete".into()))
+                .await
+                .unwrap();
+            for request in coordinator.request_page(None).await.unwrap().0 {
+                enqueue_merge_request(&state, &coordinator, &request)
+                    .await
+                    .unwrap();
+            }
+            let other = state.task_store.claim_next().await.unwrap().unwrap();
+            assert_eq!(other.task.target, "other");
+            state
+                .task_store
+                .finish(other, Ok("done".into()))
+                .await
+                .unwrap();
+        }
+        assert!(state.task_store.claim_next().await.unwrap().is_none());
+        assert!(coordinator.request_page(None).await.unwrap().0.is_empty());
+    }
+
     /// Wait until the task reaches a terminal state, returning its final record.
     async fn await_terminal(state: &Arc<MasterState>, id: &str) -> TaskRecord {
         for _ in 0..100 {

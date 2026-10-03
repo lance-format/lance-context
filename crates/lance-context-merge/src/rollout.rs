@@ -56,7 +56,7 @@ pub struct MergeRequest {
 }
 
 impl Coordinator {
-    fn request_key(&self, target: &str) -> String {
+    pub(crate) fn request_key(&self, target: &str) -> String {
         execution_key(&self.prefix, target).replace("/merge-executions/", "/merge-requests/")
     }
 

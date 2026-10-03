@@ -53,6 +53,14 @@ pub struct ServerConfig {
     #[arg(long, env = "ROLLOUT_MERGE_AFTER_GENERATIONS", default_value = "0")]
     pub rollout_merge_after_generations: usize,
 
+    /// Per-shard threshold for requesting a master-owned merge on explicitly
+    /// selected MERGE_OWNED_TARGETS. Uses only manifest metadata on the flush
+    /// timer and never enables legacy self-merges. 0 disables this trigger.
+    /// Unset inherits a positive ROLLOUT_MERGE_AFTER_GENERATIONS, or uses 32
+    /// when legacy count-triggered merging is disabled.
+    #[arg(long, env = "OWNED_MERGE_AFTER_GENERATIONS")]
+    pub owned_merge_after_generations: Option<usize>,
+
     /// Maximum flushed MemWAL generations folded into the base table by one
     /// merge pass. `0` disables this cap; the byte budget still applies.
     /// Leftovers stay pending for the next pass. Both caps apply to count- and

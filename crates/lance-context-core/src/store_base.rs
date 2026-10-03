@@ -867,7 +867,13 @@ impl StorageBase {
     /// Metadata-only count trigger for a coordinated sweeper. Never prepares
     /// batches or takes a merge-memory reservation just to enqueue work.
     pub async fn count_merge_due(&self) -> LanceResult<bool> {
-        if self.merge_after_generations == 0 || self.is_version_pinned() || self.deleted {
+        self.count_merge_due_at(self.merge_after_generations).await
+    }
+
+    /// Check this shard's manifest against an external scheduling threshold.
+    /// This does not enable inline merges or prepare any payload batches.
+    pub async fn count_merge_due_at(&self, threshold: usize) -> LanceResult<bool> {
+        if threshold == 0 || self.is_version_pinned() || self.deleted {
             return Ok(false);
         }
         let manifest_store = ShardManifestStore::new(
@@ -876,9 +882,10 @@ impl StorageBase {
             self.write_shard,
             DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
         );
-        Ok(manifest_store.read_latest().await?.is_some_and(|manifest| {
-            manifest.flushed_generations.len() >= self.merge_after_generations
-        }))
+        Ok(manifest_store
+            .read_latest()
+            .await?
+            .is_some_and(|manifest| manifest.flushed_generations.len() >= threshold))
     }
 
     /// [`Self::prepare_merge_if_ready`], but seals the active memtable *before*

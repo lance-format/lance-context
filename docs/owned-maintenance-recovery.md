@@ -59,3 +59,37 @@ this change cannot retroactively fence an old unguarded write. It does not enabl
 owned targets, alter production pods, or complete registry migration. Recovery
 continues on draining targets while an owned execution remains. Validate large
 table timings and fault recovery before selecting tighter deadlines.
+
+## Continuous WAL catch-up
+
+A successful owned WAL execution that reclaims generations now writes a coalesced
+merge request in the same etcd transaction that releases its execution. The
+master's 15-second demand poll retains that request while the current task runs,
+then queues another pass. Each pass returns to the normal task queue, preserving
+serial worker fan-out and giving other tables and maintenance a scheduling
+opportunity. A final zero-progress pass stops the continuation. Failed executions
+still use their durable retry budgets; successful work on another shard cannot
+reset those budgets. This also drains historical batches when no new writes or
+stats sweeps arrive.
+
+Workers use `OWNED_MERGE_AFTER_GENERATIONS` (0 disables) to request work
+for explicitly selected owned targets from the existing flush timer. The check
+reads only this worker's shard manifest, without loading WAL payloads or taking a
+merge slot. Unset, it inherits a positive `ROLLOUT_MERGE_AFTER_GENERATIONS` or
+uses 32 when legacy count-triggered merging is disabled. An explicit threshold
+is independent of `ROLLOUT_MERGE_AFTER_GENERATIONS`,
+which can remain 0 for legacy targets during a per-table rollout. The flush timer
+must be enabled. Draining targets request no new work. Count thresholds bound
+triggering per shard, not total table pending or merge memory.
+
+Deployment is not activation: all regular and auxiliary masters must support
+owned maintenance before selecting a table. Keep legacy writers excluded until
+old work is drained or its admitted storage writes have been fenced. Transfer a
+dedicated executor's claim only at a verified terminal boundary, then remove the
+drain selector and select the table for owned execution on masters and workers.
+Never remove a live execution record just because its request timed out.
+
+Validate both backlog-only and sustained-write workloads with small byte-bounded
+batches, plus worker/master interruption and repeated shard failures. Check that
+ordinary services resume without a helper, another table gets service between
+passes, empty tables stop producing continuations, and memory remains bounded.

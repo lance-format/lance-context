@@ -310,6 +310,22 @@ impl Coordinator {
                 Some(etcd_client::PutOptions::new().with_lease(claim.lease_id)),
             ),
         ]);
+        // A byte-bounded batch can succeed while leaving historical WAL behind,
+        // even when no new writes arrive to trigger demand. Persist continuation
+        // with release so a master crash cannot lose it. The scheduler coalesces
+        // it behind the current task, then queues another fair, bounded pass.
+        // Zero progress, failures and local maintenance must not hot-loop.
+        if execution.maintenance.is_none()
+            && execution.phase == Phase::Finished
+            && execution.error.is_none()
+            && execution.reclaimed > 0
+        {
+            operations.push(TxnOp::put(
+                self.request_key(&execution.target),
+                execution.target.clone(),
+                None,
+            ));
+        }
         self.transact(compares, operations).await
     }
 
@@ -614,6 +630,69 @@ mod tests {
             proof,
             lease,
         )
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn successful_release_durably_requests_another_pass_without_resetting_other_failures() {
+        let (coordinator, client, proof, _) = fixture().await;
+        let failure = coordinator
+            .record_failure(&proof, "table", "broken-worker", "schema mismatch")
+            .await
+            .unwrap();
+        coordinator.request_merge("table").await.unwrap();
+        let old_request = coordinator.request_page(None).await.unwrap().0.remove(0);
+        let execution = Execution::new("table", "worker", "boot", 600);
+        assert!(coordinator.reserve(&proof, &execution).await.unwrap());
+        let running = coordinator.start(&execution).await.unwrap().unwrap();
+        assert!(coordinator.finish(&running, Ok(3)).await.unwrap());
+        let finished = coordinator.get("table").await.unwrap().unwrap();
+        let stale_claim = ClaimProof {
+            token: "stale".into(),
+            ..proof.clone()
+        };
+        assert!(!coordinator.release(&stale_claim, &finished).await.unwrap());
+        assert_eq!(
+            coordinator.request_page(None).await.unwrap().0[0].revision,
+            old_request.revision
+        );
+        assert!(coordinator.release(&proof, &finished).await.unwrap());
+        // Simulate restarting the master after releasing the execution, before
+        // it has finished its task. The continuation survives that crash window.
+        let reconnected = Coordinator::new(client, coordinator.prefix.clone());
+        assert!(reconnected.get("table").await.unwrap().is_none());
+        assert!(!reconnected.acknowledge_request(&old_request).await.unwrap());
+        let requests = reconnected.request_page(None).await.unwrap().0;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].target, "table");
+        let after = reconnected
+            .failure("table", "broken-worker")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.consecutive_attempts, failure.consecutive_attempts);
+        assert_eq!(after.next_retry_ms, failure.next_retry_ms);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn empty_failed_and_maintenance_releases_do_not_request_more_merges() {
+        let (coordinator, _, proof, _) = fixture().await;
+        for (maintenance, outcome) in [
+            (None, Ok(0)),
+            (None, Err("storage timeout".into())),
+            (Some(MaintenanceKind::Compact), Ok(4)),
+            (Some(MaintenanceKind::IndexId), Ok(4)),
+        ] {
+            let mut execution = Execution::new("table", "worker", "boot", 600);
+            execution.maintenance = maintenance;
+            assert!(coordinator.reserve(&proof, &execution).await.unwrap());
+            let running = coordinator.start(&execution).await.unwrap().unwrap();
+            assert!(coordinator.finish(&running, outcome).await.unwrap());
+            let finished = coordinator.get("table").await.unwrap().unwrap();
+            assert!(coordinator.release(&proof, &finished).await.unwrap());
+            assert!(coordinator.request_page(None).await.unwrap().0.is_empty());
+        }
     }
 
     #[tokio::test]
