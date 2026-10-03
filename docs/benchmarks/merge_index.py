@@ -69,7 +69,11 @@ def run(case, rows, blob_size, ordered, kind):
         builder = ds.merge_insert('id').when_matched_delete()
         if round_no == 0:
             try:
-                emit(event='plan', plan=builder.explain_plan(schema=source.select(['id']).schema), **m)
+                if kind.endswith('_predicate'):
+                    predicate = 'id IN (' + ','.join("'" + x + "'" for x in update_ids) + ')'
+                    emit(event='predicate_scan_plan', plan=ds.scanner(columns=['id'], filter=predicate).explain_plan(), **m)
+                else:
+                    emit(event='merge_plan', plan=builder.explain_plan(schema=source.select(['id']).schema), **m)
             except Exception as e:
                 emit(event='plan_unavailable', error=str(e), **m)
         measured('delete', lambda: ds.delete('id IN (' + ','.join(("'" + x + "'" for x in update_ids)) + ')') if kind.endswith('_predicate') else builder.execute(source.select(['id'])), **m)
