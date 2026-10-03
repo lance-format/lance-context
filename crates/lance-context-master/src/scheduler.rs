@@ -375,10 +375,13 @@ async fn index_id_inner(state: &Arc<MasterState>, name: &str) -> Result<String, 
         .await
         .map_err(|e| e.to_string())?;
     store
-        .create_id_btree_index()
+        .create_id_key_index()
         .await
         .map_err(|e| e.to_string())?;
-    Ok("built btree index on id".to_string())
+    Ok(format!(
+        "built {} index on id",
+        state.config.key_index_type.as_str()
+    ))
 }
 
 async fn compact_inner(
@@ -970,6 +973,7 @@ mod tests {
             compaction_batch_size: 8,
             compaction_max_source_fragments: 32,
             index_after_compaction: false,
+            key_index_type: Default::default(),
             index_before_merge: false,
             compaction_max_bytes_per_file: 1024 * 1024 * 1024,
             merge_wal_interval_secs: 0,

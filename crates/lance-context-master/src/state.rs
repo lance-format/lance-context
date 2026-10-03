@@ -237,6 +237,7 @@ impl MasterState {
     pub(crate) fn generic_store_options(&self) -> GenericStoreOptions {
         GenericStoreOptions {
             session: self.rollout_session.clone(),
+            key_index_type: self.config.key_index_type,
             ..Default::default()
         }
     }
@@ -245,6 +246,7 @@ impl MasterState {
     pub(crate) fn rollout_store_options(&self) -> RolloutStoreOptions {
         RolloutStoreOptions {
             session: self.rollout_session.clone(),
+            key_index_type: self.config.key_index_type,
             // The master observes and merges shards *because* they are behind;
             // the worker-side read cap must never hide those from it.
             pending_generations_max: Some(0),
@@ -313,6 +315,7 @@ mod tests {
             compaction_batch_size: 8,
             compaction_max_source_fragments: 32,
             index_after_compaction: false,
+            key_index_type: Default::default(),
             index_before_merge: false,
             compaction_max_bytes_per_file: 1024 * 1024 * 1024,
             merge_wal_interval_secs: 0,

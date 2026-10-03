@@ -271,6 +271,7 @@ async fn zero_merge_caps_merge_everything_in_one_pass() {
         merge_after_generations: None,
         merge_max_generations: Some(0),
         merge_max_bytes: Some(0),
+        key_index_type: Default::default(),
         ..Default::default()
     };
     let mut store = RolloutStore::open_with_options(&uri, opts).await.unwrap();
@@ -297,6 +298,7 @@ async fn assert_blob_merge_passes(max_generations: usize, max_bytes: usize, pass
         shard_id: Some("byte-budget".to_string()),
         merge_max_generations: Some(max_generations),
         merge_max_bytes: Some(max_bytes),
+        key_index_type: Default::default(),
         ..Default::default()
     };
     let mut store = RolloutStore::open_with_options(&uri, opts).await.unwrap();
@@ -366,6 +368,7 @@ async fn oversized_generation_is_merged_in_full_and_makes_progress() {
         merge_after_generations: Some(1),
         merge_max_generations: Some(8),
         merge_max_bytes: Some(1),
+        key_index_type: Default::default(),
         ..Default::default()
     };
     let mut store = RolloutStore::open_with_options(&uri, opts).await.unwrap();

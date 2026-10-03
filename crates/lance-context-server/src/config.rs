@@ -65,6 +65,16 @@ pub struct ServerConfig {
     #[arg(long, env = "ROLLOUT_MERGE_MAX_BYTES", default_value = "1073741824")]
     pub rollout_merge_max_bytes: usize,
 
+    /// Base key index policy. Configure every master and worker consistently.
+    /// ZoneMap uses bounded key-only predicate deletes during WAL merge.
+    #[arg(
+        long,
+        env = "ROLLOUT_KEY_INDEX_TYPE",
+        value_enum,
+        default_value = "btree"
+    )]
+    pub rollout_key_index_type: lance_context_core::KeyIndexType,
+
     /// Warn when one MemWAL shard has at least this many flushed generations
     /// pending merge, sampled on every LSM read of any store kind. Every
     /// pending generation is a separate dataset a read must open, so this is
@@ -244,6 +254,21 @@ impl ServerConfig {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn key_index_policy_is_explicit_and_validated() {
+        use clap::Parser;
+        use lance_context_core::KeyIndexType;
+        let config =
+            super::ServerConfig::try_parse_from(["server", "--rollout-key-index-type", "zonemap"])
+                .unwrap();
+        assert_eq!(config.rollout_key_index_type, KeyIndexType::Zonemap);
+        assert!(super::ServerConfig::try_parse_from([
+            "server",
+            "--rollout-key-index-type",
+            "unknown",
+        ])
+        .is_err());
+    }
     use super::*;
     use clap::CommandFactory;
 

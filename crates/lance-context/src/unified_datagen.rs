@@ -38,6 +38,7 @@ impl DatagenStore {
             merge_after_generations: None,
             merge_max_generations: None,
             merge_max_bytes: None,
+            key_index_type: Default::default(),
             pending_generations_warn: None,
             pending_generations_max: None,
             merge_budget: None,

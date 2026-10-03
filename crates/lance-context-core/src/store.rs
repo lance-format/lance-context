@@ -649,6 +649,7 @@ impl ContextStore {
                 shard_id: options.shard_id.clone(),
                 merge_after_generations: options.merge_after_generations,
                 merge_max_generations: options.merge_max_generations,
+                key_index_type: Default::default(),
                 merge_max_bytes: options.merge_max_bytes,
                 pending_generations_warn: options.pending_generations_warn,
                 pending_generations_max: options.pending_generations_max,

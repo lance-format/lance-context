@@ -52,7 +52,8 @@ fn admission_requires_fresh_owned_pressure_even_for_manual_requests() {
 }
 #[test]
 fn job_is_native_and_bounded_and_overrides_unsafe_inherited_mode() {
-    let c = config();
+    let mut c = config();
+    c.key_index_type = lance_context_core::KeyIndexType::Zonemap;
     let r = Record {
         target: "hot".into(),
         job: "lc-catchup-test".into(),
@@ -72,7 +73,10 @@ fn job_is_native_and_bounded_and_overrides_unsafe_inherited_mode() {
         progress: None,
     };
     let mut pod = template();
-    pod["containers"][0]["env"] = json!([{"name":"CATCHUP_ENABLED","value":"true"}]);
+    pod["containers"][0]["env"] = json!([
+        {"name":"CATCHUP_ENABLED","value":"true"},
+        {"name":"ROLLOUT_KEY_INDEX_TYPE","value":"btree"}
+    ]);
     pod["activeDeadlineSeconds"] = json!(1);
     let job = kubernetes::render_job(&c, &r, pod);
     assert!(job["spec"].get("activeDeadlineSeconds").is_none());
@@ -89,6 +93,18 @@ fn job_is_native_and_bounded_and_overrides_unsafe_inherited_mode() {
     let env = job["spec"]["template"]["spec"]["containers"][0]["env"]
         .as_array()
         .unwrap();
+    assert_eq!(
+        env.iter()
+            .filter(|e| e["name"] == "ROLLOUT_KEY_INDEX_TYPE")
+            .count(),
+        1
+    );
+    assert_eq!(
+        env.iter()
+            .find(|e| e["name"] == "ROLLOUT_KEY_INDEX_TYPE")
+            .unwrap()["value"],
+        "zonemap"
+    );
     assert_eq!(
         env.iter()
             .filter(|e| e["name"] == "CATCHUP_ENABLED")

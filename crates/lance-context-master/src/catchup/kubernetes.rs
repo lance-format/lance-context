@@ -235,6 +235,10 @@ pub(super) fn render_job(config: &MasterConfig, record: &Record, mut spec: Value
     }
     let overrides = [
         ("DATA_DIR", config.data_dir.clone()),
+        (
+            "ROLLOUT_KEY_INDEX_TYPE",
+            config.key_index_type.as_str().into(),
+        ),
         ("ETCD_ENDPOINTS", config.etcd.etcd_endpoints.join(",")),
         ("ETCD_PREFIX", config.etcd.etcd_prefix.clone()),
         ("CATCHUP_ENABLED", "false".into()),

@@ -386,6 +386,8 @@ pub struct RolloutStoreOptions {
     /// reaches the budget, or the generation-count cap, whichever comes first.
     /// A generation is indivisible, so even an oversized one is fully merged.
     pub merge_max_bytes: Option<usize>,
+    /// Index used for base-table key lookup during WAL merge.
+    pub key_index_type: crate::KeyIndexType,
     /// Warn when one MemWAL shard has at least this many flushed generations
     /// pending merge, sampled on every read. `None` uses the crate default
     /// (256); `Some(0)` disables the warn. The `rollout_wal_pending_generations`
@@ -483,6 +485,7 @@ impl RolloutStore {
             merge_after_generations,
             merge_max_generations,
             merge_max_bytes,
+            key_index_type,
             pending_generations_warn,
             pending_generations_max,
             merge_budget,
@@ -496,6 +499,7 @@ impl RolloutStore {
                 merge_after_generations,
                 merge_max_generations,
                 merge_max_bytes,
+                key_index_type,
                 pending_generations_warn,
                 pending_generations_max,
                 merge_budget,
@@ -712,8 +716,12 @@ impl RolloutStore {
         self.base.repair_missing_fragments().await
     }
 
-    /// Build a ZoneMap scalar index on the base table's `id` column. Idempotent.
-    /// See `StorageBase::create_key_btree_index`.
+    /// Build the configured key index on the base table's `id` column.
+    pub async fn create_id_key_index(&mut self) -> LanceResult<()> {
+        self.base.create_configured_key_index().await
+    }
+
+    /// Explicitly create a BTree, independent of the configured merge policy.
     pub async fn create_id_btree_index(&mut self) -> LanceResult<()> {
         self.base.create_key_btree_index().await
     }
@@ -2851,6 +2859,7 @@ mod tests {
                     merge_after_generations: None,
                     merge_max_generations: None,
                     merge_max_bytes: None,
+                    key_index_type: Default::default(),
                     pending_generations_warn: None,
                     pending_generations_max: None,
                     merge_budget: None,
@@ -3173,6 +3182,7 @@ mod tests {
                     merge_after_generations: Some(0),
                     merge_max_generations: None,
                     merge_max_bytes: None,
+                    key_index_type: Default::default(),
                     pending_generations_warn: None,
                     pending_generations_max: None,
                     merge_budget: None,
@@ -3220,6 +3230,7 @@ mod tests {
                 merge_after_generations: None,
                 merge_max_generations: None,
                 merge_max_bytes: None,
+                key_index_type: Default::default(),
                 pending_generations_warn: None,
                 pending_generations_max: None,
                 merge_budget: None,
@@ -3272,6 +3283,7 @@ mod tests {
                     merge_after_generations: None,
                     merge_max_generations: None,
                     merge_max_bytes: None,
+                    key_index_type: Default::default(),
                     pending_generations_warn: None,
                     pending_generations_max: None,
                     merge_budget: None,
@@ -3326,6 +3338,7 @@ mod tests {
                 merge_after_generations: None,
                 merge_max_generations: None,
                 merge_max_bytes: None,
+                key_index_type: Default::default(),
                 pending_generations_warn: None,
                 pending_generations_max: None,
                 merge_budget: None,
@@ -3550,6 +3563,7 @@ mod tests {
                     merge_after_generations: Some(1),
                     merge_max_generations: None,
                     merge_max_bytes: None,
+                    key_index_type: Default::default(),
                     pending_generations_warn: None,
                     pending_generations_max: None,
                     merge_budget: None,
@@ -3615,6 +3629,7 @@ mod tests {
                     merge_after_generations: Some(1),
                     merge_max_generations: None,
                     merge_max_bytes: None,
+                    key_index_type: Default::default(),
                     pending_generations_warn: None,
                     pending_generations_max: None,
                     merge_budget: None,
@@ -3718,6 +3733,7 @@ mod tests {
                     merge_after_generations: None, // no merge → epoch never reclaimed
                     merge_max_generations: None,
                     merge_max_bytes: None,
+                    key_index_type: Default::default(),
                     pending_generations_warn: None,
                     pending_generations_max: None,
                     merge_budget: None,
@@ -3779,6 +3795,7 @@ mod tests {
                     merge_after_generations: Some(1),
                     merge_max_generations: None,
                     merge_max_bytes: None,
+                    key_index_type: Default::default(),
                     pending_generations_warn: None,
                     pending_generations_max: None,
                     merge_budget: None,
@@ -3821,6 +3838,7 @@ mod tests {
                     merge_after_generations: None,
                     merge_max_generations: None,
                     merge_max_bytes: None,
+                    key_index_type: Default::default(),
                     pending_generations_warn: None,
                     pending_generations_max: None,
                     merge_budget: None,
@@ -3959,6 +3977,7 @@ mod tests {
                     merge_after_generations: Some(1),
                     merge_max_generations: None,
                     merge_max_bytes: None,
+                    key_index_type: Default::default(),
                     pending_generations_warn: None,
                     pending_generations_max: None,
                     merge_budget: None,
@@ -4048,6 +4067,7 @@ mod tests {
                     merge_after_generations: Some(1),
                     merge_max_generations: None,
                     merge_max_bytes: None,
+                    key_index_type: Default::default(),
                     pending_generations_warn: None,
                     pending_generations_max: None,
                     merge_budget: None,
@@ -4137,6 +4157,7 @@ mod tests {
                     merge_after_generations: Some(1),
                     merge_max_generations: None,
                     merge_max_bytes: None,
+                    key_index_type: Default::default(),
                     pending_generations_warn: None,
                     pending_generations_max: None,
                     merge_budget: None,
@@ -4188,6 +4209,7 @@ mod tests {
                     merge_after_generations: Some(1),
                     merge_max_generations: None,
                     merge_max_bytes: None,
+                    key_index_type: Default::default(),
                     pending_generations_warn: None,
                     pending_generations_max: None,
                     merge_budget: None,
@@ -4275,6 +4297,7 @@ mod tests {
                     merge_after_generations: Some(3),
                     merge_max_generations: None,
                     merge_max_bytes: None,
+                    key_index_type: Default::default(),
                     pending_generations_warn: None,
                     pending_generations_max: None,
                     merge_budget: None,
@@ -4315,6 +4338,7 @@ mod tests {
                     merge_after_generations: Some(3),
                     merge_max_generations: None,
                     merge_max_bytes: None,
+                    key_index_type: Default::default(),
                     pending_generations_warn: None,
                     pending_generations_max: None,
                     merge_budget: None,
@@ -4376,6 +4400,7 @@ mod tests {
                         merge_after_generations: Some(2),
                         merge_max_generations: None,
                         merge_max_bytes: None,
+                        key_index_type: Default::default(),
                         pending_generations_warn: None,
                         pending_generations_max: None,
                         merge_budget: None,
@@ -4536,6 +4561,7 @@ mod tests {
                     merge_after_generations: None, // count trigger off
                     merge_max_generations: None,
                     merge_max_bytes: None,
+                    key_index_type: Default::default(),
                     pending_generations_warn: None,
                     pending_generations_max: None,
                     merge_budget: None,
@@ -4678,13 +4704,81 @@ mod tests {
         });
     }
 
-    /// The whole point of the id index: `merge_insert` must take the indexed
-    /// probe path, not a full-table hash join. Lance's `explain_plan` only
-    /// renders the full-scan plan and returns `NotSupported` when the job
-    /// would use a scalar index, so "explain refuses" is the observable
-    /// signal that the merge will probe. Without the index (and with a
-    /// ZoneMap, which cannot answer equality exactly) explain succeeds and
-    /// shows a HashJoin over a LanceScan of the base table.
+    /// ZoneMap merges use key predicates rather than the full-target merge
+    /// join. Exercise multiple bounded delete chunks and unusual literal IDs.
+    #[test]
+    fn zonemap_merge_preserves_updates_across_delete_chunks_and_retries() {
+        use crate::KeyIndexType;
+        use lance::index::DatasetIndexExt;
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut store = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    key_index_type: KeyIndexType::Zonemap,
+                    merge_max_generations: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let mut ids: Vec<_> = (0..2050).map(|i| format!("key-{i}")).collect();
+            ids.push("quote' AND false -- \\ unicode-你好".to_string());
+            for payload in [1u8, 2, 2] {
+                let records: Vec<_> = ids
+                    .iter()
+                    .map(|id| artifact_record(id, &[payload; 1024]))
+                    .collect();
+                store.add(&records).await.unwrap();
+                store.flush().await.unwrap();
+                assert_eq!(store.cleanup_own_shard().await.unwrap(), 1);
+                assert_eq!(flushed_generation_count(&store).await, 0);
+                assert_eq!(
+                    store.base.dataset.count_rows(None).await.unwrap(),
+                    ids.len()
+                );
+                let actual = store.list(None, None).await.unwrap();
+                assert_eq!(actual.len(), ids.len());
+                let mut scanner = store.base.dataset.scan();
+                scanner.project(&["binary_payload"]).unwrap();
+                let mut stream = scanner.try_into_stream().await.unwrap();
+                while let Some(batch) = stream.try_next().await.unwrap() {
+                    let blobs = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<arrow_array::LargeBinaryArray>()
+                        .unwrap();
+                    for row in 0..batch.num_rows() {
+                        assert_eq!(blobs.value(row), &[payload; 1024]);
+                    }
+                }
+            }
+            assert!(!store.has_id_btree_index().await.unwrap());
+            let indices = store.base.dataset.load_indices().await.unwrap();
+            assert!(indices.iter().any(|i| i.name == ROLLOUT_ID_INDEX_NAME
+                && i.index_details
+                    .as_ref()
+                    .is_some_and(|d| d.type_url.ends_with("ZoneMapIndexDetails"))));
+
+            // A configured maintenance rebuild must preserve the selected type.
+            store.create_id_key_index().await.unwrap();
+            assert!(!store.has_id_btree_index().await.unwrap());
+            // Changing the policy takes effect on maintenance, not on opening.
+            drop(store);
+            let mut store = RolloutStore::open(&uri).await.unwrap();
+            assert!(!store.has_id_btree_index().await.unwrap());
+            store
+                .add(&[artifact_record(&ids[0], &[3; 1024])])
+                .await
+                .unwrap();
+            store.flush().await.unwrap();
+            store.cleanup_own_shard().await.unwrap();
+            assert!(store.has_id_btree_index().await.unwrap());
+            assert_eq!(store.list(None, None).await.unwrap().len(), ids.len());
+        });
+    }
+
     #[test]
     fn merge_insert_probes_the_id_btree_instead_of_scanning() {
         use lance::dataset::MergeInsertBuilder;
@@ -4825,6 +4919,7 @@ mod tests {
                         merge_after_generations: None,
                         merge_max_generations: None,
                         merge_max_bytes: None,
+                        key_index_type: Default::default(),
                         pending_generations_warn: None,
                         pending_generations_max: Some(3),
                         merge_budget: None,
@@ -4873,6 +4968,7 @@ mod tests {
                     merge_after_generations: None,
                     merge_max_generations: None,
                     merge_max_bytes: None,
+                    key_index_type: Default::default(),
                     pending_generations_warn: None,
                     pending_generations_max: Some(2),
                     merge_budget: None,
@@ -5102,6 +5198,7 @@ mod tests {
                         shard_id: Some("budget-contention".to_string()),
                         merge_max_generations: Some(0),
                         merge_max_bytes: Some(MIB),
+                        key_index_type: Default::default(),
                         merge_budget: Some(budget.clone()),
                         ..Default::default()
                     },
@@ -5344,6 +5441,7 @@ mod tests {
                     merge_after_generations: Some(1),
                     merge_max_generations: None,
                     merge_max_bytes: None,
+                    key_index_type: Default::default(),
                     pending_generations_warn: None,
                     pending_generations_max: None,
                     merge_budget: None,
@@ -5445,6 +5543,7 @@ mod tests {
                     merge_after_generations: None, // disabled
                     merge_max_generations: None,
                     merge_max_bytes: None,
+                    key_index_type: Default::default(),
                     pending_generations_warn: None,
                     pending_generations_max: None,
                     merge_budget: None,
@@ -5480,6 +5579,7 @@ mod tests {
                     merge_after_generations: Some(1),
                     merge_max_generations: None,
                     merge_max_bytes: None,
+                    key_index_type: Default::default(),
                     pending_generations_warn: None,
                     pending_generations_max: None,
                     merge_budget: None,

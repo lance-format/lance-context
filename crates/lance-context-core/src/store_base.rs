@@ -256,6 +256,8 @@ pub(crate) struct StorageBaseOptions {
     /// reaches the budget, or the generation-count cap, whichever comes first.
     /// A generation is indivisible, so even an oversized one is fully merged.
     pub merge_max_bytes: Option<usize>,
+    /// Index used for base-table key lookup during WAL merge.
+    pub key_index_type: crate::KeyIndexType,
     /// Warn when a single shard has at least this many flushed generations
     /// pending merge (sampled on every LSM read). `None` uses the crate default
     /// (256); `Some(0)` disables the warning. The metric is always emitted.
@@ -331,6 +333,7 @@ pub(crate) struct StorageBase {
     merge_after_generations: usize,
     merge_max_generations: usize,
     merge_max_bytes: usize,
+    key_index_type: crate::KeyIndexType,
     /// Per-shard pending-generation count at which reads warn; `0` disables.
     pending_generations_warn: usize,
     /// Refuse reads that would open more flushed generations than this, per
@@ -394,6 +397,7 @@ impl StorageBase {
             merge_after_generations,
             merge_max_generations,
             merge_max_bytes,
+            key_index_type,
             pending_generations_warn,
             pending_generations_max,
             merge_budget,
@@ -427,6 +431,7 @@ impl StorageBase {
                 merge_after_generations,
                 merge_max_generations,
                 merge_max_bytes,
+                key_index_type,
                 pending_generations_warn,
                 pending_generations_max,
                 merge_budget,
@@ -454,6 +459,7 @@ impl StorageBase {
             merge_after_generations,
             merge_max_generations,
             merge_max_bytes,
+            key_index_type,
             pending_generations_warn,
             pending_generations_max,
             merge_budget,
@@ -482,6 +488,7 @@ impl StorageBase {
             merge_after_generations: merge_after_generations.unwrap_or(0),
             merge_max_generations: merge_max_generations.unwrap_or(DEFAULT_MERGE_MAX_GENERATIONS),
             merge_max_bytes: merge_max_bytes.unwrap_or(DEFAULT_MERGE_MAX_BYTES),
+            key_index_type,
             pending_generations_warn: pending_generations_warn
                 .unwrap_or(DEFAULT_PENDING_GENERATIONS_WARN),
             pending_generations_max: pending_generations_max
@@ -1252,8 +1259,9 @@ impl StorageBase {
     /// Merge prepared WAL rows into the base table by primary key.
     ///
     /// `read_flushed_generations` has already reduced the source to one newest
-    /// row per key. The merge is two commits: a delete-only `merge_insert` on
-    /// the key column, then a plain append of the rows.
+    /// row per key. Delete old keys first, then append the prepared rows.
+    /// BTree uses a delete-only `merge_insert`; ZoneMap uses bounded predicate
+    /// deletes so Lance does not include target payloads in its hash join.
     ///
     /// Not `WhenMatched::UpdateAll`, deliberately. An upsert takes the matched
     /// target rows *with every column* to join and rewrite them, and rollout
@@ -1265,7 +1273,7 @@ impl StorageBase {
     /// rows straight to fresh fragments. Neither ever holds a target blob.
     ///
     /// Last-write-wins and retry idempotence are preserved: a crash between
-    /// the two commits leaves the old rows deleted and the new ones still in
+    /// commits leaves the old rows deleted and the new ones still in
     /// the WAL, and the retry deletes nothing and appends them once. A crash
     /// after the append but before the manifest drain retries as delete (of
     /// what was just appended) + append, the same end state.
@@ -1274,54 +1282,54 @@ impl StorageBase {
         batches: Vec<RecordBatch>,
         merge_schema: Arc<Schema>,
     ) -> LanceResult<()> {
-        // Without an exact-answer key index the delete-only merge_insert is
-        // a hash join over the whole base table. On a 174 GB / 67k-row store
-        // that no master had ever indexed, that join OOMKilled every worker
-        // that tried to merge it; building the BTree first took 19 s. The
-        // master builds it before fan-out (#277), but a worker's own timer
-        // or a manual merge must not depend on the master having been here.
-        if self.dataset.count_fragments() > 0 {
-            if !self.has_key_btree_index().await? {
-                metrics::counter!("rollout_merge_index_built_on_demand_total").increment(1);
-                info!(
-                    uri = %self.dataset.uri(),
-                    "base table has no key BTree; building it before the merge"
-                );
-                self.create_key_btree_index().await?;
-            } else {
-                // Present is not enough: every merge and compaction appends
-                // fragments the index does not cover, and the delete-only
-                // merge_insert hash-joins exactly those. A 2.2 GB store whose
-                // BTree covered 1 of 65 fragments took a worker from 5 to
-                // 32 GiB on a 37 MB merge and OOMKilled 19 of them at once;
-                // after one `optimize_indices` the same merge peaked at 3 GiB.
-                let covered = self.extend_key_btree_index().await?;
-                if covered > 0 {
-                    metrics::counter!("rollout_merge_index_extended_on_demand_total").increment(1);
-                }
-            }
-        }
+        observe_phase!("index", self.ensure_merge_key_index().await)?;
         let key_index = merge_schema.index_of(&self.key_column)?;
         let key_schema = Arc::new(merge_schema.project(&[key_index])?);
         let keys = batches
             .iter()
             .map(|batch| batch.project(&[key_index]))
             .collect::<Result<Vec<_>, ArrowError>>()?;
-        let key_reader = RecordBatchIterator::new(
-            keys.into_iter().map(Ok::<RecordBatch, ArrowError>),
-            key_schema,
-        );
-        let mut builder = MergeInsertBuilder::try_new(
-            Arc::new(self.dataset.clone()),
-            vec![self.key_column.clone()],
-        )?;
-        builder
-            .when_matched(WhenMatched::Delete)
-            .when_not_matched(WhenNotMatched::DoNothing);
-        // Both Lance futures are large; boxing keeps them off the caller's
-        // stack (the merge runs inside sweeper and request tasks).
-        let (dataset, _) = Box::pin(builder.try_build()?.execute_reader(key_reader)).await?;
-        self.dataset = Arc::unwrap_or_clone(dataset);
+        if self.key_index_type == crate::KeyIndexType::Zonemap {
+            // merge_insert's non-exact-index path projects target payloads even
+            // with an ID-only source in Lance 9.0. Predicate deletion instead
+            // scans only predicate columns and lets ZoneMap prune zones.
+            // Bound expression size; commit all deletes before appending rows.
+            // A cancelled prefix remains recoverable from the undrained WAL.
+            use datafusion::common::ScalarValue;
+            use datafusion::logical_expr::Expr;
+            let mut values = Vec::with_capacity(1024);
+            for batch in &keys {
+                for row in 0..batch.num_rows() {
+                    values.push(Expr::Literal(
+                        ScalarValue::try_from_array(batch.column(0), row)
+                            .map_err(|e| LanceError::invalid_input(e.to_string()))?,
+                        None,
+                    ));
+                    if values.len() == 1024 {
+                        self.delete_key_values(std::mem::take(&mut values)).await?;
+                    }
+                }
+            }
+            if !values.is_empty() {
+                self.delete_key_values(values).await?;
+            }
+        } else {
+            let key_reader = RecordBatchIterator::new(
+                keys.into_iter().map(Ok::<RecordBatch, ArrowError>),
+                key_schema,
+            );
+            let mut builder = MergeInsertBuilder::try_new(
+                Arc::new(self.dataset.clone()),
+                vec![self.key_column.clone()],
+            )?;
+            builder
+                .when_matched(WhenMatched::Delete)
+                .when_not_matched(WhenNotMatched::DoNothing);
+            // Both Lance futures are large; boxing keeps them off the caller's
+            // stack (the merge runs inside sweeper and request tasks).
+            let (dataset, _) = Box::pin(builder.try_build()?.execute_reader(key_reader)).await?;
+            self.dataset = Arc::unwrap_or_clone(dataset);
+        }
 
         let reader = RecordBatchIterator::new(
             batches.into_iter().map(Ok::<RecordBatch, ArrowError>),
@@ -1329,6 +1337,86 @@ impl StorageBase {
         );
         Box::pin(self.dataset.append(reader, None)).await?;
         Ok(())
+    }
+
+    async fn delete_key_values(
+        &mut self,
+        values: Vec<datafusion::logical_expr::Expr>,
+    ) -> LanceResult<()> {
+        use datafusion::{common::Column, logical_expr::Expr};
+        let predicate =
+            Expr::Column(Column::from_name(self.key_column.clone())).in_list(values, false);
+        let result = observe_phase!(
+            "delete_keys",
+            Box::pin(
+                lance::dataset::DeleteBuilder::from_expr(Arc::new(self.dataset.clone()), predicate)
+                    .execute()
+            )
+            .await
+        )?;
+        self.dataset = Arc::unwrap_or_clone(result.new_dataset);
+        crate::merge_write_scope::checkpoint();
+        Ok(())
+    }
+
+    async fn ensure_merge_key_index(&mut self) -> LanceResult<()> {
+        if self.dataset.count_fragments() == 0 {
+            return Ok(());
+        }
+        match self.key_index_type {
+            crate::KeyIndexType::Btree => {
+                if !self.has_key_btree_index().await? {
+                    self.create_key_btree_index().await?;
+                    metrics::counter!("rollout_merge_index_built_on_demand_total").increment(1);
+                } else if self.extend_key_btree_index().await? > 0 {
+                    metrics::counter!("rollout_merge_index_extended_on_demand_total").increment(1);
+                }
+            }
+            crate::KeyIndexType::Zonemap => {
+                use lance::index::DatasetIndexInternalExt as _;
+                let indices = self.dataset.load_indices().await?;
+                let present = indices.iter().filter(|i| i.name == ID_INDEX_NAME).any(|i| {
+                    i.index_details
+                        .as_ref()
+                        .is_some_and(|d| d.type_url.ends_with("ZoneMapIndexDetails"))
+                });
+                if !present {
+                    self.create_configured_key_index().await?;
+                } else if !self
+                    .dataset
+                    .unindexed_fragments(ID_INDEX_NAME)
+                    .await?
+                    .is_empty()
+                {
+                    self.dataset
+                        .optimize_indices(
+                            &lance_index::optimize::OptimizeOptions::merge(1)
+                                .index_names(vec![ID_INDEX_NAME.to_string()]),
+                        )
+                        .await?;
+                    self.reload().await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn create_configured_key_index(&mut self) -> LanceResult<()> {
+        self.ensure_writable()?;
+        let kind = match self.key_index_type {
+            crate::KeyIndexType::Btree => IndexType::BTree,
+            crate::KeyIndexType::Zonemap => IndexType::ZoneMap,
+        };
+        self.dataset
+            .create_index_builder(
+                &[self.key_column.as_str()],
+                kind,
+                &ScalarIndexParams::default(),
+            )
+            .name(ID_INDEX_NAME.to_string())
+            .replace(true)
+            .await?;
+        self.reload().await
     }
 
     /// Evolve an older base table to the store's latest additive schema.

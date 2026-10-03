@@ -123,6 +123,7 @@ pub struct AppState {
     pub rollout_merge_max_generations: usize,
     /// Buffered Arrow array byte budget per merge pass; `0` disables this cap.
     pub rollout_merge_max_bytes: usize,
+    pub rollout_key_index_type: lance_context_core::KeyIndexType,
     /// Per-shard pending-generation count at which reads warn; `0` disables.
     pub rollout_wal_pending_warn_generations: usize,
     pub rollout_wal_pending_max_generations: usize,
@@ -380,6 +381,7 @@ impl AppState {
             rollout_merge_after_generations: config.rollout_merge_after_generations,
             rollout_merge_max_generations: config.rollout_merge_max_generations,
             rollout_merge_max_bytes: config.rollout_merge_max_bytes,
+            rollout_key_index_type: config.rollout_key_index_type,
             rollout_wal_pending_warn_generations: config.rollout_wal_pending_warn_generations,
             rollout_wal_pending_max_generations: config.rollout_wal_pending_max_generations,
             merge_budget: (config.rollout_merge_memory_bytes > 0)
@@ -465,6 +467,7 @@ impl AppState {
             rollout_merge_after_generations: 0,
             rollout_merge_max_generations: 8,
             rollout_merge_max_bytes: 1024 * 1024 * 1024,
+            rollout_key_index_type: Default::default(),
             rollout_wal_pending_warn_generations: 256,
             rollout_wal_pending_max_generations: 0,
             merge_budget: None,
@@ -504,6 +507,7 @@ impl AppState {
                 .then_some(self.rollout_merge_after_generations),
             merge_max_generations: Some(self.rollout_merge_max_generations),
             merge_max_bytes: Some(self.rollout_merge_max_bytes),
+            key_index_type: self.rollout_key_index_type,
             pending_generations_warn: Some(self.rollout_wal_pending_warn_generations),
             pending_generations_max: Some(self.rollout_wal_pending_max_generations),
             merge_budget: self.merge_budget.clone(),
@@ -691,6 +695,7 @@ impl AppState {
                 .then_some(self.rollout_merge_after_generations),
             merge_max_generations: Some(self.rollout_merge_max_generations),
             merge_max_bytes: Some(self.rollout_merge_max_bytes),
+            key_index_type: self.rollout_key_index_type,
             pending_generations_warn: Some(self.rollout_wal_pending_warn_generations),
             pending_generations_max: Some(self.rollout_wal_pending_max_generations),
             merge_budget: self.merge_budget.clone(),
@@ -832,6 +837,7 @@ impl AppState {
                 .then_some(self.rollout_merge_after_generations),
             merge_max_generations: Some(self.rollout_merge_max_generations),
             merge_max_bytes: Some(self.rollout_merge_max_bytes),
+            key_index_type: self.rollout_key_index_type,
             pending_generations_warn: Some(self.rollout_wal_pending_warn_generations),
             pending_generations_max: Some(self.rollout_wal_pending_max_generations),
             merge_budget: self.merge_budget.clone(),

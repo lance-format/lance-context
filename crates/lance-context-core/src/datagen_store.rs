@@ -60,6 +60,8 @@ pub struct DatagenStoreOptions {
     /// reaches the budget, or the generation-count cap, whichever comes first.
     /// A generation is indivisible, so even an oversized one is fully merged.
     pub merge_max_bytes: Option<usize>,
+    /// Index used for base-table key lookup during WAL merge.
+    pub key_index_type: crate::KeyIndexType,
     /// Warn when one MemWAL shard has at least this many flushed generations
     /// pending merge, sampled on every read. `None` uses the crate default
     /// (256); `Some(0)` disables the warn. The `rollout_wal_pending_generations`
@@ -115,6 +117,7 @@ impl DatagenStore {
                 merge_after_generations: options.merge_after_generations,
                 merge_max_generations: options.merge_max_generations,
                 merge_max_bytes: options.merge_max_bytes,
+                key_index_type: options.key_index_type,
                 pending_generations_warn: options.pending_generations_warn,
                 pending_generations_max: options.pending_generations_max,
                 merge_budget: options.merge_budget.clone(),

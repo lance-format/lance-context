@@ -118,6 +118,16 @@ pub struct MasterConfig {
     #[arg(long, env = "INDEX_BEFORE_MERGE", default_value_t = true, action = clap::ArgAction::Set)]
     pub index_before_merge: bool,
 
+    /// Base key index policy. Configure every master and worker consistently.
+    /// ZoneMap uses bounded key-only predicate deletes during WAL merge.
+    #[arg(
+        long,
+        env = "ROLLOUT_KEY_INDEX_TYPE",
+        value_enum,
+        default_value = "btree"
+    )]
+    pub key_index_type: lance_context_core::KeyIndexType,
+
     /// Maximum bytes per compacted output file. `0` uses Lance's default.
     #[arg(
         long,
@@ -238,6 +248,18 @@ pub struct MasterConfig {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn key_index_policy_is_explicit_and_validated() {
+        use clap::Parser;
+        use lance_context_core::KeyIndexType;
+        let config =
+            super::MasterConfig::try_parse_from(["master", "--key-index-type", "zonemap"]).unwrap();
+        assert_eq!(config.key_index_type, KeyIndexType::Zonemap);
+        assert!(
+            super::MasterConfig::try_parse_from(["master", "--key-index-type", "unknown",])
+                .is_err()
+        );
+    }
     use super::*;
     use clap::CommandFactory;
 

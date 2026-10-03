@@ -1,0 +1,133 @@
+{
+  "measurement": "index maintenance + key deletion + append; excludes WAL prepare/drain and initial index build",
+  "samples": [
+    {
+      "case": "many_ids_random",
+      "kind": "btree",
+      "n": 6,
+      "mean_seconds": 1.212600218015723,
+      "median_seconds": 1.3087847646092996,
+      "min_seconds": 0.6173404389992356,
+      "max_seconds": 1.6881290629971772,
+      "mean_read_mib": 4.930051803588867,
+      "mean_iops": 347,
+      "max_rss_mib": 345.3046875
+    },
+    {
+      "case": "many_ids_random",
+      "kind": "zonemap_predicate",
+      "n": 6,
+      "mean_seconds": 0.6871739939088002,
+      "median_seconds": 0.6813553952379152,
+      "min_seconds": 0.4439579779282212,
+      "max_seconds": 0.9270498780533671,
+      "mean_read_mib": 2.291510581970215,
+      "mean_iops": 43.333333333333336,
+      "max_rss_mib": 277.54296875
+    },
+    {
+      "case": "many_ids_ordered",
+      "kind": "btree",
+      "n": 6,
+      "mean_seconds": 1.031405057486457,
+      "median_seconds": 1.0647503705695271,
+      "min_seconds": 0.35998480627313256,
+      "max_seconds": 1.5736293338704854,
+      "mean_read_mib": 2.891977310180664,
+      "mean_iops": 281,
+      "max_rss_mib": 342.578125
+    },
+    {
+      "case": "many_ids_ordered",
+      "kind": "zonemap_predicate",
+      "n": 6,
+      "mean_seconds": 0.7070462131717553,
+      "median_seconds": 0.7199272835860029,
+      "min_seconds": 0.4173455690033734,
+      "max_seconds": 1.0748638901859522,
+      "mean_read_mib": 0.14267381032307944,
+      "mean_iops": 29.333333333333332,
+      "max_rss_mib": 277.7578125
+    },
+    {
+      "case": "large_payload_random",
+      "kind": "btree",
+      "n": 6,
+      "mean_seconds": 1.1275531464489177,
+      "median_seconds": 1.1163200367009267,
+      "min_seconds": 0.9487479431554675,
+      "max_seconds": 1.4106423910707235,
+      "mean_read_mib": 0.3032808303833008,
+      "mean_iops": 28,
+      "max_rss_mib": 588.91015625
+    },
+    {
+      "case": "large_payload_random",
+      "kind": "zonemap_predicate",
+      "n": 6,
+      "mean_seconds": 1.0108064976520836,
+      "median_seconds": 1.0509298224933445,
+      "min_seconds": 0.6639390881173313,
+      "max_seconds": 1.3364728998858482,
+      "mean_read_mib": 0.4599571228027344,
+      "mean_iops": 42.333333333333336,
+      "max_rss_mib": 605.48828125
+    },
+    {
+      "case": "large_payload_ordered",
+      "kind": "btree",
+      "n": 6,
+      "mean_seconds": 2.3442257062221565,
+      "median_seconds": 1.0725305575178936,
+      "min_seconds": 0.6588206051383168,
+      "max_seconds": 7.812396941473708,
+      "mean_read_mib": 0.30266284942626953,
+      "mean_iops": 28,
+      "max_rss_mib": 619.015625
+    },
+    {
+      "case": "large_payload_ordered",
+      "kind": "zonemap_predicate",
+      "n": 6,
+      "mean_seconds": 1.0707172531401739,
+      "median_seconds": 1.0403590565547347,
+      "min_seconds": 0.8739815538283437,
+      "max_seconds": 1.2820485748816282,
+      "mean_read_mib": 0.13915506998697916,
+      "mean_iops": 30.333333333333332,
+      "max_rss_mib": 625.203125
+    },
+    {
+      "case": "fragmented",
+      "kind": "btree",
+      "n": 3,
+      "mean_seconds": 1.1019850313508261,
+      "median_seconds": 1.2661343852523714,
+      "min_seconds": 0.6936106679495424,
+      "max_seconds": 1.3462100408505648,
+      "mean_read_mib": 5.207733154296875,
+      "mean_iops": 347,
+      "max_rss_mib": 372.73046875
+    },
+    {
+      "case": "fragmented",
+      "kind": "zonemap_predicate",
+      "n": 3,
+      "mean_seconds": 1.354135996196419,
+      "median_seconds": 1.6811805807519704,
+      "min_seconds": 0.5980637588072568,
+      "max_seconds": 1.7831636490300298,
+      "mean_read_mib": 57.06763903299967,
+      "mean_iops": 4123.333333333333,
+      "max_rss_mib": 383.02734375
+    }
+  ],
+  "failures": [
+    {
+      "case": "large_payload_ordered",
+      "kind": "zonemap_predicate",
+      "stage": "retry_append",
+      "error": "Azure manifest PUT exceeded 30s; incomplete fixture excluded; rerun under fresh prefix succeeded"
+    }
+  ]
+}

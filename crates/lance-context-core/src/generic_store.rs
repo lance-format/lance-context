@@ -72,6 +72,8 @@ pub struct GenericStoreOptions {
     /// reaches the budget, or the generation-count cap, whichever comes first.
     /// A generation is indivisible, so even an oversized one is fully merged.
     pub merge_max_bytes: Option<usize>,
+    /// Index used for base-table key lookup during WAL merge.
+    pub key_index_type: crate::KeyIndexType,
     /// Warn when one MemWAL shard has at least this many flushed generations
     /// pending merge, sampled on every read. Every pending generation is a
     /// separate dataset a read must open, so this is the read-amplification
@@ -187,6 +189,7 @@ impl GenericStore {
                 merge_after_generations: options.merge_after_generations,
                 merge_max_generations: options.merge_max_generations,
                 merge_max_bytes: options.merge_max_bytes,
+                key_index_type: options.key_index_type,
                 pending_generations_warn: options.pending_generations_warn,
                 pending_generations_max: options.pending_generations_max,
                 merge_budget: options.merge_budget.clone(),
@@ -868,6 +871,7 @@ mod tests {
                 seal_on_add: true,
                 shard_id: Some(shard.to_string()),
                 merge_max_bytes: Some(1024 * 1024),
+                key_index_type: Default::default(),
                 merge_budget: Some(budget.clone()),
                 ..Default::default()
             };
