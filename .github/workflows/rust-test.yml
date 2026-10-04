@@ -29,7 +29,9 @@ env:
 jobs:
   test:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # The focused HA suite builds a second feature graph after workspace tests;
+    # cold native dependency builds can exhaust 30 minutes before HA tests run.
+    timeout-minutes: 60
     strategy:
       matrix:
         toolchain:
