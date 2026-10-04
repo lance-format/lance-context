@@ -369,6 +369,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn master_stages_two_workers_in_parallel_and_commits_one_version() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir
@@ -422,6 +423,13 @@ mod tests {
             vec![format!("http://{address}/a"), format!("http://{address}/b")];
         config.append.rollout_append_targets = vec!["hot".into()];
         config.append.rollout_append_concurrency = 2;
+        config.etcd.etcd_endpoints = std::env::var("ETCD_TEST_ENDPOINTS")
+            .expect("ETCD_TEST_ENDPOINTS is required")
+            .split(',')
+            .map(str::to_owned)
+            .collect();
+        config.etcd.etcd_prefix =
+            format!("/rollout-append-test/{}", lance_context_core::generate_id());
         let state = MasterState::new(config).await.unwrap();
         let result = tokio::time::timeout(Duration::from_secs(30), run(&state, "hot"))
             .await
@@ -507,6 +515,7 @@ mod tests {
         server.abort();
     }
     #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn dedicated_job_uses_its_own_memory_for_oversized_generations() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir
@@ -548,6 +557,13 @@ mod tests {
         config.append.rollout_append_concurrency = 2;
         config.append.rollout_append_max_bytes = 1024 * 1024;
         // No worker endpoints: this dedicated Pod must actually add compute.
+        config.etcd.etcd_endpoints = std::env::var("ETCD_TEST_ENDPOINTS")
+            .expect("ETCD_TEST_ENDPOINTS is required")
+            .split(',')
+            .map(str::to_owned)
+            .collect();
+        config.etcd.etcd_prefix =
+            format!("/rollout-append-test/{}", lance_context_core::generate_id());
         let state = MasterState::new(config).await.unwrap();
         assert!(
             tokio::time::timeout(Duration::from_secs(30), run(&state, "hot"))
