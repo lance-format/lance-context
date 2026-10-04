@@ -34,8 +34,6 @@ lance = "9.0.0"
 lance-context-api = { version = "0.6.7", path = "../lance-context-api" }
 lance-index = "9.0.0"
 lance-namespace = "9.0.0"
-lancedb = "0.30.0"
-lance-graph = "0.5.4"
 # Version-matched with lance-context-server/-master so one process-wide recorder
 # serves every crate.
 metrics = { version = "0.24", optional = true }
