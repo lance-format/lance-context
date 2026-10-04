@@ -81,7 +81,9 @@ pub use rollout_store::{
     SQL_TABLE_NAME,
 };
 // Schema declaration lives in the API crate: it is part of the wire contract.
-pub use lance_context_api::{ColumnSpec, ColumnType, SchemaSpec, ID_COLUMN};
+pub use lance_context_api::{
+    trace_schema, ColumnSpec, ColumnType, SchemaSpec, TraceRecord, TraceStore, ID_COLUMN,
+};
 pub use storage::{
     create_local_dir_if_needed, join_uri, remove_dataset, validate_store_name, MAX_STORE_NAME_LEN,
 };

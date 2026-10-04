@@ -1,5 +1,7 @@
 pub mod schema_spec;
 pub use schema_spec::{ColumnSpec, ColumnType, SchemaSpec, ID_COLUMN};
+mod trace;
+pub use trace::{trace_schema, TraceRecord, TraceStore};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use chrono::{DateTime, Utc};

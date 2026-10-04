@@ -32,6 +32,11 @@ one).
 
 Full documentation: **<https://lance-format.github.io/lance-context/>**
 
+For deduplicated conversation turns, see [Trace records](docs/trace-records.md):
+`TraceRecord` supplies `session_id`, ordered `turn_id`, role and content in one
+dataset, with typed local/remote access and ID-only batch lookup through the
+existing GenericStore API.
+
 ## Install
 
 ```bash

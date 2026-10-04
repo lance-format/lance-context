@@ -18,17 +18,17 @@ pub use lance_context_core::{
 };
 
 pub use lance_context_api::{
-    AddDatagenEventsRequest, AddDatagenEventsResponse, AddRecordRequest, AddRecordsResponse,
-    AddRolloutRequest, AddRolloutsResponse, AddRowsRequest, AddRowsResponse, ColumnSpec,
-    ColumnType, CompactRequest, CompactResponse, CompactStatsResponse, ContextError, ContextResult,
-    ContextStoreApi, CreateDatagenStoreRequest, CreateGenericStoreRequest,
+    trace_schema, AddDatagenEventsRequest, AddDatagenEventsResponse, AddRecordRequest,
+    AddRecordsResponse, AddRolloutRequest, AddRolloutsResponse, AddRowsRequest, AddRowsResponse,
+    ColumnSpec, ColumnType, CompactRequest, CompactResponse, CompactStatsResponse, ContextError,
+    ContextResult, ContextStoreApi, CreateDatagenStoreRequest, CreateGenericStoreRequest,
     CreateRolloutStoreRequest, DatagenEventDto, DatagenFailureBucketDto, DatagenFailureDto,
     DatagenFieldStateDto, DatagenRootItemStatusesResponse, DatagenRunOverviewDto,
     DatagenStepCursorDto, DatagenStoreApi, DatagenStreamPositionDto, DatagenValueDto,
     DeleteRecordResponse, FoldedDatagenItemDto, GenericStoreApi, GenericStoreInfo, RecordDto,
     RelationshipDto, RetrieveRequest, RetrieveResponse, RetrieveResultDto, RolloutRecordDto,
-    RolloutStoreApi, SchemaSpec, SearchResultDto, UpsertRecordRequest, UpsertRecordResponse,
-    ID_COLUMN,
+    RolloutStoreApi, SchemaSpec, SearchResultDto, TraceRecord, TraceStore, UpsertRecordRequest,
+    UpsertRecordResponse, ID_COLUMN,
 };
 
 #[cfg(feature = "remote")]

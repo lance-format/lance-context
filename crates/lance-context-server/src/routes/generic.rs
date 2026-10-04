@@ -366,6 +366,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trace_schema_and_batch_dedup_round_trip_through_existing_http_api() {
+        use lance_context_api::{trace_schema, TraceRecord, TraceStore};
+        use lance_context_client::RemoteGenericStore;
+
+        let (state, _dir) = test_state().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = crate::routes::router().with_state(state);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let backend = RemoteGenericStore::connect_or_create(
+            &url,
+            &CreateGenericStoreRequest {
+                name: "trace-turns".into(),
+                schema: trace_schema(),
+                storage_options: None,
+                seal_on_add: true,
+            },
+        )
+        .await
+        .unwrap();
+        let store = TraceStore::new(backend).unwrap();
+        let record: TraceRecord = serde_json::from_value(serde_json::json!({
+            "id":"turn/雪'", "session_id":"session", "turn_id":3,
+            "role":"tool", "content":"tool output", "metadata":{"tool_name":"search"}
+        }))
+        .unwrap();
+        assert_eq!(
+            store
+                .add(std::slice::from_ref(&record))
+                .await
+                .unwrap()
+                .count,
+            1
+        );
+        let ids = vec![record.id.clone(), "absent".into(), record.id.clone()];
+        assert_eq!(store.existing_ids(&ids).await.unwrap(), [record.id.clone()]);
+        assert_eq!(store.get_many(&ids).await.unwrap(), [record.clone()]);
+        store.add(std::slice::from_ref(&record)).await.unwrap();
+        store.flush().await.unwrap();
+        let reopened = TraceStore::new(
+            RemoteGenericStore::connect(&url, "trace-turns")
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(reopened.get_many(&ids).await.unwrap(), [record]);
+        assert!(reopened
+            .existing_ids(&vec!["id".into(); MAX_BATCH_GET_IDS + 1])
+            .await
+            .is_err());
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn batch_get_round_trips_through_http_and_rust_client() {
         use lance_context_api::GenericStoreApi;
         use lance_context_client::{ClientError, ContextClient, RemoteGenericStore};
