@@ -401,8 +401,14 @@ mod tests {
             1
         );
         let ids = vec![record.id.clone(), "absent".into(), record.id.clone()];
-        assert_eq!(store.existing_ids(&ids).await.unwrap(), [record.id.clone()]);
-        assert_eq!(store.get_many(&ids).await.unwrap(), [record.clone()]);
+        assert_eq!(
+            store.existing_ids(&ids).await.unwrap(),
+            std::slice::from_ref(&record.id)
+        );
+        assert_eq!(
+            store.get_many(&ids).await.unwrap(),
+            std::slice::from_ref(&record)
+        );
         store.add(std::slice::from_ref(&record)).await.unwrap();
         store.flush().await.unwrap();
         let reopened = TraceStore::new(
