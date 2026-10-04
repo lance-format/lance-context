@@ -85,6 +85,16 @@ While staging this prefix, probe the base for IDs in chunks of 1024, projecting
 until the historical prefix is consumed; it does not read old payloads or delete
 base rows. Generations beyond the cutover do not require this migration lookup.
 
+The coordinator also persists the last observed writer epoch per shard. On a
+writer restart or fence, it extends the ID-check boundary through the current
+active generation as well as every flushed generation already visible. A WAL
+replay cursor can lag a flush: already-published rows can then be replayed into a
+new generation, so generation watermarks alone are insufficient. Planning before
+the recovered memtable flushes must protect that active generation too. The
+boundary stays fixed while the writer epoch is unchanged; subsequent generations
+return to append without base ID probes. Upgrading metadata that lacks a writer
+epoch performs this bounded check once before using the fast path.
+
 Merge retries are idempotent through the atomic generation watermark. This is not
 an arbitrary upsert or ingest-deduplication API: replaying the same ID into different
 new generations/shards after cutover violates rollout's no-reappend contract.

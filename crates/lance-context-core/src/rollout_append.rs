@@ -26,6 +26,7 @@ use crate::{LanceError as Error, MergeMemoryBudget, Session};
 use lance::Result;
 
 const CUTOVER_PREFIX: &str = "lance-context.rollout-append.cutover.";
+const WRITER_EPOCH_PREFIX: &str = "lance-context.rollout-append.writer-epoch.";
 pub const MAX_PLAN_GENERATIONS: usize = 256;
 pub const MAX_STAGE_BYTES: usize = 256 * 1024 * 1024;
 
@@ -234,22 +235,52 @@ impl AppendCoordinator {
             };
             crate::merge_write_scope::checkpoint();
             let key = format!("{CUTOVER_PREFIX}{shard}");
-            let cutoff = match self.dataset.metadata().get(&key) {
-                Some(value) => value
-                    .parse::<u64>()
-                    .map_err(|_| Error::io("invalid rollout cutover"))?,
-                None => {
-                    // The historical prefix can contain a legacy append whose
-                    // drain failed. Only that prefix needs a base ID lookup.
-                    let high = manifest
-                        .flushed_generations
-                        .iter()
-                        .map(|g| g.generation)
-                        .max()
-                        .unwrap_or(0);
-                    cutovers.insert(key, high.to_string());
-                    high
-                }
+            let epoch_key = format!("{WRITER_EPOCH_PREFIX}{shard}");
+            let previous_cutoff = self
+                .dataset
+                .metadata()
+                .get(&key)
+                .map(|value| {
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| Error::io("invalid rollout cutover"))
+                })
+                .transpose()?;
+            let previous_epoch = self
+                .dataset
+                .metadata()
+                .get(&epoch_key)
+                .map(|value| {
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| Error::io("invalid rollout writer epoch"))
+                })
+                .transpose()?;
+            if previous_epoch.is_some() && previous_cutoff.is_none() {
+                return Err(Error::io("rollout writer epoch has no replay boundary"));
+            }
+            if previous_epoch.is_some_and(|epoch| epoch > manifest.writer_epoch) {
+                return Err(Error::io("rollout writer epoch moved backwards"));
+            }
+            let cutoff = if previous_epoch != Some(manifest.writer_epoch) {
+                // A restarted/fenced writer can replay already-published WAL
+                // bytes into a NEW generation when its flush cursor lagged.
+                // Generation watermarks alone cannot identify those rows.
+                // Protect the active generation too: planning may observe an
+                // epoch claim before the recovered memtable is flushed.
+                let high = manifest
+                    .flushed_generations
+                    .iter()
+                    .map(|g| g.generation)
+                    .max()
+                    .unwrap_or(0)
+                    .max(manifest.current_generation)
+                    .max(previous_cutoff.unwrap_or(0));
+                cutovers.insert(key, high.to_string());
+                cutovers.insert(epoch_key, manifest.writer_epoch.to_string());
+                high
+            } else {
+                previous_cutoff.unwrap_or(0)
             };
             let mut generations: Vec<_> = manifest
                 .flushed_generations
@@ -719,6 +750,80 @@ mod tests {
             0,
             "append merge must not build an ID index"
         );
+    }
+
+    #[tokio::test]
+    async fn restarted_writer_replay_is_filtered_even_before_its_first_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut a = writer(uri, "a").await;
+        let mut coordinator = AppendCoordinator::open(uri, None).await.unwrap();
+        for id in ["first", "tail"] {
+            put(&a, id, 4096).await;
+            let (plans, _) = coordinator
+                .plan(&["a".into()], 64, 1024 * 1024)
+                .await
+                .unwrap();
+            let part = stage(uri, plans[0].clone(), budget(), None).await.unwrap();
+            coordinator.commit(vec![part]).await.unwrap();
+        }
+        a.close().await.unwrap();
+        assert_eq!(rows(uri).await, 2);
+        let shard = derive_shard_id(Some("a"));
+        let store = shard_store(&coordinator.dataset, shard).await.unwrap();
+        let before = store.read_latest().await.unwrap().unwrap();
+        // Reproduce a persisted replay cursor lagging the last durable flush.
+        // The WAL bytes survive a merge; reopening can replay the old tail into
+        // a NEW generation even though its original generation was committed.
+        store
+            .commit_update(before.writer_epoch, |current| {
+                let mut next = current.clone();
+                next.version += 1;
+                next.replay_after_wal_entry_position = 1;
+                next
+            })
+            .await
+            .unwrap();
+        let mut restarted = writer(uri, "a").await;
+        restarted
+            .add(&[artifact_record("new", &[42; 4096])])
+            .await
+            .unwrap();
+        let opened = store.read_latest().await.unwrap().unwrap();
+        assert!(opened.writer_epoch > before.writer_epoch);
+        assert!(opened.flushed_generations.is_empty());
+        // Planning may observe the new epoch before its replay memtable flushes.
+        // It must protect that active generation, not only the empty disk prefix.
+        let (empty, _) = coordinator
+            .plan(&["a".into()], 64, 1024 * 1024)
+            .await
+            .unwrap();
+        assert!(empty.is_empty());
+        restarted.flush().await.unwrap();
+        let (plans, _) = coordinator
+            .plan(&["a".into()], 64, 1024 * 1024)
+            .await
+            .unwrap();
+        let part = stage(uri, plans[0].clone(), budget(), None).await.unwrap();
+        assert_eq!(
+            part.rows, 1,
+            "the already committed replay tail must be excluded"
+        );
+        coordinator.commit(vec![part]).await.unwrap();
+        assert_eq!(rows(uri).await, 3);
+        put(&restarted, "steady", 4096).await;
+        let (plans, _) = coordinator
+            .plan(&["a".into()], 64, 1024 * 1024)
+            .await
+            .unwrap();
+        assert!(
+            plans[0].generations[0].number > plans[0].legacy_through,
+            "the same writer epoch must return to the lookup-free append path"
+        );
+        let part = stage(uri, plans[0].clone(), budget(), None).await.unwrap();
+        coordinator.commit(vec![part]).await.unwrap();
+        assert_eq!(rows(uri).await, 4);
+        restarted.close().await.unwrap();
     }
 
     #[derive(Debug)]
