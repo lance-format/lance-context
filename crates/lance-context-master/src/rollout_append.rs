@@ -129,10 +129,14 @@ pub(crate) async fn run(state: &Arc<MasterState>, target: &str) -> Result<String
     let mut seen = HashSet::new();
     // Capability probing is cheap and bounded; never send a new protocol RPC to
     // an older worker and silently fall back to its manifest-publishing merge.
+    // Dedicated Jobs contribute their own CPU/memory. The ordinary master
+    // remains metadata-only; it never falls back to local payload processing.
+    let dedicated = state.config.catchup.target.is_some();
     let probe_futures: Vec<_> = state
         .config
         .worker_endpoints
         .iter()
+        .filter(|_| !dedicated)
         .cloned()
         .map(|endpoint| {
             let client = state.http.clone();
@@ -187,7 +191,7 @@ pub(crate) async fn run(state: &Arc<MasterState>, target: &str) -> Result<String
             shards.push(shard.clone());
         }
     }
-    if endpoints.is_empty() {
+    if endpoints.is_empty() && !dedicated {
         return Err("no staging workers available".into());
     }
     let mut coordinator = AppendCoordinator::open(
@@ -230,24 +234,40 @@ async fn run_pass(
         )
         .await
         .map_err(|e| e.to_string())?;
+    let local = state.config.catchup.target.as_ref().map(|_| {
+        (
+            lance_context_core::MergeMemoryBudget::new(state.config.catchup.merge_memory_bytes),
+            lance_context_core::RolloutStore::build_session(96 * 1024 * 1024, 32 * 1024 * 1024),
+        )
+    });
     let stage_futures: Vec<_> = plans.into_iter().enumerate().map(|(i, plan)| {
         let client = state.http.clone();
-        let endpoint = endpoints[i % endpoints.len()].clone();
-        let fallback = endpoints[(i + 1) % endpoints.len()].clone();
+        let routes = (!endpoints.is_empty()).then(|| (
+            endpoints[i % endpoints.len()].clone(), endpoints[(i + 1) % endpoints.len()].clone()));
         let target = target.to_owned();
+        let uri = state.rollout_uri(&target);
+        let local = local.clone();
         async move {
-            match stage_remote(&client, &endpoint, &target, plan.clone()).await {
-                Ok(part) => Ok(part),
-                Err(error) => {
-                    tracing::warn!(%target, %endpoint, %error, "retrying immutable staging on another worker");
-                    stage_remote(&client, &fallback, &target, plan).await
+            let result = if let Some((budget, session)) = local {
+                lance_context_core::rollout_append::stage(&uri, plan.clone(), budget, Some(session))
+                    .await.map_err(|e| e.to_string())
+            } else {
+                let (endpoint, fallback) = routes.expect("ordinary master requires staging endpoints");
+                match stage_remote(&client, &endpoint, &target, plan.clone()).await {
+                    Ok(part) => Ok(part),
+                    Err(error) => {
+                        tracing::warn!(%target, %endpoint, %error, "retrying immutable staging on another worker");
+                        stage_remote(&client, &fallback, &target, plan.clone()).await
+                    }
                 }
-            }
+            };
+            result.map_err(|error| (plan, error))
         }.boxed()
     }).collect();
     let mut work = stream::iter(stage_futures).buffer_unordered(config.rollout_append_concurrency);
     let mut group = Vec::new();
     let mut errors = Vec::new();
+    let mut memory_retries = Vec::new();
     let mut flush = tokio::time::Instant::now() + Duration::from_secs(2);
     loop {
         tokio::select! {
@@ -256,7 +276,11 @@ async fn run_pass(
                     if group.is_empty() { flush = tokio::time::Instant::now() + Duration::from_secs(2); }
                     group.push(part);
                 },
-                Some(Err(error)) => errors.push(error),
+                Some(Err((plan, error))) => {
+                    if local.is_some() && error.contains("merge memory budget busy while reading first generation; retry") {
+                        memory_retries.push(plan);
+                    } else { errors.push(error); }
+                },
                 None => break,
             },
             _ = tokio::time::sleep_until(flush), if !group.is_empty() => {},
@@ -272,6 +296,27 @@ async fn run_pass(
     }
     if !group.is_empty() {
         reclaimed += coordinator.commit(group).await.map_err(|e| e.to_string())?;
+    }
+    // Every speculative reader has now dropped its reservation. Retry an
+    // indivisible oversized generation once alone, without Job-level backoff.
+    for plan in memory_retries {
+        let (budget, session) = local.as_ref().unwrap();
+        match lance_context_core::rollout_append::stage(
+            &state.rollout_uri(target),
+            plan,
+            budget.clone(),
+            Some(session.clone()),
+        )
+        .await
+        {
+            Ok(part) => {
+                reclaimed += coordinator
+                    .commit(vec![part])
+                    .await
+                    .map_err(|e| e.to_string())?
+            }
+            Err(error) => errors.push(error.to_string()),
+        }
     }
     metrics::counter!("master_rollout_append_generations_reclaimed_total")
         .increment(reclaimed as u64);
@@ -460,5 +505,74 @@ mod tests {
             "one actual progress update plus completion"
         );
         server.abort();
+    }
+    #[tokio::test]
+    async fn dedicated_job_uses_its_own_memory_for_oversized_generations() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir
+            .path()
+            .join("hot.rollout.lance")
+            .to_string_lossy()
+            .to_string();
+        for shard in ["a", "b"] {
+            let store = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    shard_id: Some(shard.into()),
+                    merge_after_generations: Some(0),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let dto = serde_json::from_value(
+                json!({"id":shard,"rollout_id":"r","content":"x".repeat(2 * 1024 * 1024)}),
+            )
+            .unwrap();
+            store
+                .add(&[lance_context_core::rollout_record_from_add_request(&dto)])
+                .await
+                .unwrap();
+            store.flush().await.unwrap();
+        }
+        let mut config = crate::config::MasterConfig::parse_from([
+            "test",
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+        ]);
+        config.catchup.target = Some("hot".into());
+        config.catchup.job_name = Some("append-fixture".into());
+        config.catchup.shards = vec!["a".into(), "b".into()];
+        config.catchup.merge_max_bytes = 1024 * 1024;
+        config.catchup.merge_memory_bytes = 3 * 1024 * 1024;
+        config.append.rollout_append_concurrency = 2;
+        config.append.rollout_append_max_bytes = 1024 * 1024;
+        // No worker endpoints: this dedicated Pod must actually add compute.
+        let state = MasterState::new(config).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(30), run(&state, "hot"))
+                .await
+                .unwrap()
+                .unwrap()
+                .contains("2 generations")
+        );
+        assert_eq!(
+            lance::Dataset::open(&uri)
+                .await
+                .unwrap()
+                .count_rows(None)
+                .await
+                .unwrap(),
+            2
+        );
+        let store = RolloutStore::open_existing_with_options(&uri, RolloutStoreOptions::default())
+            .await
+            .unwrap();
+        for id in ["a", "b"] {
+            assert_eq!(
+                store.get_by_id(id).await.unwrap().unwrap().content.unwrap(),
+                "x".repeat(2 * 1024 * 1024)
+            );
+        }
     }
 }

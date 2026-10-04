@@ -35,9 +35,13 @@ advertised stable worker identities and additional `CATCHUP_SHARDS`. Unavailable
 workers are skipped during staging admission; healthy workers can process their
 WAL. An explicit incompatible capability response rejects the new protocol. Any compatible
 worker can stage immutable generations from any shard; it does not claim its epoch.
-Dedicated catch-up executors receive these settings and worker endpoints through
-the generated Job. Both normal master merges and catch-up executions use the
-same publisher under the existing maintenance ownership protocol.
+Dedicated catch-up executors receive these settings through the generated Job
+and perform parallel staging with their own CPU and shared catch-up memory budget;
+they do not send their data work back to ordinary workers. A speculative read
+which cannot grow its reservation retries once alone after other readers finish.
+Both normal master merges and catch-up executions use the same publisher under
+the existing maintenance ownership protocol. The ordinary master never reads WAL
+payloads locally, including when no remote worker is available.
 
 ## Commit and recovery
 
