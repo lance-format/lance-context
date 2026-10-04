@@ -64,3 +64,31 @@ correctness comparisons. All measured responses are checked against expected
 IDs and values. The example logs only timing, byte counts and status. An
 existing fixture is fully scanned to establish expected rows, so use a
 bounded test fixture.
+
+## Local results, 2026-10-04
+
+ARM64 shared host, unoptimized debug build, local filesystem, warm caches;
+no concurrent build from this task during measurement. One warmup and five
+measured calls per case. Times below include complete row materialization.
+The private conversation fixture contains 721 rows, all merged into base;
+its contents are not included. The synthetic fixture has 2,048 rows and two
+pending generations, including overlapping replacements.
+
+| Fixture | IDs | Legacy IN P50 (ms) | Batch P50 (ms) | Batch P95 (ms) | ID-only batch P50 (ms) |
+|---|---:|---:|---:|---:|---:|
+| Conversation, base | 1 | 11.94 | 10.18 | 10.41 | 8.65 |
+| Conversation, base | 32 | 231.40 | 13.34 | 13.89 | 10.48 |
+| Conversation, base | 512 | 3,703.85 | 42.35 | 42.89 | 18.87 |
+| Synthetic, base + WAL | 1 | 21.85 | 18.12 | 19.43 | 14.61 |
+| Synthetic, base + WAL | 32 | 523.33 | 20.00 | 20.45 | 18.45 |
+| Synthetic, base + WAL | 512 | 7,892.15 | 49.42 | 50.51 | 40.83 |
+
+The 512-row full responses were 831,557 bytes and 1,063,425 bytes respectively,
+identical between legacy and batch lookup. Every measured response matched
+expected rows; ID-only reads were checked separately. These are small,
+warm-cache fixtures, not object-storage latency or ingestion-throughput
+measurements; five samples do not characterize production tail latency.
+
+Validation: 21 core generic-store tests and 10 generic HTTP route tests passed,
+including a live HTTP/Rust-client round trip. Clippy passed for core, API,
+client, server, and the facade with remote support (`--all-targets -D warnings`).
