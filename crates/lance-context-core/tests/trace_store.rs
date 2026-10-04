@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use std::collections::BTreeSet;
 
 use lance_context_api::MAX_BATCH_GET_IDS;
