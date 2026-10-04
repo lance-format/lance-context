@@ -444,7 +444,7 @@ mod tests {
             }),
         );
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let scope = lance_context_core::merge_write_scope::MergeWriteScope::default();
+        let scope = Arc::new(lance_context_core::merge_write_scope::MergeWriteScope::default());
         scope
             .run(stage_remote(
                 &reqwest::Client::new(),

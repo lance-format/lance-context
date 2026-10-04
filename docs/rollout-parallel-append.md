@@ -3,7 +3,8 @@
 Rollout rows are immutable and their IDs are never reused for different records.
 This opt-in path moves WAL reading, encoding and immutable file uploads to workers,
 then publishes several workers' files in one base-table transaction on the master.
-Generic/context stores retain their existing keyed merge behavior.
+Generic/context stores retain their existing keyed merge behavior. Staging requires
+Lance V2 files, whose dictionary encodings are local to each file.
 
 ## Configuration
 
@@ -107,3 +108,29 @@ arriving between stage and publication, duplicate results, partial stale prefixe
 byte bounds, legacy append-without-drain migration, restart after base publication,
 and fallback through the existing merge implementation. Master HTTP tests require
 two workers to reach a barrier together, catching accidental serial fan-out.
+
+A local ARM64 debug-build benchmark (Lance 9.0.0, one process, local filesystem)
+used four shards × eight generations × sixteen 8-KiB payload rows, about 4 MiB per
+fixture. Two fresh fixtures per variant, with the second order reversed, produced:
+
+| Merge path | Mean time | Generations/s | Base version increments |
+| --- | --- | --- | --- |
+| Existing serial keyed merge | 1.141 s | 28.0 | 11 |
+| Four concurrent stages + combined append | 0.724 s | 44.2 | 2 |
+
+Both variants consume the same 32 generations and verify all 512 final IDs and
+payloads, with no duplicate base rows. The append path's two versions are the
+one-time cutover metadata commit and one combined data/watermark commit.
+This is approximately 1.58× throughput for this small synthetic workload, not an
+Azure or multi-Pod production throughput measurement. Large-blob and highly
+fragmented tables still need deployment-environment measurements.
+
+Run the opt-in benchmark with:
+
+```bash
+ROLLOUT_APPEND_BENCH=1 cargo test -p lance-context-core --lib \
+  benchmark_rollout_parallel_append -- --ignored --nocapture
+```
+
+`ROLLOUT_APPEND_BENCH_ROOT` optionally selects a scratch object-store prefix. Each
+fixture creates a new UUID subdirectory; it never scans an existing table.

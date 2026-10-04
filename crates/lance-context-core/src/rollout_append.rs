@@ -171,6 +171,11 @@ impl AppendCoordinator {
         let dataset = StorageBase::load_with_options(uri, None, session).await?;
         let actual: Schema = dataset.schema().into();
         let expected = crate::rollout_schema();
+        if dataset.manifest().should_use_legacy_format() {
+            return Err(Error::invalid_input(
+                "rollout staging requires Lance V2 files",
+            ));
+        }
         if actual != expected {
             return Err(Error::invalid_input(
                 "rollout append requires the current rollout schema",
@@ -320,7 +325,9 @@ impl AppendCoordinator {
                 compare_field_ids: true,
                 ..Default::default()
             };
-            if Schema::from(snapshot.schema()) != Schema::from(self.dataset.schema())
+            if snapshot.manifest().data_storage_format.version
+                != self.dataset.manifest().data_storage_format.version
+                || Schema::from(snapshot.schema()) != Schema::from(self.dataset.schema())
                 || snapshot
                     .schema()
                     .check_compatible(self.dataset.schema(), &options)
@@ -418,6 +425,11 @@ pub async fn stage(
         .checkout_version(plan.base_version)
         .await?;
     let schema: Arc<Schema> = Arc::new(dataset.schema().into());
+    if dataset.manifest().should_use_legacy_format() {
+        return Err(Error::invalid_input(
+            "rollout staging requires Lance V2 files",
+        ));
+    }
     if *schema != crate::rollout_schema() {
         return Err(Error::invalid_input("staging requires a rollout schema"));
     }
