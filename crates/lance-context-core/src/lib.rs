@@ -20,6 +20,7 @@ mod record;
 mod registry;
 mod registry_etcd;
 mod rollout;
+pub mod rollout_append;
 mod rollout_store;
 pub mod serde;
 mod storage;

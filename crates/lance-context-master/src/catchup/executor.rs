@@ -79,6 +79,9 @@ pub async fn execute(mut config: MasterConfig, target: &str) -> Result<()> {
 }
 
 async fn merge_passes(state: &Arc<MasterState>, target: &str) -> Result<String> {
+    if state.config.append.enabled(target) {
+        return crate::rollout_append::run(state, target).await;
+    }
     let config = &state.config.catchup;
     let session = RolloutStore::build_session(96 * 1024 * 1024, 32 * 1024 * 1024);
     let budget = MergeMemoryBudget::new(config.merge_memory_bytes);

@@ -6,6 +6,7 @@ pub mod discovery;
 pub mod error;
 mod maintenance_execution;
 mod merge_execution;
+pub mod rollout_append;
 pub mod routes;
 pub mod scanner;
 pub mod scheduler;

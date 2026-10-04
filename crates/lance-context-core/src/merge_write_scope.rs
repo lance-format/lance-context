@@ -21,6 +21,12 @@ use std::{
 use tokio::sync::{oneshot, Notify};
 
 tokio::task_local! { static CURRENT: Arc<MergeWriteScope>; }
+tokio::task_local! { static EXPECTED_BASE_VERSION: u64; }
+
+/// Pin the next publication without replacing a dataset's captured owner guard.
+pub(crate) async fn at_base_version<F: Future>(version: u64, work: F) -> F::Output {
+    EXPECTED_BASE_VERSION.scope(version, work).await
+}
 
 #[derive(Debug, Default)]
 struct Progress {
@@ -114,8 +120,24 @@ impl MergeWriteScope {
 
 /// Count completed work, never timer ticks or admission attempts. This is a
 /// stall diagnostic, not evidence that WAL has been durably reclaimed.
-pub(crate) fn checkpoint() {
+pub fn checkpoint() {
     let _ = CURRENT.try_with(|scope| scope.completed_steps.fetch_add(1, Ordering::Relaxed));
+}
+
+/// Capture progress explicitly for Lance callbacks which can run on another task.
+pub(crate) fn write_progress() -> lance::dataset::write::WriteProgressFn {
+    let scope = CURRENT.try_with(Arc::clone).ok();
+    let previous = std::sync::Mutex::new((0u64, 0u64, 0u32));
+    lance::dataset::write::WriteProgressFn::new(move |stats| {
+        let current = (stats.bytes_written, stats.rows_written, stats.files_written);
+        let mut old = previous.lock().unwrap();
+        if current.0 > old.0 || current.1 > old.1 || current.2 > old.2 {
+            *old = current;
+            if let Some(scope) = &scope {
+                scope.completed_steps.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    })
 }
 
 pub(crate) async fn authorize(resource: &str, version: u64) -> Result<()> {
@@ -392,6 +414,12 @@ impl CommitHandler for GuardedCommit {
         transaction: Option<Transaction>,
     ) -> std::result::Result<ManifestLocation, CommitError> {
         let work = async {
+            if EXPECTED_BASE_VERSION
+                .try_with(|version| manifest.version != *version)
+                .unwrap_or(false)
+            {
+                return Err(CommitError::CommitConflict);
+            }
             authorize("base", manifest.version).await?;
             let inner = self.inner.clone();
             let mut owned_manifest = manifest.clone();

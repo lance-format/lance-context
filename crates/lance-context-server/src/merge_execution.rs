@@ -142,6 +142,8 @@ pub async fn capabilities(
         "queue_timeout_secs": state.merge_executions.queue_timeout_secs,
         "idle_timeout_secs": state.merge_executions.idle_timeout_secs,
         "progress_protocol": 1,
+        "rollout_append_protocol": 1,
+        "shard_name": state.instance_id,
         "owned_targets": state.merge_executions.rollout.owned_targets,
         "drain_targets": state.merge_executions.rollout.drain_targets}),
     ))
@@ -817,5 +819,175 @@ mod tests {
         assert!(coordinator.release(&proof, &done).await.unwrap());
         server.abort();
         client.delete(proof.key, None).await.unwrap();
+    }
+}
+
+/// This endpoint only writes unreachable immutable files. Dropping its HTTP
+/// body cancels preparation; there is no detached manifest publisher to fence.
+pub async fn stage_append(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    Json(plan): Json<lance_context_core::rollout_append::AppendPlan>,
+) -> Result<axum::response::Response, AppError> {
+    use axum::response::IntoResponse;
+    use lance_context_core::{
+        merge_write_scope::MergeWriteScope,
+        rollout_append::{stage, StageEvent},
+    };
+    lance_context_core::validate_store_name(&name).map_err(AppError::InvalidRequest)?;
+    plan.validate().map_err(AppError::from_lance)?;
+    if !state.merge_executions.owned(&name) || state.merge_executions.rollout.draining(&name) {
+        return Err(AppError::Overloaded(
+            "staged append requires an owned, non-draining rollout".into(),
+        ));
+    }
+    let budget = state.merge_budget.clone().ok_or_else(|| {
+        AppError::Overloaded("staged append requires a shared merge memory budget".into())
+    })?;
+    if state.rollout_merge_max_bytes == 0 || plan.max_bytes > state.rollout_merge_max_bytes {
+        return Err(AppError::InvalidRequest(
+            "staged append exceeds worker byte limit".into(),
+        ));
+    }
+    let scope = Arc::new(MergeWriteScope::default());
+    let worker_scope = scope.clone();
+    let idle = Duration::from_secs(state.merge_executions.idle_timeout_secs);
+    let work = Box::pin(async move {
+        let _slot = state.acquire_merge_slot().await;
+        worker_scope
+            .run(stage(
+                &state.rollout_uri(&name),
+                plan,
+                budget,
+                state.rollout_session.clone(),
+            ))
+            .await
+    });
+    let stream = futures::stream::unfold(
+        Some((work, scope, 0, tokio::time::Instant::now())),
+        move |next| async move {
+            let (mut work, scope, mut sequence, mut changed) = next?;
+            let event = tokio::select! {
+                result = &mut work => match result {
+                    Ok(part) => StageEvent::Complete(part),
+                    Err(error) => StageEvent::Failed(error.to_string()),
+                },
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                    let current = scope.completed_steps();
+                    if current > sequence { sequence = current; changed = tokio::time::Instant::now(); }
+                    if changed.elapsed() >= idle { StageEvent::Failed("staged append made no progress".into()) }
+                    else { StageEvent::Progress(sequence) }
+                }
+            };
+            let terminal = !matches!(event, StageEvent::Progress(_));
+            let mut bytes = serde_json::to_vec(&event).expect("serializable stage event");
+            bytes.push(b'\n');
+            let next = if terminal {
+                None
+            } else {
+                Some((work, scope, sequence, changed))
+            };
+            Some((Ok::<_, std::convert::Infallible>(bytes), next))
+        },
+    );
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/x-ndjson")],
+        axum::body::Body::from_stream(stream),
+    )
+        .into_response())
+}
+
+#[cfg(test)]
+mod append_tests {
+    use super::*;
+    use axum::{
+        body::{to_bytes, Body},
+        http::Request,
+    };
+    use lance_context_core::{
+        rollout_append::{AppendCoordinator, StageEvent},
+        MergeMemoryBudget, RolloutStore, RolloutStoreOptions,
+    };
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn staging_http_writes_only_files_and_uses_shared_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state =
+            AppState::new_for_test_with_instance(dir.path().to_path_buf(), Some("a".into())).await;
+        state
+            .merge_executions
+            .rollout
+            .owned_targets
+            .push("hot".into());
+        state.merge_budget = Some(MergeMemoryBudget::new(4 * 1024 * 1024));
+        let uri = state.rollout_uri("hot");
+        let store = RolloutStore::open_with_options(
+            &uri,
+            RolloutStoreOptions {
+                shard_id: Some("a".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let dto = serde_json::from_value(
+            serde_json::json!({"id":"a", "rollout_id":"r", "content":"hello"}),
+        )
+        .unwrap();
+        store
+            .add(&[lance_context_core::rollout_record_from_add_request(&dto)])
+            .await
+            .unwrap();
+        store.flush().await.unwrap();
+        let mut coordinator = AppendCoordinator::open(&uri, None).await.unwrap();
+        let plan = coordinator
+            .plan(&["a".into()], 1, 1024 * 1024)
+            .await
+            .unwrap()
+            .0
+            .remove(0);
+        let version = coordinator.version();
+        let state = Arc::new(state);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/internal/rollout-append/hot")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&plan).unwrap()))
+            .unwrap();
+        let response = crate::routes::router()
+            .with_state(state.clone())
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap();
+        let event: StageEvent = serde_json::from_slice(
+            body.split(|b| *b == b'\n')
+                .rfind(|line| !line.is_empty())
+                .unwrap(),
+        )
+        .unwrap();
+        let StageEvent::Complete(part) = event else {
+            panic!("staging failed: {event:?}")
+        };
+        assert_eq!(part.rows, 1);
+        assert_eq!(state.merge_budget.as_ref().unwrap().reserved(), 0);
+        assert_eq!(
+            lance::Dataset::open(&uri).await.unwrap().version().version,
+            version
+        );
+        assert_eq!(
+            lance::Dataset::open(&uri)
+                .await
+                .unwrap()
+                .count_rows(None)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(coordinator.commit(vec![part]).await.unwrap(), 1);
     }
 }

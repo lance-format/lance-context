@@ -12,6 +12,8 @@ pub struct MasterConfig {
     pub maintenance: MaintenanceConfig,
     #[command(flatten)]
     pub catchup: crate::catchup::CatchupConfig,
+    #[command(flatten)]
+    pub append: crate::rollout_append::AppendConfig,
     /// Data directory / object-store prefix shared with the data-plane server.
     #[arg(long, env = "DATA_DIR", default_value = "./data")]
     pub data_dir: String,

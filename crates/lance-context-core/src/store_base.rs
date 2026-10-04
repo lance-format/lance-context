@@ -961,6 +961,24 @@ impl StorageBase {
     /// **older** than the stored one. Reusing the shard's current epoch commits
     /// the drain and leaves the live writer untouched.
     async fn prepare_merge(&self, manifest: &ShardManifest) -> LanceResult<Option<PreparedMerge>> {
+        // A staged append publishes its recovery watermark atomically with its
+        // files. Honor it even when returning to the legacy merge implementation.
+        let latest = Self::load_with_options(
+            self.uri(),
+            self.storage_options.clone(),
+            self.session.clone(),
+        )
+        .await?;
+        crate::rollout_append::reconcile_shard(&latest, self.write_shard).await?;
+        let marks = crate::rollout_append::watermarks(&latest).await?;
+        let mut manifest = manifest.clone();
+        if let Some(high) = marks.get(&self.write_shard) {
+            manifest
+                .flushed_generations
+                .retain(|g| g.generation > *high);
+        }
+        manifest.flushed_generations.sort_by_key(|g| g.generation);
+        let manifest = &manifest;
         if manifest.flushed_generations.is_empty() {
             return Ok(None);
         }
@@ -1044,11 +1062,28 @@ impl StorageBase {
         // before retrying, including generic stores without schema evolution.
         self.refresh_latest().await?;
         self.ensure_latest_schema().await?;
+        if crate::rollout_append::watermarks(&self.dataset)
+            .await?
+            .get(&self.write_shard)
+            .is_some_and(|high| merged_generations.iter().any(|g| g <= high))
+        {
+            return Err(LanceError::io(
+                "prepared merge overlaps committed rollout watermark; reprepare",
+            ));
+        }
 
+        let watermark = if crate::rollout_append::has_cutover(&self.dataset, self.write_shard) {
+            merged_generations
+                .iter()
+                .max()
+                .map(|high| lance_index::mem_wal::MergedGeneration::new(self.write_shard, *high))
+        } else {
+            None
+        };
         if !batches.is_empty() {
             observe_phase!(
                 "append",
-                Box::pin(self.merge_prepared_batches(batches, merge_schema)).await
+                Box::pin(self.merge_prepared_batches(batches, merge_schema, watermark)).await
             )?;
             self.pinned_version = None;
         }
@@ -1281,6 +1316,7 @@ impl StorageBase {
         &mut self,
         batches: Vec<RecordBatch>,
         merge_schema: Arc<Schema>,
+        watermark: Option<lance_index::mem_wal::MergedGeneration>,
     ) -> LanceResult<()> {
         observe_phase!("index", self.ensure_merge_key_index().await)?;
         let key_index = merge_schema.index_of(&self.key_column)?;
@@ -1331,11 +1367,30 @@ impl StorageBase {
             self.dataset = Arc::unwrap_or_clone(dataset);
         }
 
-        let reader = RecordBatchIterator::new(
-            batches.into_iter().map(Ok::<RecordBatch, ArrowError>),
-            merge_schema,
-        );
-        Box::pin(self.dataset.append(reader, None)).await?;
+        if let Some(watermark) = watermark {
+            let params = WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            };
+            let staged = lance::dataset::InsertBuilder::new(Arc::new(self.dataset.clone()))
+                .with_params(&params)
+                .execute_uncommitted(batches)
+                .await?;
+            let lance::dataset::transaction::Operation::Append { fragments } = staged.operation
+            else {
+                return Err(LanceError::io(
+                    "legacy fallback did not stage append fragments",
+                ));
+            };
+            crate::rollout_append::commit_files(&mut self.dataset, fragments, vec![watermark])
+                .await?;
+        } else {
+            let reader = RecordBatchIterator::new(
+                batches.into_iter().map(Ok::<RecordBatch, ArrowError>),
+                merge_schema,
+            );
+            Box::pin(self.dataset.append(reader, None)).await?;
+        }
         Ok(())
     }
 

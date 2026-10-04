@@ -235,6 +235,23 @@ pub(super) fn render_job(config: &MasterConfig, record: &Record, mut spec: Value
     }
     let overrides = [
         ("DATA_DIR", config.data_dir.clone()),
+        ("WORKER_ENDPOINTS", config.worker_endpoints.join(",")),
+        (
+            "ROLLOUT_APPEND_TARGETS",
+            config.append.rollout_append_targets.join(","),
+        ),
+        (
+            "ROLLOUT_APPEND_CONCURRENCY",
+            config.append.rollout_append_concurrency.to_string(),
+        ),
+        (
+            "ROLLOUT_APPEND_MAX_GENERATIONS",
+            config.append.rollout_append_max_generations.to_string(),
+        ),
+        (
+            "ROLLOUT_APPEND_MAX_BYTES",
+            config.append.rollout_append_max_bytes.to_string(),
+        ),
         (
             "ROLLOUT_KEY_INDEX_TYPE",
             config.key_index_type.as_str().into(),

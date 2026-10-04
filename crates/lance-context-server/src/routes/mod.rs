@@ -30,6 +30,10 @@ pub fn router() -> Router<Arc<AppState>> {
             "/api/v1/internal/merge-executor/cancel",
             post(crate::merge_execution::cancel),
         )
+        .route(
+            "/api/v1/internal/rollout-append/{name}",
+            post(crate::merge_execution::stage_append),
+        )
         .route("/api/v1/health", get(health::health_check))
         .route("/api/v1/contexts", post(contexts::create_context))
         .route("/api/v1/contexts", get(contexts::list_contexts))

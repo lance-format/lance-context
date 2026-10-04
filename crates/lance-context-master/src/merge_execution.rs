@@ -59,6 +59,19 @@ pub(crate) async fn run_merge_wal(
         }
         return run_legacy(state, target).await;
     }
+    if state.config.append.enabled(target) {
+        if let Some(old) = coordinator.get(target).await? {
+            ensure_recovery_due(&coordinator, &old).await?;
+            recover_execution(state, &coordinator, &proof, old).await?;
+        }
+        return crate::maintenance_execution::run_as(
+            state,
+            claim,
+            lance_context_merge::MaintenanceKind::Catchup,
+            crate::rollout_append::run(state, target),
+        )
+        .await;
+    }
     // Reconcile/fence before any other table mutation. One retry of the fan-out
     // after a completed barrier lets healthy shards progress in this task.
     for recovery_round in 0..2 {

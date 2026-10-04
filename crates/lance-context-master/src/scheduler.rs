@@ -945,6 +945,7 @@ mod tests {
 
     fn config(dir: &TempDir) -> MasterConfig {
         MasterConfig {
+            append: Default::default(),
             catchup: Default::default(),
             maintenance: Default::default(),
             merge_rollout: lance_context_merge::rollout::MergeRollout {

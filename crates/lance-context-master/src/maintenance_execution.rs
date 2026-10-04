@@ -197,7 +197,7 @@ where
                 .catchup
                 .job_name
                 .as_deref()
-                .ok_or("missing catch-up Job identity")?
+                .unwrap_or(&claim.task.id)
         } else {
             &claim.task.id
         },
