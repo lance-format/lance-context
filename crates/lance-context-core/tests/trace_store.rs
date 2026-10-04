@@ -87,7 +87,13 @@ async fn late_turns_variants_and_replays_survive_merge_and_restart() {
             .len(),
         4
     );
-    assert_eq!(store.get_many(&[other.id.clone()]).await.unwrap(), [other]);
+    assert_eq!(
+        store
+            .get_many(std::slice::from_ref(&other.id))
+            .await
+            .unwrap(),
+        [other]
+    );
     store.into_generic().close().await.unwrap();
     assert_eq!(
         std::fs::read_dir(dir.path()).unwrap().count(),
