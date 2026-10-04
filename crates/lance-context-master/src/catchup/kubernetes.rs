@@ -242,9 +242,17 @@ pub(super) fn render_job(config: &MasterConfig, record: &Record, mut spec: Value
         ("ETCD_ENDPOINTS", config.etcd.etcd_endpoints.join(",")),
         ("ETCD_PREFIX", config.etcd.etcd_prefix.clone()),
         ("CATCHUP_ENABLED", "false".into()),
+        (
+            "CATCHUP_PIPELINE_ENABLED",
+            config.catchup.pipeline_enabled.to_string(),
+        ),
         ("CATCHUP_TARGET", record.target.clone()),
         ("CATCHUP_JOB_NAME", record.job.clone()),
         ("CATCHUP_SHARDS", shards.join(",")),
+        (
+            "CATCHUP_MERGE_MAX_GENERATIONS",
+            config.catchup.merge_max_generations.to_string(),
+        ),
         (
             "CATCHUP_MERGE_MAX_BYTES",
             config.catchup.merge_max_bytes.to_string(),

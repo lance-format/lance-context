@@ -40,14 +40,25 @@ still apply. It does not enable owned targets or restart production workers.
 
 Defaults: four Jobs cluster-wide, 256 pending generations, a 30-second scan
 interval, and stats no older than 900 seconds. A Job has one container, one table,
-serial shard visits, no Kubernetes retries, a 1800-second soft admission slice, a
+ordered shard commits, no Kubernetes retries, a 1800-second soft admission slice, a
 30-second termination grace period, and a 24-hour terminal retention period.
 The Job cannot preempt other Pods. CPU/memory requests must equal explicit
 limits. The sample reserves 2 CPUs and 8 GiB per Job (8 CPUs/32 GiB total at the
 default fleet cap); size these against available capacity before enabling.
 
-The native process uses a 128 MiB shared Lance cache, one merge at a time,
-eight generations and 64 MiB per batch, and a 1 GiB merge-buffer budget. These
+The native process uses a 128 MiB shared Lance cache, a single committer,
+64 generations (`CATCHUP_MERGE_MAX_GENERATIONS`) and 64 MiB per batch, and a
+1 GiB merge-buffer budget. Generation count and byte limits both apply; zero
+count disables only the count cap. Small generations can now share a commit
+instead of repeating index maintenance every eight generations.
+
+`CATCHUP_PIPELINE_ENABLED=true` (default) overlaps the next shard's preparation
+with the current shard's commit. At most two batches are preparing/retained,
+sharing the same memory budget. Commit and drain order remains shard order;
+no ordinary worker fan-out is made concurrent. A budget that only admits one
+batch falls back naturally to serial reads/commits. Set the flag to `false` and
+the generation cap to `8` for a comparison with the previous executor. Both
+settings are passed explicitly to new Jobs. These
 are buffering bounds, not a total RSS guarantee: one indivisible generation and
 Lance working memory can exceed the buffer bound. Kubernetes limits provide the
 final process bound. Validate real large generations before increasing concurrency.

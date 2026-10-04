@@ -45,6 +45,9 @@ pub struct CatchupConfig {
     /// Stable writer identities, not Pod IPs. Only sealed generations are merged.
     #[arg(long, env = "CATCHUP_SHARDS", value_delimiter = ',')]
     pub shards: Vec<String>,
+    /// Generation count cap in addition to the byte cap; zero disables this cap.
+    #[arg(long, env = "CATCHUP_MERGE_MAX_GENERATIONS", default_value_t = 64)]
+    pub merge_max_generations: usize,
     #[arg(long, env = "CATCHUP_MERGE_MAX_BYTES", default_value_t = 67_108_864)]
     pub merge_max_bytes: usize,
     #[arg(
@@ -53,6 +56,9 @@ pub struct CatchupConfig {
         default_value_t = 1_073_741_824
     )]
     pub merge_memory_bytes: usize,
+    /// Prepare the next shard while the current shard commits. Commits stay ordered.
+    #[arg(long, env = "CATCHUP_PIPELINE_ENABLED", default_value_t = true, action = clap::ArgAction::Set)]
+    pub pipeline_enabled: bool,
     /// Native one-table executor mode; does not start the admin server or scanner.
     #[arg(long, env = "CATCHUP_TARGET", hide = true)]
     pub target: Option<String>,
@@ -72,8 +78,10 @@ impl Default for CatchupConfig {
             slice_secs: 1800,
             startup_timeout_secs: 1800,
             shards: Vec::new(),
+            merge_max_generations: 64,
             merge_max_bytes: 67_108_864,
             merge_memory_bytes: 1_073_741_824,
+            pipeline_enabled: true,
             target: None,
             job_name: None,
         }

@@ -54,6 +54,8 @@ fn admission_requires_fresh_owned_pressure_even_for_manual_requests() {
 fn job_is_native_and_bounded_and_overrides_unsafe_inherited_mode() {
     let mut c = config();
     c.key_index_type = lance_context_core::KeyIndexType::Zonemap;
+    c.catchup.pipeline_enabled = false;
+    c.catchup.merge_max_generations = 32;
     let r = Record {
         target: "hot".into(),
         job: "lc-catchup-test".into(),
@@ -75,6 +77,8 @@ fn job_is_native_and_bounded_and_overrides_unsafe_inherited_mode() {
     let mut pod = template();
     pod["containers"][0]["env"] = json!([
         {"name":"CATCHUP_ENABLED","value":"true"},
+        {"name":"CATCHUP_PIPELINE_ENABLED","value":"true"},
+        {"name":"CATCHUP_MERGE_MAX_GENERATIONS","value":"8"},
         {"name":"ROLLOUT_KEY_INDEX_TYPE","value":"btree"}
     ]);
     pod["activeDeadlineSeconds"] = json!(1);
@@ -93,6 +97,14 @@ fn job_is_native_and_bounded_and_overrides_unsafe_inherited_mode() {
     let env = job["spec"]["template"]["spec"]["containers"][0]["env"]
         .as_array()
         .unwrap();
+    for (name, expected) in [
+        ("CATCHUP_PIPELINE_ENABLED", "false"),
+        ("CATCHUP_MERGE_MAX_GENERATIONS", "32"),
+    ] {
+        let matches: Vec<_> = env.iter().filter(|e| e["name"] == name).collect();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0]["value"], expected);
+    }
     assert_eq!(
         env.iter()
             .filter(|e| e["name"] == "ROLLOUT_KEY_INDEX_TYPE")
@@ -273,6 +285,12 @@ async fn policy_disagreement_cannot_expand_the_cluster_budget() {
 #[tokio::test]
 #[ignore = "requires ETCD_TEST_ENDPOINTS"]
 async fn native_executor_preserves_live_ingestion_and_drains_sealed_shards() {
+    for memory_bytes in [1024 * 1024, 2 * 1024 * 1024] {
+        native_executor_with_budget(memory_bytes).await;
+    }
+}
+
+async fn native_executor_with_budget(memory_bytes: usize) {
     use lance_context_core::{
         ColumnSpec, ColumnType, GenericStore, GenericStoreOptions, SchemaSpec,
     };
@@ -307,7 +325,11 @@ async fn native_executor_preserves_live_ingestion_and_drains_sealed_shards() {
                 .as_object()
                 .unwrap()
                 .clone();
-            writer.add(&[row]).await.unwrap();
+            let shared = json!({"id":"shared", "text":format!("{shard}-{generation}")})
+                .as_object()
+                .unwrap()
+                .clone();
+            writer.add(&[row, shared]).await.unwrap();
             writer.flush().await.unwrap();
         }
         writers.push(writer);
@@ -315,6 +337,10 @@ async fn native_executor_preserves_live_ingestion_and_drains_sealed_shards() {
     assert_eq!(writers[0].pending_wal_generations().await.unwrap(), 8);
     let mut cfg = state.config.clone();
     cfg.catchup.enabled = false;
+    // Exercise both overlapping reads and a budget that admits one batch.
+    // Prefetch must not block the commit that releases its reservation.
+    cfg.catchup.merge_max_bytes = 512 * 1024;
+    cfg.catchup.merge_memory_bytes = memory_bytes;
     cfg.merge_rollout.owned_targets.push(target.into());
     let decision = Inventory::new(&state)
         .reserve(target, "integration", 8, 100)
@@ -357,10 +383,14 @@ async fn native_executor_preserves_live_ingestion_and_drains_sealed_shards() {
         .unwrap();
     assert!(reader.pending_wal_generations().await.unwrap() <= 18);
     let rows = reader.list(None, None).await.unwrap();
-    assert_eq!(rows.len(), 26);
+    assert_eq!(rows.len(), 27);
+    assert_eq!(
+        rows.iter().find(|r| r["id"] == "shared").unwrap()["text"],
+        "worker-1-3"
+    );
     let ids: std::collections::HashSet<_> =
         rows.iter().map(|r| r["id"].as_str().unwrap()).collect();
-    assert_eq!(ids.len(), 26);
+    assert_eq!(ids.len(), 27);
     assert!(state
         .task_store
         .merge_coordinator()
@@ -501,4 +531,109 @@ async fn stale_progress_revoke_cannot_cancel_advancing_or_replaced_execution() {
         .finish(claim, Err("injected stall".into()))
         .await
         .unwrap();
+}
+
+/// Full native executor comparison; setup and verification are outside timing.
+/// Opt in explicitly so CI's ignored etcd suite does not run a benchmark.
+#[tokio::test]
+#[ignore = "manual benchmark: CATCHUP_BENCH=1 ETCD_TEST_ENDPOINTS required"]
+async fn benchmark_native_catchup_pipeline() {
+    if std::env::var("CATCHUP_BENCH").as_deref() != Ok("1") {
+        return;
+    }
+    use lance_context_core::{
+        ColumnSpec, ColumnType, GenericStore, GenericStoreOptions, SchemaSpec,
+    };
+    let workload = std::env::var("CATCHUP_BENCH_WORKLOAD").unwrap_or_else(|_| "updates".into());
+    assert!(["updates", "unique"].contains(&workload.as_str()));
+    for (pipeline, max_generations) in [
+        (false, 8),
+        (true, 8),
+        (true, 64),
+        (true, 64),
+        (true, 8),
+        (false, 8),
+    ] {
+        let (_dir, state) = fixture().await.unwrap();
+        let target = "generic:hot";
+        let uri = state.generic_uri("hot");
+        let spec = SchemaSpec::new(vec![
+            (
+                "id".into(),
+                ColumnSpec::required(ColumnType::String { large: false }),
+            ),
+            (
+                "text".into(),
+                ColumnSpec::new(ColumnType::String { large: true }),
+            ),
+        ]);
+        let shards: Vec<_> = (0..4).map(|i| format!("worker-{i}")).collect();
+        let mut writers = Vec::new();
+        for shard in &shards {
+            let writer = GenericStore::open(
+                &uri,
+                spec.clone(),
+                GenericStoreOptions {
+                    shard_id: Some(shard.clone()),
+                    merge_after_generations: Some(0),
+                    session: Some(lance_context_core::RolloutStore::build_session(
+                        32 << 20,
+                        32 << 20,
+                    )),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            for generation in 0..32 {
+                let rows: Vec<_> = (0..8).map(|id| {
+                    json!({"id": if workload == "updates" { format!("{shard}-{id}") } else { format!("{shard}-{generation}-{id}") }, "text": format!("{generation}:{}", "x".repeat(8192))})
+                        .as_object().unwrap().clone()
+                }).collect();
+                writer.add(&rows).await.unwrap();
+                writer.flush().await.unwrap();
+            }
+            writers.push(writer);
+        }
+        let pending = writers[0].pending_wal_generations().await.unwrap();
+        assert_eq!(pending, 128);
+        let mut cfg = state.config.clone();
+        cfg.catchup.enabled = false;
+        cfg.catchup.shards = shards;
+        cfg.catchup.pipeline_enabled = pipeline;
+        cfg.catchup.merge_max_generations = max_generations;
+        cfg.merge_rollout.owned_targets.push(target.into());
+        cfg.catchup.target = Some(target.into());
+        cfg.catchup.job_name = Inventory::new(&state)
+            .reserve(target, "benchmark", pending as i64, 100)
+            .await
+            .unwrap()
+            .job;
+        let started = std::time::Instant::now();
+        execute(cfg, target).await.unwrap();
+        let seconds = started.elapsed().as_secs_f64();
+        let reader = GenericStore::open_existing(&uri, GenericStoreOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(reader.pending_wal_generations().await.unwrap(), 0);
+        let rows = reader.list(None, None).await.unwrap();
+        let expected_rows = if workload == "updates" { 32 } else { 1024 };
+        assert_eq!(rows.len(), expected_rows);
+        for row in rows {
+            let generation = if workload == "updates" {
+                "31"
+            } else {
+                row["id"].as_str().unwrap().split('-').nth(2).unwrap()
+            };
+            assert_eq!(row["text"], format!("{generation}:{}", "x".repeat(8192)));
+        }
+        let base = lance::Dataset::open(&uri).await.unwrap();
+        assert_eq!(base.count_rows(None).await.unwrap(), expected_rows);
+        eprintln!(
+            "CATCHUP_BENCH {}",
+            json!({"workload":workload,"pipeline":pipeline,"max_generations":max_generations,
+            "seconds":seconds,"generations":pending,"generations_per_second":pending as f64 / seconds,
+            "base_version":base.version().version})
+        );
+    }
 }
