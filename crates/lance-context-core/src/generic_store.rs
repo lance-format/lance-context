@@ -334,6 +334,8 @@ impl GenericStore {
     /// Like `get`, reads include flushed WAL; deferred appends need `flush`.
     /// Reads retry a concurrent WAL merge, and fail rather than return partial
     /// results if the view cannot be stabilized. Pinned reads stay pinned.
+    /// A known Lance 9 WAL index error retries native point lookups against
+    /// the same captured view; that compatibility path is slower.
     pub async fn get_many(
         &self,
         ids: &[String],
@@ -363,20 +365,60 @@ impl GenericStore {
             .read_consistent(ListSource::All, |dataset, snapshots| {
                 let filter = &filter;
                 let columns = &columns;
+                let ids = &ids;
                 async move {
                     let scanner = StorageBase::lsm_scanner_for_dataset(
                         &dataset,
                         ID_COLUMN,
                         ListSource::All,
-                        snapshots,
+                        snapshots.clone(),
                     );
                     let scanner = batch_get_scanner(scanner, filter, columns)?;
-                    let mut stream = scanner.try_into_stream().await?;
-                    let mut rows = Vec::new();
-                    while let Some(batch) = stream.try_next().await? {
-                        rows.extend(batch_to_rows(&self.spec, &batch)?);
+                    let read = async {
+                        let mut stream = scanner.try_into_stream().await?;
+                        let mut rows = Vec::new();
+                        while let Some(batch) = stream.try_next().await? {
+                            rows.extend(batch_to_rows(&self.spec, &batch)?);
+                        }
+                        Ok::<_, LanceError>(rows)
                     }
-                    Ok(rows)
+                    .await;
+                    match read {
+                        Err(error)
+                            if error.to_string().contains(
+                                "RowAddrTreeMap::from_sorted_iter called with non-sorted input",
+                            ) =>
+                        {
+                            // Lance 9's batched WAL membership probe can reject
+                            // a PK sidecar that its point lookup can still read.
+                            // Discard partial results and retry all keys through
+                            // that native route against the SAME captured view.
+                            // Other errors propagate; no missing row is inferred
+                            // from a failed read. The outer consistency check
+                            // also covers this slower compatibility path.
+                            tracing::warn!(
+                                "batch get retrying native point lookups after a WAL PK index error"
+                            );
+                            let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+                            let mut rows = Vec::new();
+                            for id in ids {
+                                let scanner = StorageBase::lsm_scanner_for_dataset(
+                                    &dataset,
+                                    ID_COLUMN,
+                                    ListSource::All,
+                                    snapshots.clone(),
+                                )
+                                .project(&refs)?
+                                .filter_expr(col(ID_COLUMN).eq(lit(*id)));
+                                let mut stream = scanner.try_into_stream().await?;
+                                while let Some(batch) = stream.try_next().await? {
+                                    rows.extend(batch_to_rows(&self.spec, &batch)?);
+                                }
+                            }
+                            Ok(rows)
+                        }
+                        result => result,
+                    }
                 }
             })
             .await?;
@@ -727,6 +769,53 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reopened.get_many(&requested, None).await.unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn batch_get_reopened_writer_preserves_mutations_and_projection() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut store = GenericStore::open(uri, spec(), sealing()).await.unwrap();
+        let original: Vec<Row> = (0..64)
+            .map(|i| row(json!({"id": format!("r{i:03}"), "score": 1.0})))
+            .collect();
+        store.add(&original).await.unwrap();
+        store.cleanup_wal().await.unwrap();
+        store.create_id_index().await.unwrap();
+        store.close().await.unwrap();
+        let mut store = GenericStore::open_existing(uri, sealing()).await.unwrap();
+        // Reuse the writer through merge cycles, with different key subsets
+        // and row positions. Base rows and newly sealed WAL rows must agree.
+        for cycle in 0..3 {
+            let score = (cycle + 2) as f64;
+            let changed: Vec<Row> = (0..64)
+                .rev()
+                .filter(|i| i % 3 == cycle)
+                .map(|i| row(json!({"id": format!("r{i:03}"), "score": score})))
+                .collect();
+            store.add(&changed).await.unwrap();
+            let mut ids: Vec<String> = original
+                .iter()
+                .rev()
+                .map(|r| r["id"].as_str().unwrap().to_owned())
+                .collect();
+            ids.extend(["missing".into(), ids[0].clone()]);
+            let rows = store.get_many(&ids, Some(&["score".into()])).await.unwrap();
+            assert_eq!(rows.len(), 64);
+            for (r, id) in rows.iter().zip(&ids) {
+                assert_eq!(r["id"], *id);
+                assert_eq!(r.len(), 2);
+                let n: usize = id[1..].parse().unwrap();
+                let expected = if n % 3 <= cycle {
+                    (n % 3 + 2) as f64
+                } else {
+                    1.0
+                };
+                assert_eq!(r["score"], expected);
+            }
+            store.cleanup_wal().await.unwrap();
+        }
+        store.close().await.unwrap();
     }
 
     #[tokio::test]

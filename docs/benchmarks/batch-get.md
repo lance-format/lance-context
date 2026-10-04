@@ -1,6 +1,6 @@
 # Batched generic row lookup
 
-`GenericStore::get_many(ids, columns)` reads up to 1,024 IDs with a single
+`GenericStore::get_many(ids, columns)` reads up to 1,024 IDs, normally with a single
 LSM query per read attempt. The Rust `GenericStoreApi` trait exposes it on
 embedded and remote stores. `ContextClient::get_rows` calls
 `POST /api/v1/generic/{name}/get-rows`:
@@ -92,3 +92,12 @@ measurements; five samples do not characterize production tail latency.
 Validation: 21 core generic-store tests and 10 generic HTTP route tests passed,
 including a live HTTP/Rust-client round trip. Clippy passed for core, API,
 client, server, and the facade with remote support (`--all-targets -D warnings`).
+## Lance 9 WAL compatibility
+
+Some WAL primary-key sidecars trigger Lance 9's
+`RowAddrTreeMap::from_sorted_iter called with non-sorted input` error in its
+batched membership probe, while native point lookup still reads the same rows.
+Batch get retries that specific error through native point lookups against the
+same captured base/WAL view, discarding any partial batch first. Other errors
+still propagate. This compatibility path can have serial lookup latency; the
+fast-path measurements above do not describe it.
