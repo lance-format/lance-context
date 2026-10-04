@@ -11,8 +11,8 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use lance_context_api::{
-    AddRowsRequest, AddRowsResponse, CreateGenericStoreRequest, GenericStoreInfo,
-    ListGenericStoresResponse, ListRowsResponse,
+    AddRowsRequest, AddRowsResponse, CreateGenericStoreRequest, GenericStoreInfo, GetRowsRequest,
+    ListGenericStoresResponse, ListRowsResponse, MAX_BATCH_GET_IDS,
 };
 use lance_context_core::{GenericStore, GenericStoreOptions};
 use serde::Deserialize;
@@ -248,6 +248,30 @@ pub async fn get_row(
     Ok(Json(row))
 }
 
+/// `POST /api/v1/generic/{name}/get-rows`
+///
+/// Missing IDs are omitted, duplicates returned once in first-requested order.
+/// Uses one consistent base/WAL read, including a refresh after external merges.
+/// Blob columns require an explicit projection, just as for `get_row`.
+pub async fn get_rows(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(req): Json<GetRowsRequest>,
+) -> Result<Json<ListRowsResponse>, AppError> {
+    if req.ids.len() > MAX_BATCH_GET_IDS {
+        return Err(AppError::InvalidRequest(format!(
+            "batch get accepts at most {MAX_BATCH_GET_IDS} IDs"
+        )));
+    }
+    let store = state.get_or_open_generic_store(&name).await?;
+    let guard = store.read().await;
+    let rows = guard
+        .get_many(&req.ids, req.columns.as_deref())
+        .await
+        .map_err(AppError::from_lance)?;
+    Ok(Json(ListRowsResponse { rows }))
+}
+
 /// `POST /api/v1/generic/{name}/flush`
 ///
 /// Seals the active memtable so previously added rows become readable. Needed
@@ -339,6 +363,105 @@ mod tests {
 
     fn row(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
         value.as_object().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn batch_get_round_trips_through_http_and_rust_client() {
+        use lance_context_api::GenericStoreApi;
+        use lance_context_client::{ClientError, ContextClient, RemoteGenericStore};
+
+        let (state, _dir) = test_state().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = crate::routes::router().with_state(state.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = ContextClient::new(&url);
+        client
+            .create_generic_store(&CreateGenericStoreRequest {
+                name: "batch".into(),
+                schema: spec(),
+                storage_options: None,
+                seal_on_add: true,
+            })
+            .await
+            .unwrap();
+        client
+            .add_rows(
+                "batch",
+                &[
+                    row(serde_json::json!({"id":"a/雪'", "user":"u1", "blob":[1,2,3]})),
+                    row(serde_json::json!({"id":"b", "user":"u2"})),
+                ],
+            )
+            .await
+            .unwrap();
+        let remote = RemoteGenericStore::connect(&url, "batch").await.unwrap();
+        let ids = vec!["b".into(), "missing".into(), "a/雪'".into(), "b".into()];
+        let rows = remote.get_many(&ids, None).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["id"], "b");
+        assert_eq!(rows[1]["id"], "a/雪'");
+        assert!(!rows[1].contains_key("blob"));
+        let rows = client
+            .get_rows("batch", &ids, Some(&["id".into()]))
+            .await
+            .unwrap()
+            .rows;
+        assert_eq!(
+            rows,
+            vec![
+                row(serde_json::json!({"id":"b"})),
+                row(serde_json::json!({"id":"a/雪'"}))
+            ]
+        );
+        let rows = client
+            .get_rows("batch", &["a/雪'".into()], Some(&["blob".into()]))
+            .await
+            .unwrap()
+            .rows;
+        assert_eq!(rows[0]["blob"], "AQID");
+        assert!(client
+            .get_rows("batch", &[], None)
+            .await
+            .unwrap()
+            .rows
+            .is_empty());
+        assert!(matches!(
+            client
+                .get_rows("batch", &vec!["b".into(); MAX_BATCH_GET_IDS + 1], None)
+                .await,
+            Err(ClientError::Api { status: 400, .. })
+        ));
+        assert!(matches!(
+            client.get_rows("absent", &[], None).await,
+            Err(ClientError::Api { status: 404, .. })
+        ));
+
+        // The cached server handle must see a row already merged and removed
+        // from another writer's WAL, without a point-read refresh per ID.
+        let mut writer = GenericStore::open_existing(
+            &state.generic_uri("batch"),
+            GenericStoreOptions {
+                shard_id: Some("external-batch".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        writer
+            .add(&[row(serde_json::json!({"id":"external", "user":"new"}))])
+            .await
+            .unwrap();
+        writer.cleanup_wal().await.unwrap();
+        assert_eq!(
+            client
+                .get_rows("batch", &["external".into()], None)
+                .await
+                .unwrap()
+                .rows[0]["user"],
+            "new"
+        );
+        server.abort();
     }
 
     #[tokio::test]

@@ -465,6 +465,19 @@ impl GenericStoreApi for RemoteGenericStore {
             .map_err(to_ctx_err)
     }
 
+    async fn get_many(
+        &self,
+        ids: &[String],
+        columns: Option<&[String]>,
+    ) -> ContextResult<Vec<Map<String, Value>>> {
+        Ok(self
+            .client
+            .get_rows(&self.store_name, ids, columns)
+            .await
+            .map_err(to_ctx_err)?
+            .rows)
+    }
+
     async fn flush(&self) -> ContextResult<()> {
         self.client
             .flush_generic_store(&self.store_name)
@@ -1232,6 +1245,27 @@ impl ContextClient {
             return Ok(None);
         }
         Self::handle_response(resp).await.map(Some)
+    }
+
+    /// Fetch up to `MAX_BATCH_GET_IDS` IDs in one request. Missing IDs are
+    /// omitted; duplicates appear once in first-requested order. `None`
+    /// excludes blobs, and an explicit projection always includes `id`.
+    pub async fn get_rows(
+        &self,
+        name: &str,
+        ids: &[String],
+        columns: Option<&[String]>,
+    ) -> Result<ListRowsResponse, ClientError> {
+        let resp = self
+            .http
+            .post(self.url(&format!("/generic/{name}/get-rows")))
+            .json(&GetRowsRequest {
+                ids: ids.to_vec(),
+                columns: columns.map(<[String]>::to_vec),
+            })
+            .send()
+            .await?;
+        Self::handle_response(resp).await
     }
 
     /// Seal the store's active memtable so added rows become readable.

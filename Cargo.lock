@@ -6457,6 +6457,7 @@ dependencies = [
  "futures",
  "lance 9.0.0",
  "lance-context-api",
+ "lance-context-client",
  "lance-context-core",
  "lance-context-merge",
  "lance-context-metrics",

@@ -419,6 +419,16 @@ impl GenericStoreApi for GenericStore {
             .map_err(to_ctx_err)
     }
 
+    async fn get_many(
+        &self,
+        ids: &[String],
+        columns: Option<&[String]>,
+    ) -> ContextResult<Vec<Row>> {
+        GenericStore::get_many(self, ids, columns)
+            .await
+            .map_err(to_ctx_err)
+    }
+
     async fn flush(&self) -> ContextResult<()> {
         GenericStore::flush(self).await.map_err(to_ctx_err)
     }

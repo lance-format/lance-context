@@ -188,6 +188,7 @@ pub fn router() -> Router<Arc<AppState>> {
         )
         .route("/api/v1/generic/{name}/rows", get(generic::list_rows))
         .route("/api/v1/generic/{name}/rows/{id}", get(generic::get_row))
+        .route("/api/v1/generic/{name}/get-rows", post(generic::get_rows))
         .route(
             "/api/v1/generic/{name}/flush",
             post(generic::flush_generic_store),

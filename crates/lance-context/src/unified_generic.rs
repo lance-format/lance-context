@@ -173,6 +173,18 @@ impl GenericStoreApi for GenericStore {
         }
     }
 
+    async fn get_many(
+        &self,
+        ids: &[String],
+        columns: Option<&[String]>,
+    ) -> ContextResult<Vec<Map<String, Value>>> {
+        match self {
+            Self::Local(store) => GenericStoreApi::get_many(store.as_ref(), ids, columns).await,
+            #[cfg(feature = "remote")]
+            Self::Remote(store) => GenericStoreApi::get_many(store, ids, columns).await,
+        }
+    }
+
     async fn flush(&self) -> ContextResult<()> {
         match self {
             Self::Local(store) => GenericStoreApi::flush(store.as_ref()).await,

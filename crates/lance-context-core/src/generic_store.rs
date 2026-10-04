@@ -19,11 +19,12 @@
 //! back on open, so callers pass it once. Reopening with a *different* spec is
 //! an error rather than a silent reinterpretation of existing data.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_schema::{ArrowError, Schema};
+use datafusion::prelude::{col, lit, Expr};
 use futures::TryStreamExt;
 use lance::dataset::mem_wal::ShardManifestStore;
 use lance::dataset::optimize::CompactionMetrics;
@@ -36,6 +37,7 @@ use crate::merge_budget::MergeMemoryBudget;
 use crate::store::{CompactionConfig, CompactionStats};
 use crate::store_base::{ListSource, PreparedMerge, StorageBase, StorageBaseOptions};
 use lance_context_api::schema_spec::{SchemaSpec, ID_COLUMN};
+use lance_context_api::MAX_BATCH_GET_IDS;
 
 /// Schema-metadata key holding the serialized [`SchemaSpec`], so a store can be
 /// reopened without the caller re-declaring its columns.
@@ -323,6 +325,77 @@ impl GenericStore {
         Ok(rows.into_iter().next())
     }
 
+    /// Fetch a batch in first-requested order, omitting missing IDs and
+    /// returning duplicate IDs only once. At most [`MAX_BATCH_GET_IDS`] input
+    /// IDs are accepted, including duplicates; an empty batch returns empty.
+    ///
+    /// `None` excludes blobs. Explicit columns always include `id`; use
+    /// `Some(&["id".into()])` for existence checks without fetching payloads.
+    /// Like `get`, reads include flushed WAL; deferred appends need `flush`.
+    /// Reads retry a concurrent WAL merge, and fail rather than return partial
+    /// results if the view cannot be stabilized. Pinned reads stay pinned.
+    pub async fn get_many(
+        &self,
+        ids: &[String],
+        columns: Option<&[String]>,
+    ) -> LanceResult<Vec<Row>> {
+        if ids.len() > MAX_BATCH_GET_IDS {
+            return Err(LanceError::invalid_input(format!(
+                "batch get accepts at most {MAX_BATCH_GET_IDS} IDs"
+            )));
+        }
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut seen = HashSet::new();
+        let ids: Vec<&str> = ids
+            .iter()
+            .map(String::as_str)
+            .filter(|id| seen.insert(*id))
+            .collect();
+        let filter = col(ID_COLUMN).in_list(ids.iter().map(|id| lit(*id)).collect(), false);
+        let mut columns = columns.map_or_else(|| self.spec.scan_columns(), <[String]>::to_vec);
+        if !columns.iter().any(|column| column == ID_COLUMN) {
+            columns.push(ID_COLUMN.to_string());
+        }
+        let rows = self
+            .base
+            .read_consistent(ListSource::All, |dataset, snapshots| {
+                let filter = &filter;
+                let columns = &columns;
+                async move {
+                    let scanner = StorageBase::lsm_scanner_for_dataset(
+                        &dataset,
+                        ID_COLUMN,
+                        ListSource::All,
+                        snapshots,
+                    );
+                    let scanner = batch_get_scanner(scanner, filter, columns)?;
+                    let mut stream = scanner.try_into_stream().await?;
+                    let mut rows = Vec::new();
+                    while let Some(batch) = stream.try_next().await? {
+                        rows.extend(batch_to_rows(&self.spec, &batch)?);
+                    }
+                    Ok(rows)
+                }
+            })
+            .await?;
+        let mut by_id = HashMap::with_capacity(rows.len());
+        for row in rows {
+            // The schema requires a non-null string ID and the projection includes it.
+            let id = row[ID_COLUMN]
+                .as_str()
+                .expect("required string id")
+                .to_string();
+            if by_id.insert(id, row).is_some() {
+                return Err(LanceError::io(
+                    "batch get received duplicate IDs from the LSM scan",
+                ));
+            }
+        }
+        Ok(ids.into_iter().filter_map(|id| by_id.remove(id)).collect())
+    }
+
     async fn scan(
         &self,
         filter: Option<&str>,
@@ -462,7 +535,7 @@ impl GenericStore {
         self.base.compaction_stats()
     }
 
-    /// Build a ZoneMap scalar index on `id`. Idempotent.
+    /// Build a BTree scalar index on `id`. Idempotent.
     pub async fn create_id_index(&mut self) -> LanceResult<()> {
         self.base.create_key_btree_index().await
     }
@@ -472,6 +545,24 @@ impl GenericStore {
     pub async fn count_base_rows(&self) -> LanceResult<usize> {
         self.base.dataset.count_rows(None).await
     }
+}
+
+fn batch_get_scanner(
+    scanner: lance::dataset::mem_wal::scanner::LsmScanner,
+    filter: &Expr,
+    columns: &[String],
+) -> LanceResult<lance::dataset::mem_wal::scanner::LsmScanner> {
+    let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+    // Lance 9 routes a bare PK IN to lookup_many_via_per_key, which serializes
+    // disk reads. Explicit OFFSET 0 selects its general LSM scan: one indexed
+    // IN scan per source with Lance's native cross-generation suppression.
+    // This is a compatibility adapter using public APIs; the plan regression
+    // test guards it when Lance changes its routing. No LIMIT: source-local
+    // caps can underfill after newer generations suppress older matches.
+    scanner
+        .project(&refs)?
+        .filter_expr(filter.clone())
+        .limit(None, Some(0))
 }
 
 /// Attach the serialized spec and the seal mode to the Arrow schema, so both
@@ -585,6 +676,239 @@ mod tests {
             seal_on_add: true,
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn batch_get_matches_visible_rows_across_generations_and_merge() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut store = GenericStore::open(uri, spec(), sealing()).await.unwrap();
+        let original: Vec<Row> = (0..64)
+            .map(|i| row(json!({"id": format!("r{i}"), "score": 1.0})))
+            .collect();
+        store.add(&original).await.unwrap();
+        store.cleanup_wal().await.unwrap();
+        let ids: Vec<String> = (0..64).rev().map(|i| format!("r{i}")).collect();
+        // Exercise both the unindexed base and BTree-covered base.
+        assert_eq!(store.get_many(&ids, None).await.unwrap().len(), 64);
+        store.create_id_index().await.unwrap();
+        for score in [2.0, 3.0] {
+            let replacements: Vec<Row> = (0..60)
+                .map(|i| row(json!({"id": format!("r{i}"), "score": score})))
+                .collect();
+            store.add(&replacements).await.unwrap();
+        }
+        store
+            .add(&[
+                row(json!({"id":"wal-only", "score":4.0})),
+                row(json!({"id":"wal-only", "score":5.0})),
+                row(json!({"id":"quote'雪", "score":6.0})),
+            ])
+            .await
+            .unwrap();
+        let mut requested = vec!["wal-only".into(), "missing".into(), "quote'雪".into()];
+        requested.extend(ids.clone());
+        requested.extend(["r0".into(), "wal-only".into()]);
+        let before = store.get_many(&requested, None).await.unwrap();
+        assert_eq!(before.len(), 66);
+        assert_eq!(before[0]["id"], "wal-only");
+        assert_eq!(before[0]["score"], 5.0);
+        assert_eq!(before[1]["id"], "quote'雪");
+        for (row, id) in before[2..].iter().zip(&ids) {
+            assert_eq!(row["id"], *id);
+            let i: usize = id[1..].parse().unwrap();
+            assert_eq!(row["score"], if i < 60 { 3.0 } else { 1.0 });
+        }
+        assert!(store.pending_wal_generations().await.unwrap() >= 3);
+        store.cleanup_wal().await.unwrap();
+        assert_eq!(store.get_many(&requested, None).await.unwrap(), before);
+        store.close().await.unwrap();
+        let reopened = GenericStore::open_existing(uri, GenericStoreOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(reopened.get_many(&requested, None).await.unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn batch_get_projection_bounds_and_deferred_visibility() {
+        let dir = TempDir::new().unwrap();
+        let store = GenericStore::open(
+            dir.path().to_str().unwrap(),
+            spec(),
+            GenericStoreOptions::default(),
+        )
+        .await
+        .unwrap();
+        let ids = vec!["r1".into()];
+        store
+            .add(&[row(json!({"id":"r1", "user_id":"u1", "payload":[1,2,3]}))])
+            .await
+            .unwrap();
+        assert!(store.get_many(&ids, None).await.unwrap().is_empty());
+        store.flush().await.unwrap();
+        let default = store.get_many(&ids, None).await.unwrap();
+        assert!(!default[0].contains_key("payload"));
+        assert_eq!(
+            store.get_many(&ids, Some(&[])).await.unwrap(),
+            vec![row(json!({"id":"r1"}))]
+        );
+        assert_eq!(
+            store
+                .get_many(&ids, Some(&["payload".into()]))
+                .await
+                .unwrap(),
+            vec![row(json!({"id":"r1", "payload":"AQID"}))]
+        );
+        assert!(store.get_many(&[], None).await.unwrap().is_empty());
+        assert!(store
+            .get_many(&["missing".into()], None)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .get_many(&ids, Some(&["unknown".into()]))
+            .await
+            .is_err());
+        assert_eq!(
+            store
+                .get_many(&vec!["r1".into(); MAX_BATCH_GET_IDS], None)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(matches!(
+            store
+                .get_many(&vec!["r1".into(); MAX_BATCH_GET_IDS + 1], None)
+                .await,
+            Err(LanceError::InvalidInput { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn batch_get_refreshes_external_merges_and_respects_base_deletions() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let reader = GenericStore::open(uri, spec(), sealing()).await.unwrap();
+        let mut writer = GenericStore::open_existing(
+            uri,
+            GenericStoreOptions {
+                shard_id: Some("external".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        writer
+            .add(&[
+                row(json!({"id":"r1", "score":1.0})),
+                row(json!({"id":"r2"})),
+            ])
+            .await
+            .unwrap();
+        writer.cleanup_wal().await.unwrap();
+        writer.create_id_index().await.unwrap();
+        let ids = vec!["r1".into(), "r2".into()];
+        assert_eq!(reader.get_many(&ids, None).await.unwrap().len(), 2);
+        let mut dataset = lance::Dataset::open(uri).await.unwrap();
+        dataset.delete("id = 'r2'").await.unwrap();
+        writer
+            .add(&[row(json!({"id":"r1", "score":2.0}))])
+            .await
+            .unwrap();
+        let rows = reader.get_many(&ids, None).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["score"], 2.0);
+        writer.refresh_latest().await.unwrap();
+        writer.cleanup_wal().await.unwrap();
+        assert_eq!(reader.get_many(&ids, None).await.unwrap(), rows);
+    }
+
+    #[tokio::test]
+    async fn batch_get_never_returns_partial_rows_during_external_merges() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut writer = GenericStore::open(uri, spec(), sealing()).await.unwrap();
+        let rows: Vec<Row> = (0..32)
+            .map(|i| row(json!({"id":format!("r{i}"), "score":1.0})))
+            .collect();
+        writer.add(&rows).await.unwrap();
+        writer.cleanup_wal().await.unwrap();
+        writer.create_id_index().await.unwrap();
+        let reader = GenericStore::open_existing(
+            uri,
+            GenericStoreOptions {
+                shard_id: Some("reader".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let ids: Vec<String> = rows
+            .iter()
+            .map(|row| row["id"].as_str().unwrap().to_string())
+            .collect();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let writer_barrier = barrier.clone();
+        let merges = tokio::spawn(async move {
+            writer_barrier.wait().await;
+            for _ in 0..3 {
+                writer.add(&rows).await.unwrap();
+                writer.cleanup_wal().await.unwrap();
+            }
+            writer.close().await.unwrap();
+        });
+        barrier.wait().await;
+        for _ in 0..8 {
+            // A continuously changing view may report a retryable error, but
+            // may never claim that any of these durable IDs are missing.
+            match reader.get_many(&ids, Some(&[])).await {
+                Ok(found) => assert_eq!(
+                    found,
+                    ids.iter()
+                        .map(|id| row(json!({"id":id})))
+                        .collect::<Vec<_>>()
+                ),
+                Err(error) => {
+                    let message = error.to_string();
+                    assert!(
+                        message.contains("dataset changed during read")
+                            || message.to_lowercase().contains("not found"),
+                        "{error}"
+                    );
+                }
+            }
+        }
+        merges.await.unwrap();
+        assert_eq!(reader.get_many(&ids, None).await.unwrap().len(), 32);
+    }
+
+    #[tokio::test]
+    async fn batch_get_plan_uses_one_indexed_scan_for_multiple_ids() {
+        use datafusion::physical_plan::displayable;
+        let dir = TempDir::new().unwrap();
+        let mut store = GenericStore::open(dir.path().to_str().unwrap(), spec(), sealing())
+            .await
+            .unwrap();
+        let rows: Vec<Row> = (0..2048)
+            .map(|i| row(json!({"id": format!("r{i}")})))
+            .collect();
+        store.add(&rows).await.unwrap();
+        store.cleanup_wal().await.unwrap();
+        store.create_id_index().await.unwrap();
+        let scanner = batch_get_scanner(
+            store.base.lsm_scanner().await.unwrap(),
+            &col(ID_COLUMN).in_list(vec![lit("r1"), lit("r2"), lit("r3")], false),
+            &["id".into()],
+        )
+        .unwrap();
+        let plan = scanner.create_plan().await.unwrap();
+        let plan = displayable(plan.as_ref()).indent(true).to_string();
+        // The old point route materializes lookups while planning and returns
+        // a OneShotExec. Require a single lazy scalar-index scan instead.
+        assert_eq!(plan.matches("ScalarIndexQuery").count(), 1, "{plan}");
+        let batch = scanner.try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), 3);
     }
 
     #[test]

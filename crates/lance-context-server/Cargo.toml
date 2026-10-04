@@ -35,6 +35,7 @@ uuid = { version = "1", features = ["v4"] }
 [dev-dependencies]
 lance = "9.0.0"
 tower = { version = "0.5", features = ["util"] }
+lance-context-client = { version = "0.6.7", path = "../lance-context-client" }
 etcd-client = { version = "0.19", features = ["tls"] }
 # Snapshotting recorder so tests can assert which metric series an operation
 # emitted, without installing a process-global Prometheus exporter.

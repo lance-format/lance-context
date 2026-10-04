@@ -249,6 +249,18 @@ pub struct ListRowsResponse {
     pub rows: Vec<Map<String, Value>>,
 }
 
+/// Maximum number of input IDs in one batch read, including duplicates.
+pub const MAX_BATCH_GET_IDS: usize = 1024;
+
+/// Read multiple generic rows without issuing a request per ID.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GetRowsRequest {
+    pub ids: Vec<String>,
+    /// `None` omits blobs. An explicit projection always includes `id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub columns: Option<Vec<String>>,
+}
+
 /// Remote-capable surface of a store over a user-declared schema.
 ///
 /// Rows are `serde_json` maps in both directions, so this trait needs no DTO
@@ -286,6 +298,16 @@ pub trait GenericStoreApi {
         id: &str,
         columns: Option<&[String]>,
     ) -> impl Future<Output = ContextResult<Option<Map<String, Value>>>> + Send;
+
+    /// Fetch up to [`MAX_BATCH_GET_IDS`] IDs in one batch. Returns each found
+    /// ID once, in first-requested order; missing IDs are omitted. `None`
+    /// omits blob columns; an explicit projection always includes `id`.
+    /// Visibility follows `get`: deferred appends require a flush.
+    fn get_many(
+        &self,
+        ids: &[String],
+        columns: Option<&[String]>,
+    ) -> impl Future<Output = ContextResult<Vec<Map<String, Value>>>> + Send;
 
     /// Seal the active memtable so previously added rows become readable.
     fn flush(&self) -> impl Future<Output = ContextResult<()>> + Send;
