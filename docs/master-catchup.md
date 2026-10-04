@@ -56,7 +56,11 @@ instead of repeating index maintenance every eight generations.
 with the current shard's commit. At most two batches are preparing/retained,
 sharing the same memory budget. Commit and drain order remains shard order;
 no ordinary worker fan-out is made concurrent. A budget that only admits one
-batch falls back naturally to serial reads/commits. Set the flag to `false` and
+batch falls back naturally to serial reads/commits. If an indivisible generation
+cannot grow its reservation while the preceding commit holds memory, prefetch
+waits for that commit and retries the same shard once with the freed budget.
+Later shards cannot consume those bytes first. Other read failures retain normal
+failure/backoff behavior. Set the flag to `false` and
 the generation cap to `8` for a comparison with the previous executor. Both
 settings are passed explicitly to new Jobs. These
 are buffering bounds, not a total RSS guarantee: one indivisible generation and

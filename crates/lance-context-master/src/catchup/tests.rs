@@ -285,7 +285,7 @@ async fn policy_disagreement_cannot_expand_the_cluster_budget() {
 #[tokio::test]
 #[ignore = "requires ETCD_TEST_ENDPOINTS"]
 async fn native_executor_preserves_live_ingestion_and_drains_sealed_shards() {
-    for memory_bytes in [1024 * 1024, 2 * 1024 * 1024] {
+    for memory_bytes in [1024 * 1024, 2 * 1024 * 1024, 3 * 1024 * 1024] {
         native_executor_with_budget(memory_bytes).await;
     }
 }
@@ -321,10 +321,16 @@ async fn native_executor_with_budget(memory_bytes: usize) {
         .await
         .unwrap();
         for generation in 0..4 {
-            let row = json!({"id":format!("{shard}-{generation}"),"text":"x".repeat(512 * 1024)})
-                .as_object()
-                .unwrap()
-                .clone();
+            let payload_bytes = if memory_bytes == 3 * 1024 * 1024 && shard == "worker-1" {
+                2 * 1024 * 1024
+            } else {
+                512 * 1024
+            };
+            let row =
+                json!({"id":format!("{shard}-{generation}"),"text":"x".repeat(payload_bytes)})
+                    .as_object()
+                    .unwrap()
+                    .clone();
             let shared = json!({"id":"shared", "text":format!("{shard}-{generation}")})
                 .as_object()
                 .unwrap()

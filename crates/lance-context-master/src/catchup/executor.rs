@@ -194,6 +194,10 @@ async fn prepare_shard(
     }
 }
 
+// StorageBase releases the failed generation/reservation before returning this
+// error. A speculative reader can encounter it while the committer holds bytes.
+const MERGE_BUDGET_BUSY: &str = "merge memory budget busy while reading first generation; retry";
+
 /// At most one commit plus one preparing/queued batch. Reserve queue capacity
 /// BEFORE preparing: otherwise a producer can retain a third batch. Do not use
 /// `buffered(n)` here: a later read holding the entire memory budget can block
@@ -205,6 +209,7 @@ async fn prepare_shard(
 async fn run_pipeline<I, P, F, C>(items: I, enabled: bool, mut prepare: P) -> Result<usize>
 where
     I: IntoIterator,
+    I::Item: Clone,
     P: FnMut(I::Item) -> F,
     F: Future<Output = Result<C>>,
     C: Future<Output = Result<usize>>,
@@ -217,13 +222,30 @@ where
         return Ok(total);
     }
     let (send, mut receive) = tokio::sync::mpsc::channel::<Result<C>>(1);
+    let (completed, mut completion) = tokio::sync::watch::channel(0usize);
     let producer = async move {
-        for item in items {
+        for (sent, item) in items.into_iter().enumerate() {
             let permit = send
                 .reserve()
                 .await
                 .map_err(|_| "catch-up committer stopped")?;
-            let prepared = prepare(item).await;
+            let mut prepared = prepare(item.clone()).await;
+            if prepared
+                .as_ref()
+                .is_err_and(|error| error.contains(MERGE_BUDGET_BUSY))
+            {
+                // Finish the preceding commit before retrying this shard alone.
+                // Do not prepare later shards while it waits: they could take
+                // the freed memory and recreate the contention. Retry only once;
+                // storage/other failures retain the normal durable backoff.
+                let finished = completion
+                    .wait_for(|count| *count >= sent)
+                    .await
+                    .map_err(|_| "catch-up committer stopped before memory retry")?;
+                drop(finished);
+                metrics::counter!("master_catchup_prefetch_memory_retries_total").increment(1);
+                prepared = prepare(item).await;
+            }
             let failed = prepared.is_err();
             permit.send(prepared);
             // Deliver read errors in order: let the preceding commit finish,
@@ -236,8 +258,11 @@ where
     };
     let consumer = async move {
         let mut total = 0;
+        let mut finished = 0;
         while let Some(prepared) = receive.recv().await {
             total += prepared?.await?;
+            finished += 1;
+            completed.send_replace(finished);
         }
         Ok::<_, String>(total)
     };
@@ -325,6 +350,43 @@ mod tests {
                 assert_eq!(budget.reserved(), 0);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn oversized_prefetch_retries_after_commit_releases_memory() {
+        let budget = MergeMemoryBudget::new(2 * 1024 * 1024);
+        let attempts = AtomicUsize::new(0);
+        let contention = Notify::new();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_pipeline(0..2, true, |id| {
+                let budget = &budget;
+                let attempts = &attempts;
+                let contention = &contention;
+                async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    let mut reservation = budget.reserve(1024 * 1024).await;
+                    if id == 1 && !reservation.try_grow_to(2 * 1024 * 1024) {
+                        contention.notify_one();
+                        return Err(MERGE_BUDGET_BUSY.into());
+                    }
+                    Ok(async move {
+                        let _reservation = reservation;
+                        if id == 0 {
+                            // Force the first attempt at shard 1 to contend with
+                            // this commit, then permit the commit to release bytes.
+                            contention.notified().await;
+                        }
+                        Ok(1)
+                    })
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, Ok(2));
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(budget.reserved(), 0);
     }
 
     #[tokio::test]
