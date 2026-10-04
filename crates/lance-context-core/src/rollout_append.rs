@@ -70,6 +70,7 @@ impl AppendPlan {
 /// Only file metadata crosses the worker/master boundary. No Arrow payloads.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StagedAppend {
+    pub dataset_uri: String,
     pub plan: AppendPlan,
     pub completed: usize,
     pub fragments: Vec<Fragment>,
@@ -295,6 +296,11 @@ impl AppendCoordinator {
         let mut merged = Vec::new();
         for part in staged {
             part.plan.validate()?;
+            if part.dataset_uri.trim_end_matches('/') != self.dataset.uri().trim_end_matches('/') {
+                return Err(Error::invalid_input(
+                    "staging worker used a different dataset URI",
+                ));
+            }
             if part.completed == 0
                 || part.completed > part.plan.generations.len()
                 || !shards.insert(part.plan.shard)
@@ -424,6 +430,7 @@ pub async fn stage(
         .await?
         .checkout_version(plan.base_version)
         .await?;
+    let dataset_uri = dataset.uri().to_owned();
     let schema: Arc<Schema> = Arc::new(dataset.schema().into());
     if dataset.manifest().should_use_legacy_format() {
         return Err(Error::invalid_input(
@@ -550,6 +557,7 @@ pub async fn stage(
     drop(reservation);
     crate::merge_write_scope::checkpoint();
     Ok(StagedAppend {
+        dataset_uri,
         plan,
         completed,
         fragments,
@@ -663,6 +671,15 @@ mod tests {
         .unwrap();
         assert_eq!(rows(uri).await, 0, "staging must not publish rows");
         assert_eq!(memory.reserved(), 0);
+        let mut wrong_store = a_part.clone();
+        wrong_store.dataset_uri = format!("{uri}/other");
+        assert!(commit
+            .commit(vec![wrong_store])
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("different dataset URI"));
+        assert_eq!(rows(uri).await, 0);
         put(&a, "a2", 4096).await;
         assert_eq!(
             commit

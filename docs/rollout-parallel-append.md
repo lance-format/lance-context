@@ -61,7 +61,8 @@ payloads locally, including when no remote worker is available.
 An uncertain commit response is resolved by reopening the base and checking its
 watermarks. Fully committed results become drain-only retries. Partially stale
 prefixes must be replanned; appending their whole files would duplicate rows.
-Unexpected schema changes or a changed WAL prefix reject the staged result.
+An unexpected worker dataset URI, schema/storage-format change, or changed WAL
+prefix rejects the staged result before publication.
 
 The final commit handler pins the exact validated next version. Merely setting
 Lance's retry count to zero is insufficient: it still attempts transaction rebase

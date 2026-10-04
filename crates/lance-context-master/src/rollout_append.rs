@@ -475,6 +475,7 @@ mod tests {
             .0
             .remove(0);
         let part = StagedAppend {
+            dataset_uri: dir.path().to_string_lossy().into(),
             plan: plan.clone(),
             completed: 1,
             fragments: Vec::new(),
