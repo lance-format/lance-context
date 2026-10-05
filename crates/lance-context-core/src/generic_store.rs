@@ -441,16 +441,39 @@ impl GenericStore {
         offset: Option<usize>,
         columns: &[String],
     ) -> LanceResult<Vec<Row>> {
-        // Keep retries on one captured base/WAL view, including the fallback.
+        if let Some(filter) = filter {
+            // Keep point/filtered reads on this handle's view. The server's
+            // refresh-on-miss path refreshes the cached handle itself; reading
+            // a newer clone here would bypass that cache update.
+            let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+            let mut scanner = self
+                .base
+                .lsm_scanner()
+                .await?
+                .project(&refs)?
+                .filter(filter)?;
+            if limit.is_some() || offset.is_some() {
+                scanner = scanner.limit(
+                    map_i64_bound("limit", limit)?,
+                    map_i64_bound("offset", offset)?,
+                )?;
+            }
+            let mut stream = scanner.try_into_stream().await?;
+            let mut rows = Vec::new();
+            while let Some(batch) = stream.try_next().await? {
+                rows.extend(batch_to_rows(&self.spec, &batch)?);
+            }
+            return Ok(rows);
+        }
+
+        // Only unfiltered lists use this compatibility recovery. Keep retries
+        // on one captured base/WAL view, including the fallback.
         self.base
             .read_consistent(ListSource::All, |dataset, snapshots| async move {
                 let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
                 let mut scanner = StorageBase::lsm_scanner_for_dataset(
                     &dataset, ID_COLUMN, ListSource::All, snapshots.clone(),
                 ).project(&refs)?;
-                if let Some(filter) = filter {
-                    scanner = scanner.filter(filter)?;
-                }
                 if limit.is_some() || offset.is_some() {
                     scanner = scanner.limit(
                         map_i64_bound("limit", limit)?, map_i64_bound("offset", offset)?,
@@ -465,7 +488,7 @@ impl GenericStore {
                     Ok::<_, LanceError>(rows)
                 }.await;
                 match read {
-                    Err(error) if filter.is_none() && is_wal_pk_batch_error(&error) => {
+                    Err(error) if is_wal_pk_batch_error(&error) => {
                         tracing::warn!("unfiltered list retrying bounded native point lookups after a WAL PK index error");
                         // Never turn an index failure into an unbounded ID cache
                         // or a long-running scan of a production table.
