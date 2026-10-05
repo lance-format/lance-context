@@ -524,17 +524,14 @@ impl GenericStore {
         let mut ids = BTreeSet::new();
         let mut id_bytes = 0usize;
         let mut scanned = 0usize;
-        let paths: Vec<_> = snapshots
-            .iter()
-            .flat_map(|snapshot| {
-                snapshot.flushed_generations.iter().map(|generation| {
-                    self.base
-                        .flushed_generation_uri(snapshot.shard_id, &generation.path)
-                })
+        let paths = snapshots.iter().flat_map(|snapshot| {
+            snapshot.flushed_generations.iter().map(|generation| {
+                self.base
+                    .flushed_generation_uri(snapshot.shard_id, &generation.path)
             })
-            .collect();
+        });
         // One dataset at a time, ID projection only, with hard key/byte/work caps.
-        for path in std::iter::once(None).chain(paths.into_iter().map(Some)) {
+        for path in std::iter::once(None).chain(paths.map(Some)) {
             let source = match path {
                 None => dataset.clone(),
                 Some(path) => {
