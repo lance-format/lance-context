@@ -1084,6 +1084,9 @@ fn spawn_pool_poller(
                 let Ok(permit) = pool.clone().try_acquire_owned() else {
                     break;
                 };
+                let Some(operation) = state.admission.try_admit() else {
+                    break;
+                };
                 let claim_start = std::time::Instant::now();
                 match state.task_store.claim_next_of_kinds(kinds).await {
                     Ok(Some(claim)) => {
@@ -1099,6 +1102,7 @@ fn spawn_pool_poller(
                             run_task(&st, claim, timing).await;
                             drop(permit);
                             drop(compact_permit);
+                            drop(operation);
                         });
                     }
                     Ok(None) => break,
@@ -2100,6 +2104,100 @@ mod tests {
                     }
                 }),
             )
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn executor_drain_finishes_current_merge_and_leaves_queue_for_other_master() {
+        use axum::{routing::post, Json, Router};
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(Semaphore::new(0));
+        let app = Router::new().route(
+            "/api/v1/internal/merge-wal/{name}",
+            post({
+                let started = started.clone();
+                let release = release.clone();
+                move || {
+                    let started = started.clone();
+                    let release = release.clone();
+                    async move {
+                        started.notify_one();
+                        release.acquire().await.unwrap().forget();
+                        Json(serde_json::json!({"reclaimed": 3}))
+                    }
+                }
+            }),
+        );
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.merge_wal_concurrency = 1;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        cfg.worker_endpoints = vec![format!("http://{}", listener.local_addr().unwrap())];
+        let app = owned_stub(app, &cfg).await;
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = MasterState::new(cfg.clone()).await.unwrap();
+        let worker = spawn_scheduler(&state);
+        let current = enqueue(&state, TaskKind::MergeWal, "exp").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), started.notified())
+            .await
+            .unwrap();
+        use tower::ServiceExt;
+        let api = crate::routes::api_router().with_state(state.clone());
+        let request = |id: &str| {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/executor/drain")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"executor_id":id}).to_string(),
+                ))
+                .unwrap()
+        };
+        let wrong = api
+            .clone()
+            .oneshot(request("previous-process"))
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), axum::http::StatusCode::CONFLICT);
+        assert!(state.admission.status().accepting);
+        let id = state.admission.status().executor_id;
+        let response = api.oneshot(request(&id)).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let draining = state.admission.status();
+        assert!(!draining.accepting);
+        assert!(draining.active_operations > 0);
+        let next = enqueue(&state, TaskKind::MergeWal, "exp-1").await.unwrap();
+        release.add_permits(2);
+        tokio::time::timeout(Duration::from_secs(10), state.admission.wait_drained())
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .task_store
+                .get(&current.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            TaskState::Done
+        );
+        assert_eq!(
+            state.task_store.get(&next.id).await.unwrap().unwrap().state,
+            TaskState::Queued
+        );
+        assert!(state.admission.try_admit().is_none());
+        assert!(crate::scanner::scan_once(&state).await.is_err());
+
+        let other = MasterState::new(cfg).await.unwrap();
+        let other_worker = spawn_scheduler(&other);
+        assert_eq!(
+            await_terminal(&other, &next.id).await.state,
+            TaskState::Done
+        );
+        assert!(state.admission.status().drained());
+        worker.abort();
+        other_worker.abort();
+        server.abort();
     }
 
     /// MergeWal fans out to every configured worker endpoint and sums the

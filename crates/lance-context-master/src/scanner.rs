@@ -208,6 +208,10 @@ async fn maintain_registry(
 /// for experiments no longer in the registry. Returns the number of
 /// experiments successfully observed.
 pub async fn scan_once(state: &Arc<MasterState>) -> lance::Result<usize> {
+    let _operation = state
+        .admission
+        .try_admit()
+        .ok_or_else(|| lance::Error::io("master executor is draining; stats scan not admitted"))?;
     let guard = state.task_store.coordination_lock("stats-writer").await?;
     let result = scan_once_inner(state).await;
     let release = state.task_store.release_coordination_lock(guard).await;
@@ -219,6 +223,9 @@ pub async fn scan_once(state: &Arc<MasterState>) -> lance::Result<usize> {
 }
 
 async fn try_scan_once(state: &Arc<MasterState>, maintain: bool) -> lance::Result<Option<usize>> {
+    let Some(_operation) = state.admission.try_admit() else {
+        return Ok(None);
+    };
     let Some(guard) = state
         .task_store
         .try_coordination_lock("stats-writer")
