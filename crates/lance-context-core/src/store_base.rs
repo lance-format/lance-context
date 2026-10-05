@@ -54,8 +54,7 @@ use lance::dataset::optimize::{
     CompactionOptions, RewriteResult,
 };
 use lance::dataset::{
-    builder::DatasetBuilder, Dataset, MergeInsertBuilder, NewColumnTransform, WhenMatched,
-    WhenNotMatched, WriteMode, WriteParams,
+    builder::DatasetBuilder, Dataset, NewColumnTransform, WriteMode, WriteParams,
 };
 use lance::index::DatasetIndexExt;
 use lance::io::{ObjectStoreParams, StorageOptionsAccessor};
@@ -1326,16 +1325,16 @@ impl StorageBase {
     ///
     /// `read_flushed_generations` has already reduced the source to one newest
     /// row per key. Delete old keys first, then append the prepared rows.
-    /// BTree uses a delete-only `merge_insert`; ZoneMap uses bounded predicate
-    /// deletes so Lance does not include target payloads in its hash join.
+    /// Bounded predicate deletes project only keys and row IDs, using any
+    /// existing BTree/ZoneMap coverage without publishing an index update.
     ///
     /// Not `WhenMatched::UpdateAll`, deliberately. An upsert takes the matched
     /// target rows *with every column* to join and rewrite them, and rollout
     /// rows carry multi-megabyte inline blobs: in production one merge of
     /// 17k matched rows read 7.6 GB (459 KB/row), one of 1.4k rows read
     /// 4.0 GB (3 MB/row), and two of those in flight held a worker at its
-    /// 32 GiB limit. The delete-only merge probes the id index and touches
-    /// only the key column and deletion vectors; the append streams the new
+    /// 32 GiB limit. Predicate deletion uses available index coverage and reads
+    /// only keys and row IDs for uncovered fragments; the append streams the new
     /// rows straight to fresh fragments. Neither ever holds a target blob.
     ///
     /// Last-write-wins and retry idempotence are preserved: a crash between
@@ -1349,53 +1348,28 @@ impl StorageBase {
         merge_schema: Arc<Schema>,
         watermark: Option<lance_index::mem_wal::MergedGeneration>,
     ) -> LanceResult<()> {
-        observe_phase!("index", self.ensure_merge_key_index().await)?;
+        // Predicate deletion projects only the key and row IDs, including for
+        // unindexed fragments. It can use existing BTree/ZoneMap coverage but
+        // does not need to publish an index before every shard merge. Doing
+        // that here made parallel shards compete on CreateIndex transactions
+        // and repeatedly rebuild the same table-wide index.
         let key_index = merge_schema.index_of(&self.key_column)?;
-        let key_schema = Arc::new(merge_schema.project(&[key_index])?);
-        let keys = batches
-            .iter()
-            .map(|batch| batch.project(&[key_index]))
-            .collect::<Result<Vec<_>, ArrowError>>()?;
-        if self.key_index_type == crate::KeyIndexType::Zonemap {
-            // merge_insert's non-exact-index path projects target payloads even
-            // with an ID-only source in Lance 9.0. Predicate deletion instead
-            // scans only predicate columns and lets ZoneMap prune zones.
-            // Bound expression size; commit all deletes before appending rows.
-            // A cancelled prefix remains recoverable from the undrained WAL.
-            use datafusion::common::ScalarValue;
-            use datafusion::logical_expr::Expr;
-            let mut values = Vec::with_capacity(1024);
-            for batch in &keys {
-                for row in 0..batch.num_rows() {
-                    values.push(Expr::Literal(
-                        ScalarValue::try_from_array(batch.column(0), row)
-                            .map_err(|e| LanceError::invalid_input(e.to_string()))?,
-                        None,
-                    ));
-                    if values.len() == 1024 {
-                        self.delete_key_values(std::mem::take(&mut values)).await?;
-                    }
+        use datafusion::logical_expr::Expr;
+        let mut values = Vec::with_capacity(1024);
+        for batch in &batches {
+            for row in 0..batch.num_rows() {
+                values.push(Expr::Literal(
+                    ScalarValue::try_from_array(batch.column(key_index), row)
+                        .map_err(|e| LanceError::invalid_input(e.to_string()))?,
+                    None,
+                ));
+                if values.len() == 1024 {
+                    self.delete_key_values(std::mem::take(&mut values)).await?;
                 }
             }
-            if !values.is_empty() {
-                self.delete_key_values(values).await?;
-            }
-        } else {
-            let key_reader = RecordBatchIterator::new(
-                keys.into_iter().map(Ok::<RecordBatch, ArrowError>),
-                key_schema,
-            );
-            let mut builder = MergeInsertBuilder::try_new(
-                Arc::new(self.dataset.clone()),
-                vec![self.key_column.clone()],
-            )?;
-            builder
-                .when_matched(WhenMatched::Delete)
-                .when_not_matched(WhenNotMatched::DoNothing);
-            // Both Lance futures are large; boxing keeps them off the caller's
-            // stack (the merge runs inside sweeper and request tasks).
-            let (dataset, _) = Box::pin(builder.try_build()?.execute_reader(key_reader)).await?;
-            self.dataset = Arc::unwrap_or_clone(dataset);
+        }
+        if !values.is_empty() {
+            self.delete_key_values(values).await?;
         }
 
         if let Some(watermark) = watermark {
@@ -1442,48 +1416,6 @@ impl StorageBase {
         )?;
         self.dataset = Arc::unwrap_or_clone(result.new_dataset);
         crate::merge_write_scope::checkpoint();
-        Ok(())
-    }
-
-    async fn ensure_merge_key_index(&mut self) -> LanceResult<()> {
-        if self.dataset.count_fragments() == 0 {
-            return Ok(());
-        }
-        match self.key_index_type {
-            crate::KeyIndexType::Btree => {
-                if !self.has_key_btree_index().await? {
-                    self.create_key_btree_index().await?;
-                    metrics::counter!("rollout_merge_index_built_on_demand_total").increment(1);
-                } else if self.extend_key_btree_index().await? > 0 {
-                    metrics::counter!("rollout_merge_index_extended_on_demand_total").increment(1);
-                }
-            }
-            crate::KeyIndexType::Zonemap => {
-                use lance::index::DatasetIndexInternalExt as _;
-                let indices = self.dataset.load_indices().await?;
-                let present = indices.iter().filter(|i| i.name == ID_INDEX_NAME).any(|i| {
-                    i.index_details
-                        .as_ref()
-                        .is_some_and(|d| d.type_url.ends_with("ZoneMapIndexDetails"))
-                });
-                if !present {
-                    self.create_configured_key_index().await?;
-                } else if !self
-                    .dataset
-                    .unindexed_fragments(ID_INDEX_NAME)
-                    .await?
-                    .is_empty()
-                {
-                    self.dataset
-                        .optimize_indices(
-                            &lance_index::optimize::OptimizeOptions::merge(1)
-                                .index_names(vec![ID_INDEX_NAME.to_string()]),
-                        )
-                        .await?;
-                    self.reload().await?;
-                }
-            }
-        }
         Ok(())
     }
 
@@ -1809,32 +1741,16 @@ impl StorageBase {
         })
     }
 
-    /// Build a BTree scalar index on the base table's key column, or report
-    /// whether one already exists.
+    /// Build or replace a BTree scalar index on the base table's key column.
     ///
-    /// The key column is the table's (unenforced) primary key. The index does
-    /// two jobs:
+    /// The index accelerates base-table point lookups and range scans. WAL
+    /// merges use available coverage but do not create or extend indexes;
+    /// their predicate deletes scan only keys and row IDs when uncovered.
+    /// Index publication belongs to explicit maintenance, avoiding conflicts
+    /// between independently merging shards.
     ///
-    /// - point lookups and range scans on the already-merged base table;
-    /// - **the MemWAL merge itself**. `merge_insert` joins the WAL rows to the
-    ///   base table on the key. With a scalar index that answers equality
-    ///   exactly it probes only the fragments holding the source keys; without
-    ///   one it reads the *whole* base table into a hash join. On a 2 TB /
-    ///   5.8M-row table that full join ran for every 64-generation merge and
-    ///   took every worker with it (18/20 OOMKilled together, 2026-09-29).
-    ///
-    /// It must be a BTree: Lance's `merge_insert` only takes the indexed path
-    /// for an index whose plugin `provides_exact_answer()`, and ZoneMap (a
-    /// per-fragment min/max) does not, so a ZoneMap here changed nothing for
-    /// the merge. `replace(true)` makes rebuilding idempotent.
-    ///
-    /// # MemWAL interaction
-    ///
-    /// Lance's MemWAL does not maintain this index across WAL flushes (it only
-    /// keeps the indices named in `maintained_indexes`). That does not affect
-    /// correctness: rows are de-duplicated by the key column at read time, so
-    /// the index only ever needs to describe the base table's already-merged
-    /// fragments, and compaction rebuilds it (see the master's `IndexId`).
+    /// MemWAL flushes do not extend base-table index coverage. Lance combines
+    /// indexed lookups with scans of uncovered fragments, preserving correctness.
     pub async fn create_key_btree_index(&mut self) -> LanceResult<()> {
         self.ensure_writable()?;
         info!(column = %self.key_column, "creating BTree index on key column");
@@ -1855,14 +1771,9 @@ impl StorageBase {
     /// Extend the key column's BTree index over every base-table fragment it
     /// does not yet cover, appending an index delta rather than rebuilding.
     ///
-    /// Lance's `merge_insert` probes the index for the fragments it covers and
-    /// **scans** every fragment it does not (its plan is a `Union` of the two).
-    /// Every WAL merge appends fragments the index has never seen, so between
-    /// rebuilds each merge reads those fragments whole: 6.5 GB for a 2,046-row
-    /// merge into a 22-fragment table was observed, and that read is what
-    /// spiked workers to 20-29 GiB after the BTree itself was in place.
-    /// Calling this before a merge keeps the unindexed set empty, so the scan
-    /// arm reads nothing.
+    /// This is explicit index maintenance. WAL merges leave new fragments
+    /// uncovered until maintenance runs, and query planning scans their key
+    /// columns rather than rebuilding the index on every merge.
     ///
     /// Returns how many fragments were unindexed beforehand (0 = no commit).
     /// A table without the BTree at all is left alone; the caller builds it
