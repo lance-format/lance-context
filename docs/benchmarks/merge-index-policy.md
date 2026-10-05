@@ -7,13 +7,13 @@ The default remains `btree`. Core callers can set `key_index_type` in their
 store options. This does not change ContextStore's separate ID-index setting.
 
 Use the same setting on every writer/maintenance process for a table. An
-existing `id_idx` of a different type is replaced during merge/index
+existing `id_idx` of a different type is replaced during explicit index
 maintenance, not just by opening the table. Roll out consistent configuration
 before admitting maintenance with the new policy; otherwise mixed policies
 can repeatedly replace the index. Selecting ZoneMap does not remove other
 user-created indexes.
 
-## Why index selection also changes the delete path
+## Why merges use predicate deletion
 
 With Lance 9.0.0, `merge_insert` requires an exact-answer index for its indexed
 lookup path. ZoneMap does not qualify. A key-only source with
@@ -22,7 +22,7 @@ on its non-indexed path. Both a Rust execution-plan probe and an Azure storage
 benchmark reproduced this. Changing only `IndexType::BTree` to `ZoneMap`
 therefore reintroduces payload scan amplification.
 
-The ZoneMap policy uses `DeleteBuilder::from_expr` with typed ID literals,
+Both BTree and ZoneMap policies use `DeleteBuilder::from_expr` with typed ID literals,
 allowing the predicate scanner to prune zones and read only keys. Expressions
 are bounded to 1,024 IDs per delete; every delete commits before the prepared
 rows are appended. The original WAL remains until the append and manifest
@@ -31,9 +31,11 @@ again. Existing table ownership, commit fencing, WAL byte limits and the shared
 merge reservation are unchanged. Many small keys can require multiple delete
 commits; this tradeoff must be measured for the intended workload.
 
-BTree keeps the existing merge path and index-extension behavior. An `index`
-phase metric now separately measures index preparation inside the encompassing
-`append` phase; do not sum nested phase durations as independent work.
+WAL merges neither create nor extend the key index. Explicit `IndexId`
+maintenance still manages coverage. This removes competing `CreateIndex`
+transactions from parallel shard merges; uncovered fragments require key scans,
+so measure scan costs and keep scheduled maintenance running. The historical
+`index` phase metric is no longer emitted by the WAL merge path.
 
 ## Reproduction
 
@@ -48,7 +50,10 @@ BENCH_KIND=zonemap_predicate BENCH_BATCH_ROWS=1024 \
 python docs/benchmarks/merge_index.py
 ```
 
-Compare `BENCH_KIND=btree` (existing merge) with `zonemap_predicate` (new path).
+Compare `BENCH_KIND=btree BENCH_MAINTAIN_INDEX=1` (the previous eager-index
+merge) with `BENCH_KIND=btree_predicate BENCH_MAINTAIN_INDEX=0` (the current
+BTree path). `zonemap_predicate` with maintenance disabled exercises the current
+ZoneMap path; set it to 1 to reproduce the earlier ZoneMap measurements below.
 `zonemap` and `none` reproduce the old non-indexed join as controls. Each
 invocation runs in a fresh process, generates deterministic synthetic data,
 measures Lance read bytes and I/O counts plus sampled process RSS, and tests
@@ -104,3 +109,32 @@ retaining BTree as the default. A workload with thousands of overlapping
 fragments needs further compaction/layout work or its own representative
 benchmark before switching. To reproduce the fragmented case, use
 `BENCH_CASE=fragmented BENCH_FRAGMENT_ROWS=128 BENCH_BATCH_ROWS=128`.
+
+
+## Deferred index maintenance, Azure results, 2026-10-05
+
+One isolated AMD64 Pod with 4 CPU / 8 GiB limits, fresh processes and datasets,
+Lance 9.0.0, synthetic unordered IDs. Each row sums three batches (0%, 50%,
+100% overlap), excluding initial loading/index creation and the replay check.
+All eight fixtures passed complete ID/revision comparison and payload spot
+checks after replay; cgroup max/oom/oom_kill counters remained zero.
+
+| Base / batch | Index and delete policy | Three batches (s) | Read MiB | Peak process MiB |
+|---|---|---:|---:|---:|
+| 262k IDs / 128 rows | BTree eager index + merge_insert | 3.093 | 14.767 | 339.5 |
+| 262k IDs / 128 rows | BTree deferred index + predicate | 2.656 | 6.288 | 308.7 |
+| 262k IDs / 128 rows | ZoneMap eager index + predicate | 2.177 | 6.876 | 271.4 |
+| 262k IDs / 128 rows | ZoneMap deferred index + predicate | 2.210 | 6.899 | 270.5 |
+| 256 MiB payload / 64 MiB | BTree eager index + merge_insert | 3.416 | 0.909 | 585.7 |
+| 256 MiB payload / 64 MiB | BTree deferred index + predicate | 2.747 | 0.474 | 653.3 |
+| 256 MiB payload / 64 MiB | ZoneMap eager index + predicate | 2.962 | 1.380 | 586.8 |
+| 256 MiB payload / 64 MiB | ZoneMap deferred index + predicate | 2.913 | 1.435 | 586.8 |
+
+BTree elapsed time fell 14% and 20% in this small run; ZoneMap differences
+were small. BTree's large-payload peak RSS increased by about 68 MiB.
+These serial component measurements do not quantify fleet throughput or
+concurrent conflict reduction. The separate Rust regression runs four shard
+merges concurrently for both index types, verifies all updated payload bytes,
+and checks physical row counts, empty replay and unchanged index identity.
+Long-running tables with large uncovered key ranges still need index
+maintenance; this run does not bound their scan amplification.

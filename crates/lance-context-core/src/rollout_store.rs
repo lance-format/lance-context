@@ -4441,12 +4441,10 @@ mod tests {
         });
     }
 
-    /// A merge into a base table that has rows but no id BTree builds the
-    /// BTree first: without it the delete-only `merge_insert` is a hash
-    /// join over the whole base table. The very first merge (empty base)
-    /// has nothing to join and builds nothing.
+    /// Merging does not publish table-wide indexes, even on a populated base.
+    /// Predicate deletion scans keys only when no index is available.
     #[test]
-    fn merge_builds_the_id_btree_when_the_base_has_rows_but_no_index() {
+    fn merge_does_not_build_an_id_index_on_the_write_path() {
         let dir = TempDir::new().unwrap();
         let uri = dir.path().to_string_lossy().to_string();
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -4465,25 +4463,17 @@ mod tests {
             store.flush().await.unwrap();
             store.cleanup_own_shard().await.unwrap();
             assert!(
-                store.has_id_btree_index().await.unwrap(),
-                "second merge joins against a populated base and builds the BTree first"
+                !store.has_id_btree_index().await.unwrap(),
+                "merge must not race other shards to create a table-wide index"
             );
             assert_eq!(store.list(None, None).await.unwrap().len(), 2);
         });
     }
 
-    /// The WAL merge is a delete-only `merge_insert` on the key followed by
-    /// an append: an upsert would take the matched target rows with every
-    /// column (multi-megabyte inline blobs included) to rewrite them.
-    /// Observable shape: an overwritten key leaves the old fragment in
-    /// place with a deletion vector, and the new row lands in a fresh
-    /// fragment; last-write-wins still holds.
-    /// A BTree that exists but covers only some fragments leaves the rest to
-    /// a full scan in the delete-only merge_insert. Each merge extends it
-    /// over whatever the previous merges and compactions appended, so no
-    /// fragment is ever scanned twice.
+    /// Partial index coverage remains correct without extending the index in
+    /// each shard's write path. Explicit maintenance still extends coverage.
     #[test]
-    fn merge_extends_a_stale_id_btree_over_new_fragments() {
+    fn merge_uses_partial_btree_without_publishing_index_updates() {
         use lance::index::DatasetIndexInternalExt as _;
         let dir = TempDir::new().unwrap();
         let uri = dir.path().to_string_lossy().to_string();
@@ -4493,8 +4483,14 @@ mod tests {
             store.add(&[assistant_record("a-0")]).await.unwrap();
             store.flush().await.unwrap();
             store.cleanup_own_shard().await.unwrap();
-            // Three more merges, each appending a fragment the index (built by
-            // the first merge) does not cover.
+            store.create_id_btree_index().await.unwrap();
+            let indices = store.base.dataset.load_indices().await.unwrap();
+            let original = indices
+                .iter()
+                .find(|i| i.name == ROLLOUT_ID_INDEX_NAME)
+                .unwrap()
+                .uuid;
+            // Three more merges append fragments outside existing coverage.
             for id in ["a-1", "a-2", "a-3"] {
                 store.add(&[assistant_record(id)]).await.unwrap();
                 store.flush().await.unwrap();
@@ -4507,12 +4503,24 @@ mod tests {
                 .await
                 .unwrap()
                 .len();
-            // The merge that appended the last fragment extended the index
-            // before its own write, so at most that one fragment is uncovered.
-            assert!(
-                unindexed <= 1,
-                "unindexed fragments after merges: {unindexed}"
+            assert_eq!(unindexed, 3);
+            let indices = store.base.dataset.load_indices().await.unwrap();
+            assert_eq!(
+                indices
+                    .iter()
+                    .find(|i| i.name == ROLLOUT_ID_INDEX_NAME)
+                    .unwrap()
+                    .uuid,
+                original
             );
+            store.extend_id_btree_index().await.unwrap();
+            assert!(store
+                .base
+                .dataset
+                .unindexed_fragments(ROLLOUT_ID_INDEX_NAME)
+                .await
+                .unwrap()
+                .is_empty());
             assert_eq!(store.list(None, None).await.unwrap().len(), 4);
         });
     }
@@ -4772,6 +4780,9 @@ mod tests {
             }
             assert!(!store.has_id_btree_index().await.unwrap());
             let indices = store.base.dataset.load_indices().await.unwrap();
+            assert!(!indices.iter().any(|i| i.name == ROLLOUT_ID_INDEX_NAME));
+            store.create_id_key_index().await.unwrap();
+            let indices = store.base.dataset.load_indices().await.unwrap();
             assert!(indices.iter().any(|i| i.name == ROLLOUT_ID_INDEX_NAME
                 && i.index_details
                     .as_ref()
@@ -4790,9 +4801,108 @@ mod tests {
                 .unwrap();
             store.flush().await.unwrap();
             store.cleanup_own_shard().await.unwrap();
-            assert!(store.has_id_btree_index().await.unwrap());
+            assert!(!store.has_id_btree_index().await.unwrap());
             assert_eq!(store.list(None, None).await.unwrap().len(), ids.len());
+            store.create_id_key_index().await.unwrap();
+            assert!(store.has_id_btree_index().await.unwrap());
         });
+    }
+
+    #[test]
+    fn parallel_shard_merges_preserve_partial_indexes_and_full_payloads() {
+        use crate::KeyIndexType;
+        use lance::index::DatasetIndexExt;
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                for kind in [KeyIndexType::Btree, KeyIndexType::Zonemap] {
+                    let dir = TempDir::new().unwrap();
+                    let uri = dir.path().to_string_lossy().to_string();
+                    let mut seed = RolloutStore::open_with_options(
+                        &uri,
+                        RolloutStoreOptions {
+                            shard_id: Some("seed".into()),
+                            key_index_type: kind,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    let records: Vec<_> = (0..16)
+                        .map(|i| artifact_record(&format!("old-{i}"), &[1; 65536]))
+                        .collect();
+                    seed.add(&records).await.unwrap();
+                    seed.flush().await.unwrap();
+                    seed.cleanup_own_shard().await.unwrap();
+                    seed.create_id_key_index().await.unwrap();
+                    let indices = seed.base.dataset.load_indices().await.unwrap();
+                    let index = indices
+                        .iter()
+                        .find(|i| i.name == ROLLOUT_ID_INDEX_NAME)
+                        .unwrap()
+                        .uuid;
+                    let mut shards = Vec::new();
+                    for shard in 0..4 {
+                        let writer = RolloutStore::open_with_options(
+                            &uri,
+                            RolloutStoreOptions {
+                                shard_id: Some(format!("shard-{shard}")),
+                                key_index_type: kind,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .unwrap();
+                        let records: Vec<_> = (shard * 4..shard * 4 + 4)
+                            .flat_map(|i| {
+                                [
+                                    artifact_record(&format!("old-{i}"), &[2; 65536]),
+                                    artifact_record(&format!("new-{i}"), &[2; 65536]),
+                                ]
+                            })
+                            .collect();
+                        writer.add(&records).await.unwrap();
+                        writer.flush().await.unwrap();
+                        shards.push(writer);
+                    }
+                    let results = futures::future::join_all(
+                        shards
+                            .iter_mut()
+                            .map(|writer| async move { writer.cleanup_own_shard().await }),
+                    )
+                    .await;
+                    for result in results {
+                        assert_eq!(result.unwrap(), 1);
+                    }
+                    // Replay is empty and cannot duplicate data or mutate the index.
+                    for writer in &mut shards {
+                        assert_eq!(writer.cleanup_own_shard().await.unwrap(), 0);
+                    }
+                    let fresh = RolloutStore::open(&uri).await.unwrap();
+                    assert_eq!(fresh.base.dataset.count_rows(None).await.unwrap(), 32);
+                    let rows = fresh.list(None, None).await.unwrap();
+                    assert_eq!(rows.len(), 32);
+                    for prefix in ["old", "new"] {
+                        for i in 0..16 {
+                            let id = format!("{prefix}-{i}");
+                            assert!(rows.iter().any(|row| row.id == id));
+                            assert_eq!(fresh.get_blob(&id).await.unwrap().unwrap(), vec![2; 65536]);
+                        }
+                    }
+                    let indices = fresh.base.dataset.load_indices().await.unwrap();
+                    assert_eq!(
+                        indices
+                            .iter()
+                            .find(|i| i.name == ROLLOUT_ID_INDEX_NAME)
+                            .unwrap()
+                            .uuid,
+                        index
+                    );
+                }
+            });
     }
 
     #[test]
@@ -4881,9 +4991,7 @@ mod tests {
             store.create_id_btree_index().await.unwrap();
             assert_eq!(store.extend_id_btree_index().await.unwrap(), 0);
 
-            // Two merges land two fragments. Each merge extends the index over
-            // what was uncovered *before* its own append, so only the last
-            // appended fragment is left for the explicit call here.
+            // Both merged fragments remain uncovered until explicit maintenance.
             for id in ["a-1", "a-2"] {
                 store.add(&[assistant_record(id)]).await.unwrap();
                 store.flush().await.unwrap();
@@ -4899,9 +5007,9 @@ mod tests {
                         .len()
                 }
             };
-            assert_eq!(unindexed(&store).await, 1);
+            assert_eq!(unindexed(&store).await, 2);
 
-            assert_eq!(store.extend_id_btree_index().await.unwrap(), 1);
+            assert_eq!(store.extend_id_btree_index().await.unwrap(), 2);
             assert_eq!(unindexed(&store).await, 0);
             assert!(store.has_id_btree_index().await.unwrap());
             assert_eq!(store.extend_id_btree_index().await.unwrap(), 0);

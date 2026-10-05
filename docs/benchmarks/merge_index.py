@@ -64,7 +64,7 @@ def run(case, rows, blob_size, ordered, kind):
         update_ids = ids[round_no * old:round_no * old + old] + new_ids
         source = batch(update_ids, blob_size, round_no + 1, 100000 + round_no)
         m = dict(**meta, round=round_no, overlap=overlap, source_bytes=source.nbytes)
-        if kind != 'none':
+        if kind != 'none' and os.environ.get('BENCH_MAINTAIN_INDEX', '1') == '1':
             measured('index_maintain', lambda: ds.optimize.optimize_indices(num_indices_to_merge=1, index_names=['id_idx']), **m)
         builder = ds.merge_insert('id').when_matched_delete()
         if round_no == 0:
@@ -79,7 +79,7 @@ def run(case, rows, blob_size, ordered, kind):
         measured('delete', lambda: ds.delete('id IN (' + ','.join(("'" + x + "'" for x in update_ids)) + ')') if kind.endswith('_predicate') else builder.execute(source.select(['id'])), **m)
         ds = measured('append', lambda: lance.write_dataset(source, uri, mode='append'), **m)
         expected.update({ident: round_no + 1 for ident in update_ids})
-    if kind != 'none':
+    if kind != 'none' and os.environ.get('BENCH_MAINTAIN_INDEX', '1') == '1':
         measured('retry_index', lambda: ds.optimize.optimize_indices(num_indices_to_merge=1, index_names=['id_idx']), **meta)
     measured('retry_delete', lambda: ds.delete('id IN (' + ','.join(("'" + x + "'" for x in update_ids)) + ')') if kind.endswith('_predicate') else ds.merge_insert('id').when_matched_delete().execute(source.select(['id'])), **meta)
     ds = measured('retry_append', lambda: lance.write_dataset(source, uri, mode='append'), **meta)
