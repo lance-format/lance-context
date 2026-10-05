@@ -103,6 +103,8 @@ pub struct MasterState {
     /// Durable scheduler queue in etcd, providing shared CAS/lease semantics
     /// for stateless HA master replicas.
     pub task_store: TaskStore,
+    /// Local claim/scan admission, including in-flight ownership RPCs.
+    pub admission: Arc<crate::admission::Admission>,
     /// Shared HTTP client for fanning `MergeWal` tasks out to worker endpoints.
     pub http: reqwest::Client,
     /// Process-wide compaction permits shared by scheduler and retirement work.
@@ -212,6 +214,7 @@ impl MasterState {
             base_uri,
             config,
             task_store,
+            admission: Arc::new(crate::admission::Admission::default()),
             http: reqwest::Client::new(),
             compaction_permits: Arc::new(Semaphore::new(compaction_concurrency)),
             stats_maintenance_failures: std::sync::atomic::AtomicU64::new(0),

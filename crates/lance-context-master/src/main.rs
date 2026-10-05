@@ -68,6 +68,7 @@ async fn main() {
         app = app.fallback_service(serve);
     }
 
+    let admission = state.admission.clone();
     let app = app
         .with_state(state)
         .merge(lance_context_metrics::metrics_router(metrics_handle))
@@ -80,7 +81,14 @@ async fn main() {
 
     let listener = TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app)
-        .with_graceful_shutdown(wait_for_shutdown_signal())
+        .with_graceful_shutdown(async move {
+            wait_for_shutdown_signal().await;
+            let status = admission.begin_drain();
+            tracing::info!(executor_id = %status.executor_id, active = status.active_operations,
+                "stopped local admission; waiting for admitted work");
+            admission.wait_drained().await;
+            tracing::info!("local executor drained");
+        })
         .await
         .unwrap();
 }

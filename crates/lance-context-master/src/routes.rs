@@ -695,9 +695,32 @@ pub async fn get_task(
     }
 }
 
+/// Call through the exact Pod endpoint. The process identity prevents a load
+/// balancer or replacement Pod from draining a different executor by mistake.
+#[derive(Deserialize)]
+pub struct DrainRequest {
+    pub executor_id: String,
+}
+
+async fn executor_status(State(state): State<Arc<MasterState>>) -> Json<crate::admission::Status> {
+    Json(state.admission.status())
+}
+
+async fn drain_executor(
+    State(state): State<Arc<MasterState>>,
+    Json(request): Json<DrainRequest>,
+) -> Result<Json<crate::admission::Status>, StatusCode> {
+    if state.admission.status().executor_id != request.executor_id {
+        return Err(StatusCode::CONFLICT);
+    }
+    Ok(Json(state.admission.begin_drain()))
+}
+
 /// Build the admin API router (mounted under `/api/v1`).
 pub fn api_router() -> Router<Arc<MasterState>> {
     Router::new()
+        .route("/executor", get(executor_status))
+        .route("/executor/drain", post(drain_executor))
         .route("/experiments", get(list_experiments))
         .route("/experiments/{name}", get(get_experiment))
         .route("/experiments/{name}/records", get(list_experiment_records))

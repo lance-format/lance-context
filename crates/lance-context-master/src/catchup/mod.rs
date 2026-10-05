@@ -236,6 +236,9 @@ async fn admit(
     row: Option<&StatRow>,
     request: &Trigger,
 ) -> Result<Decision> {
+    let Some(_operation) = state.admission.try_admit() else {
+        return Ok(Decision::new(&request.target, "executor_draining"));
+    };
     let now = chrono::Utc::now().timestamp_millis();
     let target = &request.target;
     if let Some(reason) = eligibility(&state.config, row, target, now) {
@@ -327,6 +330,9 @@ pub fn spawn(state: &Arc<MasterState>) -> Option<tokio::task::JoinHandle<()>> {
     }))
 }
 async fn tick(state: &Arc<MasterState>, cursor: &mut usize) -> Result<()> {
+    let Some(_operation) = state.admission.try_admit() else {
+        return Ok(());
+    };
     let inventory = Inventory::new(state);
     inventory.ensure_policy(&state.config).await?;
     let kube = Kubernetes::in_cluster(&state.config.catchup)?;
