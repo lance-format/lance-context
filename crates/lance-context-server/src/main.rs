@@ -1,3 +1,4 @@
+mod body_timeout;
 mod config;
 mod error;
 mod merge_execution;
@@ -24,6 +25,7 @@ async fn main() {
         .init();
 
     let config = ServerConfig::parse();
+    let body_idle_timeout = std::time::Duration::from_secs(config.request_body_idle_timeout_secs);
     let addr = format!("{}:{}", config.host, config.port);
 
     if let Err(e) = create_local_dir_if_needed(&config.data_dir) {
@@ -73,6 +75,10 @@ async fn main() {
     let app = routes::router()
         .with_state(state.clone())
         .merge(lance_context_metrics::metrics_router(metrics_handle))
+        .layer(axum::middleware::from_fn_with_state(
+            body_idle_timeout,
+            body_timeout::guard_request_body,
+        ))
         .layer(axum::middleware::from_fn(
             lance_context_metrics::http_metrics_layer,
         ))

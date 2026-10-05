@@ -3987,6 +3987,7 @@ dependencies = [
  "clap",
  "etcd-client",
  "futures",
+ "http-body-util",
  "lance",
  "lance-context-api",
  "lance-context-client",

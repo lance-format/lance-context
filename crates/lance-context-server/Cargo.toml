@@ -20,6 +20,7 @@ lance-context-metrics = { version = "0.1.0", path = "../lance-context-metrics" }
 axum = { version = "0.8", features = ["json", "multipart"] }
 bytes = "1"
 futures = "0.3"
+http-body-util = "0.1"
 metrics = "0.24"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive", "env"] }
@@ -27,12 +28,13 @@ lru = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
-tower-http = { version = "0.6", features = ["trace"] }
+tower-http = { version = "0.6", features = ["trace", "timeout"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util", "io-util"] }
 lance = "9.0.0"
 tower = { version = "0.5", features = ["util"] }
 lance-context-client = { version = "0.6.7", path = "../lance-context-client" }

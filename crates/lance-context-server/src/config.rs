@@ -7,6 +7,16 @@ pub struct ServerConfig {
     #[command(flatten)]
     pub merge_rollout: lance_context_merge::rollout::MergeRollout,
 
+    /// Maximum wait for the next requested upload body frame. Each frame resets
+    /// this idle timer; completed uploads and handler/merge execution are not timed.
+    #[arg(
+        long,
+        env = "REQUEST_BODY_IDLE_TIMEOUT_SECS",
+        default_value_t = 120,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub request_body_idle_timeout_secs: u64,
+
     /// Legacy wire field; owned merges now use the real-progress idle timeout.
     #[arg(long, env = "MERGE_EXECUTION_TIMEOUT_SECS", default_value_t = 3600)]
     pub merge_execution_timeout_secs: u64,
