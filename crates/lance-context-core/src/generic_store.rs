@@ -19,14 +19,14 @@
 //! back on open, so callers pass it once. Reopening with a *different* spec is
 //! an error rather than a silent reinterpretation of existing data.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
-use arrow_array::RecordBatch;
+use arrow_array::{RecordBatch, StringArray};
 use arrow_schema::{ArrowError, Schema};
 use datafusion::prelude::{col, lit, Expr};
 use futures::TryStreamExt;
-use lance::dataset::mem_wal::ShardManifestStore;
+use lance::dataset::mem_wal::{scanner::ShardSnapshot, ShardManifestStore};
 use lance::dataset::optimize::CompactionMetrics;
 use lance::session::Session;
 use lance::{Error as LanceError, Result as LanceResult};
@@ -384,11 +384,7 @@ impl GenericStore {
                     }
                     .await;
                     match read {
-                        Err(error)
-                            if error.to_string().contains(
-                                "RowAddrTreeMap::from_sorted_iter called with non-sorted input",
-                            ) =>
-                        {
+                        Err(error) if is_wal_pk_batch_error(&error) => {
                             // Lance 9's batched WAL membership probe can reject
                             // a PK sidecar that its point lookup can still read.
                             // Discard partial results and retry all keys through
@@ -445,22 +441,137 @@ impl GenericStore {
         offset: Option<usize>,
         columns: &[String],
     ) -> LanceResult<Vec<Row>> {
-        let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
-        let mut scanner = self.base.lsm_scanner().await?.project(&refs)?;
-        if let Some(filter) = filter {
-            scanner = scanner.filter(filter)?;
-        }
-        if limit.is_some() || offset.is_some() {
-            scanner = scanner.limit(
-                map_i64_bound("limit", limit)?,
-                map_i64_bound("offset", offset)?,
-            )?;
-        }
+        // Keep retries on one captured base/WAL view, including the fallback.
+        self.base
+            .read_consistent(ListSource::All, |dataset, snapshots| async move {
+                let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+                let mut scanner = StorageBase::lsm_scanner_for_dataset(
+                    &dataset, ID_COLUMN, ListSource::All, snapshots.clone(),
+                ).project(&refs)?;
+                if let Some(filter) = filter {
+                    scanner = scanner.filter(filter)?;
+                }
+                if limit.is_some() || offset.is_some() {
+                    scanner = scanner.limit(
+                        map_i64_bound("limit", limit)?, map_i64_bound("offset", offset)?,
+                    )?;
+                }
+                let read = async {
+                    let mut stream = scanner.try_into_stream().await?;
+                    let mut rows = Vec::new();
+                    while let Some(batch) = stream.try_next().await? {
+                        rows.extend(batch_to_rows(&self.spec, &batch)?);
+                    }
+                    Ok::<_, LanceError>(rows)
+                }.await;
+                match read {
+                    Err(error) if filter.is_none() && is_wal_pk_batch_error(&error) => {
+                        tracing::warn!("unfiltered list retrying bounded native point lookups after a WAL PK index error");
+                        // Never turn an index failure into an unbounded ID cache
+                        // or a long-running scan of a production table.
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(10),
+                            self.scan_via_points(&dataset, &snapshots, limit, offset, columns),
+                        ).await.map_err(|_| LanceError::io(
+                            "WAL PK index fallback exceeded its 10 second budget"
+                        ))?
+                    }
+                    result => result,
+                }
+            }).await
+    }
 
-        let mut stream = scanner.try_into_stream().await?;
+    /// Narrow compatibility path for Lance 9's broken batched PK sidecars.
+    /// Physical scans supply only candidate keys; the native point planner
+    /// still decides visibility/newest-wins, including replay and tombstones.
+    /// Filtering is deliberately not pushed into these older physical sources.
+    async fn scan_via_points(
+        &self,
+        dataset: &lance::Dataset,
+        snapshots: &[ShardSnapshot],
+        limit: Option<usize>,
+        offset: Option<usize>,
+        columns: &[String],
+    ) -> LanceResult<Vec<Row>> {
+        let mut ids = BTreeSet::new();
+        let mut id_bytes = 0usize;
+        let mut scanned = 0usize;
+        let paths: Vec<_> = snapshots
+            .iter()
+            .flat_map(|snapshot| {
+                snapshot.flushed_generations.iter().map(|generation| {
+                    self.base
+                        .flushed_generation_uri(snapshot.shard_id, &generation.path)
+                })
+            })
+            .collect();
+        // One dataset at a time, ID projection only, with hard key/byte/work caps.
+        for path in std::iter::once(None).chain(paths.into_iter().map(Some)) {
+            let source = match path {
+                None => dataset.clone(),
+                Some(path) => {
+                    StorageBase::load_with_options(
+                        &path,
+                        self.base.storage_options.clone(),
+                        Some(dataset.session()),
+                    )
+                    .await?
+                }
+            };
+            let mut scanner = source.scan();
+            scanner.project(&[ID_COLUMN])?;
+            scanner.batch_size(256);
+            let mut stream = scanner.try_into_stream().await?;
+            while let Some(batch) = stream.try_next().await? {
+                scanned += batch.num_rows();
+                let keys = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| LanceError::io("generic ID must be Utf8"))?;
+                for key in keys.iter().flatten() {
+                    if !ids.contains(key) {
+                        if ids.len() >= MAX_BATCH_GET_IDS
+                            || id_bytes.saturating_add(key.len()) > 1024 * 1024
+                        {
+                            return Err(LanceError::io(
+                                "WAL PK index fallback key budget exceeded",
+                            ));
+                        }
+                        id_bytes += key.len();
+                        ids.insert(key.to_owned());
+                    }
+                }
+                if scanned > 16 * MAX_BATCH_GET_IDS {
+                    return Err(LanceError::io("WAL PK index fallback scan budget exceeded"));
+                }
+            }
+        }
+        let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
         let mut rows = Vec::new();
-        while let Some(batch) = stream.try_next().await? {
-            rows.extend(batch_to_rows(&self.spec, &batch)?);
+        let mut skip = offset.unwrap_or(0);
+        for id in ids {
+            if limit.is_some_and(|n| rows.len() >= n) {
+                break;
+            }
+            let scanner = StorageBase::lsm_scanner_for_dataset(
+                dataset,
+                ID_COLUMN,
+                ListSource::All,
+                snapshots.to_vec(),
+            )
+            .project(&refs)?
+            .filter_expr(col(ID_COLUMN).eq(lit(id)));
+            let mut stream = scanner.try_into_stream().await?;
+            while let Some(batch) = stream.try_next().await? {
+                for row in batch_to_rows(&self.spec, &batch)? {
+                    if skip > 0 {
+                        skip -= 1;
+                    } else {
+                        rows.push(row);
+                    }
+                }
+            }
         }
         Ok(rows)
     }
@@ -679,6 +790,12 @@ impl GenericStore {
     }
 }
 
+fn is_wal_pk_batch_error(error: &LanceError) -> bool {
+    error
+        .to_string()
+        .contains("RowAddrTreeMap::from_sorted_iter called with non-sorted input")
+}
+
 #[cfg(test)]
 // `GenericStore` owns a `Dataset` and is not `Debug`, so `expect_err` (which
 // formats the Ok value) is unavailable; `.err().expect(..)` is the alternative.
@@ -718,6 +835,83 @@ mod tests {
             seal_on_add: true,
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn point_scan_fallback_preserves_newest_rows_projection_and_paging() {
+        let dir = TempDir::new().unwrap();
+        let mut store = GenericStore::open(dir.path().to_str().unwrap(), spec(), sealing())
+            .await
+            .unwrap();
+        store
+            .add(&[
+                row(json!({"id":"a", "score":1.0})),
+                row(json!({"id":"b", "score":2.0})),
+                row(json!({"id":"c", "score":3.0})),
+            ])
+            .await
+            .unwrap();
+        store.cleanup_wal().await.unwrap();
+        store
+            .add(&[row(json!({"id":"b", "score":20.0}))])
+            .await
+            .unwrap();
+        store
+            .add(&[
+                row(json!({"id":"b", "score":21.0})),
+                row(json!({"id":"d", "score":4.0})),
+            ])
+            .await
+            .unwrap();
+        let dataset = store.base.dataset.clone();
+        let snapshots = store.base.wal_shard_snapshots().await.unwrap();
+        let columns = vec!["id".to_string(), "score".to_string()];
+        let rows = store
+            .scan_via_points(&dataset, &snapshots, None, None, &columns)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|r| r["id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["a", "b", "c", "d"]
+        );
+        assert_eq!(rows[1]["score"], json!(21.0));
+        assert!(rows.iter().all(|r| r.len() == 2));
+        let page = store
+            .scan_via_points(&dataset, &snapshots, Some(2), Some(1), &columns)
+            .await
+            .unwrap();
+        assert_eq!(page, rows[1..3]);
+        assert!(store
+            .scan_via_points(&dataset, &snapshots, Some(0), None, &columns)
+            .await
+            .unwrap()
+            .is_empty());
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn point_scan_fallback_refuses_an_unbounded_key_cache() {
+        let dir = TempDir::new().unwrap();
+        let mut store = GenericStore::open(dir.path().to_str().unwrap(), spec(), sealing())
+            .await
+            .unwrap();
+        let rows: Vec<_> = (0..=MAX_BATCH_GET_IDS)
+            .map(|i| row(json!({"id":format!("key-{i}"),"score":1.0})))
+            .collect();
+        store.add(&rows).await.unwrap();
+        let dataset = store.base.dataset.clone();
+        let snapshots = store.base.wal_shard_snapshots().await.unwrap();
+        let error = store
+            .scan_via_points(&dataset, &snapshots, Some(1), None, &["id".into()])
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("fallback key budget exceeded"),
+            "{error}"
+        );
+        store.close().await.unwrap();
     }
 
     #[tokio::test]
