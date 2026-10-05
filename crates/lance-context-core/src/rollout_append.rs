@@ -18,6 +18,7 @@ use lance::dataset::{
 use lance::index::DatasetIndexExt;
 use lance_index::mem_wal::{MemWalIndexDetails, MergedGeneration, MEM_WAL_INDEX_NAME};
 use lance_table::format::{pb, Fragment};
+use lance_table::system_index::mem_wal::ShardManifest;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -27,6 +28,8 @@ use lance::Result;
 
 const CUTOVER_PREFIX: &str = "lance-context.rollout-append.cutover.";
 const WRITER_EPOCH_PREFIX: &str = "lance-context.rollout-append.writer-epoch.";
+const REPLAY_RANGES_PREFIX: &str = "lance-context.rollout-append.replay-ranges.";
+
 pub const MAX_PLAN_GENERATIONS: usize = 256;
 pub const MAX_STAGE_BYTES: usize = 256 * 1024 * 1024;
 
@@ -34,6 +37,190 @@ pub const MAX_STAGE_BYTES: usize = 256 * 1024 * 1024;
 pub struct Generation {
     pub number: u64,
     pub path: String,
+}
+
+/// Precise replay generations, with the old broad cutoff retained for rolling
+/// upgrades. Old coordinators/workers may still use that conservative prefix.
+/// Only trust this state while its epoch AND cutoff match the durable old keys.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ReplayRanges {
+    epoch: u64,
+    through: u64,
+    manifest_version: u64,
+    ranges: Vec<(u64, u64)>,
+}
+
+impl ReplayRanges {
+    fn load(dataset: &Dataset, shard: Uuid) -> Result<Option<Self>> {
+        let Some(json) = dataset
+            .metadata()
+            .get(&format!("{REPLAY_RANGES_PREFIX}{shard}"))
+        else {
+            return Ok(None);
+        };
+        let state: Self =
+            serde_json::from_str(json).map_err(|_| Error::io("invalid rollout replay ranges"))?;
+        if state.manifest_version == 0
+            || state.ranges.len() > MAX_PLAN_GENERATIONS
+            || state
+                .ranges
+                .iter()
+                .any(|(lo, hi)| lo > hi || *hi > state.through)
+            || state.ranges.windows(2).any(|r| r[0].1 >= r[1].0)
+        {
+            return Err(Error::io("invalid rollout replay ranges"));
+        }
+        if dataset
+            .metadata()
+            .get(&format!("{WRITER_EPOCH_PREFIX}{shard}"))
+            != Some(&state.epoch.to_string())
+            || dataset.metadata().get(&format!("{CUTOVER_PREFIX}{shard}"))
+                != Some(&state.through.to_string())
+        {
+            // An older coordinator advanced the boundary. Import its entire
+            // prefix rather than trusting an optimization it did not update.
+            return Ok(None);
+        }
+        Ok(Some(state))
+    }
+
+    fn contains(&self, generation: u64) -> bool {
+        self.ranges
+            .iter()
+            .any(|(lo, hi)| (*lo..=*hi).contains(&generation))
+    }
+
+    fn normalize(&mut self, watermark: Option<u64>) {
+        self.ranges
+            .retain(|(_, hi)| watermark.is_none_or(|w| *hi > w));
+        self.ranges.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::new();
+        for (lo, hi) in self.ranges.drain(..) {
+            if let Some(last) = merged.last_mut() {
+                if lo <= last.1.saturating_add(1) {
+                    last.1 = last.1.max(hi);
+                    continue;
+                }
+            }
+            merged.push((lo, hi));
+        }
+        // Bound metadata even if a writer repeatedly restarts without draining.
+        // Coalescing adds checks, never removes a necessary check.
+        if merged.len() > MAX_PLAN_GENERATIONS {
+            let excess = merged.len() - MAX_PLAN_GENERATIONS;
+            merged[excess].0 = merged[0].0;
+            merged.drain(..excess);
+        }
+        self.ranges = merged;
+    }
+}
+
+/// Find the first manifest of each unseen writer epoch. Claiming an epoch
+/// preserves current_generation; replay fills exactly that first memtable.
+/// Immutable generations older than the claim cannot acquire replayed rows.
+/// Binary search bounds this to 64 metadata GETs per transition, with a safe
+/// broad-prefix fallback when history is missing or too many epochs elapsed.
+async fn replay_generations(
+    store: &ShardManifestStore,
+    previous: &ReplayRanges,
+    current: &ShardManifest,
+) -> Result<Vec<(u64, u64)>> {
+    if previous.manifest_version >= current.version || previous.epoch >= current.writer_epoch {
+        return Err(Error::io("rollout replay history moved backwards"));
+    }
+    let mut version = previous.manifest_version;
+    let mut epoch = previous.epoch;
+    let mut reads = 0;
+    let mut ranges = Vec::new();
+    while epoch < current.writer_epoch {
+        let mut low = version + 1;
+        let mut high = current.version;
+        let mut first = current.clone();
+        while low < high {
+            if reads >= 64 {
+                return Err(Error::io("rollout replay history read budget exceeded"));
+            }
+            let mid = low + (high - low) / 2;
+            let manifest = store.read_version(mid).await?;
+            reads += 1;
+            crate::merge_write_scope::checkpoint();
+            if manifest.writer_epoch > epoch {
+                high = mid;
+                first = manifest;
+            } else {
+                low = mid + 1;
+            }
+        }
+        if first.version != low
+            || first.writer_epoch <= epoch
+            || first.writer_epoch > current.writer_epoch
+            || first.current_generation > current.current_generation
+        {
+            return Err(Error::io("inconsistent rollout replay history"));
+        }
+        ranges.push((first.current_generation, first.current_generation));
+        version = first.version;
+        epoch = first.writer_epoch;
+    }
+    Ok(ranges)
+}
+
+/// Upgrade the old ever-growing cutoff using its first epoch-aware boundary.
+/// This is a one-time metadata-only search: historical data files are never read.
+/// Missing/pruned history leaves the caller on the conservative prefix.
+async fn import_replay_ranges(
+    dataset: &Dataset,
+    shard: Uuid,
+    current: &ShardManifest,
+    through: u64,
+) -> Result<ReplayRanges> {
+    let epoch_key = format!("{WRITER_EPOCH_PREFIX}{shard}");
+    let cutoff_key = format!("{CUTOVER_PREFIX}{shard}");
+    let mut low = 1;
+    let mut high = dataset.version().version;
+    let mut first = dataset.clone();
+    let mut reads = 0;
+    while low < high {
+        if reads >= 64 {
+            return Err(Error::io("rollout cutover history read budget exceeded"));
+        }
+        let mid = low + (high - low) / 2;
+        let snapshot = dataset.checkout_version(mid).await?;
+        reads += 1;
+        crate::merge_write_scope::checkpoint();
+        if snapshot.metadata().contains_key(&epoch_key) {
+            high = mid;
+            first = snapshot;
+        } else {
+            low = mid + 1;
+        }
+    }
+    let parse = |key: &str| -> Result<u64> {
+        first
+            .metadata()
+            .get(key)
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| Error::io("missing initial rollout replay boundary"))
+    };
+    let epoch = parse(&epoch_key)?;
+    let initial_cutoff = parse(&cutoff_key)?;
+    if first.version().version != low || epoch > current.writer_epoch || initial_cutoff > through {
+        return Err(Error::io("inconsistent rollout cutover history"));
+    }
+    let mut state = ReplayRanges {
+        epoch,
+        through,
+        // Start at the beginning of the immutable shard history. Versions in
+        // the original epoch are skipped by replay_generations' binary search.
+        manifest_version: 1,
+        ranges: vec![(0, initial_cutoff)],
+    };
+    if epoch < current.writer_epoch {
+        state.ranges.extend(
+            replay_generations(&shard_store(dataset, shard).await?, &state, current).await?,
+        );
+    }
+    Ok(state)
 }
 
 /// A bounded, immutable prefix of one shard. URIs/credentials are never supplied
@@ -224,6 +411,7 @@ impl AppendCoordinator {
         let mut pending = Vec::new();
         let mut cutovers = HashMap::new();
         let mut reclaimed = 0;
+        let marks = watermarks(&self.dataset).await?;
         for shard in shard_ids {
             reclaimed += reconcile_shard(&self.dataset, shard).await?;
             let Some(manifest) = shard_store(&self.dataset, shard)
@@ -262,12 +450,9 @@ impl AppendCoordinator {
             if previous_epoch.is_some_and(|epoch| epoch > manifest.writer_epoch) {
                 return Err(Error::io("rollout writer epoch moved backwards"));
             }
-            let cutoff = if previous_epoch != Some(manifest.writer_epoch) {
-                // A restarted/fenced writer can replay already-published WAL
-                // bytes into a NEW generation when its flush cursor lagged.
-                // Generation watermarks alone cannot identify those rows.
-                // Protect the active generation too: planning may observe an
-                // epoch claim before the recovered memtable is flushed.
+            let prior_ranges = ReplayRanges::load(&self.dataset, shard)?;
+            let cutoff = if previous_epoch != Some(manifest.writer_epoch) || prior_ranges.is_none()
+            {
                 let high = manifest
                     .flushed_generations
                     .iter()
@@ -276,6 +461,57 @@ impl AppendCoordinator {
                     .unwrap_or(0)
                     .max(manifest.current_generation)
                     .max(previous_cutoff.unwrap_or(0));
+                let mut state = if let Some(mut state) = prior_ranges {
+                    match replay_generations(
+                        &shard_store(&self.dataset, shard).await?,
+                        &state,
+                        &manifest,
+                    )
+                    .await
+                    {
+                        Ok(ranges) => state.ranges.extend(ranges),
+                        Err(error) => {
+                            tracing::warn!(%shard, %error, "using conservative rollout replay boundary");
+                            state.ranges.push((0, high));
+                        }
+                    }
+                    state
+                } else {
+                    let conservative = ReplayRanges {
+                        epoch: manifest.writer_epoch,
+                        through: high,
+                        manifest_version: manifest.version,
+                        ranges: vec![(
+                            0,
+                            if previous_epoch == Some(manifest.writer_epoch) {
+                                previous_cutoff.unwrap_or(high)
+                            } else {
+                                high
+                            },
+                        )],
+                    };
+                    if previous_epoch.is_some() {
+                        match import_replay_ranges(&self.dataset, shard, &manifest, high).await {
+                            Ok(state) => state,
+                            Err(error) => {
+                                tracing::warn!(%shard, %error, "preserving legacy rollout replay prefix");
+                                conservative
+                            }
+                        }
+                    } else {
+                        // Initial cutover: the old commit/drain ambiguity must
+                        // be checked once. Future restarts add only replayed generations.
+                        conservative
+                    }
+                };
+                state.epoch = manifest.writer_epoch;
+                state.through = high;
+                state.manifest_version = manifest.version;
+                state.normalize(marks.get(&shard).copied());
+                cutovers.insert(
+                    format!("{REPLAY_RANGES_PREFIX}{shard}"),
+                    serde_json::to_string(&state)?,
+                );
                 cutovers.insert(key, high.to_string());
                 cutovers.insert(epoch_key, manifest.writer_epoch.to_string());
                 high
@@ -477,6 +713,7 @@ pub async fn stage(
             "staging plan does not match durable cutover",
         ));
     }
+    let replay_ranges = ReplayRanges::load(&dataset, plan.shard)?;
     let mut reservation = budget.reserve(plan.max_bytes.min(budget.limit())).await;
     let mut batches = Vec::new();
     let mut bytes = 0usize;
@@ -505,7 +742,12 @@ pub async fn stage(
             current.push(batch);
             crate::merge_write_scope::checkpoint();
         }
-        batches.extend(current);
+        let needs_lookup = replay_ranges
+            .as_ref()
+            .map_or(generation.number <= plan.legacy_through, |ranges| {
+                ranges.contains(generation.number)
+            });
+        batches.extend(current.into_iter().map(|batch| (batch, needs_lookup)));
         completed += 1;
         if bytes >= plan.max_bytes {
             break;
@@ -514,9 +756,13 @@ pub async fn stage(
     // Rollout IDs are immutable. Dedup identical retries within this batch;
     // during migration also exclude IDs already published by a legacy merge.
     let mut seen = HashSet::new();
-    if plan.generations[0].number <= plan.legacy_through {
+    let lookup_started = std::time::Instant::now();
+    let mut lookup_ids = 0;
+    if batches.iter().any(|(_, needs_lookup)| *needs_lookup)
+        && !dataset.manifest().fragments.is_empty()
+    {
         let mut ids = HashSet::new();
-        for batch in &batches {
+        for (batch, _) in batches.iter().filter(|(_, needs_lookup)| *needs_lookup) {
             let column = batch
                 .column_by_name("id")
                 .unwrap()
@@ -526,6 +772,7 @@ pub async fn stage(
             ids.extend(column.iter().flatten().map(str::to_owned));
         }
         let ids: Vec<_> = ids.into_iter().collect();
+        lookup_ids = ids.len();
         for chunk in ids.chunks(1024) {
             let mut scanner = dataset.scan();
             scanner.project(&["id"])?;
@@ -544,8 +791,15 @@ pub async fn stage(
             }
         }
     }
+    tracing::info!(
+        shard = %plan.shard,
+        completed_generations = completed,
+        legacy_lookup_ids = lookup_ids,
+        legacy_lookup_seconds = lookup_started.elapsed().as_secs_f64(),
+        "rollout append legacy lookup completed"
+    );
     let mut output = Vec::new();
-    for batch in batches {
+    for (batch, _) in batches {
         let ids = batch
             .column_by_name("id")
             .unwrap()
@@ -823,6 +1077,378 @@ mod tests {
         let part = stage(uri, plans[0].clone(), budget(), None).await.unwrap();
         coordinator.commit(vec![part]).await.unwrap();
         assert_eq!(rows(uri).await, 4);
+        restarted.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_does_not_make_clean_backlog_scan_base_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut a = writer(uri, "a").await;
+        let mut coordinator = AppendCoordinator::open(uri, None).await.unwrap();
+        // Drain the one-time legacy boundary, including its active generation.
+        for id in ["seed", "tail"] {
+            put(&a, id, 4096).await;
+            let (plans, _) = coordinator
+                .plan(&["a".into()], 64, 1024 * 1024)
+                .await
+                .unwrap();
+            let part = stage(uri, plans[0].clone(), budget(), None).await.unwrap();
+            coordinator.commit(vec![part]).await.unwrap();
+        }
+        for i in 0..8 {
+            put(&a, &format!("clean-{i}"), 4096).await;
+        }
+        a.close().await.unwrap();
+        let shard = derive_shard_id(Some("a"));
+        let store = shard_store(&coordinator.dataset, shard).await.unwrap();
+        let before = store.read_latest().await.unwrap().unwrap();
+        // Real replay: lag the durable cursor, so reopening replays "tail" and
+        // the eight still-pending rows into the first generation of the epoch.
+        store
+            .commit_update(before.writer_epoch, |m| {
+                let mut next = m.clone();
+                next.version += 1;
+                next.replay_after_wal_entry_position = 1;
+                next
+            })
+            .await
+            .unwrap();
+        let mut restarted = writer(uri, "a").await;
+        restarted
+            .add(&[artifact_record("new", &[42; 4096])])
+            .await
+            .unwrap();
+        // Observe the new epoch BEFORE replay's first flush.
+        let (plans, _) = coordinator
+            .plan(&["a".into()], 8, 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(plans[0].generations.len(), 8);
+        let state = ReplayRanges::load(&coordinator.dataset, shard)
+            .unwrap()
+            .unwrap();
+        assert!(plans[0]
+            .generations
+            .iter()
+            .all(|g| !state.contains(g.number)));
+        assert!(state.contains(before.current_generation));
+
+        // Make base payload files unavailable. Staging the clean backlog must
+        // still work: metadata/watermarks suffice, not even an ID scan is needed.
+        let mut hidden = Vec::new();
+        for fragment in coordinator.dataset.manifest().fragments.iter() {
+            for file in &fragment.files {
+                let path = dir.path().join("data").join(&file.path);
+                let saved = path.with_extension("saved");
+                std::fs::rename(&path, &saved).unwrap();
+                hidden.push((path, saved));
+            }
+        }
+        let part = stage(uri, plans[0].clone(), budget(), None).await.unwrap();
+        assert_eq!(part.rows, 8);
+        for (path, saved) in hidden {
+            std::fs::rename(saved, path).unwrap();
+        }
+        coordinator.commit(vec![part]).await.unwrap();
+        restarted.flush().await.unwrap();
+        put(&restarted, "steady", 4096).await;
+        let (plans, _) = coordinator
+            .plan(&["a".into()], 64, 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(plans[0].generations.len(), 2);
+        let state = ReplayRanges::load(&coordinator.dataset, shard)
+            .unwrap()
+            .unwrap();
+        assert!(state.contains(plans[0].generations[0].number));
+        assert!(!state.contains(plans[0].generations[1].number));
+        let part = stage(uri, plans[0].clone(), budget(), None).await.unwrap();
+        assert_eq!(part.rows, 2, "exclude committed tail AND replayed backlog");
+        coordinator.commit(vec![part.clone()]).await.unwrap();
+        assert_eq!(coordinator.commit(vec![part]).await.unwrap(), 0);
+        assert_eq!(rows(uri).await, 12);
+        let reader = RolloutStore::open_existing_with_options(uri, RolloutStoreOptions::default())
+            .await
+            .unwrap();
+        for id in ["seed", "tail", "clean-0", "clean-7", "new", "steady"] {
+            assert_eq!(reader.get_blob(id).await.unwrap(), Some(vec![42; 4096]));
+        }
+        restarted.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn multiple_unobserved_epochs_protect_only_their_replay_generations() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut a = writer(uri, "a").await;
+        let mut coordinator = AppendCoordinator::open(uri, None).await.unwrap();
+        coordinator
+            .plan(&["a".into()], 64, 1024 * 1024)
+            .await
+            .unwrap();
+        let shard = derive_shard_id(Some("a"));
+        let store = shard_store(&coordinator.dataset, shard).await.unwrap();
+        let mut expected = vec![1];
+        let mut clean = Vec::new();
+        for epoch in 0..3 {
+            put(&a, &format!("first-{epoch}"), 4096).await;
+            let current = store.read_latest().await.unwrap().unwrap();
+            clean.push(current.current_generation);
+            put(&a, &format!("steady-{epoch}"), 4096).await;
+            a.close().await.unwrap();
+            expected.push(
+                store
+                    .read_latest()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .current_generation,
+            );
+            a = writer(uri, "a").await;
+        }
+        coordinator
+            .plan(&["a".into()], 64, 1024 * 1024)
+            .await
+            .unwrap();
+        let state = ReplayRanges::load(&coordinator.dataset, shard)
+            .unwrap()
+            .unwrap();
+        assert!(expected.into_iter().all(|g| state.contains(g)));
+        assert!(clean.into_iter().all(|g| !state.contains(g)));
+        a.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn old_coordinator_boundary_invalidates_precise_ranges() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut a = writer(uri, "a").await;
+        let mut coordinator = AppendCoordinator::open(uri, None).await.unwrap();
+        coordinator
+            .plan(&["a".into()], 64, 1024 * 1024)
+            .await
+            .unwrap();
+        let shard = derive_shard_id(Some("a"));
+        assert!(ReplayRanges::load(&coordinator.dataset, shard)
+            .unwrap()
+            .is_some());
+        a.close().await.unwrap();
+        a = writer(uri, "a").await;
+        put(&a, "new", 4096).await;
+        let current = shard_store(&coordinator.dataset, shard)
+            .await
+            .unwrap()
+            .read_latest()
+            .await
+            .unwrap()
+            .unwrap();
+        // Simulate an older coordinator, which updates only the legacy keys.
+        coordinator
+            .dataset
+            .update_metadata([
+                (
+                    format!("{WRITER_EPOCH_PREFIX}{shard}"),
+                    current.writer_epoch.to_string(),
+                ),
+                (
+                    format!("{CUTOVER_PREFIX}{shard}"),
+                    current.current_generation.to_string(),
+                ),
+            ])
+            .await
+            .unwrap();
+        assert!(ReplayRanges::load(&coordinator.dataset, shard)
+            .unwrap()
+            .is_none());
+        coordinator
+            .plan(&["a".into()], 64, 1024 * 1024)
+            .await
+            .unwrap();
+        let state = ReplayRanges::load(&coordinator.dataset, shard)
+            .unwrap()
+            .unwrap();
+        assert!(state.contains(1));
+        assert!(state.contains(current.flushed_generations[0].generation));
+        assert!(!state.contains(current.current_generation));
+        a.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn missing_epoch_history_preserves_conservative_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut a = writer(uri, "a").await;
+        let mut coordinator = AppendCoordinator::open(uri, None).await.unwrap();
+        coordinator
+            .plan(&["a".into()], 64, 1024 * 1024)
+            .await
+            .unwrap();
+        for i in 0..4 {
+            put(&a, &format!("row-{i}"), 4096).await;
+        }
+        a.close().await.unwrap();
+        let mut restarted = writer(uri, "a").await;
+        let shard = derive_shard_id(Some("a"));
+        let store = shard_store(&coordinator.dataset, shard).await.unwrap();
+        let current = store.read_latest().await.unwrap().unwrap();
+        // Remove only old metadata, retaining the exact latest version so that
+        // normal WAL discovery and publication are still possible.
+        let manifest_dir = dir
+            .path()
+            .join("_mem_wal")
+            .join(shard.to_string())
+            .join("manifest");
+        let latest = format!("{:064b}.binpb", current.version.reverse_bits());
+        for entry in std::fs::read_dir(manifest_dir).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_name().to_string_lossy().ends_with(".binpb")
+                && entry.file_name() != latest.as_str()
+            {
+                std::fs::remove_file(entry.path()).unwrap();
+            }
+        }
+        let (plans, _) = coordinator
+            .plan(&["a".into()], 64, 1024 * 1024)
+            .await
+            .unwrap();
+        let state = ReplayRanges::load(&coordinator.dataset, shard)
+            .unwrap()
+            .unwrap();
+        assert!(plans[0]
+            .generations
+            .iter()
+            .all(|g| state.contains(g.number)));
+        let part = stage(uri, plans[0].clone(), budget(), None).await.unwrap();
+        coordinator.commit(vec![part]).await.unwrap();
+        assert_eq!(rows(uri).await, 4);
+        restarted.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "opt-in populated-base replay lookup benchmark"]
+    async fn benchmark_replay_lookup_elision() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut a = writer(uri, "a").await;
+        let mut coordinator = AppendCoordinator::open(uri, None).await.unwrap();
+        // Many base fragments, then a clean backlog and a writer restart.
+        for i in 0..64 {
+            let records: Vec<_> = (0..16)
+                .map(|row| artifact_record(&format!("base-{i}-{row}"), &[42; 4096]))
+                .collect();
+            a.add(&records).await.unwrap();
+            a.flush().await.unwrap();
+            let (plans, _) = coordinator
+                .plan(&["a".into()], 64, 1024 * 1024)
+                .await
+                .unwrap();
+            let part = stage(uri, plans[0].clone(), budget(), None).await.unwrap();
+            coordinator.commit(vec![part]).await.unwrap();
+        }
+        for i in 0..32 {
+            put(&a, &format!("pending-{i}"), 4096).await;
+        }
+        a.close().await.unwrap();
+        let mut restarted = writer(uri, "a").await;
+        let shard = derive_shard_id(Some("a"));
+        let current = shard_store(&coordinator.dataset, shard)
+            .await
+            .unwrap()
+            .read_latest()
+            .await
+            .unwrap()
+            .unwrap();
+        // The old coordinator expands its cutoff over the entire clean backlog.
+        coordinator
+            .dataset
+            .update_metadata([
+                (
+                    format!("{WRITER_EPOCH_PREFIX}{shard}"),
+                    current.writer_epoch.to_string(),
+                ),
+                (
+                    format!("{CUTOVER_PREFIX}{shard}"),
+                    current.current_generation.to_string(),
+                ),
+            ])
+            .await
+            .unwrap();
+        assert!(ReplayRanges::load(&coordinator.dataset, shard)
+            .unwrap()
+            .is_none());
+        let old_plan = AppendPlan {
+            base_version: coordinator.version(),
+            shard,
+            generations: current
+                .flushed_generations
+                .iter()
+                .map(|g| Generation {
+                    number: g.generation,
+                    path: g.path.clone(),
+                })
+                .collect(),
+            max_bytes: 1024 * 1024,
+            legacy_through: current.current_generation,
+        };
+        let (plans, _) = coordinator
+            .plan(&["a".into()], 64, 1024 * 1024)
+            .await
+            .unwrap();
+        let new_plan = plans[0].clone();
+        let state = ReplayRanges::load(&coordinator.dataset, shard)
+            .unwrap()
+            .unwrap();
+        assert!(new_plan
+            .generations
+            .iter()
+            .all(|g| !state.contains(g.number)));
+        for old in [true, false, false, true] {
+            let start = std::time::Instant::now();
+            let part = stage(
+                uri,
+                if old {
+                    old_plan.clone()
+                } else {
+                    new_plan.clone()
+                },
+                budget(),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(part.rows, 32);
+            assert_eq!(part.completed, 32);
+            println!("replay_lookup_benchmark mode={} base_fragments=64 generations=32 rows={} seconds={:.6}", if old { "legacy" } else { "precise" }, part.rows, start.elapsed().as_secs_f64());
+        }
+        let part = stage(uri, new_plan, budget(), None).await.unwrap();
+        coordinator.commit(vec![part.clone()]).await.unwrap();
+        assert_eq!(coordinator.commit(vec![part]).await.unwrap(), 0);
+        let dataset = Dataset::open(uri).await.unwrap();
+        let mut scanner = dataset.scan();
+        scanner.project(&["id"]).unwrap();
+        let mut stream = scanner.try_into_stream().await.unwrap();
+        let mut ids = HashSet::new();
+        let mut count = 0;
+        while let Some(batch) = stream.try_next().await.unwrap() {
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            count += column.len();
+            ids.extend(column.iter().flatten().map(str::to_owned));
+        }
+        assert_eq!(count, 1056);
+        assert_eq!(ids.len(), count);
+        for i in 0..64 {
+            for row in 0..16 {
+                assert!(ids.contains(&format!("base-{i}-{row}")));
+            }
+        }
+        for i in 0..32 {
+            assert!(ids.contains(&format!("pending-{i}")));
+        }
         restarted.close().await.unwrap();
     }
 

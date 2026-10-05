@@ -85,15 +85,30 @@ While staging this prefix, probe the base for IDs in chunks of 1024, projecting
 until the historical prefix is consumed; it does not read old payloads or delete
 base rows. Generations beyond the cutover do not require this migration lookup.
 
-The coordinator also persists the last observed writer epoch per shard. On a
-writer restart or fence, it extends the ID-check boundary through the current
-active generation as well as every flushed generation already visible. A WAL
-replay cursor can lag a flush: already-published rows can then be replayed into a
-new generation, so generation watermarks alone are insufficient. Planning before
-the recovered memtable flushes must protect that active generation too. The
-boundary stays fixed while the writer epoch is unchanged; subsequent generations
-return to append without base ID probes. Upgrading metadata that lacks a writer
-epoch performs this bounded check once before using the fast path.
+The coordinator persists the last observed writer epoch and precise replay ranges
+per shard. Lance 9.0.0 replays WAL into the first memtable opened by a new writer;
+the epoch-claim manifest identifies that generation. A bounded binary search of
+immutable shard manifests locates each unseen epoch's first generation. Only
+those generations need replay ID checks. Previously flushed, immutable backlog
+and later generations in the same epoch keep the lookup-free append path, even
+when they share a staging batch with replayed data. The first replay generation
+is protected even if planning happens before it flushes.
+
+The original legacy cutover prefix still needs ID checks until consumed. Upgrading
+an old, repeatedly expanded boundary performs a one-time binary search of base
+metadata for the first epoch-aware cutover, then reconstructs subsequent replay
+generations from shard metadata. Both searches are limited to 64 metadata reads;
+missing/pruned history falls back to the conservative prefix and does not prevent
+merge. Ranges are bounded to 256 per shard, coalescing conservatively if needed.
+No full-table ID cache, new index, or payload scan is introduced by this planning.
+
+The old cutoff and epoch keys remain present for rolling upgrades. Old workers
+may perform extra checks; new workers use precise ranges only when both old keys
+match their recorded values. If an old coordinator advances the keys without
+updating the ranges, staging falls back to the old prefix until a new coordinator
+reconstructs it. The append RPC and atomic data/watermark publication are unchanged.
+The `rollout append legacy lookup completed` log reports `legacy_lookup_ids` and
+`legacy_lookup_seconds`; clean batches report zero candidate IDs.
 
 Merge retries are idempotent through the atomic generation watermark. This is not
 an arbitrary upsert or ingest-deduplication API: replaying the same ID into different
@@ -121,7 +136,10 @@ maintenance runs; point queries must retain their existing uncovered-fragment sc
 Tests exercise parallel file preparation and a single combined commit, live writes
 arriving between stage and publication, duplicate results, partial stale prefixes,
 byte bounds, legacy append-without-drain migration, restart after base publication,
-and fallback through the existing merge implementation. Master HTTP tests require
+and fallback through the existing merge implementation. Replay tests also cover
+multiple unobserved epochs, old-coordinator boundary updates, missing shard history,
+and a clean backlog that stages successfully with every base data file unavailable.
+Master HTTP tests require
 two workers to reach a barrier together, catching accidental serial fan-out.
 
 A local ARM64 debug-build benchmark (Lance 9.0.0, one process, local filesystem)
@@ -149,3 +167,13 @@ ROLLOUT_APPEND_BENCH=1 cargo test -p lance-context-core --lib \
 
 `ROLLOUT_APPEND_BENCH_ROOT` optionally selects a scratch object-store prefix. Each
 fixture creates a new UUID subdirectory; it never scans an existing table.
+
+A separate local populated-base comparison can be run with:
+
+```bash
+cargo test -p lance-context-core --lib benchmark_replay_lookup_elision -- --ignored --nocapture
+```
+
+It stages the same 32 pending generations against 64 populated base fragments in
+legacy/precise/precise/legacy order, then verifies all 1,056 final IDs and duplicate
+commit idempotence. Fixture data is confined to a new local temporary directory.
