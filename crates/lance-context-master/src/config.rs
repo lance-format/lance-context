@@ -325,6 +325,12 @@ pub struct MaintenanceConfig {
     /// source fragments invalidate preparation instead of being overwritten.
     #[arg(long, env = "COMPACTION_PREPARE_TARGETS", value_delimiter = ',')]
     pub compaction_prepare_targets: Vec<String>,
+    /// Exact owned rollout targets whose dedicated publishers all use the
+    /// common fenced task/target/merge-claim protocol. Allows Compact/IndexId
+    /// beside persistent catch-up identity; empty retains legacy exclusion.
+    /// Enable only after verifying publisher compatibility. No wildcard.
+    #[arg(long, env = "MAINTENANCE_CATCHUP_TARGETS", value_delimiter = ',')]
+    pub maintenance_catchup_targets: Vec<String>,
     /// Yield prepared output after this long waiting for another table writer.
     /// This limits local capacity retention; it never cancels the current writer.
     #[arg(long, env = "COMPACTION_COMMIT_WAIT_SECS", default_value_t = 120)]
@@ -343,6 +349,7 @@ impl Default for MaintenanceConfig {
     fn default() -> Self {
         Self {
             compaction_prepare_targets: Vec::new(),
+            maintenance_catchup_targets: Vec::new(),
             compaction_commit_wait_secs: 120,
             maintenance_timeout_secs: 3600,
             maintenance_idle_timeout_secs: 600,

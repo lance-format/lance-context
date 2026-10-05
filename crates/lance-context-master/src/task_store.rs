@@ -119,6 +119,7 @@ struct EtcdTaskStore {
     prefix: String,
     lease_ttl: i64,
     prepare_targets: Vec<String>,
+    maintenance_catchup_targets: Vec<String>,
     rollout: lance_context_merge::rollout::MergeRollout,
 }
 
@@ -141,6 +142,7 @@ struct ClaimBackend {
     claim_key: String,
     target_key: Option<String>,
     preparation_key: Option<String>,
+    preparation_owner: Option<Vec<u8>>,
     keepalive: LeaseKeepalive,
 }
 
@@ -206,7 +208,7 @@ impl TaskStore {
             .transpose()
             .map_err(|e| lance::Error::io(e.to_string()))?;
         if values[2].is_some()
-            || values[3].is_some()
+            || values[3] != b.preparation_owner
             || old.as_ref().is_some_and(|e| e.maintenance.is_none())
         {
             return Ok(false);
@@ -223,7 +225,10 @@ impl TaskStore {
                 b.token.as_bytes(),
             ),
             Compare::version(merge_key.as_str(), CompareOp::Equal, 0),
-            Compare::version(active_key, CompareOp::Equal, 0),
+            match &b.preparation_owner {
+                Some(owner) => Compare::value(active_key, CompareOp::Equal, owner.clone()),
+                None => Compare::version(active_key, CompareOp::Equal, 0),
+            },
         ];
         for (key, value) in [
             (execution_key, &values[0]),
@@ -653,6 +658,7 @@ impl EtcdTaskStore {
             prefix: config.etcd.prefix().to_string(),
             lease_ttl: config.etcd_lease_ttl_secs,
             prepare_targets: config.maintenance.compaction_prepare_targets.clone(),
+            maintenance_catchup_targets: config.maintenance.maintenance_catchup_targets.clone(),
             rollout: config.merge_rollout.clone(),
         })
     }
@@ -848,9 +854,20 @@ impl EtcdTaskStore {
                 let expected_owner = merge_execution
                     .as_ref()
                     .map(lance_context_merge::execution_owner);
-                let expected_job = only_id.map(|(_, job)| job.as_bytes());
+                let shared_owner = snapshot[2].is_some()
+                    && matches!(task.kind, TaskKind::Compact | TaskKind::IndexId)
+                    && self.rollout.owned(&task.target)
+                    && !self.rollout.draining(&task.target)
+                    && !task.target.starts_with("generic:")
+                    && self.maintenance_catchup_targets.contains(&task.target);
+                let expected_job = only_id.map(|(_, job)| job.as_bytes()).or(if shared_owner {
+                    snapshot[2].as_deref()
+                } else {
+                    None
+                });
                 if snapshot[4].is_some()
-                    || (preparing && (snapshot[5].is_some() || snapshot[2].is_some()))
+                    || (preparing
+                        && (snapshot[5].is_some() || (snapshot[2].is_some() && !shared_owner)))
                     || (write_claim
                         && (snapshot[2].as_deref() != expected_job
                             || snapshot[3].is_some()
@@ -897,16 +914,16 @@ impl EtcdTaskStore {
                 ];
                 if let Some(key) = &preparation_key {
                     compares.push(Compare::version(key.as_str(), CompareOp::Equal, 0));
-                    compares.push(Compare::version(
-                        crate::catchup::store::active_key(&self.prefix, &task.target),
-                        CompareOp::Equal,
-                        0,
-                    ));
+                    let active_key = crate::catchup::store::active_key(&self.prefix, &task.target);
+                    compares.push(match &snapshot[2] {
+                        Some(owner) => Compare::value(active_key, CompareOp::Equal, owner.clone()),
+                        None => Compare::version(active_key, CompareOp::Equal, 0),
+                    });
                 }
                 let catchup_key = crate::catchup::store::active_key(&self.prefix, &task.target);
                 if write_claim {
-                    compares.push(match only_id {
-                        Some((_, job)) => Compare::value(catchup_key, CompareOp::Equal, job),
+                    compares.push(match expected_job {
+                        Some(job) => Compare::value(catchup_key, CompareOp::Equal, job),
                         None => Compare::version(catchup_key, CompareOp::Equal, 0),
                     });
                 }
@@ -989,6 +1006,7 @@ impl EtcdTaskStore {
                                 claim_key,
                                 target_key,
                                 preparation_key,
+                                preparation_owner: snapshot[2].clone(),
                                 keepalive,
                             },
                         }),
@@ -1017,6 +1035,7 @@ impl EtcdTaskStore {
             target_key,
             preparation_key,
             keepalive,
+            ..
         } = claim.backend;
         let mut task = claim.task;
         let owns_table = target_key.is_some();
@@ -2455,6 +2474,186 @@ mod tests {
             .unwrap()
             .unwrap();
         store.finish(next, Ok("continued".into())).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn opted_in_native_owner_allows_preparation_and_exclusive_maintenance() {
+        let (_dir, mut cfg, _) = preparation_test_store().await;
+        cfg.maintenance.maintenance_catchup_targets = vec!["hot".into()];
+        cfg.merge_rollout.owned_targets = vec!["hot".into()];
+        let store = TaskStore::open(&cfg).await.unwrap();
+        let active = crate::catchup::store::active_key(&cfg.etcd.etcd_prefix, "hot");
+        store
+            .inner
+            .client
+            .clone()
+            .put(active.clone(), "native", None)
+            .await
+            .unwrap();
+        store
+            .enqueue(TaskKind::MergeWal, "hot", Vec::new())
+            .await
+            .unwrap();
+        assert!(store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .is_none());
+        let native = store
+            .claim_merge_target("hot", "native")
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .enqueue(TaskKind::Compact, "hot", Vec::new())
+            .await
+            .unwrap();
+        let mut prep = store
+            .claim_next_of_kinds(TaskKinds::COMPACT)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(prep.preparing_compaction());
+        assert!(!store.promote_compaction(&mut prep).await.unwrap());
+        store
+            .finish(native, Ok("native pass joined".into()))
+            .await
+            .unwrap();
+        assert!(store.promote_compaction(&mut prep).await.unwrap());
+        store
+            .enqueue(TaskKind::MergeWal, "hot", Vec::new())
+            .await
+            .unwrap();
+        assert!(store
+            .claim_merge_target("hot", "native")
+            .await
+            .unwrap()
+            .is_none());
+        store
+            .finish(prep, Ok("compact published".into()))
+            .await
+            .unwrap();
+        store
+            .enqueue(TaskKind::IndexId, "hot", Vec::new())
+            .await
+            .unwrap();
+        let index = store
+            .claim_next_of_kinds(TaskKinds::GENERAL.without_compact())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(index.task.kind, TaskKind::IndexId);
+        assert!(store
+            .claim_merge_target("hot", "native")
+            .await
+            .unwrap()
+            .is_none());
+        store
+            .finish(index, Ok("index published".into()))
+            .await
+            .unwrap();
+        let native = store
+            .claim_merge_target("hot", "native")
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .finish(native, Ok("native drainage continues".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.inner.get_text(&active).await.unwrap().as_deref(),
+            Some("native")
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn native_maintenance_opt_in_cannot_bypass_legacy_generic_or_drain_guards() {
+        for (target, owned, draining, opt_in) in [
+            ("hot", false, false, "hot"),
+            ("hot", true, true, "hot"),
+            ("generic:hot", true, false, "generic:hot"),
+            ("hot", true, false, "*"),
+        ] {
+            let (_dir, mut cfg, _) = preparation_test_store().await;
+            cfg.maintenance.maintenance_catchup_targets = vec![opt_in.into()];
+            if owned {
+                cfg.merge_rollout.owned_targets = vec![target.into()];
+            }
+            if draining {
+                cfg.merge_rollout.drain_targets = vec![target.into()];
+            }
+            let store = TaskStore::open(&cfg).await.unwrap();
+            let active = crate::catchup::store::active_key(&cfg.etcd.etcd_prefix, target);
+            store
+                .inner
+                .client
+                .clone()
+                .put(active.clone(), "native", None)
+                .await
+                .unwrap();
+            store
+                .enqueue(TaskKind::Compact, target, Vec::new())
+                .await
+                .unwrap();
+            store
+                .enqueue(TaskKind::IndexId, target, Vec::new())
+                .await
+                .unwrap();
+            assert!(store
+                .claim_next_of_kinds(TaskKinds::GENERAL)
+                .await
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                store.inner.get_text(&active).await.unwrap().as_deref(),
+                Some("native")
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn native_owner_change_invalidates_prepared_admission() {
+        let (_dir, mut cfg, _) = preparation_test_store().await;
+        cfg.maintenance.maintenance_catchup_targets = vec!["hot".into()];
+        cfg.merge_rollout.owned_targets = vec!["hot".into()];
+        let store = TaskStore::open(&cfg).await.unwrap();
+        let active = crate::catchup::store::active_key(&cfg.etcd.etcd_prefix, "hot");
+        store
+            .inner
+            .client
+            .clone()
+            .put(active.clone(), "native", None)
+            .await
+            .unwrap();
+        store
+            .enqueue(TaskKind::Compact, "hot", Vec::new())
+            .await
+            .unwrap();
+        let mut prep = store
+            .claim_next_of_kinds(TaskKinds::COMPACT)
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .inner
+            .client
+            .clone()
+            .put(active.clone(), "replacement", None)
+            .await
+            .unwrap();
+        assert!(!store.promote_compaction(&mut prep).await.unwrap());
+        store
+            .finish(prep, Err("native identity changed".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.inner.get_text(&active).await.unwrap().as_deref(),
+            Some("replacement")
+        );
     }
 
     #[tokio::test]
