@@ -41,8 +41,6 @@ pub fn classify(error: &str) -> FailureClass {
         "corrupt",
         "schema",
         "invalid",
-        "403",
-        "401",
         "permission denied",
         "access denied",
         "accessdenied",
@@ -53,14 +51,58 @@ pub fn classify(error: &str) -> FailureClass {
     ]
     .iter()
     .any(|s| error.contains(s))
+        || has_http_status(&error, &["401", "403"])
     {
         FailureClass::DataOrConfiguration
+    } else if has_http_status(&error, &["408", "429", "500", "502", "503", "504"]) {
+        FailureClass::Retryable
     } else if error.contains("deadline") || error.contains("timeout") || error.contains("timed out")
     {
         FailureClass::Deadline
     } else {
         FailureClass::Retryable
     }
+}
+
+// Errors cross worker HTTP and durable task boundaries as strings. Recognize
+// explicit HTTP status syntax, never digits in a request ID, path or timestamp.
+fn has_http_status(error: &str, codes: &[&str]) -> bool {
+    [
+        "status code",
+        "status_code",
+        "statuscode",
+        "status",
+        "http/1.1",
+        "http/2",
+        "http",
+    ]
+    .iter()
+    .any(|marker| {
+        error.match_indices(marker).any(|(offset, matched)| {
+            if error[..offset]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '/'))
+            {
+                return false;
+            }
+            let rest = &error[offset + matched.len()..];
+            let value = rest.trim_start_matches(|c: char| {
+                c.is_ascii_whitespace() || matches!(c, ':' | '=' | '(' | '\"' | '\'')
+            });
+            // Require a separator and a complete code, so HTTP401 and
+            // status=401e-... cannot accidentally identify authentication.
+            rest.len() != value.len()
+                && codes.iter().any(|code| {
+                    value.strip_prefix(code).is_some_and(|suffix| {
+                        suffix.chars().next().is_none_or(|c| {
+                            c.is_ascii_whitespace()
+                                || matches!(c, ')' | '}' | ']' | ',' | ';' | ':' | '\"' | '\'')
+                        })
+                    })
+                })
+        })
+    })
 }
 
 impl ShardFailure {
@@ -263,6 +305,52 @@ impl Coordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn explicit_http_status_controls_backoff_not_request_id_digits() {
+        let azure = include_str!("../tests/fixtures/azure-server-busy.txt");
+        for error in [
+            azure.to_string(),
+            azure.replace(
+                "bdb822a8-401e-00b9-57f1-545094000000",
+                "b78c8e80-001e-005c-28f1-5401d6000000",
+            ),
+            azure.replace("401e", "403e"),
+            "HTTP 429; request_id=403".into(),
+            "HTTP 503; retry_timeout: 180s".into(),
+            "temporary storage failure at /data/401/403.lance".into(),
+            "temporary failure RequestId:401e-005c".into(),
+            "temporary failure status=401e-005c".into(),
+        ] {
+            let failure = ShardFailure::advance("table", "worker", None, &error, 1000);
+            assert_eq!(failure.class, FailureClass::Retryable, "{error}");
+            assert!(!failure.needs_attention, "{error}");
+            assert_eq!(failure.next_retry_ms, 3000, "{error}");
+        }
+        for error in [
+            "HTTP 401",
+            "HTTP/1.1 403",
+            "HTTP/2 401",
+            "Server returned non-2xx status code: 403",
+            "status_code=401",
+            "StatusCode(403)",
+            "response status: 401",
+            "{\"status\":403}",
+        ] {
+            let failure = ShardFailure::advance("table", "worker", None, error, 1000);
+            assert_eq!(failure.class, FailureClass::DataOrConfiguration, "{error}");
+            assert!(failure.needs_attention);
+            assert_eq!(failure.next_retry_ms, 3_601_000);
+        }
+        assert_eq!(
+            classify("storage operation timed out"),
+            FailureClass::Deadline
+        );
+        assert_eq!(
+            classify("merge ownership unresolved: HTTP 503"),
+            FailureClass::OwnershipUnresolved
+        );
+    }
+
     #[test]
     fn persistent_budget_backoff_and_attention() {
         let mut old = None;
