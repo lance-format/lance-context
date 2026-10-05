@@ -140,8 +140,27 @@ jobs:
             -p lance-context-core --lib -- registry --ignored
       - name: Merge coverage reports
         run: cargo llvm-cov report --lcov --output-path lcov.info
+      - name: Save coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: lcov.info
+          if-no-files-found: error
+          retention-days: 7
+
+  coverage-upload:
+    needs: coverage
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: coverage-lcov
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
+        # v5 uses the maintained shell uploader, including signature checks.
+        # Keep network upload independently retryable after tests have passed.
+        uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5
         with:
           files: lcov.info
           fail_ci_if_error: false
