@@ -479,7 +479,9 @@ impl TaskStore {
             }
         }
         if self.global_maintenance {
-            self.prune_terminal_history().await?;
+            if let Err(error) = self.prune_terminal_history().await {
+                tracing::warn!(kind = ?kind, target = %target, %error, "post-completion history pruning failed");
+            }
         }
         Ok(())
     }
@@ -1073,17 +1075,14 @@ impl EtcdTaskStore {
         let completed = client
             .txn(Txn::new().when(compares).and_then(operations))
             .await
-            .map_err(etcd_error("complete task"))?
-            .succeeded();
+            .map(|response| response.succeeded())
+            .map_err(etcd_error("complete task"));
         drop(keepalive);
-        self.revoke_lease(lease_id).await?;
-        if !completed {
-            return Err(lance::Error::io(format!(
-                "task '{}' lost its etcd claim before completion",
-                task.id
-            )));
-        }
-        Ok(())
+        // Cleanup cannot change whether the terminal-state CAS committed. In
+        // particular, lease expiry must not hide a rejected CAS or turn a
+        // committed merge into a failure/backoff in a dedicated executor.
+        let cleanup = self.revoke_lease(lease_id).await;
+        completion_result(&task, lease_id, completed, cleanup)
     }
 
     async fn resolve_claim_response(
@@ -1299,11 +1298,17 @@ impl EtcdTaskStore {
 
     async fn revoke_lease(&self, lease_id: i64) -> lance::Result<()> {
         let mut client = self.client.clone();
-        client
-            .lease_revoke(lease_id)
-            .await
-            .map(|_| ())
-            .map_err(etcd_error("revoke lease"))
+        match client.lease_revoke(lease_id).await {
+            Ok(_) => Ok(()),
+            // This is the exact etcd lease RPC error, not a substring search
+            // across an arbitrary storage error or request identifier.
+            Err(etcd_client::Error::GRpcStatus(status))
+                if status.message() == "etcdserver: requested lease not found" =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(etcd_error("revoke lease")(error)),
+        }
     }
 
     async fn delete_owned_key(&self, key: &str, owner: &str) -> lance::Result<()> {
@@ -1782,6 +1787,36 @@ fn decode_task(value: &[u8], key: &str) -> lance::Result<TaskRecord> {
         .map_err(|err| lance::Error::io(format!("failed to decode task '{key}': {err}")))
 }
 
+fn completion_result(
+    task: &TaskRecord,
+    lease_id: i64,
+    completed: lance::Result<bool>,
+    cleanup: lance::Result<()>,
+) -> lance::Result<()> {
+    let outcome = match &completed {
+        Ok(true) => "committed",
+        Ok(false) => "claim_lost",
+        Err(_) => "unknown",
+    };
+    metrics::counter!("master_task_completion_total", "outcome" => outcome).increment(1);
+    tracing::info!(task = %task.id, target = %task.target, lease_id, outcome, "task completion transaction result");
+    if let Err(error) = cleanup {
+        metrics::counter!("master_task_completion_cleanup_failed_total").increment(1);
+        tracing::warn!(task = %task.id, target = %task.target, lease_id, outcome, %error,
+            "task lease cleanup failed; preserving completion transaction result");
+    }
+    match completed {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(lance::Error::io(format!(
+            "task '{}' lost its etcd claim before completion",
+            task.id
+        ))),
+        // A lost response is not evidence of either a committed or rejected
+        // transaction. Leave recovery to the durable task/ownership protocol.
+        Err(error) => Err(error),
+    }
+}
+
 fn etcd_error(action: &'static str) -> impl FnOnce(etcd_client::Error) -> lance::Error {
     move |err| lance::Error::io(format!("failed to {action}: {err}"))
 }
@@ -1790,6 +1825,88 @@ fn etcd_error(action: &'static str) -> impl FnOnce(etcd_client::Error) -> lance:
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn completion_cleanup_never_changes_the_transaction_outcome() {
+        let task = new_task(TaskKind::MergeWal, "hot", Vec::new());
+        let cleanup_error = || Err(lance::Error::io("injected lease revoke timeout"));
+        assert!(completion_result(&task, 1, Ok(true), cleanup_error()).is_ok());
+        let lost = completion_result(&task, 1, Ok(false), cleanup_error()).unwrap_err();
+        assert!(lost.to_string().contains("lost its etcd claim"));
+        let unknown = completion_result(
+            &task,
+            1,
+            Err(lance::Error::io("injected completion response loss")),
+            cleanup_error(),
+        )
+        .unwrap_err();
+        assert!(unknown.to_string().contains("completion response loss"));
+        assert!(!unknown.to_string().contains("lease revoke"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn expired_merge_claim_reports_ownership_loss_and_preserves_replacement() {
+        let (_dir, _cfg, store) = preparation_test_store().await;
+        let task = store
+            .enqueue(TaskKind::MergeWal, "hot", Vec::new())
+            .await
+            .unwrap();
+        let old = store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        let lease = old.backend.lease_id;
+        store.inner.revoke_lease(lease).await.unwrap();
+        // An already absent lease is a successful idempotent cleanup.
+        store.inner.revoke_lease(lease).await.unwrap();
+        store.recover_orphaned().await.unwrap();
+        let replacement = store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(replacement.task.id, task.id);
+        let error = store
+            .finish(old, Ok("stale successful execution".into()))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("lost its etcd claim"), "{error}");
+        assert_eq!(
+            store
+                .inner
+                .get_text(&replacement.backend.claim_key)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(replacement.backend.token.as_str())
+        );
+        assert_eq!(
+            store
+                .inner
+                .get_text(&store.inner.target_lock_key("hot"))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(replacement.backend.token.as_str())
+        );
+        store
+            .finish(replacement, Ok("replacement completed".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .inner
+                .get(&task.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .detail
+                .as_deref(),
+            Some("replacement completed")
+        );
+    }
 
     #[tokio::test]
     #[ignore = "requires ETCD_TEST_ENDPOINTS"]
