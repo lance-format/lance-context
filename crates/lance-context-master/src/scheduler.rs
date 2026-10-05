@@ -147,8 +147,14 @@ async fn run_task(state: &Arc<MasterState>, mut claim: TaskClaim, timing: TaskCl
     .record(timing.permit_wait.as_secs_f64());
 
     let started = std::time::Instant::now();
+    let mut refresh_compaction_stats = false;
     let outcome = if claim.preparing_compaction() {
-        run_prepared_compaction(state, &mut claim).await
+        run_prepared_compaction(state, &mut claim)
+            .await
+            .map(|(detail, changed)| {
+                refresh_compaction_stats = changed;
+                detail
+            })
     } else {
         match crate::maintenance_execution::reconcile_previous(state, &claim).await {
             Err(error) => Err(error),
@@ -204,6 +210,25 @@ async fn run_task(state: &Arc<MasterState>, mut claim: TaskClaim, timing: TaskCl
         .record(commit_start.elapsed().as_secs_f64());
     if let Err(error) = finished {
         tracing::error!(task = %task.id, error = %error, "failed to persist task completion");
+    } else if refresh_compaction_stats {
+        // finish releases table ownership durably. Stats bookkeeping must not
+        // hold up the next writer, but stays inside the caller's task/compact
+        // permits so slow refreshes cannot create unbounded background work.
+        let started = std::time::Instant::now();
+        let (_, name) = parse_target(&task.target);
+        match RolloutStore::open_existing_with_options(
+            &state.rollout_uri(name),
+            state.rollout_store_options(),
+        )
+        .await
+        {
+            Ok(store) => update_stats_after_compaction(state, name, &store).await,
+            Err(error) => {
+                tracing::warn!(store = %name, error = %error, "post-compaction stats open failed");
+            }
+        }
+        metrics::histogram!("master_compaction_phase_duration_seconds", "phase" => "stats_refresh")
+            .record(started.elapsed().as_secs_f64());
     }
 }
 
@@ -401,7 +426,7 @@ async fn wait_for_compaction_commit(
 async fn run_prepared_compaction(
     state: &Arc<MasterState>,
     claim: &mut TaskClaim,
-) -> Result<String, String> {
+) -> Result<(String, bool), String> {
     let target = claim.task.target.clone();
     let (_, name) = parse_target(&target);
     let uri = state.rollout_uri(name);
@@ -439,7 +464,7 @@ async fn run_prepared_compaction(
                 .record_compact_noop(name, &uri, prepared.read_version(), &options),
         )
         .await;
-        return Ok("compaction snapshot needs no rewrite".into());
+        return Ok(("compaction snapshot needs no rewrite".into(), false));
     }
     let waiting = std::time::Instant::now();
     tracing::info!(task = %claim.task.id, target = %claim.task.target, seconds = began.elapsed().as_secs_f64(), "compaction files ready; waiting for commit ownership");
@@ -459,13 +484,12 @@ async fn run_prepared_compaction(
             .commit_prepared_compaction(prepared)
             .await
             .map_err(|e| e.to_string())?;
-        update_stats_after_compaction(state, name, &store).await;
         finish_compaction(state, &claim.task, metrics).await
     })
     .await;
     metrics::histogram!("master_compaction_phase_duration_seconds", "phase" => "commit")
         .record(started.elapsed().as_secs_f64());
-    outcome
+    outcome.map(|detail| (detail, true))
 }
 
 /// Compact one experiment. The task-store claim owns the per-experiment write
@@ -1301,6 +1325,81 @@ mod tests {
     #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn prepared_compact_runs_through_legacy_commit_and_releases_both_claims() {
         prepared_compact_commit_and_release(false).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn prepared_compact_releases_writer_before_waiting_for_stats() {
+        for owned in [true, false] {
+            let dir = TempDir::new().unwrap();
+            let mut cfg = config(&dir);
+            cfg.maintenance.compaction_prepare_targets = vec!["exp".into()];
+            cfg.etcd_lease_ttl_secs = 30;
+            if !owned {
+                cfg.merge_rollout.owned_targets.clear();
+            }
+            let state = MasterState::new(cfg).await.unwrap();
+            let mut store = RolloutStore::open(&state.rollout_uri("exp")).await.unwrap();
+            for id in ["a", "b", "c", "d"] {
+                store.add(&[rollout_record(id)]).await.unwrap();
+                store.cleanup_own_shard().await.unwrap();
+            }
+            let stats_guard = state
+                .task_store
+                .coordination_lock("stats-writer")
+                .await
+                .unwrap();
+            let compact = enqueue(&state, TaskKind::Compact, "exp").await.unwrap();
+            let claim = state
+                .task_store
+                .claim_next_of_kinds(TaskKinds::COMPACT)
+                .await
+                .unwrap()
+                .unwrap();
+            let permit = state
+                .compaction_permits
+                .clone()
+                .acquire_owned()
+                .await
+                .unwrap();
+            let runner_state = state.clone();
+            let runner = tokio::spawn(async move {
+                let _permit = permit;
+                run_task(&runner_state, claim, TaskClaimTiming::default()).await;
+            });
+            // This is shorter than STATS_REFRESH_LOCK_WAIT. Completion must
+            // become durable while the competing stats writer still holds on.
+            let finished = await_terminal(&state, &compact.id).await;
+            assert_eq!(finished.state, TaskState::Done, "{:?}", finished.error);
+            assert!(!runner.is_finished());
+            assert_eq!(state.compaction_permits.available_permits(), 0);
+            enqueue(&state, TaskKind::MergeWal, "exp").await.unwrap();
+            let merge = state
+                .task_store
+                .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+                .await
+                .unwrap()
+                .expect("stats contention must not retain table ownership");
+            state
+                .task_store
+                .finish(merge, Ok("next writer admitted during stats wait".into()))
+                .await
+                .unwrap();
+            assert!(!runner.is_finished());
+            state
+                .task_store
+                .release_coordination_lock(stats_guard)
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), runner)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(state.compaction_permits.available_permits(), 1);
+            let stats = state.stats.lock().await.get("exp").await.unwrap().unwrap();
+            assert_eq!(stats.total_compactions, 1);
+            assert_eq!(stats.row_count, 4);
+        }
     }
 
     async fn prepared_compact_commit_and_release(owned: bool) {

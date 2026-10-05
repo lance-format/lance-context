@@ -26,6 +26,12 @@ targets do not use preparation.
    reservations, index remapping and final publication all occur in this phase.
 5. Finish the task and release its own keys. A failed preparation must never
    delete another task's merge claim or execution record.
+6. After durable completion, refresh statistics best-effort using a fresh
+   handle outside publication authority. Waiting for `stats-writer` does not
+   retain table ownership. The task keeps its local capacity permits until
+   refresh ends, so slow statistics cannot spawn unbounded background work.
+   A crash here can omit the statistics update; the next scan refreshes table
+   counts, but the best-effort compaction counter can miss that compaction.
 
 An append-only merge does not alter the selected source fragments and can
 complete during preparation. An update, delete, overlapping rewrite, or schema
@@ -37,7 +43,8 @@ the latest manifest and must survive either commit order.
 Compaction capacity is reserved before claiming, together with the existing
 general task budget. Index/repair and WAL polling remain independent. The
 `master_compaction_phase_duration_seconds` histogram separates `prepare`,
-`commit_wait`, and `commit`; task/target identities appear only in logs.
+`commit_wait`, `commit`, and `stats_refresh`; task/target identities appear only
+in logs. Task completion does not wait for the best-effort statistics refresh.
 
 Prepared output is deliberately not a new durable publication protocol. A
 process lost before commit may leave unreferenced immutable files and its task
