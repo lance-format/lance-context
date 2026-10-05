@@ -1182,6 +1182,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
         let mut a = writer(uri, "a").await;
+        a.add(&[artifact_record("seed", &[42; 4096])])
+            .await
+            .unwrap();
         let mut coordinator = AppendCoordinator::open(uri, None).await.unwrap();
         coordinator
             .plan(&["a".into()], 64, 1024 * 1024)
@@ -1206,6 +1209,9 @@ mod tests {
                     .current_generation,
             );
             a = writer(uri, "a").await;
+            a.add(&[artifact_record(&format!("opened-{epoch}"), &[42; 4096])])
+                .await
+                .unwrap();
         }
         coordinator
             .plan(&["a".into()], 64, 1024 * 1024)
@@ -1224,6 +1230,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
         let mut a = writer(uri, "a").await;
+        a.add(&[artifact_record("seed", &[42; 4096])])
+            .await
+            .unwrap();
         let mut coordinator = AppendCoordinator::open(uri, None).await.unwrap();
         coordinator
             .plan(&["a".into()], 64, 1024 * 1024)
@@ -1279,6 +1288,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
         let mut a = writer(uri, "a").await;
+        a.add(&[artifact_record("seed", &[42; 4096])])
+            .await
+            .unwrap();
         let mut coordinator = AppendCoordinator::open(uri, None).await.unwrap();
         coordinator
             .plan(&["a".into()], 64, 1024 * 1024)
@@ -1289,6 +1301,10 @@ mod tests {
         }
         a.close().await.unwrap();
         let mut restarted = writer(uri, "a").await;
+        restarted
+            .add(&[artifact_record("next", &[42; 4096])])
+            .await
+            .unwrap();
         let shard = derive_shard_id(Some("a"));
         let store = shard_store(&coordinator.dataset, shard).await.unwrap();
         let current = store.read_latest().await.unwrap().unwrap();
@@ -1321,7 +1337,7 @@ mod tests {
             .all(|g| state.contains(g.number)));
         let part = stage(uri, plans[0].clone(), budget(), None).await.unwrap();
         coordinator.commit(vec![part]).await.unwrap();
-        assert_eq!(rows(uri).await, 4);
+        assert_eq!(rows(uri).await, 5);
         restarted.close().await.unwrap();
     }
 
@@ -1351,6 +1367,10 @@ mod tests {
         }
         a.close().await.unwrap();
         let mut restarted = writer(uri, "a").await;
+        restarted
+            .add(&[artifact_record("next", &[42; 4096])])
+            .await
+            .unwrap();
         let shard = derive_shard_id(Some("a"));
         let current = shard_store(&coordinator.dataset, shard)
             .await
