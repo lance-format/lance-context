@@ -4831,7 +4831,7 @@ mod tests {
                     )
                     .await
                     .unwrap();
-                    let records: Vec<_> = (0..16)
+                    let records: Vec<_> = (0..8)
                         .map(|i| artifact_record(&format!("old-{i}"), &[1; 65536]))
                         .collect();
                     seed.add(&records).await.unwrap();
@@ -4844,6 +4844,15 @@ mod tests {
                         .find(|i| i.name == ROLLOUT_ID_INDEX_NAME)
                         .unwrap()
                         .uuid;
+                    // Half the existing rows are outside index coverage. The
+                    // concurrent updates must delete those rows too, using key
+                    // scans without extending the shared index.
+                    let uncovered: Vec<_> = (8..16)
+                        .map(|i| artifact_record(&format!("old-{i}"), &[1; 65536]))
+                        .collect();
+                    seed.add(&uncovered).await.unwrap();
+                    seed.flush().await.unwrap();
+                    seed.cleanup_own_shard().await.unwrap();
                     let mut shards = Vec::new();
                     for shard in 0..4 {
                         let writer = RolloutStore::open_with_options(
