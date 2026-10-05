@@ -136,6 +136,12 @@ async fn run_legacy_workers(
             if response.status() == reqwest::StatusCode::NOT_FOUND {
                 return Ok(0);
             }
+            if response.status().is_redirection() {
+                return Err((
+                    false,
+                    format!("legacy merge redirect refused: HTTP {}", response.status()),
+                ));
+            }
             let reply: serde_json::Value = response
                 .error_for_status()
                 .map_err(|e| (false, e.to_string()))?
@@ -1229,16 +1235,18 @@ mod legacy_connection_tests {
         let socket = tokio::net::TcpSocket::new_v4().unwrap();
         socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let lost = format!("http://{}/elsewhere", socket.local_addr().unwrap());
-        let (redirect, redirect_server) =
-            serve(
-                Router::new().fallback(post(move || {
-                    let location = lost.clone();
-                    async move {
-                        (StatusCode::TEMPORARY_REDIRECT, [("location", location)]).into_response()
-                    }
-                })),
-            )
-            .await;
+        let (redirect, redirect_server) = serve(Router::new().fallback(post(move || {
+            let location = lost.clone();
+            async move {
+                (
+                    StatusCode::TEMPORARY_REDIRECT,
+                    [("location", location)],
+                    Json(serde_json::json!({"reclaimed": 99})),
+                )
+                    .into_response()
+            }
+        })))
+        .await;
         let calls = Arc::new(AtomicUsize::new(0));
         let (good, server) = healthy(calls.clone()).await;
         let http = crate::state::worker_http_client().unwrap();
