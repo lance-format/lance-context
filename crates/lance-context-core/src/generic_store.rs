@@ -524,52 +524,21 @@ impl GenericStore {
         let mut ids = BTreeSet::new();
         let mut id_bytes = 0usize;
         let mut scanned = 0usize;
-        let paths = snapshots.iter().flat_map(|snapshot| {
-            snapshot.flushed_generations.iter().map(|generation| {
-                self.base
-                    .flushed_generation_uri(snapshot.shard_id, &generation.path)
-            })
-        });
-        // One dataset at a time, ID projection only, with hard key/byte/work caps.
-        for path in std::iter::once(None).chain(paths.map(Some)) {
-            let source = match path {
-                None => dataset.clone(),
-                Some(path) => {
-                    StorageBase::load_with_options(
-                        &path,
-                        self.base.storage_options.clone(),
-                        Some(dataset.session()),
-                    )
-                    .await?
-                }
-            };
-            let mut scanner = source.scan();
-            scanner.project(&[ID_COLUMN])?;
-            scanner.batch_size(256);
-            let mut stream = scanner.try_into_stream().await?;
-            while let Some(batch) = stream.try_next().await? {
-                scanned += batch.num_rows();
-                let keys = batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .ok_or_else(|| LanceError::io("generic ID must be Utf8"))?;
-                for key in keys.iter().flatten() {
-                    if !ids.contains(key) {
-                        if ids.len() >= MAX_BATCH_GET_IDS
-                            || id_bytes.saturating_add(key.len()) > 1024 * 1024
-                        {
-                            return Err(LanceError::io(
-                                "WAL PK index fallback key budget exceeded",
-                            ));
-                        }
-                        id_bytes += key.len();
-                        ids.insert(key.to_owned());
-                    }
-                }
-                if scanned > 16 * MAX_BATCH_GET_IDS {
-                    return Err(LanceError::io("WAL PK index fallback scan budget exceeded"));
-                }
+        // One dataset at a time; do not allocate a path list proportional to
+        // pending WAL generations before the key/work budgets can reject it.
+        collect_scan_keys(dataset, &mut ids, &mut id_bytes, &mut scanned).await?;
+        for snapshot in snapshots {
+            for generation in &snapshot.flushed_generations {
+                let path = self
+                    .base
+                    .flushed_generation_uri(snapshot.shard_id, &generation.path);
+                let source = StorageBase::load_with_options(
+                    &path,
+                    self.base.storage_options.clone(),
+                    Some(dataset.session()),
+                )
+                .await?;
+                collect_scan_keys(&source, &mut ids, &mut id_bytes, &mut scanned).await?;
             }
         }
         let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
@@ -813,6 +782,42 @@ impl GenericStore {
         self.base.put(batches).await?;
         Ok(self.base.version())
     }
+}
+
+/// Collect only candidate keys; native point reads resolve their visibility.
+async fn collect_scan_keys(
+    source: &lance::Dataset,
+    ids: &mut BTreeSet<String>,
+    id_bytes: &mut usize,
+    scanned: &mut usize,
+) -> LanceResult<()> {
+    let mut scanner = source.scan();
+    scanner.project(&[ID_COLUMN])?;
+    scanner.batch_size(256);
+    let mut stream = scanner.try_into_stream().await?;
+    while let Some(batch) = stream.try_next().await? {
+        *scanned += batch.num_rows();
+        if *scanned > 16 * MAX_BATCH_GET_IDS {
+            return Err(LanceError::io("WAL PK index fallback scan budget exceeded"));
+        }
+        let keys = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| LanceError::io("generic ID must be Utf8"))?;
+        for key in keys.iter().flatten() {
+            if !ids.contains(key) {
+                if ids.len() >= MAX_BATCH_GET_IDS
+                    || id_bytes.saturating_add(key.len()) > 1024 * 1024
+                {
+                    return Err(LanceError::io("WAL PK index fallback key budget exceeded"));
+                }
+                *id_bytes += key.len();
+                ids.insert(key.to_owned());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn is_wal_pk_batch_error(error: &LanceError) -> bool {
