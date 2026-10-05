@@ -25,7 +25,7 @@ use std::sync::Arc;
 use arrow_array::{RecordBatch, StringArray};
 use arrow_schema::{ArrowError, Schema};
 use datafusion::prelude::{col, lit, Expr};
-use futures::TryStreamExt;
+use futures::{FutureExt, TryStreamExt};
 use lance::dataset::mem_wal::{scanner::ShardSnapshot, ShardManifestStore};
 use lance::dataset::optimize::CompactionMetrics;
 use lance::session::Session;
@@ -478,7 +478,12 @@ impl GenericStore {
                     }
                     result => result,
                 }
-            }).await
+            })
+            // Erase this recovery future so callers do not inherit the full
+            // Lance scan + retry type (master tests otherwise exceed rustc
+            // layout query depth before they can run).
+            .boxed()
+            .await
     }
 
     /// Narrow compatibility path for Lance 9's broken batched PK sidecars.
