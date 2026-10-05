@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
-use etcd_client::{Client, Compare, CompareOp, GetOptions, PutOptions, Txn, TxnOp};
+use etcd_client::{Client, Compare, CompareOp, GetOptions, PutOptions, Txn, TxnOp, TxnOpResponse};
 use lance_context_api::{RepairRecord, TaskCooldown, TaskKind, TaskRecord, TaskState};
 use lance_context_core::generate_id;
 use tokio::sync::oneshot;
@@ -71,6 +71,7 @@ pub struct TaskStore {
     history_limit: usize,
     history_ttl_secs: u64,
     cooldown: CooldownPolicy,
+    global_maintenance: bool,
 }
 
 /// When to stop re-enqueueing a target that keeps failing, and for how long.
@@ -239,9 +240,15 @@ impl TaskStore {
                 base: Duration::from_secs(config.task_cooldown_base_secs),
                 max: Duration::from_secs(config.task_cooldown_max_secs),
             },
+            global_maintenance: config.catchup.target.is_none(),
         };
-        store.recover_orphaned().await?;
-        store.prune_terminal_history().await?;
+        // Short-lived exact-target executors must not sweep the fleet's running
+        // tasks or terminal history on every invocation. Ordinary masters own
+        // that maintenance; dedicated admission reconciles its own task below.
+        if store.global_maintenance {
+            store.recover_orphaned().await?;
+            store.prune_terminal_history().await?;
+        }
         Ok(store)
     }
 
@@ -306,10 +313,14 @@ impl TaskStore {
         target: &str,
         job: &str,
     ) -> lance::Result<Option<TaskClaim>> {
-        self.inner.recover_orphaned().await?;
         let Some(id) = self.get_active_id(TaskKind::MergeWal, target).await? else {
             return Ok(None);
         };
+        if let Some(task) = self.inner.get(&id).await? {
+            if task.state == TaskState::Running {
+                self.inner.recover_tasks(&[task]).await?;
+            }
+        }
         Ok(self
             .inner
             .claim_next(TaskKinds::MERGE_WAL, Some((&id, job)))
@@ -342,7 +353,10 @@ impl TaskStore {
                 tracing::warn!(kind = ?kind, target = %target, %error, "cooldown bookkeeping failed");
             }
         }
-        self.prune_terminal_history().await.map(|_| ())
+        if self.global_maintenance {
+            self.prune_terminal_history().await?;
+        }
+        Ok(())
     }
 
     /// Whether the sweeps should skip this target for now because it has
@@ -663,11 +677,37 @@ impl EtcdTaskStore {
                     }
                 }
 
-                let merge_execution =
-                    lance_context_merge::Coordinator::new(self.client.clone(), self.prefix.clone())
-                        .get(&task.target)
-                        .await
-                        .map_err(lance::Error::io)?;
+                let execution_key = lance_context_merge::execution_key(&self.prefix, &task.target);
+                let snapshot = self
+                    .read_values(&[
+                        execution_key.clone(),
+                        self.target_lock_key(&task.target),
+                        crate::catchup::store::active_key(&self.prefix, &task.target),
+                        execution_key.replace("/merge-executions/", "/merge-claims/"),
+                        self.claim_key(&task.id),
+                    ])
+                    .await?;
+                let merge_execution: Option<lance_context_merge::Execution> = snapshot[0]
+                    .as_deref()
+                    .map(serde_json::from_slice)
+                    .transpose()
+                    .map_err(|e| lance::Error::io(format!("invalid merge execution: {e}")))?;
+                // Avoid lease grant/revoke for a clearly blocked candidate.
+                // The final transaction still checks every ownership predicate.
+                let expected_owner = merge_execution
+                    .as_ref()
+                    .map(lance_context_merge::execution_owner);
+                let expected_job = only_id.map(|(_, job)| job.as_bytes());
+                if snapshot[4].is_some()
+                    || (requires_target_lock(task.kind)
+                        && (snapshot[2].as_deref() != expected_job
+                            || snapshot[3].is_some()
+                            || snapshot[1].as_deref()
+                                != expected_owner.as_deref().map(str::as_bytes)))
+                {
+                    metrics::counter!("master_task_admission_blocked_total").increment(1);
+                    continue;
+                }
                 // Only MergeWal reconciles a worker execution. A local fenced
                 // mutation may be recovered by any table writer after the
                 // exclusive reconciler lease has expired.
@@ -680,6 +720,15 @@ impl EtcdTaskStore {
                 }
                 let token = generate_id();
                 let lease_id = self.grant_lease().await?;
+                // Establish renewal before publishing ownership, so a slow
+                // keepalive handshake cannot strand an already accepted claim.
+                let keepalive = match self.start_keepalive(lease_id).await {
+                    Ok(keepalive) => keepalive,
+                    Err(error) => {
+                        let _ = self.revoke_lease(lease_id).await;
+                        return Err(error);
+                    }
+                };
                 let claim_key = self.claim_key(&task.id);
                 let target_key =
                     requires_target_lock(task.kind).then(|| self.target_lock_key(&task.target));
@@ -749,13 +798,21 @@ impl EtcdTaskStore {
                     }
                 }
                 let mut client = self.client.clone();
-                let claimed = client
+                let response = client
                     .txn(Txn::new().when(compares).and_then(operations))
+                    .await;
+                let claimed = match self
+                    .resolve_claim_response(response, &claim_key, &token)
                     .await
-                    .map_err(etcd_error("claim task"))?
-                    .succeeded();
+                {
+                    Ok(claimed) => claimed,
+                    Err(error) => {
+                        drop(keepalive);
+                        let _ = self.revoke_lease(lease_id).await;
+                        return Err(error);
+                    }
+                };
                 if claimed {
-                    let keepalive = self.start_keepalive(lease_id).await?;
                     return Ok((
                         Some(TaskClaim {
                             task,
@@ -770,6 +827,7 @@ impl EtcdTaskStore {
                         dependency_failed,
                     ));
                 }
+                drop(keepalive);
                 self.revoke_lease(lease_id).await?;
             }
 
@@ -857,45 +915,146 @@ impl EtcdTaskStore {
         Ok(())
     }
 
+    async fn resolve_claim_response(
+        &self,
+        response: Result<etcd_client::TxnResponse, etcd_client::Error>,
+        claim_key: &str,
+        token: &str,
+    ) -> lance::Result<bool> {
+        match response {
+            Ok(response) => Ok(response.succeeded()),
+            Err(error) => {
+                // A transport deadline can arrive after the atomic claim was
+                // accepted. Adopt only our unique token, never another owner.
+                if self.get_text(claim_key).await?.as_deref() == Some(token) {
+                    metrics::counter!("master_task_claim_response_recovered_total").increment(1);
+                    Ok(true)
+                } else {
+                    Err(etcd_error("claim task")(error))
+                }
+            }
+        }
+    }
+
     async fn recover_orphaned(&self) -> lance::Result<usize> {
-        let mut client = self.client.clone();
-        let response = client
-            .get(self.running_prefix(), Some(GetOptions::new().with_prefix()))
-            .await
-            .map_err(etcd_error("list running tasks"))?;
-        let running = response
-            .kvs()
-            .iter()
-            .map(|kv| decode_task(kv.value(), &String::from_utf8_lossy(kv.key())))
-            .collect::<lance::Result<Vec<_>>>()?;
+        // Bound each read and batch live-claim checks: a healthy running task
+        // needs no conditional recovery transaction. Keep the original CAS
+        // authority for missing claims, since preflight reads may become stale.
+        let mut start = self.running_prefix().into_bytes();
+        let end = prefix_range_end(&start);
         let mut recovered = 0;
-        for mut task in running {
-            let running_value = encode_task(&task)?;
-            let claim_key = self.claim_key(&task.id);
-            let running_key = self.running_key(&task.id);
-            requeue(&mut task);
-            let txn = Txn::new()
-                .when([
-                    Compare::value(self.task_key(&task.id), CompareOp::Equal, running_value),
-                    Compare::version(claim_key.as_str(), CompareOp::Equal, 0),
-                    Compare::version(running_key.as_str(), CompareOp::Greater, 0),
-                ])
-                .and_then([
-                    TxnOp::put(self.task_key(&task.id), encode_task(&task)?, None),
-                    TxnOp::put(self.queue_key(&task.id), encode_task(&task)?, None),
-                    TxnOp::delete(running_key, None),
-                ]);
-            let mut client = self.client.clone();
-            if client
-                .txn(txn)
+        loop {
+            let page = self
+                .client
+                .clone()
+                .get(
+                    start,
+                    Some(GetOptions::new().with_range(end.clone()).with_limit(64)),
+                )
                 .await
-                .map_err(etcd_error("recover orphaned task"))?
-                .succeeded()
-            {
+                .map_err(etcd_error("list running tasks"))?;
+            let tasks = page
+                .kvs()
+                .iter()
+                .map(|kv| decode_task(kv.value(), &String::from_utf8_lossy(kv.key())))
+                .collect::<lance::Result<Vec<_>>>()?;
+            recovered += self.recover_tasks(&tasks).await?;
+            if !page.more() {
+                return Ok(recovered);
+            }
+            start = page
+                .kvs()
+                .last()
+                .ok_or_else(|| lance::Error::io("empty recovery page"))?
+                .key()
+                .to_vec();
+            start.push(0);
+        }
+    }
+
+    /// Exact keys in one read-only transaction; never a fleet prefix scan.
+    async fn read_values(&self, keys: &[String]) -> lance::Result<Vec<Option<Vec<u8>>>> {
+        let response = self
+            .client
+            .clone()
+            .txn(
+                Txn::new().and_then(
+                    keys.iter()
+                        .map(|key| TxnOp::get(key.as_str(), None))
+                        .collect::<Vec<_>>(),
+                ),
+            )
+            .await
+            .map_err(etcd_error("read admission snapshot"))?;
+        let responses = response.op_responses();
+        if responses.len() != keys.len() {
+            return Err(lance::Error::io("incomplete admission snapshot"));
+        }
+        responses
+            .into_iter()
+            .map(|op| match op {
+                TxnOpResponse::Get(value) => Ok(value.kvs().first().map(|kv| kv.value().to_vec())),
+                _ => Err(lance::Error::io("invalid admission snapshot response")),
+            })
+            .collect()
+    }
+
+    async fn recover_tasks(&self, tasks: &[TaskRecord]) -> lance::Result<usize> {
+        if tasks.is_empty() {
+            return Ok(0);
+        }
+        let claims = self
+            .read_values(
+                &tasks
+                    .iter()
+                    .map(|t| self.claim_key(&t.id))
+                    .collect::<Vec<_>>(),
+            )
+            .await?;
+        let mut recovered = 0;
+        for (task, claim) in tasks.iter().zip(claims) {
+            if claim.is_some() {
+                continue;
+            }
+            if self.recover_task(task).await? {
                 recovered += 1;
             }
         }
+        metrics::counter!("master_task_recovery_inspected_total").increment(tasks.len() as u64);
+        metrics::counter!("master_task_recovery_requeued_total").increment(recovered as u64);
         Ok(recovered)
+    }
+
+    async fn recover_task(&self, task: &TaskRecord) -> lance::Result<bool> {
+        let mut queued = task.clone();
+        requeue(&mut queued);
+        let value = encode_task(&queued)?;
+        let txn = Txn::new()
+            .when([
+                Compare::value(
+                    self.task_key(&task.id),
+                    CompareOp::Equal,
+                    encode_task(task)?,
+                ),
+                Compare::version(self.claim_key(&task.id), CompareOp::Equal, 0),
+                Compare::value(
+                    self.running_key(&task.id),
+                    CompareOp::Equal,
+                    encode_task(task)?,
+                ),
+            ])
+            .and_then([
+                TxnOp::put(self.task_key(&task.id), value.clone(), None),
+                TxnOp::put(self.queue_key(&task.id), value, None),
+                TxnOp::delete(self.running_key(&task.id), None),
+            ]);
+        Ok(self
+            .client
+            .clone()
+            .txn(txn)
+            .await
+            .map_err(etcd_error("recover orphaned task"))?
+            .succeeded())
     }
 
     async fn try_coordination_lock(&self, name: &str) -> lance::Result<Option<CoordinationGuard>> {
@@ -1460,6 +1619,249 @@ fn etcd_error(action: &'static str) -> impl FnOnce(etcd_client::Error) -> lance:
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn benchmark_target_admission_with_eighty_healthy_tasks() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.etcd.etcd_endpoints = std::env::var("ETCD_TEST_ENDPOINTS")
+            .unwrap()
+            .split(',')
+            .map(str::to_owned)
+            .collect();
+        cfg.etcd.etcd_prefix = format!("/admission-benchmark/{}", generate_id());
+        cfg.catchup.target = Some("hot".into());
+        let store = TaskStore::open(&cfg).await.unwrap();
+        let lease = store.inner.grant_lease().await.unwrap();
+        let keepalive = store.inner.start_keepalive(lease).await.unwrap();
+        let mut client = store.inner.client.clone();
+        for i in 0..80 {
+            let mut task = new_task(TaskKind::MergeWal, &format!("healthy-{i}"), Vec::new());
+            task.state = TaskState::Running;
+            let value = encode_task(&task).unwrap();
+            client
+                .txn(Txn::new().and_then([
+                    TxnOp::put(store.inner.task_key(&task.id), value.clone(), None),
+                    TxnOp::put(store.inner.running_key(&task.id), value, None),
+                    TxnOp::put(
+                        store.inner.claim_key(&task.id),
+                        "live",
+                        Some(PutOptions::new().with_lease(lease)),
+                    ),
+                ]))
+                .await
+                .unwrap();
+        }
+        // Reproduce the old sweep's sequential conditional transactions. All
+        // predicates fail because these fixture tasks have healthy claims.
+        let baseline = std::time::Instant::now();
+        let running = client
+            .get(
+                store.inner.running_prefix(),
+                Some(GetOptions::new().with_prefix()),
+            )
+            .await
+            .unwrap();
+        for kv in running.kvs() {
+            let task = decode_task(kv.value(), "fixture").unwrap();
+            assert!(!store.inner.recover_task(&task).await.unwrap());
+        }
+        let old_sweep_seconds = baseline.elapsed().as_secs_f64();
+        let batch = std::time::Instant::now();
+        assert_eq!(store.inner.recover_orphaned().await.unwrap(), 0);
+        let batched_sweep_seconds = batch.elapsed().as_secs_f64();
+        client
+            .put(
+                crate::catchup::store::active_key(&store.inner.prefix, "hot"),
+                "job",
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .enqueue(TaskKind::MergeWal, "hot", Vec::new())
+            .await
+            .unwrap();
+        let start = std::time::Instant::now();
+        let claim = store
+            .claim_merge_target("hot", "job")
+            .await
+            .unwrap()
+            .unwrap();
+        let target_claim_seconds = start.elapsed().as_secs_f64();
+        println!(
+            "{}",
+            serde_json::json!({"healthy_running":80, "old_sweep_seconds":old_sweep_seconds,
+            "batched_sweep_seconds":batched_sweep_seconds, "target_claim_seconds":target_claim_seconds})
+        );
+        store.finish(claim, Ok("done".into())).await.unwrap();
+        drop(keepalive);
+        store.inner.revoke_lease(lease).await.unwrap();
+        client
+            .delete(
+                cfg.etcd.etcd_prefix,
+                Some(etcd_client::DeleteOptions::new().with_prefix()),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn dedicated_admission_ignores_unrelated_history_and_recovers_own_orphan() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.etcd.etcd_endpoints = std::env::var("ETCD_TEST_ENDPOINTS")
+            .unwrap()
+            .split(',')
+            .map(str::to_owned)
+            .collect();
+        cfg.etcd.etcd_prefix = format!("/admission-test/{}", generate_id());
+        cfg.catchup.target = Some("hot".into());
+        let backend = EtcdTaskStore::connect(&cfg).await.unwrap();
+        let mut client = backend.client.clone();
+        // These intentionally undecodable records expose any accidental fleet
+        // scan during dedicated open, claim, recovery, or finish.
+        let unrelated_running = backend.running_key("unrelated");
+        let unrelated_history = backend.task_key("unrelated");
+        for key in [&unrelated_running, &unrelated_history] {
+            client
+                .put(key.as_str(), "not a task record", None)
+                .await
+                .unwrap();
+        }
+        client
+            .put(
+                crate::catchup::store::active_key(&backend.prefix, "hot"),
+                "job",
+                None,
+            )
+            .await
+            .unwrap();
+        let store = TaskStore::open(&cfg).await.unwrap();
+        let task = store
+            .enqueue(TaskKind::MergeWal, "hot", Vec::new())
+            .await
+            .unwrap();
+        assert!(store
+            .claim_merge_target("hot", "wrong-job")
+            .await
+            .unwrap()
+            .is_none());
+        let claim = store
+            .claim_merge_target("hot", "job")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.task.id, task.id);
+        assert!(
+            store
+                .claim_merge_target("hot", "job")
+                .await
+                .unwrap()
+                .is_none(),
+            "a live claim must remain protected"
+        );
+        store.abandon_claim_for_test(claim).await.unwrap();
+        let recovered = store
+            .claim_merge_target("hot", "job")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.task.id, task.id);
+        store.finish(recovered, Ok("merged".into())).await.unwrap();
+        assert_eq!(
+            store.get(&task.id).await.unwrap().unwrap().state,
+            TaskState::Done
+        );
+        for key in [&unrelated_running, &unrelated_history] {
+            assert_eq!(
+                backend.get_text(key).await.unwrap().as_deref(),
+                Some("not a task record")
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn lost_claim_response_adopts_only_its_own_token() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.etcd.etcd_endpoints = std::env::var("ETCD_TEST_ENDPOINTS")
+            .unwrap()
+            .split(',')
+            .map(str::to_owned)
+            .collect();
+        cfg.etcd.etcd_prefix = format!("/admission-test/{}", generate_id());
+        let store = TaskStore::open(&cfg).await.unwrap();
+        store
+            .enqueue(TaskKind::MergeWal, "hot", Vec::new())
+            .await
+            .unwrap();
+        let claim = store.claim_next().await.unwrap().unwrap();
+        let lost = || {
+            Err(etcd_client::Error::Internal(
+                "simulated lost response".into(),
+            ))
+        };
+        assert!(store
+            .inner
+            .resolve_claim_response(lost(), &claim.backend.claim_key, &claim.backend.token)
+            .await
+            .unwrap());
+        assert!(store
+            .inner
+            .resolve_claim_response(lost(), &claim.backend.claim_key, "another-owner")
+            .await
+            .is_err());
+        store.abandon_claim_for_test(claim).await.unwrap();
+        assert!(store
+            .inner
+            .resolve_claim_response(lost(), &store.inner.claim_key("absent"), "another-owner")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn batched_recovery_preserves_live_claims_and_crosses_pages() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.etcd.etcd_endpoints = std::env::var("ETCD_TEST_ENDPOINTS")
+            .unwrap()
+            .split(',')
+            .map(str::to_owned)
+            .collect();
+        cfg.etcd.etcd_prefix = format!("/admission-test/{}", generate_id());
+        let store = TaskStore::open(&cfg).await.unwrap();
+        store
+            .enqueue(TaskKind::MergeWal, "live", Vec::new())
+            .await
+            .unwrap();
+        let live = store.claim_next().await.unwrap().unwrap();
+        let mut client = store.inner.client.clone();
+        for i in 0..70 {
+            let mut task = new_task(TaskKind::MergeWal, &format!("orphan-{i}"), Vec::new());
+            task.state = TaskState::Running;
+            let value = encode_task(&task).unwrap();
+            client
+                .txn(Txn::new().and_then([
+                    TxnOp::put(store.inner.task_key(&task.id), value.clone(), None),
+                    TxnOp::put(store.inner.running_key(&task.id), value, None),
+                ]))
+                .await
+                .unwrap();
+        }
+        assert_eq!(store.inner.recover_orphaned().await.unwrap(), 70);
+        assert_eq!(
+            store.get(&live.task.id).await.unwrap().unwrap().state,
+            TaskState::Running
+        );
+        assert_eq!(store.inner.recover_orphaned().await.unwrap(), 0);
+        assert_eq!(store.queue_depth().await.unwrap(), 70);
+        store.finish(live, Ok("done".into())).await.unwrap();
+    }
 
     #[tokio::test]
     #[ignore = "requires ETCD_TEST_ENDPOINTS"]

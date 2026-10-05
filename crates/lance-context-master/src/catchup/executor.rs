@@ -21,28 +21,29 @@ pub async fn execute(mut config: MasterConfig, target: &str) -> Result<()> {
         .job_name
         .clone()
         .ok_or("missing catch-up Job identity")?;
+    let startup = tokio::time::Instant::now();
     let state = MasterState::new(config).await.map_err(|e| e.to_string())?;
+    tracing::info!(%target, startup_seconds = startup.elapsed().as_secs_f64(), "catch-up state ready");
     // Enqueue through the normal durable queue, then claim only this table.
     state
         .task_store
         .enqueue(TaskKind::MergeWal, target, Vec::new())
         .await
         .map_err(|e| e.to_string())?;
-    let claim = tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            if let Some(claim) = state
+    let admission_started = tokio::time::Instant::now();
+    let claim = claim_before_deadline(
+        || async {
+            state
                 .task_store
                 .claim_merge_target(target, &job)
                 .await
-                .map_err(|e| e.to_string())?
-            {
-                return Ok::<_, String>(claim);
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-    })
-    .await
-    .map_err(|_| "catch-up admission remained busy for 30 seconds")??;
+                .map_err(|e| e.to_string())
+        },
+        admission_started + Duration::from_secs(30),
+    )
+    .await?;
+    tracing::info!(%target, admission_seconds = admission_started.elapsed().as_secs_f64(),
+        "catch-up task claimed");
     let result = async {
         // The claim CAS has excluded any live reconciler. A previous process
         // may still have a storage PUT in flight: fence before opening writers.
@@ -76,6 +77,31 @@ pub async fn execute(mut config: MasterConfig, target: &str) -> Result<()> {
         return Err(error);
     }
     Ok(())
+}
+
+async fn claim_before_deadline<T, F, Fut>(
+    mut attempt: F,
+    deadline: tokio::time::Instant,
+) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<Option<T>>>,
+{
+    loop {
+        // Bound retries between attempts, not by dropping an in-flight
+        // mutating claim RPC. Individual etcd RPCs have their own timeout;
+        // an accepted claim must be delivered even at the retry deadline.
+        if tokio::time::Instant::now() >= deadline {
+            return Err("catch-up admission remained busy for 30 seconds".into());
+        }
+        if let Some(claim) = attempt().await? {
+            return Ok(claim);
+        }
+        tokio::time::sleep_until(
+            deadline.min(tokio::time::Instant::now() + Duration::from_secs(1)),
+        )
+        .await;
+    }
 }
 
 async fn merge_passes(state: &Arc<MasterState>, target: &str) -> Result<String> {
@@ -278,6 +304,37 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::{Notify, Semaphore};
+
+    #[tokio::test]
+    async fn admission_delivers_claim_accepted_across_retry_deadline() {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+        let result = claim_before_deadline(
+            || async {
+                tokio::time::sleep_until(deadline + Duration::from_millis(10)).await;
+                Ok(Some("accepted claim"))
+            },
+            deadline,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, "accepted claim");
+    }
+
+    #[tokio::test]
+    async fn admission_stops_retrying_unclaimed_work_at_deadline() {
+        let calls = AtomicUsize::new(0);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+        let result = claim_before_deadline(
+            || async {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Ok(None::<()>)
+            },
+            deadline,
+        )
+        .await;
+        assert!(result.unwrap_err().contains("admission remained busy"));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
 
     #[tokio::test]
     async fn pipeline_overlaps_reads_with_one_ordered_commit_and_bounds_lookahead() {
