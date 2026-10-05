@@ -224,7 +224,7 @@ impl MasterState {
             config,
             task_store,
             admission: Arc::new(crate::admission::Admission::default()),
-            http: worker_http_client().map_err(lance::Error::io)?,
+            http: worker_http_client().map_err(|error| lance::Error::io(error.to_string()))?,
             compaction_permits: Arc::new(Semaphore::new(compaction_concurrency)),
             stats_maintenance_failures: std::sync::atomic::AtomicU64::new(0),
             stats_last_reclaimed_version: std::sync::atomic::AtomicU64::new(0),
