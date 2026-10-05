@@ -109,8 +109,18 @@ pub(crate) async fn run_merge_wal(
 // Compatibility path is chosen only by explicit configuration, never after a
 // failed owned RPC. It retains legacy limitations until that table is drained.
 async fn run_legacy(state: &Arc<MasterState>, target: &str) -> Result<String, String> {
+    run_legacy_workers(&state.http, &state.config.worker_endpoints, target).await
+}
+
+async fn run_legacy_workers(
+    http: &reqwest::Client,
+    endpoints: &[String],
+    target: &str,
+) -> Result<String, String> {
     let mut reclaimed = 0u64;
-    for endpoint in &state.config.worker_endpoints {
+    let mut completed = 0usize;
+    let mut unavailable = Vec::new();
+    for endpoint in endpoints {
         let endpoint = endpoint.trim_end_matches('/');
         let url = match target.strip_prefix("generic:") {
             Some(name) => format!("{endpoint}/api/v1/generic/{name}/merge-wal"),
@@ -118,37 +128,62 @@ async fn run_legacy(state: &Arc<MasterState>, target: &str) -> Result<String, St
         };
         let started = std::time::Instant::now();
         let result = async {
-            let response = state
-                .http
-                .post(url)
-                .send()
-                .await
-                .map_err(|e| e.to_string())?;
+            let response = http.post(url).send().await.map_err(|error| {
+                // The shared worker client must disable redirects: a failed
+                // connection AFTER a redirected POST could hide an execution.
+                (error.is_connect(), error.to_string())
+            })?;
             if response.status() == reqwest::StatusCode::NOT_FOUND {
                 return Ok(0);
             }
             let reply: serde_json::Value = response
                 .error_for_status()
-                .map_err(|e| e.to_string())?
+                .map_err(|e| (false, e.to_string()))?
                 .json()
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| (false, e.to_string()))?;
             reply["reclaimed"]
                 .as_u64()
-                .ok_or_else(|| "invalid legacy merge response".to_string())
+                .ok_or_else(|| (false, "invalid legacy merge response".to_string()))
         }
         .await;
         metrics::histogram!("master_merge_wal_worker_duration_seconds")
             .record(started.elapsed().as_secs_f64());
         metrics::counter!("master_merge_wal_workers_total", "result" => if result.is_ok() { "ok" } else { "failed" }).increment(1);
-        reclaimed += result?;
+        match result {
+            Ok(n) => {
+                completed += 1;
+                reclaimed += n;
+                // Preserve real progress even when a later worker is unavailable.
+                metrics::counter!("master_merge_wal_generations_reclaimed_total").increment(n);
+            }
+            Err((true, error)) => {
+                tracing::warn!(%endpoint, %target, %error, "worker connection failed before merge admission; continuing healthy workers");
+                unavailable.push(format!("{endpoint}: {error}"));
+            }
+            Err((false, error)) => {
+                // A response error, reset, or timeout after sending may leave
+                // an unfenced legacy writer alive. Do not advance the fan-out.
+                return Err(format!(
+                    "merged {reclaimed} generations across {completed}/{} workers (legacy); stopped at {endpoint}: {error}",
+                    endpoints.len()
+                ));
+            }
+        }
     }
-    metrics::counter!("master_merge_wal_generations_reclaimed_total").increment(reclaimed);
-    Ok(format!(
-        "merged {reclaimed} generations across {}/{} workers (legacy)",
-        state.config.worker_endpoints.len(),
-        state.config.worker_endpoints.len()
-    ))
+    let detail = format!(
+        "merged {reclaimed} generations across {completed}/{} workers (legacy)",
+        endpoints.len()
+    );
+    if unavailable.is_empty() {
+        Ok(detail)
+    } else {
+        // Keep the canonical task failed/retryable: skipped shards are not done.
+        Err(format!(
+            "{detail}; unavailable workers: {}",
+            unavailable.join("; ")
+        ))
+    }
 }
 
 struct Deadlines {
@@ -1117,5 +1152,133 @@ mod tests {
         assert!(coordinator.get("table").await.unwrap().is_none());
         first_server.abort();
         second_server.abort();
+    }
+}
+
+#[cfg(test)]
+mod legacy_connection_tests {
+    use super::run_legacy_workers;
+    use axum::{http::StatusCode, response::IntoResponse, routing::post, Json, Router};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    async fn serve(app: Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (url, handle)
+    }
+
+    async fn healthy(calls: Arc<AtomicUsize>) -> (String, tokio::task::JoinHandle<()>) {
+        serve(Router::new().fallback(post(move || {
+            let calls = calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Json(serde_json::json!({"reclaimed": 7}))
+            }
+        })))
+        .await
+    }
+
+    #[tokio::test]
+    async fn connection_refusal_preserves_progress_on_both_sides() {
+        // Reserve a non-listening port so another test cannot take it.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let lost = format!("http://{}", socket.local_addr().unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (good, server) = healthy(calls.clone()).await;
+        let http = crate::state::worker_http_client().unwrap();
+        let error = run_legacy_workers(&http, &[good.clone(), lost, good], "table")
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("merged 14 generations across 2/3 workers"),
+            "{error}"
+        );
+        assert!(error.contains("unavailable workers"));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn server_failure_stops_before_next_legacy_writer() {
+        let (bad, failed_server) =
+            serve(Router::new().fallback(post(|| async { StatusCode::INTERNAL_SERVER_ERROR })))
+                .await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (good, server) = healthy(calls.clone()).await;
+        let http = crate::state::worker_http_client().unwrap();
+        let error = run_legacy_workers(&http, &[good.clone(), bad, good], "table")
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("merged 7 generations across 1/3 workers"),
+            "{error}"
+        );
+        assert!(error.contains("stopped at"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        failed_server.abort();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn redirected_connect_failure_cannot_be_treated_as_unadmitted() {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let lost = format!("http://{}/elsewhere", socket.local_addr().unwrap());
+        let (redirect, redirect_server) =
+            serve(
+                Router::new().fallback(post(move || {
+                    let location = lost.clone();
+                    async move {
+                        (StatusCode::TEMPORARY_REDIRECT, [("location", location)]).into_response()
+                    }
+                })),
+            )
+            .await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (good, server) = healthy(calls.clone()).await;
+        let http = crate::state::worker_http_client().unwrap();
+        let error = run_legacy_workers(&http, &[redirect, good], "table")
+            .await
+            .unwrap_err();
+        assert!(error.contains("stopped at"), "{error}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        redirect_server.abort();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn timeout_after_admission_does_not_advance_to_another_writer() {
+        let admitted = Arc::new(AtomicUsize::new(0));
+        let seen = admitted.clone();
+        let (slow, slow_server) = serve(Router::new().fallback(post(move || {
+            let seen = seen.clone();
+            async move {
+                seen.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                Json(serde_json::json!({"reclaimed": 3}))
+            }
+        })))
+        .await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (good, server) = healthy(calls.clone()).await;
+        // Test-only execution deadline reproduces an ambiguous lost response.
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let error = run_legacy_workers(&http, &[slow, good], "table")
+            .await
+            .unwrap_err();
+        assert!(error.contains("stopped at"), "{error}");
+        assert_eq!(admitted.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        slow_server.abort();
+        server.abort();
     }
 }

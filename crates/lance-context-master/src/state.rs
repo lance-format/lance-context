@@ -122,6 +122,15 @@ pub struct MasterState {
     pub stats_last_reclaimed_version: std::sync::atomic::AtomicU64,
 }
 
+// Internal worker endpoints are direct addresses. Never follow a merge POST
+// redirect: connect failures must mean the original worker never received it.
+pub(crate) fn worker_http_client() -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(2))
+        .build()
+}
+
 impl MasterState {
     /// Open the registry, stats dataset, and configured durable task store.
     pub async fn new(config: MasterConfig) -> lance::Result<Arc<Self>> {
@@ -215,7 +224,7 @@ impl MasterState {
             config,
             task_store,
             admission: Arc::new(crate::admission::Admission::default()),
-            http: reqwest::Client::new(),
+            http: worker_http_client().map_err(lance::Error::io)?,
             compaction_permits: Arc::new(Semaphore::new(compaction_concurrency)),
             stats_maintenance_failures: std::sync::atomic::AtomicU64::new(0),
             stats_last_reclaimed_version: std::sync::atomic::AtomicU64::new(0),
