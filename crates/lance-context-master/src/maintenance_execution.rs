@@ -116,6 +116,42 @@ impl CommitAuthorizer for Guard {
     }
 }
 
+/// Recovery may just have published the first failure's two-second backoff.
+/// Honor that deadline here instead of failing a new dedicated pass and making
+/// its supervisor add another exponential delay. Budget at most two seconds
+/// for cooldown sleeps, then re-read the deadline before admitting payload work.
+async fn wait_for_short_backoff(
+    coordinator: &Coordinator,
+    target: &str,
+    endpoint: &str,
+) -> Result<(), String> {
+    let wait_until = tokio::time::Instant::now() + Duration::from_secs(2);
+    while let Some(failure) = coordinator.failure(target, endpoint).await? {
+        let remaining = failure
+            .next_retry_ms
+            .saturating_sub(lance_context_merge::failure::now_ms());
+        if remaining == 0 {
+            break;
+        }
+        let delay = Duration::from_millis(remaining);
+        if delay > wait_until.saturating_duration_since(tokio::time::Instant::now()) {
+            return Err(format!(
+                "maintenance retry at {} after {:?} failure",
+                failure.next_retry_ms, failure.class
+            ));
+        }
+        tracing::info!(
+            target,
+            endpoint,
+            retry_at_ms = failure.next_retry_ms,
+            wait_ms = remaining,
+            "waiting for short maintenance retry deadline"
+        );
+        tokio::time::sleep(delay).await;
+    }
+    Ok(())
+}
+
 async fn watch(
     coordinator: &Coordinator,
     execution: &Execution,
@@ -176,17 +212,7 @@ where
     }
     let coordinator = state.task_store.merge_coordinator();
     let proof = state.task_store.merge_claim(claim);
-    if let Some(failure) = coordinator
-        .failure(&claim.task.target, maintenance.endpoint())
-        .await?
-    {
-        if failure.next_retry_ms > lance_context_merge::failure::now_ms() {
-            return Err(format!(
-                "maintenance retry at {} after {:?} failure",
-                failure.next_retry_ms, failure.class
-            ));
-        }
-    }
+    wait_for_short_backoff(&coordinator, &claim.task.target, maintenance.endpoint()).await?;
     let config = &state.config.maintenance;
     let mut reserved = Execution::new(
         &claim.task.target,
@@ -396,6 +422,136 @@ mod tests {
             assert_eq!(failure.consecutive_attempts, 1);
             assert!(failure.next_retry_ms > failure.last_failure_ms);
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn short_retry_is_honored_without_failing_another_pass() {
+        let (_dir, state) = fixture().await;
+        let first = claim(&state, TaskKind::IndexId).await;
+        let result = run(&state, &first, async {
+            Err("temporary storage timeout".into())
+        })
+        .await;
+        state.task_store.finish(first, result).await.unwrap();
+        let coordinator = state.task_store.merge_coordinator();
+        let before = coordinator
+            .failure("table", "master:index_id")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.consecutive_attempts, 1);
+        assert_eq!(before.next_retry_ms - before.last_failure_ms, 2000);
+        let next = claim(&state, TaskKind::IndexId).await;
+        let result = run(&state, &next, async {
+            assert!(lance_context_merge::failure::now_ms() >= before.next_retry_ms);
+            Ok("continued after retry deadline".into())
+        })
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        state.task_store.finish(next, result).await.unwrap();
+        assert!(coordinator
+            .failure("table", "master:index_id")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn recovered_catchup_waits_for_newly_materialized_failure() {
+        let (_dir, state) = fixture().await;
+        let uri = state.rollout_uri("table");
+        let store = lance_context_core::RolloutStore::open(&uri).await.unwrap();
+        let old_claim = claim(&state, TaskKind::MergeWal).await;
+        let coordinator = state.task_store.merge_coordinator();
+        let endpoint = MaintenanceKind::Catchup.endpoint();
+        let mut old = Execution::new("table", endpoint, "old-publisher", 60);
+        old.maintenance = Some(MaintenanceKind::Catchup);
+        assert!(coordinator
+            .reserve(&state.task_store.merge_claim(&old_claim), &old)
+            .await
+            .unwrap());
+        let old = coordinator.start(&old).await.unwrap().unwrap();
+        coordinator
+            .authorize_commit(&old, &uri, "base", store.version() + 1)
+            .await
+            .unwrap();
+        coordinator
+            .report_uncertain(&old, "maintenance progress publication timeout".into())
+            .await
+            .unwrap();
+        assert!(coordinator
+            .failure("table", endpoint)
+            .await
+            .unwrap()
+            .is_none());
+        state
+            .task_store
+            .abandon_claim_for_test(old_claim)
+            .await
+            .unwrap();
+        let next = claim(&state, TaskKind::MergeWal).await;
+        reconcile_previous(&state, &next).await.unwrap();
+        let failure = coordinator
+            .failure("table", endpoint)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failure.consecutive_attempts, 1);
+        assert_eq!(failure.next_retry_ms - failure.last_failure_ms, 2000);
+        let result = run_as(&state, &next, MaintenanceKind::Catchup, async {
+            assert!(lance_context_merge::failure::now_ms() >= failure.next_retry_ms);
+            Ok("recovered publisher continued in the same pass".into())
+        })
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        state.task_store.finish(next, result).await.unwrap();
+        assert!(coordinator
+            .failure("table", endpoint)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(coordinator
+            .authorize_commit(&old, &uri, "base", store.version() + 2)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn short_retry_wait_rechecks_an_extended_failure_deadline() {
+        let (_dir, state) = fixture().await;
+        let first = claim(&state, TaskKind::IndexId).await;
+        let result = run(&state, &first, async {
+            Err("temporary storage timeout".into())
+        })
+        .await;
+        state.task_store.finish(first, result).await.unwrap();
+        let coordinator = state.task_store.merge_coordinator();
+        let next = claim(&state, TaskKind::IndexId).await;
+        let proof = state.task_store.merge_claim(&next);
+        let update = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            coordinator
+                .record_failure(&proof, "table", "master:index_id", "invalid index schema")
+                .await
+                .unwrap()
+        };
+        let run = run(&state, &next, async {
+            panic!("extended backoff must prevent payload work")
+        });
+        let (result, extended) = tokio::join!(run, update);
+        assert!(result.as_ref().unwrap_err().contains("retry at"));
+        state.task_store.finish(next, result).await.unwrap();
+        let after = coordinator
+            .failure("table", "master:index_id")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.consecutive_attempts, extended.consecutive_attempts);
+        assert_eq!(after.next_retry_ms, extended.next_retry_ms);
+        assert!(coordinator.get("table").await.unwrap().is_none());
     }
 
     #[tokio::test]
