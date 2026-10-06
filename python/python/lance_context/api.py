@@ -2636,13 +2636,22 @@ class RolloutStore:
     def add(
         self,
         records: Mapping[str, Any] | Iterable[Mapping[str, Any]],
+        *,
+        flush: bool = False,
     ) -> dict[str, Any]:
-        """Append one record (dict) or many (iterable of dicts)."""
-        return self._sync.add(_rollout_records_to_json(records))
+        """Append one record (dict) or many (iterable of dicts).
 
-    def add_one(self, **fields: Any) -> dict[str, Any]:
+        Set ``flush=True`` to make the appended rows readable before this call
+        returns. The default keeps visibility asynchronous for lower latency.
+        Remote flush-on-add requires lance-context-server 0.6.5 or newer.
+        A flush error can happen after the append is durable. Supply stable
+        ``id`` values and reuse them if the operation may be retried.
+        """
+        return self._sync.add(_rollout_records_to_json(records), flush=flush)
+
+    def add_one(self, *, flush: bool = False, **fields: Any) -> dict[str, Any]:
         """Append a single record given as keyword arguments."""
-        return self.add(fields)
+        return self.add(fields, flush=flush)
 
     def flush(self) -> None:
         """Make previously added rows visible to subsequent reads.
@@ -2653,7 +2662,9 @@ class RolloutStore:
         store has no such timer, so a write-then-read sequence returns nothing
         until you call this.
 
-        No-op for stores connected to a remote server.
+        For stores connected to a remote server this is a no-op. Pass
+        ``flush=True`` to :meth:`add` when a remote write must be immediately
+        readable.
         """
         self._sync.flush()
 
@@ -2741,23 +2752,33 @@ class AsyncRolloutStore:
     async def add(
         self,
         records: Mapping[str, Any] | Iterable[Mapping[str, Any]],
+        *,
+        flush: bool = False,
     ) -> dict[str, Any]:
-        """Append one record (dict) or many (iterable of dicts)."""
+        """Append one record (dict) or many (iterable of dicts).
+
+        Set ``flush=True`` to make the appended rows readable before this call
+        returns. The default keeps visibility asynchronous for lower latency.
+        Remote flush-on-add requires lance-context-server 0.6.5 or newer.
+        A flush error can happen after the append is durable. Supply stable
+        ``id`` values and reuse them if the operation may be retried.
+        """
         payload = _rollout_records_to_json(records)
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, lambda: self._sync.add(payload))
+        return await loop.run_in_executor(
+            None, lambda: self._sync.add(payload, flush=flush)
+        )
 
-    async def add_one(self, **fields: Any) -> dict[str, Any]:
+    async def add_one(self, *, flush: bool = False, **fields: Any) -> dict[str, Any]:
         """Append a single record given as keyword arguments."""
-        return await self.add(fields)
+        return await self.add(fields, flush=flush)
 
     async def flush(self) -> None:
         """Make previously added rows visible to subsequent reads.
 
         For an embedded store this seals the local memtable. For a store
-        connected to a remote server this is a no-op: the server flushes on its
-        own interval (``ROLLOUT_FLUSH_INTERVAL_SECS``), which bounds how long a
-        just-written row stays invisible.
+        connected to a remote server this is a no-op. Pass ``flush=True`` to
+        :meth:`add` when a remote write must be immediately readable.
         """
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._sync.flush)

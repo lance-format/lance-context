@@ -285,17 +285,42 @@ impl RemoteRolloutStore {
             cached_version: info.version.unwrap_or(0),
         })
     }
+
+    /// Append rollout rows and wait until they are visible to subsequent reads.
+    ///
+    /// The server must be v0.6.5 or newer. Older servers accept the query
+    /// parameter but do not provide the visibility guarantee. If the server
+    /// persists the append but fails to flush it, this method returns an error
+    /// even though the rows may already be durable. Callers that retry should
+    /// reuse the same record ids.
+    pub async fn add_with_flush(
+        &mut self,
+        records: &[AddRolloutRequest],
+    ) -> ContextResult<AddRolloutsResponse> {
+        self.add_inner(records, true).await
+    }
+
+    async fn add_inner(
+        &mut self,
+        records: &[AddRolloutRequest],
+        flush: bool,
+    ) -> ContextResult<AddRolloutsResponse> {
+        let resp = if flush {
+            self.client
+                .add_rollouts_with_flush(&self.store_name, records)
+                .await
+        } else {
+            self.client.add_rollouts(&self.store_name, records).await
+        }
+        .map_err(to_ctx_err)?;
+        self.cached_version = resp.version;
+        Ok(resp)
+    }
 }
 
 impl RolloutStoreApi for RemoteRolloutStore {
     async fn add(&mut self, records: &[AddRolloutRequest]) -> ContextResult<AddRolloutsResponse> {
-        let resp = self
-            .client
-            .add_rollouts(&self.store_name, records)
-            .await
-            .map_err(to_ctx_err)?;
-        self.cached_version = resp.version;
-        Ok(resp)
+        self.add_inner(records, false).await
     }
 
     async fn list(
@@ -1011,21 +1036,49 @@ impl ContextClient {
         }
     }
 
-    /// Append rollout rows. When any record carries `binary_payload`, the request
-    /// is sent as `multipart/form-data`: the first part, `metadata`, holds the
-    /// records array with each `binary_payload` stripped to null; each record that
-    /// carries a blob then contributes one raw binary part named for that record's
-    /// zero-based index in the metadata array (`"0"`, `"1"`, ...). Naming by index
-    /// keeps part names round-trip safe (record ids may contain arbitrary bytes and
-    /// are not unique). The `metadata` part is sent first so the server can parse
-    /// the manifest before matching binary parts. When no record carries bytes, a
+    /// Append rollout rows without waiting for read visibility. Use
+    /// [`Self::add_rollouts_with_flush`] when the next operation must read them.
+    ///
+    /// When any record carries `binary_payload`, the request is sent as
+    /// `multipart/form-data`: the first part, `metadata`, holds the records array
+    /// with each `binary_payload` stripped to null; each record that carries a blob
+    /// then contributes one raw binary part named for that record's zero-based
+    /// index in the metadata array (`"0"`, `"1"`, ...). Naming by index keeps part
+    /// names round-trip safe (record ids may contain arbitrary bytes and are not
+    /// unique). The `metadata` part is sent first so the server can parse the
+    /// manifest before matching binary parts. When no record carries bytes, a
     /// plain JSON body is sent instead.
     pub async fn add_rollouts(
         &self,
         name: &str,
         records: &[AddRolloutRequest],
     ) -> Result<AddRolloutsResponse, ClientError> {
+        self.add_rollouts_inner(name, records, false).await
+    }
+
+    /// Append rollout rows and ask the server to make them readable before it
+    /// responds. Requires lance-context-server v0.6.5 or newer. The server may
+    /// have persisted the rows already if the flush step returns an error;
+    /// callers that retry should reuse the same record ids.
+    pub async fn add_rollouts_with_flush(
+        &self,
+        name: &str,
+        records: &[AddRolloutRequest],
+    ) -> Result<AddRolloutsResponse, ClientError> {
+        self.add_rollouts_inner(name, records, true).await
+    }
+
+    async fn add_rollouts_inner(
+        &self,
+        name: &str,
+        records: &[AddRolloutRequest],
+        flush: bool,
+    ) -> Result<AddRolloutsResponse, ClientError> {
         let url = self.url(&format!("/rollouts/{}/records", name));
+        let mut request = self.http.post(url);
+        if flush {
+            request = request.query(&[("flush", true)]);
+        }
         let has_blob = records.iter().any(|r| r.binary_payload.is_some());
 
         let resp = if has_blob {
@@ -1049,12 +1102,12 @@ impl ContextClient {
                     form = form.part(idx.to_string(), part);
                 }
             }
-            self.http.post(url).multipart(form).send().await?
+            request.multipart(form).send().await?
         } else {
             let req = AddRolloutsRequest {
                 records: records.to_vec(),
             };
-            self.http.post(url).json(&req).send().await?
+            request.json(&req).send().await?
         };
         Self::handle_response(resp).await
     }

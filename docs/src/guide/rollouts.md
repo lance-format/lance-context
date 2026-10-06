@@ -23,7 +23,7 @@ store.add({
     "content": "The answer is 42.",
     "reward": 1.0,
     "policy_version": "ckpt-100",
-})
+}, flush=True)  # make this row readable before add returns
 
 for row in store.list():
     print(row["rollout_id"], row["reward"])
@@ -46,8 +46,17 @@ your event loop:
 from lance_context import AsyncRolloutStore
 
 store = await AsyncRolloutStore.connect_or_create("http://localhost:8080", "rl-run-1")
-await store.add({"rollout_id": "traj-1", "role": "assistant", "reward": 1.0})
+await store.add(
+    {"rollout_id": "traj-1", "role": "assistant", "reward": 1.0},
+    flush=True,
+)
 ```
+
+By default, `add` returns after the write is durable in the WAL. A background
+sweeper makes it readable later. Use `flush=True` only when the next operation
+must read the new rows; it waits for that visibility and adds write latency.
+If flushing fails, the append may still be durable. Give retryable records
+stable `id` values and reuse those ids when retrying.
 
 ## Further reading
 
