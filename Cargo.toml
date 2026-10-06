@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/lance-context-ingestion",
     "crates/lance-context-merge",
     "crates/lance-context-core",
     "crates/lance-context-metrics",
