@@ -1,0 +1,28 @@
+{
+  "apiVersion": "v1",
+  "kind": "Pod",
+  "metadata": {"name": "native-publisher-example"},
+  "spec": {
+    "restartPolicy": "Never",
+    "automountServiceAccountToken": false,
+    "terminationGracePeriodSeconds": 1800,
+    "containers": [{
+      "name": "publisher",
+      "image": "YOUR_REGISTRY/lance-context@sha256:REPLACE_WITH_TESTED_IMAGE_DIGEST",
+      "command": ["python3", "-u", "/supervisor/native_supervisor.py"],
+      "envFrom": [{"secretRef": {"name": "lance-native-publisher-config"}}],
+      "env": [
+        {"name": "POD_UID", "valueFrom": {"fieldRef": {"apiVersion": "v1", "fieldPath": "metadata.uid"}}},
+        {"name": "HOSTNAME", "valueFrom": {"fieldRef": {"apiVersion": "v1", "fieldPath": "metadata.name"}}}
+      ],
+      "resources": {
+        "requests": {"cpu": "2", "memory": "16Gi"},
+        "limits": {"cpu": "2", "memory": "16Gi"}
+      },
+      "readinessProbe": {"exec": {"command": ["test", "-f", "/tmp/native-supervisor-ready"]}},
+      "volumeMounts": [{"name": "supervisor", "mountPath": "/supervisor", "readOnly": true}],
+      "securityContext": {"allowPrivilegeEscalation": false}
+    }],
+    "volumes": [{"name": "supervisor", "configMap": {"name": "native-supervisor-REPLACE_WITH_CONTENT_HASH"}}]
+  }
+}

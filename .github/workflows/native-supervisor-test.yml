@@ -1,0 +1,24 @@
+name: Native Supervisor Tests
+on:
+  push:
+    branches: [main]
+    paths: [deploy/catchup/**, .github/workflows/native-supervisor-test.yml]
+  pull_request:
+    paths: [deploy/catchup/**, .github/workflows/native-supervisor-test.yml]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  admission:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install disposable etcd fixture dependency
+        run: sudo apt-get update && sudo apt-get install -y etcd-server
+      - name: Verify supervisor identity, CAS, backoff and join behavior
+        env:
+          ETCD_BIN: /usr/bin/etcd
+        run: python3 -m unittest discover -s deploy/catchup -p 'test_native_supervisor.py' -v
