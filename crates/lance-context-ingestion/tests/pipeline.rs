@@ -369,6 +369,181 @@ async fn partial_checkpoint_batch_recovery_skips_already_applied_session_deltas(
     assert_eq!(checkpoints.load("b").await.unwrap().unwrap().value, b"1");
 }
 
+type SessionDeltas = (String, Vec<u64>);
+
+struct OrderedBatch {
+    batches: Arc<Mutex<Vec<SessionDeltas>>>,
+    fail_b: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl Reducer for OrderedBatch {
+    async fn apply(&self, _: &str, _: &[u8], _: &[u8]) -> Result<Vec<u8>> {
+        Err(Error::Stage("unexpected per-delta reduction".into()))
+    }
+
+    async fn apply_batch(
+        &self,
+        session: &str,
+        state: &[u8],
+        deltas: &[&[u8]],
+        max_state_bytes: usize,
+    ) -> Result<Vec<u8>> {
+        let deltas = deltas
+            .iter()
+            .map(|delta| serde_json::from_slice::<u64>(delta))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        self.batches
+            .lock()
+            .unwrap()
+            .push((session.into(), deltas.clone()));
+        let mut values: Vec<u64> = if state.is_empty() {
+            Vec::new()
+        } else {
+            serde_json::from_slice(state)?
+        };
+        values.extend(deltas);
+        let result = serde_json::to_vec(&values)?;
+        // This representation only grows, so the final bound covers each prefix.
+        if result.len() > max_state_bytes {
+            return Err(Error::Invalid("test state budget exceeded".into()));
+        }
+        if session == "b" && self.fail_b.load(Ordering::SeqCst) {
+            return Err(Error::Stage("injected batch reduction failure".into()));
+        }
+        Ok(result)
+    }
+}
+
+#[tokio::test]
+async fn checkpoint_batch_override_coalesces_ordered_deltas_and_skips_committed_prefix() {
+    let journal = journal(Arc::new(InMemory::new()), 0);
+    let mut writer = journal.acquire().await.unwrap();
+    for sequence in 1..=5 {
+        let mut entry = wal_entry(sequence);
+        entry.session = if sequence % 2 == 1 { "a" } else { "b" }.into();
+        writer.append(vec![entry]).await.unwrap();
+    }
+    let batches = Arc::new(Mutex::new(Vec::new()));
+    let fail_b = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let checkpoints = SessionCheckpoints::new(journal.clone(), 1024).unwrap();
+    let mut sink = checkpoints
+        .sink(
+            OrderedBatch {
+                batches: batches.clone(),
+                fail_b: fail_b.clone(),
+            },
+            1,
+        )
+        .unwrap();
+    let mut consumer = Consumer::open(journal.clone(), "checkpoint").await.unwrap();
+    assert!(consumer.consume(&mut sink, 10, 16384).await.is_err());
+    assert_eq!(consumer.position(), &Position::default());
+    let a = checkpoints.load("a").await.unwrap().unwrap();
+    assert_eq!(a.through_sequence, 5);
+    assert_eq!(a.value, b"[1,3,5]");
+    assert!(checkpoints.load("b").await.unwrap().is_none());
+    assert_eq!(
+        *batches.lock().unwrap(),
+        vec![("a".into(), vec![1, 3, 5]), ("b".into(), vec![2, 4])]
+    );
+
+    fail_b.store(false, Ordering::SeqCst);
+    let mut consumer = Consumer::open(journal.clone(), "checkpoint").await.unwrap();
+    // Regroup the retry across different consumer batch boundaries. Session a
+    // is ahead of the global prefix and must not be reduced again, even partly.
+    assert_eq!(consumer.consume(&mut sink, 2, 16384).await.unwrap(), 2);
+    assert_eq!(consumer.consume(&mut sink, 3, 16384).await.unwrap(), 3);
+    assert_eq!(checkpoints.load("a").await.unwrap().unwrap(), a);
+    assert_eq!(
+        checkpoints.load("b").await.unwrap().unwrap().value,
+        b"[2,4]"
+    );
+    assert_eq!(
+        *batches.lock().unwrap(),
+        vec![
+            ("a".into(), vec![1, 3, 5]),
+            ("b".into(), vec![2, 4]),
+            ("b".into(), vec![2]),
+            ("b".into(), vec![4]),
+        ]
+    );
+
+    let mut next = wal_entry(6);
+    next.session = "a".into();
+    writer.append(vec![next]).await.unwrap();
+    assert_eq!(consumer.consume(&mut sink, 10, 16384).await.unwrap(), 1);
+    let a = checkpoints.load("a").await.unwrap().unwrap();
+    assert_eq!(a.through_sequence, 6);
+    assert_eq!(a.value, b"[1,3,5,6]");
+    assert_eq!(batches.lock().unwrap().last(), Some(&("a".into(), vec![6])));
+    assert_eq!(consumer.consume(&mut sink, 10, 16384).await.unwrap(), 0);
+}
+
+struct ReplaceDelta;
+
+#[async_trait]
+impl Reducer for ReplaceDelta {
+    async fn apply(&self, _: &str, _: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
+        Ok(delta.to_vec())
+    }
+}
+
+struct OversizedBatch;
+
+#[async_trait]
+impl Reducer for OversizedBatch {
+    async fn apply(&self, _: &str, _: &[u8], _: &[u8]) -> Result<Vec<u8>> {
+        unreachable!("batch override is required")
+    }
+
+    async fn apply_batch(&self, _: &str, _: &[u8], _: &[&[u8]], _: usize) -> Result<Vec<u8>> {
+        // Deliberately violate the callback's budget contract. The sink still
+        // rejects oversized output without publishing it or advancing progress.
+        Ok(vec![0; 9])
+    }
+}
+
+async fn checkpoint_budget_rejects_without_advancing<R: Reducer>(reducer: R) {
+    let journal = journal(Arc::new(InMemory::new()), 0);
+    let mut writer = journal.acquire().await.unwrap();
+    let mut entries = vec![wal_entry(1), wal_entry(2)];
+    entries[0].transition.delta = vec![1; 9];
+    entries[1].transition.delta = vec![2; 1];
+    writer.append(entries).await.unwrap();
+    let checkpoints = SessionCheckpoints::new(journal.clone(), 8).unwrap();
+    let mut sink = checkpoints.sink(reducer, 1).unwrap();
+    let mut consumer = Consumer::open(journal.clone(), "checkpoint").await.unwrap();
+    assert!(matches!(
+        consumer.consume(&mut sink, 10, 16384).await,
+        Err(Error::Invalid(_))
+    ));
+    assert_eq!(consumer.position(), &Position::default());
+    assert!(checkpoints.load("session-a").await.unwrap().is_none());
+    assert_eq!(
+        journal.consumer_position("checkpoint").await.unwrap(),
+        Position::default()
+    );
+    // Recovery with sufficient budget consumes the unchanged WAL normally.
+    let checkpoints = SessionCheckpoints::new(journal.clone(), 16).unwrap();
+    let mut sink = checkpoints.sink(ReplaceDelta, 1).unwrap();
+    let mut consumer = Consumer::open(journal.clone(), "checkpoint").await.unwrap();
+    assert_eq!(consumer.consume(&mut sink, 10, 16384).await.unwrap(), 2);
+    let state = checkpoints.load("session-a").await.unwrap().unwrap();
+    assert_eq!(state.through_sequence, 2);
+    assert_eq!(state.value, vec![2]);
+}
+
+#[tokio::test]
+async fn checkpoint_default_batch_rejects_oversized_intermediate_state() {
+    checkpoint_budget_rejects_without_advancing(ReplaceDelta).await;
+}
+
+#[tokio::test]
+async fn checkpoint_batch_override_cannot_publish_oversized_output() {
+    checkpoint_budget_rejects_without_advancing(OversizedBatch).await;
+}
+
 fn binding(partition: u32) -> Binding {
     Binding {
         run: "run-1".into(),

@@ -27,6 +27,32 @@ pub struct SessionState {
 #[async_trait]
 pub trait Reducer: Send + Sync {
     async fn apply(&self, session: &str, state: &[u8], delta: &[u8]) -> Result<Vec<u8>>;
+
+    /// Reduce one session's ordered, unapplied deltas. Adapters may decode state
+    /// once and encode it once; the result must equal repeated `apply` calls.
+    /// Preserve delta order and enforce `max_state_bytes` at every intermediate
+    /// state, including in overrides. Errors publish no state for this session.
+    async fn apply_batch(
+        &self,
+        session: &str,
+        state: &[u8],
+        deltas: &[&[u8]],
+        max_state_bytes: usize,
+    ) -> Result<Vec<u8>> {
+        let mut result = None;
+        for delta in deltas {
+            let next = self
+                .apply(session, result.as_deref().unwrap_or(state), delta)
+                .await?;
+            if next.len() > max_state_bytes {
+                return Err(Error::Invalid(
+                    "session checkpoint exceeds state budget".into(),
+                ));
+            }
+            result = Some(next);
+        }
+        Ok(result.unwrap_or_else(|| state.to_vec()))
+    }
 }
 
 #[derive(Clone)]
@@ -101,22 +127,24 @@ impl SessionCheckpoints {
                 PutMode::Create,
             ),
         };
-        let before = state.through_sequence;
-        for entry in entries {
-            if entry.sequence <= state.through_sequence {
-                continue;
-            }
+        let pending = entries
+            .into_iter()
+            .filter(|entry| entry.sequence > state.through_sequence)
+            .collect::<Vec<_>>();
+        if let Some(last) = pending.last() {
+            let deltas = pending
+                .iter()
+                .map(|entry| entry.transition.delta.as_slice())
+                .collect::<Vec<_>>();
             state.value = reducer
-                .apply(session, &state.value, &entry.transition.delta)
+                .apply_batch(session, &state.value, &deltas, self.max_state_bytes)
                 .await?;
             if state.value.len() > self.max_state_bytes {
                 return Err(Error::Invalid(
                     "session checkpoint exceeds state budget".into(),
                 ));
             }
-            state.through_sequence = entry.sequence;
-        }
-        if state.through_sequence != before {
+            state.through_sequence = last.sequence;
             self.journal
                 .put(
                     &self

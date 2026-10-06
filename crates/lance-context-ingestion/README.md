@@ -63,6 +63,12 @@ replayable source / stable partition-local receipts
   A partially successful checkpoint batch can leave some session states ahead of the
   global cursor. Restore each state with its own sequence and skip already applied
   deltas when replaying the remaining global prefix.
+  `Reducer::apply_batch` receives only a session's ordered, unapplied deltas and
+  lets an adapter decode its state once and encode it once per consumer batch.
+  Its default preserves per-delta `apply` behavior and intermediate size checks;
+  overrides must preserve those semantics and bound intermediate state themselves.
+  The sink also checks final output size before writing. This interface alone does
+  not accelerate existing reducers or change the deployed ingestion adapter.
 
 - With the `lance` feature, `lance_sink::stage` writes immutable Lance 2.2 files
   using a Zstd-annotated schema. Lance's constant-valued pages use scalar
