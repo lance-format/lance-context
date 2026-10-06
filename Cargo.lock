@@ -3911,8 +3911,16 @@ dependencies = [
 name = "lance-context-ingestion"
 version = "0.1.0"
 dependencies = [
+ "arrow-array",
+ "arrow-ipc",
+ "arrow-schema",
  "async-trait",
  "futures",
+ "lance",
+ "lance-file",
+ "lance-index",
+ "lance-io",
+ "lance-table",
  "object_store",
  "serde",
  "serde_json",

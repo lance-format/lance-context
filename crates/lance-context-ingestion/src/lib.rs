@@ -5,6 +5,8 @@
 mod checkpoint;
 mod consumer;
 mod journal;
+#[cfg(feature = "lance")]
+pub mod lance_sink;
 mod pipeline;
 
 pub use checkpoint::{CheckpointSink, Reducer, SessionCheckpoints, SessionState};

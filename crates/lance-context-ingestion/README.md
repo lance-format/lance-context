@@ -1,8 +1,9 @@
 # lance-context-ingestion
 
 Experimental streaming ingestion primitives. The implementation currently provides
-the pipeline and journal protocol; integration with the existing trace alignment
-adapter and a Lance table sink is **not complete**. This crate is not deployed.
+the pipeline, journal protocol and an optional Lance table sink. Application
+alignment/source adapters and deployment orchestration remain separate. This crate
+is not deployed.
 
 ```text
 replayable source / stable partition-local receipts
@@ -52,6 +53,16 @@ replayable source / stable partition-local receipts
   global cursor. Restore each state with its own sequence and skip already applied
   deltas when replaying the remaining global prefix.
 
+- With the `lance` feature, `lance_sink::stage` writes immutable Lance 2.2 files
+  using a Zstd-annotated schema. Lance's constant-valued pages use scalar
+  encoding before codec selection; even a single large string can take that path. `LanceTableSink::commit_staged` coalesces staged
+  partitions and atomically publishes rows plus each partition's covered sequence.
+  Fully covered retries are skipped; gaps and partial overlaps are rejected.
+  A caller-supplied ownership-guarded commit handler is wrapped by an exact version
+  pin to reject implicit rebasing. Uncertain publication poisons the sink; reopen
+  and reconcile the table watermarks before retrying. The sink does not acquire
+  table ownership or schedule index maintenance.
+
 Use a backend supporting atomic conditional updates, such as a suitably configured
 cloud object store. `object_store::local::LocalFileSystem` does not implement the
 required update operation and is rejected; there is no unsafe local-lock fallback.
@@ -64,9 +75,9 @@ process-crash behavior on a real durable service, or production throughput.
 1. Adapt the existing revisioned session history/cache and cross-call alignment
    implementation. Preserve its compaction/branch identity rules and source ordering;
    the generic pipeline deliberately does not invent a new turn-ID algorithm.
-2. Connect the table consumer to public Lance staging/commit APIs. Persist exact WAL
-   input coverage with table publication; staged files alone do not justify a cursor
-   advance. Preserve Lance 2.2, Zstd and session ZoneMap configuration in that adapter.
+2. Wire table ownership and independently scheduled session ZoneMap maintenance.
+   Staging is independent of publication; a distributed worker transport must
+   carry validated staged results and retain ownership through manifest commit.
 3. Add source fan-out receipts and contiguous source progress. A source call spanning
    partitions is complete only after every required partition ACK.
 4. Add worker ownership orchestration, stage timing/queue telemetry, consumer run loops,
@@ -78,7 +89,7 @@ process-crash behavior on a real durable service, or production throughput.
 Run focused checks from the workspace root:
 
 ```sh
-CARGO_TARGET_DIR=/tmp/trace-streaming-target cargo test -p lance-context-ingestion --offline
-CARGO_TARGET_DIR=/tmp/trace-streaming-target cargo clippy -p lance-context-ingestion --all-targets --offline -- -D warnings
+CARGO_TARGET_DIR=/tmp/trace-streaming-target cargo test -p lance-context-ingestion --features lance --offline
+CARGO_TARGET_DIR=/tmp/trace-streaming-target cargo clippy -p lance-context-ingestion --features lance --all-targets --offline -- -D warnings
 cargo fmt -p lance-context-ingestion --check
 ```

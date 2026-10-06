@@ -5,8 +5,20 @@ edition.workspace = true
 license.workspace = true
 description = "Bounded session-ordered ingestion with recoverable WAL and independent consumers"
 
+[features]
+default = []
+lance = ["dep:arrow-array", "dep:arrow-ipc", "dep:arrow-schema", "dep:lance", "dep:lance-file", "dep:lance-index", "dep:lance-io", "dep:lance-table"]
+
 [dependencies]
 async-trait = "0.1"
+arrow-array = { version = "58", optional = true }
+arrow-ipc = { version = "58", optional = true }
+arrow-schema = { version = "58", optional = true }
+lance = { version = "9.0.0", optional = true }
+lance-file = { version = "9.0.0", optional = true }
+lance-index = { version = "9.0.0", optional = true }
+lance-io = { version = "9.0.0", optional = true }
+lance-table = { version = "9.0.0", optional = true }
 futures = "0.3"
 object_store = "0.13.2"
 serde = { version = "1", features = ["derive"] }
@@ -14,7 +26,7 @@ serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v5"] }
 
 [dev-dependencies]
 tempfile = "3"
