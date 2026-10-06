@@ -88,8 +88,7 @@ def test_remote_add_one_and_connect(server_without_sweeps):
         )
         await store.add_one(id="only", rollout_id="traj-9", reward=0.5, flush=True)
 
-        # A second connection can read the row immediately, without affinity
-        # to the server-side store handle that accepted the append.
+        # A separately connected client sees the flushed row immediately.
         reader = await AsyncRolloutStore.connect(server_without_sweeps, "rl-run-2")
         rows = await reader.list()
         assert [r["id"] for r in rows] == ["only"]

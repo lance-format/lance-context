@@ -288,11 +288,9 @@ impl RemoteRolloutStore {
 
     /// Append rollout rows and wait until they are visible to subsequent reads.
     ///
-    /// The server must be v0.6.5 or newer. Older servers accept the query
-    /// parameter but do not provide the visibility guarantee. If the server
-    /// persists the append but fails to flush it, this method returns an error
-    /// even though the rows may already be durable. Callers that retry should
-    /// reuse the same record ids.
+    /// Requires server v0.6.5 or newer; older servers ignore the flush option.
+    /// If flushing fails, the append may still be durable. Retries should reuse
+    /// the same record ids.
     pub async fn add_with_flush(
         &mut self,
         records: &[AddRolloutRequest],
@@ -1036,18 +1034,18 @@ impl ContextClient {
         }
     }
 
-    /// Append rollout rows without waiting for read visibility. Use
-    /// [`Self::add_rollouts_with_flush`] when the next operation must read them.
-    ///
-    /// When any record carries `binary_payload`, the request is sent as
-    /// `multipart/form-data`: the first part, `metadata`, holds the records array
-    /// with each `binary_payload` stripped to null; each record that carries a blob
-    /// then contributes one raw binary part named for that record's zero-based
-    /// index in the metadata array (`"0"`, `"1"`, ...). Naming by index keeps part
-    /// names round-trip safe (record ids may contain arbitrary bytes and are not
-    /// unique). The `metadata` part is sent first so the server can parse the
-    /// manifest before matching binary parts. When no record carries bytes, a
+    /// Append rollout rows. When any record carries `binary_payload`, the request
+    /// is sent as `multipart/form-data`: the first part, `metadata`, holds the
+    /// records array with each `binary_payload` stripped to null; each record that
+    /// carries a blob then contributes one raw binary part named for that record's
+    /// zero-based index in the metadata array (`"0"`, `"1"`, ...). Naming by index
+    /// keeps part names round-trip safe (record ids may contain arbitrary bytes and
+    /// are not unique). The `metadata` part is sent first so the server can parse
+    /// the manifest before matching binary parts. When no record carries bytes, a
     /// plain JSON body is sent instead.
+    ///
+    /// This method does not wait for read visibility. Use
+    /// [`Self::add_rollouts_with_flush`] when the next operation must read the rows.
     pub async fn add_rollouts(
         &self,
         name: &str,
@@ -1056,10 +1054,11 @@ impl ContextClient {
         self.add_rollouts_inner(name, records, false).await
     }
 
-    /// Append rollout rows and ask the server to make them readable before it
-    /// responds. Requires lance-context-server v0.6.5 or newer. The server may
-    /// have persisted the rows already if the flush step returns an error;
-    /// callers that retry should reuse the same record ids.
+    /// Append rollout rows and wait until the server makes them readable.
+    ///
+    /// Requires server v0.6.5 or newer; older servers ignore the flush option.
+    /// If flushing fails, the append may still be durable. Retries should reuse
+    /// the same record ids.
     pub async fn add_rollouts_with_flush(
         &self,
         name: &str,

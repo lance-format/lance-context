@@ -2641,11 +2641,11 @@ class RolloutStore:
     ) -> dict[str, Any]:
         """Append one record (dict) or many (iterable of dicts).
 
-        Set ``flush=True`` to make the appended rows readable before this call
-        returns. The default keeps visibility asynchronous for lower latency.
-        Remote flush-on-add requires lance-context-server 0.6.5 or newer.
-        A flush error can happen after the append is durable. Supply stable
-        ``id`` values and reuse them if the operation may be retried.
+        By default, the append is durable but may not yet be readable. Set
+        ``flush=True`` to wait for visibility. Remote stores require server
+        0.6.5 or newer; older servers ignore this option. If flushing fails,
+        retry with the same stable ``id`` values because the append may already
+        be durable.
         """
         return self._sync.add(_rollout_records_to_json(records), flush=flush)
 
@@ -2757,11 +2757,11 @@ class AsyncRolloutStore:
     ) -> dict[str, Any]:
         """Append one record (dict) or many (iterable of dicts).
 
-        Set ``flush=True`` to make the appended rows readable before this call
-        returns. The default keeps visibility asynchronous for lower latency.
-        Remote flush-on-add requires lance-context-server 0.6.5 or newer.
-        A flush error can happen after the append is durable. Supply stable
-        ``id`` values and reuse them if the operation may be retried.
+        By default, the append is durable but may not yet be readable. Set
+        ``flush=True`` to wait for visibility. Remote stores require server
+        0.6.5 or newer; older servers ignore this option. If flushing fails,
+        retry with the same stable ``id`` values because the append may already
+        be durable.
         """
         payload = _rollout_records_to_json(records)
         loop = asyncio.get_running_loop()

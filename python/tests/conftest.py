@@ -51,10 +51,7 @@ def _run_server(flush_interval_seconds: int) -> Iterator[str]:
         pytest.skip(msg)
     port = _free_port()
     with tempfile.TemporaryDirectory() as data_dir:
-        # Rows are durable on `add` but only become visible when the server's
-        # sweeper seals the memtable. Tests choose a short interval when they
-        # need eventual visibility and disable it when they must prove that
-        # flush-on-add made a row visible.
+        # Disable cleanup so another sweeper cannot make flush-on-add tests pass.
         env = {
             **os.environ,
             "ROLLOUT_CLEANUP_INTERVAL_SECS": "0",
@@ -99,13 +96,11 @@ def _run_server(flush_interval_seconds: int) -> Iterator[str]:
 
 @pytest.fixture()
 def server() -> Iterator[str]:
-    """Run a server whose sweeper makes default appends visible quickly."""
     with _run_server(flush_interval_seconds=1) as base_url:
         yield base_url
 
 
 @pytest.fixture()
 def server_without_sweeps() -> Iterator[str]:
-    """Run a server with no sweeper to prove flush-on-add wiring."""
     with _run_server(flush_interval_seconds=0) as base_url:
         yield base_url

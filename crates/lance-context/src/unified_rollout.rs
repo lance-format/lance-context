@@ -67,15 +67,10 @@ impl RolloutStore {
 
     /// Append rollout rows and wait until they are visible to subsequent reads.
     ///
-    /// Local stores seal their MemWAL memtable after the append. Remote stores
-    /// send one append request with `?flush=true`, so the server instance that
-    /// accepted the rows also makes them visible. Remote servers must be v0.6.5
-    /// or newer.
-    ///
-    /// The append is durable before the flush starts. If the flush fails, this
-    /// method returns an error even though the rows may already be durable.
-    /// Callers that retry should reuse the same record ids. Sealing can also
-    /// make earlier or concurrent pending appends visible.
+    /// Remote stores require server v0.6.5 or newer; older servers ignore the
+    /// flush option. If flushing fails, the append may still be durable. Retries
+    /// should reuse the same record ids. A flush may also publish other pending
+    /// appends.
     pub async fn add_with_flush(
         &mut self,
         records: &[AddRolloutRequest],
