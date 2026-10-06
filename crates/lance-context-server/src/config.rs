@@ -17,6 +17,17 @@ pub struct ServerConfig {
     )]
     pub request_body_idle_timeout_secs: u64,
 
+    /// During graceful shutdown, retire response connections whose socket writes
+    /// are blocked for this long, after all admitted HTTP handlers have finished.
+    /// This does not impose a total deadline on queries, merges, or downloads.
+    #[arg(
+        long,
+        env = "HTTP_SHUTDOWN_RESPONSE_IDLE_SECS",
+        default_value_t = 120,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub http_shutdown_response_idle_secs: u64,
+
     /// Legacy wire field; owned merges now use the real-progress idle timeout.
     #[arg(long, env = "MERGE_EXECUTION_TIMEOUT_SECS", default_value_t = 3600)]
     pub merge_execution_timeout_secs: u64,

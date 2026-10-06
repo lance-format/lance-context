@@ -1,5 +1,6 @@
 mod body_timeout;
 mod config;
+mod drain;
 mod error;
 mod merge_execution;
 mod routes;
@@ -26,6 +27,7 @@ async fn main() {
 
     let config = ServerConfig::parse();
     let body_idle_timeout = std::time::Duration::from_secs(config.request_body_idle_timeout_secs);
+    let response_idle = std::time::Duration::from_secs(config.http_shutdown_response_idle_secs);
     let addr = format!("{}:{}", config.host, config.port);
 
     if let Err(e) = create_local_dir_if_needed(&config.data_dir) {
@@ -87,15 +89,13 @@ async fn main() {
     tracing::info!("Starting lance-context-server on {}", addr);
 
     let listener = TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app)
-        .with_graceful_shutdown(wait_for_shutdown_signal())
-        .await
-        .unwrap();
+    let result = drain::serve(listener, app, response_idle, wait_for_shutdown_signal()).await;
 
-    // Connections have drained. Deterministically close every resident writer
-    // before the runtime tears down.
+    // Accepted HTTP handlers, including those whose clients disconnected, have
+    // joined before we close resident writers.
     state.merge_executions.shutdown().await;
     state.shutdown().await;
+    result.expect("HTTP server failed");
 }
 
 #[cfg(unix)]
