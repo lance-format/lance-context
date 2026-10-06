@@ -5,12 +5,244 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use lance_context_ingestion::{
-    Aligner, BatchPolicy, Binding, Consumer, Entry, Error, HistoryLoader, Journal, Partition,
-    PipelineConfig, Position, Reducer, Request, Result, SessionCheckpoints, Sink, Transition,
+    Aligner, BacklogPolicy, BatchPolicy, Binding, Consumer, Entry, Error, HistoryLoader, Journal,
+    Partition, PipelineConfig, Position, Reducer, Request, Result, SessionCheckpoints, Sink,
+    Transition,
 };
+
 use object_store::{memory::InMemory, path::Path, ObjectStore, ObjectStoreExt};
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
+
+fn backlog(consumers: &[&str], max_segments: u64) -> BacklogPolicy {
+    BacklogPolicy {
+        consumers: consumers.iter().map(|name| (*name).into()).collect(),
+        max_segments,
+        poll_interval: Duration::from_millis(1),
+    }
+}
+
+fn wal_entry(sequence: u64) -> Entry {
+    Entry {
+        sequence,
+        session: "session-a".into(),
+        receipt: format!("receipt-{sequence}"),
+        input_digest: "digest".into(),
+        transition: Transition {
+            delta: serde_json::to_vec(&sequence).unwrap(),
+            records: vec![],
+        },
+    }
+}
+
+#[tokio::test]
+async fn backlog_waits_for_every_required_consumer_and_reopens_without_reset() {
+    let journal = journal(Arc::new(InMemory::new()), 0);
+    let mut writer = journal.acquire().await.unwrap();
+    for n in 1..=3 {
+        writer.append(vec![wal_entry(n)]).await.unwrap();
+    }
+    // Enabling the limit on an existing backlog must preserve all its data.
+    let mut writer = journal
+        .acquire()
+        .await
+        .unwrap()
+        .with_backlog(backlog(&["table", "checkpoint"], 2))
+        .unwrap();
+    assert_eq!(
+        journal.consumer_position("table").await.unwrap(),
+        Position::default()
+    );
+    let mut append = Box::pin(writer.append(vec![wal_entry(4)]));
+    assert!(timeout(Duration::from_millis(20), &mut append)
+        .await
+        .is_err());
+    let mut table = Consumer::open(journal.clone(), "table").await.unwrap();
+    let mut checkpoint = Consumer::open(journal.clone(), "checkpoint").await.unwrap();
+    let mut table_sink = Collect::new();
+    let mut checkpoint_sink = Collect::new();
+    assert_eq!(table.consume(&mut table_sink, 3, 16384).await.unwrap(), 3);
+    assert!(timeout(Duration::from_millis(20), &mut append)
+        .await
+        .is_err());
+    assert_eq!(
+        checkpoint
+            .consume(&mut checkpoint_sink, 1, 16384)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(timeout(Duration::from_millis(20), &mut append)
+        .await
+        .is_err());
+    assert_eq!(
+        checkpoint
+            .consume(&mut checkpoint_sink, 1, 16384)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        timeout(Duration::from_secs(2), append)
+            .await
+            .unwrap()
+            .unwrap()
+            .sequence,
+        4
+    );
+    assert_eq!(journal.position().await.unwrap().generation, 4);
+    assert_eq!(
+        journal
+            .consumer_position("checkpoint")
+            .await
+            .unwrap()
+            .generation,
+        2
+    );
+}
+
+#[tokio::test]
+async fn cancelling_or_reassigning_a_backlog_paused_writer_fences_it() {
+    let journal = journal(Arc::new(InMemory::new()), 0);
+    let mut writer = journal
+        .acquire()
+        .await
+        .unwrap()
+        .with_backlog(backlog(&["table"], 1))
+        .unwrap();
+    writer.append(vec![wal_entry(1)]).await.unwrap();
+    // This timeout drops the actual append future, unlike the retained futures above.
+    assert!(
+        timeout(Duration::from_millis(20), writer.append(vec![wal_entry(2)]))
+            .await
+            .is_err()
+    );
+    assert!(matches!(
+        writer.append(vec![wal_entry(2)]).await,
+        Err(Error::Fenced)
+    ));
+    let mut writer = journal
+        .acquire()
+        .await
+        .unwrap()
+        .with_backlog(backlog(&["table"], 1))
+        .unwrap();
+    let mut append = Box::pin(writer.append(vec![wal_entry(2)]));
+    assert!(timeout(Duration::from_millis(20), &mut append)
+        .await
+        .is_err());
+    let mut replacement = journal
+        .acquire()
+        .await
+        .unwrap()
+        .with_backlog(backlog(&["table"], 1))
+        .unwrap();
+    assert!(matches!(
+        timeout(Duration::from_secs(2), append).await.unwrap(),
+        Err(Error::Fenced)
+    ));
+    let mut table = Consumer::open(journal.clone(), "table").await.unwrap();
+    assert_eq!(
+        table.consume(&mut Collect::new(), 1, 16384).await.unwrap(),
+        1
+    );
+    replacement.append(vec![wal_entry(2)]).await.unwrap();
+    assert_eq!(journal.position().await.unwrap().sequence, 2);
+}
+
+#[tokio::test]
+async fn pipeline_backpressure_keeps_retries_live_and_other_partitions_independent() {
+    let store = Arc::new(InMemory::new());
+    let j = journal(store.clone(), 0);
+    let mut cfg = config();
+    cfg.wal.max_entries = 1;
+    let pipeline = Partition::start(
+        j.acquire()
+            .await
+            .unwrap()
+            .with_backlog(backlog(&["table"], 1))
+            .unwrap(),
+        Counter::new(Arc::default()),
+        cfg,
+    )
+    .await
+    .unwrap();
+    pipeline
+        .enqueue(request(1))
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    let mut next = Box::pin(pipeline.enqueue(request(2)).await.unwrap().wait());
+    assert!(timeout(Duration::from_millis(30), &mut next).await.is_err());
+    // Already durable retries must not wait for a table consumer to catch up.
+    timeout(
+        Duration::from_secs(2),
+        pipeline.enqueue(request(1)).await.unwrap().wait(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let other = journal(store, 1);
+    other
+        .acquire()
+        .await
+        .unwrap()
+        .with_backlog(backlog(&["table"], 1))
+        .unwrap()
+        .append(vec![wal_entry(1)])
+        .await
+        .unwrap();
+    assert_eq!(j.position().await.unwrap().sequence, 1);
+    let mut consumer = Consumer::open(j.clone(), "table").await.unwrap();
+    consumer
+        .consume(&mut Collect::new(), 1, 16384)
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(2), &mut next)
+        .await
+        .unwrap()
+        .unwrap();
+    pipeline.shutdown().await.unwrap();
+    assert_eq!(j.position().await.unwrap().sequence, 2);
+}
+
+#[tokio::test]
+async fn backlog_rejects_forged_cursor_even_when_its_generation_would_release_capacity() {
+    let store = Arc::new(InMemory::new());
+    let j = journal(store.clone(), 0);
+    let mut writer = j
+        .acquire()
+        .await
+        .unwrap()
+        .with_backlog(backlog(&["table"], 1))
+        .unwrap();
+    let committed = writer.append(vec![wal_entry(1)]).await.unwrap();
+    let forged = Position {
+        segment: Some(uuid::Uuid::new_v4().to_string()),
+        ..committed.clone()
+    };
+    let path = Path::from("run/partition-0/consumers/table.json");
+    store
+        .put(
+            &path,
+            serde_json::to_vec(&serde_json::json!({"binding":binding(0),"position":forged}))
+                .unwrap()
+                .into(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        writer.append(vec![wal_entry(2)]).await,
+        Err(Error::Invalid(_))
+    ));
+    assert_eq!(j.position().await.unwrap(), committed);
+    assert!(matches!(
+        writer.append(vec![wal_entry(2)]).await,
+        Err(Error::Fenced)
+    ));
+}
 
 #[tokio::test]
 async fn lagging_recovery_and_consumers_page_without_loading_entire_wal() {

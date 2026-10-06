@@ -20,6 +20,42 @@ struct Cursor {
     position: Position,
 }
 
+pub(crate) fn validate_consumer_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Err(Error::Invalid("invalid consumer name".into()));
+    }
+    Ok(())
+}
+
+impl Journal {
+    /// Read durable consumer progress without creating or advancing its cursor.
+    /// A consumer that has not started is at zero. The returned position must
+    /// still be checked against the publisher's committed chain before use.
+    pub async fn consumer_position(&self, name: &str) -> Result<Position> {
+        validate_consumer_name(name)?;
+        let (cursor, _): (Cursor, _) = match self
+            .read(&self.path(&format!("consumers/{name}.json")))
+            .await
+        {
+            Ok(value) => value,
+            Err(Error::Storage(object_store::Error::NotFound { .. })) => {
+                return Ok(Position::default());
+            }
+            Err(error) => return Err(error),
+        };
+        if &cursor.binding != self.binding() {
+            return Err(Error::Invalid(
+                "consumer run/schema/partition mismatch".into(),
+            ));
+        }
+        Ok(cursor.position)
+    }
+}
+
 /// Separate names (for example `checkpoint` and `table`) consume the same WAL
 /// independently. Scheduler must assign a single active worker per consumer and
 /// partition; cursor CAS detects ownership races but does not fence sink writes.
@@ -33,13 +69,7 @@ pub struct Consumer {
 
 impl Consumer {
     pub async fn open(journal: Journal, name: &str) -> Result<Self> {
-        if name.is_empty()
-            || !name
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        {
-            return Err(Error::Invalid("invalid consumer name".into()));
-        }
+        validate_consumer_name(name)?;
         let path = journal.path(&format!("consumers/{name}.json"));
         let (cursor, version): (Cursor, _) = match journal.read(&path).await {
             Ok(pair) => pair,

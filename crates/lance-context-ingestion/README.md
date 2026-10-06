@@ -3,7 +3,7 @@
 Experimental streaming ingestion primitives. The implementation currently provides
 the pipeline, journal protocol and an optional Lance table sink. Application
 alignment/source adapters and deployment orchestration remain separate. This crate
-is not deployed.
+does not provide a complete distributed ingestion service.
 
 ```text
 replayable source / stable partition-local receipts
@@ -47,6 +47,17 @@ replayable source / stable partition-local receipts
   into their own batches. Sink output and input coverage must be committed together;
   cursor writes can fail after output succeeds, so repeated/regrouped input must be
   idempotent. The scheduler owns exclusive consumer assignment and sink-side fencing.
+- `Writer::with_backlog` optionally limits committed segments outstanding for
+  every required consumer. A consumer that has not started is at zero; table and
+  checkpoint progress are both required when both are configured. The publisher
+  waits before writing another segment, retaining bounded pipeline reservations;
+  other partitions and already durable retries remain independent. Consumers must
+  continue running while producers drain. Cancellation or ownership transfer fences
+  a paused writer. Reapply the same policy on every acquire/restart. The gate checks
+  durable cursor metadata and its committed ancestry; it adds storage reads and is
+  not itself a throughput optimization. It bounds unconsumed payload bytes by
+  `max_segments * max_segment_bytes`, not retained history, orphan uploads or total
+  storage. No WAL garbage collection or scheduling is implied.
 - `SessionCheckpoints` provides an actual object-store checkpoint sink: group by
   session, reduce ordered deltas, then write each session once with a conditional put.
   A partially successful checkpoint batch can leave some session states ahead of the
@@ -81,7 +92,7 @@ process-crash behavior on a real durable service, or production throughput.
 3. Add source fan-out receipts and contiguous source progress. A source call spanning
    partitions is complete only after every required partition ACK.
 4. Add worker ownership orchestration, stage timing/queue telemetry, consumer run loops,
-   bounded durable backlog and safe WAL reclamation. No WAL files are deleted here.
+   deployment of the backlog policy and safe WAL reclamation. No WAL files are deleted here.
 5. Verify real compacted sessions, process crash/restart with durable storage, Lance
    uncertain commits and source retry integration before a guarded production handoff.
    Existing source-reader local audit history must survive that handoff.

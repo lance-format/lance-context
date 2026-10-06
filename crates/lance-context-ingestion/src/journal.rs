@@ -1,11 +1,42 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use object_store::{path::Path, ObjectStore, ObjectStoreExt, PutMode, PutOptions, UpdateVersion};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::consumer::validate_consumer_name;
 use crate::{Error, Result};
+
+/// Limit committed WAL segments not yet acknowledged by every named consumer.
+/// This bounds outstanding payload bytes by `max_segments * max_segment_bytes`
+/// for this journal; retained consumed history, orphan uploads and metadata are
+/// not reclaimed or included. All scheduled publishers must use the same policy.
+#[derive(Clone, Debug)]
+pub struct BacklogPolicy {
+    pub consumers: Vec<String>,
+    pub max_segments: u64,
+    pub poll_interval: Duration,
+}
+
+impl BacklogPolicy {
+    fn validate(&self) -> Result<()> {
+        if self.consumers.is_empty() || self.max_segments == 0 || self.poll_interval.is_zero() {
+            return Err(Error::Invalid(
+                "empty consumers or zero backlog limit".into(),
+            ));
+        }
+        let mut names = std::collections::HashSet::new();
+        for name in &self.consumers {
+            validate_consumer_name(name)?;
+            if !names.insert(name) {
+                return Err(Error::Invalid("duplicate backlog consumer".into()));
+            }
+        }
+        Ok(())
+    }
+}
 
 /// A namespace is permanently bound to one run, schema and virtual partition.
 /// Worker count may change; these virtual partition identities must not.
@@ -79,6 +110,7 @@ pub struct Writer {
     head: Head,
     version: UpdateVersion,
     poisoned: bool,
+    backlog: Option<BacklogPolicy>,
 }
 
 pub(crate) fn digest(bytes: &[u8]) -> String {
@@ -196,6 +228,7 @@ impl Journal {
             head,
             version,
             poisoned: false,
+            backlog: None,
         })
     }
 
@@ -298,6 +331,28 @@ impl Journal {
         Ok(segments)
     }
 
+    async fn validate_ancestor(&self, ancestor: &Position, through: &Position) -> Result<()> {
+        validate_position(ancestor)?;
+        validate_position(through)?;
+        let mut cursor = through.clone();
+        while cursor.generation > ancestor.generation {
+            cursor = self
+                .link(&cursor)
+                .await?
+                .ancestors
+                .into_iter()
+                .rev()
+                .find(|position| position.generation >= ancestor.generation)
+                .ok_or_else(|| Error::Invalid("missing cursor skip link".into()))?;
+        }
+        if cursor != *ancestor {
+            return Err(Error::Invalid(
+                "consumer cursor is outside committed WAL".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Read a segment previously obtained from `pending`; not an authorization
     /// to consume arbitrary uncommitted object paths.
     pub async fn entries(&self, position: &Position) -> Result<Vec<Entry>> {
@@ -343,6 +398,40 @@ fn validate_position(position: &Position) -> Result<()> {
 }
 
 impl Writer {
+    /// Apply backpressure before publishing another segment. Existing backlog
+    /// above the limit is drained, never discarded. Required consumers must keep
+    /// running while a pipeline shuts down; dropping a blocked append fences it.
+    /// This policy is process configuration and must be reapplied after acquire.
+    pub fn with_backlog(mut self, policy: BacklogPolicy) -> Result<Self> {
+        policy.validate()?;
+        self.backlog = Some(policy);
+        Ok(self)
+    }
+
+    async fn wait_for_backlog(&self) -> Result<()> {
+        let Some(policy) = &self.backlog else {
+            return Ok(());
+        };
+        loop {
+            let (head, _) = self.journal.head().await?;
+            if head.epoch != self.head.epoch || head.position != self.head.position {
+                return Err(Error::Fenced);
+            }
+            let mut full = false;
+            for name in &policy.consumers {
+                let cursor = self.journal.consumer_position(name).await?;
+                self.journal
+                    .validate_ancestor(&cursor, &head.position)
+                    .await?;
+                full |= head.position.generation - cursor.generation >= policy.max_segments;
+            }
+            if !full {
+                return Ok(());
+            }
+            tokio::time::sleep(policy.poll_interval).await;
+        }
+    }
+
     pub fn position(&self) -> &Position {
         &self.head.position
     }
@@ -386,6 +475,7 @@ impl Writer {
         };
         // Set before the first await: cancelling this future also fences reuse.
         self.poisoned = true;
+        self.wait_for_backlog().await?;
         let mut ancestors = vec![self.head.position.clone()];
         let mut level = 1;
         while let Some(ancestor) = ancestors.last().filter(|ancestor| ancestor.generation > 0) {

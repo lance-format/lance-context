@@ -11,7 +11,7 @@ mod pipeline;
 
 pub use checkpoint::{CheckpointSink, Reducer, SessionCheckpoints, SessionState};
 pub use consumer::{Consumer, Sink};
-pub use journal::{Binding, Entry, Journal, Position, Transition, Writer};
+pub use journal::{BacklogPolicy, Binding, Entry, Journal, Position, Transition, Writer};
 pub use pipeline::{Ack, Aligner, BatchPolicy, HistoryLoader, Partition, PipelineConfig, Request};
 
 pub type Result<T> = std::result::Result<T, Error>;
