@@ -1,0 +1,410 @@
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+use async_trait::async_trait;
+use lance_context_ingestion::{
+    Aligner, BatchPolicy, Binding, Entry, HistoryLoader, Journal, PipelineConfig, Position,
+    Request, Result, SourceConfig, SourcePartition, SourceRequest, Transition,
+};
+use object_store::{memory::InMemory, path::Path};
+use tokio::{sync::Semaphore, time::timeout};
+
+struct EmptyHistory;
+#[async_trait]
+impl HistoryLoader for EmptyHistory {
+    async fn load(&self, _: &Request, _: usize) -> Result<Vec<u8>> {
+        Ok(vec![])
+    }
+}
+
+struct Counter {
+    states: HashMap<String, u64>,
+    observed: Arc<Mutex<Vec<String>>>,
+    slow: Arc<Semaphore>,
+    fast_done: Arc<Semaphore>,
+}
+#[async_trait]
+impl Aligner for Counter {
+    async fn restore(&mut self, _: &Binding) -> Result<Position> {
+        Ok(Position::default())
+    }
+    async fn replay(&mut self, entry: &Entry) -> Result<()> {
+        self.states.insert(
+            entry.session.clone(),
+            serde_json::from_slice(&entry.transition.delta)?,
+        );
+        Ok(())
+    }
+    async fn align(&mut self, request: &Request, _: &[u8]) -> Result<Transition> {
+        if request.session == "slow" {
+            self.slow.acquire().await.unwrap().forget();
+        }
+        let count = self.states.entry(request.session.clone()).or_default();
+        *count += 1;
+        self.observed.lock().unwrap().push(request.receipt.clone());
+        if request.session == "fast" {
+            self.fast_done.add_permits(1);
+        }
+        Ok(Transition {
+            delta: serde_json::to_vec(count)?,
+            records: request.receipt.as_bytes().to_vec(),
+        })
+    }
+}
+
+fn journal() -> Journal {
+    Journal::new(
+        Arc::new(InMemory::new()),
+        Path::from("source"),
+        Binding {
+            run: "source-run".into(),
+            schema: "counter".into(),
+            partition: 0,
+        },
+        1 << 20,
+        2,
+    )
+    .unwrap()
+}
+
+fn config() -> PipelineConfig {
+    PipelineConfig {
+        queue_entries: 8,
+        load_concurrency: 4,
+        memory_bytes: 1 << 20,
+        max_input_bytes: 1024,
+        max_transition_bytes: 1024,
+        max_history_bytes: 0,
+        wal: BatchPolicy {
+            max_entries: 8,
+            max_bytes: 16 << 10,
+            max_delay: Duration::from_millis(2),
+        },
+    }
+}
+
+async fn start(
+    journal: &Journal,
+    observed: Arc<Mutex<Vec<String>>>,
+    slow: Arc<Semaphore>,
+    fast_done: Arc<Semaphore>,
+    config: PipelineConfig,
+) -> SourcePartition {
+    SourcePartition::start(
+        journal.acquire().await.unwrap(),
+        (0..2)
+            .map(|_| Counter {
+                states: HashMap::new(),
+                observed: observed.clone(),
+                slow: slow.clone(),
+                fast_done: fast_done.clone(),
+            })
+            .collect(),
+        EmptyHistory,
+        config,
+        SourceConfig {
+            max_batch_requests: 16,
+            max_batch_bytes: 16 << 10,
+            receipt_read_concurrency: 2,
+        },
+    )
+    .await
+    .unwrap()
+}
+
+fn request(receipt: &str, session: &str) -> SourceRequest {
+    SourceRequest {
+        receipt: receipt.into(),
+        session: session.into(),
+        payload: receipt.as_bytes().to_vec(),
+    }
+}
+
+#[tokio::test]
+async fn in_flight_source_retries_do_not_realign_or_block_later_dispatch() {
+    let journal = journal();
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let slow = Arc::new(Semaphore::new(0));
+    let fast_done = Arc::new(Semaphore::new(0));
+    let mut source = start(
+        &journal,
+        observed.clone(),
+        slow.clone(),
+        fast_done.clone(),
+        config(),
+    )
+    .await;
+    let a = request("a", "slow");
+    let first = source
+        .enqueue_many(vec![a.clone(), a.clone(), request("b", "fast")])
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(2), fast_done.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    let second = source
+        .enqueue_many(vec![a.clone(), request("c", "fast")])
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(2), fast_done.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    assert_eq!(journal.position().await.unwrap().sequence, 0);
+    let mut changed = a;
+    changed.payload.push(9);
+    assert!(source.enqueue_many(vec![changed]).await.is_err());
+    slow.add_permits(1);
+    let mut sequences = Vec::new();
+    for ack in first.into_iter().chain(second) {
+        let commit = timeout(Duration::from_secs(2), ack.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(commit.through.sequence >= commit.sequence);
+        sequences.push(commit.sequence);
+    }
+    assert_eq!(sequences, [1, 1, 2, 1, 3]);
+    source.shutdown().await.unwrap();
+    let mut aligned = observed.lock().unwrap().clone();
+    aligned.sort();
+    assert_eq!(aligned, ["a", "b", "c"]);
+    assert_eq!(journal.position().await.unwrap().sequence, 3);
+}
+
+#[tokio::test]
+async fn lost_response_and_restart_recover_receipts_without_realigning_or_resetting_sequences() {
+    let journal = journal();
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let slow = Arc::new(Semaphore::new(0));
+    let fast_done = Arc::new(Semaphore::new(0));
+    let mut source = start(
+        &journal,
+        observed.clone(),
+        slow.clone(),
+        fast_done.clone(),
+        config(),
+    )
+    .await;
+    let original = request("a", "fast");
+    drop(source.enqueue_many(vec![original.clone()]).await.unwrap());
+    source.shutdown().await.unwrap();
+    let before = journal.position().await.unwrap();
+    let mut source = start(&journal, observed.clone(), slow, fast_done, config()).await;
+    let mut changed = original.clone();
+    changed.session = "different-session".into();
+    assert!(source.enqueue_many(vec![changed]).await.is_err());
+    assert_eq!(journal.position().await.unwrap(), before);
+    let acks = source
+        .enqueue_many(vec![original, request("b", "fast")])
+        .await
+        .unwrap();
+    let mut sequences = Vec::new();
+    for ack in acks {
+        sequences.push(ack.wait().await.unwrap().sequence);
+    }
+    assert_eq!(sequences, [1, 2]);
+    let mut consumer = source.open_receipt_consumer().await.unwrap();
+    let mut sink = source.receipt_index().sink(2).unwrap();
+    while consumer.consume(&mut sink, 2, 1 << 20).await.unwrap() != 0 {}
+    assert_eq!(consumer.position().sequence, 2);
+    let retry = source
+        .enqueue_many(vec![request("a", "fast")])
+        .await
+        .unwrap();
+    assert_eq!(
+        retry
+            .into_iter()
+            .next()
+            .unwrap()
+            .wait()
+            .await
+            .unwrap()
+            .sequence,
+        1
+    );
+    source.shutdown().await.unwrap();
+    assert_eq!(*observed.lock().unwrap(), ["a", "b"]);
+    assert_eq!(journal.position().await.unwrap().sequence, 2);
+}
+
+#[tokio::test]
+async fn cancelled_partial_admission_requires_recovery_and_retries_exactly_once() {
+    let journal = journal();
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let slow = Arc::new(Semaphore::new(0));
+    let fast_done = Arc::new(Semaphore::new(0));
+    let mut limited = config();
+    limited.memory_bytes = 60_000;
+    let mut source = start(
+        &journal,
+        observed.clone(),
+        slow.clone(),
+        fast_done.clone(),
+        limited,
+    )
+    .await;
+    let first = request("a", "slow");
+    drop(source.enqueue_many(vec![first.clone()]).await.unwrap());
+    let later = (0..10)
+        .map(|n| request(&format!("later-{n}"), "fast"))
+        .collect::<Vec<_>>();
+    let mut admission = Box::pin(source.enqueue_many(later.clone()));
+    timeout(Duration::from_secs(2), async {
+        tokio::select! {
+            _ = &mut admission => panic!("admission must wait for bounded capacity"),
+            ready = fast_done.acquire() => ready.unwrap().forget(),
+        }
+    })
+    .await
+    .unwrap();
+    assert!(timeout(Duration::from_millis(20), &mut admission)
+        .await
+        .is_err());
+    drop(admission);
+    assert!(source.enqueue_many(vec![first.clone()]).await.is_err());
+    slow.add_permits(1);
+    timeout(Duration::from_secs(2), source.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+    let prefix = journal.position().await.unwrap();
+    assert!(prefix.sequence > 1 && prefix.sequence < 11);
+    let mut source = start(&journal, observed.clone(), slow, fast_done, config()).await;
+    let acks = source
+        .enqueue_many(std::iter::once(first).chain(later).collect())
+        .await
+        .unwrap();
+    for (n, ack) in acks.into_iter().enumerate() {
+        assert_eq!(ack.wait().await.unwrap().sequence, n as u64 + 1);
+    }
+    source.shutdown().await.unwrap();
+    assert_eq!(journal.position().await.unwrap().sequence, 11);
+    let observed = observed.lock().unwrap();
+    assert_eq!(observed.len(), 11);
+    let mut unique = observed.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), 11);
+}
+
+#[tokio::test]
+async fn invalid_batch_cannot_allocate_a_sequence_or_poison_valid_admission() {
+    let journal = journal();
+    let mut source = start(
+        &journal,
+        Arc::default(),
+        Arc::new(Semaphore::new(0)),
+        Arc::new(Semaphore::new(0)),
+        config(),
+    )
+    .await;
+    let original = request("a", "fast");
+    let mut changed = original.clone();
+    changed.payload.push(1);
+    assert!(source
+        .enqueue_many(vec![original.clone(), changed])
+        .await
+        .is_err());
+    let mut oversized = original.clone();
+    oversized.payload = vec![0; 1025];
+    assert!(source.enqueue_many(vec![oversized]).await.is_err());
+    assert!(source.enqueue_many(Vec::new()).await.is_err());
+    assert_eq!(journal.position().await.unwrap().sequence, 0);
+    let ack = source
+        .enqueue_many(vec![original])
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(ack.wait().await.unwrap().sequence, 1);
+    source.shutdown().await.unwrap();
+}
+
+struct Failing {
+    release: Arc<Semaphore>,
+    fail_wal: bool,
+}
+
+#[async_trait]
+impl Aligner for Failing {
+    async fn restore(&mut self, _: &Binding) -> Result<Position> {
+        Ok(Position::default())
+    }
+    async fn replay(&mut self, _: &Entry) -> Result<()> {
+        Ok(())
+    }
+    async fn align(&mut self, _: &Request, _: &[u8]) -> Result<Transition> {
+        self.release.acquire().await.unwrap().forget();
+        if self.fail_wal {
+            // Fits the transition budget but exceeds the journal object budget.
+            Ok(Transition {
+                delta: vec![1],
+                records: vec![1; 256],
+            })
+        } else {
+            Err(lance_context_ingestion::Error::Stage(
+                "injected alignment failure".into(),
+            ))
+        }
+    }
+}
+
+#[tokio::test]
+async fn original_and_duplicate_waiters_fail_together_on_alignment_or_wal_error() {
+    for fail_wal in [false, true] {
+        let journal = Journal::new(
+            Arc::new(InMemory::new()),
+            Path::from("failure"),
+            Binding {
+                run: "run".into(),
+                schema: "counter".into(),
+                partition: 0,
+            },
+            512,
+            2,
+        )
+        .unwrap();
+        let release = Arc::new(Semaphore::new(0));
+        let mut source = SourcePartition::start(
+            journal.acquire().await.unwrap(),
+            vec![Failing {
+                release: release.clone(),
+                fail_wal,
+            }],
+            EmptyHistory,
+            config(),
+            SourceConfig {
+                max_batch_requests: 4,
+                max_batch_bytes: 16 << 10,
+                receipt_read_concurrency: 2,
+            },
+        )
+        .await
+        .unwrap();
+        let input = request("original", "session");
+        let acks = source
+            .enqueue_many(vec![input.clone(), input.clone()])
+            .await
+            .unwrap();
+        release.add_permits(1);
+        for ack in acks {
+            assert!(timeout(Duration::from_secs(2), ack.wait())
+                .await
+                .unwrap()
+                .is_err());
+        }
+        assert!(source.enqueue_many(vec![input]).await.is_err());
+        assert!(timeout(Duration::from_secs(2), source.shutdown())
+            .await
+            .unwrap()
+            .is_err());
+        assert_eq!(journal.position().await.unwrap().sequence, 0);
+    }
+}

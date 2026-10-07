@@ -63,6 +63,15 @@ replayable source / stable partition-local receipts
   committed position: the admission owner must still check its in-flight map and
   serialize sequence assignment. This index does not schedule source fan-out or
   replace the requirement to ACK every partition before advancing source progress.
+- `SourcePartition` adds a serialized admission owner for continuous callers that
+  have stable source receipts but no partition sequence numbers. `enqueue_many`
+  checks committed and in-flight identities, assigns sequences only to new inputs,
+  and returns independent ACK waiters. A repeated in-flight receipt watches the
+  original commit without blocking later alignment dispatch. Dropped ACK waiters
+  do not cancel work; cancellation during admission requires recovery of the
+  unknown admitted prefix. Run its dedicated receipt consumer independently and
+  keep HTTP/source queues bounded. This API does not supply HTTP authentication,
+  cross-partition fan-out, or a migration from an application's previous WAL format.
 - `Writer::with_backlog` optionally limits committed segments outstanding for
   every required consumer. A consumer that has not started is at zero; table and
   checkpoint progress are both required when both are configured. The publisher

@@ -271,6 +271,10 @@ impl Partition {
         self.durable.borrow().clone()
     }
 
+    pub(crate) fn subscribe_durable(&self) -> watch::Receiver<Position> {
+        self.durable.clone()
+    }
+
     /// Stop admission, drain alignment and flush even a partially filled WAL.
     /// Dropping Partition instead aborts tasks; recovery reconciles any uncertain
     /// head write. Neither path advances checkpoint or merge consumer cursors.
