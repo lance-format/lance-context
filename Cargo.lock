@@ -3922,6 +3922,7 @@ dependencies = [
  "lance-io",
  "lance-table",
  "object_store",
+ "redb",
  "serde",
  "serde_json",
  "sha2 0.10.9",

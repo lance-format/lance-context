@@ -11,7 +11,7 @@ use arrow_schema::Schema;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use lance::dataset::{
-    transaction::{Operation, Transaction},
+    transaction::{Operation, Transaction, UpdateMap},
     CommitBuilder, Dataset, InsertBuilder, WriteMode, WriteParams,
 };
 use lance::index::DatasetIndexExt;
@@ -267,6 +267,46 @@ impl LanceTableSink {
         &self.dataset
     }
 
+    /// Publish control pointers under the same lease and exact-version fence as
+    /// data. This merges table metadata without changing record schema or rows.
+    pub async fn update_metadata_at(
+        &mut self,
+        updates: HashMap<String, String>,
+        base: u64,
+    ) -> Result<()> {
+        if self.poisoned {
+            return Err(Error::Fenced);
+        }
+        self.poisoned = true;
+        self.dataset.checkout_latest().await.map_err(failure)?;
+        if self.dataset.version().version != base {
+            return Err(Error::Fenced);
+        }
+        let operation = Operation::UpdateConfig {
+            config_updates: None,
+            table_metadata_updates: Some(UpdateMap {
+                update_entries: updates.into_iter().map(Into::into).collect(),
+                replace: false,
+            }),
+            schema_metadata_updates: None,
+            field_metadata_updates: HashMap::new(),
+        };
+        let handler = Arc::new(PinnedCommit {
+            delegate: self.handler.clone(),
+            next_version: base
+                .checked_add(1)
+                .ok_or_else(|| Error::Invalid("table version overflow".into()))?,
+        });
+        self.dataset = CommitBuilder::new(Arc::new(self.dataset.clone()))
+            .with_commit_handler(handler)
+            .with_max_retries(0)
+            .execute(Transaction::new(base, operation, None))
+            .await
+            .map_err(failure)?;
+        self.poisoned = false;
+        Ok(())
+    }
+
     pub async fn covered_sequence(&mut self, binding: &Binding) -> Result<u64> {
         self.dataset.checkout_latest().await.map_err(failure)?;
         validate_dataset(&self.dataset, binding)?;
@@ -278,10 +318,28 @@ impl LanceTableSink {
     }
 
     pub async fn commit_staged(&mut self, staged: Vec<Staged>) -> Result<usize> {
+        self.commit_staged_inner(staged, None).await
+    }
+
+    /// Commit only against the version used to compute local state changes.
+    /// A changed base requires recovery and realignment, never an append retry.
+    pub async fn commit_staged_at(&mut self, staged: Vec<Staged>, version: u64) -> Result<usize> {
+        self.commit_staged_inner(staged, Some(version)).await
+    }
+
+    async fn commit_staged_inner(
+        &mut self,
+        staged: Vec<Staged>,
+        expected_version: Option<u64>,
+    ) -> Result<usize> {
         if self.poisoned {
             return Err(Error::Fenced);
         }
         self.dataset.checkout_latest().await.map_err(failure)?;
+        if expected_version.is_some_and(|version| version != self.dataset.version().version) {
+            self.poisoned = true;
+            return Err(Error::Fenced);
+        }
         let marks = watermarks(&self.dataset).await?;
         let mut seen = HashSet::new();
         let mut fragments = Vec::new();

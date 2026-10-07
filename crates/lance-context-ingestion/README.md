@@ -178,3 +178,30 @@ CARGO_TARGET_DIR=/tmp/trace-streaming-target cargo test -p lance-context-ingesti
 CARGO_TARGET_DIR=/tmp/trace-streaming-target cargo clippy -p lance-context-ingestion --features lance --all-targets --offline -- -D warnings
 cargo fmt -p lance-context-ingestion --check
 ```
+
+# Local state and a Lance recovery log
+
+The `local_lance` module (`lance` feature) stores individual binary state cells
+and exact receipts in a local redb database. This is a disposable local index;
+it does not require a remote KV request for each message. Session routing and
+the durable partition lease remain the caller's responsibility.
+
+An `AlignedCall` contains typed output rows and the matching state mutations.
+`LocalLancePartition::commit` coalesces calls into one Lance 2.2 commit with Zstd
+requested on its columns, then applies one local transaction. A cancelled or
+failed commit fences the instance. Reopen and check the original receipts before
+realigning or acknowledging a retry. The exact-version commit fence prevents a
+stale writer from acknowledging another writer's output at the same sequence.
+
+`checkpoint` streams the local tables in bounded batches to a separate immutable
+Lance dataset. `publish_checkpoint` pins its exact URI/version in the WAL's
+manifest under the same lease/version fence. Do this on a byte/time threshold,
+not once per source call. Cold restart discovers that pointer, restores state,
+and reads only new immutable WAL fragments. Recovery projects state and receipt
+columns, excluding output bodies. No method deletes WAL or checkpoint history.
+
+The first output schema supports flat Arrow columns. State cell encoding and
+legacy migration are adapter contracts; this API does not convert JSON payloads
+supplied by a caller. This is an opt-in backend: existing `Journal` and
+`SessionCheckpoints` adapters keep their existing storage and recovery behavior.
+Migrate their committed suffix and receipts before changing the intake log.

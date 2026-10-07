@@ -7,6 +7,8 @@ mod consumer;
 mod journal;
 #[cfg(feature = "lance")]
 pub mod lance_sink;
+#[cfg(feature = "lance")]
+pub mod local_lance;
 mod pipeline;
 mod receipt;
 mod source;
