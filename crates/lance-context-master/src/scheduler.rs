@@ -2025,6 +2025,97 @@ mod tests {
         worker.abort();
     }
 
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn resident_merge_waiting_for_memory_keeps_general_tasks_running() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.append.rollout_append_local = true;
+        cfg.append.rollout_append_targets = vec!["exp".into()];
+        cfg.catchup.shards = vec!["historical".into()];
+        cfg.merge_wal_concurrency = 1;
+        cfg.task_concurrency = 1;
+        let state = MasterState::new(cfg).await.unwrap();
+        let hot = RolloutStore::open_with_options(
+            &state.rollout_uri("exp"),
+            lance_context_core::RolloutStoreOptions {
+                shard_id: Some("historical".into()),
+                merge_after_generations: Some(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        hot.add(&[rollout_record("hot-row")]).await.unwrap();
+        hot.flush().await.unwrap();
+        let mut cold = RolloutStore::open(&state.rollout_uri("other"))
+            .await
+            .unwrap();
+        cold.add(&[rollout_record("cold-row")]).await.unwrap();
+        cold.cleanup_own_shard().await.unwrap();
+        let budget = state.local_append.as_ref().unwrap().budget.clone();
+        let held = budget.reserve(budget.limit()).await;
+        let merge = enqueue(&state, TaskKind::MergeWal, "exp").await.unwrap();
+        let merge_poller = spawn_pool_poller(
+            state.clone(),
+            Arc::new(Semaphore::new(1)),
+            TaskKinds::MERGE_WAL,
+            false,
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if state
+                    .task_store
+                    .get(&merge.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state
+                    == TaskState::Running
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let index = enqueue(&state, TaskKind::IndexId, "other").await.unwrap();
+        let general = spawn_pool_poller(
+            state.clone(),
+            Arc::new(Semaphore::new(1)),
+            TaskKinds::GENERAL.without_compact(),
+            false,
+        );
+        let indexed = await_terminal(&state, &index.id).await;
+        assert_eq!(indexed.state, TaskState::Done, "{indexed:?}");
+        assert_eq!(
+            state
+                .task_store
+                .get(&merge.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            TaskState::Running
+        );
+        drop(held);
+        let merged = await_terminal(&state, &merge.id).await;
+        assert_eq!(merged.state, TaskState::Done, "{merged:?}");
+        assert_eq!(budget.reserved(), 0);
+        assert_eq!(
+            lance::Dataset::open(&state.rollout_uri("exp"))
+                .await
+                .unwrap()
+                .count_rows(None)
+                .await
+                .unwrap(),
+            1
+        );
+        merge_poller.abort();
+        general.abort();
+    }
+
     /// Enqueuing the same experiment twice while queued de-dupes to one task.
     #[tokio::test]
     #[ignore = "requires ETCD_TEST_ENDPOINTS"]

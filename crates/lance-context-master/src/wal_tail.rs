@@ -9,7 +9,7 @@ use std::{sync::Arc, time::Duration};
 #[derive(Clone, Debug, clap::Args)]
 pub struct WalTailConfig {
     /// Revisit low-count WAL tails after this interval; 0 disables this sweep.
-    /// Requires ordinary automatic WAL merge and worker endpoints as well.
+    /// Requires automatic WAL merge and either workers or resident local append.
     #[arg(long, env = "MERGE_WAL_TAIL_INTERVAL_SECS", default_value_t = 0)]
     pub wal_tail_interval_secs: u64,
     /// At most this many candidates per fleet-wide 30-second batch (hard cap 64).
@@ -38,7 +38,7 @@ struct Cursor {
 fn enabled(config: &MasterConfig) -> bool {
     config.wal_tail.wal_tail_interval_secs > 0
         && config.merge_wal_interval_secs > 0
-        && !config.worker_endpoints.is_empty()
+        && (!config.worker_endpoints.is_empty() || config.append.rollout_append_local)
         && config.wal_tail.wal_tail_stats_max_age_secs > 0
 }
 
@@ -57,6 +57,8 @@ fn candidates(
                 && row.scanned_at <= now
                 && now.saturating_sub(row.scanned_at) <= age
                 && !config.merge_rollout.draining(&row.name)
+                && (!config.worker_endpoints.is_empty()
+                    || (config.append.local(&row.name) && config.merge_rollout.owned(&row.name)))
                 && after.is_none_or(|after| row.name.as_str() > after)
         })
         .map(|row| row.name.clone())
@@ -244,6 +246,30 @@ mod tests {
             scanned_at: at,
             version: -1,
         }
+    }
+
+    #[test]
+    fn local_master_services_owned_tails_without_worker_endpoints() {
+        let mut cfg = config();
+        cfg.worker_endpoints.clear();
+        cfg.append.rollout_append_local = true;
+        cfg.append.rollout_append_targets = vec!["*".into()];
+        cfg.merge_rollout.owned_targets = vec!["hot".into(), "generic:other".into()];
+        let now = 2_000_000;
+        assert!(enabled(&cfg));
+        assert_eq!(
+            candidates(
+                &cfg,
+                &[
+                    row("hot", 1, now),
+                    row("legacy", 1, now),
+                    row("generic:other", 1, now)
+                ],
+                None,
+                now
+            ),
+            ["hot"]
+        );
     }
 
     #[test]

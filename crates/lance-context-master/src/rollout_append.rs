@@ -1,4 +1,4 @@
-//! Workers stage files concurrently; the master publishes bounded groups under
+//! Workers or the resident master stage files concurrently; the master publishes bounded groups under
 //! the existing table claim, idle watchdog, and manifest-version fence.
 use crate::state::MasterState;
 use futures::{stream, FutureExt, StreamExt};
@@ -23,6 +23,17 @@ pub struct AppendConfig {
     pub rollout_append_max_generations: usize,
     #[arg(long, env = "ROLLOUT_APPEND_MAX_BYTES", default_value_t = 67_108_864)]
     pub rollout_append_max_bytes: usize,
+    /// Read and encode WAL in this master for opted-in owned append targets.
+    /// Uses the ordinary durable task queue; creates no Kubernetes Jobs.
+    #[arg(long, env = "ROLLOUT_APPEND_LOCAL", default_value_t = false)]
+    pub rollout_append_local: bool,
+    /// Shared Arrow-buffer budget across every local append task in this master.
+    #[arg(
+        long,
+        env = "ROLLOUT_APPEND_LOCAL_MEMORY_BYTES",
+        default_value_t = 2_147_483_648
+    )]
+    pub rollout_append_local_memory_bytes: usize,
 }
 impl Default for AppendConfig {
     fn default() -> Self {
@@ -31,10 +42,53 @@ impl Default for AppendConfig {
             rollout_append_concurrency: 4,
             rollout_append_max_generations: 64,
             rollout_append_max_bytes: 67_108_864,
+            rollout_append_local: false,
+            rollout_append_local_memory_bytes: 2_147_483_648,
         }
     }
 }
 impl AppendConfig {
+    pub(crate) fn local(&self, target: &str) -> bool {
+        self.rollout_append_local && self.enabled(target)
+    }
+
+    pub(crate) fn validate_local(&self, config: &crate::config::MasterConfig) -> Result<()> {
+        if !self.rollout_append_local {
+            return Ok(());
+        }
+        self.validate()?;
+        if config.catchup.enabled
+            || config.catchup.pod_template.is_some()
+            || config.catchup.target.is_some()
+        {
+            return Err(
+                "resident local append cannot be combined with Kubernetes catch-up mode".into(),
+            );
+        }
+        if self.rollout_append_targets.is_empty()
+            || config.catchup.shards.is_empty()
+            || config.catchup.shards.len() > 256
+            || config.catchup.shards.iter().any(|s| s.is_empty())
+            || self.rollout_append_local_memory_bytes < self.rollout_append_max_bytes
+            || config.merge_wal_concurrency == 0
+            || config.catchup.slice_secs == 0
+        {
+            return Err("local append requires targets, stable WAL shards, a sufficient shared memory budget, and a separate merge task pool".into());
+        }
+        for target in &self.rollout_append_targets {
+            if target != "*"
+                && (target.starts_with("generic:")
+                    || !config.merge_rollout.owned(target)
+                    || config.merge_rollout.draining(target))
+            {
+                return Err(format!(
+                    "local append requires a non-draining owned rollout: {target}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn enabled(&self, target: &str) -> bool {
         !target.starts_with("generic:")
             && self
@@ -51,6 +105,25 @@ impl AppendConfig {
             return Err("invalid rollout append limits".into());
         }
         Ok(())
+    }
+}
+
+/// One instance per resident master, shared across tables and passes.
+#[derive(Clone)]
+pub(crate) struct LocalStaging {
+    pub(crate) budget: Arc<lance_context_core::MergeMemoryBudget>,
+    session: Arc<lance::session::Session>,
+}
+
+impl LocalStaging {
+    pub(crate) fn new(memory_bytes: usize) -> Self {
+        Self {
+            budget: lance_context_core::MergeMemoryBudget::new(memory_bytes),
+            session: lance_context_core::RolloutStore::build_session(
+                96 * 1024 * 1024,
+                32 * 1024 * 1024,
+            ),
+        }
     }
 }
 
@@ -129,14 +202,14 @@ pub(crate) async fn run(state: &Arc<MasterState>, target: &str) -> Result<String
     let mut seen = HashSet::new();
     // Capability probing is cheap and bounded; never send a new protocol RPC to
     // an older worker and silently fall back to its manifest-publishing merge.
-    // Dedicated Jobs contribute their own CPU/memory. The ordinary master
-    // remains metadata-only; it never falls back to local payload processing.
-    let dedicated = state.config.catchup.target.is_some();
+    // Local execution is explicitly configured, never a fallback after failed
+    // worker RPCs. Stable shard identities include historical, absent workers.
+    let local_execution = state.config.catchup.target.is_some() || config.local(target);
     let probe_futures: Vec<_> = state
         .config
         .worker_endpoints
         .iter()
-        .filter(|_| !dedicated)
+        .filter(|_| !local_execution)
         .cloned()
         .map(|endpoint| {
             let client = state.http.clone();
@@ -191,8 +264,11 @@ pub(crate) async fn run(state: &Arc<MasterState>, target: &str) -> Result<String
             shards.push(shard.clone());
         }
     }
-    if endpoints.is_empty() && !dedicated {
+    if endpoints.is_empty() && !local_execution {
         return Err("no staging workers available".into());
+    }
+    if local_execution && shards.is_empty() {
+        return Err("no stable WAL shard identities configured".into());
     }
     let mut coordinator = AppendCoordinator::open(
         &state.rollout_uri(target),
@@ -234,11 +310,13 @@ async fn run_pass(
         )
         .await
         .map_err(|e| e.to_string())?;
-    let local = state.config.catchup.target.as_ref().map(|_| {
-        (
-            lance_context_core::MergeMemoryBudget::new(state.config.catchup.merge_memory_bytes),
-            lance_context_core::RolloutStore::build_session(96 * 1024 * 1024, 32 * 1024 * 1024),
-        )
+    let local = state.local_append.clone().or_else(|| {
+        state
+            .config
+            .catchup
+            .target
+            .as_ref()
+            .map(|_| LocalStaging::new(state.config.catchup.merge_memory_bytes))
     });
     let stage_futures: Vec<_> = plans.into_iter().enumerate().map(|(i, plan)| {
         let client = state.http.clone();
@@ -248,8 +326,8 @@ async fn run_pass(
         let uri = state.rollout_uri(&target);
         let local = local.clone();
         async move {
-            let result = if let Some((budget, session)) = local {
-                lance_context_core::rollout_append::stage(&uri, plan.clone(), budget, Some(session))
+            let result = if let Some(local) = local {
+                lance_context_core::rollout_append::stage(&uri, plan.clone(), local.budget, Some(local.session))
                     .await.map_err(|e| e.to_string())
             } else {
                 let (endpoint, fallback) = routes.expect("ordinary master requires staging endpoints");
@@ -297,15 +375,16 @@ async fn run_pass(
     if !group.is_empty() {
         reclaimed += coordinator.commit(group).await.map_err(|e| e.to_string())?;
     }
-    // Every speculative reader has now dropped its reservation. Retry an
-    // indivisible oversized generation once alone, without Job-level backoff.
+    // This pass's speculative readers have dropped their reservations. Retry an
+    // indivisible oversized generation serially within this pass. Other resident
+    // tasks still share the budget, so contention can remain retryable.
     for plan in memory_retries {
-        let (budget, session) = local.as_ref().unwrap();
+        let local = local.as_ref().unwrap();
         match lance_context_core::rollout_append::stage(
             &state.rollout_uri(target),
             plan,
-            budget.clone(),
-            Some(session.clone()),
+            local.budget.clone(),
+            Some(local.session.clone()),
         )
         .await
         {
@@ -320,7 +399,7 @@ async fn run_pass(
     }
     metrics::counter!("master_rollout_append_generations_reclaimed_total")
         .increment(reclaimed as u64);
-    tracing::info!(%target, reclaimed, failed = errors.len(), version = coordinator.version(), "parallel rollout append completed");
+    tracing::info!(%target, reclaimed, local = local.is_some(), failed = errors.len(), version = coordinator.version(), "parallel rollout append completed");
     if !errors.is_empty() {
         return Err(format!(
             "staged append reclaimed {reclaimed}; {} shard(s) failed: {}",
@@ -348,6 +427,177 @@ mod tests {
         uri: String,
         barrier: Arc<tokio::sync::Barrier>,
         budget: Arc<MergeMemoryBudget>,
+    }
+
+    #[test]
+    fn resident_merge_rejects_unowned_targets_and_unbounded_resources() {
+        let mut config = crate::config::MasterConfig::parse_from(["test"]);
+        config.append.rollout_append_local = true;
+        config.append.rollout_append_targets = vec!["hot".into()];
+        config.catchup.shards = vec!["historical-worker".into()];
+        assert!(config.append.validate_local(&config).is_err());
+        config.merge_rollout.owned_targets = vec!["hot".into()];
+        assert!(config.append.validate_local(&config).is_ok());
+        config.merge_wal_concurrency = 0;
+        assert!(config.append.validate_local(&config).is_err());
+        config.merge_wal_concurrency = 2;
+        config.append.rollout_append_local_memory_bytes = 1;
+        assert!(config.append.validate_local(&config).is_err());
+        config.append.rollout_append_local_memory_bytes = 2 * 1024 * 1024 * 1024;
+        config.merge_rollout.drain_targets = vec!["hot".into()];
+        assert!(config.append.validate_local(&config).is_err());
+        config.merge_rollout.drain_targets.clear();
+        config.catchup.enabled = true;
+        assert!(config.append.validate_local(&config).is_err());
+        config.catchup.enabled = false;
+        config.catchup.slice_secs = 0;
+        assert!(config.append.validate_local(&config).is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn resident_replicas_merge_from_queue_with_no_workers_or_jobs() {
+        use crate::task_store::TaskKinds;
+        use lance_context_api::TaskKind;
+
+        let dir = tempfile::tempdir().unwrap();
+        for target in ["hot", "cold"] {
+            let uri = dir.path().join(format!("{target}.rollout.lance"));
+            for shard in ["a", "b"] {
+                let writer = RolloutStore::open_with_options(
+                    uri.to_str().unwrap(),
+                    RolloutStoreOptions {
+                        shard_id: Some(shard.into()),
+                        merge_after_generations: Some(0),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+                let dto = serde_json::from_value(
+                    json!({"id":shard, "rollout_id":"r", "content":format!("{target}-{shard}")}),
+                )
+                .unwrap();
+                writer
+                    .add(&[lance_context_core::rollout_record_from_add_request(&dto)])
+                    .await
+                    .unwrap();
+                writer.flush().await.unwrap();
+            }
+        }
+        let mut config = crate::config::MasterConfig::parse_from([
+            "test",
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+        ]);
+        config.etcd.etcd_endpoints = std::env::var("ETCD_TEST_ENDPOINTS")
+            .unwrap()
+            .split(',')
+            .map(str::to_owned)
+            .collect();
+        config.etcd.etcd_prefix =
+            format!("/resident-merge-test/{}", lance_context_core::generate_id());
+        config.worker_endpoints.clear();
+        config.merge_rollout.owned_targets = vec!["hot".into(), "cold".into()];
+        config.append.rollout_append_targets = config.merge_rollout.owned_targets.clone();
+        config.append.rollout_append_local = true;
+        config.append.rollout_append_max_bytes = 1024 * 1024;
+        config.append.rollout_append_local_memory_bytes = 2 * 1024 * 1024;
+        config.catchup.shards = vec!["a".into(), "b".into()];
+        let first = MasterState::new(config.clone()).await.unwrap();
+        let second = MasterState::new(config).await.unwrap();
+        assert!(first.config.catchup.target.is_none());
+        assert!(first.config.catchup.pod_template.is_none());
+        assert!(!first.config.catchup.enabled);
+        let queued = first
+            .task_store
+            .enqueue(TaskKind::MergeWal, "hot", Vec::new())
+            .await
+            .unwrap();
+        let duplicate = second
+            .task_store
+            .enqueue(TaskKind::MergeWal, "hot", Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(queued.id, duplicate.id);
+        let claim = first
+            .task_store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(second
+            .task_store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .is_none());
+
+        // Exhaust the first process's shared budget. Its local task must wait;
+        // another master can still service a different table from the same queue.
+        let budget = first.local_append.as_ref().unwrap().budget.clone();
+        let held = budget.reserve(budget.limit()).await;
+        let runner = {
+            let first = first.clone();
+            tokio::spawn(async move {
+                let result = crate::merge_execution::run_merge_wal(&first, &claim).await;
+                assert!(result.as_ref().unwrap().contains("2 generations"));
+                first.task_store.finish(claim, result).await.unwrap();
+            })
+        };
+        second
+            .task_store
+            .enqueue(TaskKind::MergeWal, "cold", Vec::new())
+            .await
+            .unwrap();
+        let other = second
+            .task_store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(other.task.target, "cold");
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            crate::merge_execution::run_merge_wal(&second, &other),
+        )
+        .await
+        .unwrap();
+        assert!(result.as_ref().unwrap().contains("2 generations"));
+        second.task_store.finish(other, result).await.unwrap();
+        assert!(
+            !runner.is_finished(),
+            "the first master must respect its shared memory budget"
+        );
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(30), runner)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(budget.reserved(), 0);
+        assert_eq!(second.local_append.as_ref().unwrap().budget.reserved(), 0);
+        for target in ["hot", "cold"] {
+            let uri = first.rollout_uri(target);
+            assert_eq!(
+                lance::Dataset::open(&uri)
+                    .await
+                    .unwrap()
+                    .count_rows(None)
+                    .await
+                    .unwrap(),
+                2
+            );
+            let store =
+                RolloutStore::open_existing_with_options(&uri, RolloutStoreOptions::default())
+                    .await
+                    .unwrap();
+            for id in ["a", "b"] {
+                assert_eq!(
+                    store.get_by_id(id).await.unwrap().unwrap().content.unwrap(),
+                    format!("{target}-{id}")
+                );
+            }
+        }
     }
 
     async fn caps(Path(worker): Path<String>) -> Json<serde_json::Value> {

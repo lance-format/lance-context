@@ -31,7 +31,10 @@ pub(crate) async fn run_merge_wal(
     state: &Arc<MasterState>,
     claim: &TaskClaim,
 ) -> Result<String, String> {
-    if state.config.worker_endpoints.is_empty() {
+    if state.config.worker_endpoints.is_empty()
+        && !(state.config.append.local(&claim.task.target)
+            && state.config.merge_rollout.owned(&claim.task.target))
+    {
         return Err("no worker endpoints configured".into());
     }
     let coordinator = state.task_store.merge_coordinator();

@@ -1,8 +1,9 @@
 # Parallel rollout WAL append
 
 Rollout rows are immutable and their IDs are never reused for different records.
-This opt-in path moves WAL reading, encoding and immutable file uploads to workers,
-then publishes several workers' files in one base-table transaction on the master.
+This opt-in path reads WAL, encodes and uploads immutable files concurrently,
+then publishes the files together in one base-table transaction on the master.
+Staging can run on workers or directly inside resident masters.
 Generic/context stores retain their existing keyed merge behavior. Staging requires
 Lance V2 files, whose dictionary encodings are local to each file.
 
@@ -40,8 +41,53 @@ and perform parallel staging with their own CPU and shared catch-up memory budge
 they do not send their data work back to ordinary workers. A speculative read
 which cannot grow its reservation retries once alone after other readers finish.
 Both normal master merges and catch-up executions use the same publisher under
-the existing maintenance ownership protocol. The ordinary master never reads WAL
-payloads locally, including when no remote worker is available.
+the existing maintenance ownership protocol. Remote mode never falls back to reading WAL payloads locally after a worker failure.
+Resident local execution is an explicit configuration described below.
+
+## Resident master execution
+
+Set `ROLLOUT_APPEND_LOCAL=true` on regular master replicas to perform the same
+parallel staging inside each resident process. Keep the existing shared etcd
+prefix and storage root. No per-table executor, Kubernetes Job template, or Job
+creation permission is needed. `CATCHUP_ENABLED`, `CATCHUP_POD_TEMPLATE` and
+`CATCHUP_TARGET` cannot be combined with this mode.
+
+Configure:
+
+| Setting | Purpose |
+| --- | --- |
+| `ROLLOUT_APPEND_TARGETS` | Explicit owned, non-draining append-only rollout targets, or `*` for owned rollouts |
+| `CATCHUP_SHARDS` | Stable writer identities, including historical workers; required even without live endpoints |
+| `MERGE_WAL_CONCURRENCY` | Positive per-master table concurrency, independent of ordinary task slots |
+| `ROLLOUT_APPEND_CONCURRENCY` | Parallel shard staging per active table, default 4 |
+| `ROLLOUT_APPEND_LOCAL_MEMORY_BYTES` | Shared per-master Arrow reservation budget, default 2 GiB; at least the per-batch byte limit |
+| `CATCHUP_SLICE_SECS` | Positive soft pass-admission duration; default 1800 s, at most 16 passes per task |
+
+Existing automatic pending sweeps, worker demand notifications and the low-count
+WAL tail sweep feed the ordinary durable queue. Manual clients use the ordinary
+MergeWal task API. Queue deduplication and leases distribute tables across master
+replicas; the existing manifest fence protects publisher handoff. A resident
+master does not claim the ingestion worker's live WAL epoch.
+
+The operator can increase the regular master replica count with the same settings.
+This increases concurrent table capacity; one table still has one publisher and
+uses parallel file staging internally. Queue leases preserve unfinished work when
+a replica exits. Ordinary tasks keep their separate slots while merge waits on
+its shared memory budget, although CPU and object-store bandwidth remain shared.
+
+The memory setting accounts for Arrow buffers, not total RSS. Lance encoding,
+per-table coordinators, compaction and the rest of the process need headroom. One
+indivisible oversized generation can exceed the nominal byte limit while holding
+the entire reservation budget. Measure RSS, CPU, merge completion and pending
+counts before increasing concurrency or replicas. Resident staging reuses one
+96 MiB index / 32 MiB metadata cache session per process.
+
+Before moving an existing target, qualify the previous publisher's retirement or
+complete the existing recovery fence. Persistent external-publisher guards remain
+in force; enabling local execution does not erase them. All ingestion writers
+must already honor owned-target fencing. To roll back local execution, drain the
+resident work normally and disable `ROLLOUT_APPEND_LOCAL`; retain append/ownership
+settings and compatible staging workers for remote execution.
 
 ## Commit and recovery
 

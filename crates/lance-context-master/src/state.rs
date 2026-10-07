@@ -107,6 +107,8 @@ pub struct MasterState {
     pub admission: Arc<crate::admission::Admission>,
     /// Shared HTTP client for fanning `MergeWal` tasks out to worker endpoints.
     pub http: reqwest::Client,
+    /// Explicit resident-master staging shares one byte budget and cache session.
+    pub(crate) local_append: Option<crate::rollout_append::LocalStaging>,
     /// Process-wide compaction permits shared by scheduler and retirement work.
     pub(crate) compaction_permits: Arc<Semaphore>,
     /// Consecutive `_stats` maintenance failures, for alerting.
@@ -136,6 +138,10 @@ impl MasterState {
     pub async fn new(config: MasterConfig) -> lance::Result<Arc<Self>> {
         config.merge_rollout.validate().map_err(lance::Error::io)?;
         config.catchup.validate().map_err(lance::Error::io)?;
+        config
+            .append
+            .validate_local(&config)
+            .map_err(lance::Error::io)?;
         if config.maintenance.maintenance_timeout_secs == 0
             || config.maintenance.maintenance_idle_timeout_secs == 0
             || config.maintenance.maintenance_drain_timeout_secs == 0
@@ -210,6 +216,11 @@ impl MasterState {
         if let Some(guard) = init_guard {
             task_store.release_coordination_lock(guard).await?;
         }
+        let local_append = config.append.rollout_append_local.then(|| {
+            crate::rollout_append::LocalStaging::new(
+                config.append.rollout_append_local_memory_bytes,
+            )
+        });
         let state = Arc::new(Self {
             registry,
             generic_registry,
@@ -225,6 +236,7 @@ impl MasterState {
             task_store,
             admission: Arc::new(crate::admission::Admission::default()),
             http: worker_http_client().map_err(|error| lance::Error::io(error.to_string()))?,
+            local_append,
             compaction_permits: Arc::new(Semaphore::new(compaction_concurrency)),
             stats_maintenance_failures: std::sync::atomic::AtomicU64::new(0),
             stats_last_reclaimed_version: std::sync::atomic::AtomicU64::new(0),
