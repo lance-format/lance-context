@@ -33,6 +33,10 @@ pub struct RecoveredSession {
 /// Apply the already chosen alignment delta. This operation must be deterministic
 /// and must not allocate new IDs or rerun history matching. Empty state denotes
 /// a session with no checkpoint. Bound transient reducer memory in the adapter.
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait adds must_use to boxed futures"
+)]
 #[async_trait]
 pub trait Reducer: Send + Sync {
     async fn apply(&self, session: &str, state: &[u8], delta: &[u8]) -> Result<Vec<u8>>;

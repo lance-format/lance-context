@@ -24,6 +24,10 @@ pub struct Request {
 /// Adapter owns session state and its cache budget. Alignment can run ahead of
 /// WAL durability, so an error discards this adapter and its speculative suffix.
 /// Checkpoints restore exact committed deltas, never freshly recomputed IDs.
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait adds must_use to boxed futures"
+)]
 #[async_trait]
 pub trait Aligner: Send + 'static {
     async fn restore(&mut self, binding: &Binding) -> Result<Position>;
@@ -37,6 +41,10 @@ pub trait Aligner: Send + 'static {
 /// Concurrent, read-only history loading. The adapter must respect `max_bytes`
 /// while fetching/decoding, not only after allocation. Loaded state carries its
 /// revision in the adapter's encoding so alignment can reconcile stale loads.
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait adds must_use to boxed futures"
+)]
 #[async_trait]
 pub trait HistoryLoader: Send + Sync + 'static {
     async fn load(&self, request: &Request, max_bytes: usize) -> Result<Vec<u8>>;

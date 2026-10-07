@@ -9,6 +9,10 @@ use crate::{Binding, Entry, Error, Journal, Position, Result};
 /// Return success only after outputs AND their coverage are durable together.
 /// For Lance, staged fragments alone are insufficient: manifest publication must
 /// atomically record the covered input range. This callback never owns WAL ACKs.
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait adds must_use to boxed futures"
+)]
 #[async_trait]
 pub trait Sink: Send {
     async fn apply(&mut self, binding: &Binding, entries: &[Entry]) -> Result<()>;
