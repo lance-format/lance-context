@@ -93,8 +93,9 @@ pub struct PipelineConfig {
 }
 
 impl PipelineConfig {
-    /// Conservative byte reservation per admitted entry, held through its WAL
-    /// commit. Total capacity can exceed u32; each semaphore acquisition cannot.
+    /// Maximum byte reservation for loading/alignment. Completed alignment retains
+    /// only its output reservation through WAL commit. Total capacity can exceed
+    /// u32; each semaphore acquisition cannot.
     pub fn reservation_bytes(&self) -> Result<u32> {
         reservation(
             self.max_input_bytes,
@@ -483,10 +484,12 @@ async fn alignment_worker_loop<A: Aligner>(
             history,
             input_digest,
             ack,
-            permit,
+            mut permit,
             result,
         } = work;
         let transition = aligner.align(&request, &history).await;
+        drop(history);
+        drop(request.payload);
         let aligned = transition.and_then(|transition| {
             if transition
                 .delta
@@ -511,11 +514,33 @@ async fn alignment_worker_loop<A: Aligner>(
                     "single transition exceeds WAL batch limit".into(),
                 ));
             }
+            // Input/history are gone. Keep conservative output/serialization
+            // capacity charged until durable ACK, but let the next alignment run
+            // while this entry waits for batching or object-store publication.
+            // The fixed envelope allowance includes the 64-byte input digest.
+            let retained = reservation(
+                entry
+                    .session
+                    .capacity()
+                    .checked_add(entry.receipt.capacity())
+                    .ok_or_else(|| Error::Invalid("retained input size overflow".into()))?,
+                entry
+                    .transition
+                    .delta
+                    .capacity()
+                    .checked_add(entry.transition.records.capacity())
+                    .ok_or_else(|| Error::Invalid("retained output size overflow".into()))?,
+                0,
+            )?;
+            let output_permit = permit.split(retained as usize).ok_or_else(|| {
+                Error::Invalid("retained output exceeds admission reservation".into())
+            })?;
+            drop(permit);
             Ok(Aligned {
                 entry,
                 encoded_bytes,
                 ack,
-                _permit: permit,
+                _permit: output_permit,
             })
         });
         match aligned {

@@ -1678,9 +1678,14 @@ async fn budget_over_four_gib_runs_two_large_reservations_and_bounds_the_third()
     let observed = Arc::new(Mutex::new(Vec::new()));
     let slow = Arc::new(Semaphore::new(0));
     let fast_done = Arc::new(Semaphore::new(0));
+    let alignment_gate = Arc::new(Semaphore::new(0));
     let aligners = (0..2)
         .map(|_| LaneCounter {
-            counter: Counter::new(observed.clone()),
+            counter: {
+                let mut counter = Counter::new(observed.clone());
+                counter.align_gate = Some(alignment_gate.clone());
+                counter
+            },
             slow: slow.clone(),
             fast_done: fast_done.clone(),
             failure: None,
@@ -1714,6 +1719,12 @@ async fn budget_over_four_gib_runs_two_large_reservations_and_bounds_the_third()
     .await
     .unwrap()
     .unwrap();
+    // Both active alignments retain their full reservations: a third cannot enter.
+    let mut third = Box::pin(pipeline.enqueue(lane_request(3, "fast")));
+    assert!(timeout(Duration::from_millis(30), &mut third)
+        .await
+        .is_err());
+    alignment_gate.add_permits(1);
     timeout(Duration::from_secs(2), fast_done.acquire())
         .await
         .unwrap()
@@ -1721,15 +1732,15 @@ async fn budget_over_four_gib_runs_two_large_reservations_and_bounds_the_third()
         .forget();
     assert_eq!(*observed.lock().unwrap(), vec![(2, 1)]);
     assert_eq!(journal.position().await.unwrap().sequence, 0);
-    let mut third = Box::pin(pipeline.enqueue(lane_request(3, "fast")));
-    assert!(timeout(Duration::from_millis(30), &mut third)
-        .await
-        .is_err());
-    slow.add_permits(1);
+    // Finished out-of-order output keeps its smaller reservation. The third
+    // alignment can enter even while the first blocks ordered WAL publication.
     let third = timeout(Duration::from_secs(2), third)
         .await
         .unwrap()
         .unwrap();
+    assert_eq!(journal.position().await.unwrap().sequence, 0);
+    slow.add_permits(1);
+    alignment_gate.add_permits(2);
     for ack in [first, second, third] {
         timeout(Duration::from_secs(2), ack.wait())
             .await
@@ -1752,4 +1763,93 @@ async fn unsupported_semaphore_capacity_is_rejected_without_panicking() {
     )
     .await
     .is_err());
+}
+
+#[tokio::test]
+async fn completed_alignment_releases_history_budget_before_a_batched_durable_ack() {
+    let journal = journal(Arc::new(InMemory::new()), 0);
+    let mut cfg = config();
+    cfg.max_history_bytes = 8 << 20;
+    cfg.memory_bytes = 200 << 20;
+    assert_eq!(
+        cfg.memory_bytes / cfg.reservation_bytes().unwrap() as usize,
+        1
+    );
+    cfg.wal.max_entries = 3;
+    // The test must fill one batch; waiting for a sparse flush cannot pass.
+    cfg.wal.max_delay = Duration::from_secs(60);
+    let pipeline = Partition::start_with_aligners(
+        journal.acquire().await.unwrap(),
+        vec![Counter::new(Arc::default())],
+        EmptyHistory,
+        cfg,
+    )
+    .await
+    .unwrap();
+    let mut acks = Vec::new();
+    for sequence in 1..=3 {
+        acks.push(
+            timeout(Duration::from_secs(2), pipeline.enqueue(request(sequence)))
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    for ack in acks {
+        let position = timeout(Duration::from_secs(2), ack.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(position.sequence, 3);
+        assert_eq!(position.generation, 1);
+    }
+    pipeline.shutdown().await.unwrap();
+    let mut sink = Collect::new();
+    let mut consumer = Consumer::open(journal.clone(), "table").await.unwrap();
+    assert_eq!(consumer.consume(&mut sink, 1, 16384).await.unwrap(), 3);
+    assert_eq!(sink.entries.lock().unwrap().len(), 3);
+    assert_eq!(journal.position().await.unwrap().generation, 1);
+}
+
+#[tokio::test]
+async fn completed_output_stays_charged_until_wal_durability() {
+    let journal = journal(Arc::new(InMemory::new()), 0);
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let mut cfg = config();
+    cfg.max_transition_bytes = 2048;
+    cfg.memory_bytes = cfg.reservation_bytes().unwrap() as usize;
+    cfg.wal.max_delay = Duration::from_secs(60);
+    let pipeline = Partition::start(
+        journal.acquire().await.unwrap(),
+        Counter::new(observed.clone()),
+        cfg,
+    )
+    .await
+    .unwrap();
+    let mut first_request = request(1);
+    first_request.payload = vec![b'x'; 900];
+    let mut second_request = request(2);
+    second_request.payload = vec![b'y'; 900];
+    let first = pipeline.enqueue(first_request).await.unwrap();
+    timeout(Duration::from_secs(2), async {
+        while observed.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    // The first transition's retained capacity prevents another large input
+    // from entering, even though its history/input loading reservation is gone.
+    assert!(
+        timeout(Duration::from_millis(30), pipeline.enqueue(second_request))
+            .await
+            .is_err()
+    );
+    assert_eq!(journal.position().await.unwrap().sequence, 0);
+    timeout(Duration::from_secs(2), pipeline.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.wait().await.unwrap().sequence, 1);
+    assert_eq!(journal.position().await.unwrap().sequence, 1);
 }
