@@ -369,6 +369,136 @@ async fn partial_checkpoint_batch_recovery_skips_already_applied_session_deltas(
     assert_eq!(checkpoints.load("b").await.unwrap().unwrap().value, b"1");
 }
 
+#[tokio::test]
+async fn lazy_session_recovery_reads_only_suffix_and_handles_uncached_sessions() {
+    let store = Arc::new(InMemory::new());
+    // One-segment pages force recovery to consume several pages.
+    let journal = Journal::new(store.clone(), Path::from("lazy"), binding(0), 1 << 20, 1).unwrap();
+    let mut writer = journal.acquire().await.unwrap();
+    let first = writer.append(vec![wal_entry(1)]).await.unwrap();
+    let checkpoints = SessionCheckpoints::new(journal.clone(), 1024).unwrap();
+    let reducer = || AddDelta {
+        fail_b: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        a_calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let mut sink = checkpoints.sink(reducer(), 1).unwrap();
+    let mut consumer = Consumer::open(journal.clone(), "checkpoint").await.unwrap();
+    consumer.consume(&mut sink, 10, 16384).await.unwrap();
+    // The checkpoint replaces these payload reads, but not immutable link metadata.
+    // Deliberately deleting data here is a regression test, not a GC protocol.
+    store
+        .delete(&Path::from(format!(
+            "lazy/segments/{}.json",
+            first.segment.unwrap()
+        )))
+        .await
+        .unwrap();
+    for sequence in 2..=5 {
+        writer.append(vec![wal_entry(sequence)]).await.unwrap();
+    }
+    let recovered = checkpoints
+        .recover("checkpoint", "session-a", &reducer())
+        .await
+        .unwrap();
+    assert_eq!(recovered.state.value, b"15");
+    assert_eq!(recovered.state.through_sequence, 5);
+    assert_eq!(recovered.position, *writer.position());
+    assert_eq!(
+        checkpoints.load("session-a").await.unwrap().unwrap().value,
+        b"1",
+        "readonly recovery must not publish a new checkpoint"
+    );
+    assert_eq!(
+        journal
+            .consumer_position("checkpoint")
+            .await
+            .unwrap()
+            .sequence,
+        1
+    );
+    let missing = checkpoints
+        .recover("checkpoint", "new-session", &reducer())
+        .await
+        .unwrap();
+    assert!(missing.state.value.is_empty());
+    assert_eq!(missing.state.through_sequence, 0);
+    assert_eq!(missing.position, recovered.position);
+}
+
+#[tokio::test]
+async fn lazy_recovery_skips_partially_published_state_and_propagates_reducer_errors() {
+    let journal = journal(Arc::new(InMemory::new()), 0);
+    let mut writer = journal.acquire().await.unwrap();
+    for (sequence, session) in [(1, "a"), (2, "b"), (3, "a")] {
+        let mut entry = wal_entry(sequence);
+        entry.session = session.into();
+        entry.transition.delta = b"1".to_vec();
+        writer.append(vec![entry]).await.unwrap();
+    }
+    let checkpoints = SessionCheckpoints::new(journal.clone(), 1024).unwrap();
+    let fail_b = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let a_calls = Arc::new(AtomicUsize::new(0));
+    let reducer = || AddDelta {
+        fail_b: fail_b.clone(),
+        a_calls: a_calls.clone(),
+    };
+    let mut sink = checkpoints.sink(reducer(), 1).unwrap();
+    let mut consumer = Consumer::open(journal.clone(), "checkpoint").await.unwrap();
+    assert!(consumer.consume(&mut sink, 10, 16384).await.is_err());
+    assert_eq!(consumer.position().sequence, 0);
+    let a = checkpoints
+        .recover("checkpoint", "a", &reducer())
+        .await
+        .unwrap();
+    assert_eq!(a.state.value, b"2");
+    assert_eq!(
+        a_calls.load(Ordering::SeqCst),
+        2,
+        "already checkpointed deltas must not replay"
+    );
+    assert!(checkpoints
+        .recover("checkpoint", "b", &reducer())
+        .await
+        .is_err());
+    fail_b.store(false, Ordering::SeqCst);
+    let b = checkpoints
+        .recover("checkpoint", "b", &reducer())
+        .await
+        .unwrap();
+    assert_eq!(b.state.value, b"1");
+    assert_eq!(b.state.through_sequence, 2);
+    assert_eq!(b.position.sequence, 3);
+    assert!(checkpoints.load("b").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn lazy_recovery_rejects_wrong_chain_cursor_and_oversized_reduction() {
+    let store = Arc::new(InMemory::new());
+    let journal = journal(store.clone(), 0);
+    let mut writer = journal.acquire().await.unwrap();
+    let head = writer.append(vec![wal_entry(1)]).await.unwrap();
+    let checkpoints = SessionCheckpoints::new(journal.clone(), 1).unwrap();
+    assert!(checkpoints
+        .recover("checkpoint", "session-a", &OversizedBatch)
+        .await
+        .is_err());
+    let mut wrong = head;
+    wrong.segment = Some(uuid::Uuid::new_v4().to_string());
+    store
+        .put(
+            &Path::from("run/partition-0/consumers/checkpoint.json"),
+            serde_json::to_vec(&serde_json::json!({"binding": binding(0), "position": wrong}))
+                .unwrap()
+                .into(),
+        )
+        .await
+        .unwrap();
+    assert!(checkpoints
+        .recover("checkpoint", "new-session", &ReplaceDelta)
+        .await
+        .is_err());
+}
+
 type SessionDeltas = (String, Vec<u64>);
 
 struct OrderedBatch {

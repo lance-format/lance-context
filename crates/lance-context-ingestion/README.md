@@ -70,6 +70,13 @@ replayable source / stable partition-local receipts
   The sink also checks final output size before writing. This interface alone does
   not accelerate existing reducers or change the deployed ingestion adapter.
 
+- `SessionCheckpoints::recover` reconstructs one evicted or cold session from the
+  checkpoint consumer cursor plus committed WAL suffix, one segment at a time.
+  It returns the captured WAL position separately from the session mutation
+  sequence and skips partially published checkpoint deltas. This is read-only;
+  callers must still reconcile their newer speculative state and bound the cache.
+  Use the checkpoint consumer name, never an unrelated table consumer cursor.
+
 - With the `lance` feature, `lance_sink::stage` writes immutable Lance 2.2 files
   using a Zstd-annotated schema. Lance's constant-valued pages use scalar
   encoding before codec selection; even a single large string can take that path. `LanceTableSink::commit_staged` coalesces staged

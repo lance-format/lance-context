@@ -7,7 +7,7 @@ use object_store::{PutMode, UpdateVersion};
 use serde::{Deserialize, Serialize};
 
 use crate::journal::digest;
-use crate::{Binding, Entry, Error, Journal, Result, Sink};
+use crate::{Binding, Entry, Error, Journal, Position, Result, Sink};
 
 /// A per-session checkpoint may be ahead of the consumer's coherent prefix if a
 /// previous multi-session batch failed halfway. Recovery must skip replay deltas
@@ -19,6 +19,15 @@ pub struct SessionState {
     pub session: String,
     pub through_sequence: u64,
     pub value: Vec<u8>,
+}
+
+/// One session reconstructed through an exact committed WAL position. The state
+/// sequence is its last mutation, which can be older than `position.sequence`.
+/// This does not include a publisher's uncommitted alignment suffix.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveredSession {
+    pub state: SessionState,
+    pub position: Position,
 }
 
 /// Apply the already chosen alignment delta. This operation must be deterministic
@@ -94,6 +103,72 @@ impl SessionCheckpoints {
 
     pub async fn load(&self, session: &str) -> Result<Option<SessionState>> {
         Ok(self.read(session).await?.map(|(state, _)| state))
+    }
+
+    /// Lazily recover one session after restart or cache eviction. `consumer`
+    /// must name the consumer using this checkpoint store, never a table cursor.
+    /// Read its coherent prefix before the session and the WAL head after it:
+    /// a partially committed checkpoint batch can leave this session ahead of
+    /// the prefix. Such deltas are skipped, not applied twice. No storage writes
+    /// occur. Replay holds one WAL segment and one session state at a time;
+    /// reducer transient allocations remain the adapter's responsibility.
+    pub async fn recover<R: Reducer>(
+        &self,
+        consumer: &str,
+        session: &str,
+        reducer: &R,
+    ) -> Result<RecoveredSession> {
+        if session.is_empty() {
+            return Err(Error::Invalid("empty recovery session".into()));
+        }
+        let mut after = self.journal.consumer_position(consumer).await?;
+        let mut state = self.load(session).await?.unwrap_or_else(|| SessionState {
+            binding: self.journal.binding().clone(),
+            session: session.into(),
+            through_sequence: 0,
+            value: Vec::new(),
+        });
+        let position = self.journal.position().await?;
+        if state.through_sequence > position.sequence {
+            return Err(Error::Invalid(
+                "session checkpoint is ahead of committed WAL".into(),
+            ));
+        }
+        // pending also validates that the consumer's opaque position belongs to
+        // this exact committed chain, including when there is nothing to replay.
+        loop {
+            let pending = self.journal.pending(&after, &position).await?;
+            if pending.is_empty() {
+                break;
+            }
+            for segment in pending {
+                let entries = self.journal.entries(&segment).await?;
+                let unapplied = entries
+                    .iter()
+                    .filter(|entry| {
+                        entry.session == session && entry.sequence > state.through_sequence
+                    })
+                    .collect::<Vec<_>>();
+                if let Some(last) = unapplied.last() {
+                    let deltas = unapplied
+                        .iter()
+                        .map(|entry| entry.transition.delta.as_slice())
+                        .collect::<Vec<_>>();
+                    let value = reducer
+                        .apply_batch(session, &state.value, &deltas, self.max_state_bytes)
+                        .await?;
+                    if value.len() > self.max_state_bytes {
+                        return Err(Error::Invalid(
+                            "recovered session exceeds state budget".into(),
+                        ));
+                    }
+                    state.value = value;
+                    state.through_sequence = last.sequence;
+                }
+                after = segment;
+            }
+        }
+        Ok(RecoveredSession { state, position })
     }
 
     /// Each session is written once per consumer batch, even if it occurred in
