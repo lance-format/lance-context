@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
-use futures::{stream, StreamExt, TryStreamExt};
+use futures::{future::BoxFuture, stream, FutureExt, StreamExt, TryStreamExt};
 use object_store::PutMode;
 use serde::{Deserialize, Serialize};
 
@@ -126,8 +126,13 @@ impl ReceiptIndex {
             ));
         }
         let mut after = self.journal.consumer_position(consumer).await?;
-        let indexed = stream::iter(receipts.iter().copied())
-            .map(|receipt| self.read(receipt))
+        // Erase borrowed lookup futures before the buffered stream so callers
+        // can await batch admission inside a Send task on a multithread runtime.
+        let reads: Vec<BoxFuture<'_, Result<Option<SourceReceipt>>>> = receipts
+            .iter()
+            .map(|receipt| self.read(receipt).boxed())
+            .collect();
+        let indexed = stream::iter(reads)
             .buffer_unordered(concurrency)
             .try_collect::<Vec<_>>()
             .await?;

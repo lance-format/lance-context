@@ -178,3 +178,22 @@ async fn index_rejects_wrong_binding_empty_identity_and_uncommitted_sequence() {
         .unwrap();
     assert!(index.find("receipts", "receipt").await.is_err());
 }
+
+#[tokio::test]
+async fn batch_lookup_runs_in_a_send_task_with_borrowed_dynamic_identities() {
+    let journal = journal(Arc::new(InMemory::new()));
+    let mut writer = journal.acquire().await.unwrap();
+    let last = writer.append(vec![entry(1, "present")]).await.unwrap();
+    let index = ReceiptIndex::new(journal);
+    let found = tokio::spawn(async move {
+        let owned = ["present".to_owned(), "missing".to_owned()];
+        let identities = owned.iter().map(String::as_str).collect::<Vec<_>>();
+        index.find_many("receipts", &identities, 2).await
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(found.through, last);
+    assert_eq!(found.receipts.len(), 1);
+    assert_eq!(found.receipts["present"].sequence, 1);
+}
