@@ -3,8 +3,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::{stream, StreamExt};
+use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{timeout_at, Instant};
 
 use crate::journal::digest;
@@ -123,9 +124,7 @@ impl Ack {
 /// to the same partition; changing worker count must not change that mapping.
 pub struct Partition {
     input: Option<mpsc::Sender<Input>>,
-    loading: Option<JoinHandle<Result<()>>>,
-    alignment: Option<JoinHandle<Result<()>>>,
-    wal: Option<JoinHandle<Result<()>>>,
+    supervisor: Option<JoinHandle<Result<()>>>,
     budget: Arc<Semaphore>,
     config: PipelineConfig,
     durable: watch::Receiver<Position>,
@@ -142,7 +141,21 @@ impl Partition {
 
     pub async fn start_with_loader<A: Aligner, L: HistoryLoader>(
         writer: Writer,
-        mut aligner: A,
+        aligner: A,
+        loader: L,
+        config: PipelineConfig,
+    ) -> Result<Self> {
+        Self::start_with_aligners(writer, vec![aligner], loader, config).await
+    }
+
+    /// Independent session alignment lanes within one durable partition. Every
+    /// adapter must implement the same per-session transition rules. Routing is
+    /// session-stable for this process; lanes may change only after shutdown and
+    /// recovery. Their state/cache allocations are additional to `memory_bytes`.
+    /// WAL output remains globally ordered even when later sessions finish first.
+    pub async fn start_with_aligners<A: Aligner, L: HistoryLoader>(
+        writer: Writer,
+        mut aligners: Vec<A>,
         loader: L,
         config: PipelineConfig,
     ) -> Result<Self> {
@@ -152,6 +165,11 @@ impl Partition {
             config.max_transition_bytes,
             config.max_history_bytes,
         )?;
+        if aligners.is_empty() || aligners.len() > config.queue_entries {
+            return Err(Error::Invalid(
+                "alignment lanes must fit the nonempty queue budget".into(),
+            ));
+        }
         if config.queue_entries == 0
             || config.load_concurrency == 0
             || reserve > config.memory_bytes
@@ -161,34 +179,46 @@ impl Partition {
             ));
         }
         let journal = writer.journal().clone();
-        let mut checkpoint = aligner.restore(journal.binding()).await?;
-        while &checkpoint != writer.position() {
-            for position in journal.pending(&checkpoint, writer.position()).await? {
-                for entry in journal.entries(&position).await? {
-                    aligner.replay(&entry).await?;
+        let lanes = aligners.len();
+        for (lane, aligner) in aligners.iter_mut().enumerate() {
+            let mut checkpoint = aligner.restore(journal.binding()).await?;
+            while &checkpoint != writer.position() {
+                for position in journal.pending(&checkpoint, writer.position()).await? {
+                    for entry in journal.entries(&position).await? {
+                        if alignment_lane(&entry.session, lanes) == lane {
+                            aligner.replay(&entry).await?;
+                        }
+                    }
+                    checkpoint = position;
                 }
-                checkpoint = position;
             }
         }
         let (input_tx, input_rx) = mpsc::channel(config.queue_entries);
         let (loaded_tx, loaded_rx) = mpsc::channel(config.queue_entries);
         let (wal_tx, wal_rx) = mpsc::channel(config.queue_entries);
         let (durable_tx, durable_rx) = watch::channel(writer.position().clone());
-        let loading = tokio::spawn(load_loop(loader, input_rx, loaded_tx, config.clone()));
-        let alignment = tokio::spawn(align_loop(
-            aligner,
+        let mut stages = JoinSet::new();
+        stages.spawn(load_loop(loader, input_rx, loaded_tx, config.clone()));
+        stages.spawn(align_loop(
+            aligners,
             journal,
             loaded_rx,
             wal_tx,
             durable_rx.clone(),
             config.clone(),
         ));
-        let wal = tokio::spawn(wal_loop(writer, wal_rx, durable_tx, config.wal.clone()));
+        stages.spawn(wal_loop(writer, wal_rx, durable_tx, config.wal.clone()));
+        let supervisor = tokio::spawn(async move {
+            // Observe every stage independently. On error, dropping this JoinSet
+            // cancels even a loader or alignment lane blocked on unrelated work.
+            while let Some(result) = stages.join_next().await {
+                result.map_err(|error| Error::Stage(error.to_string()))??;
+            }
+            Ok(())
+        });
         Ok(Self {
             input: Some(input_tx),
-            loading: Some(loading),
-            alignment: Some(alignment),
-            wal: Some(wal),
+            supervisor: Some(supervisor),
             budget: Arc::new(Semaphore::new(config.memory_bytes as usize)),
             config,
             durable: durable_rx,
@@ -246,42 +276,20 @@ impl Partition {
     /// head write. Neither path advances checkpoint or merge consumer cursors.
     pub async fn shutdown(mut self) -> Result<()> {
         self.input.take();
-        let loading = self
-            .loading
+        let result = self
+            .supervisor
             .as_mut()
             .unwrap()
             .await
             .map_err(|error| Error::Stage(error.to_string()))?;
-        self.loading.take();
-        let alignment = self
-            .alignment
-            .as_mut()
-            .unwrap()
-            .await
-            .map_err(|error| Error::Stage(error.to_string()))?;
-        self.alignment.take();
-        let wal = self
-            .wal
-            .as_mut()
-            .unwrap()
-            .await
-            .map_err(|error| Error::Stage(error.to_string()))?;
-        self.wal.take();
-        loading?;
-        alignment?;
-        wal
+        self.supervisor.take();
+        result
     }
 }
 
 impl Drop for Partition {
     fn drop(&mut self) {
-        if let Some(task) = &self.loading {
-            task.abort();
-        }
-        if let Some(task) = &self.alignment {
-            task.abort();
-        }
-        if let Some(task) = &self.wal {
+        if let Some(task) = &self.supervisor {
             task.abort();
         }
     }
@@ -331,21 +339,74 @@ async fn load_loop<L: HistoryLoader>(
     Ok(())
 }
 
+struct AlignmentWork {
+    request: Request,
+    history: Vec<u8>,
+    input_digest: String,
+    ack: oneshot::Sender<Result<Position>>,
+    permit: OwnedSemaphorePermit,
+    result: oneshot::Sender<Result<Aligned>>,
+}
+
+fn alignment_lane(session: &str, lanes: usize) -> usize {
+    let hash = Sha256::digest(session.as_bytes());
+    (u64::from_le_bytes(hash[..8].try_into().expect("SHA-256 prefix")) % lanes as u64) as usize
+}
+
 async fn align_loop<A: Aligner>(
-    mut aligner: A,
+    aligners: Vec<A>,
+    journal: Journal,
+    input: mpsc::Receiver<Prepared>,
+    wal: mpsc::Sender<Aligned>,
+    durable: watch::Receiver<Position>,
+    config: PipelineConfig,
+) -> Result<()> {
+    let mut workers = JoinSet::new();
+    let mut lanes = Vec::with_capacity(aligners.len());
+    for aligner in aligners {
+        let (sender, receiver) = mpsc::channel(config.queue_entries);
+        lanes.push(sender);
+        workers.spawn(alignment_worker_loop(aligner, receiver, config.clone()));
+    }
+    let (ordered, mut results) =
+        mpsc::channel::<oneshot::Receiver<Result<Aligned>>>(config.queue_entries);
+    // JoinSet owns every lane: error, cancellation or dropping this supervisor
+    // aborts the entire speculative suffix, including other sessions' workers.
+    tokio::try_join!(
+        async {
+            // Supervision must progress independently of ordered output. A later
+            // lane can fail while an earlier request is still blocked.
+            while let Some(result) = workers.join_next().await {
+                result.map_err(|error| Error::Stage(error.to_string()))??;
+            }
+            Ok(())
+        },
+        dispatch_alignment(lanes, journal, input, ordered, durable),
+        async move {
+            while let Some(result) = results.recv().await {
+                let aligned = result.await.map_err(|_| Error::Stopped)??;
+                wal.send(aligned).await.map_err(|_| Error::Stopped)?;
+            }
+            Ok(())
+        }
+    )?;
+    Ok(())
+}
+
+async fn dispatch_alignment(
+    lanes: Vec<mpsc::Sender<AlignmentWork>>,
     journal: Journal,
     mut input: mpsc::Receiver<Prepared>,
-    wal: mpsc::Sender<Aligned>,
+    ordered: mpsc::Sender<oneshot::Receiver<Result<Aligned>>>,
     mut durable: watch::Receiver<Position>,
-    config: PipelineConfig,
 ) -> Result<()> {
     let mut next = durable
         .borrow()
         .sequence
         .checked_add(1)
         .ok_or_else(|| Error::Invalid("sequence overflow".into()))?;
-    while let Some(input) = input.recv().await {
-        let Prepared { input, history } = input;
+    while let Some(prepared) = input.recv().await {
+        let Prepared { input, history } = prepared;
         let Input {
             request,
             ack,
@@ -377,41 +438,82 @@ async fn align_loop<A: Aligner>(
             ))));
             continue;
         }
-        let transition = aligner.align(&request, &history).await?;
-        if transition
-            .delta
-            .capacity()
-            .saturating_add(transition.records.capacity())
-            > config.max_transition_bytes
-        {
-            return Err(Error::Invalid(
-                "aligner exceeded reserved output bytes".into(),
-            ));
-        }
-        let entry = Entry {
-            sequence: next,
-            session: request.session,
-            receipt: request.receipt,
-            input_digest,
-            transition,
-        };
-        let encoded_bytes = serde_json::to_vec(&entry)?.len();
-        if encoded_bytes > config.wal.max_bytes {
-            return Err(Error::Invalid(
-                "single transition exceeds WAL batch limit".into(),
-            ));
-        }
-        wal.send(Aligned {
-            entry,
-            encoded_bytes,
-            ack,
-            _permit: permit,
-        })
-        .await
-        .map_err(|_| Error::Stopped)?;
+        let lane = alignment_lane(&request.session, lanes.len());
+        let (result, receiver) = oneshot::channel();
+        lanes[lane]
+            .send(AlignmentWork {
+                request,
+                history,
+                input_digest,
+                ack,
+                permit,
+                result,
+            })
+            .await
+            .map_err(|_| Error::Stopped)?;
+        ordered.send(receiver).await.map_err(|_| Error::Stopped)?;
         next = next
             .checked_add(1)
             .ok_or_else(|| Error::Invalid("sequence overflow".into()))?;
+    }
+    Ok(())
+}
+
+async fn alignment_worker_loop<A: Aligner>(
+    mut aligner: A,
+    mut input: mpsc::Receiver<AlignmentWork>,
+    config: PipelineConfig,
+) -> Result<()> {
+    while let Some(work) = input.recv().await {
+        let AlignmentWork {
+            request,
+            history,
+            input_digest,
+            ack,
+            permit,
+            result,
+        } = work;
+        let transition = aligner.align(&request, &history).await;
+        let aligned = transition.and_then(|transition| {
+            if transition
+                .delta
+                .capacity()
+                .saturating_add(transition.records.capacity())
+                > config.max_transition_bytes
+            {
+                return Err(Error::Invalid(
+                    "aligner exceeded reserved output bytes".into(),
+                ));
+            }
+            let entry = Entry {
+                sequence: request.sequence,
+                session: request.session,
+                receipt: request.receipt,
+                input_digest,
+                transition,
+            };
+            let encoded_bytes = serde_json::to_vec(&entry)?.len();
+            if encoded_bytes > config.wal.max_bytes {
+                return Err(Error::Invalid(
+                    "single transition exceeds WAL batch limit".into(),
+                ));
+            }
+            Ok(Aligned {
+                entry,
+                encoded_bytes,
+                ack,
+                _permit: permit,
+            })
+        });
+        match aligned {
+            Ok(aligned) => result.send(Ok(aligned)).map_err(|_| Error::Stopped)?,
+            Err(error) => {
+                // Report out of order to the supervisor as well as to the
+                // ordered waiter; the latter may be stuck on an earlier lane.
+                let _ = result.send(Err(Error::Stage(error.to_string())));
+                return Err(error);
+            }
+        }
     }
     Ok(())
 }

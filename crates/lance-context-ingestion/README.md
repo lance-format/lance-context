@@ -43,6 +43,14 @@ replayable source / stable partition-local receipts
 - Immutable skip links support bounded chronological recovery pages and historical
   receipt lookup without reading unrelated record payloads. Recovery replays all
   pages after the adapter's checkpoint, not just one next WAL segment.
+- `Partition::start_with_aligners` can run several session alignment lanes inside
+  one stable durable partition, independently of history-loader concurrency and WAL
+  batch size. Same-session calls stay ordered; completed lanes rejoin the original
+  sequence before publication. Changing lane count on restart reroutes replayed
+  session deltas without changing partition identity. An error or cancellation
+  stops all speculative lanes. Lane count must fit the queue-entry budget; adapter
+  caches are additional to the shared input/output byte budget. This does not
+  schedule workers on other machines or remove the WAL ordering barrier.
 - Named `Consumer`s have independent durable cursors and coalesce producer segments
   into their own batches. Sink output and input coverage must be committed together;
   cursor writes can fail after output succeeds, so repeated/regrouped input must be

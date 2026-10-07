@@ -1208,3 +1208,465 @@ async fn corrupt_committed_segment_fails_recovery_and_binding_cannot_change() {
     .await
     .is_err());
 }
+
+struct EmptyHistory;
+
+#[async_trait]
+impl HistoryLoader for EmptyHistory {
+    async fn load(&self, _: &Request, _: usize) -> Result<Vec<u8>> {
+        Ok(Vec::new())
+    }
+}
+
+struct LaneCounter {
+    counter: Counter,
+    slow: Arc<Semaphore>,
+    fast_done: Arc<Semaphore>,
+    failure: Option<(u64, bool)>,
+    slow_started: Arc<Semaphore>,
+}
+
+#[async_trait]
+impl Aligner for LaneCounter {
+    async fn restore(&mut self, binding: &Binding) -> Result<Position> {
+        self.counter.restore(binding).await
+    }
+    async fn replay(&mut self, entry: &Entry) -> Result<()> {
+        self.counter.replay(entry).await
+    }
+    async fn align(&mut self, request: &Request, history: &[u8]) -> Result<Transition> {
+        if request.session == "slow" {
+            self.slow_started.add_permits(1);
+            self.slow.acquire().await.unwrap().forget();
+        }
+        if let Some((sequence, panic)) = self.failure {
+            if request.sequence == sequence {
+                assert!(!panic, "injected later lane panic");
+                return Err(Error::Stage("injected lane failure".into()));
+            }
+        }
+        let transition = self.counter.align(request, history).await?;
+        if request.session == "fast" {
+            self.fast_done.add_permits(1);
+        }
+        Ok(transition)
+    }
+}
+
+fn lane_request(sequence: u64, session: &str) -> Request {
+    Request {
+        session: session.into(),
+        ..request(sequence)
+    }
+}
+
+#[tokio::test]
+async fn independent_alignment_lanes_overlap_but_wal_and_same_session_stay_ordered() {
+    let journal = journal(Arc::new(InMemory::new()), 0);
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let slow = Arc::new(Semaphore::new(0));
+    let fast_done = Arc::new(Semaphore::new(0));
+    let aligners = (0..2)
+        .map(|_| LaneCounter {
+            counter: Counter::new(observed.clone()),
+            slow: slow.clone(),
+            fast_done: fast_done.clone(),
+            failure: None,
+            slow_started: Arc::new(Semaphore::new(0)),
+        })
+        .collect();
+    let pipeline = Partition::start_with_aligners(
+        journal.acquire().await.unwrap(),
+        aligners,
+        EmptyHistory,
+        config(),
+    )
+    .await
+    .unwrap();
+    let mut acks = Vec::new();
+    for (sequence, session) in [(1, "slow"), (2, "fast"), (3, "slow")] {
+        acks.push(
+            pipeline
+                .enqueue(lane_request(sequence, session))
+                .await
+                .unwrap(),
+        );
+    }
+    timeout(Duration::from_secs(2), fast_done.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    assert_eq!(
+        *observed.lock().unwrap(),
+        vec![(2, 1)],
+        "fast session must execute while earlier slow session is blocked"
+    );
+    assert_eq!(
+        journal.position().await.unwrap().sequence,
+        0,
+        "later completed lane cannot publish ahead of the first entry"
+    );
+    slow.add_permits(2);
+    for ack in acks {
+        timeout(Duration::from_secs(2), ack.wait())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    pipeline.shutdown().await.unwrap();
+    let mut consumer = Consumer::open(journal.clone(), "check").await.unwrap();
+    let mut sink = Collect::new();
+    consumer.consume(&mut sink, 100, 16384).await.unwrap();
+    {
+        let rows = sink.entries.lock().unwrap();
+        assert_eq!(rows.keys().copied().collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert_eq!(
+            rows.values()
+                .map(|v| serde_json::from_slice::<u64>(&v.transition.delta).unwrap())
+                .collect::<Vec<_>>(),
+            vec![1, 1, 2]
+        );
+    }
+    // Lane count is process-local: replay routes each durable session to its new
+    // lane without changing the journal binding or allocating its IDs again.
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let aligners = (0..3).map(|_| Counter::new(observed.clone())).collect();
+    let pipeline = Partition::start_with_aligners(
+        journal.acquire().await.unwrap(),
+        aligners,
+        EmptyHistory,
+        config(),
+    )
+    .await
+    .unwrap();
+    pipeline
+        .enqueue(lane_request(3, "slow"))
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    assert!(
+        observed.lock().unwrap().is_empty(),
+        "durable retry must not realign"
+    );
+    pipeline
+        .enqueue(lane_request(4, "slow"))
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    assert_eq!(*observed.lock().unwrap(), vec![(4, 3)]);
+    pipeline.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_alignment_lane_discards_later_speculation_and_reopens_cleanly() {
+    let journal = journal(Arc::new(InMemory::new()), 0);
+    let slow = Arc::new(Semaphore::new(0));
+    let fast_done = Arc::new(Semaphore::new(0));
+    let aligners = (0..2)
+        .map(|_| LaneCounter {
+            counter: Counter::new(Arc::default()),
+            slow: slow.clone(),
+            fast_done: fast_done.clone(),
+            failure: Some((1, false)),
+            slow_started: Arc::new(Semaphore::new(0)),
+        })
+        .collect();
+    let pipeline = Partition::start_with_aligners(
+        journal.acquire().await.unwrap(),
+        aligners,
+        EmptyHistory,
+        config(),
+    )
+    .await
+    .unwrap();
+    let first = pipeline.enqueue(lane_request(1, "slow")).await.unwrap();
+    let second = pipeline.enqueue(lane_request(2, "fast")).await.unwrap();
+    timeout(Duration::from_secs(2), fast_done.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    slow.add_permits(1);
+    assert!(timeout(Duration::from_secs(2), first.wait())
+        .await
+        .unwrap()
+        .is_err());
+    assert!(timeout(Duration::from_secs(2), second.wait())
+        .await
+        .unwrap()
+        .is_err());
+    assert!(timeout(Duration::from_secs(2), pipeline.shutdown())
+        .await
+        .unwrap()
+        .is_err());
+    assert_eq!(journal.position().await.unwrap().sequence, 0);
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let pipeline = Partition::start_with_aligners(
+        journal.acquire().await.unwrap(),
+        (0..2).map(|_| Counter::new(observed.clone())).collect(),
+        EmptyHistory,
+        config(),
+    )
+    .await
+    .unwrap();
+    for (sequence, session) in [(1, "slow"), (2, "fast")] {
+        pipeline
+            .enqueue(lane_request(sequence, session))
+            .await
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+    }
+    assert_eq!(*observed.lock().unwrap(), vec![(1, 1), (2, 1)]);
+    pipeline.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn dropping_alignment_supervisor_cancels_blocked_lanes_without_publishing_a_gap() {
+    let journal = journal(Arc::new(InMemory::new()), 0);
+    let slow = Arc::new(Semaphore::new(0));
+    let fast_done = Arc::new(Semaphore::new(0));
+    let pipeline = Partition::start_with_aligners(
+        journal.acquire().await.unwrap(),
+        (0..2)
+            .map(|_| LaneCounter {
+                counter: Counter::new(Arc::default()),
+                slow: slow.clone(),
+                fast_done: fast_done.clone(),
+                failure: None,
+                slow_started: Arc::new(Semaphore::new(0)),
+            })
+            .collect(),
+        EmptyHistory,
+        config(),
+    )
+    .await
+    .unwrap();
+    let first = pipeline.enqueue(lane_request(1, "slow")).await.unwrap();
+    let second = pipeline.enqueue(lane_request(2, "fast")).await.unwrap();
+    timeout(Duration::from_secs(2), fast_done.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    drop(pipeline);
+    assert!(timeout(Duration::from_secs(2), first.wait())
+        .await
+        .unwrap()
+        .is_err());
+    assert!(timeout(Duration::from_secs(2), second.wait())
+        .await
+        .unwrap()
+        .is_err());
+    assert_eq!(journal.position().await.unwrap().sequence, 0);
+}
+
+#[tokio::test]
+async fn later_lane_error_or_panic_cancels_an_earlier_blocked_request() {
+    for panic in [false, true] {
+        let journal = journal(Arc::new(InMemory::new()), 0);
+        let slow = Arc::new(Semaphore::new(0));
+        let slow_started = Arc::new(Semaphore::new(0));
+        let pipeline = Partition::start_with_aligners(
+            journal.acquire().await.unwrap(),
+            (0..2)
+                .map(|_| LaneCounter {
+                    counter: Counter::new(Arc::default()),
+                    slow: slow.clone(),
+                    slow_started: slow_started.clone(),
+                    fast_done: Arc::new(Semaphore::new(0)),
+                    failure: Some((2, panic)),
+                })
+                .collect(),
+            EmptyHistory,
+            config(),
+        )
+        .await
+        .unwrap();
+        let first = pipeline.enqueue(lane_request(1, "slow")).await.unwrap();
+        timeout(Duration::from_secs(2), slow_started.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        let second = pipeline.enqueue(lane_request(2, "fast")).await.unwrap();
+        // Never release the first lane: observing only ordered output would hang.
+        assert!(timeout(Duration::from_secs(2), first.wait())
+            .await
+            .unwrap()
+            .is_err());
+        assert!(timeout(Duration::from_secs(2), second.wait())
+            .await
+            .unwrap()
+            .is_err());
+        assert!(timeout(Duration::from_secs(2), pipeline.shutdown())
+            .await
+            .unwrap()
+            .is_err());
+        timeout(Duration::from_secs(2), async {
+            while Arc::strong_count(&slow) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(journal.position().await.unwrap().sequence, 0);
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let pipeline = Partition::start_with_aligners(
+            journal.acquire().await.unwrap(),
+            (0..2).map(|_| Counter::new(observed.clone())).collect(),
+            EmptyHistory,
+            config(),
+        )
+        .await
+        .unwrap();
+        for (sequence, session) in [(1, "slow"), (2, "fast")] {
+            pipeline
+                .enqueue(lane_request(sequence, session))
+                .await
+                .unwrap()
+                .wait()
+                .await
+                .unwrap();
+        }
+        assert_eq!(*observed.lock().unwrap(), vec![(1, 1), (2, 1)]);
+        pipeline.shutdown().await.unwrap();
+    }
+}
+
+struct FailSecondHistory;
+
+#[async_trait]
+impl HistoryLoader for FailSecondHistory {
+    async fn load(&self, request: &Request, _: usize) -> Result<Vec<u8>> {
+        if request.sequence == 2 {
+            return Err(Error::Stage("history failed".into()));
+        }
+        Ok(Vec::new())
+    }
+}
+
+#[tokio::test]
+async fn history_failure_also_cancels_an_already_blocked_alignment_lane() {
+    let journal = journal(Arc::new(InMemory::new()), 0);
+    let slow = Arc::new(Semaphore::new(0));
+    let slow_started = Arc::new(Semaphore::new(0));
+    let pipeline = Partition::start_with_aligners(
+        journal.acquire().await.unwrap(),
+        (0..2)
+            .map(|_| LaneCounter {
+                counter: Counter::new(Arc::default()),
+                slow: slow.clone(),
+                slow_started: slow_started.clone(),
+                fast_done: Arc::new(Semaphore::new(0)),
+                failure: None,
+            })
+            .collect(),
+        FailSecondHistory,
+        config(),
+    )
+    .await
+    .unwrap();
+    let first = pipeline.enqueue(lane_request(1, "slow")).await.unwrap();
+    timeout(Duration::from_secs(2), slow_started.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    let second = pipeline.enqueue(lane_request(2, "fast")).await.unwrap();
+    assert!(timeout(Duration::from_secs(2), first.wait())
+        .await
+        .unwrap()
+        .is_err());
+    assert!(timeout(Duration::from_secs(2), second.wait())
+        .await
+        .unwrap()
+        .is_err());
+    assert!(timeout(Duration::from_secs(2), pipeline.shutdown())
+        .await
+        .unwrap()
+        .is_err());
+    timeout(Duration::from_secs(2), async {
+        while Arc::strong_count(&slow) != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(journal.position().await.unwrap().sequence, 0);
+}
+
+#[tokio::test]
+async fn wal_failure_cancels_a_blocked_alignment_lane_without_publishing_a_gap() {
+    let journal = Journal::new(
+        Arc::new(InMemory::new()),
+        Path::from("small-wal"),
+        binding(0),
+        512,
+        100,
+    )
+    .unwrap();
+    let slow = Arc::new(Semaphore::new(0));
+    let slow_started = Arc::new(Semaphore::new(0));
+    let release_first = Arc::new(Semaphore::new(0));
+    let mut config = config();
+    config.wal.max_entries = 1;
+    let pipeline = Partition::start_with_aligners(
+        journal.acquire().await.unwrap(),
+        (0..2)
+            .map(|_| {
+                let mut counter = Counter::new(Arc::default());
+                counter.align_gate = Some(release_first.clone());
+                LaneCounter {
+                    counter,
+                    slow: slow.clone(),
+                    slow_started: slow_started.clone(),
+                    fast_done: Arc::new(Semaphore::new(0)),
+                    failure: None,
+                }
+            })
+            .collect(),
+        EmptyHistory,
+        config,
+    )
+    .await
+    .unwrap();
+    let mut request = lane_request(1, "fast");
+    // Fits admission/alignment, but its encoded WAL segment exceeds 512 bytes.
+    request.payload = vec![1; 256];
+    let first = pipeline.enqueue(request).await.unwrap();
+    let second = pipeline.enqueue(lane_request(2, "slow")).await.unwrap();
+    timeout(Duration::from_secs(2), slow_started.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    release_first.add_permits(1);
+    assert!(timeout(Duration::from_secs(2), first.wait())
+        .await
+        .unwrap()
+        .is_err());
+    assert!(timeout(Duration::from_secs(2), second.wait())
+        .await
+        .unwrap()
+        .is_err());
+    assert!(timeout(Duration::from_secs(2), pipeline.shutdown())
+        .await
+        .unwrap()
+        .is_err());
+    timeout(Duration::from_secs(2), async {
+        while Arc::strong_count(&slow) != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(journal.position().await.unwrap().sequence, 0);
+    assert_eq!(journal.acquire().await.unwrap().position().sequence, 0);
+}
