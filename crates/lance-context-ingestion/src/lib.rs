@@ -8,11 +8,13 @@ mod journal;
 #[cfg(feature = "lance")]
 pub mod lance_sink;
 mod pipeline;
+mod receipt;
 
 pub use checkpoint::{CheckpointSink, RecoveredSession, Reducer, SessionCheckpoints, SessionState};
 pub use consumer::{Consumer, Sink};
 pub use journal::{BacklogPolicy, Binding, Entry, Journal, Position, Transition, Writer};
 pub use pipeline::{Ack, Aligner, BatchPolicy, HistoryLoader, Partition, PipelineConfig, Request};
+pub use receipt::{ReceiptBatchLookup, ReceiptIndex, ReceiptLookup, ReceiptSink, SourceReceipt};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
