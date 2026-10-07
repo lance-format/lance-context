@@ -85,11 +85,23 @@ pub struct PipelineConfig {
     pub load_concurrency: usize,
     /// Bounds reserved input/output/serialization bytes across both queues and
     /// active batches. Adapter state, runtime and object-store buffers are extra.
-    pub memory_bytes: u32,
+    pub memory_bytes: usize,
     pub max_input_bytes: usize,
     pub max_transition_bytes: usize,
     pub max_history_bytes: usize,
     pub wal: BatchPolicy,
+}
+
+impl PipelineConfig {
+    /// Conservative byte reservation per admitted entry, held through its WAL
+    /// commit. Total capacity can exceed u32; each semaphore acquisition cannot.
+    pub fn reservation_bytes(&self) -> Result<u32> {
+        reservation(
+            self.max_input_bytes,
+            self.max_transition_bytes,
+            self.max_history_bytes,
+        )
+    }
 }
 
 struct Input {
@@ -160,11 +172,7 @@ impl Partition {
         config: PipelineConfig,
     ) -> Result<Self> {
         config.wal.validate()?;
-        let reserve = reservation(
-            config.max_input_bytes,
-            config.max_transition_bytes,
-            config.max_history_bytes,
-        )?;
+        let reserve = config.reservation_bytes()?;
         if aligners.is_empty() || aligners.len() > config.queue_entries {
             return Err(Error::Invalid(
                 "alignment lanes must fit the nonempty queue budget".into(),
@@ -172,7 +180,8 @@ impl Partition {
         }
         if config.queue_entries == 0
             || config.load_concurrency == 0
-            || reserve > config.memory_bytes
+            || reserve as usize > config.memory_bytes
+            || config.memory_bytes > Semaphore::MAX_PERMITS
         {
             return Err(Error::Invalid(
                 "queue empty or maximum request exceeds memory budget".into(),
@@ -219,7 +228,7 @@ impl Partition {
         Ok(Self {
             input: Some(input_tx),
             supervisor: Some(supervisor),
-            budget: Arc::new(Semaphore::new(config.memory_bytes as usize)),
+            budget: Arc::new(Semaphore::new(config.memory_bytes)),
             config,
             durable: durable_rx,
         })

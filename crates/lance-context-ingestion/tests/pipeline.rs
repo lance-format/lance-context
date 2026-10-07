@@ -1128,7 +1128,7 @@ async fn consumer_uncertain_apply_replays_without_skipping_or_duplicating_output
 async fn byte_admission_is_bounded_and_sparse_wal_flushes_on_timer() {
     let mut cfg = config();
     // Exactly one maximum-sized input/output reservation fits.
-    cfg.memory_bytes = ((cfg.max_input_bytes + cfg.max_transition_bytes) * 16 + 4096) as u32;
+    cfg.memory_bytes = (cfg.max_input_bytes + cfg.max_transition_bytes) * 16 + 4096;
     cfg.wal.max_delay = Duration::from_millis(50);
     let gate = Arc::new(Semaphore::new(0));
     let mut aligner = Counter::new(Arc::default());
@@ -1669,4 +1669,87 @@ async fn wal_failure_cancels_a_blocked_alignment_lane_without_publishing_a_gap()
     .unwrap();
     assert_eq!(journal.position().await.unwrap().sequence, 0);
     assert_eq!(journal.acquire().await.unwrap().position().sequence, 0);
+}
+
+#[cfg(target_pointer_width = "64")]
+#[tokio::test]
+async fn budget_over_four_gib_runs_two_large_reservations_and_bounds_the_third() {
+    let journal = journal(Arc::new(InMemory::new()), 0);
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let slow = Arc::new(Semaphore::new(0));
+    let fast_done = Arc::new(Semaphore::new(0));
+    let aligners = (0..2)
+        .map(|_| LaneCounter {
+            counter: Counter::new(observed.clone()),
+            slow: slow.clone(),
+            fast_done: fast_done.clone(),
+            failure: None,
+            slow_started: Arc::new(Semaphore::new(0)),
+        })
+        .collect();
+    let mut cfg = config();
+    cfg.max_input_bytes = 16 << 20;
+    cfg.max_transition_bytes = 32 << 20;
+    cfg.max_history_bytes = 97 << 20;
+    cfg.memory_bytes = 6144 << 20;
+    assert!(cfg.reservation_bytes().unwrap() > (2 << 30));
+    assert_eq!(
+        cfg.memory_bytes / cfg.reservation_bytes().unwrap() as usize,
+        2
+    );
+    // Semaphore reservations are accounting, not allocations of these GiBs.
+    let pipeline = Partition::start_with_aligners(
+        journal.acquire().await.unwrap(),
+        aligners,
+        EmptyHistory,
+        cfg,
+    )
+    .await
+    .unwrap();
+    let first = pipeline.enqueue(lane_request(1, "slow")).await.unwrap();
+    let second = timeout(
+        Duration::from_secs(2),
+        pipeline.enqueue(lane_request(2, "fast")),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    timeout(Duration::from_secs(2), fast_done.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    assert_eq!(*observed.lock().unwrap(), vec![(2, 1)]);
+    assert_eq!(journal.position().await.unwrap().sequence, 0);
+    let mut third = Box::pin(pipeline.enqueue(lane_request(3, "fast")));
+    assert!(timeout(Duration::from_millis(30), &mut third)
+        .await
+        .is_err());
+    slow.add_permits(1);
+    let third = timeout(Duration::from_secs(2), third)
+        .await
+        .unwrap()
+        .unwrap();
+    for ack in [first, second, third] {
+        timeout(Duration::from_secs(2), ack.wait())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    pipeline.shutdown().await.unwrap();
+    assert_eq!(journal.position().await.unwrap().sequence, 3);
+}
+
+#[tokio::test]
+async fn unsupported_semaphore_capacity_is_rejected_without_panicking() {
+    let journal = journal(Arc::new(InMemory::new()), 0);
+    let mut cfg = config();
+    cfg.memory_bytes = usize::MAX;
+    assert!(Partition::start(
+        journal.acquire().await.unwrap(),
+        Counter::new(Arc::default()),
+        cfg
+    )
+    .await
+    .is_err());
 }
