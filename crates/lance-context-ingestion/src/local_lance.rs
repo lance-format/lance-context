@@ -375,17 +375,31 @@ impl LocalLancePartition {
         let tx = self.db.begin_read().map_err(fail)?;
         let state = tx.open_table(STATE).map_err(fail)?;
         let receipts = tx.open_table(RECEIPTS).map_err(fail)?;
-        let mut rows = state
-            .range::<&[u8]>(..)
-            .map_err(fail)?
-            .map(|item| (PUT, item))
-            .chain(
-                receipts
-                    .range::<&[u8]>(..)
-                    .map_err(fail)?
-                    .map(|item| (RECEIPT, item)),
-            )
-            .peekable();
+        let mut state_rows = state.range::<&[u8]>(..).map_err(fail)?;
+        let mut receipt_rows = receipts.range::<&[u8]>(..).map_err(fail)?;
+        let mut reading_receipts = false;
+        // Erase borrowed redb guards before crossing the async writer boundary.
+        // Only one pending owned cell plus the bounded Arrow batch is retained.
+        type CheckpointRow = std::result::Result<(u8, Vec<u8>, Vec<u8>), redb::StorageError>;
+        let rows: Box<dyn Iterator<Item = CheckpointRow> + Send> =
+            Box::new(std::iter::from_fn(move || {
+                let (kind, item) = if !reading_receipts {
+                    match state_rows.next() {
+                        Some(item) => (PUT, item),
+                        None => {
+                            reading_receipts = true;
+                            (RECEIPT, receipt_rows.next()?)
+                        }
+                    }
+                } else {
+                    (RECEIPT, receipt_rows.next()?)
+                };
+                Some(match item {
+                    Ok((key, value)) => Ok((kind, key.value().to_vec(), value.value().to_vec())),
+                    Err(error) => Err(error),
+                })
+            }));
+        let mut rows = rows.peekable();
         let mut schema = table_schema(
             &Schema::new(vec![
                 Field::new("kind", DataType::UInt8, false),
@@ -418,17 +432,17 @@ impl LocalLancePartition {
             let mut values = Vec::new();
             let mut bytes = 0usize;
             for _ in 0..batch_rows {
-                if let Some((_, Ok((key, value)))) = rows.peek() {
-                    let next_bytes = key.value().len().saturating_add(value.value().len());
+                if let Some(Ok((_, key, value))) = rows.peek() {
+                    let next_bytes = key.len().saturating_add(value.len());
                     if !kinds.is_empty() && bytes.saturating_add(next_bytes) > batch_bytes {
                         break;
                     }
                 }
-                let Some((kind, result)) = rows.next() else {
+                let Some(result) = rows.next() else {
                     ended = true;
                     break;
                 };
-                let (key, value) = match result {
+                let (kind, key, value) = match result {
                     Ok(value) => value,
                     Err(error) => {
                         ended = true;
@@ -437,7 +451,7 @@ impl LocalLancePartition {
                         ))));
                     }
                 };
-                bytes += key.value().len() + value.value().len();
+                bytes += key.len() + value.len();
                 if bytes > batch_bytes {
                     ended = true;
                     return Some(Err(arrow_schema::ArrowError::InvalidArgumentError(
@@ -445,8 +459,8 @@ impl LocalLancePartition {
                     )));
                 }
                 kinds.push(kind);
-                keys.push(key.value().to_vec());
-                values.push(value.value().to_vec());
+                keys.push(key);
+                values.push(value);
             }
             if kinds.is_empty() {
                 return None;
@@ -587,6 +601,65 @@ impl LocalLancePartition {
             return Err(Error::Invalid("changed committed receipt".into()));
         }
         Ok(Some(u64::from_le_bytes(bytes[..8].try_into().unwrap())))
+    }
+
+    /// Conservative admission charge for a call, including repeated receipt
+    /// columns, IPC framing and decoded Arrow buffers. Summed charges bound all
+    /// three limits used by `commit` and staging. This does not publish data.
+    pub fn batch_charge(&self, call: &AlignedCall) -> Result<usize> {
+        let rows = call
+            .mutations
+            .len()
+            .saturating_add(call.records.num_rows())
+            .saturating_add(1);
+        let overhead = call
+            .session
+            .len()
+            .saturating_add(call.receipt.len())
+            .saturating_add(call.input_digest.len())
+            .saturating_add(64);
+        let mut input = rows
+            .saturating_mul(overhead)
+            .saturating_add(call.records.get_array_memory_size());
+        for cell in &call.mutations {
+            let size = cell
+                .key
+                .len()
+                .saturating_add(cell.value.as_ref().map_or(0, Vec::len));
+            if size > 1 << 20 {
+                return Err(Error::Invalid(
+                    "state cell exceeds 1 MiB; split the state into smaller keys".into(),
+                ));
+            }
+            input = input.saturating_add(size);
+        }
+        if input > self.max_batch_bytes {
+            return Err(Error::Invalid(
+                "local Lance input exceeds byte budget".into(),
+            ));
+        }
+        let schema = Arc::new(Schema::from(self.sink.dataset().schema()));
+        if log_schema(call.records.schema().as_ref(), &self.binding) != *schema {
+            return Err(Error::Invalid(
+                "output schema differs from durable log".into(),
+            ));
+        }
+        let encoded = encode_call(schema, call, self.batch_rows)?;
+        let mut retained = crate::lance_sink::RetainedArrowBudget::default();
+        let mut batches = Vec::new();
+        let mut decoded = 0usize;
+        for batch in arrow_ipc::reader::StreamReader::try_new(std::io::Cursor::new(&encoded), None)
+            .map_err(fail)?
+        {
+            let batch = batch.map_err(fail)?;
+            decoded = retained.add(&batch);
+            batches.push(batch);
+        }
+        Ok(input.max(encoded.len()).max(decoded))
+    }
+
+    pub fn max_batch_bytes(&self) -> usize {
+        self.max_batch_bytes
     }
 
     /// Publish one coalesced batch, then apply its local transaction. Success

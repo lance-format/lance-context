@@ -205,3 +205,16 @@ legacy migration are adapter contracts; this API does not convert JSON payloads
 supplied by a caller. This is an opt-in backend: existing `Journal` and
 `SessionCheckpoints` adapters keep their existing storage and recovery behavior.
 Migrate their committed suffix and receipts before changing the intake log.
+
+`local_lance_reader::OutputRange` reads only typed output from an immutable
+append range after validating both version watermarks, run/schema/partition and
+full fragment ancestry. It enforces physical and decoded byte limits separately.
+`BatchReference` is a bounded, checksummed binary descriptor binding that range,
+its generation/predecessor and application metadata. A consumer must budget the
+referenced payload and its own decoded representation, never the descriptor size.
+No parsing failure permits falling back to a different log format.
+
+`batch_charge` checks the input, IPC encoding and retained Arrow allocation charge
+before admission. Shared IPC buffers are charged once per allocation while their
+batches remain alive. Charge computation currently encodes and decodes a call;
+commit encodes again. Account for that CPU work when profiling the adapter.

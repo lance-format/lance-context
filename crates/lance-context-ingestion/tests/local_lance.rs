@@ -543,3 +543,217 @@ async fn lost_manifest_ack_recovers_both_local_state_and_receipts_without_new_ve
         version
     );
 }
+
+#[tokio::test]
+async fn immutable_output_range_reads_only_its_payload_and_enforces_real_byte_budgets() {
+    use lance_context_ingestion::local_lance_reader::{LogRange, OutputRange};
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("wal.lance");
+    let dataset = table(uri.to_str().unwrap()).await;
+    let mut writer = open(&dir.path().join("writer.redb"), dataset).await;
+    writer
+        .commit(&[call(1, "old", Some(b"old"), &["old"])])
+        .await
+        .unwrap();
+    let base = writer.dataset().version().version;
+    let files = writer
+        .dataset()
+        .get_fragments()
+        .iter()
+        .flat_map(|f| {
+            f.metadata()
+                .files
+                .iter()
+                .map(|f| f.path.clone())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    writer
+        .commit(&[
+            call(2, "s", Some(b"new-state"), &["new-output"]),
+            call(3, "s", None, &[]),
+        ])
+        .await
+        .unwrap();
+    let version = writer.dataset().version().version;
+    let range = LogRange {
+        base_version: base,
+        version,
+        first_sequence: 2,
+        last_sequence: 3,
+    };
+    for file in files {
+        let path = uri.join("data").join(file);
+        std::fs::rename(&path, path.with_extension("hidden")).unwrap();
+    }
+    let snapshot = writer.dataset().clone();
+    let input = OutputRange::open(snapshot.clone(), &binding(), range.clone())
+        .await
+        .unwrap();
+    assert!(input.physical_bytes > 0);
+    assert!(input.read(1, 1 << 20, 2).await.is_err());
+    let input = OutputRange::open(snapshot.clone(), &binding(), range.clone())
+        .await
+        .unwrap();
+    assert!(input.read(1 << 20, 1, 2).await.is_err());
+    let input = OutputRange::open(snapshot.clone(), &binding(), range.clone())
+        .await
+        .unwrap();
+    let rows = input.read(1 << 20, 1 << 20, 2).await.unwrap();
+    assert_eq!(rows.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+    assert_eq!(
+        rows[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0),
+        "new-output"
+    );
+    let wrong = LogRange {
+        first_sequence: 1,
+        ..range.clone()
+    };
+    assert!(OutputRange::open(snapshot.clone(), &binding(), wrong)
+        .await
+        .is_err());
+    writer
+        .commit(&[call(4, "s", Some(b"later"), &["later"])])
+        .await
+        .unwrap();
+    assert!(
+        OutputRange::open(writer.dataset().clone(), &binding(), range.clone())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        OutputRange::open(snapshot, &binding(), range)
+            .await
+            .unwrap()
+            .read(1 << 20, 1 << 20, 2)
+            .await
+            .unwrap()
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>(),
+        1
+    );
+    let before = writer.dataset().version().version;
+    writer.commit(&[call(5, "s", None, &[])]).await.unwrap();
+    let empty = LogRange {
+        base_version: before,
+        version: writer.dataset().version().version,
+        first_sequence: 5,
+        last_sequence: 5,
+    };
+    assert!(
+        OutputRange::open(writer.dataset().clone(), &binding(), empty)
+            .await
+            .unwrap()
+            .read(1 << 20, 1 << 20, 2)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn binary_batch_reference_rejects_corruption_truncation_and_invalid_continuity() {
+    use lance_context_ingestion::local_lance_reader::{BatchReference, LogRange};
+    use sha2::{Digest, Sha256};
+    let mut reference = BatchReference {
+        binding: binding(),
+        uri: "az://bucket/session-log.lance".into(),
+        generation: 7,
+        previous_generation: 6,
+        range: LogRange {
+            base_version: 11,
+            version: 13,
+            first_sequence: 9,
+            last_sequence: 21,
+        },
+        physical_bytes: 105_000,
+        decoded_byte_limit: 1 << 20,
+        output_rows: 30,
+        application_metadata: vec![0, 255, 13, 10],
+    };
+    let bytes = reference.encode().unwrap();
+    assert_eq!(BatchReference::decode(&bytes).unwrap(), reference);
+    for len in 0..bytes.len() {
+        assert!(BatchReference::decode(&bytes[..len]).is_err());
+    }
+    for i in 0..bytes.len() {
+        let mut changed = bytes.clone();
+        changed[i] ^= 1;
+        assert!(BatchReference::decode(&changed).is_err());
+    }
+    // Recompute checksum so framing/continuity validation is independently tested.
+    let mut changed = bytes[..bytes.len() - 32].to_vec();
+    changed[8..16].copy_from_slice(&9u64.to_le_bytes());
+    changed.extend_from_slice(&Sha256::digest(&changed));
+    assert!(BatchReference::decode(&changed).is_err());
+    let mut trailing = bytes[..bytes.len() - 32].to_vec();
+    trailing.push(0);
+    trailing.extend_from_slice(&Sha256::digest(&trailing));
+    assert!(BatchReference::decode(&trailing).is_err());
+    reference.application_metadata = vec![0; 65537];
+    assert!(reference.encode().is_err());
+    reference.application_metadata.clear();
+    reference.uri = "x".repeat(4097);
+    assert!(reference.encode().is_err());
+}
+
+#[tokio::test]
+async fn wide_shared_ipc_buffers_keep_small_calls_in_one_bounded_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("wide.lance");
+    let output_schema = Arc::new(Schema::new(
+        (0..24)
+            .map(|i| Field::new(format!("field{i}"), DataType::Utf8, false))
+            .collect::<Vec<_>>(),
+    ));
+    let output = RecordBatch::try_new(
+        output_schema.clone(),
+        (0..24)
+            .map(|_| {
+                Arc::new(StringArray::from(vec!["small escaped 世界\nvalue"]))
+                    as arrow_array::ArrayRef
+            })
+            .collect(),
+    )
+    .unwrap();
+    let schema = Arc::new(log_schema(&output_schema, &binding()));
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(RecordBatch::new_empty(schema.clone()))], schema),
+        uri.to_str().unwrap(),
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let mut writer = open(&dir.path().join("wide.redb"), dataset).await;
+    let calls = (1..=128)
+        .map(|sequence| AlignedCall {
+            sequence,
+            session: "session".into(),
+            receipt: format!("r{sequence}"),
+            input_digest: format!("d{sequence}"),
+            mutations: vec![],
+            records: output.clone(),
+        })
+        .collect::<Vec<_>>();
+    let charge = calls
+        .iter()
+        .map(|call| writer.batch_charge(call).unwrap())
+        .sum::<usize>();
+    assert!(
+        charge <= 4 << 20,
+        "shared allocations overcharged: {charge}"
+    );
+    let base = writer.dataset().version().version;
+    writer.commit(&calls).await.unwrap();
+    assert_eq!(writer.dataset().version().version, base + 1);
+    assert_eq!(writer.through_sequence(), 128);
+}

@@ -31,6 +31,47 @@ pub const RUN_METADATA: &str = "lance-context.ingestion.run";
 pub const SCHEMA_METADATA: &str = "lance-context.ingestion.schema";
 const SHARD_NAMESPACE: Uuid = Uuid::from_u128(0x8370a74b_3aaf_4083_8ed0_610b9bd6e8da);
 
+// IPC arrays may share an entire message allocation. Charging its capacity once
+// per column can shrink a batch by the number of columns, despite retaining only
+// one allocation. Callers must keep charged batches alive for this budget's life.
+#[derive(Default)]
+pub(crate) struct RetainedArrowBudget {
+    allocations: HashMap<usize, usize>,
+    bytes: usize,
+}
+impl RetainedArrowBudget {
+    pub(crate) fn add(&mut self, batch: &RecordBatch) -> usize {
+        let mut arrays = batch
+            .columns()
+            .iter()
+            .map(|array| array.to_data())
+            .collect::<Vec<_>>();
+        self.bytes = self
+            .bytes
+            .saturating_add(std::mem::size_of::<RecordBatch>());
+        while let Some(data) = arrays.pop() {
+            self.bytes = self.bytes.saturating_add(std::mem::size_of_val(&data));
+            for buffer in data
+                .buffers()
+                .iter()
+                .chain(data.nulls().map(|nulls| nulls.buffer()))
+            {
+                let size = buffer
+                    .capacity()
+                    .max(buffer.ptr_offset().saturating_add(buffer.len()));
+                let charged = self
+                    .allocations
+                    .entry(buffer.data_ptr().as_ptr() as usize)
+                    .or_default();
+                self.bytes = self.bytes.saturating_add(size.saturating_sub(*charged));
+                *charged = (*charged).max(size);
+            }
+            arrays.extend(data.child_data().iter().cloned());
+        }
+        self.bytes
+    }
+}
+
 fn failure(error: impl std::fmt::Display) -> Error {
     Error::Stage(error.to_string())
 }
@@ -157,6 +198,17 @@ async fn watermarks(dataset: &Dataset) -> Result<HashMap<Uuid, u64>> {
         .collect())
 }
 
+/// Read the covered entry sequence of this exact supplied snapshot. This never
+/// refreshes the dataset, so immutable batch references cannot drift to latest.
+pub async fn covered_sequence_at(dataset: &Dataset, binding: &Binding) -> Result<u64> {
+    validate_dataset(dataset, binding)?;
+    Ok(watermarks(dataset)
+        .await?
+        .get(&shard(binding)?)
+        .copied()
+        .unwrap_or(0))
+}
+
 /// Decode a bounded WAL range and prepare immutable Lance 2.2 files only. This
 /// is safe to distribute across workers: no table manifest or WAL cursor changes.
 /// `max_bytes` bounds decoded Arrow data retained by this stage; input WAL and
@@ -179,7 +231,7 @@ pub async fn stage(
     }
     let schema = Schema::from(dataset.schema());
     let mut batches = Vec::new();
-    let mut bytes = 0_usize;
+    let mut retained = RetainedArrowBudget::default();
     for entry in entries {
         if entry.transition.records.is_empty() {
             continue;
@@ -193,10 +245,7 @@ pub async fn stage(
         }
         for batch in reader {
             let batch = batch.map_err(failure)?;
-            bytes = bytes
-                .checked_add(batch.get_array_memory_size())
-                .ok_or_else(|| Error::Invalid("Arrow byte count overflow".into()))?;
-            if bytes > max_bytes {
+            if retained.add(&batch) > max_bytes {
                 return Err(Error::Invalid(
                     "staging decoded Arrow budget exceeded".into(),
                 ));
