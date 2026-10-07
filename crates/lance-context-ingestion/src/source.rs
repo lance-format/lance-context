@@ -95,6 +95,7 @@ pub struct SourcePartition {
     last_assigned: u64,
     pending: HashMap<String, Pending>,
     poisoned: bool,
+    batch_flush: Option<crate::BatchFlush>,
     journal: crate::Journal,
 }
 
@@ -106,6 +107,31 @@ impl SourcePartition {
         pipeline: PipelineConfig,
         config: SourceConfig,
     ) -> Result<Self> {
+        Self::start_inner(writer, aligners, loader, pipeline, config, None).await
+    }
+
+    /// Preserve a source batch through alignment and WAL collection. Multiple
+    /// calls from one session see speculative state in admission order. A batch
+    /// may split at byte/count/memory limits; every returned ACK remains durable.
+    pub async fn start_batched<A: Aligner, L: HistoryLoader>(
+        writer: Writer,
+        aligners: Vec<A>,
+        loader: L,
+        pipeline: PipelineConfig,
+        config: SourceConfig,
+        flush: crate::BatchFlush,
+    ) -> Result<Self> {
+        Self::start_inner(writer, aligners, loader, pipeline, config, Some(flush)).await
+    }
+
+    async fn start_inner<A: Aligner, L: HistoryLoader>(
+        writer: Writer,
+        aligners: Vec<A>,
+        loader: L,
+        pipeline: PipelineConfig,
+        config: SourceConfig,
+        batch_flush: Option<crate::BatchFlush>,
+    ) -> Result<Self> {
         if config.max_batch_requests == 0
             || config.max_batch_bytes == 0
             || config.receipt_read_concurrency == 0
@@ -115,7 +141,18 @@ impl SourcePartition {
         let journal = writer.journal().clone();
         let last_assigned = writer.position().sequence;
         let max_input_bytes = pipeline.max_input_bytes;
-        let partition = Partition::start_with_aligners(writer, aligners, loader, pipeline).await?;
+        let partition = if let Some(flush) = &batch_flush {
+            Partition::start_batched_with_aligners(
+                writer,
+                aligners,
+                loader,
+                pipeline,
+                flush.clone(),
+            )
+            .await?
+        } else {
+            Partition::start_with_aligners(writer, aligners, loader, pipeline).await?
+        };
         Ok(Self {
             partition,
             index: ReceiptIndex::new(journal.clone()),
@@ -124,6 +161,7 @@ impl SourcePartition {
             last_assigned,
             pending: HashMap::new(),
             poisoned: false,
+            batch_flush,
             journal,
         })
     }
@@ -281,6 +319,9 @@ impl SourcePartition {
                     wait: Wait::New(ack),
                 });
             }
+        }
+        if let Some(flush) = &self.batch_flush {
+            flush.request(self.last_assigned);
         }
         self.poisoned = false;
         Ok(acks)

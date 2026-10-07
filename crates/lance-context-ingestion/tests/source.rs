@@ -408,3 +408,279 @@ async fn original_and_duplicate_waiters_fail_together_on_alignment_or_wal_error(
         assert_eq!(journal.position().await.unwrap().sequence, 0);
     }
 }
+
+async fn start_bulk(
+    journal: &Journal,
+    observed: Arc<Mutex<Vec<String>>>,
+    slow: Arc<Semaphore>,
+    fast_done: Arc<Semaphore>,
+    pipeline: PipelineConfig,
+) -> SourcePartition {
+    SourcePartition::start_batched(
+        journal.acquire().await.unwrap(),
+        (0..2)
+            .map(|_| Counter {
+                states: HashMap::new(),
+                observed: observed.clone(),
+                slow: slow.clone(),
+                fast_done: fast_done.clone(),
+            })
+            .collect(),
+        EmptyHistory,
+        pipeline,
+        SourceConfig {
+            max_batch_requests: 256,
+            max_batch_bytes: 64 << 10,
+            receipt_read_concurrency: 2,
+        },
+        lance_context_ingestion::BatchFlush::new(),
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn bulk_batch_preserves_pending_dedup_and_restarts_without_checkpoint_or_realigning() {
+    let journal = journal();
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let slow = Arc::new(Semaphore::new(0));
+    let fast = Arc::new(Semaphore::new(0));
+    let mut pipeline = config();
+    pipeline.wal.max_entries = 128;
+    let mut source = start_bulk(
+        &journal,
+        observed.clone(),
+        slow.clone(),
+        fast.clone(),
+        pipeline.clone(),
+    )
+    .await;
+    let mut requests: Vec<_> = (0..39)
+        .map(|i| request(&format!("batch-{i}"), "fast"))
+        .collect();
+    requests.push(request("batch-last", "slow"));
+    requests.push(request("batch-0", "fast")); // Duplicate within the same uncommitted batch.
+    let mut acks = source.enqueue_many(requests.clone()).await.unwrap();
+    timeout(Duration::from_secs(5), fast.acquire_many(39))
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    let first = acks.remove(0).wait();
+    tokio::pin!(first);
+    // The 2ms streaming timer must not split this batch while its final call is
+    // still aligning. All earlier calls have actually finished alignment.
+    assert!(timeout(Duration::from_millis(30), &mut first)
+        .await
+        .is_err());
+    assert_eq!(journal.position().await.unwrap(), Position::default());
+    slow.add_permits(1);
+    timeout(Duration::from_secs(5), &mut first)
+        .await
+        .unwrap()
+        .unwrap();
+    for ack in acks {
+        ack.wait().await.unwrap();
+    }
+    let head = journal.position().await.unwrap();
+    assert_eq!((head.sequence, head.generation), (40, 1));
+    let entries = journal.entries(&head).await.unwrap();
+    assert_eq!(entries.len(), 40);
+    for (index, entry) in entries[..39].iter().enumerate() {
+        assert_eq!(
+            serde_json::from_slice::<u64>(&entry.transition.delta).unwrap(),
+            index as u64 + 1
+        );
+    }
+    // Stop after a durable ACK without checkpoint/receipt consumers. Recovery
+    // must use the committed WAL, including same-batch source identity mappings.
+    drop(source);
+    let mut source = start_bulk(&journal, observed.clone(), slow, fast, pipeline).await;
+    for ack in source.enqueue_many(requests).await.unwrap() {
+        ack.wait().await.unwrap();
+    }
+    assert_eq!(journal.position().await.unwrap(), head);
+    assert_eq!(observed.lock().unwrap().len(), 40);
+    let mut changed = request("batch-0", "fast");
+    changed.payload = b"different contents".to_vec();
+    assert!(source.enqueue_many(vec![changed]).await.is_err());
+    for ack in source
+        .enqueue_many(vec![request("next", "fast")])
+        .await
+        .unwrap()
+    {
+        ack.wait().await.unwrap();
+    }
+    let last = journal.position().await.unwrap();
+    assert_eq!(last.sequence, 41);
+    assert_eq!(
+        serde_json::from_slice::<u64>(&journal.entries(&last).await.unwrap()[0].transition.delta)
+            .unwrap(),
+        40
+    );
+    source.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn bulk_batch_splits_at_size_or_memory_headroom_without_waiting_for_a_timer() {
+    for limit in ["entries", "bytes", "memory"] {
+        let journal = journal();
+        let mut pipeline = config();
+        pipeline.wal.max_delay = Duration::from_secs(3600);
+        pipeline.wal.max_entries = if limit == "entries" { 7 } else { 128 };
+        if limit == "memory" {
+            pipeline.memory_bytes = pipeline.reservation_bytes().unwrap() as usize;
+        }
+        if limit == "bytes" {
+            pipeline.wal.max_bytes = 1024;
+        }
+        let mut source = start_bulk(
+            &journal,
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Semaphore::new(0)),
+            Arc::new(Semaphore::new(0)),
+            pipeline,
+        )
+        .await;
+        let requests = (0..40)
+            .map(|i| request(&format!("row-{i}"), "fast"))
+            .collect();
+        timeout(Duration::from_secs(5), async {
+            for ack in source.enqueue_many(requests).await.unwrap() {
+                ack.wait().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        let head = journal.position().await.unwrap();
+        assert_eq!(head.sequence, 40);
+        assert!(head.generation > 1);
+        if limit == "entries" {
+            assert_eq!(head.generation, 6);
+        }
+        let mut cursor = Position::default();
+        let mut entries = Vec::new();
+        while cursor != head {
+            for position in journal.pending(&cursor, &head).await.unwrap() {
+                entries.extend(journal.entries(&position).await.unwrap());
+                cursor = position;
+            }
+        }
+        assert_eq!(entries.len(), 40);
+        assert!(entries
+            .iter()
+            .enumerate()
+            .all(|(i, e)| e.sequence == i as u64 + 1));
+        source.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn bulk_recovery_prefix_is_not_hidden_by_a_later_batch_boundary() {
+    let journal = journal();
+    let slow = Arc::new(Semaphore::new(0));
+    let fast = Arc::new(Semaphore::new(0));
+    let flush = lance_context_ingestion::BatchFlush::new();
+    let mut source = SourcePartition::start_batched(
+        journal.acquire().await.unwrap(),
+        vec![Counter {
+            states: HashMap::new(),
+            observed: Arc::new(Mutex::new(Vec::new())),
+            slow: slow.clone(),
+            fast_done: fast.clone(),
+        }],
+        EmptyHistory,
+        config(),
+        SourceConfig {
+            max_batch_requests: 16,
+            max_batch_bytes: 16384,
+            receipt_read_concurrency: 2,
+        },
+        flush.clone(),
+    )
+    .await
+    .unwrap();
+    let mut acks = source
+        .enqueue_many(vec![request("first", "fast"), request("last", "slow")])
+        .await
+        .unwrap();
+    fast.acquire().await.unwrap().forget();
+    // enqueue_many already requested the full batch (sequence 2). The pending
+    // alignment needs sequence 1 committed before it can recover evicted state.
+    flush.request_prefix(1);
+    timeout(Duration::from_secs(2), acks.remove(0).wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(journal.position().await.unwrap().sequence, 1);
+    let last = acks.remove(0).wait();
+    tokio::pin!(last);
+    assert!(timeout(Duration::from_millis(20), &mut last).await.is_err());
+    slow.add_permits(1);
+    timeout(Duration::from_secs(2), &mut last)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(journal.position().await.unwrap().sequence, 2);
+    source.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn bulk_cancelled_partial_admission_recovers_without_duplicate_rows() {
+    let journal = journal();
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let slow = Arc::new(Semaphore::new(0));
+    let fast_done = Arc::new(Semaphore::new(0));
+    let mut limited = config();
+    limited.memory_bytes = 60_000;
+    let mut source = start_bulk(
+        &journal,
+        observed.clone(),
+        slow.clone(),
+        fast_done.clone(),
+        limited,
+    )
+    .await;
+    let first = request("a", "slow");
+    drop(source.enqueue_many(vec![first.clone()]).await.unwrap());
+    let later = (0..10)
+        .map(|n| request(&format!("later-{n}"), "fast"))
+        .collect::<Vec<_>>();
+    let mut admission = Box::pin(source.enqueue_many(later.clone()));
+    timeout(Duration::from_secs(2), async {
+        tokio::select! {
+            _ = &mut admission => panic!("admission must wait for bounded capacity"),
+            ready = fast_done.acquire() => ready.unwrap().forget(),
+        }
+    })
+    .await
+    .unwrap();
+    assert!(timeout(Duration::from_millis(20), &mut admission)
+        .await
+        .is_err());
+    drop(admission);
+    assert!(source.enqueue_many(vec![first.clone()]).await.is_err());
+    slow.add_permits(1);
+    timeout(Duration::from_secs(2), source.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+    let prefix = journal.position().await.unwrap();
+    assert!(prefix.sequence > 1 && prefix.sequence < 11);
+    let mut source = start_bulk(&journal, observed.clone(), slow, fast_done, config()).await;
+    let acks = source
+        .enqueue_many(std::iter::once(first).chain(later).collect())
+        .await
+        .unwrap();
+    for (n, ack) in acks.into_iter().enumerate() {
+        assert_eq!(ack.wait().await.unwrap().sequence, n as u64 + 1);
+    }
+    source.shutdown().await.unwrap();
+    assert_eq!(journal.position().await.unwrap().sequence, 11);
+    let observed = observed.lock().unwrap();
+    assert_eq!(observed.len(), 11);
+    let mut unique = observed.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), 11);
+}

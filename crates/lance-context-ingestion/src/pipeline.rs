@@ -79,6 +79,60 @@ impl BatchPolicy {
     }
 }
 
+/// Flush requests for one batch partition. A request commits the ordered prefix
+/// through `sequence`; it never acknowledges uncommitted data. Create a fresh
+/// handle per partition process. Adapters use `request_prefix` before awaiting
+/// recovery of evicted speculative state, avoiding a batch-boundary deadlock.
+#[derive(Clone)]
+pub struct BatchFlush {
+    through: watch::Sender<FlushTargets>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct FlushTargets {
+    batch_end: u64,
+    required_prefix: u64,
+}
+
+impl Default for BatchFlush {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BatchFlush {
+    pub fn new() -> Self {
+        Self {
+            through: watch::channel(FlushTargets::default()).0,
+        }
+    }
+
+    pub fn request(&self, sequence: u64) {
+        self.through.send_if_modified(|through| {
+            if sequence > through.batch_end {
+                through.batch_end = sequence;
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    /// Commit available outputs until this prefix is durable. Use before waiting
+    /// for evicted speculative state. Unlike an ordinary batch boundary, this
+    /// must not wait for later alignment that depends on the requested prefix.
+    pub fn request_prefix(&self, sequence: u64) {
+        self.through.send_if_modified(|through| {
+            if sequence > through.required_prefix {
+                through.required_prefix = sequence;
+                true
+            } else {
+                false
+            }
+        });
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PipelineConfig {
     pub queue_entries: usize,
@@ -141,6 +195,7 @@ pub struct Partition {
     budget: Arc<Semaphore>,
     config: PipelineConfig,
     durable: watch::Receiver<Position>,
+    _batch_flush: Option<BatchFlush>,
 }
 
 impl Partition {
@@ -168,9 +223,31 @@ impl Partition {
     /// WAL output remains globally ordered even when later sessions finish first.
     pub async fn start_with_aligners<A: Aligner, L: HistoryLoader>(
         writer: Writer,
+        aligners: Vec<A>,
+        loader: L,
+        config: PipelineConfig,
+    ) -> Result<Self> {
+        Self::start_inner(writer, aligners, loader, config, None).await
+    }
+
+    /// Bulk input flushes at caller batch boundaries, size/count limits, memory
+    /// headroom, or shutdown. `wal.max_delay` is not used in this mode.
+    pub async fn start_batched_with_aligners<A: Aligner, L: HistoryLoader>(
+        writer: Writer,
+        aligners: Vec<A>,
+        loader: L,
+        config: PipelineConfig,
+        flush: BatchFlush,
+    ) -> Result<Self> {
+        Self::start_inner(writer, aligners, loader, config, Some(flush)).await
+    }
+
+    async fn start_inner<A: Aligner, L: HistoryLoader>(
+        writer: Writer,
         mut aligners: Vec<A>,
         loader: L,
         config: PipelineConfig,
+        flush: Option<BatchFlush>,
     ) -> Result<Self> {
         config.wal.validate()?;
         let reserve = config.reservation_bytes()?;
@@ -217,7 +294,14 @@ impl Partition {
             durable_rx.clone(),
             config.clone(),
         ));
-        stages.spawn(wal_loop(writer, wal_rx, durable_tx, config.wal.clone()));
+        stages.spawn(wal_loop(
+            writer,
+            wal_rx,
+            durable_tx,
+            config.wal.clone(),
+            flush.as_ref().map(|f| f.through.subscribe()),
+            config.memory_bytes - reserve as usize,
+        ));
         let supervisor = tokio::spawn(async move {
             // Observe every stage independently. On error, dropping this JoinSet
             // cancels even a loader or alignment lane blocked on unrelated work.
@@ -232,6 +316,7 @@ impl Partition {
             budget: Arc::new(Semaphore::new(config.memory_bytes)),
             config,
             durable: durable_rx,
+            _batch_flush: flush,
         })
     }
 
@@ -561,6 +646,8 @@ async fn wal_loop(
     mut input: mpsc::Receiver<Aligned>,
     durable: watch::Sender<Position>,
     policy: BatchPolicy,
+    mut flush: Option<watch::Receiver<FlushTargets>>,
+    output_headroom: usize,
 ) -> Result<()> {
     let mut carry: Option<Aligned> = None;
     loop {
@@ -573,18 +660,54 @@ async fn wal_loop(
         };
         let deadline = Instant::now() + policy.max_delay;
         let mut bytes = first.encoded_bytes;
+        let mut reserved = first._permit.num_permits();
         let mut batch = vec![first];
         while batch.len() < policy.max_entries && bytes < policy.max_bytes {
-            match timeout_at(deadline, input.recv()).await {
-                Ok(Some(next)) if next.encoded_bytes <= policy.max_bytes - bytes => {
+            let next = if let Some(flush) = flush.as_mut() {
+                // Keep room to admit a maximum-sized request while collecting
+                // outputs. Otherwise a partial batch could hold all permits and
+                // prevent the source from ever reaching its explicit boundary.
+                let requested = *flush.borrow_and_update();
+                if reserved >= output_headroom
+                    || (requested.batch_end > writer.position().sequence
+                        && batch.last().unwrap().entry.sequence >= requested.batch_end)
+                {
+                    break;
+                }
+                if requested.required_prefix > writer.position().sequence {
+                    // An evicted state can block an earlier alignment result.
+                    // Drain outputs already available, then commit that prefix
+                    // instead of waiting for the whole source batch to finish.
+                    match input.try_recv() {
+                        Ok(item) => Some(item),
+                        Err(_) => break,
+                    }
+                } else {
+                    tokio::select! {
+                        item = input.recv() => item,
+                        changed = flush.changed() => {
+                            if changed.is_err() { return Err(Error::Stopped); }
+                            continue;
+                        }
+                    }
+                }
+            } else {
+                match timeout_at(deadline, input.recv()).await {
+                    Ok(next) => next,
+                    Err(_) => break,
+                }
+            };
+            match next {
+                Some(next) if next.encoded_bytes <= policy.max_bytes - bytes => {
                     bytes += next.encoded_bytes;
+                    reserved += next._permit.num_permits();
                     batch.push(next);
                 }
-                Ok(Some(next)) => {
+                Some(next) => {
                     carry = Some(next);
                     break;
                 }
-                Ok(None) | Err(_) => break,
+                None => break,
             }
         }
         let entries = batch

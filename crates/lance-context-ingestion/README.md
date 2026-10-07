@@ -27,22 +27,28 @@ replayable source / stable partition-local receipts
   publication. Different virtual partitions run independently. Within a partition,
   load completion may reorder, while alignment and durable publication stay ordered.
   Do not change session-to-virtual-partition routing when changing worker count.
+
 - `enqueue` reserves bytes before admission. A reservation remains held through the
   durable ACK, covering input, history, bounded output and serialization. Adapter
   caches, transient adapter allocation, executor and storage-client memory need their
   own budgets. Sources must also bound concurrent requests waiting for admission.
+
 - `Aligner` owns the session cache and speculative state. Prefetched checkpoints may
   be stale: reconcile their revisions with pending deltas. On failure, discard the
   adapter and recover; speculative changes must never become checkpoints directly.
+
 - `Journal` stores immutable segments binding records, state deltas, exact input
   digests, receipt identities, run/schema and predecessor sequence. Conditional head
   updates fence stale writers. Failed or cancelled commits poison a writer.
+
 - ACK follows head publication. An uploaded orphan is not committed. Retry the
   same partition sequence, receipt, session and input bytes after an uncertain result.
   A gap is rejected; older receipts are compared with the committed journal.
+
 - Immutable skip links support bounded chronological recovery pages and historical
   receipt lookup without reading unrelated record payloads. Recovery replays all
   pages after the adapter's checkpoint, not just one next WAL segment.
+
 - `Partition::start_with_aligners` can run several session alignment lanes inside
   one stable durable partition, independently of history-loader concurrency and WAL
   batch size. Same-session calls stay ordered; completed lanes rejoin the original
@@ -51,10 +57,12 @@ replayable source / stable partition-local receipts
   stops all speculative lanes. Lane count must fit the queue-entry budget; adapter
   caches are additional to the shared input/output byte budget. This does not
   schedule workers on other machines or remove the WAL ordering barrier.
+
 - Named `Consumer`s have independent durable cursors and coalesce producer segments
   into their own batches. Sink output and input coverage must be committed together;
   cursor writes can fail after output succeeds, so repeated/regrouped input must be
   idempotent. The scheduler owns exclusive consumer assignment and sink-side fencing.
+
 - `ReceiptIndex` resolves exact source receipt/session/input-digest identities after
   an HTTP retry or restart. A dedicated consumer writes immutable receipt mappings;
   `find_many` reads the index concurrently, then reconciles its unindexed WAL suffix
@@ -63,6 +71,7 @@ replayable source / stable partition-local receipts
   committed position: the admission owner must still check its in-flight map and
   serialize sequence assignment. This index does not schedule source fan-out or
   replace the requirement to ACK every partition before advancing source progress.
+
 - `SourcePartition` adds a serialized admission owner for continuous callers that
   have stable source receipts but no partition sequence numbers. `enqueue_many`
   checks committed and in-flight identities, assigns sequences only to new inputs,
@@ -72,6 +81,7 @@ replayable source / stable partition-local receipts
   unknown admitted prefix. Run its dedicated receipt consumer independently and
   keep HTTP/source queues bounded. This API does not supply HTTP authentication,
   cross-partition fan-out, or a migration from an application's previous WAL format.
+
 - `Writer::with_backlog` optionally limits committed segments outstanding for
   every required consumer. A consumer that has not started is at zero; table and
   checkpoint progress are both required when both are configured. The publisher
@@ -83,6 +93,7 @@ replayable source / stable partition-local receipts
   not itself a throughput optimization. It bounds unconsumed payload bytes by
   `max_segments * max_segment_bytes`, not retained history, orphan uploads or total
   storage. No WAL garbage collection or scheduling is implied.
+
 - `SessionCheckpoints` provides an actual object-store checkpoint sink: group by
   session, reduce ordered deltas, then write each session once with a conditional put.
   A partially successful checkpoint batch can leave some session states ahead of the
@@ -119,19 +130,44 @@ Tests use the real `object_store::memory::InMemory` implementation for CAS behav
 with fault injection around writes. These tests do not establish cloud durability,
 process-crash behavior on a real durable service, or production throughput.
 
+## Bulk sources
+
+For replayable batch sources, use `SourcePartition::start_batched` with a fresh
+`BatchFlush` shared by the partition's alignment adapters. Pass the existing source
+batch to `enqueue_many`; do not replace its stable record receipts when combining
+batches for transport or WAL publication. The admission owner validates the entire
+batch, preserves in-flight deduplication, and requests a flush through its final
+assigned sequence. An all-duplicate batch does not manufacture a WAL entry.
+
+This mode does not use `BatchPolicy::max_delay`. WAL collection continues until a
+source batch boundary, the byte/count limit, output memory headroom, or shutdown.
+A later already-admitted batch boundary can coalesce available batches. Limits may
+split a large batch into committed prefixes: rows, state deltas and source receipts
+remain together in each segment, and callers await **all** returned ACKs before
+advancing source progress. Table/checkpoint consumers still group segments
+independently. The bulk constructor changes scheduling, not the WAL format.
+
+Same-session alignment sees its speculative state throughout the batch. If an
+adapter evicts uncommitted state and needs to recover it, call
+`BatchFlush::request_prefix(sequence)` before waiting for that prefix's durability.
+This flushes available ordered outputs even when a later batch boundary is pending;
+otherwise the blocked alignment could prevent the batch itself from completing.
+Do not treat a stale checkpoint as the current batch's state. Cache/input/output
+budgets still apply; increasing a batch target does not permit unbounded memory.
+
 ## Remaining integration
 
 1. Adapt the existing revisioned session history/cache and cross-call alignment
    implementation. Preserve its compaction/branch identity rules and source ordering;
    the generic pipeline deliberately does not invent a new turn-ID algorithm.
-2. Wire table ownership and independently scheduled session ZoneMap maintenance.
+1. Wire table ownership and independently scheduled session ZoneMap maintenance.
    Staging is independent of publication; a distributed worker transport must
    carry validated staged results and retain ownership through manifest commit.
-3. Add source fan-out receipts and contiguous source progress. A source call spanning
+1. Add source fan-out receipts and contiguous source progress. A source call spanning
    partitions is complete only after every required partition ACK.
-4. Add worker ownership orchestration, stage timing/queue telemetry, consumer run loops,
+1. Add worker ownership orchestration, stage timing/queue telemetry, consumer run loops,
    deployment of the backlog policy and safe WAL reclamation. No WAL files are deleted here.
-5. Verify real compacted sessions, process crash/restart with durable storage, Lance
+1. Verify real compacted sessions, process crash/restart with durable storage, Lance
    uncertain commits and source retry integration before a guarded production handoff.
    Existing source-reader local audit history must survive that handoff.
 
