@@ -402,7 +402,7 @@ mod tests {
         let claim = claim(&state, TaskKind::MergeWal).await;
         let coordinator = state.task_store.merge_coordinator();
         let mut execution = Execution::new("table", "master:catchup", "test", 60);
-        execution.idle_timeout_secs = 3;
+        execution.idle_timeout_secs = 5;
         assert!(coordinator
             .reserve(&state.task_store.merge_claim(&claim), &execution)
             .await
@@ -418,7 +418,7 @@ mod tests {
         );
         let producer = async {
             // Make real checkpoint progress beyond the entire idle allowance.
-            for _ in 0..8 {
+            for _ in 0..12 {
                 scope
                     .run(async {
                         lance_context_core::merge_write_scope::checkpoint();
@@ -429,11 +429,22 @@ mod tests {
             let moving = coordinator.work_progress(&running).await.unwrap().unwrap();
             assert_eq!(moving["executor_id"], "executor-test");
             assert_eq!(moving["task_id"], claim.task.id);
-            // Allow the last checkpoint to be sampled, then compare heartbeats.
-            tokio::time::sleep(Duration::from_millis(1200)).await;
-            let first = coordinator.work_progress(&running).await.unwrap().unwrap();
-            tokio::time::sleep(Duration::from_millis(1100)).await;
-            let second = coordinator.work_progress(&running).await.unwrap().unwrap();
+            // Wait for actual publications instead of assuming an etcd RPC
+            // plus a one-second timer always completes in 1.1 wall seconds.
+            let first = loop {
+                let report = coordinator.work_progress(&running).await.unwrap().unwrap();
+                if report["sequence"].as_u64() == Some(scope.completed_steps()) {
+                    break report;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            };
+            let second = loop {
+                let report = coordinator.work_progress(&running).await.unwrap().unwrap();
+                if report["observed_at_ms"].as_u64() > first["observed_at_ms"].as_u64() {
+                    break report;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            };
             assert_eq!(first["sequence"], second["sequence"]);
             assert_eq!(first["last_progress_at_ms"], second["last_progress_at_ms"]);
             assert!(
@@ -441,7 +452,7 @@ mod tests {
                     > first["observed_at_ms"].as_u64().unwrap()
             );
         };
-        let (error, ()) = tokio::time::timeout(Duration::from_secs(12), async {
+        let (error, ()) = tokio::time::timeout(Duration::from_secs(30), async {
             tokio::join!(watchdog, producer)
         })
         .await
