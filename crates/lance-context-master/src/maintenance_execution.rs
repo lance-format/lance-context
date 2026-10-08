@@ -156,22 +156,42 @@ async fn watch(
     coordinator: &Coordinator,
     execution: &Execution,
     scope: &MergeWriteScope,
+    executor_id: &str,
+    task_id: &str,
 ) -> String {
     let mut sequence = scope.completed_steps();
     let mut changed = tokio::time::Instant::now();
+    let mut last_progress_at_ms = lance_context_merge::failure::now_ms();
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
         let current = scope.completed_steps();
         if current != sequence {
             changed = tokio::time::Instant::now();
             sequence = current;
+            last_progress_at_ms = lance_context_merge::failure::now_ms();
         }
         if changed.elapsed() >= Duration::from_secs(execution.idle_timeout_secs) {
+            tracing::warn!(target = %execution.target, execution = %execution.id, task_id, executor_id,
+                sequence, work = ?scope.work(), idle_seconds = changed.elapsed().as_secs(),
+                "maintenance stopped making progress; cancelling preparation before drain/fence recovery");
             return "maintenance no-progress deadline exceeded".into();
         }
         // Publishing an unchanged sequence checks ownership but does not count
         // as progress. A healthy lease never resets the idle deadline.
-        match coordinator.publish_progress(execution, sequence).await {
+        let report = serde_json::json!({
+            "executor_id": executor_id,
+            "task_id": task_id,
+            "sequence": sequence,
+            "observed_at_ms": lance_context_merge::failure::now_ms(),
+            "last_progress_at_ms": last_progress_at_ms,
+            "idle_for_ms": changed.elapsed().as_millis() as u64,
+            "idle_timeout_secs": execution.idle_timeout_secs,
+            "work": scope.work(),
+        });
+        match coordinator
+            .publish_work_progress(execution, sequence, report)
+            .await
+        {
             Ok(true) => {}
             Ok(false) => return "maintenance ownership revoked".into(),
             Err(error) => return format!("maintenance progress publication failed: {error}"),
@@ -243,11 +263,12 @@ where
         execution: running.clone(),
         uri,
     }));
+    let executor_id = state.admission.status().executor_id;
     let outcome = std::panic::AssertUnwindSafe(async {
         let watched = async {
             tokio::select! {
                 result = scope.run(work) => result,
-                error = watch(&coordinator, &running, &scope) => Err(error),
+                error = watch(&coordinator, &running, &scope, &executor_id, &claim.task.id) => Err(error),
             }
         };
         watched.await
@@ -255,6 +276,9 @@ where
     .catch_unwind()
     .await
     .unwrap_or_else(|_| Err("maintenance executor panicked".into()));
+    tracing::info!(target = %running.target, execution = %running.id,
+        task_id = %claim.task.id, %executor_id, work = ?scope.work(),
+        success = outcome.is_ok(), "maintenance work outcome before commit drain");
     // The work future has been dropped, so no preparation may issue another
     // commit. The shielded manifest leaves still need acknowledgement or fencing.
     let drained = tokio::time::timeout(
@@ -369,6 +393,60 @@ mod tests {
             .await
             .unwrap();
         state.task_store.claim_next().await.unwrap().unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn work_report_heartbeats_do_not_extend_actual_progress_deadline() {
+        let (_dir, state) = fixture().await;
+        let claim = claim(&state, TaskKind::MergeWal).await;
+        let coordinator = state.task_store.merge_coordinator();
+        let mut execution = Execution::new("table", "master:catchup", "test", 60);
+        execution.idle_timeout_secs = 3;
+        assert!(coordinator
+            .reserve(&state.task_store.merge_claim(&claim), &execution)
+            .await
+            .unwrap());
+        let running = coordinator.start(&execution).await.unwrap().unwrap();
+        let scope = MergeWriteScope::new();
+        let watchdog = watch(
+            &coordinator,
+            &running,
+            &scope,
+            "executor-test",
+            &claim.task.id,
+        );
+        let producer = async {
+            // Make real checkpoint progress beyond the entire idle allowance.
+            for _ in 0..8 {
+                scope
+                    .run(async {
+                        lance_context_core::merge_write_scope::checkpoint();
+                    })
+                    .await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            let moving = coordinator.work_progress(&running).await.unwrap().unwrap();
+            assert_eq!(moving["executor_id"], "executor-test");
+            assert_eq!(moving["task_id"], claim.task.id);
+            // Allow the last checkpoint to be sampled, then compare heartbeats.
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+            let first = coordinator.work_progress(&running).await.unwrap().unwrap();
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            let second = coordinator.work_progress(&running).await.unwrap().unwrap();
+            assert_eq!(first["sequence"], second["sequence"]);
+            assert_eq!(first["last_progress_at_ms"], second["last_progress_at_ms"]);
+            assert!(
+                second["observed_at_ms"].as_u64().unwrap()
+                    > first["observed_at_ms"].as_u64().unwrap()
+            );
+        };
+        let (error, ()) = tokio::time::timeout(Duration::from_secs(12), async {
+            tokio::join!(watchdog, producer)
+        })
+        .await
+        .unwrap();
+        assert!(error.contains("no-progress"));
     }
 
     #[tokio::test]

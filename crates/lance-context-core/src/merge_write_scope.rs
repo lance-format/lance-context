@@ -35,6 +35,57 @@ struct Progress {
     uncertain: bool,
 }
 
+/// Completed work for one execution. Decoded bytes are Arrow buffer sizes,
+/// not network bytes. File encoding is not evidence of a committed merge.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MergeWork {
+    /// Parallel staging can occupy several phases at once. Entering/leaving
+    /// a phase is diagnostic only and never advances completed_steps.
+    pub active_stages: std::collections::BTreeMap<String, u32>,
+    pub wal_batches_read: u64,
+    pub wal_rows_read: u64,
+    pub wal_decoded_bytes: u64,
+    pub encoded_bytes: u64,
+    pub encoded_rows: u64,
+    pub encoded_files: u64,
+    pub base_commits: u64,
+    pub generations_reclaimed: u64,
+    pub last_completed_stage: Option<String>,
+}
+
+pub(crate) struct WorkStage {
+    scope: Option<Arc<MergeWriteScope>>,
+    name: &'static str,
+}
+
+impl Drop for WorkStage {
+    fn drop(&mut self) {
+        if let Some(scope) = &self.scope {
+            let mut work = scope.work.lock().unwrap();
+            if let Some(count) = work.active_stages.get_mut(self.name) {
+                *count -= 1;
+                if *count == 0 {
+                    work.active_stages.remove(self.name);
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn work_stage(name: &'static str) -> WorkStage {
+    let scope = CURRENT.try_with(Arc::clone).ok();
+    if let Some(scope) = &scope {
+        *scope
+            .work
+            .lock()
+            .unwrap()
+            .active_stages
+            .entry(name.into())
+            .or_default() += 1;
+    }
+    WorkStage { scope, name }
+}
+
 pub trait CommitAuthorizer: std::fmt::Debug + Send + Sync {
     fn authorize<'a>(
         &'a self,
@@ -46,6 +97,7 @@ pub trait CommitAuthorizer: std::fmt::Debug + Send + Sync {
 #[derive(Debug, Default)]
 pub struct MergeWriteScope {
     completed_steps: Arc<AtomicU64>,
+    work: Mutex<MergeWork>,
     observe_file_io: bool,
     local_io: Mutex<Vec<(lance_io::utils::tracking_store::IOTracker, u64)>>,
     progress: Mutex<Progress>,
@@ -56,6 +108,9 @@ pub struct MergeWriteScope {
 }
 
 impl MergeWriteScope {
+    pub fn work(&self) -> MergeWork {
+        self.work.lock().unwrap().clone()
+    }
     pub fn completed_steps(&self) -> u64 {
         self.local_io.lock().unwrap().iter().fold(
             self.completed_steps.load(Ordering::Relaxed),
@@ -148,6 +203,38 @@ pub fn checkpoint() {
     let _ = CURRENT.try_with(|scope| scope.completed_steps.fetch_add(1, Ordering::Relaxed));
 }
 
+pub(crate) fn wal_batch_read(rows: usize, bytes: usize) {
+    let _ = CURRENT.try_with(|scope| {
+        let mut work = scope.work.lock().unwrap();
+        work.wal_batches_read += 1;
+        work.wal_rows_read = work.wal_rows_read.saturating_add(rows as u64);
+        work.wal_decoded_bytes = work.wal_decoded_bytes.saturating_add(bytes as u64);
+        work.last_completed_stage = Some("wal_read".into());
+    });
+    checkpoint();
+}
+
+pub(crate) fn base_committed() {
+    let _ = CURRENT.try_with(|scope| {
+        let mut work = scope.work.lock().unwrap();
+        work.base_commits += 1;
+        work.last_completed_stage = Some("base_commit".into());
+    });
+    checkpoint();
+}
+
+pub(crate) fn generations_reclaimed(count: usize) {
+    if count == 0 {
+        return;
+    }
+    let _ = CURRENT.try_with(|scope| {
+        let mut work = scope.work.lock().unwrap();
+        work.generations_reclaimed = work.generations_reclaimed.saturating_add(count as u64);
+        work.last_completed_stage = Some("wal_drain".into());
+    });
+    checkpoint();
+}
+
 /// Capture progress explicitly for Lance callbacks which can run on another task.
 pub(crate) fn write_progress() -> lance::dataset::write::WriteProgressFn {
     let scope = CURRENT.try_with(Arc::clone).ok();
@@ -156,10 +243,25 @@ pub(crate) fn write_progress() -> lance::dataset::write::WriteProgressFn {
         let current = (stats.bytes_written, stats.rows_written, stats.files_written);
         let mut old = previous.lock().unwrap();
         if current.0 > old.0 || current.1 > old.1 || current.2 > old.2 {
-            *old = current;
             if let Some(scope) = &scope {
+                let mut work = scope.work.lock().unwrap();
+                work.encoded_bytes = work
+                    .encoded_bytes
+                    .saturating_add(current.0.saturating_sub(old.0));
+                work.encoded_rows = work
+                    .encoded_rows
+                    .saturating_add(current.1.saturating_sub(old.1));
+                work.encoded_files = work
+                    .encoded_files
+                    .saturating_add(current.2.saturating_sub(old.2) as u64);
+                work.last_completed_stage = Some("file_encoding".into());
                 scope.completed_steps.fetch_add(1, Ordering::Relaxed);
             }
+            *old = (
+                old.0.max(current.0),
+                old.1.max(current.1),
+                old.2.max(current.2),
+            );
         }
     })
 }
@@ -591,6 +693,27 @@ impl CommitHandler for GuardedCommit {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[tokio::test]
+    async fn phase_changes_and_observation_do_not_count_as_completed_work() {
+        let scope = MergeWriteScope::new();
+        scope
+            .run(async {
+                let first = work_stage("memory_wait");
+                let second = work_stage("memory_wait");
+                assert_eq!(scope.work().active_stages["memory_wait"], 2);
+                assert_eq!(scope.completed_steps(), 0);
+                drop(first);
+                assert_eq!(scope.work().active_stages["memory_wait"], 1);
+                drop(second);
+                assert!(scope.work().active_stages.is_empty());
+                assert_eq!(scope.completed_steps(), 0);
+                wal_batch_read(3, 1024);
+                assert_eq!(scope.completed_steps(), 1);
+                assert_eq!(scope.work().wal_rows_read, 3);
+            })
+            .await;
+    }
 
     #[test]
     fn recovery_rejects_unsafe_and_external_commit_handlers() {

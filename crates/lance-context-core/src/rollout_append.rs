@@ -323,8 +323,11 @@ pub(crate) async fn reconcile_shard(dataset: &Dataset, shard: Uuid) -> Result<us
             .filter(|g| generations.contains(&g.generation))
             .map(|g| g.path.clone())
             .collect();
+        let phase = crate::merge_write_scope::work_stage("wal_drain");
         crate::merge_write_scope::drain_generations(store, manifest.writer_epoch, generations)
             .await?;
+        crate::merge_write_scope::generations_reclaimed(count);
+        drop(phase);
         let object_store = dataset.object_store(None).await?;
         let root = dataset
             .branch_location()
@@ -406,6 +409,7 @@ impl AppendCoordinator {
         max_generations: usize,
         max_bytes: usize,
     ) -> Result<(Vec<AppendPlan>, usize)> {
+        let _phase = crate::merge_write_scope::work_stage("planning");
         if max_generations == 0
             || max_generations > MAX_PLAN_GENERATIONS
             || max_bytes == 0
@@ -683,6 +687,7 @@ pub(crate) async fn commit_files(
     fragments: Vec<Fragment>,
     merged: Vec<MergedGeneration>,
 ) -> Result<()> {
+    let _phase = crate::merge_write_scope::work_stage("base_commit");
     let operation = Operation::Update {
         removed_fragment_ids: Vec::new(),
         updated_fragments: Vec::new(),
@@ -703,6 +708,7 @@ pub(crate) async fn commit_files(
             .execute(Transaction::new(version, operation, None)),
     )
     .await?;
+    crate::merge_write_scope::base_committed();
     dataset.checkout_latest().await?;
     Ok(())
 }
@@ -737,11 +743,14 @@ pub async fn stage(
         ));
     }
     let replay_ranges = ReplayRanges::load(&dataset, plan.shard)?;
+    let phase = crate::merge_write_scope::work_stage("memory_wait");
     let mut reservation = budget.reserve(plan.max_bytes.min(budget.limit())).await;
+    drop(phase);
     let mut batches = Vec::new();
     let mut bytes = 0usize;
     let mut completed = 0;
     'generations: for generation in &plan.generations {
+        let _phase = crate::merge_write_scope::work_stage("wal_read");
         let path = format!(
             "{}/_mem_wal/{}/{}",
             uri.trim_end_matches('/'),
@@ -753,6 +762,10 @@ pub async fn stage(
         let mut current = Vec::new();
         while let Some(batch) = stream.try_next().await? {
             let batch = align_batch_to_schema(batch, schema.clone())?;
+            crate::merge_write_scope::wal_batch_read(
+                batch.num_rows(),
+                batch.get_array_memory_size(),
+            );
             bytes = bytes.saturating_add(batch.get_array_memory_size());
             if !reservation.try_grow_to(bytes.saturating_mul(2)) {
                 if completed == 0 {
@@ -763,7 +776,6 @@ pub async fn stage(
                 break 'generations;
             }
             current.push(batch);
-            crate::merge_write_scope::checkpoint();
         }
         let needs_lookup = replay_ranges
             .as_ref()
@@ -784,6 +796,7 @@ pub async fn stage(
     if batches.iter().any(|(_, needs_lookup)| *needs_lookup)
         && !dataset.manifest().fragments.is_empty()
     {
+        let _phase = crate::merge_write_scope::work_stage("legacy_id_lookup");
         let mut ids = HashSet::new();
         for (batch, _) in batches.iter().filter(|(_, needs_lookup)| *needs_lookup) {
             let column = batch
@@ -847,6 +860,7 @@ pub async fn stage(
     let fragments = if output.is_empty() {
         Vec::new()
     } else {
+        let _phase = crate::merge_write_scope::work_stage("file_encoding");
         let params = WriteParams {
             mode: WriteMode::Append,
             max_bytes_per_file: plan.max_bytes,
@@ -955,6 +969,44 @@ mod tests {
     }
     fn budget() -> Arc<MergeMemoryBudget> {
         MergeMemoryBudget::new(8 * 1024 * 1024)
+    }
+
+    #[tokio::test]
+    async fn work_report_distinguishes_encoding_from_durable_reclamation() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let store = writer(uri, "a").await;
+        put(&store, "first", 4096).await;
+        let scope = crate::merge_write_scope::MergeWriteScope::new();
+        scope
+            .run(async {
+                let mut coordinator = AppendCoordinator::open(uri, None).await.unwrap();
+                let (mut plans, _) = coordinator
+                    .plan(&["a".into()], 64, 1024 * 1024)
+                    .await
+                    .unwrap();
+                let part = stage(uri, plans.remove(0), budget(), None).await.unwrap();
+                let encoded = scope.work();
+                assert_eq!(encoded.wal_rows_read, 1);
+                assert!(encoded.wal_decoded_bytes >= 4096);
+                assert_eq!(encoded.encoded_rows, 1);
+                assert!(encoded.encoded_bytes > 0);
+                assert!(encoded.encoded_files > 0);
+                assert_eq!(encoded.base_commits, 0);
+                assert_eq!(encoded.generations_reclaimed, 0);
+                assert_eq!(coordinator.commit(vec![part]).await.unwrap(), 1);
+                let committed = scope.work();
+                assert_eq!(committed.base_commits, 1);
+                assert_eq!(committed.generations_reclaimed, 1);
+                assert_eq!(committed.last_completed_stage.as_deref(), Some("wal_drain"));
+                let sequence = scope.completed_steps();
+                tokio::task::yield_now().await;
+                assert_eq!(scope.completed_steps(), sequence);
+                assert_eq!(scope.work(), committed);
+            })
+            .await;
+        scope.drain().await;
+        assert_eq!(rows(uri).await, 1);
     }
 
     #[derive(Debug)]

@@ -9,6 +9,63 @@ pub struct ExecutionProgress {
 }
 
 impl Coordinator {
+    fn work_key(&self, execution: &Execution) -> String {
+        format!(
+            "{}/merge-work/{}",
+            self.prefix.trim_end_matches('/'),
+            execution.id
+        )
+    }
+
+    /// Publish work details atomically with the existing progress sequence.
+    /// Keep the old sequence wire format intact: mixed-version executors use
+    /// its exact bytes in the no-progress revocation compare-and-swap.
+    pub async fn publish_work_progress(
+        &self,
+        execution: &Execution,
+        sequence: u64,
+        report: serde_json::Value,
+    ) -> Result<bool> {
+        self.transact(
+            vec![Compare::value(
+                execution_key(&self.prefix, &execution.target),
+                CompareOp::Equal,
+                encode(execution),
+            )],
+            vec![
+                TxnOp::put(
+                    self.progress_key(execution),
+                    serde_json::to_vec(&ExecutionProgress { sequence }).unwrap(),
+                    None,
+                ),
+                TxnOp::put(
+                    self.work_key(execution),
+                    serde_json::to_vec(&report).map_err(|e| e.to_string())?,
+                    None,
+                ),
+            ],
+        )
+        .await
+    }
+
+    pub async fn work_progress(&self, execution: &Execution) -> Result<Option<serde_json::Value>> {
+        let response = self
+            .client
+            .clone()
+            .get(self.work_key(execution), None)
+            .await
+            .map_err(|e| e.to_string())?;
+        response
+            .kvs()
+            .first()
+            .map(|kv| serde_json::from_slice(kv.value()).map_err(|e| e.to_string()))
+            .transpose()
+    }
+
+    pub(crate) fn remove_work_progress(&self, execution: &Execution) -> TxnOp {
+        TxnOp::delete(self.work_key(execution), None)
+    }
+
     fn progress_key(&self, execution: &Execution) -> String {
         format!(
             "{}/merge-progress/{}",

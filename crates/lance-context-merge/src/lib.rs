@@ -306,6 +306,7 @@ impl Coordinator {
         operations.extend([
             self.remove_permits(execution),
             self.remove_progress(execution),
+            self.remove_work_progress(execution),
             TxnOp::delete(key, None),
             TxnOp::put(
                 target_lock_key(&self.prefix, &execution.target),
@@ -703,6 +704,55 @@ mod tests {
         assert!(coordinator.release(&proof, &recovered).await.unwrap());
         assert!(coordinator.progress(&running).await.unwrap().is_none());
         assert!(!coordinator.publish_progress(&running, 6).await.unwrap());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn detailed_work_keeps_legacy_progress_cas_and_cannot_resurrect_execution() {
+        let (coordinator, _, proof, _) = fixture().await;
+        let execution = Execution::new("table", "master:catchup", "boot", 3600);
+        assert!(coordinator.reserve(&proof, &execution).await.unwrap());
+        let running = coordinator.start(&execution).await.unwrap().unwrap();
+        let report = serde_json::json!({"sequence": 4, "work": {"wal_rows_read": 100}});
+        assert!(coordinator
+            .publish_work_progress(&running, 4, report.clone())
+            .await
+            .unwrap());
+        assert_eq!(
+            coordinator.work_progress(&running).await.unwrap(),
+            Some(report.clone())
+        );
+        assert_eq!(
+            coordinator
+                .progress(&running)
+                .await
+                .unwrap()
+                .unwrap()
+                .sequence,
+            4
+        );
+        // A stale observation cannot revoke completed new work. Details have
+        // their own key, so the established exact-byte sequence CAS still works.
+        assert!(!coordinator.revoke_stalled(&running, Some(3)).await.unwrap());
+        assert!(coordinator.revoke_stalled(&running, Some(4)).await.unwrap());
+        assert!(!coordinator
+            .publish_work_progress(&running, 5, report.clone())
+            .await
+            .unwrap());
+        let uncertain = coordinator.get("table").await.unwrap().unwrap();
+        let frozen = coordinator
+            .freeze(&proof, &uncertain)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(coordinator.finish_recovery(&proof, &frozen).await.unwrap());
+        let recovered = coordinator.get("table").await.unwrap().unwrap();
+        assert!(coordinator.release(&proof, &recovered).await.unwrap());
+        assert!(coordinator.work_progress(&running).await.unwrap().is_none());
+        assert!(!coordinator
+            .publish_work_progress(&running, 6, report)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]

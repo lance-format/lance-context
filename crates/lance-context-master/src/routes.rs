@@ -706,6 +706,70 @@ async fn executor_status(State(state): State<Arc<MasterState>>) -> Json<crate::a
     Json(state.admission.status())
 }
 
+#[derive(Deserialize)]
+struct MergeProgressQuery {
+    target: String,
+}
+
+/// Exact target reads only. A live task/lease without execution telemetry is
+/// explicitly unknown, not evidence that a legacy merge is making progress.
+async fn merge_progress(
+    State(state): State<Arc<MasterState>>,
+    Query(query): Query<MergeProgressQuery>,
+) -> Result<Json<serde_json::Value>, MasterError> {
+    if query.target.is_empty() || query.target.len() > 512 {
+        return Err(MasterError::InvalidRequest("invalid merge target".into()));
+    }
+    let coordinator = state.task_store.merge_coordinator();
+    let task_id = state
+        .task_store
+        .get_active_id(TaskKind::MergeWal, &query.target)
+        .await
+        .map_err(MasterError::from_lance)?;
+    let Some(execution) = coordinator
+        .get(&query.target)
+        .await
+        .map_err(MasterError::Internal)?
+    else {
+        return Ok(Json(
+            serde_json::json!({"target": query.target, "task_id": task_id, "status": if task_id.is_some() { "progress_unknown" } else { "no_active_merge" }}),
+        ));
+    };
+    let progress = coordinator
+        .progress(&execution)
+        .await
+        .map_err(MasterError::Internal)?;
+    let work = coordinator
+        .work_progress(&execution)
+        .await
+        .map_err(MasterError::Internal)?;
+    if work
+        .as_ref()
+        .is_some_and(|report| report["sequence"].as_u64() != progress.as_ref().map(|p| p.sequence))
+    {
+        return Ok(Json(
+            serde_json::json!({"target":query.target,"status":"progress_changed_retry"}),
+        ));
+    }
+    if coordinator
+        .get(&query.target)
+        .await
+        .map_err(MasterError::Internal)?
+        .as_ref()
+        != Some(&execution)
+    {
+        return Ok(Json(
+            serde_json::json!({"target":query.target,"status":"execution_changed_retry"}),
+        ));
+    }
+    Ok(Json(serde_json::json!({
+        "target": query.target, "task_id": task_id, "execution": execution,
+        "progress": progress, "work_report": work,
+        "sampled_at_ms": lance_context_merge::failure::now_ms(),
+        "status": if work.is_some() { "reported" } else { "progress_details_unavailable" },
+    })))
+}
+
 async fn drain_executor(
     State(state): State<Arc<MasterState>>,
     Json(request): Json<DrainRequest>,
@@ -720,6 +784,7 @@ async fn drain_executor(
 pub fn api_router() -> Router<Arc<MasterState>> {
     Router::new()
         .route("/executor", get(executor_status))
+        .route("/merge-progress", get(merge_progress))
         .route("/executor/drain", post(drain_executor))
         .route("/experiments", get(list_experiments))
         .route("/experiments/{name}", get(get_experiment))
@@ -851,6 +916,44 @@ mod tests {
         std::env::var("ETCD_TEST_ENDPOINTS")
             .map(|value| value.split(',').map(str::to_string).collect())
             .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn merge_progress_never_calls_a_live_legacy_task_healthy() {
+        let dir = TempDir::new().unwrap();
+        let state = MasterState::new(test_config(&dir)).await.unwrap();
+        state
+            .task_store
+            .enqueue(TaskKind::MergeWal, "legacy", vec![])
+            .await
+            .unwrap();
+        let claim = state.task_store.claim_next().await.unwrap().unwrap();
+        let Json(report) = merge_progress(
+            State(state.clone()),
+            Query(MergeProgressQuery {
+                target: "legacy".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report["status"], "progress_unknown");
+        assert_eq!(report["task_id"], claim.task.id);
+        assert!(report.get("work_report").is_none());
+        state
+            .task_store
+            .finish(claim, Ok("done".into()))
+            .await
+            .unwrap();
+        let Json(report) = merge_progress(
+            State(state),
+            Query(MergeProgressQuery {
+                target: "legacy".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report["status"], "no_active_merge");
     }
 
     fn test_record(id: &str, with_blob: bool) -> RolloutRecord {
