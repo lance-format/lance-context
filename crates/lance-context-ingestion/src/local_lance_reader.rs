@@ -1,6 +1,6 @@
 //! Version-pinned reads for an independent consumer of a local-state Lance log.
 use crate::{lance_sink::covered_sequence_at, Binding, Error, Result};
-use arrow_array::{Array, RecordBatch, StructArray};
+use arrow_array::{Array, RecordBatch, StructArray, UInt64Array};
 use futures::TryStreamExt;
 use lance::Dataset;
 
@@ -115,6 +115,53 @@ impl OutputRange {
         max_decoded_bytes: usize,
         batch_rows: usize,
     ) -> Result<Vec<RecordBatch>> {
+        self.read_projection(max_physical_bytes, max_decoded_bytes, batch_rows, None)
+            .await
+    }
+
+    /// Read selected field paths within the output `record` struct. Projection
+    /// first selects matching row IDs, then reads only the projected schema,
+    /// preserving the record struct's validity before charging retained output.
+    /// Physical-file, range and sequence checks are unchanged. Empty projections
+    /// are rejected; omitted fields remain in the immutable log for recovery.
+    pub async fn read_projected(
+        self,
+        max_physical_bytes: u64,
+        max_decoded_bytes: usize,
+        batch_rows: usize,
+        fields: &[&str],
+    ) -> Result<Vec<RecordBatch>> {
+        if fields.is_empty() || fields.iter().any(|field| field.is_empty()) {
+            return Err(Error::Invalid("empty Lance output projection".into()));
+        }
+        let columns = fields
+            .iter()
+            .map(|field| format!("record.{field}"))
+            .collect::<Vec<_>>();
+        if columns
+            .iter()
+            .any(|column| self.dataset.schema().field(column).is_none())
+        {
+            return Err(Error::Invalid(
+                "unknown Lance output projection field".into(),
+            ));
+        }
+        self.read_projection(
+            max_physical_bytes,
+            max_decoded_bytes,
+            batch_rows,
+            Some(&columns),
+        )
+        .await
+    }
+
+    async fn read_projection(
+        self,
+        max_physical_bytes: u64,
+        max_decoded_bytes: usize,
+        batch_rows: usize,
+        columns: Option<&[String]>,
+    ) -> Result<Vec<RecordBatch>> {
         if self.physical_bytes > max_physical_bytes || max_decoded_bytes == 0 || batch_rows == 0 {
             return Err(Error::Invalid("Lance log range exceeds read budget".into()));
         }
@@ -122,7 +169,15 @@ impl OutputRange {
         scan.with_fragments(self.fragments)
             .batch_size(batch_rows)
             .scan_in_order(true);
-        scan.project(&["record"]).map_err(fail)?;
+        let projection = columns
+            .map(|columns| self.dataset.schema().project(columns))
+            .transpose()
+            .map_err(fail)?;
+        if projection.is_some() {
+            scan.empty_project().map_err(fail)?.with_row_id();
+        } else {
+            scan.project(&["record"]).map_err(fail)?;
+        }
         scan.filter(&format!(
             "kind = 3 AND sequence >= {} AND sequence <= {}",
             self.range.first_sequence, self.range.last_sequence
@@ -132,6 +187,19 @@ impl OutputRange {
         let mut bytes = 0usize;
         let mut output = Vec::new();
         while let Some(batch) = stream.try_next().await.map_err(fail)? {
+            let batch = if let Some(projection) = &projection {
+                let row_ids = batch
+                    .column_by_name("_rowid")
+                    .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+                    .filter(|ids| ids.null_count() == 0)
+                    .ok_or_else(|| Error::Invalid("invalid Lance output row IDs".into()))?;
+                self.dataset
+                    .take_rows(row_ids.values(), projection.clone())
+                    .await
+                    .map_err(fail)?
+            } else {
+                batch
+            };
             bytes = bytes
                 .checked_add(batch.get_array_memory_size())
                 .ok_or_else(|| Error::Invalid("decoded Lance log size overflow".into()))?;
