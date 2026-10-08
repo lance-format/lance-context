@@ -1120,6 +1120,21 @@ pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
     if let Some(merge) = merge_sem {
         spawn_pool_poller(state.clone(), merge, TaskKinds::MERGE_WAL, false);
     }
+    if state.config.append.rollout_append_local
+        && state.config.append.rollout_append_local_task_concurrency > 0
+    {
+        // Reserve before claiming. A saturated legacy RPC pool cannot consume
+        // this capacity; buffers still use the process-wide local Arrow budget.
+        spawn_filtered_pool_poller(
+            state.clone(),
+            Arc::new(Semaphore::new(
+                state.config.append.rollout_append_local_task_concurrency,
+            )),
+            TaskKinds::MERGE_WAL,
+            false,
+            true,
+        );
+    }
     general
 }
 
@@ -1133,6 +1148,16 @@ fn spawn_pool_poller(
     pool: Arc<Semaphore>,
     kinds: TaskKinds,
     report_depth: bool,
+) -> tokio::task::JoinHandle<()> {
+    spawn_filtered_pool_poller(state, pool, kinds, report_depth, false)
+}
+
+fn spawn_filtered_pool_poller(
+    state: Arc<MasterState>,
+    pool: Arc<Semaphore>,
+    kinds: TaskKinds,
+    report_depth: bool,
+    resident_only: bool,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -1158,7 +1183,15 @@ fn spawn_pool_poller(
                     break;
                 };
                 let claim_start = std::time::Instant::now();
-                match state.task_store.claim_next_of_kinds(kinds).await {
+                let claim = if resident_only {
+                    state
+                        .task_store
+                        .claim_resident_merge(&state.config.append.rollout_append_targets)
+                        .await
+                } else {
+                    state.task_store.claim_next_of_kinds(kinds).await
+                };
+                match claim {
                     Ok(Some(claim)) => {
                         let claim_elapsed = claim_start.elapsed();
                         // Local capacity was reserved before the claim. No
@@ -2406,6 +2439,116 @@ mod tests {
         assert!(state.admission.status().drained());
         worker.abort();
         other_worker.abort();
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn reserved_resident_merge_finishes_while_legacy_pool_is_saturated() {
+        use axum::{routing::post, Json, Router};
+        use lance_context_core::{RolloutStore, RolloutStoreOptions};
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(Semaphore::new(0));
+        let app = Router::new().route(
+            "/api/v1/internal/merge-wal/{name}",
+            post({
+                let started = started.clone();
+                let release = release.clone();
+                move || {
+                    let started = started.clone();
+                    let release = release.clone();
+                    async move {
+                        started.notify_one();
+                        release.acquire().await.unwrap().forget();
+                        Json(serde_json::json!({"reclaimed": 1}))
+                    }
+                }
+            }),
+        );
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.merge_wal_concurrency = 1;
+        cfg.append.rollout_append_local = true;
+        cfg.append.rollout_append_targets = vec!["exp".into()];
+        cfg.catchup.shards = vec!["writer".into()];
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        cfg.worker_endpoints = vec![format!("http://{}", listener.local_addr().unwrap())];
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = MasterState::new(cfg).await.unwrap();
+        let writer = RolloutStore::open_with_options(
+            &state.rollout_uri("exp"),
+            RolloutStoreOptions {
+                shard_id: Some("writer".into()),
+                merge_after_generations: Some(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let dto = serde_json::from_value(serde_json::json!({
+            "id":"one", "rollout_id":"r", "content":"test"
+        }))
+        .unwrap();
+        writer
+            .add(&[lance_context_core::rollout_record_from_add_request(&dto)])
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        let legacy = enqueue(&state, TaskKind::MergeWal, "legacy-blocked")
+            .await
+            .unwrap();
+        let scheduler = spawn_scheduler(&state);
+        tokio::time::timeout(Duration::from_secs(10), started.notified())
+            .await
+            .unwrap();
+        let queued = enqueue(&state, TaskKind::MergeWal, "legacy-queued")
+            .await
+            .unwrap();
+        let resident = enqueue(&state, TaskKind::MergeWal, "exp").await.unwrap();
+        let result = await_terminal(&state, &resident.id).await;
+        assert_eq!(result.state, TaskState::Done, "{:?}", result.error);
+        assert_eq!(writer.pending_wal_generations().await.unwrap(), 0);
+        let reader = lance::Dataset::open(&state.rollout_uri("exp"))
+            .await
+            .unwrap();
+        assert_eq!(reader.count_rows(None).await.unwrap(), 1);
+        assert_eq!(
+            state
+                .task_store
+                .get(&legacy.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            TaskState::Running
+        );
+        assert_eq!(
+            state
+                .task_store
+                .get(&queued.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            TaskState::Queued
+        );
+        // The reserved poller obeys the same joined admission drain.
+        state.admission.begin_drain();
+        release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(10), state.admission.wait_drained())
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .task_store
+                .get(&queued.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            TaskState::Queued
+        );
+        scheduler.abort();
         server.abort();
     }
 

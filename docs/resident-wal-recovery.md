@@ -50,3 +50,14 @@ This removes external refill for already-owned resident tables. It does not
 certify cancellation of legacy unfenced worker handlers, fix serial worker
 flush scheduling, or replay an unsealed historical raw WAL tail. Those cases
 must retain their existing recovery protection until separately validated.
+
+Resident masters also reserve `ROLLOUT_APPEND_LOCAL_TASK_CONCURRENCY` task slots
+(default 1, 0 disables the reservation) in addition to `MERGE_WAL_CONCURRENCY`.
+Only locally enabled, owned, non-draining rollout merges can use these slots.
+Eligibility is checked before dependency reads or claim/lock mutation. The
+ordinary merge pool remains available to all merge tasks, including legacy
+worker RPCs; a legacy request cannot consume the reserved capacity. Local
+Arrow buffers still share `ROLLOUT_APPEND_LOCAL_MEMORY_BYTES` across both pools.
+Canonical claims, external catch-up ownership, progress watchdogs, and process
+admission drain apply equally to the reserved pool. This does not cancel an
+existing legacy owner of the same table.

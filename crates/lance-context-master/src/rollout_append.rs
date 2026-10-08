@@ -27,6 +27,14 @@ pub struct AppendConfig {
     /// Uses the ordinary durable task queue; creates no Kubernetes Jobs.
     #[arg(long, env = "ROLLOUT_APPEND_LOCAL", default_value_t = false)]
     pub rollout_append_local: bool,
+    /// Additional task slots reserved for owned local append merges. Legacy RPCs
+    /// cannot claim these slots. All local tasks share the existing Arrow budget.
+    #[arg(
+        long,
+        env = "ROLLOUT_APPEND_LOCAL_TASK_CONCURRENCY",
+        default_value_t = 1
+    )]
+    pub rollout_append_local_task_concurrency: usize,
     /// Shared Arrow-buffer budget across every local append task in this master.
     #[arg(
         long,
@@ -51,6 +59,7 @@ impl Default for AppendConfig {
             rollout_append_max_generations: 64,
             rollout_append_max_bytes: 67_108_864,
             rollout_append_local: false,
+            rollout_append_local_task_concurrency: 1,
             rollout_append_local_memory_bytes: 2_147_483_648,
             rollout_append_reconcile_interval_secs: 30,
         }

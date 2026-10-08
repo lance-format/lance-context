@@ -460,7 +460,26 @@ impl TaskStore {
     /// saturated one.
     pub async fn claim_next_of_kinds(&self, kinds: TaskKinds) -> lance::Result<Option<TaskClaim>> {
         self.inner.recover_orphaned().await?;
-        let (claim, dependency_failed) = self.inner.claim_next(kinds, None).await?;
+        let (claim, dependency_failed) = self.inner.claim_next(kinds, None, None).await?;
+        if dependency_failed {
+            if let Err(error) = self.prune_terminal_history().await {
+                tracing::warn!(error = %error, "failed to prune task history");
+            }
+        }
+        Ok(claim)
+    }
+
+    /// Reserved resident capacity filters before any dependency/ownership RPC.
+    /// Keep canonical claims and all external-owner/fencing checks unchanged.
+    pub(crate) async fn claim_resident_merge(
+        &self,
+        targets: &[String],
+    ) -> lance::Result<Option<TaskClaim>> {
+        self.inner.recover_orphaned().await?;
+        let (claim, dependency_failed) = self
+            .inner
+            .claim_next(TaskKinds::MERGE_WAL, None, Some(targets))
+            .await?;
         if dependency_failed {
             if let Err(error) = self.prune_terminal_history().await {
                 tracing::warn!(error = %error, "failed to prune task history");
@@ -485,7 +504,7 @@ impl TaskStore {
         }
         Ok(self
             .inner
-            .claim_next(TaskKinds::MERGE_WAL, Some((&id, job)))
+            .claim_next(TaskKinds::MERGE_WAL, Some((&id, job)), None)
             .await?
             .0)
     }
@@ -790,6 +809,7 @@ impl EtcdTaskStore {
         &self,
         kinds: TaskKinds,
         only_id: Option<(&str, &str)>,
+        resident_targets: Option<&[String]>,
     ) -> lance::Result<(Option<TaskClaim>, bool)> {
         let prefix = only_id.map_or_else(|| self.queue_prefix(), |(id, _)| self.queue_key(id));
         let range_end = if only_id.is_some() {
@@ -832,6 +852,15 @@ impl EtcdTaskStore {
                 // probe: an unrunnable kind should cost nothing, and this is
                 // what lets a scarce kind be found behind a dominant one.
                 if !kinds.contains(task.kind) {
+                    continue;
+                }
+                if resident_targets.is_some_and(|targets| {
+                    task.kind != TaskKind::MergeWal
+                        || task.target.starts_with("generic:")
+                        || !self.rollout.owned(&task.target)
+                        || self.rollout.draining(&task.target)
+                        || !targets.iter().any(|t| t == "*" || t == &task.target)
+                }) {
                     continue;
                 }
                 match self.dependency_status(&task).await? {
@@ -2495,6 +2524,84 @@ mod tests {
         cfg.maintenance.compaction_prepare_targets = vec!["*".into()];
         let store = TaskStore::open(&cfg).await.unwrap();
         (dir, cfg, store)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn resident_claim_filter_preserves_legacy_draining_and_external_owners() {
+        let (_dir, mut cfg, _) = preparation_test_store().await;
+        cfg.merge_rollout.owned_targets = ["hot", "draining", "excluded", "external", "generic:gs"]
+            .map(str::to_owned)
+            .to_vec();
+        cfg.merge_rollout.drain_targets = vec!["draining".into()];
+        let store = TaskStore::open(&cfg).await.unwrap();
+        let mut queued = Vec::new();
+        for target in [
+            "legacy",
+            "draining",
+            "excluded",
+            "external",
+            "generic:gs",
+            "hot",
+        ] {
+            queued.push(
+                store
+                    .enqueue(TaskKind::MergeWal, target, vec![])
+                    .await
+                    .unwrap(),
+            );
+        }
+        let key = crate::catchup::store::active_key(&cfg.etcd.etcd_prefix, "external");
+        store
+            .inner
+            .client
+            .clone()
+            .put(key.clone(), "external-owner", None)
+            .await
+            .unwrap();
+        let targets = ["hot", "draining", "external", "generic:gs"].map(str::to_owned);
+        let claim = store.claim_resident_merge(&targets).await.unwrap().unwrap();
+        assert_eq!(claim.task.target, "hot");
+        // A second replica cannot take the running canonical task.
+        let other = TaskStore::open(&cfg).await.unwrap();
+        assert!(other
+            .claim_resident_merge(&targets)
+            .await
+            .unwrap()
+            .is_none());
+        for task in &queued[..5] {
+            assert_eq!(
+                store.get(&task.id).await.unwrap().unwrap().state,
+                TaskState::Queued
+            );
+        }
+        assert_eq!(
+            store.inner.get_text(&key).await.unwrap().as_deref(),
+            Some("external-owner")
+        );
+        store.finish(claim, Ok("done".into())).await.unwrap();
+        let wildcard = store
+            .claim_resident_merge(&["*".into()])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(wildcard.task.target, "excluded");
+        store.finish(wildcard, Ok("done".into())).await.unwrap();
+        assert!(store
+            .claim_resident_merge(&["*".into()])
+            .await
+            .unwrap()
+            .is_none());
+        store
+            .inner
+            .client
+            .clone()
+            .delete(
+                cfg.etcd.etcd_prefix,
+                Some(etcd_client::DeleteOptions::new().with_prefix()),
+            )
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
