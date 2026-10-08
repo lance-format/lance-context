@@ -34,6 +34,14 @@ pub struct AppendConfig {
         default_value_t = 2_147_483_648
     )]
     pub rollout_append_local_memory_bytes: usize,
+    /// Fleet-wide manifest discovery interval for resident owned targets; 0 disables.
+    /// Independent of full stats scans. At most four tables and two readers per batch.
+    #[arg(
+        long,
+        env = "ROLLOUT_APPEND_RECONCILE_INTERVAL_SECS",
+        default_value_t = 30
+    )]
+    pub rollout_append_reconcile_interval_secs: u64,
 }
 impl Default for AppendConfig {
     fn default() -> Self {
@@ -44,6 +52,7 @@ impl Default for AppendConfig {
             rollout_append_max_bytes: 67_108_864,
             rollout_append_local: false,
             rollout_append_local_memory_bytes: 2_147_483_648,
+            rollout_append_reconcile_interval_secs: 30,
         }
     }
 }
@@ -112,7 +121,7 @@ impl AppendConfig {
 #[derive(Clone)]
 pub(crate) struct LocalStaging {
     pub(crate) budget: Arc<lance_context_core::MergeMemoryBudget>,
-    session: Arc<lance::session::Session>,
+    pub(crate) session: Arc<lance::session::Session>,
 }
 
 impl LocalStaging {
@@ -288,8 +297,19 @@ pub(crate) async fn run(state: &Arc<MasterState>, target: &str) -> Result<String
         let reclaimed = run_pass(state, target, &endpoints, &shards, &mut coordinator).await?;
         total += reclaimed;
         if reclaimed == 0 {
-            break;
+            return Ok(format!("staged append reclaimed {total} generations"));
         }
+    }
+    if local_execution {
+        // Publish before this task releases its claim. The demand consumer only
+        // acknowledges a queued successor, never this still-running task. A
+        // crash before publication is covered by resident manifest discovery.
+        state
+            .task_store
+            .merge_coordinator()
+            .request_merge(target)
+            .await?;
+        metrics::counter!("master_resident_merge_continuations_total").increment(1);
     }
     Ok(format!("staged append reclaimed {total} generations"))
 }

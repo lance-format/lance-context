@@ -931,7 +931,7 @@ async fn should_probe_failure(
     false
 }
 
-async fn enqueue_merge_request(
+pub(crate) async fn enqueue_merge_request(
     state: &Arc<MasterState>,
     coordinator: &lance_context_merge::Coordinator,
     request: &lance_context_merge::rollout::MergeRequest,
@@ -958,6 +958,7 @@ async fn enqueue_merge_request(
 /// `MasterState` immediately after.
 pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
     crate::wal_tail::spawn(state);
+    crate::resident_recovery::spawn(state);
     // Retry metadata independently of coarse stats sweeps. Every replica may
     // enqueue; the existing task dedupe/claim transaction elects one executor.
     let retry_state = state.clone();

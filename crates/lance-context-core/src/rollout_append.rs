@@ -377,6 +377,29 @@ impl AppendCoordinator {
         self.dataset.version().version
     }
 
+    /// Read only latest manifests for explicitly configured writer identities.
+    /// No writer opens, raw WAL replay, generation payload reads, or publication.
+    /// Committed-but-undrained generations also need a maintenance pass.
+    pub async fn has_sealed_wal(&self, shards: &[String]) -> Result<bool> {
+        if shards.is_empty() || shards.len() > 256 {
+            return Err(Error::invalid_input(
+                "expected 1..=256 WAL shard identities",
+            ));
+        }
+        let mut seen = HashSet::new();
+        for name in shards {
+            let id = derive_shard_id(Some(name));
+            if seen.insert(id) {
+                if let Some(manifest) = shard_store(&self.dataset, id).await?.read_latest().await? {
+                    if !manifest.flushed_generations.is_empty() {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        Ok(false)
+    }
+
     pub async fn plan(
         &mut self,
         shards: &[String],

@@ -7,6 +7,7 @@ pub mod discovery;
 pub mod error;
 mod maintenance_execution;
 mod merge_execution;
+mod resident_recovery;
 pub mod rollout_append;
 pub mod routes;
 pub mod scanner;
