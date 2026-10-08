@@ -732,7 +732,7 @@ async fn merge_progress(
         .map_err(MasterError::Internal)?
     else {
         return Ok(Json(
-            serde_json::json!({"target": query.target, "task_id": task_id, "status": if task_id.is_some() { "progress_unknown" } else { "no_active_merge" }}),
+            serde_json::json!({"target": query.target, "task_id": task_id, "status": if task_id.is_some() { "progress_unknown" } else { "no_active_record" }}),
         ));
     };
     let progress = coordinator
@@ -953,7 +953,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(report["status"], "no_active_merge");
+        assert_eq!(report["status"], "no_active_record");
     }
 
     fn test_record(id: &str, with_blob: bool) -> RolloutRecord {

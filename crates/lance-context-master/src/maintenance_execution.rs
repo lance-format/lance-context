@@ -161,14 +161,14 @@ async fn watch(
 ) -> String {
     let mut sequence = scope.completed_steps();
     let mut changed = tokio::time::Instant::now();
-    let mut last_progress_at_ms = lance_context_merge::failure::now_ms();
+    let mut last_progress_at_ms = (sequence > 0).then(lance_context_merge::failure::now_ms);
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
         let current = scope.completed_steps();
         if current != sequence {
             changed = tokio::time::Instant::now();
             sequence = current;
-            last_progress_at_ms = lance_context_merge::failure::now_ms();
+            last_progress_at_ms = Some(lance_context_merge::failure::now_ms());
         }
         if changed.elapsed() >= Duration::from_secs(execution.idle_timeout_secs) {
             tracing::warn!(target = %execution.target, execution = %execution.id, task_id, executor_id,
