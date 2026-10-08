@@ -841,6 +841,94 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn persisted_preparation_conflict_is_corrected_without_clearing_budget() {
+        let (coordinator, mut client, proof, lease) = fixture().await;
+        let error = "Invalid user input: index metadata changed; reprepare, crates/lance-context-core/src/store_base.rs:1529:24";
+        let endpoint = "master:index_id";
+        // Reproduce the previous binary's durable one-hour permanent-error record.
+        let mut old = coordinator
+            .record_failure(&proof, "table", endpoint, "schema mismatch")
+            .await
+            .unwrap();
+        old.last_error = error.into();
+        old.consecutive_attempts = 4;
+        let records = client
+            .get(
+                format!("{}/merge-failures/", coordinator.prefix),
+                Some(etcd_client::GetOptions::new().with_prefix()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(records.kvs().len(), 1);
+        let key = records.kvs()[0].key().to_vec();
+        let encoded = serde_json::to_vec(&old).unwrap();
+        client
+            .put(key.clone(), encoded.clone(), None)
+            .await
+            .unwrap();
+
+        let reconnected = Coordinator::new(client.clone(), coordinator.prefix.clone());
+        let corrected = reconnected
+            .failure("table", endpoint)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(corrected.class, failure::FailureClass::Retryable);
+        assert_eq!(corrected.consecutive_attempts, 4);
+        assert_eq!(corrected.next_retry_ms, old.last_failure_ms + 60_000);
+        assert!(!corrected.needs_attention);
+        let (page, next) = reconnected.failure_page(None, 1).await.unwrap();
+        assert!(next.is_none());
+        assert_eq!(
+            serde_json::to_value(&page[0]).unwrap(),
+            serde_json::to_value(&corrected).unwrap()
+        );
+        // Reads neither change persisted data nor release ownership.
+        assert_eq!(
+            client.get(key.clone(), None).await.unwrap().kvs()[0].value(),
+            encoded
+        );
+        assert_eq!(
+            client.get(proof.key.clone(), None).await.unwrap().kvs()[0].value(),
+            proof.token.as_bytes()
+        );
+
+        let next = reconnected
+            .record_failure(&proof, "table", endpoint, error)
+            .await
+            .unwrap();
+        assert_eq!(next.consecutive_attempts, 5);
+        assert_eq!(next.class, failure::FailureClass::Retryable);
+        assert_eq!(next.next_retry_ms, next.last_failure_ms + 120_000);
+        client.lease_revoke(lease).await.unwrap();
+        assert!(reconnected
+            .record_failure(&proof, "table", endpoint, error)
+            .await
+            .is_err());
+        assert!(reconnected
+            .clear_failure(&proof, "table", endpoint)
+            .await
+            .is_err());
+        assert_eq!(
+            reconnected
+                .failure("table", endpoint)
+                .await
+                .unwrap()
+                .unwrap()
+                .consecutive_attempts,
+            5
+        );
+        client
+            .delete(
+                coordinator.prefix.clone(),
+                Some(etcd_client::DeleteOptions::new().with_prefix()),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
     async fn failure_budget_survives_reconnect_and_lost_claim_cannot_clear_it() {
         let (coordinator, mut client, proof, lease) = fixture().await;
         for count in 1..=3 {

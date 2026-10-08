@@ -36,6 +36,16 @@ the original snapshot read version, allowing Lance to check intervening commits
 as well. Newly appended fragments remain unindexed and query planning scans them;
 index publication must preserve merge watermarks and newly appended rows.
 
+These exact stale-preparation validation failures use the ordinary bounded retry
+budget, even when Lance wraps them as `Invalid user input`. The first two failed
+attempts wait two seconds; repeated failures back off and eventually require
+attention. Existing records incorrectly classified as data/configuration errors
+are interpreted with the corrected policy on read, retaining their original
+failure time and attempt count. This does not clear durable records or change
+ownership. Arbitrary invalid input, corruption, and permission errors retain
+their longer cooldown. During a rolling upgrade, older masters may still honor
+the previously stored cooldown until the table is handled by a new master.
+
 The progress watchdog counts completed data/index reads and upload parts,
 including IO from child tasks. Response headers, metadata polling and failed IO
 do not count. Lance 9 does not report fine-grained progress from its basic BTree
