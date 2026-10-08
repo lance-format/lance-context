@@ -3885,6 +3885,7 @@ dependencies = [
  "arrow-select",
  "async-trait",
  "base64",
+ "bytes",
  "chrono",
  "clap",
  "datafusion",

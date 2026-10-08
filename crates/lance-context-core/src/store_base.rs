@@ -131,6 +131,18 @@ impl PreparedCompaction {
     }
 }
 
+/// Immutable index files built against one snapshot. The publishing handle
+/// must be opened separately under commit ownership; no authorization or
+/// mutable dataset handle escapes preparation.
+#[derive(Debug)]
+pub struct PreparedKeyIndex {
+    uri: String,
+    schema: Schema,
+    fragments: Vec<lance_table::format::Fragment>,
+    index: lance_table::format::IndexMetadata,
+    replaced: Vec<lance_table::format::IndexMetadata>,
+}
+
 /// Execute only the first `max_source_fragments` from a Lance compaction plan.
 ///
 /// Lance's built-in `max_source_fragments` stops before a whole planned task
@@ -1437,6 +1449,101 @@ impl StorageBase {
         self.reload().await
     }
 
+    /// Build files only. Callers must open this handle in a preparation-only
+    /// write scope so even an unexpected metadata write is rejected.
+    pub async fn prepare_key_index(&self) -> LanceResult<PreparedKeyIndex> {
+        self.ensure_writable()?;
+        let mut snapshot = self.dataset.clone();
+        let replaced = snapshot
+            .load_indices()
+            .await?
+            .iter()
+            .filter(|index| index.name == ID_INDEX_NAME)
+            .cloned()
+            .collect();
+        let kind = match self.key_index_type {
+            crate::KeyIndexType::Btree => IndexType::BTree,
+            crate::KeyIndexType::Zonemap => IndexType::ZoneMap,
+        };
+        let index = snapshot
+            .create_index_builder(
+                &[self.key_column.as_str()],
+                kind,
+                &ScalarIndexParams::default(),
+            )
+            .name(ID_INDEX_NAME.to_string())
+            .replace(true)
+            .execute_uncommitted()
+            .await?;
+        Ok(PreparedKeyIndex {
+            uri: snapshot.uri().to_owned(),
+            schema: Schema::from(snapshot.schema()),
+            fragments: snapshot.manifest().fragments.as_ref().clone(),
+            index,
+            replaced,
+        })
+    }
+
+    /// Publish on a fresh fenced handle. Appends may have added uncovered
+    /// fragments; changes to the indexed snapshot or same-name index require
+    /// rebuilding. Keep the original read version for Lance conflict checks.
+    pub async fn commit_prepared_key_index(
+        &mut self,
+        prepared: PreparedKeyIndex,
+    ) -> LanceResult<()> {
+        use lance::dataset::transaction::{Operation, Transaction};
+        use lance::dataset::write::CommitBuilder;
+
+        self.ensure_writable()?;
+        self.dataset.checkout_latest().await?;
+        if prepared.uri != self.dataset.uri()
+            || prepared.schema != Schema::from(self.dataset.schema())
+        {
+            return Err(LanceError::invalid_input(
+                "index dataset or schema changed; reprepare",
+            ));
+        }
+        let sources: HashMap<_, _> = self
+            .dataset
+            .manifest()
+            .fragments
+            .iter()
+            .map(|f| (f.id, f))
+            .collect();
+        if prepared
+            .fragments
+            .iter()
+            .any(|old| sources.get(&old.id).copied() != Some(old))
+        {
+            return Err(LanceError::invalid_input(
+                "index source fragment changed; reprepare",
+            ));
+        }
+        let current = self.dataset.load_indices().await?;
+        let replaced: Vec<_> = current
+            .iter()
+            .filter(|index| index.name == prepared.index.name)
+            .cloned()
+            .collect();
+        if replaced != prepared.replaced {
+            return Err(LanceError::invalid_input(
+                "index metadata changed; reprepare",
+            ));
+        }
+        let transaction = Transaction::new(
+            prepared.index.dataset_version,
+            Operation::CreateIndex {
+                new_indices: vec![prepared.index],
+                removed_indices: prepared.replaced,
+            },
+            None,
+        );
+        self.dataset = CommitBuilder::new(Arc::new(self.dataset.clone()))
+            .execute(transaction)
+            .await?;
+        self.reload().await
+    }
+
     /// Evolve an older base table to the store's latest additive schema.
     ///
     /// Missing nullable columns are added as all-null arrays. Existing unknown
@@ -2188,23 +2295,38 @@ impl StorageBase {
         storage_options: Option<HashMap<String, String>>,
         session: Option<Arc<Session>>,
     ) -> LanceResult<Dataset> {
-        let store_params = storage_options.clone().map(|options| ObjectStoreParams {
+        let mut store_params = storage_options.clone().map(|options| ObjectStoreParams {
             storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
                 options,
             ))),
             ..Default::default()
         });
+        if let Some(wrapper) = crate::merge_write_scope::preparation_store_wrapper() {
+            store_params
+                .get_or_insert_with(ObjectStoreParams::default)
+                .object_store_wrapper = Some(wrapper);
+        }
         let handler = lance_table::io::commit::commit_handler_from_url(uri, &store_params).await?;
-        let mut builder = DatasetBuilder::from_uri(uri).with_commit_handler(Arc::new(
-            crate::merge_write_scope::GuardedCommit::new(handler),
-        ));
+        let mut builder = DatasetBuilder::from_uri(uri)
+            .with_read_params(lance::dataset::ReadParams {
+                store_options: store_params,
+                ..Default::default()
+            })
+            .with_commit_handler(Arc::new(crate::merge_write_scope::GuardedCommit::new(
+                handler,
+            )));
         if let Some(options) = storage_options {
             builder = builder.with_storage_options(options);
         }
         if let Some(session) = session {
             builder = builder.with_session(session);
         }
-        builder.load().await
+        let dataset = builder.load().await?;
+        if crate::merge_write_scope::observes_preparation_io() {
+            let store = dataset.object_store(None).await?;
+            crate::merge_write_scope::register_local_preparation_io(&store);
+        }
+        Ok(dataset)
     }
 
     /// Create an empty Lance dataset with `schema` at `uri`.

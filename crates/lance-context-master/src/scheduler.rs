@@ -15,10 +15,9 @@
 //!   The master cannot do this itself without fencing the live shard writer, so
 //!   it fans out to every configured worker endpoint and each worker merges its
 //!   own shard (`POST /api/v1/internal/merge-wal/{name}`).
-//! - **IndexId** — builds a ZoneMap scalar index on the base table's `id` column
-//!   (runs locally on the master). It commits a `CreateIndex`, which can conflict
-//!   with a concurrent `Compact` `Rewrite` on the same dataset, so it shares the
-//!   per-name task-store lock with `Compact`.
+//! - **IndexId** — builds the configured scalar index on `id` locally. Opted-in
+//!   targets prepare immutable files without table write ownership, then acquire
+//!   the shared writer fence to validate and publish the index metadata.
 //!
 //! Each task runs in its own `tokio::spawn`, so one task's failure never affects
 //! another. A global [`Semaphore`] bounds how many run at once.
@@ -148,7 +147,9 @@ async fn run_task(state: &Arc<MasterState>, mut claim: TaskClaim, timing: TaskCl
 
     let started = std::time::Instant::now();
     let mut refresh_compaction_stats = false;
-    let outcome = if claim.preparing_compaction() {
+    let outcome = if claim.preparing_maintenance() && task.kind == TaskKind::IndexId {
+        run_prepared_index(state, &mut claim).await
+    } else if claim.preparing_maintenance() {
         run_prepared_compaction(state, &mut claim)
             .await
             .map(|(detail, changed)| {
@@ -359,11 +360,11 @@ impl lance_context_core::merge_write_scope::CommitAuthorizer for PreparationOnly
         _: &'a str,
         _: u64,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = lance::Result<()>> + Send + 'a>> {
-        Box::pin(async { Err(lance::Error::io("compaction preparation cannot commit")) })
+        Box::pin(async { Err(lance::Error::io("maintenance preparation cannot commit")) })
     }
 }
 
-async fn watch_compaction_preparation(
+async fn watch_maintenance_preparation(
     state: &Arc<MasterState>,
     claim: &TaskClaim,
     scope: &lance_context_core::merge_write_scope::MergeWriteScope,
@@ -374,7 +375,7 @@ async fn watch_compaction_preparation(
         tokio::time::sleep(Duration::from_secs(2)).await;
         match state.task_store.preparation_owned(claim).await {
             Ok(true) => {}
-            Ok(false) => return "compaction preparation claim lost".into(),
+            Ok(false) => return "maintenance preparation claim lost".into(),
             Err(error) => return error.to_string(),
         }
         let current = scope.completed_steps();
@@ -385,23 +386,27 @@ async fn watch_compaction_preparation(
         if changed.elapsed()
             >= Duration::from_secs(state.config.maintenance.maintenance_idle_timeout_secs)
         {
-            return "compaction preparation made no progress".into();
+            return "maintenance preparation made no progress".into();
         }
     }
 }
 
-async fn wait_for_compaction_commit(
+async fn wait_for_maintenance_commit(
     state: &Arc<MasterState>,
     claim: &mut TaskClaim,
 ) -> Result<(), String> {
     let waiting = std::time::Instant::now();
+    let wait_budget = match claim.task.kind {
+        TaskKind::IndexId => state.config.maintenance.index_commit_wait_secs,
+        _ => state.config.maintenance.compaction_commit_wait_secs,
+    };
     if !state
         .task_store
-        .request_compaction_commit(claim)
+        .request_maintenance_commit(claim)
         .await
         .map_err(|e| e.to_string())?
     {
-        return Err("compaction preparation claim lost before requesting commit".into());
+        return Err("maintenance preparation claim lost before requesting commit".into());
     }
     loop {
         if !state
@@ -410,11 +415,11 @@ async fn wait_for_compaction_commit(
             .await
             .map_err(|e| e.to_string())?
         {
-            return Err("compaction preparation claim lost before commit".into());
+            return Err("maintenance preparation claim lost before commit".into());
         }
         if state
             .task_store
-            .promote_compaction(claim)
+            .promote_maintenance(claim)
             .await
             .map_err(|e| e.to_string())?
         {
@@ -422,10 +427,8 @@ async fn wait_for_compaction_commit(
         }
         // Check only after promotion has definitively declined. Never cancel
         // an in-flight acquisition and mistake an accepted claim for a timeout.
-        if waiting.elapsed()
-            >= Duration::from_secs(state.config.maintenance.compaction_commit_wait_secs)
-        {
-            return Err("compaction commit ownership wait budget exhausted; reprepare".into());
+        if waiting.elapsed() >= Duration::from_secs(wait_budget) {
+            return Err("maintenance commit ownership wait budget exhausted; reprepare".into());
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -438,7 +441,7 @@ async fn run_prepared_compaction(
     let target = claim.task.target.clone();
     let (_, name) = parse_target(&target);
     let uri = state.rollout_uri(name);
-    let scope = lance_context_core::merge_write_scope::MergeWriteScope::with_pinned_authorizer(
+    let scope = lance_context_core::merge_write_scope::MergeWriteScope::with_preparation_authorizer(
         Arc::new(PreparationOnly),
     );
     let began = std::time::Instant::now();
@@ -456,7 +459,7 @@ async fn run_prepared_compaction(
         });
         tokio::select! {
             result = work => result?,
-            error = watch_compaction_preparation(state, claim, &scope) => return Err(error),
+            error = watch_maintenance_preparation(state, claim, &scope) => return Err(error),
         }
     };
     metrics::histogram!("master_compaction_phase_duration_seconds", "phase" => "prepare")
@@ -476,7 +479,7 @@ async fn run_prepared_compaction(
     }
     let waiting = std::time::Instant::now();
     tracing::info!(task = %claim.task.id, target = %claim.task.target, seconds = began.elapsed().as_secs_f64(), "compaction files ready; waiting for commit ownership");
-    wait_for_compaction_commit(state, claim).await?;
+    wait_for_maintenance_commit(state, claim).await?;
     metrics::histogram!("master_compaction_phase_duration_seconds", "phase" => "commit_wait")
         .record(waiting.elapsed().as_secs_f64());
     // No preparation handle is reused: only this scope may authorize metadata
@@ -545,7 +548,7 @@ async fn finish_compaction(
     ))
 }
 
-/// Build a ZoneMap scalar index on one experiment's `id` column. Shares the
+/// Build the configured scalar index on one experiment's `id` column. Shares the
 /// per-name base-table write gate with [`run_compaction`] so an `IndexId` and a
 /// `Compact` for the same experiment never commit concurrently (`CreateIndex`
 /// vs `Rewrite` can conflict). Distinct experiments index concurrently.
@@ -570,6 +573,63 @@ async fn index_id_inner(state: &Arc<MasterState>, name: &str) -> Result<String, 
         "built {} index on id",
         state.config.key_index_type.as_str()
     ))
+}
+
+async fn run_prepared_index(
+    state: &Arc<MasterState>,
+    claim: &mut TaskClaim,
+) -> Result<String, String> {
+    let uri = state.rollout_uri(&claim.task.target);
+    let scope = lance_context_core::merge_write_scope::MergeWriteScope::with_preparation_authorizer(
+        Arc::new(PreparationOnly),
+    );
+    let began = std::time::Instant::now();
+    tracing::info!(task = %claim.task.id, target = %claim.task.target,
+        "index file preparation started without table ownership");
+    let prepared = {
+        let work = scope.run(async {
+            let store =
+                RolloutStore::open_existing_with_options(&uri, state.rollout_store_options())
+                    .await
+                    .map_err(|e| e.to_string())?;
+            store
+                .prepare_id_key_index()
+                .await
+                .map_err(|e| e.to_string())
+        });
+        tokio::select! {
+            result = work => result?,
+            error = watch_maintenance_preparation(state, claim, &scope) => return Err(error),
+        }
+    };
+    metrics::histogram!("master_index_phase_duration_seconds", "phase" => "prepare")
+        .record(began.elapsed().as_secs_f64());
+    tracing::info!(task = %claim.task.id, target = %claim.task.target,
+        seconds = began.elapsed().as_secs_f64(), "index files ready; waiting for commit ownership");
+    let waiting = std::time::Instant::now();
+    wait_for_maintenance_commit(state, claim).await?;
+    metrics::histogram!("master_index_phase_duration_seconds", "phase" => "commit_wait")
+        .record(waiting.elapsed().as_secs_f64());
+    crate::maintenance_execution::reconcile_previous(state, claim).await?;
+    let started = std::time::Instant::now();
+    let result = crate::maintenance_execution::run(state, claim, async {
+        let mut store =
+            RolloutStore::open_existing_with_options(&uri, state.rollout_store_options())
+                .await
+                .map_err(|e| e.to_string())?;
+        store
+            .commit_prepared_id_key_index(prepared)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(format!(
+            "built {} index on id (prepared outside write lock)",
+            state.config.key_index_type.as_str()
+        ))
+    })
+    .await;
+    metrics::histogram!("master_index_phase_duration_seconds", "phase" => "commit")
+        .record(started.elapsed().as_secs_f64());
+    result
 }
 
 async fn compact_inner(
@@ -1215,7 +1275,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let merge_id = merge.task.id.clone();
-        let error = wait_for_compaction_commit(&state, &mut prep)
+        let error = wait_for_maintenance_commit(&state, &mut prep)
             .await
             .unwrap_err();
         assert!(error.contains("wait budget exhausted"));
@@ -1253,7 +1313,9 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        wait_for_compaction_commit(&state, &mut next).await.unwrap();
+        wait_for_maintenance_commit(&state, &mut next)
+            .await
+            .unwrap();
         state
             .task_store
             .finish(next, Ok("retry acquired free writer".into()))
@@ -1437,7 +1499,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(claim.preparing_compaction());
+        assert!(claim.preparing_maintenance());
         run_task(
             &state,
             claim,
@@ -2023,6 +2085,51 @@ mod tests {
         assert_eq!(status.detail.as_deref(), Some("built btree index on id"));
 
         worker.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn prepared_index_task_runs_with_fenced_publication() {
+        for kind in [
+            lance_context_core::KeyIndexType::Btree,
+            lance_context_core::KeyIndexType::Zonemap,
+        ] {
+            let dir = TempDir::new().unwrap();
+            let mut cfg = config(&dir);
+            cfg.maintenance.index_prepare_targets = vec!["exp".into()];
+            cfg.merge_rollout.owned_targets = vec!["exp".into()];
+            cfg.key_index_type = kind;
+            let state = MasterState::new(cfg).await.unwrap();
+            let uri = state.rollout_uri("exp");
+            let mut writer = RolloutStore::open(&uri).await.unwrap();
+            writer.add(&[rollout_record("seed")]).await.unwrap();
+            writer.cleanup_own_shard().await.unwrap();
+            let task = enqueue(&state, TaskKind::IndexId, "exp").await.unwrap();
+            let claim = state
+                .task_store
+                .claim_next_of_kinds(TaskKinds::GENERAL.without_compact())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(claim.preparing_maintenance());
+            run_task(&state, claim, TaskClaimTiming::default()).await;
+            let status = state.task_store.get(&task.id).await.unwrap().unwrap();
+            assert_eq!(status.state, TaskState::Done, "{status:?}");
+            assert_eq!(
+                status.detail,
+                Some(format!(
+                    "built {} index on id (prepared outside write lock)",
+                    kind.as_str()
+                ))
+            );
+            assert!(state
+                .task_store
+                .merge_coordinator()
+                .get("exp")
+                .await
+                .unwrap()
+                .is_none());
+        }
     }
 
     #[tokio::test]

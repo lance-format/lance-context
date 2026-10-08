@@ -16,6 +16,7 @@ pub mod merge_budget;
 pub mod merge_write_scope;
 pub mod metrics;
 mod namespace;
+mod preparation_io;
 mod record;
 mod registry;
 mod registry_etcd;
@@ -103,4 +104,4 @@ pub use lance::Error as LanceError;
 // capacity-bounded cache session across all resident rollout stores.
 pub use lance::session::Session;
 
-pub use store_base::PreparedCompaction;
+pub use store_base::{PreparedCompaction, PreparedKeyIndex};

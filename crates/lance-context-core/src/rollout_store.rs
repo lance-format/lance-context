@@ -737,6 +737,19 @@ impl RolloutStore {
         self.base.create_configured_key_index().await
     }
 
+    /// Build immutable key-index files without publishing a table version.
+    pub async fn prepare_id_key_index(&self) -> LanceResult<crate::PreparedKeyIndex> {
+        self.base.prepare_key_index().await
+    }
+
+    /// Publish prepared key-index files under fresh table write ownership.
+    pub async fn commit_prepared_id_key_index(
+        &mut self,
+        prepared: crate::PreparedKeyIndex,
+    ) -> LanceResult<()> {
+        self.base.commit_prepared_key_index(prepared).await
+    }
+
     /// Explicitly create a BTree, independent of the configured merge policy.
     pub async fn create_id_btree_index(&mut self) -> LanceResult<()> {
         self.base.create_key_btree_index().await

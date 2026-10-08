@@ -45,7 +45,9 @@ pub trait CommitAuthorizer: std::fmt::Debug + Send + Sync {
 
 #[derive(Debug, Default)]
 pub struct MergeWriteScope {
-    completed_steps: AtomicU64,
+    completed_steps: Arc<AtomicU64>,
+    observe_file_io: bool,
+    local_io: Mutex<Vec<(lance_io::utils::tracking_store::IOTracker, u64)>>,
     progress: Mutex<Progress>,
     changed: Notify,
     authorizer: Option<Arc<dyn CommitAuthorizer>>,
@@ -55,7 +57,18 @@ pub struct MergeWriteScope {
 
 impl MergeWriteScope {
     pub fn completed_steps(&self) -> u64 {
-        self.completed_steps.load(Ordering::Relaxed)
+        self.local_io.lock().unwrap().iter().fold(
+            self.completed_steps.load(Ordering::Relaxed),
+            |steps, (tracker, baseline)| {
+                let stats = tracker.stats();
+                steps.saturating_add(
+                    stats
+                        .read_bytes
+                        .saturating_add(stats.written_bytes)
+                        .saturating_sub(*baseline),
+                )
+            },
+        )
     }
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
@@ -75,6 +88,17 @@ impl MergeWriteScope {
         Arc::new(Self {
             authorizer: Some(authorizer),
             pin_opened_handles: true,
+            ..Self::default()
+        })
+    }
+
+    /// Preparation reads/writes immutable files. Observe successful file IO so
+    /// long scans do not appear idle when Lance omits training callbacks.
+    pub fn with_preparation_authorizer(authorizer: Arc<dyn CommitAuthorizer>) -> Arc<Self> {
+        Arc::new(Self {
+            authorizer: Some(authorizer),
+            pin_opened_handles: true,
+            observe_file_io: true,
             ..Self::default()
         })
     }
@@ -138,6 +162,47 @@ pub(crate) fn write_progress() -> lance::dataset::write::WriteProgressFn {
             }
         }
     })
+}
+
+/// Capture only the preparation scope. Cached handles from ordinary writers
+/// must never acquire another task's diagnostic counter.
+pub(crate) fn preparation_store_wrapper(
+) -> Option<Arc<dyn lance_io::object_store::WrappingObjectStore>> {
+    CURRENT
+        .try_with(|scope| {
+            scope.observe_file_io.then(|| {
+                Arc::new(crate::preparation_io::ProgressWrapper(
+                    scope.completed_steps.clone(),
+                )) as Arc<dyn lance_io::object_store::WrappingObjectStore>
+            })
+        })
+        .ok()
+        .flatten()
+}
+
+pub(crate) fn observes_preparation_io() -> bool {
+    CURRENT
+        .try_with(|scope| scope.observe_file_io)
+        .unwrap_or(false)
+}
+
+/// Lance's direct local/uring readers and writers bypass ObjectStore wrappers.
+/// Their tracker records completed byte IO. The unique preparation wrapper in
+/// the store params isolates this handle's tracker from other cached stores.
+pub(crate) fn register_local_preparation_io(store: &ObjectStore) {
+    if !store.is_local() {
+        return;
+    }
+    let _ = CURRENT.try_with(|scope| {
+        if scope.observe_file_io {
+            let tracker = store.io_tracker().clone();
+            let stats = tracker.stats();
+            scope.local_io.lock().unwrap().push((
+                tracker,
+                stats.read_bytes.saturating_add(stats.written_bytes),
+            ));
+        }
+    });
 }
 
 pub(crate) async fn authorize(resource: &str, version: u64) -> Result<()> {

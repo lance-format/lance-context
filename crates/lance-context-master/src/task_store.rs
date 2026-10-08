@@ -119,6 +119,7 @@ struct EtcdTaskStore {
     prefix: String,
     lease_ttl: i64,
     prepare_targets: Vec<String>,
+    index_prepare_targets: Vec<String>,
     maintenance_catchup_targets: Vec<String>,
     rollout: lance_context_merge::rollout::MergeRollout,
 }
@@ -131,7 +132,7 @@ pub struct TaskClaim {
 }
 
 impl TaskClaim {
-    pub(crate) fn preparing_compaction(&self) -> bool {
+    pub(crate) fn preparing_maintenance(&self) -> bool {
         self.backend.preparation_key.is_some() && self.backend.target_key.is_none()
     }
 }
@@ -186,7 +187,10 @@ impl TaskStore {
     /// Ask subsequent merge admissions to yield after files are ready. This
     /// marker shares the preparation lease: crash/finish removes the request.
     /// It grants no write ownership and never cancels an admitted merge.
-    pub(crate) async fn request_compaction_commit(&self, claim: &TaskClaim) -> lance::Result<bool> {
+    pub(crate) async fn request_maintenance_commit(
+        &self,
+        claim: &TaskClaim,
+    ) -> lance::Result<bool> {
         let Some(preparation) = &claim.backend.preparation_key else {
             return Ok(false);
         };
@@ -208,13 +212,13 @@ impl TaskStore {
             )
             .await
             .map(|r| r.succeeded())
-            .map_err(etcd_error("request compaction commit turn"))
+            .map_err(etcd_error("request maintenance commit turn"))
     }
 
     /// Acquire the existing table writer protocol only after immutable files
     /// are ready. An ambiguous response can adopt only this claim's own token.
-    pub(crate) async fn promote_compaction(&self, claim: &mut TaskClaim) -> lance::Result<bool> {
-        assert!(claim.preparing_compaction());
+    pub(crate) async fn promote_maintenance(&self, claim: &mut TaskClaim) -> lance::Result<bool> {
+        assert!(claim.preparing_maintenance());
         let b = &claim.backend;
         let target = &claim.task.target;
         let execution_key = lance_context_merge::execution_key(&self.inner.prefix, target);
@@ -296,7 +300,7 @@ impl TaskStore {
                 {
                     true
                 } else {
-                    return Err(etcd_error("promote compaction")(error));
+                    return Err(etcd_error("promote maintenance")(error));
                 }
             }
         };
@@ -686,6 +690,7 @@ impl EtcdTaskStore {
             prefix: config.etcd.prefix().to_string(),
             lease_ttl: config.etcd_lease_ttl_secs,
             prepare_targets: config.maintenance.compaction_prepare_targets.clone(),
+            index_prepare_targets: config.maintenance.index_prepare_targets.clone(),
             maintenance_catchup_targets: config.maintenance.maintenance_catchup_targets.clone(),
             rollout: config.merge_rollout.clone(),
         })
@@ -840,14 +845,21 @@ impl EtcdTaskStore {
                     }
                 }
 
-                let preparing = task.kind == TaskKind::Compact
+                let preparation_targets: &[String] = match task.kind {
+                    TaskKind::Compact => &self.prepare_targets,
+                    TaskKind::IndexId => &self.index_prepare_targets,
+                    _ => &[],
+                };
+                let preparing = matches!(task.kind, TaskKind::Compact | TaskKind::IndexId)
                     && !task.target.starts_with("generic:")
                     && !self.rollout.draining(&task.target)
-                    && self
-                        .prepare_targets
+                    && preparation_targets
                         .iter()
                         .any(|t| t == "*" || t == &task.target);
                 let write_claim = requires_target_lock(task.kind) && !preparing;
+                // Keep the existing wire keys so older masters also yield to
+                // prepared index commits. Compact/IndexId share one preparation
+                // slot per table; append merges need neither preparation slot.
                 let preparation_key = preparing.then(|| {
                     format!(
                         "{}/compact-preparations/{}",
@@ -2487,6 +2499,110 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn index_preparation_allows_merge_and_shares_compact_commit_turn() {
+        let (_dir, mut cfg, _) = preparation_test_store().await;
+        cfg.maintenance.index_prepare_targets = vec!["hot".into()];
+        let store = TaskStore::open(&cfg).await.unwrap();
+        store
+            .enqueue(TaskKind::MergeWal, "hot", vec![])
+            .await
+            .unwrap();
+        let merge = store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .enqueue(TaskKind::IndexId, "hot", vec![])
+            .await
+            .unwrap();
+        let mut prep = store
+            .claim_next_of_kinds(TaskKinds::GENERAL.without_compact())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(prep.preparing_maintenance());
+        // Readers/file builders can start even when merge already owns the table.
+        assert!(!store.promote_maintenance(&mut prep).await.unwrap());
+        store
+            .enqueue(TaskKind::Compact, "hot", vec![])
+            .await
+            .unwrap();
+        assert!(store
+            .claim_next_of_kinds(TaskKinds::COMPACT)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store.request_maintenance_commit(&prep).await.unwrap());
+        store
+            .finish(merge, Ok("merge advanced during index build".into()))
+            .await
+            .unwrap();
+        store
+            .enqueue(TaskKind::MergeWal, "hot", vec![])
+            .await
+            .unwrap();
+        // This uses the old compact wire keys: old masters also yield the turn.
+        assert!(store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store.promote_maintenance(&mut prep).await.unwrap());
+        assert!(store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .is_none());
+        store
+            .finish(prep, Ok("index published".into()))
+            .await
+            .unwrap();
+        let merge = store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        store.finish(merge, Ok("continued".into())).await.unwrap();
+        let compact = store
+            .claim_next_of_kinds(TaskKinds::COMPACT)
+            .await
+            .unwrap()
+            .unwrap();
+        store.finish(compact, Ok("continued".into())).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn expired_index_preparation_cannot_publish_or_release_replacement() {
+        let (_dir, mut cfg, _) = preparation_test_store().await;
+        cfg.maintenance.index_prepare_targets = vec!["*".into()];
+        let store = TaskStore::open(&cfg).await.unwrap();
+        let task = store
+            .enqueue(TaskKind::IndexId, "hot", vec![])
+            .await
+            .unwrap();
+        let kinds = TaskKinds::GENERAL.without_compact();
+        let mut old = store.claim_next_of_kinds(kinds).await.unwrap().unwrap();
+        assert!(store.request_maintenance_commit(&old).await.unwrap());
+        store
+            .inner
+            .revoke_lease(old.backend.lease_id)
+            .await
+            .unwrap();
+        store.recover_orphaned().await.unwrap();
+        let mut replacement = store.claim_next_of_kinds(kinds).await.unwrap().unwrap();
+        assert_eq!(replacement.task.id, task.id);
+        assert!(!store.request_maintenance_commit(&old).await.unwrap());
+        assert!(!store.promote_maintenance(&mut old).await.unwrap());
+        assert!(store.finish(old, Ok("stale".into())).await.is_err());
+        assert!(store.preparation_owned(&replacement).await.unwrap());
+        assert!(store.promote_maintenance(&mut replacement).await.unwrap());
+        store.finish(replacement, Ok("valid".into())).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn compaction_preparation_allows_merge_but_commit_is_exclusive() {
         let (_dir, _cfg, store) = preparation_test_store().await;
         store
@@ -2498,7 +2614,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(prep.preparing_compaction());
+        assert!(prep.preparing_maintenance());
         assert!(store
             .inner
             .get_text(&store.inner.target_lock_key("hot"))
@@ -2514,13 +2630,13 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(!store.promote_compaction(&mut prep).await.unwrap());
+        assert!(!store.promote_maintenance(&mut prep).await.unwrap());
         store
             .finish(merge, Ok("append while rewriting".into()))
             .await
             .unwrap();
-        assert!(store.promote_compaction(&mut prep).await.unwrap());
-        assert!(!prep.preparing_compaction());
+        assert!(store.promote_maintenance(&mut prep).await.unwrap());
+        assert!(!prep.preparing_maintenance());
         store
             .enqueue(TaskKind::MergeWal, "hot", Vec::new())
             .await
@@ -2576,12 +2692,12 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(
-            prep.preparing_compaction(),
+            prep.preparing_maintenance(),
             "preparation must not block native merge admission"
         );
-        assert!(store.request_compaction_commit(&prep).await.unwrap());
+        assert!(store.request_maintenance_commit(&prep).await.unwrap());
         assert!(
-            !store.promote_compaction(&mut prep).await.unwrap(),
+            !store.promote_maintenance(&mut prep).await.unwrap(),
             "running merge must finish cooperatively"
         );
         store
@@ -2600,7 +2716,7 @@ mod tests {
                 .is_none(),
             "new pass must yield to ready compact"
         );
-        assert!(store.promote_compaction(&mut prep).await.unwrap());
+        assert!(store.promote_maintenance(&mut prep).await.unwrap());
         store
             .finish(prep, Ok("compact committed".into()))
             .await
@@ -2635,13 +2751,13 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(store.request_compaction_commit(&prep).await.unwrap());
+        assert!(store.request_maintenance_commit(&prep).await.unwrap());
         store
             .inner
             .revoke_lease(prep.backend.lease_id)
             .await
             .unwrap();
-        assert!(!store.request_compaction_commit(&prep).await.unwrap());
+        assert!(!store.request_maintenance_commit(&prep).await.unwrap());
         assert!(store
             .inner
             .get_text(&store.inner.compaction_commit_key("hot"))
@@ -2692,7 +2808,7 @@ mod tests {
             .reserve(&store.merge_claim(&merge), &execution)
             .await
             .unwrap());
-        assert!(store.request_compaction_commit(&prep).await.unwrap());
+        assert!(store.request_maintenance_commit(&prep).await.unwrap());
         store.abandon_claim_for_test(merge).await.unwrap();
         let recovery = store
             .claim_next_of_kinds(TaskKinds::MERGE_WAL)
@@ -2751,13 +2867,13 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(prep.preparing_compaction());
-        assert!(!store.promote_compaction(&mut prep).await.unwrap());
+        assert!(prep.preparing_maintenance());
+        assert!(!store.promote_maintenance(&mut prep).await.unwrap());
         store
             .finish(native, Ok("native pass joined".into()))
             .await
             .unwrap();
-        assert!(store.promote_compaction(&mut prep).await.unwrap());
+        assert!(store.promote_maintenance(&mut prep).await.unwrap());
         store
             .enqueue(TaskKind::MergeWal, "hot", Vec::new())
             .await
@@ -2882,7 +2998,7 @@ mod tests {
             .put(active.clone(), "replacement", None)
             .await
             .unwrap();
-        assert!(!store.promote_compaction(&mut prep).await.unwrap());
+        assert!(!store.promote_maintenance(&mut prep).await.unwrap());
         store
             .finish(prep, Err("native identity changed".into()))
             .await
@@ -2933,7 +3049,7 @@ mod tests {
             .put(active.clone(), "new-dedicated", None)
             .await
             .unwrap();
-        assert!(!store.promote_compaction(&mut prep).await.unwrap());
+        assert!(!store.promote_maintenance(&mut prep).await.unwrap());
         store.finish(prep, Err("superseded".into())).await.unwrap();
         assert_eq!(
             store.inner.get_text(&active).await.unwrap().as_deref(),
@@ -3018,10 +3134,10 @@ mod tests {
             .unwrap();
         assert_eq!(replacement.task.id, task.id);
         assert!(!store.preparation_owned(&old).await.unwrap());
-        assert!(!store.promote_compaction(&mut old).await.unwrap());
+        assert!(!store.promote_maintenance(&mut old).await.unwrap());
         assert!(store.finish(old, Ok("stale".into())).await.is_err());
         assert!(store.preparation_owned(&replacement).await.unwrap());
-        assert!(store.promote_compaction(&mut replacement).await.unwrap());
+        assert!(store.promote_maintenance(&mut replacement).await.unwrap());
         store.finish(replacement, Ok("valid".into())).await.unwrap();
     }
 

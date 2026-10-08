@@ -983,6 +983,224 @@ mod tests {
         .await
     }
 
+    async fn prepare_index_without_commit(
+        uri: &str,
+        kind: crate::KeyIndexType,
+    ) -> crate::PreparedKeyIndex {
+        let scope = crate::merge_write_scope::MergeWriteScope::with_preparation_authorizer(
+            Arc::new(NoPreparationCommit),
+        );
+        let prepared = scope
+            .run(async {
+                RolloutStore::open_existing_with_options(
+                    uri,
+                    RolloutStoreOptions {
+                        key_index_type: kind,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+                .prepare_id_key_index()
+                .await
+                .unwrap()
+            })
+            .await;
+        assert!(
+            scope.completed_steps() > 0,
+            "index file IO must advance the idle watchdog"
+        );
+        prepared
+    }
+
+    #[tokio::test]
+    async fn prepared_index_preserves_append_watermarks_and_uncovered_reads() {
+        use lance::index::DatasetIndexExt;
+        for kind in [crate::KeyIndexType::Btree, crate::KeyIndexType::Zonemap] {
+            for merge_first in [true, false] {
+                let dir = tempfile::tempdir().unwrap();
+                let uri = dir.path().to_str().unwrap();
+                let (a, mut coordinator) = prepared_compaction_fixture(uri).await;
+                let before = Dataset::open(uri).await.unwrap().version().version;
+                let prepared = prepare_index_without_commit(uri, kind).await;
+                assert_eq!(Dataset::open(uri).await.unwrap().version().version, before);
+                put(&a, "during-index", 8192).await;
+                let (plans, _) = coordinator
+                    .plan(&["a".into()], 64, 1024 * 1024)
+                    .await
+                    .unwrap();
+                let staged = stage(uri, plans[0].clone(), budget(), None).await.unwrap();
+                let high = staged.plan.generations.last().unwrap().number;
+                let shard = staged.plan.shard;
+                if merge_first {
+                    coordinator.commit(vec![staged.clone()]).await.unwrap();
+                }
+                let mut publisher =
+                    RolloutStore::open_existing_with_options(uri, RolloutStoreOptions::default())
+                        .await
+                        .unwrap();
+                publisher
+                    .commit_prepared_id_key_index(prepared)
+                    .await
+                    .unwrap();
+                if !merge_first {
+                    coordinator.commit(vec![staged.clone()]).await.unwrap();
+                }
+                assert_eq!(coordinator.commit(vec![staged]).await.unwrap(), 0);
+                let current = Dataset::open(uri).await.unwrap();
+                assert_eq!(watermarks(&current).await.unwrap().get(&shard), Some(&high));
+                assert_eq!(rows(uri).await, 5);
+                // A fresh indexed reader must find both covered and uncovered
+                // keys, including the append that raced with preparation.
+                let reader =
+                    RolloutStore::open_existing_with_options(uri, RolloutStoreOptions::default())
+                        .await
+                        .unwrap();
+                assert_eq!(
+                    reader.get_blob("during-index").await.unwrap().unwrap(),
+                    vec![42; 8192]
+                );
+                assert!(reader.get_blob("seed-0").await.unwrap().is_some());
+                let indices = current.load_indices().await.unwrap();
+                let key = indices
+                    .iter()
+                    .find(|i| i.name == crate::store_base::ID_INDEX_NAME)
+                    .unwrap();
+                assert_eq!(key.fragment_bitmap.as_ref().unwrap().len(), 4);
+                assert_eq!(current.manifest().fragments.len(), 5);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_index_progress_isolated_from_other_cached_readers() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let (_writer, _) = prepared_compaction_fixture(uri).await;
+        let options = RolloutStoreOptions {
+            session: Some(RolloutStore::build_session(1024 * 1024, 1024 * 1024)),
+            ..Default::default()
+        };
+        let scope = crate::merge_write_scope::MergeWriteScope::with_preparation_authorizer(
+            Arc::new(NoPreparationCommit),
+        );
+        let builder = scope
+            .run(RolloutStore::open_existing_with_options(
+                uri,
+                options.clone(),
+            ))
+            .await
+            .unwrap();
+        let before = scope.completed_steps();
+        let other = RolloutStore::open_existing_with_options(uri, options)
+            .await
+            .unwrap();
+        assert!(other.get_blob("seed-0").await.unwrap().is_some());
+        assert_eq!(
+            scope.completed_steps(),
+            before,
+            "another task's reads cannot keep a stalled builder alive"
+        );
+        scope.run(builder.prepare_id_key_index()).await.unwrap();
+        assert!(
+            scope.completed_steps() > before,
+            "local index IO must advance its own scope"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_index_rejects_changed_sources_schema_or_replacement() {
+        for mutation in ["delete", "compact", "index", "schema"] {
+            let dir = tempfile::tempdir().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let (_a, _) = prepared_compaction_fixture(uri).await;
+            let prepared = prepare_index_without_commit(uri, crate::KeyIndexType::Btree).await;
+            let mut publisher =
+                RolloutStore::open_existing_with_options(uri, RolloutStoreOptions::default())
+                    .await
+                    .unwrap();
+            match mutation {
+                "delete" => {
+                    Dataset::open(uri)
+                        .await
+                        .unwrap()
+                        .delete("id = 'seed-0'")
+                        .await
+                        .unwrap();
+                }
+                "compact" => {
+                    publisher
+                        .compact(Some(crate::CompactionConfig {
+                            target_rows_per_fragment: 1024,
+                            ..Default::default()
+                        }))
+                        .await
+                        .unwrap();
+                }
+                "index" => publisher.create_id_key_index().await.unwrap(),
+                "schema" => {
+                    Dataset::open(uri)
+                        .await
+                        .unwrap()
+                        .add_columns(
+                            lance::dataset::NewColumnTransform::AllNulls(Arc::new(
+                                arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                                    "new_column",
+                                    arrow_schema::DataType::Int64,
+                                    true,
+                                )]),
+                            )),
+                            None,
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let before = Dataset::open(uri).await.unwrap().version().version;
+            let error = publisher
+                .commit_prepared_id_key_index(prepared)
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("reprepare"),
+                "{mutation}: {error}"
+            );
+            assert_eq!(Dataset::open(uri).await.unwrap().version().version, before);
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_index_cannot_publish_with_revoked_authorization() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let (_a, _) = prepared_compaction_fixture(uri).await;
+        let prepared = prepare_index_without_commit(uri, crate::KeyIndexType::Btree).await;
+        let before = Dataset::open(uri).await.unwrap().version().version;
+        let error = crate::merge_write_scope::MergeWriteScope::with_pinned_authorizer(Arc::new(
+            NoPreparationCommit,
+        ))
+        .run(async {
+            let mut publisher =
+                RolloutStore::open_existing_with_options(uri, RolloutStoreOptions::default())
+                    .await
+                    .unwrap();
+            publisher
+                .commit_prepared_id_key_index(prepared)
+                .await
+                .unwrap_err()
+        })
+        .await;
+        assert!(
+            error
+                .to_string()
+                .contains("unexpected preparation manifest commit"),
+            "{error}"
+        );
+        assert_eq!(Dataset::open(uri).await.unwrap().version().version, before);
+    }
+
     #[tokio::test]
     async fn prepared_compaction_preserves_append_and_watermarks_in_both_orders() {
         for merge_first in [true, false] {
