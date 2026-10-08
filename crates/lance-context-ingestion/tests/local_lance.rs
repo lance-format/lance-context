@@ -757,3 +757,136 @@ async fn wide_shared_ipc_buffers_keep_small_calls_in_one_bounded_commit() {
     assert_eq!(writer.dataset().version().version, base + 1);
     assert_eq!(writer.through_sequence(), 128);
 }
+
+#[tokio::test]
+async fn projected_output_avoids_unneeded_payload_and_preserves_read_limits() {
+    use lance_context_ingestion::local_lance_reader::{LogRange, OutputRange};
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("projected.lance");
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("content", DataType::Utf8, false),
+        Field::new("source_metadata", DataType::Utf8, false),
+        Field::new("nullable", DataType::Utf8, true),
+    ]));
+    let large = "unused recovery metadata".repeat(4096);
+    let output = RecordBatch::try_new(
+        output_schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["kept 世界"; 8])),
+            Arc::new(StringArray::from(vec![large.as_str(); 8])),
+            Arc::new(StringArray::from(vec![None::<&str>; 8])),
+        ],
+    )
+    .unwrap();
+    let schema = Arc::new(log_schema(&output_schema, &binding()));
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(RecordBatch::new_empty(schema.clone()))], schema),
+        uri.to_str().unwrap(),
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let base_version = dataset.version().version;
+    let mut writer = open(&dir.path().join("projected.redb"), dataset).await;
+    writer
+        .commit(&[AlignedCall {
+            sequence: 1,
+            session: "s".into(),
+            receipt: "receipt".into(),
+            input_digest: "digest".into(),
+            mutations: vec![],
+            records: output,
+        }])
+        .await
+        .unwrap();
+    let snapshot = writer.dataset().clone();
+    let range = LogRange {
+        base_version,
+        version: snapshot.version().version,
+        first_sequence: 1,
+        last_sequence: 1,
+    };
+    let expected_binding = binding();
+    let open_range = || OutputRange::open(snapshot.clone(), &expected_binding, range.clone());
+    assert!(open_range()
+        .await
+        .unwrap()
+        .read(1 << 20, 64 << 10, 2)
+        .await
+        .is_err());
+    let projected = open_range()
+        .await
+        .unwrap()
+        .read_projected(1 << 20, 64 << 10, 2, &["content"])
+        .await
+        .unwrap();
+    let full = open_range()
+        .await
+        .unwrap()
+        .read(1 << 20, 8 << 20, 2)
+        .await
+        .unwrap();
+    assert_eq!(projected.len(), full.len());
+    assert_eq!(
+        projected.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        8
+    );
+    for (selected, complete) in projected.iter().zip(&full) {
+        assert_eq!(selected, &complete.project(&[0]).unwrap());
+    }
+    let nullable = open_range()
+        .await
+        .unwrap()
+        .read_projected(1 << 20, 64 << 10, 2, &["nullable"])
+        .await
+        .unwrap();
+    for (selected, complete) in nullable.iter().zip(&full) {
+        assert_eq!(selected, &complete.project(&[2]).unwrap());
+    }
+    for (physical, decoded, fields) in [
+        (1, 64 << 10, vec!["content"]),
+        (1 << 20, 1, vec!["content"]),
+        (1 << 20, 64 << 10, vec![]),
+        (1 << 20, 64 << 10, vec!["missing"]),
+    ] {
+        assert!(open_range()
+            .await
+            .unwrap()
+            .read_projected(physical, decoded, 2, &fields)
+            .await
+            .is_err());
+    }
+    // A null record is corrupt, even when all selected child values may be null.
+    let mut scan = snapshot.scan();
+    scan.filter("kind = 3")
+        .unwrap()
+        .limit(Some(1), None)
+        .unwrap();
+    let batch = scan.try_into_batch().await.unwrap();
+    let mut columns = batch.columns().to_vec();
+    columns[8] = arrow_array::new_null_array(batch.schema().field(8).data_type(), 1);
+    let corrupt = RecordBatch::try_new(batch.schema(), columns).unwrap();
+    let corrupt = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(corrupt)], batch.schema()),
+        uri.to_str().unwrap(),
+        Some(WriteParams {
+            mode: lance::dataset::WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let mut corrupt_range = range;
+    corrupt_range.version = corrupt.version().version;
+    let error = OutputRange::open(corrupt, &expected_binding, corrupt_range)
+        .await
+        .unwrap()
+        .read_projected(1 << 20, 64 << 10, 2, &["nullable"])
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("null Lance log output row"));
+}
