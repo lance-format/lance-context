@@ -300,7 +300,7 @@ pub(crate) async fn run(state: &Arc<MasterState>, target: &str) -> Result<String
             return Ok(format!("staged append reclaimed {total} generations"));
         }
     }
-    if local_execution {
+    if state.config.append.local(target) && state.config.catchup.target.is_none() {
         // Publish before this task releases its claim. The demand consumer only
         // acknowledges a queued successor, never this still-running task. A
         // crash before publication is covered by resident manifest discovery.
