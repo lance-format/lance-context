@@ -28,6 +28,15 @@ pub struct OutputRange {
     range: LogRange,
 }
 
+/// Current projected-read boundary. Notifications contain no row values or paths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputReadStage {
+    StreamCreation,
+    RowIds,
+    TakeRows,
+    Complete,
+}
+
 impl OutputRange {
     pub async fn open(dataset: Dataset, binding: &Binding, range: LogRange) -> Result<Self> {
         if range.base_version == 0
@@ -115,8 +124,14 @@ impl OutputRange {
         max_decoded_bytes: usize,
         batch_rows: usize,
     ) -> Result<Vec<RecordBatch>> {
-        self.read_projection(max_physical_bytes, max_decoded_bytes, batch_rows, None)
-            .await
+        self.read_projection(
+            max_physical_bytes,
+            max_decoded_bytes,
+            batch_rows,
+            None,
+            None,
+        )
+        .await
     }
 
     /// Read selected field paths within the output `record` struct. Projection
@@ -130,6 +145,27 @@ impl OutputRange {
         max_decoded_bytes: usize,
         batch_rows: usize,
         fields: &[&str],
+    ) -> Result<Vec<RecordBatch>> {
+        self.read_projected_observed(
+            max_physical_bytes,
+            max_decoded_bytes,
+            batch_rows,
+            fields,
+            None,
+        )
+        .await
+    }
+
+    /// Observe stage entry with a zero-based batch ordinal. The callback runs
+    /// inline and must not block or panic. Errors and cancellation retain the
+    /// same semantics as `read_projected`; `Complete` is emitted only on success.
+    pub async fn read_projected_observed(
+        self,
+        max_physical_bytes: u64,
+        max_decoded_bytes: usize,
+        batch_rows: usize,
+        fields: &[&str],
+        observer: Option<&(dyn Fn(OutputReadStage, u64) + Send + Sync)>,
     ) -> Result<Vec<RecordBatch>> {
         if fields.is_empty() || fields.iter().any(|field| field.is_empty()) {
             return Err(Error::Invalid("empty Lance output projection".into()));
@@ -151,6 +187,7 @@ impl OutputRange {
             max_decoded_bytes,
             batch_rows,
             Some(&columns),
+            observer,
         )
         .await
     }
@@ -161,6 +198,7 @@ impl OutputRange {
         max_decoded_bytes: usize,
         batch_rows: usize,
         columns: Option<&[String]>,
+        observer: Option<&(dyn Fn(OutputReadStage, u64) + Send + Sync)>,
     ) -> Result<Vec<RecordBatch>> {
         if self.physical_bytes > max_physical_bytes || max_decoded_bytes == 0 || batch_rows == 0 {
             return Err(Error::Invalid("Lance log range exceeds read budget".into()));
@@ -183,16 +221,28 @@ impl OutputRange {
             self.range.first_sequence, self.range.last_sequence
         ))
         .map_err(fail)?;
+        let notify = |stage, batch| {
+            if let Some(observer) = observer {
+                observer(stage, batch);
+            }
+        };
+        notify(OutputReadStage::StreamCreation, 0);
         let mut stream = scan.try_into_stream().await.map_err(fail)?;
         let mut bytes = 0usize;
         let mut output = Vec::new();
-        while let Some(batch) = stream.try_next().await.map_err(fail)? {
+        loop {
+            let batch_ordinal = output.len() as u64;
+            notify(OutputReadStage::RowIds, batch_ordinal);
+            let Some(batch) = stream.try_next().await.map_err(fail)? else {
+                break;
+            };
             let batch = if let Some(projection) = &projection {
                 let row_ids = batch
                     .column_by_name("_rowid")
                     .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
                     .filter(|ids| ids.null_count() == 0)
                     .ok_or_else(|| Error::Invalid("invalid Lance output row IDs".into()))?;
+                notify(OutputReadStage::TakeRows, batch_ordinal);
                 self.dataset
                     .take_rows(row_ids.values(), projection.clone())
                     .await
@@ -218,6 +268,7 @@ impl OutputRange {
             }
             output.push(RecordBatch::from(records.clone()));
         }
+        notify(OutputReadStage::Complete, output.len() as u64);
         Ok(output)
     }
 }
