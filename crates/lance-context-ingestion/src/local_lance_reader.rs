@@ -2,7 +2,8 @@
 use crate::{lance_sink::covered_sequence_at, Binding, Error, Result};
 use arrow_array::{Array, RecordBatch, StructArray, UInt64Array};
 use futures::TryStreamExt;
-use lance::Dataset;
+use lance::{dataset::scanner::DatasetRecordBatchStream, Dataset};
+use lance_datafusion::exec::{execute_plan, LanceExecutionOptions};
 
 fn fail(error: impl std::fmt::Display) -> Error {
     Error::Stage(error.to_string())
@@ -35,6 +36,30 @@ pub enum OutputReadStage {
     RowIds,
     TakeRows,
     Complete,
+}
+
+/// Finer scan boundaries without extending the original `OutputReadStage` enum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputReadPhase {
+    Read(OutputReadStage),
+    PlanCreation,
+    ExecutionInitialization,
+}
+
+#[derive(Clone, Copy)]
+enum ReadObserver<'a> {
+    Stages(Option<&'a (dyn Fn(OutputReadStage, u64) + Send + Sync)>),
+    Phases(&'a (dyn Fn(OutputReadPhase, u64) + Send + Sync)),
+}
+
+impl ReadObserver<'_> {
+    fn notify(self, stage: OutputReadStage, batch: u64) {
+        match self {
+            Self::Stages(Some(observer)) => observer(stage, batch),
+            Self::Stages(None) => {}
+            Self::Phases(observer) => observer(OutputReadPhase::Read(stage), batch),
+        }
+    }
 }
 
 impl OutputRange {
@@ -129,7 +154,7 @@ impl OutputRange {
             max_decoded_bytes,
             batch_rows,
             None,
-            None,
+            ReadObserver::Stages(None),
         )
         .await
     }
@@ -167,6 +192,46 @@ impl OutputRange {
         fields: &[&str],
         observer: Option<&(dyn Fn(OutputReadStage, u64) + Send + Sync)>,
     ) -> Result<Vec<RecordBatch>> {
+        self.read_projected_with_observer(
+            max_physical_bytes,
+            max_decoded_bytes,
+            batch_rows,
+            fields,
+            ReadObserver::Stages(observer),
+        )
+        .await
+    }
+
+    /// Observe planning separately from synchronous execution initialization.
+    /// Callbacks run inline and must not block or panic. Entry is not completion;
+    /// no task, deadline, retry, or cancellation is introduced. Batch size, stream
+    /// schema adaptation, errors and drop behavior match `read_projected`.
+    pub async fn read_projected_phases(
+        self,
+        max_physical_bytes: u64,
+        max_decoded_bytes: usize,
+        batch_rows: usize,
+        fields: &[&str],
+        observer: &(dyn Fn(OutputReadPhase, u64) + Send + Sync),
+    ) -> Result<Vec<RecordBatch>> {
+        self.read_projected_with_observer(
+            max_physical_bytes,
+            max_decoded_bytes,
+            batch_rows,
+            fields,
+            ReadObserver::Phases(observer),
+        )
+        .await
+    }
+
+    async fn read_projected_with_observer(
+        self,
+        max_physical_bytes: u64,
+        max_decoded_bytes: usize,
+        batch_rows: usize,
+        fields: &[&str],
+        observer: ReadObserver<'_>,
+    ) -> Result<Vec<RecordBatch>> {
         if fields.is_empty() || fields.iter().any(|field| field.is_empty()) {
             return Err(Error::Invalid("empty Lance output projection".into()));
         }
@@ -198,7 +263,7 @@ impl OutputRange {
         max_decoded_bytes: usize,
         batch_rows: usize,
         columns: Option<&[String]>,
-        observer: Option<&(dyn Fn(OutputReadStage, u64) + Send + Sync)>,
+        observer: ReadObserver<'_>,
     ) -> Result<Vec<RecordBatch>> {
         if self.physical_bytes > max_physical_bytes || max_decoded_bytes == 0 || batch_rows == 0 {
             return Err(Error::Invalid("Lance log range exceeds read budget".into()));
@@ -221,13 +286,27 @@ impl OutputRange {
             self.range.first_sequence, self.range.last_sequence
         ))
         .map_err(fail)?;
-        let notify = |stage, batch| {
-            if let Some(observer) = observer {
-                observer(stage, batch);
-            }
-        };
+        let notify = |stage, batch| observer.notify(stage, batch);
         notify(OutputReadStage::StreamCreation, 0);
-        let mut stream = scan.try_into_stream().await.map_err(fail)?;
+        let mut stream = if let ReadObserver::Phases(observer) = observer {
+            observer(OutputReadPhase::PlanCreation, 0);
+            let plan = scan.create_plan().await.map_err(fail)?;
+            observer(OutputReadPhase::ExecutionInitialization, 0);
+            // Match Scanner::try_into_stream: this locally constructed scanner
+            // has batch_size set above and no execution statistics callback.
+            DatasetRecordBatchStream::new(
+                execute_plan(
+                    plan,
+                    LanceExecutionOptions {
+                        batch_size: Some(batch_rows),
+                        ..Default::default()
+                    },
+                )
+                .map_err(fail)?,
+            )
+        } else {
+            scan.try_into_stream().await.map_err(fail)?
+        };
         let mut bytes = 0usize;
         let mut output = Vec::new();
         loop {

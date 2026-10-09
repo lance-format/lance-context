@@ -760,7 +760,9 @@ async fn wide_shared_ipc_buffers_keep_small_calls_in_one_bounded_commit() {
 
 #[tokio::test]
 async fn projected_output_avoids_unneeded_payload_and_preserves_read_limits() {
-    use lance_context_ingestion::local_lance_reader::{LogRange, OutputRange, OutputReadStage};
+    use lance_context_ingestion::local_lance_reader::{
+        LogRange, OutputRange, OutputReadPhase, OutputReadStage,
+    };
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().join("projected.lance");
@@ -770,10 +772,11 @@ async fn projected_output_avoids_unneeded_payload_and_preserves_read_limits() {
         Field::new("nullable", DataType::Utf8, true),
     ]));
     let large = "unused recovery metadata".repeat(4096);
+    let contents = (0..8).map(|i| format!("kept 世界 {i}")).collect::<Vec<_>>();
     let output = RecordBatch::try_new(
         output_schema.clone(),
         vec![
-            Arc::new(StringArray::from(vec!["kept 世界"; 8])),
+            Arc::new(StringArray::from(contents.clone())),
             Arc::new(StringArray::from(vec![large.as_str(); 8])),
             Arc::new(StringArray::from(vec![None::<&str>; 8])),
         ],
@@ -841,6 +844,73 @@ async fn projected_output_avoids_unneeded_payload_and_preserves_read_limits() {
     expected_stages.push((OutputReadStage::RowIds, observed.len() as u64));
     expected_stages.push((OutputReadStage::Complete, observed.len() as u64));
     assert_eq!(*stages.lock().unwrap(), expected_stages);
+    let phases = std::sync::Mutex::new(Vec::new());
+    let phase_observer = |phase, batch| phases.lock().unwrap().push((phase, batch));
+    for batch_rows in [1, 2, 1024] {
+        phases.lock().unwrap().clear();
+        let expected = open_range()
+            .await
+            .unwrap()
+            .read_projected(1 << 20, 64 << 10, batch_rows, &["content", "nullable"])
+            .await
+            .unwrap();
+        let detailed = open_range()
+            .await
+            .unwrap()
+            .read_projected_phases(
+                1 << 20,
+                64 << 10,
+                batch_rows,
+                &["content", "nullable"],
+                &phase_observer,
+            )
+            .await
+            .unwrap();
+        assert_eq!(detailed, expected);
+        let actual: Vec<_> = detailed
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.unwrap().to_owned())
+            })
+            .collect();
+        assert_eq!(actual, contents);
+        let mut expected_phases = vec![
+            (OutputReadPhase::Read(OutputReadStage::StreamCreation), 0),
+            (OutputReadPhase::PlanCreation, 0),
+            (OutputReadPhase::ExecutionInitialization, 0),
+        ];
+        for batch in 0..detailed.len() as u64 {
+            expected_phases.push((OutputReadPhase::Read(OutputReadStage::RowIds), batch));
+            expected_phases.push((OutputReadPhase::Read(OutputReadStage::TakeRows), batch));
+        }
+        expected_phases.push((
+            OutputReadPhase::Read(OutputReadStage::RowIds),
+            detailed.len() as u64,
+        ));
+        expected_phases.push((
+            OutputReadPhase::Read(OutputReadStage::Complete),
+            detailed.len() as u64,
+        ));
+        assert_eq!(*phases.lock().unwrap(), expected_phases);
+    }
+    phases.lock().unwrap().clear();
+    let phase_error = open_range()
+        .await
+        .unwrap()
+        .read_projected_phases(1 << 20, 1, 2, &["content"], &phase_observer)
+        .await
+        .unwrap_err();
+    assert!(!phases
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(phase, _)| { *phase == OutputReadPhase::Read(OutputReadStage::Complete) }));
     stages.lock().unwrap().clear();
     let observed_error = open_range()
         .await
@@ -855,6 +925,7 @@ async fn projected_output_avoids_unneeded_payload_and_preserves_read_limits() {
         .await
         .unwrap_err();
     assert_eq!(observed_error.to_string(), original_error.to_string());
+    assert_eq!(phase_error.to_string(), original_error.to_string());
     assert!(!stages
         .lock()
         .unwrap()
@@ -889,12 +960,28 @@ async fn projected_output_avoids_unneeded_payload_and_preserves_read_limits() {
         (1 << 20, 64 << 10, vec![]),
         (1 << 20, 64 << 10, vec!["missing"]),
     ] {
-        assert!(open_range()
+        let expected_error = open_range()
             .await
             .unwrap()
             .read_projected(physical, decoded, 2, &fields)
             .await
-            .is_err());
+            .unwrap_err();
+        phases.lock().unwrap().clear();
+        let detailed_error = open_range()
+            .await
+            .unwrap()
+            .read_projected_phases(physical, decoded, 2, &fields, &phase_observer)
+            .await
+            .unwrap_err();
+        assert_eq!(detailed_error.to_string(), expected_error.to_string());
+        assert!(!phases
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(phase, _)| { *phase == OutputReadPhase::Read(OutputReadStage::Complete) }));
+        if physical == 1 || fields.is_empty() || fields == ["missing"] {
+            assert!(phases.lock().unwrap().is_empty());
+        }
     }
     // A null record is corrupt, even when all selected child values may be null.
     let mut scan = snapshot.scan();
