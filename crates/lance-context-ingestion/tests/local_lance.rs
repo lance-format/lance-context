@@ -760,7 +760,7 @@ async fn wide_shared_ipc_buffers_keep_small_calls_in_one_bounded_commit() {
 
 #[tokio::test]
 async fn projected_output_avoids_unneeded_payload_and_preserves_read_limits() {
-    use lance_context_ingestion::local_lance_reader::{LogRange, OutputRange};
+    use lance_context_ingestion::local_lance_reader::{LogRange, OutputRange, OutputReadStage};
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().join("projected.lance");
@@ -824,6 +824,42 @@ async fn projected_output_avoids_unneeded_payload_and_preserves_read_limits() {
         .read_projected(1 << 20, 64 << 10, 2, &["content"])
         .await
         .unwrap();
+    let stages = std::sync::Mutex::new(Vec::new());
+    let observer = |stage, batch| stages.lock().unwrap().push((stage, batch));
+    let observed = open_range()
+        .await
+        .unwrap()
+        .read_projected_observed(1 << 20, 64 << 10, 2, &["content"], Some(&observer))
+        .await
+        .unwrap();
+    assert_eq!(observed, projected);
+    let mut expected_stages = vec![(OutputReadStage::StreamCreation, 0)];
+    for batch in 0..observed.len() as u64 {
+        expected_stages.push((OutputReadStage::RowIds, batch));
+        expected_stages.push((OutputReadStage::TakeRows, batch));
+    }
+    expected_stages.push((OutputReadStage::RowIds, observed.len() as u64));
+    expected_stages.push((OutputReadStage::Complete, observed.len() as u64));
+    assert_eq!(*stages.lock().unwrap(), expected_stages);
+    stages.lock().unwrap().clear();
+    let observed_error = open_range()
+        .await
+        .unwrap()
+        .read_projected_observed(1 << 20, 1, 2, &["content"], Some(&observer))
+        .await
+        .unwrap_err();
+    let original_error = open_range()
+        .await
+        .unwrap()
+        .read_projected(1 << 20, 1, 2, &["content"])
+        .await
+        .unwrap_err();
+    assert_eq!(observed_error.to_string(), original_error.to_string());
+    assert!(!stages
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(stage, _)| *stage == OutputReadStage::Complete));
     let full = open_range()
         .await
         .unwrap()
