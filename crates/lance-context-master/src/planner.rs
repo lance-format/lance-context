@@ -848,6 +848,251 @@ mod tests {
         assert_eq!(unhex("zz"), None);
     }
 
+    /// Spec test 4 / review rounds 5 and 7: leader failover. A first leader
+    /// builds the cache and shadow placements, then loses its lease. A
+    /// second master, with nothing but etcd, must (a) win, (b) rebuild an
+    /// identical cache from the same events, (c) rebuild identical headroom
+    /// from heartbeats and durable assignments, and (d) reach the same
+    /// shadow placement decisions. The deposed leader must be refused on
+    /// its next write. Nothing lives only in a leader's memory.
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn leader_failover_rebuilds_identical_state_and_fences_the_old_leader() {
+        use crate::executors::{Assignment, AssignmentState};
+        use crate::state::MasterState;
+        use clap::Parser;
+        use lance_context_api::TaskKind;
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::MasterConfig::parse_from([
+            "test",
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+        ]);
+        cfg.etcd.etcd_endpoints = std::env::var("ETCD_TEST_ENDPOINTS")
+            .unwrap()
+            .split(',')
+            .map(str::to_owned)
+            .collect();
+        cfg.etcd.etcd_prefix = format!("/planner-failover/{}", generate_id());
+        cfg.planner.planner_enabled = true;
+        cfg.planner.planner_reconcile_secs = 1;
+        cfg.etcd_lease_ttl_secs = 5;
+        cfg.merge_wal_concurrency = 2;
+        cfg.stats_scan_interval_secs = 0;
+        cfg.compaction_interval_secs = 0;
+        cfg.merge_wal_interval_secs = 0;
+        let a = MasterState::new(cfg.clone()).await.unwrap();
+        let b = MasterState::new(cfg.clone()).await.unwrap();
+        let keys = Keys::new(&cfg.etcd.etcd_prefix);
+        let ekeys = crate::executors::Keys::new(&cfg.etcd.etcd_prefix);
+        let client = a.task_store.etcd_client().clone();
+
+        // Demand: three tables, mixed shapes.
+        let coordinator = a.task_store.merge_coordinator();
+        for (target, shard, sealed, merged) in [
+            ("hot", "s1", 400u64, Some(40u64)),
+            ("hot", "s2", 30, None),
+            ("warm", "s1", 20, Some(4)),
+            ("idle", "s1", 7, Some(7)),
+        ] {
+            coordinator
+                .publish_demand_event(
+                    target,
+                    &DemandEvent {
+                        v: SCHEMA_VERSION,
+                        shard: shard.into(),
+                        sealed_through: sealed,
+                        sealed_bytes_through: sealed * 1_000_000,
+                        merged_through: merged,
+                        flushed_at_ms: 1_700_000_000_000,
+                        writer_epoch: 1,
+                        source: EventSource::Writer,
+                        merged_epoch: None,
+                        sealed_times: Default::default(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        // Both masters heartbeat as executors throughout.
+        let hb_a = tokio::spawn({
+            let a = a.clone();
+            async move { crate::executors::heartbeat_loop_for_test(&a).await }
+        });
+        let hb_b = tokio::spawn({
+            let b = b.clone();
+            async move { crate::executors::heartbeat_loop_for_test(&b).await }
+        });
+        // A durable non-shadow assignment, as a bound unit would leave.
+        let bound = Assignment {
+            v: crate::executors::SCHEMA_VERSION,
+            unit_id: "bound-1".into(),
+            kind: TaskKind::MergeWal,
+            target: "elsewhere".into(),
+            needs_write_turn: true,
+            executor: a.admission.status().executor_id.clone(),
+            planner_token: "old".into(),
+            reserved_slots: [(TaskKind::MergeWal, 1)].into_iter().collect(),
+            reserved_bytes: 1 << 20,
+            state: AssignmentState::Bound,
+            created_ms: 0,
+            bind_deadline_ms: 0,
+        };
+        client
+            .clone()
+            .put(
+                ekeys.assignment("elsewhere", &bound.unit_id),
+                serde_json::to_vec(&bound).unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Leader 1 (master a) campaigns alone and completes a pass.
+        let lead_a = tokio::spawn({
+            let a = a.clone();
+            async move { lead(&a).await }
+        });
+        let snapshot = |client: etcd_client::Client, keys: Keys, ekeys: crate::executors::Keys| async move {
+            let (cache, _) = read_prefix_paged(&client, &keys.demand_prefix())
+                .await
+                .unwrap();
+            let mut demand: BTreeMap<String, TableDemand> = BTreeMap::new();
+            for kv in cache {
+                let mut t: TableDemand = serde_json::from_slice(&kv.value).unwrap();
+                t.updated_ms = 0;
+                demand.insert(String::from_utf8_lossy(&kv.key).to_string(), t);
+            }
+            let (asg, _) = read_prefix_paged(&client, &ekeys.assignments_prefix())
+                .await
+                .unwrap();
+            let mut shadows: Vec<(String, String, u64)> = asg
+                .iter()
+                .filter_map(|kv| serde_json::from_slice::<Assignment>(&kv.value).ok())
+                .filter(|a| a.state == AssignmentState::Shadow)
+                .map(|a| (a.target, a.executor, a.reserved_bytes))
+                .collect();
+            shadows.sort();
+            let headroom = crate::executors::load_headroom(&client, &ekeys)
+                .await
+                .unwrap();
+            (demand, shadows, headroom)
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let first = loop {
+            let snap = snapshot(
+                client.clone(),
+                Keys::new(&cfg.etcd.etcd_prefix),
+                crate::executors::Keys::new(&cfg.etcd.etcd_prefix),
+            )
+            .await;
+            if snap.0.len() == 3 && !snap.1.is_empty() && snap.2.len() == 2 {
+                break snap;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "leader 1 never completed a pass: {:?}",
+                (snap.0.len(), snap.1.len(), snap.2.len())
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        };
+        let token_1: String = String::from_utf8(
+            client
+                .clone()
+                .get(keys.leader_token(), None)
+                .await
+                .unwrap()
+                .kvs()[0]
+                .value()
+                .to_vec(),
+        )
+        .unwrap();
+        assert_eq!(
+            first.1.len(),
+            2,
+            "hot and warm are due; idle is not: {:?}",
+            first.1
+        );
+
+        // Leader 1 dies without releasing: abort the task so no revoke runs,
+        // then let the lease expire naturally.
+        lead_a.abort();
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if client
+                .clone()
+                .get(keys.leader(), None)
+                .await
+                .unwrap()
+                .kvs()
+                .is_empty()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "leader 1 lease never expired"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        // The deposed leader's token can no longer write.
+        let err = reconcile_once(&a, &keys, &token_1).await.unwrap_err();
+        assert!(err.contains("leadership lost"), "{err}");
+
+        // Leader 2 (master b) campaigns with only etcd to go on.
+        let lead_b = tokio::spawn({
+            let b = b.clone();
+            async move { lead(&b).await }
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let lk = client.clone().get(keys.leader(), None).await.unwrap();
+            if let Some(kv) = lk.kvs().first() {
+                let rec: LeaderRecord = serde_json::from_slice(kv.value()).unwrap();
+                if rec.token != token_1 {
+                    break;
+                }
+            }
+            assert!(std::time::Instant::now() < deadline, "leader 2 never won");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        // Wait for leader 2's first pass to replace the shadow set, then compare.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        let second = snapshot(
+            client.clone(),
+            Keys::new(&cfg.etcd.etcd_prefix),
+            crate::executors::Keys::new(&cfg.etcd.etcd_prefix),
+        )
+        .await;
+        assert_eq!(second.0, first.0, "demand cache differs after failover");
+        assert_eq!(second.1, first.1, "shadow placements differ after failover");
+        // Headroom: same executors, same durable (non-shadow) reservations.
+        for (id, h1) in &first.2 {
+            let h2 = &second.2[id];
+            assert_eq!(h2.slots_total, h1.slots_total, "{id}");
+            assert_eq!(h2.bytes_total, h1.bytes_total, "{id}");
+        }
+        let durable = |h: &BTreeMap<String, crate::executors::Headroom>| -> u64 {
+            // The Bound assignment's bytes survive on master a's row in both.
+            h[&a.admission.status().executor_id].bytes_reserved
+        };
+        assert!(durable(&first.2) >= 1 << 20);
+        assert!(
+            durable(&second.2) >= 1 << 20,
+            "durable reservation lost on failover"
+        );
+        lead_b.abort();
+        hb_a.abort();
+        hb_b.abort();
+        let _ = client
+            .clone()
+            .delete(
+                cfg.etcd.etcd_prefix.as_str(),
+                Some(etcd_client::DeleteOptions::new().with_prefix()),
+            )
+            .await;
+    }
+
     /// Round-5 finding 1 at production shape: 13,405 tables, two shards
     /// each (about 12 MB of events, three times the etcd client's 4 MiB
     /// message cap). A single-shot prefix read fails; the paged read must

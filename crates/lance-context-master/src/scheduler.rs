@@ -2397,6 +2397,205 @@ mod tests {
             .is_some_and(|d| d.contains("prepared outside write lock")));
     }
 
+    /// Review rounds 5 and 7: sustained concurrent progress isolation.
+    /// Four real index preparations run at once for several idle timeouts:
+    /// two throttled-but-alive at different rates, one frozen from the
+    /// start, one frozen partway through. Each watchdog must judge only its
+    /// own scope's completed IO. The alive pair must finish regardless of
+    /// the frozen pair's silence; the frozen pair must be cancelled within
+    /// the idle window regardless of the alive pair's progress; and the
+    /// partway freeze must be detected from its own last progress, not the
+    /// test start. Runs long enough (> 4 idle windows) that a shared or
+    /// leaked progress counter would show up as a wrong verdict.
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS; ~20 s"]
+    async fn concurrent_preparations_are_judged_only_by_their_own_progress() {
+        use lance_context_core::merge_write_scope::MergeWriteScope;
+        use lance_context_core::preparation_io::test_support::{Throttle, ThrottleWrapper};
+        use std::sync::atomic::Ordering;
+        const IDLE: u64 = 3;
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.data_dir = format!("file-object-store://{}", dir.path().display());
+        cfg.maintenance.index_prepare_targets = vec!["*".into()];
+        cfg.maintenance.maintenance_idle_timeout_secs = IDLE;
+        cfg.merge_rollout.owned_targets = ["slow-a", "slow-b", "frozen-start", "frozen-mid"]
+            .map(String::from)
+            .to_vec();
+        cfg.task_concurrency = 4;
+        let state = MasterState::new(cfg).await.unwrap();
+        for target in ["slow-a", "slow-b", "frozen-start", "frozen-mid"] {
+            let mut writer = RolloutStore::open(&state.rollout_uri(target))
+                .await
+                .unwrap();
+            let records: Vec<_> = (0..64)
+                .map(|i| rollout_record(&format!("{target}-{i}")))
+                .collect();
+            writer.add(&records).await.unwrap();
+            writer.cleanup_own_shard().await.unwrap();
+        }
+        let mut claims = std::collections::HashMap::new();
+        for _ in 0..4 {
+            let claim = state
+                .task_store
+                .claim_next_of_kinds(TaskKinds::GENERAL.without_compact())
+                .await
+                .unwrap();
+            let claim = match claim {
+                Some(c) => c,
+                None => {
+                    // Enqueue lazily so claims come out one per table.
+                    for target in ["slow-a", "slow-b", "frozen-start", "frozen-mid"] {
+                        if !claims.contains_key(target) {
+                            enqueue(&state, TaskKind::IndexId, target).await.unwrap();
+                        }
+                    }
+                    state
+                        .task_store
+                        .claim_next_of_kinds(TaskKinds::GENERAL.without_compact())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                }
+            };
+            assert!(claim.preparing_maintenance());
+            claims.insert(claim.task.target.clone(), claim);
+        }
+        assert_eq!(claims.len(), 4);
+
+        let run =
+            |target: &'static str, claim: crate::task_store::TaskClaim, throttle: Throttle| {
+                let state = state.clone();
+                let scope = MergeWriteScope::with_preparation_authorizer_and_io_shim(
+                    Arc::new(PreparationOnly),
+                    Arc::new(ThrottleWrapper(throttle.clone())),
+                );
+                let uri = state.rollout_uri(target);
+                async move {
+                    let began = std::time::Instant::now();
+                    let work = scope.run(async {
+                        let store = RolloutStore::open_existing_with_options(
+                            &uri,
+                            state.rollout_store_options(),
+                        )
+                        .await
+                        .map_err(|e| e.to_string())?;
+                        store
+                            .prepare_id_key_index()
+                            .await
+                            .map(|_| "prepared")
+                            .map_err(|e| e.to_string())
+                    });
+                    let outcome = tokio::select! {
+                        done = work => done,
+                        error = watch_maintenance_preparation(&state, &claim, &scope) => Err(error),
+                    };
+                    (
+                        outcome,
+                        began.elapsed(),
+                        throttle.ops.load(Ordering::Relaxed),
+                        claim,
+                    )
+                }
+            };
+        let slow_a = Throttle::new(Duration::from_millis(1200)); // 2.5x per op below IDLE
+        let slow_b = Throttle::new(Duration::from_millis(2500)); // just under IDLE per op
+        let frozen_start = Throttle::new(Duration::ZERO);
+        frozen_start.frozen.store(true, Ordering::Relaxed);
+        // Slow enough that the build is still mid-flight when frozen: at
+        // 1.2 s/op a 64-row build runs well past 2 x IDLE.
+        let frozen_mid = Throttle::new(Duration::from_millis(1200));
+        let freezer = {
+            let f = frozen_mid.clone();
+            tokio::spawn(async move {
+                // Let it make real progress for ~1.5 idle windows, then stop.
+                tokio::time::sleep(Duration::from_millis(IDLE * 1500)).await;
+                f.frozen.store(true, Ordering::Relaxed);
+                std::time::Instant::now()
+            })
+        };
+        let started = std::time::Instant::now();
+        let c_a = claims.remove("slow-a").unwrap();
+        let c_b = claims.remove("slow-b").unwrap();
+        let c_fs = claims.remove("frozen-start").unwrap();
+        let c_fm = claims.remove("frozen-mid").unwrap();
+        // A frozen build that is never cancelled would hang here; bound the
+        // whole scenario so a regression fails fast instead.
+        let (a, b, fs, fm) = tokio::time::timeout(Duration::from_secs(60), async {
+            tokio::join!(
+                run("slow-a", c_a, slow_a.clone()),
+                run("slow-b", c_b, slow_b.clone()),
+                run("frozen-start", c_fs, frozen_start.clone()),
+                run("frozen-mid", c_fm, frozen_mid.clone()),
+            )
+        })
+        .await
+        .expect("a frozen preparation was never cancelled: watchdogs are not isolated");
+        let froze_at = freezer.await.unwrap();
+        let idle = Duration::from_secs(IDLE);
+
+        // Alive pair: finished, each past the idle window, with real IO.
+        for (name, (outcome, elapsed, ops, _)) in [("slow-a", &a), ("slow-b", &b)] {
+            assert_eq!(
+                *outcome,
+                Ok("prepared"),
+                "{name} was cancelled: {outcome:?}"
+            );
+            assert!(
+                *elapsed > idle,
+                "{name} finished in {elapsed:?}, inside one idle window; vacuous"
+            );
+            assert!(*ops >= 3, "{name} saw {ops} ops; shim not intercepting");
+        }
+        assert!(
+            b.1 > a.1,
+            "the slower build must take longer (a={:?}, b={:?}); else rates are not real",
+            a.1,
+            b.1
+        );
+        // Frozen from the start: cancelled in [IDLE, IDLE+4) from test start.
+        assert_eq!(
+            fs.0,
+            Err("maintenance preparation made no progress".to_string())
+        );
+        assert!(
+            fs.1 >= idle && fs.1 < idle + Duration::from_secs(4),
+            "frozen-start at {:?}",
+            fs.1
+        );
+        // Frozen midway: cancelled in [IDLE, IDLE+4) from *its own* freeze,
+        // not from the start and not from a neighbour's progress.
+        assert_eq!(
+            fm.0,
+            Err("maintenance preparation made no progress".to_string())
+        );
+        let since_freeze = (started + fm.1).saturating_duration_since(froze_at);
+        assert!(
+            since_freeze >= idle - Duration::from_millis(500)
+                && since_freeze < idle + Duration::from_secs(4),
+            "frozen-mid cancelled {since_freeze:?} after its freeze (total {:?})",
+            fm.1
+        );
+        assert!(
+            fm.2 >= 2,
+            "frozen-mid should have made progress before freezing: {} ops",
+            fm.2
+        );
+        // And the alive builds outlived both cancellations.
+        assert!(
+            a.1 > fs.1 && b.1 > fs.1,
+            "alive builds ended before the frozen one was cancelled"
+        );
+        for (claim, ok) in [(a.3, true), (b.3, true), (fs.3, false), (fm.3, false)] {
+            let result = if ok {
+                Ok("prepared".to_string())
+            } else {
+                Err("stalled".to_string())
+            };
+            state.task_store.finish(claim, result).await.unwrap();
+        }
+    }
+
     /// Review finding 6 on #340: prove the watchdog on a *real* index build
     /// with real storage behaviour, not hand-placed checkpoints.
     ///
