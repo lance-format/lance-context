@@ -1,0 +1,732 @@
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use futures::{stream, StreamExt};
+use sha2::{Digest, Sha256};
+use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
+use tokio::task::{JoinHandle, JoinSet};
+use tokio::time::{timeout_at, Instant};
+
+use crate::journal::digest;
+use crate::{Binding, Entry, Error, Journal, Position, Result, Transition, Writer};
+
+#[derive(Clone, Debug)]
+pub struct Request {
+    /// Contiguous, stable sequence within this virtual partition, starting at 1.
+    /// A source fan-out must wait for every partition ACK before advancing its
+    /// source checkpoint. Retries preserve sequence, receipt, session and bytes.
+    pub sequence: u64,
+    pub session: String,
+    pub receipt: String,
+    pub payload: Vec<u8>,
+}
+
+/// Adapter owns session state and its cache budget. Alignment can run ahead of
+/// WAL durability, so an error discards this adapter and its speculative suffix.
+/// Checkpoints restore exact committed deltas, never freshly recomputed IDs.
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait adds must_use to boxed futures"
+)]
+#[async_trait]
+pub trait Aligner: Send + 'static {
+    async fn restore(&mut self, binding: &Binding) -> Result<Position>;
+    async fn replay(&mut self, entry: &Entry) -> Result<()>;
+    /// Prefetched history is an immutable checkpoint, potentially behind this
+    /// adapter's speculative state. Reconcile its revision before using it;
+    /// never replace newer same-session state with an older prefetch result.
+    async fn align(&mut self, request: &Request, history: &[u8]) -> Result<Transition>;
+}
+
+/// Concurrent, read-only history loading. The adapter must respect `max_bytes`
+/// while fetching/decoding, not only after allocation. Loaded state carries its
+/// revision in the adapter's encoding so alignment can reconcile stale loads.
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait adds must_use to boxed futures"
+)]
+#[async_trait]
+pub trait HistoryLoader: Send + Sync + 'static {
+    async fn load(&self, request: &Request, max_bytes: usize) -> Result<Vec<u8>>;
+}
+
+struct NoHistory;
+
+#[async_trait]
+impl HistoryLoader for NoHistory {
+    async fn load(&self, _request: &Request, _max_bytes: usize) -> Result<Vec<u8>> {
+        Ok(Vec::new())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct BatchPolicy {
+    pub max_entries: usize,
+    /// Serialized Entry bytes, excluding the bounded segment envelope.
+    pub max_bytes: usize,
+    pub max_delay: Duration,
+}
+
+impl BatchPolicy {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.max_entries == 0 || self.max_bytes == 0 || self.max_delay.is_zero() {
+            return Err(Error::Invalid(
+                "batch count, bytes and delay must be positive".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Flush requests for one batch partition. A request commits the ordered prefix
+/// through `sequence`; it never acknowledges uncommitted data. Create a fresh
+/// handle per partition process. Adapters use `request_prefix` before awaiting
+/// recovery of evicted speculative state, avoiding a batch-boundary deadlock.
+#[derive(Clone)]
+pub struct BatchFlush {
+    through: watch::Sender<FlushTargets>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct FlushTargets {
+    batch_end: u64,
+    required_prefix: u64,
+}
+
+impl Default for BatchFlush {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BatchFlush {
+    pub fn new() -> Self {
+        Self {
+            through: watch::channel(FlushTargets::default()).0,
+        }
+    }
+
+    pub fn request(&self, sequence: u64) {
+        self.through.send_if_modified(|through| {
+            if sequence > through.batch_end {
+                through.batch_end = sequence;
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    /// Commit available outputs until this prefix is durable. Use before waiting
+    /// for evicted speculative state. Unlike an ordinary batch boundary, this
+    /// must not wait for later alignment that depends on the requested prefix.
+    pub fn request_prefix(&self, sequence: u64) {
+        self.through.send_if_modified(|through| {
+            if sequence > through.required_prefix {
+                through.required_prefix = sequence;
+                true
+            } else {
+                false
+            }
+        });
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PipelineConfig {
+    pub queue_entries: usize,
+    pub load_concurrency: usize,
+    /// Bounds reserved input/output/serialization bytes across both queues and
+    /// active batches. Adapter state, runtime and object-store buffers are extra.
+    pub memory_bytes: usize,
+    pub max_input_bytes: usize,
+    pub max_transition_bytes: usize,
+    pub max_history_bytes: usize,
+    pub wal: BatchPolicy,
+}
+
+impl PipelineConfig {
+    /// Maximum byte reservation for loading/alignment. Completed alignment retains
+    /// only its output reservation through WAL commit. Total capacity can exceed
+    /// u32; each semaphore acquisition cannot.
+    pub fn reservation_bytes(&self) -> Result<u32> {
+        reservation(
+            self.max_input_bytes,
+            self.max_transition_bytes,
+            self.max_history_bytes,
+        )
+    }
+}
+
+struct Input {
+    request: Request,
+    ack: oneshot::Sender<Result<Position>>,
+    permit: OwnedSemaphorePermit,
+}
+
+struct Prepared {
+    input: Input,
+    history: Vec<u8>,
+}
+
+struct Aligned {
+    entry: Entry,
+    encoded_bytes: usize,
+    ack: oneshot::Sender<Result<Position>>,
+    _permit: OwnedSemaphorePermit,
+}
+
+/// Dropping an ACK waiter does not cancel already admitted durable work.
+pub struct Ack(oneshot::Receiver<Result<Position>>);
+
+impl Ack {
+    pub async fn wait(self) -> Result<Position> {
+        self.0.await.map_err(|_| Error::Stopped)?
+    }
+}
+
+/// One stable virtual partition, with independent alignment and WAL tasks.
+/// Run different partitions on independent workers. A session must always route
+/// to the same partition; changing worker count must not change that mapping.
+pub struct Partition {
+    input: Option<mpsc::Sender<Input>>,
+    supervisor: Option<JoinHandle<Result<()>>>,
+    budget: Arc<Semaphore>,
+    config: PipelineConfig,
+    durable: watch::Receiver<Position>,
+    _batch_flush: Option<BatchFlush>,
+}
+
+impl Partition {
+    pub async fn start<A: Aligner>(
+        writer: Writer,
+        aligner: A,
+        config: PipelineConfig,
+    ) -> Result<Self> {
+        Self::start_with_loader(writer, aligner, NoHistory, config).await
+    }
+
+    pub async fn start_with_loader<A: Aligner, L: HistoryLoader>(
+        writer: Writer,
+        aligner: A,
+        loader: L,
+        config: PipelineConfig,
+    ) -> Result<Self> {
+        Self::start_with_aligners(writer, vec![aligner], loader, config).await
+    }
+
+    /// Independent session alignment lanes within one durable partition. Every
+    /// adapter must implement the same per-session transition rules. Routing is
+    /// session-stable for this process; lanes may change only after shutdown and
+    /// recovery. Their state/cache allocations are additional to `memory_bytes`.
+    /// WAL output remains globally ordered even when later sessions finish first.
+    pub async fn start_with_aligners<A: Aligner, L: HistoryLoader>(
+        writer: Writer,
+        aligners: Vec<A>,
+        loader: L,
+        config: PipelineConfig,
+    ) -> Result<Self> {
+        Self::start_inner(writer, aligners, loader, config, None).await
+    }
+
+    /// Bulk input flushes at caller batch boundaries, size/count limits, memory
+    /// headroom, or shutdown. `wal.max_delay` is not used in this mode.
+    pub async fn start_batched_with_aligners<A: Aligner, L: HistoryLoader>(
+        writer: Writer,
+        aligners: Vec<A>,
+        loader: L,
+        config: PipelineConfig,
+        flush: BatchFlush,
+    ) -> Result<Self> {
+        Self::start_inner(writer, aligners, loader, config, Some(flush)).await
+    }
+
+    async fn start_inner<A: Aligner, L: HistoryLoader>(
+        writer: Writer,
+        mut aligners: Vec<A>,
+        loader: L,
+        config: PipelineConfig,
+        flush: Option<BatchFlush>,
+    ) -> Result<Self> {
+        config.wal.validate()?;
+        let reserve = config.reservation_bytes()?;
+        if aligners.is_empty() || aligners.len() > config.queue_entries {
+            return Err(Error::Invalid(
+                "alignment lanes must fit the nonempty queue budget".into(),
+            ));
+        }
+        if config.queue_entries == 0
+            || config.load_concurrency == 0
+            || reserve as usize > config.memory_bytes
+            || config.memory_bytes > Semaphore::MAX_PERMITS
+        {
+            return Err(Error::Invalid(
+                "queue empty or maximum request exceeds memory budget".into(),
+            ));
+        }
+        let journal = writer.journal().clone();
+        let lanes = aligners.len();
+        for (lane, aligner) in aligners.iter_mut().enumerate() {
+            let mut checkpoint = aligner.restore(journal.binding()).await?;
+            while &checkpoint != writer.position() {
+                for position in journal.pending(&checkpoint, writer.position()).await? {
+                    for entry in journal.entries(&position).await? {
+                        if alignment_lane(&entry.session, lanes) == lane {
+                            aligner.replay(&entry).await?;
+                        }
+                    }
+                    checkpoint = position;
+                }
+            }
+        }
+        let (input_tx, input_rx) = mpsc::channel(config.queue_entries);
+        let (loaded_tx, loaded_rx) = mpsc::channel(config.queue_entries);
+        let (wal_tx, wal_rx) = mpsc::channel(config.queue_entries);
+        let (durable_tx, durable_rx) = watch::channel(writer.position().clone());
+        let mut stages = JoinSet::new();
+        stages.spawn(load_loop(loader, input_rx, loaded_tx, config.clone()));
+        stages.spawn(align_loop(
+            aligners,
+            journal,
+            loaded_rx,
+            wal_tx,
+            durable_rx.clone(),
+            config.clone(),
+        ));
+        stages.spawn(wal_loop(
+            writer,
+            wal_rx,
+            durable_tx,
+            config.wal.clone(),
+            flush.as_ref().map(|f| f.through.subscribe()),
+            config.memory_bytes - reserve as usize,
+        ));
+        let supervisor = tokio::spawn(async move {
+            // Observe every stage independently. On error, dropping this JoinSet
+            // cancels even a loader or alignment lane blocked on unrelated work.
+            while let Some(result) = stages.join_next().await {
+                result.map_err(|error| Error::Stage(error.to_string()))??;
+            }
+            Ok(())
+        });
+        Ok(Self {
+            input: Some(input_tx),
+            supervisor: Some(supervisor),
+            budget: Arc::new(Semaphore::new(config.memory_bytes)),
+            config,
+            durable: durable_rx,
+            _batch_flush: flush,
+        })
+    }
+
+    /// Admission is bounded; the returned ACK resolves only after a conditional
+    /// durable head publication. Caller must serialize admission order within a
+    /// partition. Cancellation before admission leaves the receipt uncommitted.
+    pub async fn enqueue(&self, request: Request) -> Result<Ack> {
+        let input_bytes = request
+            .payload
+            .capacity()
+            .checked_add(request.session.capacity())
+            .and_then(|n| n.checked_add(request.receipt.capacity()))
+            .ok_or_else(|| Error::Invalid("input size overflow".into()))?;
+        if input_bytes > self.config.max_input_bytes
+            || request.session.is_empty()
+            || request.receipt.is_empty()
+        {
+            return Err(Error::Invalid(
+                "input exceeds limit or lacks session/receipt".into(),
+            ));
+        }
+        let permit = self
+            .budget
+            .clone()
+            .acquire_many_owned(reservation(
+                input_bytes,
+                self.config.max_transition_bytes,
+                self.config.max_history_bytes,
+            )?)
+            .await
+            .map_err(|_| Error::Stopped)?;
+        let (ack, receiver) = oneshot::channel();
+        self.input
+            .as_ref()
+            .ok_or(Error::Stopped)?
+            .send(Input {
+                request,
+                ack,
+                permit,
+            })
+            .await
+            .map_err(|_| Error::Stopped)?;
+        Ok(Ack(receiver))
+    }
+
+    pub fn durable_position(&self) -> Position {
+        self.durable.borrow().clone()
+    }
+
+    pub(crate) fn subscribe_durable(&self) -> watch::Receiver<Position> {
+        self.durable.clone()
+    }
+
+    /// Stop admission, drain alignment and flush even a partially filled WAL.
+    /// Dropping Partition instead aborts tasks; recovery reconciles any uncertain
+    /// head write. Neither path advances checkpoint or merge consumer cursors.
+    pub async fn shutdown(mut self) -> Result<()> {
+        self.input.take();
+        let result = self
+            .supervisor
+            .as_mut()
+            .unwrap()
+            .await
+            .map_err(|error| Error::Stage(error.to_string()))?;
+        self.supervisor.take();
+        result
+    }
+}
+
+impl Drop for Partition {
+    fn drop(&mut self) {
+        if let Some(task) = &self.supervisor {
+            task.abort();
+        }
+    }
+}
+
+fn reservation(input: usize, output: usize, history: usize) -> Result<u32> {
+    // Include retained buffer capacities, escaped strings (up to six bytes per
+    // byte), geometric serializer capacity growth and fixed envelope space.
+    input
+        .checked_add(output)
+        .and_then(|n| n.checked_add(history))
+        .and_then(|n| n.checked_mul(16))
+        .and_then(|n| n.checked_add(4096))
+        .and_then(|n| u32::try_from(n).ok())
+        .ok_or_else(|| Error::Invalid("request reservation overflow".into()))
+}
+
+async fn load_loop<L: HistoryLoader>(
+    loader: L,
+    input: mpsc::Receiver<Input>,
+    output: mpsc::Sender<Prepared>,
+    config: PipelineConfig,
+) -> Result<()> {
+    let loader = Arc::new(loader);
+    let mut prepared = stream::unfold(input, |mut receiver| async move {
+        receiver.recv().await.map(|item| (item, receiver))
+    })
+    .map(|input| {
+        let loader = loader.clone();
+        async move {
+            let history = loader
+                .load(&input.request, config.max_history_bytes)
+                .await?;
+            if history.capacity() > config.max_history_bytes {
+                return Err(Error::Invalid(
+                    "history loader exceeded reserved bytes".into(),
+                ));
+            }
+            Ok(Prepared { input, history })
+        }
+    })
+    .buffered(config.load_concurrency)
+    .boxed();
+    while let Some(item) = prepared.next().await {
+        output.send(item?).await.map_err(|_| Error::Stopped)?;
+    }
+    Ok(())
+}
+
+struct AlignmentWork {
+    request: Request,
+    history: Vec<u8>,
+    input_digest: String,
+    ack: oneshot::Sender<Result<Position>>,
+    permit: OwnedSemaphorePermit,
+    result: oneshot::Sender<Result<Aligned>>,
+}
+
+fn alignment_lane(session: &str, lanes: usize) -> usize {
+    let hash = Sha256::digest(session.as_bytes());
+    (u64::from_le_bytes(hash[..8].try_into().expect("SHA-256 prefix")) % lanes as u64) as usize
+}
+
+async fn align_loop<A: Aligner>(
+    aligners: Vec<A>,
+    journal: Journal,
+    input: mpsc::Receiver<Prepared>,
+    wal: mpsc::Sender<Aligned>,
+    durable: watch::Receiver<Position>,
+    config: PipelineConfig,
+) -> Result<()> {
+    let mut workers = JoinSet::new();
+    let mut lanes = Vec::with_capacity(aligners.len());
+    for aligner in aligners {
+        let (sender, receiver) = mpsc::channel(config.queue_entries);
+        lanes.push(sender);
+        workers.spawn(alignment_worker_loop(aligner, receiver, config.clone()));
+    }
+    let (ordered, mut results) =
+        mpsc::channel::<oneshot::Receiver<Result<Aligned>>>(config.queue_entries);
+    // JoinSet owns every lane: error, cancellation or dropping this supervisor
+    // aborts the entire speculative suffix, including other sessions' workers.
+    tokio::try_join!(
+        async {
+            // Supervision must progress independently of ordered output. A later
+            // lane can fail while an earlier request is still blocked.
+            while let Some(result) = workers.join_next().await {
+                result.map_err(|error| Error::Stage(error.to_string()))??;
+            }
+            Ok(())
+        },
+        dispatch_alignment(lanes, journal, input, ordered, durable),
+        async move {
+            while let Some(result) = results.recv().await {
+                let aligned = result.await.map_err(|_| Error::Stopped)??;
+                wal.send(aligned).await.map_err(|_| Error::Stopped)?;
+            }
+            Ok(())
+        }
+    )?;
+    Ok(())
+}
+
+async fn dispatch_alignment(
+    lanes: Vec<mpsc::Sender<AlignmentWork>>,
+    journal: Journal,
+    mut input: mpsc::Receiver<Prepared>,
+    ordered: mpsc::Sender<oneshot::Receiver<Result<Aligned>>>,
+    mut durable: watch::Receiver<Position>,
+) -> Result<()> {
+    let mut next = durable
+        .borrow()
+        .sequence
+        .checked_add(1)
+        .ok_or_else(|| Error::Invalid("sequence overflow".into()))?;
+    while let Some(prepared) = input.recv().await {
+        let Prepared { input, history } = prepared;
+        let Input {
+            request,
+            ack,
+            permit,
+        } = input;
+        let input_digest = digest(&request.payload);
+        if request.sequence < next && request.sequence > 0 {
+            // A repeated in-flight receipt waits for its original commit without
+            // applying alignment twice. Closed writer watch means uncertain I/O.
+            while durable.borrow().sequence < request.sequence {
+                durable.changed().await.map_err(|_| Error::Stopped)?;
+            }
+            let through = durable.borrow().clone();
+            let original = journal.receipt(request.sequence, &through).await?;
+            let response = if original.session == request.session
+                && original.receipt == request.receipt
+                && original.input_digest == input_digest
+            {
+                Ok(through)
+            } else {
+                Err(Error::Invalid("retry receipt identity changed".into()))
+            };
+            let _ = ack.send(response);
+            continue;
+        }
+        if request.sequence != next {
+            let _ = ack.send(Err(Error::Invalid(format!(
+                "expected partition sequence {next}"
+            ))));
+            continue;
+        }
+        let lane = alignment_lane(&request.session, lanes.len());
+        let (result, receiver) = oneshot::channel();
+        lanes[lane]
+            .send(AlignmentWork {
+                request,
+                history,
+                input_digest,
+                ack,
+                permit,
+                result,
+            })
+            .await
+            .map_err(|_| Error::Stopped)?;
+        ordered.send(receiver).await.map_err(|_| Error::Stopped)?;
+        next = next
+            .checked_add(1)
+            .ok_or_else(|| Error::Invalid("sequence overflow".into()))?;
+    }
+    Ok(())
+}
+
+async fn alignment_worker_loop<A: Aligner>(
+    mut aligner: A,
+    mut input: mpsc::Receiver<AlignmentWork>,
+    config: PipelineConfig,
+) -> Result<()> {
+    while let Some(work) = input.recv().await {
+        let AlignmentWork {
+            request,
+            history,
+            input_digest,
+            ack,
+            mut permit,
+            result,
+        } = work;
+        let transition = aligner.align(&request, &history).await;
+        drop(history);
+        drop(request.payload);
+        let aligned = transition.and_then(|transition| {
+            if transition
+                .delta
+                .capacity()
+                .saturating_add(transition.records.capacity())
+                > config.max_transition_bytes
+            {
+                return Err(Error::Invalid(
+                    "aligner exceeded reserved output bytes".into(),
+                ));
+            }
+            let entry = Entry {
+                sequence: request.sequence,
+                session: request.session,
+                receipt: request.receipt,
+                input_digest,
+                transition,
+            };
+            let encoded_bytes = serde_json::to_vec(&entry)?.len();
+            if encoded_bytes > config.wal.max_bytes {
+                return Err(Error::Invalid(
+                    "single transition exceeds WAL batch limit".into(),
+                ));
+            }
+            // Input/history are gone. Keep conservative output/serialization
+            // capacity charged until durable ACK, but let the next alignment run
+            // while this entry waits for batching or object-store publication.
+            // The fixed envelope allowance includes the 64-byte input digest.
+            let retained = reservation(
+                entry
+                    .session
+                    .capacity()
+                    .checked_add(entry.receipt.capacity())
+                    .ok_or_else(|| Error::Invalid("retained input size overflow".into()))?,
+                entry
+                    .transition
+                    .delta
+                    .capacity()
+                    .checked_add(entry.transition.records.capacity())
+                    .ok_or_else(|| Error::Invalid("retained output size overflow".into()))?,
+                0,
+            )?;
+            let output_permit = permit.split(retained as usize).ok_or_else(|| {
+                Error::Invalid("retained output exceeds admission reservation".into())
+            })?;
+            drop(permit);
+            Ok(Aligned {
+                entry,
+                encoded_bytes,
+                ack,
+                _permit: output_permit,
+            })
+        });
+        match aligned {
+            Ok(aligned) => result.send(Ok(aligned)).map_err(|_| Error::Stopped)?,
+            Err(error) => {
+                // Report out of order to the supervisor as well as to the
+                // ordered waiter; the latter may be stuck on an earlier lane.
+                let _ = result.send(Err(Error::Stage(error.to_string())));
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn wal_loop(
+    mut writer: Writer,
+    mut input: mpsc::Receiver<Aligned>,
+    durable: watch::Sender<Position>,
+    policy: BatchPolicy,
+    mut flush: Option<watch::Receiver<FlushTargets>>,
+    output_headroom: usize,
+) -> Result<()> {
+    let mut carry: Option<Aligned> = None;
+    loop {
+        let first = match carry.take() {
+            Some(first) => first,
+            None => match input.recv().await {
+                Some(first) => first,
+                None => return Ok(()),
+            },
+        };
+        let deadline = Instant::now() + policy.max_delay;
+        let mut bytes = first.encoded_bytes;
+        let mut reserved = first._permit.num_permits();
+        let mut batch = vec![first];
+        while batch.len() < policy.max_entries && bytes < policy.max_bytes {
+            let next = if let Some(flush) = flush.as_mut() {
+                // Keep room to admit a maximum-sized request while collecting
+                // outputs. Otherwise a partial batch could hold all permits and
+                // prevent the source from ever reaching its explicit boundary.
+                let requested = *flush.borrow_and_update();
+                if reserved >= output_headroom
+                    || (requested.batch_end > writer.position().sequence
+                        && batch.last().unwrap().entry.sequence >= requested.batch_end)
+                {
+                    break;
+                }
+                if requested.required_prefix > writer.position().sequence {
+                    // An evicted state can block an earlier alignment result.
+                    // Drain outputs already available, then commit that prefix
+                    // instead of waiting for the whole source batch to finish.
+                    match input.try_recv() {
+                        Ok(item) => Some(item),
+                        Err(_) => break,
+                    }
+                } else {
+                    tokio::select! {
+                        item = input.recv() => item,
+                        changed = flush.changed() => {
+                            if changed.is_err() { return Err(Error::Stopped); }
+                            continue;
+                        }
+                    }
+                }
+            } else {
+                match timeout_at(deadline, input.recv()).await {
+                    Ok(next) => next,
+                    Err(_) => break,
+                }
+            };
+            match next {
+                Some(next) if next.encoded_bytes <= policy.max_bytes - bytes => {
+                    bytes += next.encoded_bytes;
+                    reserved += next._permit.num_permits();
+                    batch.push(next);
+                }
+                Some(next) => {
+                    carry = Some(next);
+                    break;
+                }
+                None => break,
+            }
+        }
+        let entries = batch
+            .iter_mut()
+            .map(|item| Entry {
+                sequence: item.entry.sequence,
+                session: std::mem::take(&mut item.entry.session),
+                receipt: std::mem::take(&mut item.entry.receipt),
+                input_digest: std::mem::take(&mut item.entry.input_digest),
+                transition: Transition {
+                    delta: std::mem::take(&mut item.entry.transition.delta),
+                    records: std::mem::take(&mut item.entry.transition.records),
+                },
+            })
+            .collect();
+        let position = writer.append(entries).await?;
+        durable.send_replace(position.clone());
+        for item in batch {
+            let _ = item.ack.send(Ok(position.clone()));
+        }
+    }
+}
