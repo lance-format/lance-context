@@ -3918,6 +3918,7 @@ dependencies = [
  "async-trait",
  "futures",
  "lance",
+ "lance-datafusion",
  "lance-file",
  "lance-index",
  "lance-io",
