@@ -2541,7 +2541,8 @@ impl RolloutStore {
 
     /// Append rollout rows given as a JSON array of `AddRolloutRequest` objects.
     /// Returns a dict `{version, ids, count}`.
-    fn add(&mut self, py: Python<'_>, records_json: &str) -> PyResult<PyObject> {
+    #[pyo3(signature = (records_json, *, flush = false))]
+    fn add(&mut self, py: Python<'_>, records_json: &str, flush: bool) -> PyResult<PyObject> {
         let records: Vec<AddRolloutRequest> = serde_json::from_str(records_json)
             .map_err(|e| PyRuntimeError::new_err(format!("invalid records JSON: {e}")))?;
         if records.is_empty() {
@@ -2549,9 +2550,14 @@ impl RolloutStore {
                 "records must not be empty".to_string(),
             ));
         }
-        let resp = py
-            .allow_threads(|| self.runtime.block_on(self.store.add(&records)))
-            .map_err(to_py_err)?;
+        let resp = py.allow_threads(|| {
+            if flush {
+                self.runtime.block_on(self.store.add_with_flush(&records))
+            } else {
+                self.runtime.block_on(self.store.add(&records))
+            }
+        });
+        let resp = resp.map_err(to_py_err)?;
         let dict = PyDict::new(py);
         dict.set_item("version", resp.version)?;
         dict.set_item("ids", resp.ids)?;

@@ -33,9 +33,12 @@ async def _eventually(fn, predicate, timeout: float = 15.0):
     raise AssertionError(f"condition not met within {timeout}s; last value: {last!r}")
 
 
-def test_remote_roundtrip(server):
+def test_remote_roundtrip(server_without_sweeps):
     async def run():
-        store = await AsyncRolloutStore.connect_or_create(server, "rl-run-1")
+        store = await AsyncRolloutStore.connect_or_create(
+            server_without_sweeps,
+            "rl-run-1",
+        )
 
         resp = await store.add(
             [
@@ -56,11 +59,12 @@ def test_remote_roundtrip(server):
                     "binary_payload": b"\x00\x01\x02trace",
                     "payload_size": 8,
                 },
-            ]
+            ],
+            flush=True,
         )
         assert resp["count"] == 2
 
-        rows = await _eventually(store.list, lambda r: len(r) == 2)
+        rows = await store.list()
         assert {r["id"] for r in rows} == {"row-0", "row-1"}
 
         one = await store.get("row-0")
@@ -76,15 +80,17 @@ def test_remote_roundtrip(server):
     asyncio.run(run())
 
 
-def test_remote_add_one_and_connect(server):
+def test_remote_add_one_and_connect(server_without_sweeps):
     async def run():
-        store = await AsyncRolloutStore.connect_or_create(server, "rl-run-2")
-        await store.add_one(id="only", rollout_id="traj-9", reward=0.5)
+        store = await AsyncRolloutStore.connect_or_create(
+            server_without_sweeps,
+            "rl-run-2",
+        )
+        await store.add_one(id="only", rollout_id="traj-9", reward=0.5, flush=True)
 
-        # A second connection sees the first's flushed write (durable, no
-        # read affinity).
-        reader = await AsyncRolloutStore.connect(server, "rl-run-2")
-        rows = await _eventually(reader.list, lambda r: len(r) == 1)
+        # A separately connected client sees the flushed row immediately.
+        reader = await AsyncRolloutStore.connect(server_without_sweeps, "rl-run-2")
+        rows = await reader.list()
         assert [r["id"] for r in rows] == ["only"]
 
     asyncio.run(run())
