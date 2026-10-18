@@ -22,6 +22,7 @@ use axum::{
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use metrics_process::Collector;
 
+mod recovery_signals;
 mod runtime_resources;
 
 /// Explicit histogram buckets (upper bounds, seconds) for request-scale latency
@@ -319,6 +320,7 @@ pub fn metrics_router(handle: MetricsHandle) -> Router {
         .route("/metrics", get(render))
         .with_state(handle)
         .merge(runtime_resources::router())
+        .merge(recovery_signals::router())
 }
 
 async fn render(State(handle): State<MetricsHandle>) -> impl IntoResponse {
@@ -340,7 +342,9 @@ pub async fn http_metrics_layer(req: Request<axum::body::Body>, next: Next) -> R
         .map(|p| p.as_str().to_owned())
         .unwrap_or_else(|| "unknown".to_owned());
 
+    let recovery_target = recovery_signals::target(req.uri().path(), &path, &method);
     let response = next.run(req).await;
+    recovery_signals::record(recovery_target, response.status());
 
     let status = response.status().as_u16().to_string();
     let elapsed = start.elapsed().as_secs_f64();
