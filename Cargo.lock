@@ -3959,6 +3959,7 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "metrics-process",
+ "serde_json",
  "tokio",
  "tower",
  "tracing",

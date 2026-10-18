@@ -10,6 +10,7 @@ axum = { version = "0.8", features = ["json"] }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", default-features = false }
 metrics-process = "2.4"
+serde_json = "1"
 tokio = { version = "1", features = ["time"] }
 tracing = "0.1"
 
