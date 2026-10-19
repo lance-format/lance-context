@@ -1604,6 +1604,21 @@ impl RolloutStore {
             return Ok(payload);
         }
 
+        // Another executor may have merged this row since the resident store
+        // opened. Check that newer base before paying for unrelated WAL reads
+        // (or refusing the request because those generations exceed the cap).
+        // Refresh a clone so shared-lock readers never mutate the resident
+        // dataset, and explicitly pinned historical reads remain historical.
+        if !self.base.is_version_pinned() {
+            let mut latest = self.base.dataset.clone();
+            latest.checkout_latest().await?;
+            if latest.manifest.version != self.base.dataset.manifest.version {
+                if let Some(payload) = Self::get_blob_from_dataset(&latest, id).await? {
+                    return Ok(payload);
+                }
+            }
+        }
+
         // Base miss: fall back to the flushed generations. Open them with
         // bounded concurrency and take the first hit; tolerate a generation that
         // was concurrently merged away (NotFound) instead of failing the request.
@@ -6162,6 +6177,55 @@ mod tests {
             );
             println!("  slowest single add() (merge on every append) : {max_add:?}");
         });
+    }
+
+    #[tokio::test]
+    async fn blob_lookup_refreshes_base_before_opening_unrelated_wal() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let open = |shard: &str| {
+            RolloutStore::open_with_options(
+                uri,
+                RolloutStoreOptions {
+                    shard_id: Some(shard.to_owned()),
+                    pending_generations_max: Some(1),
+                    ..Default::default()
+                },
+            )
+        };
+        let mut writer = open("blob-writer").await.unwrap();
+        let reader = open("blob-reader").await.unwrap();
+        let mut pinned = open("blob-pinned").await.unwrap();
+        let original_version = reader.version();
+        pinned.checkout(pinned.version()).await.unwrap();
+        let bytes = b"merged-after-reader-open";
+        writer
+            .add(&[
+                artifact_record("new-base-blob", bytes),
+                assistant_record("new-base-null"),
+            ])
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        writer.cleanup_own_shard().await.unwrap();
+        assert!(writer.version() > original_version);
+        for id in ["unrelated-1", "unrelated-2"] {
+            writer.add(&[assistant_record(id)]).await.unwrap();
+            writer.flush().await.unwrap();
+        }
+        // A WAL fallback would be refused here; neither merged row needs it.
+        assert!(reader.wal_shard_snapshots().await.is_err());
+        assert_eq!(
+            reader.get_blob("new-base-blob").await.unwrap().as_deref(),
+            Some(bytes.as_slice())
+        );
+        assert!(reader.get_blob("new-base-null").await.unwrap().is_none());
+        assert_eq!(reader.version(), original_version);
+        // A point miss still observes the existing WAL safety cap.
+        assert!(reader.get_blob("unrelated-1").await.is_err());
+        // Explicit historical reads never switch to the latest manifest.
+        assert!(pinned.get_blob("new-base-blob").await.unwrap().is_none());
+        assert_eq!(pinned.version(), original_version);
     }
 
     #[test]
