@@ -11,6 +11,7 @@ pub mod discovery;
 pub mod eligibility;
 pub mod error;
 pub mod executors;
+pub mod local_merge;
 mod maintenance_execution;
 mod merge_execution;
 mod resident_recovery;

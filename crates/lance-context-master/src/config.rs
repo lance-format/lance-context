@@ -15,6 +15,8 @@ pub struct MasterConfig {
     #[command(flatten)]
     pub append: crate::rollout_append::AppendConfig,
     #[command(flatten)]
+    pub local_merge: crate::local_merge::LocalMergeConfig,
+    #[command(flatten)]
     pub wal_tail: crate::wal_tail::WalTailConfig,
     #[command(flatten)]
     pub planner: crate::planner::PlannerConfig,

@@ -2576,7 +2576,7 @@ mod tests {
             .put(key.clone(), "external-owner", None)
             .await
             .unwrap();
-        let targets = ["hot", "draining", "external", "generic:gs"].map(str::to_owned);
+        let targets = ["hot", "draining", "external"].map(str::to_owned);
         let claim = store.claim_resident_merge(&targets).await.unwrap().unwrap();
         assert_eq!(claim.task.target, "hot");
         // A second replica cannot take the running canonical task.
@@ -2609,6 +2609,18 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+        let generic = store
+            .claim_resident_merge(&["generic:gs".into()])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(generic.task.target, "generic:gs");
+        assert!(other
+            .claim_resident_merge(&["generic:gs".into()])
+            .await
+            .unwrap()
+            .is_none());
+        store.finish(generic, Ok("done".into())).await.unwrap();
         store
             .inner
             .client

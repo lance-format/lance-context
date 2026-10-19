@@ -1142,7 +1142,7 @@ pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
     if let Some(merge) = merge_sem {
         spawn_pool_poller(state.clone(), merge, TaskKinds::MERGE_WAL, false);
     }
-    if state.config.append.rollout_append_local
+    if crate::local_merge::enabled(&state.config)
         && state.config.append.rollout_append_local_task_concurrency > 0
     {
         // Reserve before claiming. A saturated legacy RPC pool cannot consume
@@ -1239,7 +1239,7 @@ fn spawn_filtered_pool_poller(
                 let claim = if resident_only {
                     state
                         .task_store
-                        .claim_resident_merge(&state.config.append.rollout_append_targets)
+                        .claim_resident_merge(&crate::local_merge::targets(&state.config))
                         .await
                 } else {
                     state.task_store.claim_next_of_kinds(kinds).await

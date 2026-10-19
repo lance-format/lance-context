@@ -360,6 +360,37 @@ pub(crate) async fn reconcile_shard(dataset: &Dataset, shard: Uuid) -> Result<us
     Ok(count)
 }
 
+/// Metadata-only WAL demand probe for rollout and generic tables. This opens no
+/// writer, evolves no schema, and reads no generation payloads.
+pub async fn has_sealed_wal(
+    uri: &str,
+    session: Option<Arc<Session>>,
+    shards: &[String],
+) -> Result<bool> {
+    let dataset = StorageBase::load_with_options(uri, None, session).await?;
+    dataset_has_sealed_wal(&dataset, shards).await
+}
+
+async fn dataset_has_sealed_wal(dataset: &Dataset, shards: &[String]) -> Result<bool> {
+    if shards.is_empty() || shards.len() > 256 {
+        return Err(Error::invalid_input(
+            "expected 1..=256 WAL shard identities",
+        ));
+    }
+    let mut seen = HashSet::new();
+    for name in shards {
+        let id = derive_shard_id(Some(name));
+        if seen.insert(id) {
+            if let Some(manifest) = shard_store(dataset, id).await?.refresh_latest().await? {
+                if !manifest.sstables.is_empty() {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// The only publisher. Open this inside the existing MergeWriteScope so both
 /// table commits and shard drains retain ownership checks and version fencing.
 pub struct AppendCoordinator {
@@ -395,27 +426,7 @@ impl AppendCoordinator {
     /// No writer opens, raw WAL replay, generation payload reads, or publication.
     /// Committed-but-undrained generations also need a maintenance pass.
     pub async fn has_sealed_wal(&self, shards: &[String]) -> Result<bool> {
-        if shards.is_empty() || shards.len() > 256 {
-            return Err(Error::invalid_input(
-                "expected 1..=256 WAL shard identities",
-            ));
-        }
-        let mut seen = HashSet::new();
-        for name in shards {
-            let id = derive_shard_id(Some(name));
-            if seen.insert(id) {
-                if let Some(manifest) = shard_store(&self.dataset, id)
-                    .await?
-                    .refresh_latest()
-                    .await?
-                {
-                    if !manifest.sstables.is_empty() {
-                        return Ok(true);
-                    }
-                }
-            }
-        }
-        Ok(false)
+        dataset_has_sealed_wal(&self.dataset, shards).await
     }
 
     pub async fn plan(

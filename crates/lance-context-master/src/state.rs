@@ -138,6 +138,7 @@ impl MasterState {
     pub async fn new(config: MasterConfig) -> lance::Result<Arc<Self>> {
         config.merge_rollout.validate().map_err(lance::Error::io)?;
         config.catchup.validate().map_err(lance::Error::io)?;
+        crate::local_merge::validate(&config).map_err(lance::Error::io)?;
         config
             .append
             .validate_local(&config)
@@ -216,7 +217,7 @@ impl MasterState {
         if let Some(guard) = init_guard {
             task_store.release_coordination_lock(guard).await?;
         }
-        let local_append = config.append.rollout_append_local.then(|| {
+        let local_append = crate::local_merge::enabled(&config).then(|| {
             crate::rollout_append::LocalStaging::new(
                 config.append.rollout_append_local_memory_bytes,
             )

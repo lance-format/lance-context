@@ -4,7 +4,7 @@ use crate::{config::MasterConfig, state::MasterState, stats_store::StatRow};
 use etcd_client::{Compare, CompareOp, Txn, TxnOp};
 use futures::{stream, StreamExt};
 use lance_context_api::TaskKind;
-use lance_context_core::rollout_append::AppendCoordinator;
+use lance_context_core::rollout_append::has_sealed_wal;
 use serde::{Deserialize, Serialize};
 use std::{
     hash::{Hash, Hasher},
@@ -29,17 +29,19 @@ fn scope(config: &MasterConfig) -> u64 {
         &config.merge_rollout.owned_targets,
         &config.merge_rollout.drain_targets,
         &config.append.rollout_append_targets,
+        &config.local_merge.master_local_merge_targets,
     ] {
         let mut sorted = names.clone();
         sorted.sort_unstable();
         sorted.dedup();
         sorted.hash(&mut hash);
     }
+    config.append.rollout_append_local.hash(&mut hash);
     hash.finish()
 }
 
 fn enabled(config: &MasterConfig) -> bool {
-    config.append.rollout_append_local
+    crate::local_merge::enabled(config)
         && config.append.rollout_append_reconcile_interval_secs > 0
         && config.merge_wal_interval_secs > 0
 }
@@ -53,13 +55,12 @@ fn candidates(config: &MasterConfig, snapshot: &[StatRow], after: Option<&str>) 
         .owned_targets
         .iter()
         .chain(config.append.rollout_append_targets.iter())
+        .chain(config.local_merge.master_local_merge_targets.iter())
         .map(String::as_str)
         .chain(snapshot.iter().map(|row| row.name.as_str()))
         .filter(|name| {
             *name != "*"
-                && config.append.local(name)
-                && config.merge_rollout.owned(name)
-                && !config.merge_rollout.draining(name)
+                && crate::local_merge::selected(config, name)
                 && after.is_none_or(|after| *name > after)
         })
         .map(str::to_owned)
@@ -236,20 +237,19 @@ async fn probe(state: &Arc<MasterState>, target: &str) -> Result<bool, String> {
     {
         return Ok(false);
     }
-    let coordinator = AppendCoordinator::open(
-        &state.rollout_uri(target),
-        // Reuse this master's small local-staging session, never default caches.
+    let uri = target
+        .strip_prefix("generic:")
+        .map_or_else(|| state.rollout_uri(target), |name| state.generic_uri(name));
+    let pending = has_sealed_wal(
+        &uri,
         state
             .local_append
             .as_ref()
             .map(|local| local.session.clone()),
+        &state.config.catchup.shards,
     )
     .await
     .map_err(|e| e.to_string())?;
-    let pending = coordinator
-        .has_sealed_wal(&state.config.catchup.shards)
-        .await
-        .map_err(|e| e.to_string())?;
     if pending {
         state
             .task_store
@@ -480,6 +480,206 @@ mod tests {
         let reader = lance::Dataset::open(&state.rollout_uri("a")).await.unwrap();
         assert_eq!(reader.count_rows(None).await.unwrap(), 17);
         assert!(!probe(&successor, "a").await.unwrap());
+    }
+
+    async fn generic_fixture() -> (tempfile::TempDir, Arc<MasterState>) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = MasterConfig::parse_from(["test"]);
+        config.data_dir = dir.path().to_string_lossy().into();
+        config.etcd.etcd_endpoints = std::env::var("ETCD_TEST_ENDPOINTS")
+            .unwrap()
+            .split(',')
+            .map(str::to_owned)
+            .collect();
+        config.etcd.etcd_prefix = format!(
+            "/resident-generic-test/{}",
+            lance_context_core::generate_id()
+        );
+        config.merge_rollout.owned_targets = vec!["generic:a".into(), "generic:b".into()];
+        config.local_merge.master_local_merge_targets = vec!["*".into()];
+        config.catchup.shards = vec!["writer".into()];
+        config.catchup.merge_max_generations = 1;
+        config.catchup.merge_max_bytes = 1024 * 1024;
+        config.append.rollout_append_local_memory_bytes = 2 * 1024 * 1024;
+        config.worker_endpoints.clear();
+        config.stats_scan_interval_secs = 0;
+        (dir, MasterState::new(config).await.unwrap())
+    }
+
+    async fn generic_writer(state: &MasterState, name: &str) -> lance_context_core::GenericStore {
+        use lance_context_core::{
+            ColumnSpec, ColumnType, GenericStore, GenericStoreOptions, SchemaSpec,
+        };
+        GenericStore::open(
+            &state.generic_uri(name),
+            SchemaSpec::new(vec![
+                (
+                    "id".into(),
+                    ColumnSpec::required(ColumnType::String { large: false }),
+                ),
+                (
+                    "text".into(),
+                    ColumnSpec::new(ColumnType::String { large: true }),
+                ),
+            ]),
+            GenericStoreOptions {
+                shard_id: Some("writer".into()),
+                merge_after_generations: Some(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn generic_write(writer: &lance_context_core::GenericStore, id: &str, text: &str) {
+        writer
+            .add(&[serde_json::json!({"id":id, "text":text})
+                .as_object()
+                .unwrap()
+                .clone()])
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn generic_discovery_and_continuation_preserve_updates_without_workers() {
+        let (_dir, state) = generic_fixture().await;
+        let writer = generic_writer(&state, "a").await;
+        for n in 0..17 {
+            generic_write(&writer, "shared", &n.to_string()).await;
+        }
+        assert_eq!(writer.pending_wal_generations().await.unwrap(), 17);
+        // A schema-independent manifest probe discovers generic demand without
+        // payload reads or a stats scan. A second master cannot duplicate it.
+        let second = MasterState::new(state.config.clone()).await.unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let (a, b) = tokio::join!(tick(&state, now), tick(&second, now));
+        assert_eq!(a.unwrap() + b.unwrap(), 1);
+        let coordinator = state.task_store.merge_coordinator();
+        let first = coordinator.request_page(None).await.unwrap().0.remove(0);
+        crate::scheduler::enqueue_merge_request(&state, &coordinator, &first)
+            .await
+            .unwrap();
+        let claim = state
+            .task_store
+            .claim_resident_merge(&crate::local_merge::targets(&state.config))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(second
+            .task_store
+            .claim_resident_merge(&crate::local_merge::targets(&second.config))
+            .await
+            .unwrap()
+            .is_none());
+        let result = crate::merge_execution::run_merge_wal(&state, &claim).await;
+        assert!(result.as_ref().unwrap().contains("16 generations"));
+        let next = coordinator.request_page(None).await.unwrap().0.remove(0);
+        crate::scheduler::enqueue_merge_request(&second, &coordinator, &next)
+            .await
+            .unwrap();
+        assert_eq!(coordinator.request_page(None).await.unwrap().0.len(), 1);
+        state.task_store.finish(claim, result).await.unwrap();
+        crate::scheduler::enqueue_merge_request(&second, &coordinator, &next)
+            .await
+            .unwrap();
+        let claim = second
+            .task_store
+            .claim_resident_merge(&crate::local_merge::targets(&second.config))
+            .await
+            .unwrap()
+            .unwrap();
+        let result = crate::merge_execution::run_merge_wal(&second, &claim).await;
+        assert!(result.as_ref().unwrap().contains("1 generations"));
+        second.task_store.finish(claim, result).await.unwrap();
+        assert_eq!(writer.pending_wal_generations().await.unwrap(), 0);
+        let rows = writer.list(None, None).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["text"], "16");
+        assert!(!probe(&second, "generic:a").await.unwrap());
+        assert_eq!(state.local_append.as_ref().unwrap().budget.reserved(), 0);
+        assert_eq!(second.local_append.as_ref().unwrap().budget.reserved(), 0);
+        // No ingestion epoch was acquired by either master.
+        generic_write(&writer, "shared", "after").await;
+        assert!(probe(&second, "generic:a").await.unwrap());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn generic_replicas_merge_distinct_tables_during_live_ingestion() {
+        let (_dir, state) = generic_fixture().await;
+        let a = generic_writer(&state, "a").await;
+        let b = generic_writer(&state, "b").await;
+        for n in 0..4 {
+            generic_write(&a, "shared", &n.to_string()).await;
+            generic_write(&b, "shared", &n.to_string()).await;
+        }
+        for target in ["generic:a", "generic:b"] {
+            state
+                .task_store
+                .enqueue(TaskKind::MergeWal, target, vec![])
+                .await
+                .unwrap();
+        }
+        let second = MasterState::new(state.config.clone()).await.unwrap();
+        let targets = crate::local_merge::targets(&state.config);
+        let claim_a = state
+            .task_store
+            .claim_resident_merge(&targets)
+            .await
+            .unwrap()
+            .unwrap();
+        let claim_b = second
+            .task_store
+            .claim_resident_merge(&targets)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(claim_a.task.target, claim_b.task.target);
+        let budget = state.local_append.as_ref().unwrap().budget.clone();
+        let held = budget.reserve(budget.limit()).await;
+        let runner = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                let result = crate::merge_execution::run_merge_wal(&state, &claim_a).await;
+                assert!(result.is_ok(), "{result:?}");
+                state.task_store.finish(claim_a, result).await.unwrap();
+            })
+        };
+        let (rb, ()) = tokio::join!(
+            crate::merge_execution::run_merge_wal(&second, &claim_b),
+            async {
+                for n in 0..8 {
+                    generic_write(&a, &format!("during-{n}"), "live").await;
+                    generic_write(&b, &format!("during-{n}"), "live").await;
+                }
+            }
+        );
+        assert!(rb.is_ok(), "{rb:?}");
+        second.task_store.finish(claim_b, rb).await.unwrap();
+        assert!(
+            !runner.is_finished(),
+            "local generic merge must respect the process budget"
+        );
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(30), runner)
+            .await
+            .unwrap()
+            .unwrap();
+        for writer in [&a, &b] {
+            generic_write(writer, "after", "live").await;
+            let rows = writer.list(None, None).await.unwrap();
+            assert_eq!(rows.len(), 10);
+            assert_eq!(
+                rows.iter().find(|row| row["id"] == "shared").unwrap()["text"],
+                "3"
+            );
+        }
+        assert_eq!(state.local_append.as_ref().unwrap().budget.reserved(), 0);
+        assert_eq!(second.local_append.as_ref().unwrap().budget.reserved(), 0);
     }
 
     #[test]

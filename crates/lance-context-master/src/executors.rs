@@ -213,7 +213,7 @@ pub(crate) fn local_heartbeat(state: &MasterState) -> Heartbeat {
         cfg.merge_wal_concurrency
     } else {
         cfg.task_concurrency.max(1)
-    } + if cfg.append.rollout_append_local {
+    } + if crate::local_merge::enabled(cfg) {
         cfg.append.rollout_append_local_task_concurrency
     } else {
         0
@@ -222,7 +222,7 @@ pub(crate) fn local_heartbeat(state: &MasterState) -> Heartbeat {
         kinds.push(TaskKind::MergeWal);
         slots_total.insert(TaskKind::MergeWal, merge_slots as u32);
     }
-    let bytes_total = if cfg.append.rollout_append_local {
+    let bytes_total = if crate::local_merge::enabled(cfg) {
         cfg.append.rollout_append_local_memory_bytes as u64
     } else {
         0

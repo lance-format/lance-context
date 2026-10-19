@@ -1,0 +1,137 @@
+//! Native maintenance execution inside each master, sharing its local buffer budget.
+use crate::{config::MasterConfig, state::MasterState};
+use std::sync::Arc;
+
+#[derive(Clone, Debug, Default, clap::Args)]
+pub struct LocalMergeConfig {
+    /// Execute sealed WAL merges in the master, including generic upsert tables.
+    /// '*' selects only explicitly owned targets; it never migrates legacy writers.
+    #[arg(long, env = "MASTER_LOCAL_MERGE_TARGETS", value_delimiter = ',')]
+    pub master_local_merge_targets: Vec<String>,
+}
+
+impl LocalMergeConfig {
+    pub(crate) fn selected(&self, target: &str) -> bool {
+        self.master_local_merge_targets
+            .iter()
+            .any(|t| t == "*" || t == target)
+    }
+}
+
+pub(crate) fn enabled(config: &MasterConfig) -> bool {
+    config.append.rollout_append_local || !config.local_merge.master_local_merge_targets.is_empty()
+}
+
+pub(crate) fn selected(config: &MasterConfig, target: &str) -> bool {
+    config.merge_rollout.owned(target)
+        && !config.merge_rollout.draining(target)
+        && (config.append.local(target) || config.local_merge.selected(target))
+}
+
+/// Resolve the local selection before claiming. In particular an append wildcard
+/// cannot accidentally reserve a slot for a generic table that still needs RPCs.
+pub(crate) fn targets(config: &MasterConfig) -> Vec<String> {
+    config
+        .merge_rollout
+        .owned_targets
+        .iter()
+        .filter(|target| selected(config, target))
+        .cloned()
+        .collect()
+}
+
+pub(crate) fn validate(config: &MasterConfig) -> Result<(), String> {
+    if config.local_merge.master_local_merge_targets.is_empty() {
+        return Ok(());
+    }
+    let catchup = &config.catchup;
+    if catchup.enabled || catchup.pod_template.is_some() || catchup.target.is_some() {
+        return Err("master local merges cannot be combined with Kubernetes catch-up mode".into());
+    }
+    if catchup.shards.is_empty()
+        || catchup.shards.len() > 256
+        || catchup.shards.iter().any(|s| s.is_empty())
+        || catchup.slice_secs == 0
+        || catchup.merge_max_bytes == 0
+        || config.append.rollout_append_local_memory_bytes < catchup.merge_max_bytes
+        || config.merge_wal_concurrency == 0
+    {
+        return Err("master local merges require stable shards, bounded passes and a sufficient shared memory budget".into());
+    }
+    if targets(config)
+        .iter()
+        .any(|target| config.append.enabled(target))
+    {
+        config.append.validate()?;
+        if config.append.rollout_append_local_memory_bytes < config.append.rollout_append_max_bytes
+        {
+            return Err("local append batch exceeds shared memory budget".into());
+        }
+    }
+    for target in &config.local_merge.master_local_merge_targets {
+        if target != "*" && !selected(config, target) {
+            return Err(format!(
+                "master local merge requires a non-draining owned target: {target}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The caller owns the canonical task and maintenance fence. No private queue,
+/// Pod, writer epoch, or independent per-table memory budget is created here.
+pub(crate) async fn run(state: &Arc<MasterState>, target: &str) -> Result<String, String> {
+    if !selected(&state.config, target) {
+        return Err("target is not configured for master local merge".into());
+    }
+    let local = state
+        .local_append
+        .as_ref()
+        .ok_or("missing shared local merge resources")?;
+    crate::catchup::merge_local(state, target, local.session.clone(), local.budget.clone()).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn local_selection_preserves_legacy_and_append_boundaries() {
+        let mut config = MasterConfig::parse_from(["test"]);
+        config.merge_rollout.owned_targets = vec!["rollout".into(), "generic:rows".into()];
+        config.append.rollout_append_local = true;
+        config.append.rollout_append_targets = vec!["*".into()];
+        assert_eq!(targets(&config), ["rollout"]);
+        config.local_merge.master_local_merge_targets = vec!["*".into()];
+        assert_eq!(targets(&config), ["rollout", "generic:rows"]);
+        assert!(!selected(&config, "legacy"));
+        config.merge_rollout.drain_targets = vec!["generic:rows".into()];
+        assert_eq!(targets(&config), ["rollout"]);
+    }
+
+    #[test]
+    fn local_validation_requires_safe_resources_and_ownership() {
+        let mut config = MasterConfig::parse_from(["test"]);
+        config.local_merge.master_local_merge_targets = vec!["generic:rows".into()];
+        config.catchup.shards = vec!["writer".into()];
+        assert!(validate(&config).is_err());
+        config.merge_rollout.owned_targets = vec!["generic:rows".into()];
+        assert!(validate(&config).is_ok());
+        config.append.rollout_append_local_memory_bytes = config.catchup.merge_max_bytes - 1;
+        assert!(validate(&config).is_err());
+        config.append.rollout_append_local_memory_bytes = config.catchup.merge_max_bytes;
+        config.catchup.enabled = true;
+        assert!(validate(&config).is_err());
+        config.catchup.enabled = false;
+        config.catchup.shards.clear();
+        assert!(validate(&config).is_err());
+        config.catchup.shards = vec!["writer".into()];
+        config.local_merge.master_local_merge_targets = vec!["*".into()];
+        config.merge_rollout.owned_targets.push("rollout".into());
+        config.append.rollout_append_targets = vec!["rollout".into()];
+        config.append.rollout_append_max_bytes =
+            config.append.rollout_append_local_memory_bytes + 1;
+        assert!(validate(&config).is_err());
+    }
+}

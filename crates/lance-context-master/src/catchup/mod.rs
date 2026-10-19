@@ -12,6 +12,7 @@ use axum::{
     extract::{Query, State},
     Json,
 };
+pub(crate) use executor::merge_local;
 pub use executor::{execute, ExecuteOutcome};
 use kubernetes::Kubernetes;
 use serde::{Deserialize, Serialize};

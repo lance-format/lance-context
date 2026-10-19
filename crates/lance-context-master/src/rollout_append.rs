@@ -114,7 +114,7 @@ impl AppendConfig {
                 .iter()
                 .any(|t| t == "*" || t == target)
     }
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if !(1..=32).contains(&self.rollout_append_concurrency)
             || !(1..=256).contains(&self.rollout_append_max_generations)
             || self.rollout_append_max_bytes == 0
@@ -222,7 +222,8 @@ pub(crate) async fn run(state: &Arc<MasterState>, target: &str) -> Result<String
     // an older worker and silently fall back to its manifest-publishing merge.
     // Local execution is explicitly configured, never a fallback after failed
     // worker RPCs. Stable shard identities include historical, absent workers.
-    let local_execution = state.config.catchup.target.is_some() || config.local(target);
+    let local_execution = state.config.catchup.target.is_some()
+        || crate::local_merge::selected(&state.config, target);
     let probe_futures: Vec<_> = state
         .config
         .worker_endpoints
@@ -309,7 +310,8 @@ pub(crate) async fn run(state: &Arc<MasterState>, target: &str) -> Result<String
             return Ok(format!("staged append reclaimed {total} generations"));
         }
     }
-    if state.config.append.local(target) && state.config.catchup.target.is_none() {
+    if crate::local_merge::selected(&state.config, target) && state.config.catchup.target.is_none()
+    {
         // Publish before this task releases its claim. The demand consumer only
         // acknowledges a queued successor, never this still-running task. A
         // crash before publication is covered by resident manifest discovery.

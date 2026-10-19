@@ -120,16 +120,27 @@ async fn merge_passes(state: &Arc<MasterState>, target: &str) -> Result<String> 
     if state.config.append.enabled(target) {
         return crate::rollout_append::run(state, target).await;
     }
-    let config = &state.config.catchup;
     let session = RolloutStore::build_session(96 * 1024 * 1024, 32 * 1024 * 1024);
-    let budget = MergeMemoryBudget::new(config.merge_memory_bytes);
+    let budget = MergeMemoryBudget::new(state.config.catchup.merge_memory_bytes);
+    merge_local(state, target, session, budget).await
+}
+
+/// Same bounded storage implementation for resident masters and dedicated legacy executors.
+/// Resources are supplied by the caller so resident tasks share one process budget.
+pub(crate) async fn merge_local(
+    state: &Arc<MasterState>,
+    target: &str,
+    session: Arc<lance::session::Session>,
+    budget: Arc<MergeMemoryBudget>,
+) -> Result<String> {
+    let config = &state.config.catchup;
     let mut total = 0usize;
     let started = tokio::time::Instant::now();
     // This is only an admission time slice. A progressing operation already
     // admitted may run beyond it; cancellation is based on lack of progress.
     let admit_for = Duration::from_secs(config.slice_secs);
-    // Bound each slice even under continuous ingestion; later fresh stats may
-    // request another Job. Visit every shard before repeating any hot shard.
+    // Bound each slice even under continuous ingestion. Resident masters publish
+    // continuation demand before releasing their claim; no full scan is required.
     for _ in 0..16 {
         let before = total;
         total += run_pipeline(&config.shards, config.pipeline_enabled, |shard| {
@@ -151,17 +162,28 @@ async fn merge_passes(state: &Arc<MasterState>, target: &str) -> Result<String> 
                     metrics::counter!("master_catchup_generations_reclaimed_total")
                         .increment(reclaimed as u64);
                     tracing::info!(%target, %shard, reclaimed, prepare_secs, commit_secs,
-                        "dedicated catch-up committed");
+                        "local WAL merge committed");
                     Ok(reclaimed)
                 }) as BoxFuture<'_, Result<usize>>)
             }
         })
         .await?;
-        if total == before {
+        if total == before && started.elapsed() < admit_for {
+            return Ok(format!("local WAL merge reclaimed {total} generations"));
+        }
+        if started.elapsed() >= admit_for {
             break;
         }
     }
-    Ok(format!("dedicated catch-up merged {total} generations"))
+    if crate::local_merge::selected(&state.config, target) && config.target.is_none() {
+        state
+            .task_store
+            .merge_coordinator()
+            .request_merge(target)
+            .await?;
+        metrics::counter!("master_resident_merge_continuations_total").increment(1);
+    }
+    Ok(format!("local WAL merge reclaimed {total} generations"))
 }
 
 /// Read sealed WAL without acquiring a writer epoch. The returned future owns

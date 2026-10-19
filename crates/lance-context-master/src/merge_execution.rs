@@ -32,8 +32,7 @@ pub(crate) async fn run_merge_wal(
     claim: &TaskClaim,
 ) -> Result<String, String> {
     if state.config.worker_endpoints.is_empty()
-        && !(state.config.append.local(&claim.task.target)
-            && state.config.merge_rollout.owned(&claim.task.target))
+        && !crate::local_merge::selected(&state.config, &claim.task.target)
     {
         return Err("no worker endpoints configured".into());
     }
@@ -62,7 +61,7 @@ pub(crate) async fn run_merge_wal(
         }
         return run_legacy(state, target).await;
     }
-    if state.config.append.enabled(target) {
+    if state.config.append.enabled(target) || crate::local_merge::selected(&state.config, target) {
         if let Some(old) = coordinator.get(target).await? {
             ensure_recovery_due(&coordinator, &old).await?;
             recover_execution(state, &coordinator, &proof, old).await?;
@@ -71,7 +70,13 @@ pub(crate) async fn run_merge_wal(
             state,
             claim,
             lance_context_merge::MaintenanceKind::Catchup,
-            crate::rollout_append::run(state, target),
+            async {
+                if state.config.append.enabled(target) {
+                    crate::rollout_append::run(state, target).await
+                } else {
+                    crate::local_merge::run(state, target).await
+                }
+            },
         )
         .await;
     }

@@ -17,8 +17,7 @@ use lance_context_merge::rollout::MergeRollout;
 pub enum Skip {
     /// The poller's kind set does not include this task kind.
     KindNotRunnable,
-    /// A resident-only poller saw a task that is not a local append merge
-    /// on an owned, non-draining, opted-in rollout target.
+    /// A resident-only poller saw a task outside the owned, non-draining local scope.
     NotResidentEligible,
     /// A prepared compaction or index is waiting for its commit turn on
     /// this table; merge yields one admission turn.
@@ -90,10 +89,10 @@ pub fn pre_dependency_filter(
     }
     if let Some(targets) = resident_targets {
         let eligible = kind == TaskKind::MergeWal
-            && !is_generic(target)
             && policy.rollout.owned(target)
             && !policy.rollout.draining(target)
-            && listed(targets, target);
+            && (targets.iter().any(|t| t == target)
+                || (!is_generic(target) && listed(targets, target)));
         if !eligible {
             return Err(Skip::NotResidentEligible);
         }
@@ -232,10 +231,7 @@ mod tests {
             check(TaskKind::MergeWal, "excluded"),
             Err(Skip::NotResidentEligible)
         );
-        assert_eq!(
-            check(TaskKind::MergeWal, "generic:gs"),
-            Err(Skip::NotResidentEligible)
-        );
+        assert_eq!(check(TaskKind::MergeWal, "generic:gs"), Ok(()));
         assert_eq!(check(TaskKind::Compact, "hot"), Err(Skip::KindNotRunnable));
         let wildcard = strings(&["*"]);
         assert_eq!(
