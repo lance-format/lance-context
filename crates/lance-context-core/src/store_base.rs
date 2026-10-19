@@ -1442,6 +1442,9 @@ impl StorageBase {
             self.delete_key_values(values).await?;
         }
 
+        #[cfg(test)]
+        crate::rollout_store::crash_tests::checkpoint(self.uri(), "after_delete");
+
         if let Some(watermark) = watermark {
             let params = WriteParams {
                 mode: WriteMode::Append,
@@ -1466,6 +1469,8 @@ impl StorageBase {
             );
             Box::pin(self.dataset.append(reader, None)).await?;
         }
+        #[cfg(test)]
+        crate::rollout_store::crash_tests::checkpoint(self.uri(), "after_append");
         Ok(())
     }
 
