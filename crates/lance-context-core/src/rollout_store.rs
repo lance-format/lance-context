@@ -625,6 +625,15 @@ impl RolloutStore {
         self.base.flush().await
     }
 
+    /// Replay and materialize durable WAL for this instance without appending rows.
+    ///
+    /// This opens the instance's writer even on an idle table. The caller must
+    /// establish shard ownership and retire its previous writer process first;
+    /// this method is not an ownership or uncertain-operation retry protocol.
+    pub async fn replay_and_flush_own_wal(&self) -> LanceResult<()> {
+        self.base.replay_and_flush_own_wal().await
+    }
+
     /// Gracefully close the resident writer, draining its background tasks.
     /// Idempotent. See `StorageBase::close`.
     pub async fn close(&mut self) -> LanceResult<()> {
@@ -6193,5 +6202,123 @@ mod tests {
                 );
             }
         }
+    }
+
+    // Child process deliberately exits without dropping the store or runtime.
+    // The parent verifies acknowledged idle WAL after that exact process joins.
+    #[test]
+    #[ignore = "subprocess helper for explicit_replay_materializes_idle_acknowledged_wal"]
+    fn explicit_replay_crash_child() {
+        use std::io::Write;
+        let root = std::path::PathBuf::from(std::env::var("RK_REPLAY_CRASH_ROOT_20182").unwrap());
+        assert!(root.is_dir());
+        let uri = root.join("table").to_string_lossy().into_owned();
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let store = RolloutStore::open_with_options(
+                    &uri,
+                    RolloutStoreOptions {
+                        shard_id: Some("explicit-replay-crashed-owner".into()),
+                        merge_after_generations: Some(0),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+                for i in 0..20 {
+                    store
+                        .add(&[assistant_record(&format!("ack-{i:02}"))])
+                        .await
+                        .unwrap();
+                }
+                assert!(store.list(None, None).await.unwrap().is_empty());
+                let mut receipt = std::fs::File::create(root.join("acknowledged.json")).unwrap();
+                receipt
+                    .write_all(b"{\"acknowledged\":20,\"flushed\":false}")
+                    .unwrap();
+                receipt.sync_all().unwrap();
+                std::process::exit(0);
+            });
+    }
+
+    #[test]
+    fn explicit_replay_materializes_idle_acknowledged_wal() {
+        let dir = TempDir::new().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "rollout_store::tests::explicit_replay_crash_child",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("RK_REPLAY_CRASH_ROOT_20182", dir.path())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                let _ = child.wait();
+                panic!("owned replay-test child exceeded its deadline");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(status.success());
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("acknowledged.json")).unwrap())
+                .unwrap();
+        assert_eq!(receipt["acknowledged"], 20);
+        assert_eq!(receipt["flushed"], false);
+        let uri = dir.path().join("table").to_string_lossy().into_owned();
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut store = RolloutStore::open_existing_with_options(
+                    &uri,
+                    RolloutStoreOptions {
+                        shard_id: Some("explicit-replay-crashed-owner".into()),
+                        merge_after_generations: Some(0),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+                // Existing flush/merge do not instantiate the idle writer.
+                store.flush().await.unwrap();
+                assert_eq!(store.cleanup_own_shard().await.unwrap(), 0);
+                assert!(store.list(None, None).await.unwrap().is_empty());
+                // No new append is issued after the child exits.
+                store.replay_and_flush_own_wal().await.unwrap();
+                let expected: std::collections::BTreeSet<_> =
+                    (0..20).map(|i| format!("ack-{i:02}")).collect();
+                for _ in 0..2 {
+                    let rows = store.list(None, None).await.unwrap();
+                    assert_eq!(rows.len(), 20);
+                    assert_eq!(
+                        rows.iter()
+                            .map(|r| r.id.clone())
+                            .collect::<std::collections::BTreeSet<_>>(),
+                        expected
+                    );
+                    for row in &rows {
+                        assert_eq!(row.content, assistant_record(&row.id).content);
+                    }
+                    store.replay_and_flush_own_wal().await.unwrap();
+                }
+                assert!(store.cleanup_own_shard().await.unwrap() > 0);
+                assert_eq!(store.list(None, None).await.unwrap().len(), 20);
+                store.close().await.unwrap();
+            });
     }
 }
