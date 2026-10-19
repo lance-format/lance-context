@@ -32,6 +32,7 @@ pub(crate) async fn run_merge_wal(
     claim: &TaskClaim,
 ) -> Result<String, String> {
     if state.config.worker_endpoints.is_empty()
+        && !state.config.merge_rollout.draining(&claim.task.target)
         && !crate::local_merge::selected(&state.config, &claim.task.target)
     {
         return Err("no worker endpoints configured".into());

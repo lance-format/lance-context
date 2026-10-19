@@ -1897,7 +1897,9 @@ mod tests {
         let mut cfg = config(&dir);
         cfg.merge_rollout.owned_targets.retain(|t| t != "exp");
         cfg.merge_rollout.drain_targets.push("exp".into());
-        cfg.worker_endpoints = vec!["http://127.0.0.1:1".into()];
+        // A resident-only master must reconcile the recorded old execution
+        // even though it has no configured worker endpoints for fresh work.
+        cfg.worker_endpoints.clear();
         let state = MasterState::new(cfg).await.unwrap();
         enqueue(&state, TaskKind::MergeWal, "exp").await.unwrap();
         let claim = state
