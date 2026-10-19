@@ -183,7 +183,10 @@ pub(crate) async fn merge_local(
             }
         })
         .await?;
-        if total == before && started.elapsed() < admit_for {
+        if total == before && (total == 0 || started.elapsed() < admit_for) {
+            // Empty metadata reads can consume the admission slice too. They
+            // must not create a self-sustaining chain of zero-work tasks;
+            // bounded resident discovery will reassert any remaining demand.
             return Ok(detail(total));
         }
         if started.elapsed() >= admit_for {
