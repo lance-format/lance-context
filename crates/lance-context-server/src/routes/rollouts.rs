@@ -557,9 +557,9 @@ async fn get_rollout_refreshing_on_miss(
     store.get_by_id(id).await.map_err(AppError::from_lance)
 }
 
-/// Blob equivalent of [`get_rollout_refreshing_on_miss`]. A successful payload
-/// hit stays on the shared-lock fast path; only `None` pays the manifest refresh
-/// and retry.
+/// Blob lookup can use a cloned latest base under the shared lock. Retain the
+/// exclusive refresh/retry for a final miss, including a merge racing that
+/// cloned snapshot; successful payload hits never upgrade the store lock.
 async fn get_rollout_blob_refreshing_on_miss(
     store_lock: &RwLock<RolloutStore>,
     id: &str,
@@ -1193,17 +1193,25 @@ mod tests {
         assert_eq!(found.record.unwrap().id, first.id);
         assert_eq!(cached.read().await.version(), cached_version);
 
-        let response = fetch_rollout_blob(
-            State(state.clone()),
-            Path(("rl".to_string(), blob_record.id)),
+        // Another shared reader must not delay a blob found in the new base.
+        // Holding this guard exposes any regression to an exclusive refresh.
+        let resident_read = cached.read().await;
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            fetch_rollout_blob(
+                State(state.clone()),
+                Path(("rl".to_string(), blob_record.id)),
+            ),
         )
         .await
+        .expect("a newly merged blob must not wait for an exclusive store lock")
         .unwrap();
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
         assert_eq!(bytes.as_ref(), payload.as_slice());
-        assert_eq!(cached.read().await.version(), writer.version());
+        assert_eq!(resident_read.version(), cached_version);
+        drop(resident_read);
     }
 
     #[tokio::test]
