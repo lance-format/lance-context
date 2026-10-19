@@ -2411,6 +2411,86 @@ mod tests {
     use tempfile::TempDir;
 
     #[tokio::test]
+    async fn list_retries_wrapped_missing_generation_errors() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = RolloutStore::open(dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let attempts = AtomicUsize::new(0);
+        let result = store
+            .base
+            .read_consistent(ListSource::All, |_, _| {
+                let first = attempts.fetch_add(1, Ordering::SeqCst) == 0;
+                async move {
+                    if first {
+                        // Same nested error surface observed in Azure while
+                        // GC removed a generation's data file during a take.
+                        Err(LanceError::io(
+                            "Wrapped error: Not found: _mem_wal/shard/gen_9/data/file.lance",
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                }
+            })
+            .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn completed_list_snapshot_survives_later_merge_commits() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let writer = RolloutStore::open_with_options(
+            uri,
+            RolloutStoreOptions {
+                shard_id: Some("snapshot-writer".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        writer.add(&[assistant_record("initial")]).await.unwrap();
+        writer.flush().await.unwrap();
+        let reader = RolloutStore::open(uri).await.unwrap();
+        let writer = tokio::sync::Mutex::new(writer);
+        let attempts = AtomicUsize::new(0);
+
+        let rows = reader
+            .base
+            .read_consistent(ListSource::All, |dataset, snapshots| {
+                let reader = &reader;
+                let writer = &writer;
+                let attempts = &attempts;
+                async move {
+                    let rows = reader.list_non_blob_snapshot(dataset, snapshots).await?;
+                    // Publish a later write only after this read has collected
+                    // its complete snapshot. It must not invalidate those rows.
+                    let sequence = attempts.fetch_add(1, Ordering::SeqCst);
+                    let mut writer = writer.lock().await;
+                    writer
+                        .add(&[assistant_record(&format!("later-{sequence}"))])
+                        .await
+                        .unwrap();
+                    writer.flush().await.unwrap();
+                    writer.cleanup_own_shard().await.unwrap();
+                    Ok(rows)
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "initial");
+    }
+
+    #[tokio::test]
     async fn list_retries_when_a_generation_is_deleted_during_the_read() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let dir = tempfile::tempdir().unwrap();

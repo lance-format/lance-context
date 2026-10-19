@@ -2282,10 +2282,12 @@ impl StorageBase {
 
     /// Read a fresh base/WAL view and retry if a merge invalidates it. A merge
     /// commits base before draining/deleting its generations, so an unchanged
-    /// base version brackets a successful read. Retry missing generations even
-    /// when the base version is unchanged. Never return a partial result after
-    /// a generation disappears. Ordinary WAL appends do not change base and do
-    /// not force retries. Pinned reads use only their selected base version.
+    /// base version must bracket the WAL manifest capture. Validate that pair
+    /// before reading payloads. A later commit does not invalidate a completed
+    /// read of that snapshot. Retry missing generations even when the base
+    /// version is unchanged; never return a partial result after one disappears.
+    /// Ordinary WAL appends do not force retries. Pinned reads use only their
+    /// selected base version.
     pub async fn read_consistent<T, F, Fut>(
         &self,
         source: ListSource,
@@ -2306,6 +2308,16 @@ impl StorageBase {
             } else {
                 self.wal_shard_snapshots().await?
             };
+            if !self.is_version_pinned() {
+                let mut latest = dataset.clone();
+                latest.checkout_latest().await?;
+                if latest.manifest.version != version {
+                    // A merge could have drained WAL after we opened base.
+                    // Retry this metadata pair before scanning any payloads,
+                    // otherwise the view could omit its newly merged rows.
+                    continue;
+                }
+            }
             let result = read(dataset.clone(), snapshots).await;
             if self.is_version_pinned() {
                 return result;
@@ -2319,10 +2331,12 @@ impl StorageBase {
                 // the base version. Refresh both snapshots even in that case.
                 continue;
             }
-            dataset.checkout_latest().await?;
-            if dataset.manifest.version == version {
-                return result;
-            }
+            // The immutable base/WAL view was complete at capture. A commit
+            // after capture may force a missing-file retry, but cannot make
+            // successfully read rows disappear. Requiring the base to stay
+            // unchanged throughout payload decoding starves reads under
+            // continuous merging and repeats all their decoding work.
+            return result;
         }
         Err(LanceError::io(
             "dataset changed during read; retry the request",
@@ -2531,12 +2545,10 @@ pub(crate) fn is_fenced_error(err: &LanceError) -> bool {
 
 /// Whether a Lance error means the target dataset/path does not exist.
 ///
-/// Used by WAL read fallbacks to skip a flushed generation that a concurrent
-/// merge drained from the shard manifest and deleted between the manifest
-/// snapshot and the open — the row's data is already in the base table, so
-/// skipping is safe and avoids a transient failure. Both the structured
-/// not-found variants and the object-store "not found" surface are matched; the
-/// latter is text-based because it arrives as a generic wrapped IO error.
+/// WAL reads can race with a merge draining and deleting a generation. A read
+/// must then refresh its base/WAL view, not return a partial result. Both the
+/// structured variants and the object-store message are matched; the latter
+/// can arrive as a generic wrapped IO error with different capitalization.
 pub(crate) fn is_not_found_error(err: &LanceError) -> bool {
     if matches!(
         err,
@@ -2544,8 +2556,8 @@ pub(crate) fn is_not_found_error(err: &LanceError) -> bool {
     ) {
         return true;
     }
-    let text = err.to_string();
-    text.contains("was not found") || text.contains("not found") || text.contains("NotFound")
+    let text = err.to_string().to_ascii_lowercase();
+    text.contains("not found") || text.contains("notfound")
 }
 
 /// Keep the newest prepared row for each merge key.
