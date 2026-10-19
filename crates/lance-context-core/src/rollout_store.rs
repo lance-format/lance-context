@@ -853,26 +853,166 @@ impl RolloutStore {
 
     /// List rollout rows matching exact field filters.
     ///
-    /// The filter is pushed into every LSM source before merge and
-    /// deduplication. Rollout rows are immutable by id, so filtering each
-    /// generation cannot reveal an older state of a mutable record.
+    /// Select rows using narrow columns before materializing a page's payload.
+    /// Preserve first-seen ordering and last-seen values across base and WAL;
+    /// apply filters to the winning row before pagination.
+    ///
+    /// Selection still scans every source and retains one position per distinct
+    /// id; this bounds payload decoding to the selected rows, not total key I/O.
+    /// Unfiltered, unbounded calls retain the complete-list behavior.
     pub async fn list_with_filters(
         &self,
         limit: Option<usize>,
         offset: Option<usize>,
         filters: Option<&RolloutFilters>,
     ) -> LanceResult<Vec<RolloutRecord>> {
-        let mut results = self.list_all_non_blob_records().await?;
-        if let Some(filters) = filters {
-            results.retain(|record| filters.matches_record(record));
+        if limit == Some(0) {
+            return Ok(Vec::new());
+        }
+        if limit.is_some() || filters.is_some() {
+            return self
+                .base
+                .read_consistent(ListSource::All, |dataset, snapshots| {
+                    self.list_selected_snapshot(dataset, snapshots, limit, offset, filters)
+                })
+                .await;
+        }
+        Ok(self
+            .list_all_non_blob_records()
+            .await?
+            .into_iter()
+            .skip(offset.unwrap_or(0))
+            .collect())
+    }
+
+    async fn list_selected_snapshot(
+        &self,
+        dataset: Dataset,
+        snapshots: Vec<ShardSnapshot>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+        filters: Option<&RolloutFilters>,
+    ) -> LanceResult<Vec<RolloutRecord>> {
+        // Required decoder fields plus the exact-match filter columns. Text,
+        // token arrays, JSON metadata and artifact bytes never enter this scan.
+        let selection_columns = Arc::new(
+            [
+                "id",
+                "rollout_id",
+                "problem_id",
+                "sequence_order",
+                "role",
+                "created_at",
+                "content_type",
+                "dataset",
+                "policy_version",
+                "artifact_type",
+                "include_in_training",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .filter(|column| filters.is_some() || column == "id")
+            .filter(|column| dataset.schema().field(column).is_some())
+            .collect::<Vec<_>>(),
+        );
+        let selection_schema = Arc::new(projected_arrow_schema(&dataset, &selection_columns)?);
+        let columns = Self::non_blob_columns_for(&dataset);
+        let target_schema = Arc::new(projected_arrow_schema(&dataset, &columns)?);
+        let mut sources = vec![dataset];
+        for snapshot in snapshots {
+            for generation in snapshot.sstables {
+                let uri = self.flushed_generation_uri(snapshot.shard_id, &generation.path);
+                sources.push(self.open_flushed_dataset(&uri).await?);
+            }
         }
 
-        let offset = offset.unwrap_or(0);
-        let results = match limit {
-            Some(limit) => results.into_iter().skip(offset).take(limit).collect(),
-            None => results.into_iter().skip(offset).collect(),
-        };
-        Ok(results)
+        let mut positions = HashMap::new();
+        let mut selections = Vec::new();
+        for (source_index, dataset) in sources.iter().enumerate() {
+            let mut scanner = dataset.scan();
+            scanner
+                .project(&projected_column_refs(dataset, &selection_columns))?
+                .with_row_id();
+            let mut stream = scanner.try_into_stream().await?;
+            while let Some(batch) = stream.try_next().await? {
+                let row_ids = column_as::<UInt64Array>(&batch, "_rowid")?.clone();
+                let selection_indices = batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, field)| (field.name() != "_rowid").then_some(index))
+                    .collect::<Vec<_>>();
+                let aligned = align_batch_to_schema(
+                    batch.project(&selection_indices)?,
+                    selection_schema.clone(),
+                )?;
+                let matches = filters
+                    .map(|filters| {
+                        batch_to_rollout_records(&aligned).map(|records| {
+                            records
+                                .into_iter()
+                                .map(|record| filters.matches_record(&record))
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .transpose()?;
+                let ids = column_as::<StringArray>(&aligned, "id")?;
+                for row in 0..aligned.num_rows() {
+                    let selection = (
+                        source_index,
+                        row_ids.value(row),
+                        matches.as_ref().is_none_or(|matches| matches[row]),
+                    );
+                    if let Some(index) = positions.get(ids.value(row)).copied() {
+                        selections[index] = selection;
+                    } else {
+                        positions.insert(ids.value(row).to_string(), selections.len());
+                        selections.push(selection);
+                    }
+                }
+            }
+        }
+        // The winning row may fail the filter even if an older row passed it.
+        // Do not filter sources independently or fetch rows by id again.
+        drop(positions);
+        let selected = selections
+            .into_iter()
+            .filter(|(_, _, matches)| *matches)
+            .skip(offset.unwrap_or(0))
+            .take(limit.unwrap_or(usize::MAX));
+        let mut per_source = vec![Vec::new(); sources.len()];
+        let mut count = 0;
+        for (position, (source, row_id, _)) in selected.enumerate() {
+            per_source[source].push((position, row_id));
+            count += 1;
+        }
+        let mut results = vec![None; count];
+        for (dataset, rows) in sources.iter().zip(per_source) {
+            // Bound individual wide-row takes, including unbounded filtered
+            // callers. Allocate from observed rows, never from a client limit.
+            for chunk in rows.chunks(256) {
+                let row_ids = chunk.iter().map(|(_, id)| *id).collect::<Vec<_>>();
+                let projection = projected_dataset_schema(dataset, &columns)?;
+                let batch = dataset.take_rows(&row_ids, projection).await?;
+                let aligned = align_batch_to_schema(batch, target_schema.clone())?;
+                let records = batch_to_rollout_records(&aligned)?;
+                if records.len() != chunk.len() {
+                    return Err(LanceError::io(
+                        "rollout rows disappeared during page materialization",
+                    ));
+                }
+                for ((position, _), record) in chunk.iter().zip(records) {
+                    results[*position] = Some(record);
+                }
+            }
+        }
+        results
+            .into_iter()
+            .map(|record| {
+                record.ok_or_else(|| LanceError::io("rollout page row was not materialized"))
+            })
+            .collect()
     }
 
     /// Return one complete trajectory in deterministic message order.
@@ -3160,6 +3300,173 @@ mod tests {
             assert_eq!(obs.row_count, 2);
             assert!(obs.last_updated > 0);
         });
+    }
+
+    #[tokio::test]
+    async fn selected_list_retries_after_wal_reclamation() {
+        let dir = TempDir::new().unwrap();
+        let mut writer = RolloutStore::open(dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        writer.add(&[assistant_record("reclaimed")]).await.unwrap();
+        writer.flush().await.unwrap();
+        let reader = RolloutStore::open(dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let writer = tokio::sync::Mutex::new(&mut writer);
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let rows = reader
+            .base
+            .read_consistent(ListSource::All, |dataset, snapshots| {
+                let reader = &reader;
+                let writer = &writer;
+                let attempts = &attempts;
+                async move {
+                    if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                        writer.lock().await.cleanup_own_shard().await.unwrap();
+                    }
+                    reader
+                        .list_selected_snapshot(dataset, snapshots, Some(1), None, None)
+                        .await
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "reclaimed");
+    }
+
+    #[tokio::test]
+    async fn selected_list_supports_legacy_wal_and_evolved_base() {
+        for evolved in [false, true] {
+            let (_dir, store) = store_with_legacy_base_and_wal(evolved).await;
+            let expected = store.list_all_non_blob_records().await.unwrap();
+            for filters in [
+                None,
+                Some(RolloutFilters {
+                    role: Some(ROLE_ASSISTANT.into()),
+                    ..Default::default()
+                }),
+            ] {
+                let rows = store
+                    .list_with_filters(Some(10), None, filters.as_ref())
+                    .await
+                    .unwrap();
+                assert_eq!(rows.len(), expected.len());
+                for (actual, expected) in rows.iter().zip(&expected) {
+                    assert_records_eq(actual, expected);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn selected_list_skips_unselected_payload_decoding() {
+        let dir = TempDir::new().unwrap();
+        let mut store = RolloutStore::open(dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let batch = store
+            .records_to_batch(&[assistant_record("selected"), assistant_record("unselected")])
+            .unwrap();
+        let mut columns = batch.columns().to_vec();
+        columns[batch.schema().index_of("metadata").unwrap()] =
+            Arc::new(LargeStringArray::from(vec![Some("{}"), Some("{")]));
+        let batch = RecordBatch::try_new(batch.schema(), columns).unwrap();
+        let schema = batch.schema();
+        store
+            .base
+            .dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(store.list_all_non_blob_records().await.is_err());
+        let page = store.list(Some(1), None).await.unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].id, "selected");
+        let filters = RolloutFilters {
+            id: Some("selected".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            store
+                .list_with_filters(None, None, Some(&filters))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(store.list(Some(0), None).await.unwrap().is_empty());
+        assert!(store
+            .list(Some(usize::MAX), Some(usize::MAX))
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn selected_list_preserves_base_wal_winners_order_and_filters() {
+        let dir = TempDir::new().unwrap();
+        let mut store = RolloutStore::open(dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let batch = store
+            .records_to_batch(&[assistant_record("z-first"), assistant_record("a-second")])
+            .unwrap();
+        let schema = batch.schema();
+        store
+            .base
+            .dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema),
+                None,
+            )
+            .await
+            .unwrap();
+        for version in ["old", "new"] {
+            let mut updated = assistant_record("z-first");
+            updated.content = Some(version.into());
+            updated.policy_version = Some(version.into());
+            store
+                .add(&[updated, assistant_record(&format!("wal-{version}"))])
+                .await
+                .unwrap();
+            store.flush().await.unwrap();
+        }
+        let expected = store.list_all_non_blob_records().await.unwrap();
+        assert_eq!(expected[0].content.as_deref(), Some("new"));
+        for limit in [1, 2, usize::MAX] {
+            for offset in [0, 1, 3, usize::MAX] {
+                let actual = store.list(Some(limit), Some(offset)).await.unwrap();
+                let expected = expected.iter().skip(offset).take(limit).collect::<Vec<_>>();
+                assert_eq!(actual.len(), expected.len());
+                for (actual, expected) in actual.iter().zip(expected) {
+                    assert_records_eq(actual, expected);
+                }
+            }
+        }
+        for version in ["old", "new"] {
+            let filters = RolloutFilters {
+                policy_version: Some(version.into()),
+                ..Default::default()
+            };
+            let actual = store
+                .list_with_filters(Some(2), None, Some(&filters))
+                .await
+                .unwrap();
+            let expected = expected
+                .iter()
+                .filter(|row| filters.matches_record(row))
+                .collect::<Vec<_>>();
+            assert_eq!(actual.len(), expected.len());
+            for (actual, expected) in actual.iter().zip(expected) {
+                assert_records_eq(actual, expected);
+            }
+        }
     }
 
     #[test]
