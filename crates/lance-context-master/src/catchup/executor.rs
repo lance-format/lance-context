@@ -135,6 +135,16 @@ pub(crate) async fn merge_local(
 ) -> Result<String> {
     let config = &state.config.catchup;
     let mut total = 0usize;
+    // Legacy supervisors consume these progress messages and task details.
+    let dedicated = config.target.is_some();
+    let detail = |total| {
+        let prefix = if dedicated {
+            "dedicated catch-up merged"
+        } else {
+            "local WAL merge reclaimed"
+        };
+        format!("{prefix} {total} generations")
+    };
     let started = tokio::time::Instant::now();
     // This is only an admission time slice. A progressing operation already
     // admitted may run beyond it; cancellation is based on lack of progress.
@@ -161,15 +171,20 @@ pub(crate) async fn merge_local(
                     let commit_secs = commit_started.elapsed().as_secs_f64();
                     metrics::counter!("master_catchup_generations_reclaimed_total")
                         .increment(reclaimed as u64);
-                    tracing::info!(%target, %shard, reclaimed, prepare_secs, commit_secs,
-                        "local WAL merge committed");
+                    if dedicated {
+                        tracing::info!(%target, %shard, reclaimed, prepare_secs, commit_secs,
+                            "dedicated catch-up committed");
+                    } else {
+                        tracing::info!(%target, %shard, reclaimed, prepare_secs, commit_secs,
+                            "local WAL merge committed");
+                    }
                     Ok(reclaimed)
                 }) as BoxFuture<'_, Result<usize>>)
             }
         })
         .await?;
         if total == before && started.elapsed() < admit_for {
-            return Ok(format!("local WAL merge reclaimed {total} generations"));
+            return Ok(detail(total));
         }
         if started.elapsed() >= admit_for {
             break;
@@ -183,7 +198,7 @@ pub(crate) async fn merge_local(
             .await?;
         metrics::counter!("master_resident_merge_continuations_total").increment(1);
     }
-    Ok(format!("local WAL merge reclaimed {total} generations"))
+    Ok(detail(total))
 }
 
 /// Read sealed WAL without acquiring a writer epoch. The returned future owns
