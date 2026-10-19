@@ -21,12 +21,15 @@ const PER_SHARD: usize = 128;
 const WINDOW: Duration = Duration::from_secs(300);
 const MAX_REPLY: usize = 1024 * 1024;
 const MAX_TARGET: usize = 1032;
+// Observation threshold, not a deadline: never cancel or retry a request here.
+const SLOW_READ: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 struct Entry {
     touched: Instant,
     active_at: u64,
     read_error: Option<(Instant, u64, u16)>,
+    read_slow: Option<(Instant, u64, u16, u64)>,
 }
 
 struct Signals {
@@ -81,8 +84,24 @@ impl Signals {
     }
 
     fn record(&self, target: String, read: bool, status: StatusCode, now: Instant, wall: u64) {
+        self.record_with_latency(target, read, status, now, wall, None);
+    }
+
+    fn record_with_latency(
+        &self,
+        target: String,
+        read: bool,
+        status: StatusCode,
+        now: Instant,
+        wall: u64,
+        elapsed: Option<Duration>,
+    ) {
+        let slow = elapsed.filter(|elapsed| read && *elapsed >= SLOW_READ);
         if !self.enabled
-            || !(status.is_success() || status.is_redirection() || status.is_server_error())
+            || !(status.is_success()
+                || status.is_redirection()
+                || status.is_server_error()
+                || slow.is_some())
         {
             return;
         }
@@ -105,11 +124,20 @@ impl Signals {
             touched: now,
             active_at: wall,
             read_error: None,
+            read_slow: None,
         });
         entry.touched = now;
         entry.active_at = wall;
         if read && status.is_server_error() {
             entry.read_error = Some((now, wall, status.as_u16()));
+        }
+        if let Some(elapsed) = slow {
+            entry.read_slow = Some((
+                now,
+                wall,
+                status.as_u16(),
+                elapsed.as_millis().min(u64::MAX as u128) as u64,
+            ));
         }
     }
 
@@ -134,13 +162,17 @@ impl Signals {
                 }
             }
         }
-        // Preserve recent read failures first if long names fill the byte bound.
+        // Preserve recent failures, then slow reads, before ordinary activity.
         entries.sort_by_key(|(_, entry)| {
             let error = entry
                 .read_error
                 .filter(|(at, _, _)| now.saturating_duration_since(*at) < WINDOW);
+            let slow = entry
+                .read_slow
+                .filter(|(at, _, _, _)| now.saturating_duration_since(*at) < WINDOW);
             (
                 std::cmp::Reverse(error.map(|(_, at, _)| at)),
+                std::cmp::Reverse(slow.map(|(_, at, _, _)| at)),
                 std::cmp::Reverse(entry.active_at),
             )
         });
@@ -150,9 +182,15 @@ impl Signals {
             let error = entry
                 .read_error
                 .filter(|(at, _, _)| now.saturating_duration_since(*at) < WINDOW);
+            let slow = entry
+                .read_slow
+                .filter(|(at, _, _, _)| now.saturating_duration_since(*at) < WINDOW);
             let row = json!({"name": name, "active_at_unix_millis": entry.active_at,
                 "read_error_at_unix_millis": error.map(|(_, at, _)| at),
-                "read_error_status": error.map(|(_, _, status)| status)});
+                "read_error_status": error.map(|(_, _, status)| status),
+                "read_slow_at_unix_millis": slow.map(|(_, at, _, _)| at),
+                "read_slow_status": slow.map(|(_, _, status, _)| status),
+                "read_slow_header_millis": slow.map(|(_, _, _, millis)| millis)});
             let size = serde_json::to_vec(&row).expect("bounded scalar row").len() + 1;
             if bytes + size > MAX_REPLY {
                 complete = false;
@@ -170,6 +208,7 @@ impl Signals {
         complete &= dropped == dropped_before && !recent_loss;
         let value = json!({"schema":1, "nonce":nonce,"sampled_at_unix_millis":wall_millis(),
             "coverage_started_at_unix_millis":self.started_at,"window_seconds":WINDOW.as_secs(),
+            "slow_read_header_threshold_millis": SLOW_READ.as_millis() as u64,
             "complete":complete,"dropped_total":dropped,"tables":tables});
         let raw = serde_json::to_vec(&value).expect("bounded scalar envelope");
         if raw.len() > MAX_REPLY {
@@ -298,10 +337,17 @@ fn parse_target(path: &str, matched: &str, method: &Method) -> Option<(String, b
     Some((format!("{kind}{name}"), read))
 }
 
-pub(super) fn record(target: Option<(String, bool)>, status: StatusCode) {
+pub(super) fn record(target: Option<(String, bool)>, status: StatusCode, elapsed: Duration) {
     if let Some((name, true)) = target {
-        if status.is_server_error() {
-            global().record(name, true, status, Instant::now(), wall_millis());
+        if status.is_server_error() || elapsed >= SLOW_READ {
+            global().record_with_latency(
+                name,
+                true,
+                status,
+                Instant::now(),
+                wall_millis(),
+                Some(elapsed),
+            );
         }
     }
 }
@@ -522,6 +568,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn slow_read_hints_include_404_preserve_status_and_expire_independently() {
+        let signals = Signals::new(true);
+        let now = Instant::now();
+        for (name, read, status, elapsed) in [
+            (
+                "missing",
+                true,
+                StatusCode::NOT_FOUND,
+                Duration::from_secs(241),
+            ),
+            ("successful", true, StatusCode::OK, SLOW_READ),
+            ("failed", true, StatusCode::SERVICE_UNAVAILABLE, SLOW_READ),
+            (
+                "fast-miss",
+                true,
+                StatusCode::NOT_FOUND,
+                SLOW_READ - Duration::from_millis(1),
+            ),
+            ("write", false, StatusCode::OK, Duration::from_secs(241)),
+        ] {
+            signals.record_with_latency(name.into(), read, status, now, 100, Some(elapsed));
+        }
+        // Continued activity and a successful read must not erase either hint.
+        signals.record(
+            "missing".into(),
+            false,
+            StatusCode::OK,
+            now + Duration::from_secs(200),
+            200,
+        );
+        signals.record_with_latency(
+            "failed".into(),
+            true,
+            StatusCode::OK,
+            now + Duration::from_secs(200),
+            200,
+            Some(Duration::from_millis(1)),
+        );
+        let v = value(&signals, now + Duration::from_secs(201)).await;
+        let rows = v["tables"].as_array().unwrap();
+        let missing = rows.iter().find(|r| r["name"] == "missing").unwrap();
+        assert_eq!(missing["read_slow_header_millis"], 241_000);
+        assert_eq!(missing["read_slow_status"], 404);
+        assert_eq!(missing["read_error_status"], Value::Null);
+        assert_eq!(missing["active_at_unix_millis"], 200);
+        assert_eq!(missing["read_slow_at_unix_millis"], 100);
+        assert!(!rows.iter().any(|r| r["name"] == "fast-miss"));
+        assert_eq!(
+            rows.iter().find(|r| r["name"] == "write").unwrap()["read_slow_status"],
+            Value::Null
+        );
+        assert_eq!(
+            rows.iter().find(|r| r["name"] == "successful").unwrap()["read_slow_header_millis"],
+            5000
+        );
+        let failed = rows.iter().find(|r| r["name"] == "failed").unwrap();
+        assert_eq!(failed["read_error_status"], 503);
+        assert_eq!(failed["read_slow_status"], 503);
+        let v = value(&signals, now + WINDOW).await;
+        assert_eq!(v["tables"].as_array().unwrap().len(), 2);
+        for row in v["tables"].as_array().unwrap() {
+            assert_eq!(row["read_slow_at_unix_millis"], Value::Null);
+            assert_eq!(row["read_slow_header_millis"], Value::Null);
+            assert_eq!(row["read_error_status"], Value::Null);
+        }
+    }
+
+    #[tokio::test]
+    async fn slow_read_recording_keeps_the_nonblocking_loss_contract() {
+        let signals = Signals::new(true);
+        let now = Instant::now();
+        {
+            let _held = signals.shards[Signals::shard("slow")].lock().unwrap();
+            signals.record_with_latency(
+                "slow".into(),
+                true,
+                StatusCode::NOT_FOUND,
+                now,
+                1,
+                Some(SLOW_READ),
+            );
+        }
+        let v = value(&signals, now).await;
+        assert_eq!(v["complete"], false);
+        assert_eq!(v["dropped_total"], 1);
+        assert!(v["tables"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn cardinality_bytes_and_ttl_are_bounded_and_errors_win_truncation() {
         let signals = Signals::new(true);
         let now = Instant::now();
@@ -532,6 +667,14 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE,
             now,
             1,
+        );
+        signals.record_with_latency(
+            "slow".into(),
+            true,
+            StatusCode::NOT_FOUND,
+            now,
+            1,
+            Some(SLOW_READ),
         );
         for n in 0..20_000 {
             signals.record(
@@ -550,6 +693,7 @@ mod tests {
             .all(|s| s.lock().unwrap().len() <= PER_SHARD));
         let v = value(&signals, now).await;
         assert_eq!(v["tables"][0]["name"], "urgent");
+        assert_eq!(v["tables"][1]["name"], "slow");
         assert_eq!(v["complete"], false);
         assert!(v["dropped_total"].as_u64().unwrap() > 0);
         assert!(v["tables"].as_array().unwrap().len() < count);

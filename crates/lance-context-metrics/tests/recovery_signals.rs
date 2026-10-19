@@ -33,6 +33,13 @@ async fn middleware_records_inflight_demand_and_read_failures_without_payloads()
     let release = Arc::new(Notify::new());
     let app = Router::new()
         .route(
+            "/api/v1/rollouts/{name}/records",
+            get(|| async {
+                tokio::time::sleep(std::time::Duration::from_millis(5010)).await;
+                StatusCode::NOT_FOUND
+            }),
+        )
+        .route(
             "/api/v1/rollouts/{name}/records/{id}",
             get({
                 let entered = entered.clone();
@@ -103,6 +110,41 @@ async fn middleware_records_inflight_demand_and_read_failures_without_payloads()
                 .unwrap();
             assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         }
+    }
+    if std::env::var("RECOVERY_SIGNALS_ENABLED").unwrap() == "true" {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/rollouts/slow_missing/records?secret=query")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/internal/recovery-signals?nonce=slow")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("secret"));
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let slow = v["tables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == "slow_missing")
+            .unwrap();
+        assert_eq!(slow["read_error_status"], serde_json::Value::Null);
+        assert_eq!(slow["read_slow_status"], 404);
+        assert!(slow["read_slow_header_millis"].as_u64().unwrap() >= 5000);
     }
     let invalid = app
         .oneshot(
