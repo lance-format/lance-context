@@ -2246,6 +2246,10 @@ fn optional_i8_list(array: Option<&ListArray>, row: usize) -> LanceResult<Option
 }
 
 #[cfg(test)]
+#[path = "rollout_merge_crash_tests.rs"]
+pub(crate) mod crash_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2788,7 +2792,7 @@ mod tests {
         store.close().await.unwrap();
     }
 
-    fn assistant_record(id: &str) -> RolloutRecord {
+    pub(super) fn assistant_record(id: &str) -> RolloutRecord {
         RolloutRecord {
             id: id.to_string(),
             rollout_id: "rollout-1".to_string(),
