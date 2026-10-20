@@ -183,7 +183,7 @@ impl ShardFailure {
     // Read old records with corrected semantics without resetting attempts,
     // moving the failure timestamp, or mutating ownership/durable records.
     // The next fenced completion persists the normal retry result.
-    fn corrected(mut self) -> Self {
+    pub(crate) fn corrected(mut self) -> Self {
         // One rule set: whatever `classify` says today is the effective
         // class. Only a DataOrConfiguration record can be softened; a stored
         // Retryable is never hardened on read.
@@ -227,7 +227,7 @@ impl Coordinator {
     fn failures_prefix(&self) -> String {
         format!("{}/merge-failures/", self.prefix.trim_end_matches('/'))
     }
-    fn failure_key(&self, target: &str, endpoint: &str) -> String {
+    pub(crate) fn failure_key(&self, target: &str, endpoint: &str) -> String {
         let hex = |s: &str| {
             s.as_bytes()
                 .iter()
