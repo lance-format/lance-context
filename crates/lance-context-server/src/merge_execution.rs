@@ -45,6 +45,7 @@ impl lance_context_core::merge_write_scope::CommitAuthorizer for OwnedCommitGuar
 }
 
 pub struct Executions {
+    pub(crate) legacy: crate::legacy_merge::LegacyMerges,
     coordinator: OnceCell<Coordinator>,
     etcd: Option<lance_context_merge::EtcdConfig>,
     pub(crate) rollout: lance_context_merge::rollout::MergeRollout,
@@ -59,6 +60,7 @@ impl Executions {
     #[cfg(test)]
     pub fn new(coordinator: Option<Coordinator>, timeout_secs: u64) -> Self {
         Self {
+            legacy: Default::default(),
             coordinator: OnceCell::new_with(coordinator),
             etcd: None,
             rollout: Default::default(),
@@ -77,6 +79,7 @@ impl Executions {
         idle_timeout_secs: u64,
     ) -> Self {
         Self {
+            legacy: Default::default(),
             coordinator: OnceCell::new(),
             etcd: Some(etcd),
             rollout,
@@ -86,6 +89,10 @@ impl Executions {
             instance: uuid::Uuid::new_v4().to_string(),
             running: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub(crate) fn instance(&self) -> &str {
+        &self.instance
     }
 
     pub(crate) fn owned(&self, target: &str) -> bool {
@@ -154,6 +161,7 @@ pub async fn capabilities(
         "queue_timeout_secs": state.merge_executions.queue_timeout_secs,
         "idle_timeout_secs": state.merge_executions.idle_timeout_secs,
         "progress_protocol": 1,
+        "legacy_progress_protocol": 1,
         "rollout_append_protocol": 1,
         "shard_name": state.instance_id,
         "owned_targets": state.merge_executions.rollout.owned_targets,
@@ -495,6 +503,14 @@ mod tests {
         assert!(state.merge_executions.legacy_allowed("hot").is_err());
         let Json(reply) = capabilities(State(state.clone())).await.unwrap();
         assert_eq!(reply["owned_targets"][0], "hot");
+        assert_eq!(reply["legacy_progress_protocol"], 1);
+        let Json(progress) = crate::legacy_merge::status(
+            State(state.clone()),
+            axum::extract::Query(Default::default()),
+        )
+        .await;
+        assert_eq!(progress["instance"], reply["instance"]);
+        assert_eq!(progress["snapshot"]["takeover_authorized"], false);
         assert!(state.merge_executions.coordinator.get().is_none());
     }
 

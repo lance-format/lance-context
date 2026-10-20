@@ -711,8 +711,17 @@ pub async fn merge_wal(
     Path(name): Path<String>,
 ) -> Result<Json<MergeWalResponse>, AppError> {
     state.merge_executions.legacy_allowed(&name)?;
-    let _slot = state.acquire_merge_slot().await;
-    merge_wal_owned(State(state), Path(name)).await
+    let execution_state = state.clone();
+    let execution_name = name.clone();
+    state
+        .merge_executions
+        .legacy
+        .run(&name, "http", true, |started| async move {
+            let _slot = execution_state.acquire_merge_slot().await;
+            started.running();
+            merge_wal_owned(State(execution_state.clone()), Path(execution_name)).await
+        })
+        .await
 }
 
 pub(crate) async fn merge_wal_owned(

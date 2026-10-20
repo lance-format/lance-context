@@ -179,8 +179,11 @@ async fn run_legacy_workers(
             Err((false, error)) => {
                 // A response error, reset, or timeout after sending may leave
                 // an unfenced legacy writer alive. Do not advance the fan-out.
+                // Fetch evidence from the same worker without opening stores or
+                // querying etcd. This never permits retry, takeover or restart.
+                let progress = legacy_progress(http, endpoint, target).await;
                 return Err(format!(
-                    "merged {reclaimed} generations across {completed}/{} workers (legacy); stopped at {endpoint}: {error}",
+                    "merged {reclaimed} generations across {completed}/{} workers (legacy); stopped at {endpoint}: {error}; legacy progress: {progress}",
                     endpoints.len()
                 ));
             }
@@ -198,6 +201,67 @@ async fn run_legacy_workers(
             "{detail}; unavailable workers: {}",
             unavailable.join("; ")
         ))
+    }
+}
+
+async fn legacy_progress(http: &reqwest::Client, endpoint: &str, target: &str) -> String {
+    let result =
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut response = http
+                .get(format!("{endpoint}/api/v1/internal/legacy-merges"))
+                .query(&[("target", target)])
+                .send()
+                .await
+                .map_err(|e| e.to_string())?
+                .error_for_status()
+                .map_err(|e| e.to_string())?;
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+                if bytes.len().saturating_add(chunk.len()) > 64 * 1024 {
+                    return Err("snapshot exceeds 64 KiB".to_string());
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            let value: serde_json::Value =
+                serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+            if value["instance"].as_str().is_none()
+                || value["snapshot"]["protocol"] != 1
+                || value["snapshot"]["takeover_authorized"] != false
+            {
+                return Err("unsupported progress response".to_string());
+            }
+            let snapshot = &value["snapshot"];
+            let executions = snapshot["executions"]
+                .as_array()
+                .ok_or_else(|| "missing execution observations".to_string())?;
+            // Task errors are stored in etcd. Keep the durable summary small even
+            // if the endpoint returns a large history or an unexpected field.
+            let summaries: Vec<_> = executions.iter().take(8).map(|row| serde_json::json!({
+            "id": row["id"].as_str().map(|s| s.chars().take(128).collect::<String>()),
+            "phase": row["phase"].as_str().map(|s| s.chars().take(32).collect::<String>()),
+            "elapsed_ms": row["elapsed_ms"].as_u64(),
+            "completed_steps": row["completed_steps"].as_u64(),
+            "base_commits": row["work"]["base_commits"].as_u64(),
+            "generations_reclaimed": row["work"]["generations_reclaimed"].as_u64(),
+            "wal_decoded_bytes": row["work"]["wal_decoded_bytes"].as_u64(),
+            "encoded_bytes": row["work"]["encoded_bytes"].as_u64(),
+            "active_commits": row["writes"]["active_commits"].as_u64(),
+            "uncertain_commit": row["writes"]["uncertain_commit"].as_bool(),
+        })).collect();
+            Ok(serde_json::json!({
+            "instance": value["instance"].as_str().unwrap().chars().take(128).collect::<String>(),
+            "takeover_authorized": false,
+            "untracked_admissions": snapshot["untracked_admissions"].as_u64(),
+            "evicted_history": snapshot["evicted_history"].as_u64(),
+            "truncated": executions.len() > 8 || snapshot["truncated"].as_bool() != Some(false),
+            "executions": summaries,
+        }).to_string())
+        })
+        .await;
+    match result {
+        Ok(Ok(snapshot)) => snapshot,
+        Ok(Err(error)) => format!("unavailable ({error}); ownership unresolved"),
+        Err(_) => "unavailable (observation timed out); ownership unresolved".into(),
     }
 }
 
@@ -1195,6 +1259,46 @@ mod legacy_connection_tests {
             }
         })))
         .await
+    }
+
+    #[tokio::test]
+    async fn progress_evidence_is_reported_but_never_allows_unsafe_fanout() {
+        let (bad, failed_server) = serve(Router::new()
+            .route("/api/v1/internal/legacy-merges", axum::routing::get(
+                |axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>| async move {
+                    assert_eq!(query.get("target").unwrap(), "table");
+                    Json(serde_json::json!({"instance":"boot-1", "snapshot":{
+                        "protocol":1, "takeover_authorized":false,
+                        "executions":[{"id":"exec-1","completed_steps":42,"writes":{"active_commits":1}}]
+                    }}))
+                }))
+            .fallback(post(|| async { StatusCode::INTERNAL_SERVER_ERROR }))).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (good, server) = healthy(calls.clone()).await;
+        let http = crate::state::worker_http_client().unwrap();
+        let error = run_legacy_workers(&http, &[bad, good], "table")
+            .await
+            .unwrap_err();
+        assert!(error.contains("exec-1"), "{error}");
+        assert!(error.contains("active_commits"), "{error}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        failed_server.abort();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn oversized_progress_is_bounded_and_not_accepted_as_handoff_evidence() {
+        let (endpoint, server) =
+            serve(Router::new().fallback(axum::routing::get(|| async { "x".repeat(65537) }))).await;
+        let evidence = super::legacy_progress(
+            &crate::state::worker_http_client().unwrap(),
+            &endpoint,
+            "table",
+        )
+        .await;
+        assert!(evidence.contains("exceeds 64 KiB"), "{evidence}");
+        assert!(evidence.contains("ownership unresolved"));
+        server.abort();
     }
 
     #[tokio::test]

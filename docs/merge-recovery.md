@@ -164,6 +164,37 @@ Other maintenance tasks retain their existing repair policy.
 
 ## Default-off, per-table rollout
 
+### Legacy worker progress evidence
+
+Workers advertising `legacy_progress_protocol: 1` expose
+`GET /api/v1/internal/legacy-merges?target=<scheduler-target>`. The response
+identifies the process incarnation and individual executions, distinguishes
+slot waits from running work, and reports actual completed steps, WAL reads,
+encoded output, base commits, reclaimed generations, and local outstanding or
+uncertain commits. Polling and changing phase do not advance completed work.
+HTTP merges and both worker self-merge triggers share this instrumentation;
+ingestion flushes are not included. Cancelling the caller retains an
+`interrupted` observation. Cancelling an admitted storage future marks its
+commit uncertain: a remote write may still finish. This observation-only scope
+does not spawn storage tasks or change legacy cancellation and slot lifetimes.
+
+The endpoint reads only process memory, without opening tables or querying
+etcd. It returns at most 32 entries, prioritizing active calls, with explicit
+truncation and history-eviction counters. Tracking is capped at 256 active and
+128 returned/interrupted entries; overflow increments an untracked-admission
+counter without rejecting work. Query an exact target when the global response
+is truncated. Master captures a bounded snapshot after an ambiguous legacy RPC
+failure (2 seconds, 64 KiB input maximum). The task error stores a small typed
+summary of at most eight executions; serial fan-out still stops.
+Older workers returning 404 simply have unavailable evidence.
+
+This is **process-local evidence, not ownership or permission to take over**.
+Even an empty response or zero active commits cannot prove storage quiescence:
+other masters/helpers, evicted history, prior incarnations, and old binaries
+are outside its coverage. `takeover_authorized` is always false. These snapshots
+help identify legacy execution progress; they do not replace the migration
+barriers below or implement automatic enrollment of new tables.
+
 `MERGE_OWNED_TARGETS` and `MERGE_DRAIN_TARGETS` are comma-separated **exact**
 scheduler targets (`name` for rollout, `generic:name` for generic). Both default
 to empty; wildcards and overlapping lists are rejected. Merely configuring

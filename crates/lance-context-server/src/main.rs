@@ -4,6 +4,7 @@ mod body_timeout;
 mod config;
 mod drain;
 mod error;
+mod legacy_merge;
 mod merge_execution;
 mod routes;
 mod state;

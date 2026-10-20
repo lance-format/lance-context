@@ -297,8 +297,22 @@ pub async fn merge_generic_wal(
     state
         .merge_executions
         .legacy_allowed(&format!("generic:{name}"))?;
-    let _slot = state.acquire_merge_slot().await;
-    merge_generic_wal_owned(State(state), Path(name)).await
+    let execution_state = state.clone();
+    let execution_name = name.clone();
+    state
+        .merge_executions
+        .legacy
+        .run(
+            &format!("generic:{name}"),
+            "http",
+            true,
+            |started| async move {
+                let _slot = execution_state.acquire_merge_slot().await;
+                started.running();
+                merge_generic_wal_owned(State(execution_state.clone()), Path(execution_name)).await
+            },
+        )
+        .await
 }
 
 pub(crate) async fn merge_generic_wal_owned(

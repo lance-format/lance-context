@@ -291,9 +291,16 @@ pub(crate) async fn flush_pass_coordinated<S: Sweepable>(
                     },
                     None => None,
                 };
-                let merged = async move {
+                let merged = async {
                     let _slot = slot;
-                    store.merge_if_due().await
+                    observe_legacy_merge(
+                        state.as_deref(),
+                        &name,
+                        kind,
+                        "count_sweeper",
+                        store.merge_if_due(),
+                    )
+                    .await
                 };
                 report_merge(
                     &name,
@@ -345,8 +352,42 @@ pub(crate) async fn merge_pass_coordinated<S: Sweepable>(
         report_merge(
             &name,
             kind,
-            tokio::time::timeout(pass_timeout, store.merge_wal()).await,
+            tokio::time::timeout(
+                pass_timeout,
+                observe_legacy_merge(
+                    state.as_deref(),
+                    &name,
+                    kind,
+                    "cleanup_sweeper",
+                    store.merge_wal(),
+                ),
+            )
+            .await,
         );
+    }
+}
+
+/// The scope covers only merge work, never the independent ingestion flush.
+async fn observe_legacy_merge<T, E>(
+    state: Option<&crate::state::AppState>,
+    name: &str,
+    kind: &str,
+    origin: &'static str,
+    work: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, E> {
+    if let Some(state) = state {
+        let target = if kind == "rollout" {
+            name.to_string()
+        } else {
+            format!("{kind}:{name}")
+        };
+        state
+            .merge_executions
+            .legacy
+            .run(&target, origin, false, |_| work)
+            .await
+    } else {
+        work.await
     }
 }
 
@@ -758,6 +799,46 @@ mod tests {
             ID_COLUMN.to_string(),
             ColumnSpec::required(ColumnType::String { large: false }),
         )])
+    }
+
+    #[tokio::test]
+    async fn legacy_merge_observes_real_reclamation_without_tracking_ingest_flush() {
+        let state_dir = TempDir::new().unwrap();
+        let state =
+            Arc::new(crate::state::AppState::new_for_test(state_dir.path().to_path_buf()).await);
+        let dir = TempDir::new().unwrap();
+        let store = generic_with_pending(&dir, 3, 3).await;
+        flush_pass_coordinated(
+            vec![("s".into(), store.clone())],
+            Duration::from_secs(10),
+            None,
+            Some(state.clone()),
+        )
+        .await;
+        assert_eq!(
+            store.read().await.pending_wal_generations().await.unwrap(),
+            0
+        );
+        assert_eq!(store.read().await.count_base_rows().await.unwrap(), 3);
+        let axum::Json(report) = crate::legacy_merge::status(
+            axum::extract::State(state),
+            axum::extract::Query(Default::default()),
+        )
+        .await;
+        let executions = report["snapshot"]["executions"].as_array().unwrap();
+        assert_eq!(
+            executions.len(),
+            1,
+            "flush itself must not be a maintenance execution"
+        );
+        let execution = &executions[0];
+        assert_eq!(execution["target"], "generic:s");
+        assert_eq!(execution["origin"], "count_sweeper");
+        assert_eq!(execution["phase"], "returned_ok");
+        assert_eq!(execution["work"]["generations_reclaimed"], 3);
+        assert!(execution["work"]["base_commits"].as_u64().unwrap() > 0);
+        assert_eq!(execution["writes"]["active_commits"], 0);
+        assert_eq!(report["snapshot"]["takeover_authorized"], false);
     }
 
     async fn generic_with_pending(

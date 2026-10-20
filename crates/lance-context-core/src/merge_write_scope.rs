@@ -106,6 +106,9 @@ pub struct MergeWriteScope {
     completed_steps: Arc<AtomicU64>,
     work: Mutex<MergeWork>,
     observe_file_io: bool,
+    /// Legacy diagnostics must not introduce detached storage tasks or alter
+    /// cancellation/slot lifetimes before durable ownership is available.
+    observation_only: bool,
     local_io: Mutex<Vec<(lance_io::utils::tracking_store::IOTracker, u64)>>,
     progress: Mutex<Progress>,
     changed: Notify,
@@ -117,7 +120,23 @@ pub struct MergeWriteScope {
     io_shim: Option<Arc<dyn lance_io::object_store::WrappingObjectStore>>,
 }
 
+/// Local write observations, not a durable fence or proof of remote quiescence.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct MergeWriteStatus {
+    pub active_commits: usize,
+    pub admission_closed: bool,
+    pub uncertain_commit: bool,
+}
+
 impl MergeWriteScope {
+    pub fn write_status(&self) -> MergeWriteStatus {
+        let progress = self.progress.lock().unwrap();
+        MergeWriteStatus {
+            active_commits: progress.active,
+            admission_closed: progress.closed,
+            uncertain_commit: progress.uncertain,
+        }
+    }
     pub fn work(&self) -> MergeWork {
         self.work.lock().unwrap().clone()
     }
@@ -137,6 +156,13 @@ impl MergeWriteScope {
     }
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    pub fn for_legacy_observation() -> Arc<Self> {
+        Arc::new(Self {
+            observation_only: true,
+            ..Self::default()
+        })
     }
 
     pub fn with_authorizer(authorizer: Arc<dyn CommitAuthorizer>) -> Arc<Self> {
@@ -423,6 +449,18 @@ where
         scope,
         completed: false,
     };
+    if active.scope.observation_only {
+        let mut active = active;
+        let result = write.await;
+        if progressed(&result) {
+            active.scope.completed_steps.fetch_add(1, Ordering::Relaxed);
+        }
+        if result.is_err() {
+            active.scope.mark_uncertain();
+        }
+        active.completed = true;
+        return result;
+    }
     let (send, receive) = oneshot::channel();
     let leaf = tokio::spawn(async move {
         let mut active = active;
@@ -797,6 +835,45 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     #[tokio::test]
+    async fn legacy_observation_retains_uncertainty_without_detaching_storage() {
+        struct LocalWrite(Arc<AtomicBool>);
+        impl Drop for LocalWrite {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        let scope = MergeWriteScope::for_legacy_observation();
+        let writing = Arc::new(AtomicBool::new(false));
+        let flag = writing.clone();
+        let (entered, began) = oneshot::channel();
+        let run_scope = scope.clone();
+        let caller = tokio::spawn(async move {
+            run_scope
+                .run(shield(async move {
+                    flag.store(true, Ordering::SeqCst);
+                    let _local_write = LocalWrite(flag);
+                    entered.send(()).unwrap();
+                    std::future::pending::<Result<()>>().await
+                }))
+                .await
+        });
+        began.await.unwrap();
+        assert_eq!(scope.write_status().active_commits, 1);
+        caller.abort();
+        caller.await.unwrap_err();
+        assert!(
+            !writing.load(Ordering::SeqCst),
+            "diagnostics must not detach storage work"
+        );
+        assert_eq!(scope.write_status().active_commits, 0);
+        assert!(
+            scope.write_status().uncertain_commit,
+            "remote completion is still unknown"
+        );
+        assert_eq!(scope.completed_steps(), 0);
+    }
+
+    #[tokio::test]
     async fn phase_changes_and_observation_do_not_count_as_completed_work() {
         let scope = MergeWriteScope::new();
         scope
@@ -939,6 +1016,8 @@ mod tests {
         began.await.unwrap();
         merge.abort();
         assert!(merge.await.unwrap_err().is_cancelled());
+        assert_eq!(scope.write_status().active_commits, 1);
+        assert!(!scope.write_status().uncertain_commit);
         let draining_scope = scope.clone();
         let drain = tokio::spawn(async move { draining_scope.drain().await });
         tokio::task::yield_now().await;
@@ -948,6 +1027,8 @@ mod tests {
         );
         release.send(()).unwrap();
         drain.await.unwrap();
+        assert_eq!(scope.write_status().active_commits, 0);
+        assert!(scope.write_status().admission_closed);
         assert!(committed.load(Ordering::SeqCst));
         assert!(!scope.has_uncertain_commit());
         assert!(
