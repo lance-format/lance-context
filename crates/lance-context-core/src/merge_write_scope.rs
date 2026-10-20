@@ -503,8 +503,10 @@ pub(crate) async fn drain_generations(
             .version
             .checked_add(1)
             .ok_or_else(|| Error::io("manifest version overflow"))?;
+        let before = next.sstables.len();
         next.sstables
             .retain(|g| !generations.contains(&g.generation));
+        let removed = before - next.sstables.len();
         authorize(&resource, next.version).await?;
         let writer = store.clone();
         let scope = CURRENT.try_with(Arc::clone).ok();
@@ -525,7 +527,15 @@ pub(crate) async fn drain_generations(
         )
         .await?;
         match written {
-            Ok(_) => return Ok(next),
+            Ok(_) => {
+                if CURRENT
+                    .try_with(|scope| scope.observation_only)
+                    .unwrap_or(false)
+                {
+                    generations_reclaimed(removed);
+                }
+                return Ok(next);
+            }
             Err(Error::RetryableCommitConflict { .. }) => continue,
             Err(error) => return Err(error),
         }
@@ -756,6 +766,13 @@ impl CommitHandler for GuardedCommit {
             )
             .await?;
             *manifest = committed;
+            if location.is_ok()
+                && CURRENT
+                    .try_with(|scope| scope.observation_only)
+                    .unwrap_or(false)
+            {
+                base_committed();
+            }
             location
         };
         match &self.scope {

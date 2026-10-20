@@ -1353,8 +1353,11 @@ impl StorageBase {
                             break 'generations;
                         }
                     }
+                    crate::merge_write_scope::wal_batch_read(
+                        batch.num_rows(),
+                        batch.get_array_memory_size(),
+                    );
                     current_batches.push(batch);
-                    crate::merge_write_scope::checkpoint();
                 }
             }
             generation_batches.push((flushed.generation, current_batches));
@@ -1429,6 +1432,7 @@ impl StorageBase {
         if let Some(watermark) = watermark {
             let params = WriteParams {
                 mode: WriteMode::Append,
+                write_progress: Some(crate::merge_write_scope::write_progress()),
                 ..Default::default()
             };
             let staged = lance::dataset::InsertBuilder::new(Arc::new(self.dataset.clone()))
@@ -1448,7 +1452,15 @@ impl StorageBase {
                 batches.into_iter().map(Ok::<RecordBatch, ArrowError>),
                 merge_schema,
             );
-            Box::pin(self.dataset.append(reader, None)).await?;
+            Box::pin(self.dataset.append(
+                reader,
+                Some(WriteParams {
+                    mode: WriteMode::Append,
+                    write_progress: Some(crate::merge_write_scope::write_progress()),
+                    ..Default::default()
+                }),
+            ))
+            .await?;
         }
         Ok(())
     }
