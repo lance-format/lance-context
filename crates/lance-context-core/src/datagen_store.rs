@@ -438,6 +438,13 @@ impl DatagenStore {
         self.base.flush().await
     }
 
+    /// Initialize/replay and materialize this instance's WAL after the caller
+    /// has established ownership and retired the previous process with this
+    /// identity. Fencing and flush errors are returned to the caller.
+    pub async fn replay_and_flush_own_wal(&self) -> LanceResult<()> {
+        self.base.replay_and_flush_own_wal().await
+    }
+
     /// Start periodic cleanup after the configured interval. The task keeps
     /// only a weak reference and exits when the store is dropped.
     pub fn spawn_periodic_cleanup(store: Arc<tokio::sync::RwLock<Self>>) -> Option<JoinHandle<()>> {

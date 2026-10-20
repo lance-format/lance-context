@@ -157,14 +157,34 @@ impl Drain {
     }
 }
 
+/// Opt-in cancellation for a route's audited read-only phase. Accepted setup
+/// and mutations retain their existing task ownership and shutdown joining.
+#[derive(Clone)]
+pub(crate) struct ClientCancellation(tokio::sync::watch::Receiver<()>);
+impl ClientCancellation {
+    pub(crate) fn channel() -> (tokio::sync::watch::Sender<()>, Self) {
+        let (sender, receiver) = tokio::sync::watch::channel(());
+        (sender, Self(receiver))
+    }
+
+    pub(crate) async fn cancelled(&self) {
+        let mut receiver = self.0.clone();
+        // The only sender belongs to the outer HTTP future. It never sends;
+        // its destruction closes the channel, including before this await.
+        let _ = receiver.changed().await;
+    }
+}
+
 pub(crate) async fn track_handler(
     State(drain): State<Arc<Drain>>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     let Some(handler) = drain.admit() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "worker is draining").into_response();
     };
+    let (_request_lifetime, cancellation) = ClientCancellation::channel();
+    request.extensions_mut().insert(cancellation);
     // Dropping a JoinHandle detaches it. A client disconnect therefore cannot
     // drop an accepted mutation halfway through a storage commit. The guard
     // remains in the task until success, error or panic.
@@ -293,3 +313,6 @@ impl AsyncWrite for ConnectionIo {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod cancellation_tests;

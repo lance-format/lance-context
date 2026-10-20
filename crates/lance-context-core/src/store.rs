@@ -2118,6 +2118,13 @@ impl ContextStore {
         self.base.flush().await
     }
 
+    /// Initialize/replay and materialize this instance's WAL after the caller
+    /// has established ownership and retired the previous process with this
+    /// identity. Fencing and flush errors are returned to the caller.
+    pub async fn replay_and_flush_own_wal(&self) -> LanceResult<()> {
+        self.base.replay_and_flush_own_wal().await
+    }
+
     /// Gracefully close the resident MemWAL writer, draining its background
     /// tasks and sealing whatever it still buffers. Idempotent.
     pub async fn close(&mut self) -> LanceResult<()> {

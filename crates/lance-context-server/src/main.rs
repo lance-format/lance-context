@@ -5,6 +5,7 @@ mod config;
 mod drain;
 mod error;
 mod merge_execution;
+mod replay;
 mod routes;
 mod state;
 mod sweeper;
@@ -28,6 +29,11 @@ async fn main() {
         .init();
 
     let config = ServerConfig::parse();
+    if let Err(e) = replay::validate_config(&config) {
+        tracing::error!("Invalid WAL replay configuration: {e}");
+        std::process::exit(2);
+    }
+    let replay_target = config.replay_own_wal.clone();
     let body_idle_timeout = std::time::Duration::from_secs(config.request_body_idle_timeout_secs);
     let response_idle = std::time::Duration::from_secs(config.http_shutdown_response_idle_secs);
     let addr = format!("{}:{}", config.host, config.port);
@@ -48,6 +54,16 @@ async fn main() {
             std::process::exit(1);
         }
     };
+
+    // Recovery is a one-shot operation: never start listeners or sweepers.
+    if let Some(target) = replay_target {
+        if let Err(e) = replay::run(&state, &target).await {
+            tracing::error!(target = ?target, error = ?e, "WAL replay failed");
+            std::process::exit(1);
+        }
+        tracing::info!(target = ?target, "WAL replay and writer close completed");
+        return;
+    }
 
     // Single process-wide WAL-cleanup sweeper (replaces one timer per store).
     // The handle is detached: it runs for the server's lifetime and stops when

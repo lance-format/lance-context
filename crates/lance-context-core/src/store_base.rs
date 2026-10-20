@@ -732,6 +732,21 @@ impl StorageBase {
         }
     }
 
+    /// Explicitly initialize/replay this instance's writer and materialize its WAL.
+    ///
+    /// Unlike `flush`, this opens a writer when none is resident. Opening claims
+    /// the shard epoch: the caller must establish ownership and retire any
+    /// previous process using the same instance identity before recovery.
+    /// This operation does not itself establish remote retirement or authorize
+    /// retrying an uncertain mutation. Fencing and drain errors are propagated.
+    pub async fn replay_and_flush_own_wal(&self) -> LanceResult<()> {
+        self.ensure_writable()?;
+        let writer = self.resident_writer().await?;
+        writer.force_seal_active().await?;
+        writer.wait_for_flush_drain().await?;
+        Ok(())
+    }
+
     /// Materialize the active memtable into a flushed, queryable generation:
     /// `force_seal_active` freezes it and hands it to the background flusher,
     /// then `wait_for_flush_drain` blocks until every frozen memtable has landed

@@ -61,6 +61,13 @@ pub struct ServerConfig {
     #[arg(long, env = "INSTANCE_ID")]
     pub instance_id: Option<String>,
 
+    /// Replay and flush one existing store's WAL, then exit without serving HTTP.
+    /// Requires the original instance identity and verified retirement of its
+    /// previous process. TARGET is [rollout:|generic:|context:|datagen:]NAME.
+    /// This mode does not establish ownership or resolve uncertain operations.
+    #[arg(long, requires = "instance_id")]
+    pub replay_own_wal: Option<crate::replay::ReplayTarget>,
+
     /// Count-triggered self-merge threshold for rollout MemWAL shards. When this
     /// instance's shard has at least this many un-merged flushed generations, the
     /// periodic sweeper folds them into the base table and drains the shard (see
