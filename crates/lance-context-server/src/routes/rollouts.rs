@@ -641,6 +641,11 @@ pub async fn compact_rollout(
     // Once a table is draining or owned, only the master's fenced maintenance
     // path may publish a rewrite. Check before opening or locking its handle.
     state.merge_executions.legacy_allowed(&name)?;
+    if state.merge_executions.fenced_mode().await? {
+        return Err(AppError::Overloaded(
+            "fenced table maintenance must run through the master".into(),
+        ));
+    }
     let store_lock = state.get_or_open_rollout_store(&name).await?;
 
     let config = if req.target_rows_per_fragment.is_some() || req.materialize_deletions.is_some() {
@@ -715,6 +720,14 @@ pub async fn merge_wal(
     Path(name): Path<String>,
 ) -> Result<Json<MergeWalResponse>, AppError> {
     state.merge_executions.legacy_allowed(&name)?;
+    if state.merge_executions.fenced_mode().await? {
+        let result = crate::merge_execution::spawn_background(state, name).await?;
+        let reclaimed = result
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?
+            .map_err(AppError::Internal)?;
+        return Ok(Json(MergeWalResponse { reclaimed }));
+    }
     let execution_state = state.clone();
     let execution_name = name.clone();
     state

@@ -183,6 +183,7 @@ mod tests {
 
     fn rollout(owned: &[&str], draining: &[&str]) -> MergeRollout {
         MergeRollout {
+            fence_legacy: false,
             owned_targets: owned.iter().map(|s| s.to_string()).collect(),
             drain_targets: draining.iter().map(|s| s.to_string()).collect(),
         }

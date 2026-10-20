@@ -297,6 +297,15 @@ pub async fn merge_generic_wal(
     state
         .merge_executions
         .legacy_allowed(&format!("generic:{name}"))?;
+    if state.merge_executions.fenced_mode().await? {
+        let result =
+            crate::merge_execution::spawn_background(state, format!("generic:{name}")).await?;
+        let reclaimed = result
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?
+            .map_err(AppError::Internal)?;
+        return Ok(Json(serde_json::json!({"reclaimed": reclaimed})));
+    }
     let execution_state = state.clone();
     let execution_name = name.clone();
     state

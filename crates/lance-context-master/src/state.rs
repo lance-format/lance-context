@@ -135,7 +135,7 @@ pub(crate) fn worker_http_client() -> Result<reqwest::Client, reqwest::Error> {
 
 impl MasterState {
     /// Open the registry, stats dataset, and configured durable task store.
-    pub async fn new(config: MasterConfig) -> lance::Result<Arc<Self>> {
+    pub async fn new(mut config: MasterConfig) -> lance::Result<Arc<Self>> {
         config.merge_rollout.validate().map_err(lance::Error::io)?;
         config.catchup.validate().map_err(lance::Error::io)?;
         crate::local_merge::validate(&config).map_err(lance::Error::io)?;
@@ -152,6 +152,11 @@ impl MasterState {
             ));
         }
         let task_store = TaskStore::open(&config).await?;
+        config.merge_rollout.fence_legacy = task_store
+            .merge_coordinator()
+            .legacy_fencing_mode(config.merge_rollout.fence_legacy)
+            .await
+            .map_err(lance::Error::io)?;
         // Serialize first-time registry/stats creation and legacy backfill in
         // etcd mode. Followers wait briefly rather than racing Lance creates.
         let dedicated = config.catchup.target.is_some();

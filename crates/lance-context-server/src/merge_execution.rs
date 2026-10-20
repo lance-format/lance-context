@@ -1,5 +1,8 @@
 //! HTTP handlers only admit/cancel work. The owned executor, not the connection,
 //! holds the durable execution fence until the scoped storage future is gone.
+mod background;
+pub(crate) use background::spawn_background;
+
 use crate::{
     error::AppError,
     routes::{generic, rollouts},
@@ -49,6 +52,10 @@ pub struct Executions {
     coordinator: OnceCell<Coordinator>,
     etcd: Option<lance_context_merge::EtcdConfig>,
     pub(crate) rollout: lance_context_merge::rollout::MergeRollout,
+    endpoint: Option<String>,
+    fencing_mode: OnceCell<bool>,
+    mode_pending: std::sync::atomic::AtomicBool,
+    background_targets: std::sync::Mutex<std::collections::HashSet<String>>,
     queue_timeout_secs: u64,
     idle_timeout_secs: u64,
     instance: String,
@@ -64,6 +71,10 @@ impl Executions {
             coordinator: OnceCell::new_with(coordinator),
             etcd: None,
             rollout: Default::default(),
+            endpoint: None,
+            fencing_mode: OnceCell::new(),
+            mode_pending: std::sync::atomic::AtomicBool::new(false),
+            background_targets: Default::default(),
             queue_timeout_secs: 600,
             idle_timeout_secs: 600,
             instance: uuid::Uuid::new_v4().to_string(),
@@ -74,6 +85,7 @@ impl Executions {
     pub fn configured(
         etcd: lance_context_merge::EtcdConfig,
         rollout: lance_context_merge::rollout::MergeRollout,
+        endpoint: Option<String>,
         timeout_secs: u64,
         queue_timeout_secs: u64,
         idle_timeout_secs: u64,
@@ -83,12 +95,69 @@ impl Executions {
             coordinator: OnceCell::new(),
             etcd: Some(etcd),
             rollout,
+            endpoint,
+            fencing_mode: OnceCell::new(),
+            mode_pending: std::sync::atomic::AtomicBool::new(false),
+            background_targets: Default::default(),
             timeout_secs,
             queue_timeout_secs,
             idle_timeout_secs,
             instance: uuid::Uuid::new_v4().to_string(),
             running: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Unknown mode defers maintenance, never ingestion. An activated protocol
+    /// is persisted so a configuration rollback cannot reopen untracked writes.
+    pub(crate) fn fencing_mode_known(&self) -> Option<bool> {
+        if !self.rollout.fence_legacy
+            && self.coordinator.get().is_none()
+            && self
+                .etcd
+                .as_ref()
+                .is_none_or(|c| c.etcd_endpoints.is_empty())
+        {
+            return Some(false);
+        }
+        self.fencing_mode.get().copied()
+    }
+
+    pub(crate) async fn fenced_mode(&self) -> Result<bool, AppError> {
+        if let Some(mode) = self.fencing_mode_known() {
+            return Ok(mode);
+        }
+        self.fencing_mode.get_or_try_init(|| async {
+            let mode = self.coordinator().await?.legacy_fencing_mode(self.rollout.fence_legacy)
+                .await.map_err(AppError::Internal)?;
+            if mode && self.endpoint.is_none() {
+                return Err(AppError::InvalidRequest("persisted merge protocol requires MERGE_EXECUTOR_ENDPOINT; refusing legacy rollback".into()));
+            }
+            Ok(mode)
+        }).await.copied()
+    }
+
+    pub(crate) fn resolve_mode_in_background(state: Arc<AppState>) {
+        use std::sync::atomic::Ordering;
+        if state.merge_executions.fencing_mode_known().is_some()
+            || state
+                .merge_executions
+                .mode_pending
+                .swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+        tokio::spawn(async move {
+            if let Err(error) = state.merge_executions.fenced_mode().await {
+                tracing::warn!(
+                    ?error,
+                    "merge protocol unresolved; ingestion continues, untracked merges deferred"
+                );
+            }
+            state
+                .merge_executions
+                .mode_pending
+                .store(false, Ordering::SeqCst);
+        });
     }
 
     pub(crate) fn instance(&self) -> &str {
@@ -155,6 +224,7 @@ impl Executions {
 pub async fn capabilities(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    Executions::resolve_mode_in_background(state.clone());
     Ok(Json(
         serde_json::json!({"protocol": 2, "instance": state.merge_executions.instance,
         "timeout_secs": state.merge_executions.timeout_secs,
@@ -162,6 +232,7 @@ pub async fn capabilities(
         "idle_timeout_secs": state.merge_executions.idle_timeout_secs,
         "progress_protocol": 1,
         "legacy_progress_protocol": 1,
+        "fenced_legacy_merges": state.merge_executions.fencing_mode_known() == Some(true),
         "rollout_append_protocol": 1,
         "shard_name": state.instance_id,
         "owned_targets": state.merge_executions.rollout.owned_targets,
@@ -174,7 +245,10 @@ pub async fn start(
     Json(execution): Json<Execution>,
 ) -> Result<StatusCode, AppError> {
     let coordinator = state.merge_executions.coordinator().await?;
-    if !state.merge_executions.owned(&execution.target)
+    if (!state.merge_executions.owned(&execution.target)
+        && !state.merge_executions.fenced_mode().await?)
+        || state.merge_executions.rollout.draining(&execution.target)
+        || execution.background
         || execution.maintenance.is_some()
         || execution.protocol != 2
         || execution.instance != state.merge_executions.instance
@@ -205,7 +279,14 @@ pub async fn start(
     // never leave a Running fence without an executor (or cancel a live write).
     let owned = state.clone();
     tokio::spawn(async move {
-        let result = run(owned.clone(), coordinator, execution.clone(), cancelled).await;
+        let result = run(
+            owned.clone(),
+            coordinator,
+            execution.clone(),
+            cancelled,
+            None,
+        )
+        .await;
         if let Err(error) = result {
             tracing::error!(id = %execution.id, target = %execution.target, %error, "merge execution ownership unresolved");
         }
@@ -224,6 +305,7 @@ async fn run(
     coordinator: Coordinator,
     execution: Execution,
     cancelled: watch::Receiver<bool>,
+    mut slot: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> Result<(), String> {
     // CAS errors are ambiguous: never retry storage work. Reconciliation sees
     // the durable fence, so an uncertain admission cannot release ownership.
@@ -246,7 +328,6 @@ async fn run(
         tokio::time::sleep(Duration::from_secs(1)).await;
     };
     let target = execution.target.clone();
-    let mut slot = None;
     let uri = match target.strip_prefix("generic:") {
         Some(name) => state.generic_uri(name),
         None => state.rollout_uri(&target),
@@ -293,13 +374,15 @@ async fn run(
     // not exceed the compiler's async layout recursion limit.
     let execute: futures::future::BoxFuture<'_, Result<usize, String>> = Box::pin(async {
         // No payload work starts before admission to the process-wide slot.
-        slot = execute_scoped(
-            async { Ok(state.acquire_merge_slot().await) },
-            Duration::from_secs(execution.queue_timeout_secs),
-            cancelled.clone(),
-        )
-        .await
-        .map_err(|e| format!("merge queue wait: {e}"))?;
+        if slot.is_none() {
+            slot = execute_scoped(
+                async { Ok(state.acquire_merge_slot().await) },
+                Duration::from_secs(execution.queue_timeout_secs),
+                cancelled.clone(),
+            )
+            .await
+            .map_err(|e| format!("merge queue wait: {e}"))?;
+        }
         if !coordinator.publish_progress(&running, 0).await? {
             return Err("merge ownership revoked before execution".into());
         }
@@ -479,7 +562,7 @@ mod tests {
     use tokio::io::AsyncWriteExt;
 
     #[tokio::test]
-    async fn unavailable_etcd_does_not_block_startup_or_disable_legacy_self_merge() {
+    async fn unavailable_etcd_does_not_block_startup_or_flush_configuration() {
         use clap::Parser;
         let dir = tempfile::tempdir().unwrap();
         let config = crate::config::ServerConfig::parse_from([

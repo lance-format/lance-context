@@ -8,6 +8,7 @@ pub mod background;
 pub mod demand;
 pub mod failure;
 pub mod fencing;
+mod mode;
 pub mod progress;
 pub mod rollout;
 

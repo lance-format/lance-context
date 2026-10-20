@@ -364,10 +364,31 @@ impl AppState {
                 "merge execution, queue and idle timeouts must be positive".into(),
             ));
         }
+        if config.merge_rollout.fence_legacy || config.merge_executor_endpoint.is_some() {
+            let endpoint = config.merge_executor_endpoint.as_deref().unwrap_or("");
+            let valid_endpoint = endpoint.parse::<axum::http::Uri>().is_ok_and(|url| {
+                matches!(url.scheme_str(), Some("http" | "https"))
+                    && url
+                        .authority()
+                        .is_some_and(|a| !a.host().is_empty() && !a.as_str().contains('@'))
+                    && url.query().is_none()
+                    && matches!(url.path(), "" | "/")
+                    && !endpoint.contains('#')
+            });
+            if !valid_endpoint
+                || config.etcd.etcd_endpoints.is_empty()
+                || config.rollout_merge_concurrency == 0
+            {
+                return Err(AppError::InvalidRequest(
+                    "fenced legacy merges require ETCD_ENDPOINTS, a stable MERGE_EXECUTOR_ENDPOINT and positive ROLLOUT_MERGE_CONCURRENCY".into(),
+                ));
+            }
+        }
         Ok(Self {
             merge_executions: crate::merge_execution::Executions::configured(
                 config.merge_etcd_config(),
                 config.merge_rollout.clone(),
+                config.merge_executor_endpoint.clone(),
                 config.merge_execution_timeout_secs,
                 config.merge_queue_timeout_secs,
                 config.merge_idle_timeout_secs,

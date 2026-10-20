@@ -50,6 +50,9 @@ async fn main() {
         }
     };
 
+    // Resolve persisted merge protocol independently of startup and ingestion.
+    merge_execution::Executions::resolve_mode_in_background(state.clone());
+
     // Single process-wide WAL-cleanup sweeper (replaces one timer per store).
     // The handle is detached: it runs for the server's lifetime and stops when
     // the last `Arc<AppState>` is dropped.

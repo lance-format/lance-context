@@ -956,7 +956,13 @@ pub(crate) async fn enqueue_merge_request(
     coordinator: &lance_context_merge::Coordinator,
     request: &lance_context_merge::rollout::MergeRequest,
 ) -> Result<(), String> {
-    if !state.config.merge_rollout.owned(&request.target) {
+    if !state.config.merge_rollout.owned(&request.target)
+        && !state.config.merge_rollout.fence_legacy
+        && !coordinator
+            .get(&request.target)
+            .await?
+            .is_some_and(|e| e.maintenance.is_none())
+    {
         return Ok(());
     }
     let task = enqueue(state, TaskKind::MergeWal, &request.target)
@@ -965,6 +971,23 @@ pub(crate) async fn enqueue_merge_request(
     if task.state == lance_context_api::TaskState::Queued {
         coordinator.acknowledge_request(request).await?;
     }
+    Ok(())
+}
+
+async fn enqueue_execution_recovery(
+    state: &Arc<MasterState>,
+    coordinator: &lance_context_merge::Coordinator,
+    execution: &lance_context_merge::Execution,
+) -> Result<(), String> {
+    if execution.maintenance.is_some() {
+        return crate::maintenance_execution::enqueue_recovery(state, coordinator, execution).await;
+    }
+    // Durable worker executions survive flags, endpoint list changes and loss
+    // of their coalesced request. Task claims still serialize reconciliation.
+    crate::merge_execution::ensure_recovery_due(coordinator, execution).await?;
+    enqueue(state, TaskKind::MergeWal, &execution.target)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -1012,15 +1035,8 @@ pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
                 Ok((executions, next)) => {
                     execution_cursor = next;
                     for execution in executions {
-                        if execution.maintenance.is_none() {
-                            continue;
-                        }
-                        if let Err(error) = crate::maintenance_execution::enqueue_recovery(
-                            &retry_state,
-                            &coordinator,
-                            &execution,
-                        )
-                        .await
+                        if let Err(error) =
+                            enqueue_execution_recovery(&retry_state, &coordinator, &execution).await
                         {
                             tracing::warn!(target = %execution.target, %error, "local execution recovery enqueue failed");
                         }
@@ -1298,6 +1314,7 @@ mod tests {
             planner: Default::default(),
             maintenance: Default::default(),
             merge_rollout: lance_context_merge::rollout::MergeRollout {
+                fence_legacy: false,
                 owned_targets: ["exp", "generic:gs", "broken"]
                     .into_iter()
                     .map(str::to_string)
@@ -1873,6 +1890,104 @@ mod tests {
             .unwrap();
         assert_ne!(first.id, next);
         assert!(coordinator.request_page(None).await.unwrap().0.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn background_inventory_recovers_after_flags_and_requests_disappear() {
+        use lance_context_merge::Execution;
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.merge_rollout.owned_targets.clear();
+        cfg.merge_rollout.fence_legacy = false;
+        let state = MasterState::new(cfg).await.unwrap();
+        let c = state.task_store.merge_coordinator();
+        let mut e = Execution::new("new-hot-table", "http://127.0.0.1:1", "old-worker", 60);
+        e.background = true;
+        assert!(c.reserve_background(&e).await.unwrap());
+        let e = c.start(&e).await.unwrap().unwrap();
+        assert!(c.finish(&e, Ok(19)).await.unwrap());
+        let request = c.request_page(None).await.unwrap().0.remove(0);
+        assert!(c.acknowledge_request(&request).await.unwrap());
+        let inventory = c.execution_page(None).await.unwrap().0;
+        enqueue_execution_recovery(&state, &c, &inventory[0])
+            .await
+            .unwrap();
+        let claim = state
+            .task_store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        let result = crate::merge_execution::run_merge_wal(&state, &claim)
+            .await
+            .unwrap();
+        assert!(result.contains("reconciled"));
+        assert!(c.get("new-hot-table").await.unwrap().is_none());
+        state.task_store.finish(claim, Ok(result)).await.unwrap();
+        // Ambiguous storage needs a real barrier after initiation is disabled.
+        let uri = state.rollout_uri("new-hot-table");
+        RolloutStore::open(&uri)
+            .await
+            .unwrap()
+            .close()
+            .await
+            .unwrap();
+        let version = lance::Dataset::open(&uri).await.unwrap().version().version;
+        let mut orphan = Execution::new("new-hot-table", "http://127.0.0.1:1", "lost-worker", 60);
+        orphan.background = true;
+        assert!(c.reserve_background(&orphan).await.unwrap());
+        let running = c.start(&orphan).await.unwrap().unwrap();
+        c.authorize_commit(&running, &uri, "base", version + 1)
+            .await
+            .unwrap();
+        assert!(c
+            .report_uncertain(&running, "lost response".into())
+            .await
+            .unwrap());
+        let old = c.get("new-hot-table").await.unwrap().unwrap();
+        enqueue_execution_recovery(&state, &c, &old).await.unwrap();
+        let claim = state
+            .task_store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        let result = crate::merge_execution::run_merge_wal(&state, &claim)
+            .await
+            .unwrap();
+        assert!(c.get("new-hot-table").await.unwrap().is_none());
+        assert!(lance::Dataset::open(&uri).await.unwrap().version().version > version + 1);
+        assert!(c
+            .authorize_commit(&running, &uri, "base", version + 3)
+            .await
+            .is_err());
+        state.task_store.finish(claim, Ok(result)).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn fenced_new_table_demand_enqueues_without_static_ownership() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.merge_rollout.owned_targets.clear();
+        cfg.merge_rollout.fence_legacy = true;
+        let state = MasterState::new(cfg).await.unwrap();
+        let c = state.task_store.merge_coordinator();
+        c.request_merge("new-hot-table").await.unwrap();
+        let request = c.request_page(None).await.unwrap().0.remove(0);
+        enqueue_merge_request(&state, &c, &request).await.unwrap();
+        assert!(state
+            .task_store
+            .get_active_id(TaskKind::MergeWal, "new-hot-table")
+            .await
+            .unwrap()
+            .is_some());
+        assert!(c.request_page(None).await.unwrap().0.is_empty());
+        assert!(
+            !crate::local_merge::selected(&state.config, "new-hot-table"),
+            "worker recording does not certify native ownership"
+        );
     }
 
     /// Wait until the task reaches a terminal state, returning its final record.

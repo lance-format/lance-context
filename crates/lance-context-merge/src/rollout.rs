@@ -4,6 +4,10 @@ use etcd_client::{Compare, CompareOp, GetOptions, TxnOp};
 
 #[derive(Clone, Debug, Default, clap::Args)]
 pub struct MergeRollout {
+    /// Record new legacy-target worker merges with commit fencing. This does
+    /// not enroll targets for native catchup or fence pre-upgrade writers.
+    #[arg(long, env = "MERGE_FENCE_LEGACY", default_value_t = false)]
+    pub fence_legacy: bool,
     /// Exact scheduler targets using owned merges (generic stores: generic:name).
     /// Empty by default. Enable only after the target's legacy writers drain.
     #[arg(

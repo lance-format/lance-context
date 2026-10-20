@@ -481,7 +481,25 @@ async fn route_merge<S: Sweepable>(
     // unchanged.
     spawn_publish_demand(state.clone(), target.clone(), S::clone(store));
     if !state.merge_executions.owned(&target) {
-        return Ok(false);
+        match state.merge_executions.fencing_mode_known() {
+            Some(false) => return Ok(false),
+            None if !state.merge_executions.rollout.fence_legacy => {
+                crate::merge_execution::Executions::resolve_mode_in_background(state.clone());
+                return Ok(true);
+            }
+            _ => {}
+        }
+        if !count_trigger || store.count_merge_due().await? {
+            match crate::merge_execution::spawn_background(state.clone(), target).await {
+                Ok(_reply) => {} // Executor is retained independently of this sweep.
+                Err(crate::error::AppError::Overloaded(_)) => {
+                    metrics::counter!("rollout_wal_self_merge_skipped_total", "kind" => S::kind())
+                        .increment(1);
+                }
+                Err(error) => return Err(format!("{error:?}")),
+            }
+        }
+        return Ok(true);
     }
     if !count_trigger || store.count_merge_due().await? {
         state.merge_executions.request_merge(&target).await?;
