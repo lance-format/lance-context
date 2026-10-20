@@ -323,9 +323,14 @@ mod tests {
     }
 }
 
-/// Deadlines for local table mutations on explicitly owned targets.
+/// Admission and progress deadlines for local master table mutations.
 #[derive(Debug, Clone, clap::Args)]
 pub struct MaintenanceConfig {
+    /// Fence new master compact/index/repair executions even for rollout and
+    /// generic targets still using legacy worker merges. This does not migrate
+    /// worker admission or retroactively fence pre-upgrade writes.
+    #[arg(long, env = "MASTER_FENCE_LEGACY_MAINTENANCE", default_value_t = false)]
+    pub fence_legacy_maintenance: bool,
     /// Prepare rollout compaction files without holding the table write lock.
     /// Explicit rollout targets or '*'; empty keeps legacy behavior. Updates to
     /// source fragments invalidate preparation instead of being overwritten.
@@ -362,6 +367,7 @@ pub struct MaintenanceConfig {
 impl Default for MaintenanceConfig {
     fn default() -> Self {
         Self {
+            fence_legacy_maintenance: false,
             compaction_prepare_targets: Vec::new(),
             index_prepare_targets: Vec::new(),
             maintenance_catchup_targets: Vec::new(),

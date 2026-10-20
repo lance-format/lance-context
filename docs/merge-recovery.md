@@ -164,6 +164,28 @@ Other maintenance tasks retain their existing repair policy.
 
 ## Default-off, per-table rollout
 
+### Fencing master maintenance before worker migration
+
+`MASTER_FENCE_LEGACY_MAINTENANCE=true` opts a master into the existing durable
+execution/commit-permit protocol for every new rollout or generic compact,
+index, and repair task it executes, including targets absent from
+`MERGE_OWNED_TARGETS`. It defaults to false and does not include datagen.
+Prepared compaction and index work still runs without table ownership; only
+publication takes its existing commit turn and storage fence.
+
+This closes the master-side untracked-write path without changing worker merge
+admission or stopping ingestion. A master cancels an operation only after its
+real completed-work sequence stops advancing, drains admitted writes, and
+retains ownership until ambiguous commits are fenced. Recovery scans also
+re-enqueue these recorded executions after the flag is turned off: disabling
+future admission must not strand an existing storage fence.
+
+This does not make untracked old master/worker/helper writes recoverable or
+enroll a table into native merging. Use the migration barriers below for that
+transition. Deploy capable masters before enabling this option; measure etcd
+commit-authorization overhead and real compaction/index progress in a canary
+before expanding it. No worker protocol/configuration change is required.
+
 ### Legacy worker progress evidence
 
 Workers advertising `legacy_progress_protocol: 1` expose
