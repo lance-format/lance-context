@@ -411,6 +411,14 @@ mod tests {
         owned: bool,
         fence_legacy: bool,
     ) -> (tempfile::TempDir, Arc<MasterState>) {
+        fixture_with_idle(owned, fence_legacy, 1).await
+    }
+
+    async fn fixture_with_idle(
+        owned: bool,
+        fence_legacy: bool,
+        idle: u64,
+    ) -> (tempfile::TempDir, Arc<MasterState>) {
         let dir = tempfile::tempdir().unwrap();
         let endpoints = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
         let prefix = format!("/maintenance-test/{}", lance_context_core::generate_id());
@@ -431,7 +439,7 @@ mod tests {
         config.compaction_interval_secs = 0;
         config.merge_wal_interval_secs = 0;
         config.maintenance.maintenance_timeout_secs = 60;
-        config.maintenance.maintenance_idle_timeout_secs = 1;
+        config.maintenance.maintenance_idle_timeout_secs = idle;
         config.maintenance.maintenance_drain_timeout_secs = 1;
         (dir, MasterState::new(config).await.unwrap())
     }
@@ -441,6 +449,77 @@ mod tests {
             .await
             .unwrap();
         state.task_store.claim_next().await.unwrap().unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS; ~8 s"]
+    async fn legacy_maintenance_file_io_progress_survives_multiple_idle_windows() {
+        use arrow_array::{RecordBatch, RecordBatchIterator, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use futures::TryStreamExt;
+        let (_dir, state) = fixture_with_idle(false, true, 3).await;
+        let uri = state.rollout_uri("table");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("content", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from_iter_values(
+                    (0..512).map(|n| n.to_string()),
+                )),
+                Arc::new(StringArray::from_iter_values(
+                    (0..512).map(|_| "x".repeat(4096)),
+                )),
+            ],
+        )
+        .unwrap();
+        let mut dataset =
+            lance_context_core::StorageBase::create_with_options(&uri, schema.clone(), None, None)
+                .await
+                .unwrap();
+        dataset
+            .append(RecordBatchIterator::new([Ok(batch)], schema), None)
+            .await
+            .unwrap();
+        let claim = claim(&state, TaskKind::IndexId).await;
+        let coordinator = state.task_store.merge_coordinator();
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            run(&state, &claim, async {
+                // No logical checkpoint calls: only completed reads through the
+                // scoped stores may keep this operation alive. Reopen to avoid
+                // turning later scans into memory-cache hits with no IO.
+                for step in 0..14 {
+                    let dataset =
+                        lance_context_core::StorageBase::load_with_options(&uri, None, None)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                    let batches = dataset
+                        .scan()
+                        .try_into_stream()
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .try_collect::<Vec<_>>()
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 512);
+                    if step > 3 {
+                        let execution = coordinator.get("table").await?.unwrap();
+                        let report = coordinator.work_progress(&execution).await?.unwrap();
+                        assert!(report["sequence"].as_u64().unwrap() > 0);
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                Ok("file IO kept the operation alive".into())
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_ok(), "{result:?}");
+        assert!(coordinator.get("table").await.unwrap().is_none());
+        state.task_store.finish(claim, result).await.unwrap();
     }
 
     #[tokio::test]
