@@ -267,6 +267,18 @@ pub(crate) fn wal_batch_read(rows: usize, bytes: usize) {
 }
 
 pub(crate) fn base_committed() {
+    // Legacy observation counts at the commit handler, including fallback
+    // paths which also invoke the owned executor's logical checkpoints.
+    if CURRENT
+        .try_with(|scope| scope.observation_only)
+        .unwrap_or(false)
+    {
+        return;
+    }
+    record_base_commit();
+}
+
+fn record_base_commit() {
     let _ = CURRENT.try_with(|scope| {
         let mut work = scope.work.lock().unwrap();
         work.base_commits += 1;
@@ -276,6 +288,16 @@ pub(crate) fn base_committed() {
 }
 
 pub(crate) fn generations_reclaimed(count: usize) {
+    if CURRENT
+        .try_with(|scope| scope.observation_only)
+        .unwrap_or(false)
+    {
+        return;
+    }
+    record_reclaimed(count);
+}
+
+fn record_reclaimed(count: usize) {
     if count == 0 {
         return;
     }
@@ -532,7 +554,7 @@ pub(crate) async fn drain_generations(
                     .try_with(|scope| scope.observation_only)
                     .unwrap_or(false)
                 {
-                    generations_reclaimed(removed);
+                    record_reclaimed(removed);
                 }
                 return Ok(next);
             }
@@ -771,7 +793,7 @@ impl CommitHandler for GuardedCommit {
                     .try_with(|scope| scope.observation_only)
                     .unwrap_or(false)
             {
-                base_committed();
+                record_base_commit();
             }
             location
         };
