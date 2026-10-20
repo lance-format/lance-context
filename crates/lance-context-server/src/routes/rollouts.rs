@@ -810,7 +810,7 @@ mod tests {
         state.merge_executions.rollout.drain_targets = vec!["draining".into()];
         let state = Arc::new(state);
         for name in ["owned", "draining", "legacy"] {
-            create_rollout_store(
+            let (status, Json(_)) = create_rollout_store(
                 State(state.clone()),
                 Json(CreateRolloutStoreRequest {
                     name: name.into(),
@@ -819,6 +819,7 @@ mod tests {
             )
             .await
             .unwrap();
+            assert_eq!(status, StatusCode::CREATED);
             let handle = state.get_or_open_rollout_store(name).await.unwrap();
             // A live reader must not make rejection wait for the write lock.
             let reader = handle.read().await;
@@ -838,13 +839,14 @@ mod tests {
                 assert_eq!(reader.version(), version);
             } else {
                 drop(reader);
-                compact_rollout(
+                let Json(compacted) = compact_rollout(
                     State(state.clone()),
                     Path(name.into()),
                     Json(CompactRequest::default()),
                 )
                 .await
                 .expect("unowned legacy compaction remains available");
+                assert_eq!(compacted.fragments_removed, 0);
             }
         }
     }
