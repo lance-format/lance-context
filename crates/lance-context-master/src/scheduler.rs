@@ -932,7 +932,10 @@ async fn should_probe_failure(
     state: &Arc<MasterState>,
     failure: &lance_context_merge::failure::ShardFailure,
 ) -> bool {
-    if state.config.merge_rollout.owned(&failure.target) {
+    if !state.config.merge_rollout.draining(&failure.target)
+        && (state.config.merge_rollout.owned(&failure.target)
+            || state.config.merge_rollout.fence_legacy)
+    {
         return true;
     }
     if state.config.merge_rollout.draining(&failure.target) {

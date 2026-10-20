@@ -1,7 +1,7 @@
 //! HTTP handlers only admit/cancel work. The owned executor, not the connection,
 //! holds the durable execution fence until the scoped storage future is gone.
 mod background;
-pub(crate) use background::spawn_background;
+pub(crate) use background::{publish_background_request, spawn_background};
 
 use crate::{
     error::AppError,
@@ -56,6 +56,8 @@ pub struct Executions {
     fencing_mode: OnceCell<bool>,
     mode_pending: std::sync::atomic::AtomicBool,
     background_targets: std::sync::Mutex<std::collections::HashSet<String>>,
+    request_targets: std::sync::Mutex<std::collections::HashSet<String>>,
+    request_slots: Arc<tokio::sync::Semaphore>,
     queue_timeout_secs: u64,
     idle_timeout_secs: u64,
     instance: String,
@@ -75,6 +77,8 @@ impl Executions {
             fencing_mode: OnceCell::new(),
             mode_pending: std::sync::atomic::AtomicBool::new(false),
             background_targets: Default::default(),
+            request_targets: Default::default(),
+            request_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             queue_timeout_secs: 600,
             idle_timeout_secs: 600,
             instance: uuid::Uuid::new_v4().to_string(),
@@ -99,6 +103,8 @@ impl Executions {
             fencing_mode: OnceCell::new(),
             mode_pending: std::sync::atomic::AtomicBool::new(false),
             background_targets: Default::default(),
+            request_targets: Default::default(),
+            request_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             timeout_secs,
             queue_timeout_secs,
             idle_timeout_secs,

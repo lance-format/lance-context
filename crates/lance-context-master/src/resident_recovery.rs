@@ -37,6 +37,8 @@ fn scope(config: &MasterConfig) -> u64 {
         sorted.hash(&mut hash);
     }
     config.append.rollout_append_local.hash(&mut hash);
+    config.local_merge.master_local_merge_auto.hash(&mut hash);
+    config.merge_rollout.fence_legacy.hash(&mut hash);
     hash.finish()
 }
 
@@ -483,6 +485,10 @@ mod tests {
     }
 
     async fn generic_fixture() -> (tempfile::TempDir, Arc<MasterState>) {
+        generic_fixture_with_auto(false).await
+    }
+
+    async fn generic_fixture_with_auto(auto: bool) -> (tempfile::TempDir, Arc<MasterState>) {
         let dir = tempfile::tempdir().unwrap();
         let mut config = MasterConfig::parse_from(["test"]);
         config.data_dir = dir.path().to_string_lossy().into();
@@ -497,6 +503,11 @@ mod tests {
         );
         config.merge_rollout.owned_targets = vec!["generic:a".into(), "generic:b".into()];
         config.local_merge.master_local_merge_targets = vec!["*".into()];
+        if auto {
+            config.merge_rollout.owned_targets.clear();
+            config.merge_rollout.fence_legacy = true;
+            config.local_merge.master_local_merge_auto = true;
+        }
         config.catchup.shards = vec!["writer".into()];
         config.catchup.merge_max_generations = 1;
         config.catchup.merge_max_bytes = 1024 * 1024;
@@ -541,6 +552,166 @@ mod tests {
             .await
             .unwrap();
         writer.flush().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn automatic_new_table_waits_for_background_then_catches_up_across_masters() {
+        use lance_context_merge::{Execution, Phase};
+        let (_dir, state) = generic_fixture_with_auto(true).await;
+        assert!(state.config.merge_rollout.owned_targets.is_empty());
+        assert!(state.config.maintenance.fence_legacy_maintenance);
+        // Created after master startup, with no stats row or static allowlist.
+        let writer = generic_writer(&state, "new-hot").await;
+        for n in 0..17 {
+            generic_write(&writer, "shared", &n.to_string()).await;
+        }
+        let target = "generic:new-hot";
+        let c = state.task_store.merge_coordinator();
+        let mut e = Execution::new(target, "http://127.0.0.1:1", "live-worker", 60);
+        e.background = true;
+        assert!(c.reserve_background(&e).await.unwrap());
+        let running = c.start(&e).await.unwrap().unwrap();
+        assert!(c.publish_progress(&running, 0).await.unwrap());
+        let request = c.request_page(None).await.unwrap().0.remove(0);
+        crate::scheduler::enqueue_merge_request(&state, &c, &request)
+            .await
+            .unwrap();
+        let claim = state
+            .task_store
+            .claim_resident_merge(&crate::local_merge::targets(&state.config))
+            .await
+            .unwrap()
+            .unwrap();
+        let next_master = MasterState::new(state.config.clone()).await.unwrap();
+        assert!(next_master
+            .task_store
+            .claim_resident_merge(&crate::local_merge::targets(&next_master.config))
+            .await
+            .unwrap()
+            .is_none());
+        let first = tokio::spawn({
+            let state = state.clone();
+            async move {
+                let outcome = crate::merge_execution::run_merge_wal(&state, &claim).await;
+                (claim, outcome)
+            }
+        });
+        for sequence in 1..=4 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let current = c.get(target).await.unwrap().unwrap();
+            assert_eq!(current.id, running.id);
+            assert_eq!(
+                current.phase,
+                Phase::Running,
+                "native selection must preserve useful worker progress"
+            );
+            assert!(c.publish_progress(&running, sequence).await.unwrap());
+            assert!(!first.is_finished());
+        }
+        assert!(c.finish(&running, Ok(0)).await.unwrap());
+        let (claim, result) = tokio::time::timeout(Duration::from_secs(30), first)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            result.as_ref().unwrap().contains("16 generations"),
+            "{result:?}"
+        );
+        let request = c.request_page(None).await.unwrap().0.remove(0);
+        crate::scheduler::enqueue_merge_request(&next_master, &c, &request)
+            .await
+            .unwrap();
+        assert_eq!(c.request_page(None).await.unwrap().0.len(), 1);
+        state.task_store.finish(claim, result).await.unwrap();
+        crate::scheduler::enqueue_merge_request(&next_master, &c, &request)
+            .await
+            .unwrap();
+        let claim = next_master
+            .task_store
+            .claim_resident_merge(&crate::local_merge::targets(&next_master.config))
+            .await
+            .unwrap()
+            .unwrap();
+        let result = crate::merge_execution::run_merge_wal(&next_master, &claim).await;
+        assert!(
+            result.as_ref().unwrap().contains("1 generations"),
+            "{result:?}"
+        );
+        next_master.task_store.finish(claim, result).await.unwrap();
+        assert_eq!(writer.pending_wal_generations().await.unwrap(), 0);
+        let rows = writer.list(None, None).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["text"], "16");
+        assert_eq!(state.local_append.as_ref().unwrap().budget.reserved(), 0);
+        assert_eq!(
+            next_master.local_append.as_ref().unwrap().budget.reserved(),
+            0
+        );
+        generic_write(&writer, "shared", "after-handoff").await;
+        assert!(probe(&next_master, target).await.unwrap());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn automatic_rollout_uses_native_merge_and_preserves_external_owner() {
+        let (_dir, initial) = generic_fixture_with_auto(true).await;
+        let mut cfg = initial.config.clone();
+        // Existing append wildcard must not send an unowned new table through
+        // the explicit-ownership staged-append protocol.
+        cfg.append.rollout_append_targets = vec!["*".into()];
+        let state = MasterState::new(cfg).await.unwrap();
+        let target = "new-rollout";
+        let writer = write(&state, target, 4).await;
+        let c = state.task_store.merge_coordinator();
+        let owner = crate::catchup::store::active_key(&state.config.etcd.etcd_prefix, target);
+        let mut client = state.task_store.etcd_client().clone();
+        client
+            .put(owner.as_str(), "fixture-helper", None)
+            .await
+            .unwrap();
+        assert!(!probe(&state, target).await.unwrap());
+        c.request_merge(target).await.unwrap();
+        let request = c.request_page(None).await.unwrap().0.remove(0);
+        crate::scheduler::enqueue_merge_request(&state, &c, &request)
+            .await
+            .unwrap();
+        assert!(state
+            .task_store
+            .claim_resident_merge(&crate::local_merge::targets(&state.config))
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(writer.pending_wal_generations().await.unwrap(), 4);
+        // This fixture has no remote actor or commits. End its known ownership.
+        client.delete(owner, None).await.unwrap();
+        let claim = state
+            .task_store
+            .claim_resident_merge(&crate::local_merge::targets(&state.config))
+            .await
+            .unwrap()
+            .unwrap();
+        let result = crate::merge_execution::run_merge_wal(&state, &claim).await;
+        assert!(
+            result
+                .as_ref()
+                .unwrap()
+                .contains("local WAL merge reclaimed 4 generations"),
+            "{result:?}"
+        );
+        state.task_store.finish(claim, result).await.unwrap();
+        assert_eq!(writer.pending_wal_generations().await.unwrap(), 0);
+        assert_eq!(
+            lance::Dataset::open(&state.rollout_uri(target))
+                .await
+                .unwrap()
+                .count_rows(None)
+                .await
+                .unwrap(),
+            4
+        );
+        assert_eq!(state.local_append.as_ref().unwrap().budget.reserved(), 0);
+        assert!(!probe(&state, target).await.unwrap());
     }
 
     #[tokio::test]

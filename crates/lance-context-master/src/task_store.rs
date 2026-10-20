@@ -123,6 +123,7 @@ struct EtcdTaskStore {
     index_prepare_targets: Vec<String>,
     maintenance_catchup_targets: Vec<String>,
     rollout: lance_context_merge::rollout::MergeRollout,
+    auto_local_merge: bool,
 }
 
 /// Ownership of one running task. Dropping the claim stops lease renewal; etcd
@@ -743,6 +744,7 @@ impl EtcdTaskStore {
             index_prepare_targets: config.maintenance.index_prepare_targets.clone(),
             maintenance_catchup_targets: config.maintenance.maintenance_catchup_targets.clone(),
             rollout: config.merge_rollout.clone(),
+            auto_local_merge: config.local_merge.master_local_merge_auto,
         })
     }
 
@@ -838,6 +840,7 @@ impl EtcdTaskStore {
 
     fn eligibility_policy(&self) -> eligibility::Policy<'_> {
         eligibility::Policy {
+            auto_local_merge: self.auto_local_merge,
             rollout: &self.rollout,
             compaction_prepare_targets: &self.prepare_targets,
             index_prepare_targets: &self.index_prepare_targets,

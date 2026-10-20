@@ -490,6 +490,7 @@ async fn route_merge<S: Sweepable>(
             _ => {}
         }
         if !count_trigger || store.count_merge_due().await? {
+            crate::merge_execution::publish_background_request(state.clone(), target.clone());
             match crate::merge_execution::spawn_background(state.clone(), target).await {
                 Ok(_reply) => {} // Executor is retained independently of this sweep.
                 Err(crate::error::AppError::Overloaded(_)) => {

@@ -4,8 +4,15 @@ use std::sync::Arc;
 
 #[derive(Clone, Debug, Default, clap::Args)]
 pub struct LocalMergeConfig {
+    /// Route new rollout/generic demand to resident masters without a static
+    /// table allowlist. Enable only after every legacy writer/helper has drained
+    /// and all participants use persistent fenced admission. This flag is not
+    /// evidence of that initial transition; retain its deployment evidence.
+    #[arg(long, env = "MASTER_LOCAL_MERGE_AUTO", default_value_t = false)]
+    pub master_local_merge_auto: bool,
     /// Execute sealed WAL merges in the master, including generic upsert tables.
-    /// '*' selects only explicitly owned targets; it never migrates legacy writers.
+    /// '*' selects explicitly owned targets unless automatic routing is enabled.
+    /// Neither setting certifies that historical legacy writers have drained.
     #[arg(long, env = "MASTER_LOCAL_MERGE_TARGETS", value_delimiter = ',')]
     pub master_local_merge_targets: Vec<String>,
 }
@@ -23,7 +30,12 @@ pub(crate) fn enabled(config: &MasterConfig) -> bool {
 }
 
 pub(crate) fn selected(config: &MasterConfig, target: &str) -> bool {
-    config.merge_rollout.owned(target)
+    let name = target.strip_prefix("generic:").unwrap_or(target);
+    let dynamic = config.local_merge.master_local_merge_auto
+        && config.merge_rollout.fence_legacy
+        && !target.starts_with("datagen:")
+        && lance_context_core::validate_store_name(name).is_ok();
+    (config.merge_rollout.owned(target) || dynamic)
         && !config.merge_rollout.draining(target)
         && (config.append.local(target) || config.local_merge.selected(target))
 }
@@ -31,6 +43,9 @@ pub(crate) fn selected(config: &MasterConfig, target: &str) -> bool {
 /// Resolve the local selection before claiming. In particular an append wildcard
 /// cannot accidentally reserve a slot for a generic table that still needs RPCs.
 pub(crate) fn targets(config: &MasterConfig) -> Vec<String> {
+    if config.local_merge.master_local_merge_auto {
+        return vec!["*".into()];
+    }
     config
         .merge_rollout
         .owned_targets
@@ -41,6 +56,13 @@ pub(crate) fn targets(config: &MasterConfig) -> Vec<String> {
 }
 
 pub(crate) fn validate(config: &MasterConfig) -> Result<(), String> {
+    if config.local_merge.master_local_merge_auto
+        && (!config.merge_rollout.fence_legacy
+            || config.local_merge.master_local_merge_targets != ["*"]
+            || !config.maintenance.fence_legacy_maintenance)
+    {
+        return Err("automatic local merges require persistent worker fencing, fenced master maintenance and MASTER_LOCAL_MERGE_TARGETS=*; initial legacy writer drain must be verified before enabling".into());
+    }
     if config.local_merge.master_local_merge_targets.is_empty() {
         return Ok(());
     }
@@ -58,9 +80,11 @@ pub(crate) fn validate(config: &MasterConfig) -> Result<(), String> {
     {
         return Err("master local merges require stable shards, bounded passes and a sufficient shared memory budget".into());
     }
-    if targets(config)
+    if config
+        .merge_rollout
+        .owned_targets
         .iter()
-        .any(|target| config.append.enabled(target))
+        .any(|target| selected(config, target) && config.append.enabled(target))
     {
         config.append.validate()?;
         if config.append.rollout_append_local_memory_bytes < config.append.rollout_append_max_bytes
@@ -133,5 +157,26 @@ mod tests {
         config.append.rollout_append_max_bytes =
             config.append.rollout_append_local_memory_bytes + 1;
         assert!(validate(&config).is_err());
+    }
+    #[test]
+    fn automatic_selection_requires_fenced_protocol_and_bounded_resources() {
+        let mut cfg = MasterConfig::parse_from(["test"]);
+        cfg.local_merge.master_local_merge_auto = true;
+        cfg.local_merge.master_local_merge_targets = vec!["*".into()];
+        cfg.catchup.shards = vec!["writer".into()];
+        assert!(validate(&cfg).is_err());
+        assert!(!selected(&cfg, "new-hot"));
+        cfg.merge_rollout.fence_legacy = true;
+        assert!(validate(&cfg).is_err());
+        cfg.maintenance.fence_legacy_maintenance = true;
+        assert!(validate(&cfg).is_ok());
+        assert!(selected(&cfg, "new-hot"));
+        assert!(selected(&cfg, "generic:new-hot"));
+        assert!(!selected(&cfg, "datagen:new-hot"));
+        cfg.merge_rollout.drain_targets.push("new-hot".into());
+        assert!(!selected(&cfg, "new-hot"));
+        assert_eq!(targets(&cfg), ["*"]);
+        cfg.catchup.merge_max_bytes = cfg.append.rollout_append_local_memory_bytes + 1;
+        assert!(validate(&cfg).is_err());
     }
 }

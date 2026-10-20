@@ -721,6 +721,7 @@ pub async fn merge_wal(
 ) -> Result<Json<MergeWalResponse>, AppError> {
     state.merge_executions.legacy_allowed(&name)?;
     if state.merge_executions.fenced_mode().await? {
+        crate::merge_execution::publish_background_request(state.clone(), name.clone());
         let result = crate::merge_execution::spawn_background(state, name).await?;
         let reclaimed = result
             .await

@@ -31,6 +31,7 @@ pub enum Skip {
 
 /// Static per-target scheduling configuration consulted by the filter.
 pub struct Policy<'a> {
+    pub auto_local_merge: bool,
     pub rollout: &'a MergeRollout,
     pub compaction_prepare_targets: &'a [String],
     pub index_prepare_targets: &'a [String],
@@ -89,10 +90,15 @@ pub fn pre_dependency_filter(
     }
     if let Some(targets) = resident_targets {
         let eligible = kind == TaskKind::MergeWal
-            && policy.rollout.owned(target)
+            && (policy.rollout.owned(target) || policy.auto_local_merge)
+            && !target.starts_with("datagen:")
+            && lance_context_core::validate_store_name(
+                target.strip_prefix("generic:").unwrap_or(target),
+            )
+            .is_ok()
             && !policy.rollout.draining(target)
             && (targets.iter().any(|t| t == target)
-                || (!is_generic(target) && listed(targets, target)));
+                || ((!is_generic(target) || policy.auto_local_merge) && listed(targets, target)));
         if !eligible {
             return Err(Skip::NotResidentEligible);
         }
@@ -210,6 +216,7 @@ mod tests {
             &["draining"],
         );
         let policy = Policy {
+            auto_local_merge: false,
             rollout: &rollout,
             compaction_prepare_targets: &[],
             index_prepare_targets: &[],
@@ -257,6 +264,7 @@ mod tests {
         let compact = strings(&["t", "d"]);
         let index = strings(&["*"]);
         let policy = Policy {
+            auto_local_merge: false,
             rollout: &rollout,
             compaction_prepare_targets: &compact,
             index_prepare_targets: &index,
@@ -287,6 +295,7 @@ mod tests {
         let rollout = rollout(&["t"], &[]);
         let shared = strings(&["t"]);
         let policy = Policy {
+            auto_local_merge: false,
             rollout: &rollout,
             compaction_prepare_targets: &[],
             index_prepare_targets: &[],
@@ -297,6 +306,7 @@ mod tests {
         assert!(!claim_shape(TaskKind::MergeWal, "t", &policy, true).shared_owner);
         let wildcard = strings(&["*"]);
         let policy = Policy {
+            auto_local_merge: false,
             maintenance_catchup_targets: &wildcard,
             ..policy
         };
@@ -536,6 +546,40 @@ mod tests {
             ),
             Ok(()),
             "preparation runs beside a worker execution"
+        );
+    }
+    #[test]
+    fn automatic_resident_filter_admits_new_rollout_and_generic_but_keeps_drains() {
+        let rollout = rollout(&[], &["draining"]);
+        let policy = Policy {
+            auto_local_merge: true,
+            rollout: &rollout,
+            compaction_prepare_targets: &[],
+            index_prepare_targets: &[],
+            maintenance_catchup_targets: &[],
+        };
+        let targets = strings(&["*"]);
+        for name in ["new-hot", "generic:new-hot"] {
+            assert_eq!(
+                pre_dependency_filter(TaskKind::MergeWal, name, |_| true, Some(&targets), &policy),
+                Ok(())
+            );
+        }
+        for name in ["draining", "datagen:new-hot", "../escape", "generic:"] {
+            assert_eq!(
+                pre_dependency_filter(TaskKind::MergeWal, name, |_| true, Some(&targets), &policy),
+                Err(Skip::NotResidentEligible)
+            );
+        }
+        assert_eq!(
+            pre_dependency_filter(
+                TaskKind::Compact,
+                "new-hot",
+                |_| true,
+                Some(&targets),
+                &policy
+            ),
+            Err(Skip::NotResidentEligible)
         );
     }
 }

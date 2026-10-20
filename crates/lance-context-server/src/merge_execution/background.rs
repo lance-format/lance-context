@@ -8,16 +8,62 @@ type Reply = oneshot::Receiver<Result<usize, String>>;
 struct TargetGuard {
     state: Arc<AppState>,
     target: String,
+    request: bool,
 }
 impl Drop for TargetGuard {
     fn drop(&mut self) {
-        self.state
-            .merge_executions
-            .background_targets
-            .lock()
-            .unwrap()
-            .remove(&self.target);
+        let targets = if self.request {
+            &self.state.merge_executions.request_targets
+        } else {
+            &self.state.merge_executions.background_targets
+        };
+        targets.lock().unwrap().remove(&self.target);
     }
+}
+
+/// Demand must reach the master even when every worker execution slot is
+/// occupied. Metadata publication has its own small bound and per-table
+/// coalescing; no payload slot or flush-pass wait is needed.
+pub(crate) fn publish_background_request(state: Arc<AppState>, target: String) {
+    let Ok(permit) = state
+        .merge_executions
+        .request_slots
+        .clone()
+        .try_acquire_owned()
+    else {
+        return;
+    };
+    if !state
+        .merge_executions
+        .request_targets
+        .lock()
+        .unwrap()
+        .insert(target.clone())
+    {
+        return;
+    }
+    let guard = TargetGuard {
+        state: state.clone(),
+        target: target.clone(),
+        request: true,
+    };
+    tokio::spawn(async move {
+        let _permit = permit;
+        let _guard = guard;
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            state.merge_executions.request_merge(&target),
+        )
+        .await;
+        let label = match result {
+            Ok(Ok(())) => "ok",
+            outcome => {
+                tracing::warn!(target, ?outcome, "master merge demand publication deferred");
+                "failed"
+            }
+        };
+        metrics::counter!("rollout_wal_background_requests_total", "result" => label).increment(1);
+    });
 }
 
 /// Never wait for a slot or coordinator IO on the flush sweep. Coalescing and
@@ -59,6 +105,7 @@ pub(crate) async fn spawn_background(
     let guard = TargetGuard {
         state: state.clone(),
         target: target.clone(),
+        request: false,
     };
     let mut execution = Execution::new(
         &target,
@@ -349,6 +396,23 @@ mod tests {
         .await
         .unwrap();
         assert!(state.merge_executions.running.lock().await.is_empty());
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if coordinator
+                    .request_page(None)
+                    .await
+                    .unwrap()
+                    .0
+                    .iter()
+                    .any(|r| r.target == "hot")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("saturated worker must still request master catchup");
         assert!(coordinator.get("hot").await.unwrap().is_none());
         assert_eq!(
             store.read().await.pending_wal_generations().await.unwrap(),

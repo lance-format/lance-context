@@ -81,14 +81,28 @@ pub(crate) async fn run_merge_wal(
     if state.config.append.enabled(target) || crate::local_merge::selected(&state.config, target) {
         if let Some(old) = coordinator.get(target).await? {
             ensure_recovery_due(&coordinator, &old).await?;
-            recover_execution(state, &coordinator, &proof, old).await?;
+            if old.maintenance.is_none() {
+                // A newly selected resident target may still have useful
+                // background work. Wait for its real progress and terminal
+                // acknowledgement before considering storage recovery.
+                if reconcile(&state.http, &coordinator, &proof, old, false)
+                    .await
+                    .is_err()
+                {
+                    if let Some(current) = coordinator.get(target).await? {
+                        recover_execution(state, &coordinator, &proof, current).await?;
+                    }
+                }
+            } else {
+                recover_execution(state, &coordinator, &proof, old).await?;
+            }
         }
         return crate::maintenance_execution::run_as(
             state,
             claim,
             lance_context_merge::MaintenanceKind::Catchup,
             async {
-                if state.config.append.enabled(target) {
+                if state.config.merge_rollout.owned(target) && state.config.append.enabled(target) {
                     crate::rollout_append::run(state, target).await
                 } else {
                     crate::local_merge::run(state, target).await

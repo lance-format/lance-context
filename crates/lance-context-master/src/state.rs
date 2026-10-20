@@ -138,7 +138,6 @@ impl MasterState {
     pub async fn new(mut config: MasterConfig) -> lance::Result<Arc<Self>> {
         config.merge_rollout.validate().map_err(lance::Error::io)?;
         config.catchup.validate().map_err(lance::Error::io)?;
-        crate::local_merge::validate(&config).map_err(lance::Error::io)?;
         config
             .append
             .validate_local(&config)
@@ -157,6 +156,10 @@ impl MasterState {
             .legacy_fencing_mode(config.merge_rollout.fence_legacy)
             .await
             .map_err(lance::Error::io)?;
+        // Protocol activation covers every master maintenance writer as well
+        // as workers; a flag rollback must not restore unrecorded rewrites.
+        config.maintenance.fence_legacy_maintenance |= config.merge_rollout.fence_legacy;
+        crate::local_merge::validate(&config).map_err(lance::Error::io)?;
         // Serialize first-time registry/stats creation and legacy backfill in
         // etcd mode. Followers wait briefly rather than racing Lance creates.
         let dedicated = config.catchup.target.is_some();

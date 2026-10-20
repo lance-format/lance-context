@@ -298,6 +298,10 @@ pub async fn merge_generic_wal(
         .merge_executions
         .legacy_allowed(&format!("generic:{name}"))?;
     if state.merge_executions.fenced_mode().await? {
+        crate::merge_execution::publish_background_request(
+            state.clone(),
+            format!("generic:{name}"),
+        );
         let result =
             crate::merge_execution::spawn_background(state, format!("generic:{name}")).await?;
         let reclaimed = result

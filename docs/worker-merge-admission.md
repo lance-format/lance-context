@@ -15,7 +15,9 @@ merges, independently of the static native-ownership list. It requires a stable
 count triggers and cleanup timers use the same process slots and executor.
 
 A background trigger tries a slot before spawning; it never waits for capacity
-or etcd on the flush sweep. Per-table admission is coalesced. The detached
+or etcd on the flush sweep. Due demand is also published through a separate
+four-request metadata bound, so occupied execution slots do not hide a hot table
+from the master. Per-table admission and demand are coalesced. The detached
 executor exists before admission IO, so a disconnected HTTP caller cannot
 abandon a writer. Its slot remains occupied until its storage leaves drain or
 are fenced. An ambiguous terminal record is retained for master recovery.
@@ -53,17 +55,33 @@ or an empty execution inventory does not prove that historical writers are
 quiescent. Removing the shared etcd namespace/configuration or deploying an old
 binary is not a supported rollback after activation.
 
-## Remaining native handoff requirements
+## Automatic native routing (validation in progress)
 
-This implementation does not certify the initial transition, dynamically add
-native ownership, or authorize native writes solely because admission closed.
-Before production activation, finish and validate:
+After the initial legacy-writer transition is verified, explicitly enabling
+`MASTER_LOCAL_MERGE_AUTO=true` with `MASTER_LOCAL_MERGE_TARGETS=*` routes new
+rollout/generic demand through resident masters without changing a table
+allowlist. Worker protocol activation also enables fenced master maintenance.
+Automatic routing requires that persisted protocol, stable shard IDs, positive
+merge capacity and the existing shared memory budget. It creates no Pods or
+second queue. Draining targets and datagen tables remain excluded.
 
-- Complete old-writer coverage, including helpers and master compact/index/repair.
-- Durable native enrollment after recorded writers finish or are storage-fenced.
-- Automatic new-hot-table selection and bounded continuous native catchup.
-- Combined staging of worker admission, tracked master maintenance and native
-  execution, followed by measured production handoff.
+The canonical task claim excludes new background admission. A progressing
+background executor is reconciled to completion before native catchup starts;
+uncertain storage writes retain their fence until recovery succeeds. Native
+catchup uses bounded passes and publishes continuation demand before releasing
+the claim, so another master can resume it. Existing explicit append-protocol
+targets retain that optimization; newly selected targets use native sealed-WAL
+catchup, including generic updates.
 
-Keep this integration disabled until those requirements are implemented. The
-current production helpers remain necessary until the handoff is demonstrated.
+Neither automatic routing nor the activation marker proves old writers are
+quiescent. Before enabling this in production, finish and validate:
+
+- Complete old-writer coverage, including helpers and pre-upgrade master work.
+- Combined staging of worker admission, tracked maintenance and automatic
+  resident execution with ongoing ingestion, progress stalls and restart.
+- Measured production handoff under the actual traffic and memory limits.
+
+The source paths and regression tests are implemented but final validation is
+still running. Keep automatic routing disabled until the initial transition
+is proven. Existing production helpers remain necessary until the handoff is
+demonstrated.
