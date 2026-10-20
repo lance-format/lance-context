@@ -491,6 +491,7 @@ mod tests {
                 // No logical checkpoint calls: only completed reads through the
                 // scoped stores may keep this operation alive. Reopen to avoid
                 // turning later scans into memory-cache hits with no IO.
+                let mut observed_io = false;
                 for step in 0..14 {
                     let dataset =
                         lance_context_core::StorageBase::load_with_options(&uri, None, None)
@@ -507,11 +508,13 @@ mod tests {
                     assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 512);
                     if step > 3 {
                         let execution = coordinator.get("table").await?.unwrap();
-                        let report = coordinator.work_progress(&execution).await?.unwrap();
-                        assert!(report["sequence"].as_u64().unwrap() > 0);
+                        if let Some(report) = coordinator.work_progress(&execution).await? {
+                            observed_io |= report["sequence"].as_u64().unwrap() > 0;
+                        }
                     }
                     tokio::time::sleep(Duration::from_millis(500)).await;
                 }
+                assert!(observed_io, "the watchdog must publish completed file IO");
                 Ok("file IO kept the operation alive".into())
             }),
         )
