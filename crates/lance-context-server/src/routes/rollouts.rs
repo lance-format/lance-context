@@ -557,25 +557,14 @@ async fn get_rollout_refreshing_on_miss(
     store.get_by_id(id).await.map_err(AppError::from_lance)
 }
 
-/// Blob lookup can use a cloned latest base under the shared lock. Retain the
-/// exclusive refresh/retry for a final miss, including a merge racing that
-/// cloned snapshot; successful payload hits never upgrade the store lock.
-async fn get_rollout_blob_refreshing_on_miss(
+/// Core blob lookup refreshes cloned base snapshots around WAL fallback and
+/// retries missing-file races. Even a final miss stays under the shared guard,
+/// so it does not queue an exclusive refresh behind concurrent append/flush.
+async fn get_rollout_blob_shared(
     store_lock: &RwLock<RolloutStore>,
     id: &str,
 ) -> Result<Option<Vec<u8>>, AppError> {
-    {
-        let store = store_lock.read().await;
-        let payload = store.get_blob(id).await.map_err(AppError::from_lance)?;
-        if payload.is_some() || store.is_version_pinned() {
-            return Ok(payload);
-        }
-    }
-
-    let mut store = store_lock.write().await;
-    if !store.is_version_pinned() {
-        store.refresh_latest().await.map_err(AppError::from_lance)?;
-    }
+    let store = store_lock.read().await;
     store.get_blob(id).await.map_err(AppError::from_lance)
 }
 
@@ -606,11 +595,8 @@ pub async fn fetch_rollout_blob(
 ) -> Result<Response, AppError> {
     let store_lock = state.get_or_open_rollout_store(&name).await?;
 
-    let (bytes, reservation) = load_blob_with_budget(
-        &state,
-        get_rollout_blob_refreshing_on_miss(&store_lock, &id),
-    )
-    .await?;
+    let (bytes, reservation) =
+        load_blob_with_budget(&state, get_rollout_blob_shared(&store_lock, &id)).await?;
     let bytes =
         bytes.ok_or_else(|| AppError::NotFound(format!("Rollout '{}' has no payload", id)))?;
 
@@ -802,6 +788,31 @@ mod tests {
 
     use super::*;
     use crate::state::AppState;
+
+    #[tokio::test]
+    async fn blob_miss_does_not_require_exclusive_store_lock() {
+        let dir = TempDir::new().unwrap();
+        let store = RolloutStore::open_with_options(
+            dir.path().to_str().unwrap(),
+            RolloutStoreOptions::default(),
+        )
+        .await
+        .unwrap();
+        let store_lock = RwLock::new(store);
+        // Appends hold a shared guard while adding/flushing. A missing blob
+        // must finish without upgrading to an exclusive guard behind them.
+        let concurrent_request = store_lock.read().await;
+        let version = concurrent_request.version();
+        let payload = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            get_rollout_blob_shared(&store_lock, "absent"),
+        )
+        .await
+        .expect("a missing blob must not wait for another shared store guard")
+        .unwrap();
+        assert!(payload.is_none());
+        assert_eq!(concurrent_request.version(), version);
+    }
 
     #[test]
     fn flush_query_param_is_parsed_conservatively() {

@@ -434,6 +434,7 @@ pub struct RolloutStore {
 struct BlobReadPause {
     opened: tokio::sync::Notify,
     resume: tokio::sync::Notify,
+    before_wal_snapshot: bool,
 }
 
 impl RolloutStore {
@@ -1600,17 +1601,18 @@ impl RolloutStore {
     /// **concurrently** (bounded by [`DEFAULT_OBSERVE_CONCURRENCY`]) with the
     /// first match winning, rather than one-at-a-time newest-first.
     ///
-    /// Because rollout rows are immutable and an `id` is never re-appended, a
-    /// row lives in exactly one place (the base table *or* one generation, never
-    /// both), so base-first cannot shadow a newer WAL copy and the parallel
+    /// Because rollout rows are immutable and an `id` is never re-appended,
+    /// any WAL copy still visible after a merge commits is identical to the
+    /// base row. Base-first cannot shadow a newer value, and the parallel
     /// fallback needs no ordering.
     ///
     /// A concurrent merge can delete a generation after its dataset is open,
     /// while its IDs or payload are being read. Missing-file errors trigger at
     /// most two retries from a refreshed base snapshot. Persistent failures
     /// remain errors, and explicitly pinned reads never advance versions.
-    /// Generations missing at open are skipped; a final miss is also retried
-    /// by the HTTP caller after refreshing its store.
+    /// After a WAL miss, check the latest base once more to cover a generation
+    /// drained between the earlier base check and WAL discovery. All refreshes
+    /// use clones, so even misses can complete under a shared store guard.
     pub async fn get_blob(&self, id: &str) -> LanceResult<Option<Vec<u8>>> {
         let mut base = self.base.dataset.clone();
         let mut retries = 0;
@@ -1649,13 +1651,32 @@ impl RolloutStore {
         // (or refusing the request because those generations exceed the cap).
         // Refresh a clone so shared-lock readers never mutate the resident
         // dataset, and explicitly pinned historical reads remain historical.
+        let mut latest = base.clone();
         if !self.base.is_version_pinned() {
-            let mut latest = base.clone();
             latest.checkout_latest().await?;
             if latest.manifest.version != base.manifest.version {
                 if let Some(payload) = Self::get_blob_from_dataset(&latest, id).await? {
                     return Ok(payload);
                 }
+            }
+        }
+
+        #[cfg(test)]
+        {
+            let pause = {
+                let mut guard = self.blob_read_pause.lock().unwrap();
+                if guard
+                    .as_ref()
+                    .is_some_and(|pause| pause.before_wal_snapshot)
+                {
+                    guard.take()
+                } else {
+                    None
+                }
+            };
+            if let Some(pause) = pause {
+                pause.opened.notify_one();
+                pause.resume.notified().await;
             }
         }
 
@@ -1688,7 +1709,7 @@ impl RolloutStore {
                     }
                     // A generation drained + deleted by a concurrent merge
                     // between snapshot and open: its rows are in a committed
-                    // base version. The HTTP caller refreshes on a final miss.
+                    // base version, covered by the final base check below.
                     Err(err) if is_not_found_error(&err) => Ok(None),
                     Err(err) => Err(err),
                 }
@@ -1703,6 +1724,20 @@ impl RolloutStore {
             }
         }
 
+        if !self.base.is_version_pinned() {
+            let checked_version = latest.manifest.version;
+            latest.checkout_latest().await?;
+            if latest.manifest.version != checked_version {
+                // Any generation already drained during the completed WAL
+                // scan was committed before this checkout. A final base check
+                // therefore covers it without an exclusive resident refresh or
+                // waiting for merging to stop. Concurrent newer appends need
+                // not be part of this read's captured view.
+                return Self::get_blob_from_dataset(&latest, id)
+                    .await
+                    .map(Option::flatten);
+            }
+        }
         Ok(None)
     }
 
@@ -6362,6 +6397,60 @@ mod tests {
             );
             assert_eq!(version, original_version);
         }
+    }
+
+    #[tokio::test]
+    async fn blob_lookup_recovers_when_wal_drains_before_discovery() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut writer = RolloutStore::open_with_options(
+            uri,
+            RolloutStoreOptions {
+                shard_id: Some("snapshot-writer".to_owned()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let reader = RolloutStore::open_with_options(
+            uri,
+            RolloutStoreOptions {
+                shard_id: Some("snapshot-reader".to_owned()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let original_version = reader.version();
+        let bytes = b"present-before-read-starts";
+        writer
+            .add(&[artifact_record("target", bytes)])
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        let pause = Arc::new(BlobReadPause {
+            before_wal_snapshot: true,
+            ..Default::default()
+        });
+        *reader.blob_read_pause.lock().unwrap() = Some(pause.clone());
+        let reading = tokio::spawn(async move {
+            let result = reader.get_blob("target").await;
+            (result, reader.version())
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(30), pause.opened.notified())
+            .await
+            .unwrap();
+        // The row existed before the read. Move it after the base check but
+        // before WAL discovery, so opening the WAL returns no generations.
+        assert_eq!(writer.cleanup_own_shard().await.unwrap(), 1);
+        assert_eq!(flushed_generation_count(&writer).await, 0);
+        pause.resume.notify_one();
+        let (result, version) = tokio::time::timeout(std::time::Duration::from_secs(30), reading)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.unwrap().as_deref(), Some(bytes.as_slice()));
+        assert_eq!(version, original_version);
     }
 
     #[tokio::test]
