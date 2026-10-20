@@ -637,6 +637,10 @@ pub async fn compact_rollout(
     Path(name): Path<String>,
     Json(req): Json<CompactRequest>,
 ) -> Result<Json<CompactResponse>, AppError> {
+    // This legacy HTTP path has no durable execution or commit authorizer.
+    // Once a table is draining or owned, only the master's fenced maintenance
+    // path may publish a rewrite. Check before opening or locking its handle.
+    state.merge_executions.legacy_allowed(&name)?;
     let store_lock = state.get_or_open_rollout_store(&name).await?;
 
     let config = if req.target_rows_per_fragment.is_some() || req.materialize_deletions.is_some() {
@@ -797,6 +801,53 @@ mod tests {
 
     use super::*;
     use crate::state::AppState;
+
+    #[tokio::test]
+    async fn legacy_compaction_cannot_bypass_owned_or_draining_admission() {
+        let dir = TempDir::new().unwrap();
+        let mut state = AppState::new_for_test(dir.path().to_path_buf()).await;
+        state.merge_executions.rollout.owned_targets = vec!["owned".into()];
+        state.merge_executions.rollout.drain_targets = vec!["draining".into()];
+        let state = Arc::new(state);
+        for name in ["owned", "draining", "legacy"] {
+            create_rollout_store(
+                State(state.clone()),
+                Json(CreateRolloutStoreRequest {
+                    name: name.into(),
+                    storage_options: None,
+                }),
+            )
+            .await
+            .unwrap();
+            let handle = state.get_or_open_rollout_store(name).await.unwrap();
+            // A live reader must not make rejection wait for the write lock.
+            let reader = handle.read().await;
+            let version = reader.version();
+            if name != "legacy" {
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    compact_rollout(
+                        State(state.clone()),
+                        Path(name.into()),
+                        Json(CompactRequest::default()),
+                    ),
+                )
+                .await
+                .expect("protected maintenance must reject before acquiring a store lock");
+                assert!(matches!(result, Err(AppError::Overloaded(_))));
+                assert_eq!(reader.version(), version);
+            } else {
+                drop(reader);
+                compact_rollout(
+                    State(state.clone()),
+                    Path(name.into()),
+                    Json(CompactRequest::default()),
+                )
+                .await
+                .expect("unowned legacy compaction remains available");
+            }
+        }
+    }
 
     #[tokio::test]
     async fn blob_miss_does_not_require_exclusive_store_lock() {
