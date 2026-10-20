@@ -425,6 +425,15 @@ pub struct RolloutStoreOptions {
 /// typed read APIs built on top of the base's scanners.
 pub struct RolloutStore {
     base: StorageBase,
+    #[cfg(test)]
+    blob_read_pause: std::sync::Mutex<Option<Arc<BlobReadPause>>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct BlobReadPause {
+    opened: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
 }
 
 impl RolloutStore {
@@ -522,7 +531,11 @@ impl RolloutStore {
         // Encoding follows the base schema. Evolve before accepting writes,
         // otherwise values for newly supported fields are silently discarded.
         base.ensure_latest_schema().await?;
-        Ok(Self { base })
+        Ok(Self {
+            base,
+            #[cfg(test)]
+            blob_read_pause: Default::default(),
+        })
     }
     /// URI of the underlying Lance dataset.
     #[must_use]
@@ -1592,15 +1605,42 @@ impl RolloutStore {
     /// both), so base-first cannot shadow a newer WAL copy and the parallel
     /// fallback needs no ordering.
     ///
-    /// The fallback is tolerant of a generation that a concurrent merge drained
-    /// and deleted between snapshot and open: such an open fails with a
-    /// not-found error, which is skipped (the row's data is already covered by
-    /// the base table we checked first). This removes the transient 500s that
-    /// the previous fail-fast fallback surfaced under concurrent auto-merge.
+    /// A concurrent merge can delete a generation after its dataset is open,
+    /// while its IDs or payload are being read. Missing-file errors trigger at
+    /// most two retries from a refreshed base snapshot. Persistent failures
+    /// remain errors, and explicitly pinned reads never advance versions.
+    /// Generations missing at open are skipped; a final miss is also retried
+    /// by the HTTP caller after refreshing its store.
     pub async fn get_blob(&self, id: &str) -> LanceResult<Option<Vec<u8>>> {
+        let mut base = self.base.dataset.clone();
+        let mut retries = 0;
+        loop {
+            match self.get_blob_from_snapshot(&base, id).await {
+                Err(error)
+                    if is_not_found_error(&error)
+                        && !self.base.is_version_pinned()
+                        && retries < 2 =>
+                {
+                    // Merge can delete a generation after its manifest was
+                    // opened, during the ID scan or payload take. Re-read from
+                    // the committed base instead of turning that race into a
+                    // 500. Persistent missing files still fail after 3 tries.
+                    retries += 1;
+                    base.checkout_latest().await?;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    async fn get_blob_from_snapshot(
+        &self,
+        base: &Dataset,
+        id: &str,
+    ) -> LanceResult<Option<Vec<u8>>> {
         // Base-table-first: an already-merged row is found here with no MemWAL
         // manifest reads and no per-generation opens.
-        if let Some(payload) = Self::get_blob_from_dataset(&self.base.dataset, id).await? {
+        if let Some(payload) = Self::get_blob_from_dataset(base, id).await? {
             return Ok(payload);
         }
 
@@ -1610,9 +1650,9 @@ impl RolloutStore {
         // Refresh a clone so shared-lock readers never mutate the resident
         // dataset, and explicitly pinned historical reads remain historical.
         if !self.base.is_version_pinned() {
-            let mut latest = self.base.dataset.clone();
+            let mut latest = base.clone();
             latest.checkout_latest().await?;
-            if latest.manifest.version != self.base.dataset.manifest.version {
+            if latest.manifest.version != base.manifest.version {
                 if let Some(payload) = Self::get_blob_from_dataset(&latest, id).await? {
                     return Ok(payload);
                 }
@@ -1635,10 +1675,20 @@ impl RolloutStore {
         let mut hits = stream::iter(uris)
             .map(|uri| async move {
                 match self.open_flushed_dataset(&uri).await {
-                    Ok(dataset) => Self::get_blob_from_dataset(&dataset, id).await,
+                    Ok(dataset) => {
+                        #[cfg(test)]
+                        {
+                            let pause = self.blob_read_pause.lock().unwrap().take();
+                            if let Some(pause) = pause {
+                                pause.opened.notify_one();
+                                pause.resume.notified().await;
+                            }
+                        }
+                        Self::get_blob_from_dataset(&dataset, id).await
+                    }
                     // A generation drained + deleted by a concurrent merge
-                    // between snapshot and open: its rows are already in the base
-                    // table (checked above), so skip it rather than 500.
+                    // between snapshot and open: its rows are in a committed
+                    // base version. The HTTP caller refreshes on a final miss.
                     Err(err) if is_not_found_error(&err) => Ok(None),
                     Err(err) => Err(err),
                 }
@@ -3210,6 +3260,7 @@ mod tests {
         // Model a writer from the old release without running today's open-
         // time migration, so the fixtures really contain the legacy schema.
         let mut store = RolloutStore {
+            blob_read_pause: Default::default(),
             base: StorageBase::open(
                 &uri,
                 StorageBaseOptions {
@@ -6257,6 +6308,106 @@ mod tests {
             );
             println!("  slowest single add() (merge on every append) : {max_add:?}");
         });
+    }
+
+    #[tokio::test]
+    async fn blob_lookup_recovers_when_open_wal_is_deleted() {
+        for requested_id in ["target", "mid-absent"] {
+            let dir = TempDir::new().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let open = |shard: &str| {
+                RolloutStore::open_with_options(
+                    uri,
+                    RolloutStoreOptions {
+                        shard_id: Some(shard.to_owned()),
+                        ..Default::default()
+                    },
+                )
+            };
+            let mut writer = open("race-writer").await.unwrap();
+            let reader = open("race-reader").await.unwrap();
+            let original_version = reader.version();
+            let bytes = b"blob-moved-after-generation-open";
+            writer
+                .add(&[
+                    assistant_record("a"),
+                    artifact_record("target", bytes),
+                    assistant_record("z"),
+                ])
+                .await
+                .unwrap();
+            writer.flush().await.unwrap();
+            let pause = Arc::new(BlobReadPause::default());
+            *reader.blob_read_pause.lock().unwrap() = Some(pause.clone());
+            let reading = tokio::spawn(async move {
+                let result = reader.get_blob(requested_id).await;
+                (result, reader.version())
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(30), pause.opened.notified())
+                .await
+                .unwrap();
+            // The generation dataset is already open, but its payload has not
+            // been read. Commit it to the base and delete its source files.
+            assert_eq!(writer.cleanup_own_shard().await.unwrap(), 1);
+            assert_eq!(flushed_generation_count(&writer).await, 0);
+            pause.resume.notify_one();
+            let (result, version) =
+                tokio::time::timeout(std::time::Duration::from_secs(30), reading)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(
+                result.unwrap().as_deref(),
+                (requested_id == "target").then_some(bytes.as_slice()),
+            );
+            assert_eq!(version, original_version);
+        }
+    }
+
+    #[tokio::test]
+    async fn blob_lookup_does_not_hide_persistent_missing_data() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let writer = RolloutStore::open_with_options(
+            uri,
+            RolloutStoreOptions {
+                shard_id: Some("missing-writer".to_owned()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        writer
+            .add(&[artifact_record("target", b"not-merged")])
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        let reader = RolloutStore::open_with_options(
+            uri,
+            RolloutStoreOptions {
+                shard_id: Some("missing-reader".to_owned()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let snapshots = writer.wal_shard_snapshots().await.unwrap();
+        let generation_uri =
+            writer.flushed_generation_uri(snapshots[0].shard_id, &snapshots[0].sstables[0].path);
+        // Retain the generation manifest. Unlike a completed merge, no base
+        // commit can recover this row: bounded retries must preserve the error.
+        let path = generation_uri
+            .strip_prefix("file://")
+            .unwrap_or(&generation_uri);
+        std::fs::remove_dir_all(std::path::Path::new(path).join("data")).unwrap();
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            reader.get_blob("target"),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(is_not_found_error(&error), "unexpected error: {error}");
     }
 
     #[tokio::test]
