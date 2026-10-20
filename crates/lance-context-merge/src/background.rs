@@ -110,6 +110,15 @@ impl Coordinator {
         }
         let (mut compares, mut operations) = self.completion_changes(terminal).await?;
         compares.extend([
+            // A scheduler may already be reconciling this execution. Leave
+            // its terminal record intact so ordinary release can transfer the
+            // write lock to that claim, rather than deleting its predecessor.
+            Compare::version(
+                execution_key(&self.prefix, &terminal.target)
+                    .replace("/merge-executions/", "/merge-claims/"),
+                CompareOp::Equal,
+                0,
+            ),
             Compare::value(
                 execution_key(&self.prefix, &terminal.target),
                 CompareOp::Equal,
@@ -336,6 +345,42 @@ mod tests {
         assert!(coordinator.reserve(&proof, &successor).await.unwrap());
         assert!(!coordinator.release_background(&recovered).await.unwrap());
         assert_eq!(coordinator.get("hot").await.unwrap(), Some(successor));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated ETCD_TEST_ENDPOINTS"]
+    async fn terminal_background_writer_transfers_to_a_waiting_master_claim() {
+        let (coordinator, mut client, prefix) = fixture().await;
+        let background = execution();
+        assert!(coordinator.reserve_background(&background).await.unwrap());
+        let running = coordinator.start(&background).await.unwrap().unwrap();
+        let proof = ClaimProof {
+            key: format!("{prefix}/claim"),
+            token: "master".into(),
+            lease_id: 0,
+        };
+        client
+            .put(proof.key.as_str(), proof.token.as_str(), None)
+            .await
+            .unwrap();
+        client
+            .put(
+                execution_key(&prefix, "hot").replace("/merge-executions/", "/merge-claims/"),
+                proof.token.as_str(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(coordinator.finish(&running, Ok(4)).await.unwrap());
+        let terminal = running.finished(Ok(4));
+        assert!(!coordinator.release_background(&terminal).await.unwrap());
+        assert_eq!(
+            coordinator.get("hot").await.unwrap(),
+            Some(terminal.clone())
+        );
+        assert!(coordinator.release(&proof, &terminal).await.unwrap());
+        let next = Execution::new("hot", "http://next", "next-boot", 60);
+        assert!(coordinator.reserve(&proof, &next).await.unwrap());
     }
 
     #[tokio::test]
