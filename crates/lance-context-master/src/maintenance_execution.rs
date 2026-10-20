@@ -454,35 +454,43 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires ETCD_TEST_ENDPOINTS; ~8 s"]
     async fn legacy_maintenance_file_io_progress_survives_multiple_idle_windows() {
-        use arrow_array::{RecordBatch, RecordBatchIterator, StringArray};
-        use arrow_schema::{DataType, Field, Schema};
-        use futures::TryStreamExt;
+        use lance_context_core::{
+            ColumnSpec, ColumnType, GenericStore, GenericStoreOptions, ListSource, SchemaSpec,
+        };
         let (_dir, state) = fixture_with_idle(false, true, 3).await;
         let uri = state.rollout_uri("table");
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Utf8, false),
-            Field::new("content", DataType::Utf8, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(StringArray::from_iter_values(
-                    (0..512).map(|n| n.to_string()),
-                )),
-                Arc::new(StringArray::from_iter_values(
-                    (0..512).map(|_| "x".repeat(4096)),
-                )),
-            ],
+        let schema = SchemaSpec::new(vec![
+            (
+                "id".into(),
+                ColumnSpec::required(ColumnType::String { large: false }),
+            ),
+            (
+                "content".into(),
+                ColumnSpec::required(ColumnType::String { large: false }),
+            ),
+        ]);
+        let mut store = GenericStore::open(
+            &uri,
+            schema,
+            GenericStoreOptions {
+                merge_after_generations: Some(0),
+                ..Default::default()
+            },
         )
+        .await
         .unwrap();
-        let mut dataset =
-            lance_context_core::StorageBase::create_with_options(&uri, schema.clone(), None, None)
-                .await
-                .unwrap();
-        dataset
-            .append(RecordBatchIterator::new([Ok(batch)], schema), None)
-            .await
-            .unwrap();
+        let rows: Vec<_> = (0..512)
+            .map(|n| {
+                serde_json::json!({"id": n.to_string(), "content": "x".repeat(4096)})
+                    .as_object()
+                    .unwrap()
+                    .clone()
+            })
+            .collect();
+        store.add(&rows).await.unwrap();
+        store.flush().await.unwrap();
+        store.cleanup_wal().await.unwrap();
+        store.close().await.unwrap();
         let claim = claim(&state, TaskKind::IndexId).await;
         let coordinator = state.task_store.merge_coordinator();
         let result = tokio::time::timeout(
@@ -493,19 +501,14 @@ mod tests {
                 // turning later scans into memory-cache hits with no IO.
                 let mut observed_io = false;
                 for step in 0..14 {
-                    let dataset =
-                        lance_context_core::StorageBase::load_with_options(&uri, None, None)
-                            .await
-                            .map_err(|e| e.to_string())?;
-                    let batches = dataset
-                        .scan()
-                        .try_into_stream()
-                        .await
-                        .map_err(|e| e.to_string())?
-                        .try_collect::<Vec<_>>()
+                    let store = GenericStore::open_existing(&uri, GenericStoreOptions::default())
                         .await
                         .map_err(|e| e.to_string())?;
-                    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 512);
+                    let rows = store
+                        .list_from(ListSource::Fragments)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    assert_eq!(rows.len(), 512);
                     if step > 3 {
                         let execution = coordinator.get("table").await?.unwrap();
                         if let Some(report) = coordinator.work_progress(&execution).await? {
