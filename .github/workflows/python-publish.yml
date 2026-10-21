@@ -7,6 +7,7 @@ on:
   pull_request:
     paths:
       - .github/workflows/python-publish.yml
+      - scripts/ci/install-manylinux-deps.sh
       - Cargo.lock
       - python/Cargo.lock
       - python/pyproject.toml
@@ -74,12 +75,7 @@ jobs:
           target: ${{ matrix.target }}
           rust-toolchain: stable
           before-script-linux: |
-            if command -v yum >/dev/null 2>&1; then
-              yum install -y curl make openssl-devel perl
-            elif command -v apt-get >/dev/null 2>&1; then
-              apt-get update
-              apt-get install -y curl libssl-dev ca-certificates make perl
-            fi
+            bash ../scripts/ci/install-manylinux-deps.sh
             PROTOC_VERSION=25.6
             curl -LsS -o /tmp/protoc.zip "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
             python3 - <<'PY'

@@ -8,6 +8,7 @@ on:
       - python/**
       - crates/**
       - .github/workflows/python-test.yml
+      - scripts/ci/install-manylinux-deps.sh
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -61,12 +62,7 @@ jobs:
           rust-toolchain: stable
           sccache: "true"
           before-script-linux: |
-            if command -v yum >/dev/null 2>&1; then
-              yum install -y curl make openssl-devel perl
-            elif command -v apt-get >/dev/null 2>&1; then
-              apt-get update
-              apt-get install -y curl libssl-dev ca-certificates make perl
-            fi
+            bash ../scripts/ci/install-manylinux-deps.sh
             PROTOC_VERSION=25.6
             curl -LsS -o /tmp/protoc.zip "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
             python3 - <<'PY'
