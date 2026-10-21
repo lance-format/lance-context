@@ -663,6 +663,14 @@ impl GenericStore {
         self.base.cleanup_own_shard().await
     }
 
+    /// Admission for a split merge on this resident store. Clone under a short
+    /// store read lock, release that lock, then await the gate; retain the guard
+    /// until commit finishes. Reads, ingestion and other tables do not take it.
+    #[must_use]
+    pub fn merge_preparation_gate(&self) -> Arc<tokio::sync::Mutex<()>> {
+        self.base.merge_preparation_gate()
+    }
+
     /// The shared-lock half of [`Self::maybe_merge_wal`]: `None` unless the
     /// count trigger is configured and met.
     pub async fn prepare_count_merge(

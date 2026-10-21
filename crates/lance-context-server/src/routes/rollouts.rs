@@ -747,6 +747,8 @@ pub(crate) async fn merge_wal_owned(
     Path(name): Path<String>,
 ) -> Result<Json<MergeWalResponse>, AppError> {
     let store_lock = state.get_or_open_rollout_store(&name).await?;
+    let merge_gate = { store_lock.read().await.merge_preparation_gate() };
+    let _merge = merge_gate.lock().await;
     // Split by lock scope: seal + read every flushed generation under the
     // *read* lock so ingest on this store keeps running, then take the write
     // lock only for the short commit. Holding the write lock across the whole

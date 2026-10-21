@@ -333,6 +333,8 @@ pub(crate) async fn merge_generic_wal_owned(
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let store = state.get_or_open_generic_store(&name).await?;
+    let merge_gate = { store.read().await.merge_preparation_gate() };
+    let _merge = merge_gate.lock().await;
     // Same prepare/commit split as the sweeper: the object-storage read of the
     // generations runs under the shared lock so the store keeps serving.
     let prepared = {

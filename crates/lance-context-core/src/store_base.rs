@@ -403,6 +403,8 @@ pub(crate) struct StorageBase {
     pending_generations_max: usize,
     /// Process-wide merge byte budget; `None` means unbounded.
     merge_budget: Option<Arc<MergeMemoryBudget>>,
+    /// Serializes split preparation/commit on this handle, before taking a store lock.
+    merge_preparation_gate: Arc<tokio::sync::Mutex<()>>,
     /// Timestamp of the last successful [`Self::compact`] on this handle.
     last_compaction: Option<DateTime<Utc>>,
     /// Number of successful compactions performed by this handle.
@@ -556,6 +558,7 @@ impl StorageBase {
             pending_generations_max: pending_generations_max
                 .unwrap_or(DEFAULT_PENDING_GENERATIONS_MAX),
             merge_budget,
+            merge_preparation_gate: Arc::new(tokio::sync::Mutex::new(())),
             last_compaction: None,
             total_compactions: 0,
             last_compaction_error: None,
@@ -940,6 +943,14 @@ impl StorageBase {
         Ok(if committed { pending } else { 0 })
     }
 
+    /// Clone this gate under a short read lock, then drop that read guard before
+    /// awaiting the gate. Hold the permit through preparation and commit.
+    /// Otherwise a second preparation can hold a read lock while waiting for
+    /// memory owned by the first preparation, which needs the write lock to commit.
+    pub fn merge_preparation_gate(&self) -> Arc<tokio::sync::Mutex<()>> {
+        self.merge_preparation_gate.clone()
+    }
+
     /// The shared-lock half of a merge: decide whether one is due and read the
     /// flushed generations into memory.
     ///
@@ -949,6 +960,8 @@ impl StorageBase {
     /// due.
     ///
     /// ```ignore
+    /// let merge_gate = { store.read().await.merge_preparation_gate() };
+    /// let _merge = merge_gate.lock().await;
     /// let prepared = { store.read().await.prepare_merge_if_ready(1).await? };
     /// if let Some((manifest_store, manifest, prepared)) = prepared {
     ///     store.write().await.commit_prepared_merge(&manifest_store, &manifest, prepared).await?;

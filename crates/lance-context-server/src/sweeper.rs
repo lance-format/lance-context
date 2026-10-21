@@ -94,6 +94,8 @@ impl Sweepable for Arc<RwLock<RolloutStore>> {
     }
 
     async fn merge_if_due(&self) -> Result<usize, String> {
+        let merge_gate = { self.read().await.merge_preparation_gate() };
+        let _merge = merge_gate.lock().await;
         let prepared = {
             let guard = self.read().await;
             guard
@@ -113,6 +115,8 @@ impl Sweepable for Arc<RwLock<RolloutStore>> {
     }
 
     async fn merge_wal(&self) -> Result<usize, String> {
+        let merge_gate = { self.read().await.merge_preparation_gate() };
+        let _merge = merge_gate.lock().await;
         let prepared = {
             let guard = self.read().await;
             guard
@@ -179,6 +183,8 @@ impl Sweepable for Arc<RwLock<GenericStore>> {
     }
 
     async fn merge_if_due(&self) -> Result<usize, String> {
+        let merge_gate = { self.read().await.merge_preparation_gate() };
+        let _merge = merge_gate.lock().await;
         // Generic stores default to a deferred seal and take the same
         // one-row-per-append traffic as rollout, so the count trigger rides
         // this timer too. Without it a hot generic store depends entirely on
@@ -202,6 +208,8 @@ impl Sweepable for Arc<RwLock<GenericStore>> {
     }
 
     async fn merge_wal(&self) -> Result<usize, String> {
+        let merge_gate = { self.read().await.merge_preparation_gate() };
+        let _merge = merge_gate.lock().await;
         let prepared = {
             let guard = self.read().await;
             guard
@@ -858,6 +866,97 @@ mod tests {
         assert!(execution["work"]["base_commits"].as_u64().unwrap() > 0);
         assert_eq!(execution["writes"]["active_commits"], 0);
         assert_eq!(report["snapshot"]["takeover_authorized"], false);
+    }
+
+    /// A prepared merge retains its memory reservation until the write-lock
+    /// commit. A competing prepare must not hold a read lock while waiting
+    /// for those same bytes, or neither merge can finish.
+    #[tokio::test]
+    async fn concurrent_same_store_merges_do_not_pin_budget_behind_read_lock() {
+        let dir = TempDir::new().unwrap();
+        let budget = lance_context_core::merge_budget::MergeMemoryBudget::new(1024 * 1024);
+        let store = GenericStore::open(
+            &dir.path().to_string_lossy(),
+            spec(),
+            GenericStoreOptions {
+                merge_after_generations: Some(1),
+                merge_max_bytes: Some(1024 * 1024),
+                merge_budget: Some(budget.clone()),
+                seal_on_add: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        for i in 0..3 {
+            store
+                .add(&[json!({"id": format!("r{i}")}).as_object().unwrap().clone()])
+                .await
+                .unwrap();
+        }
+        let store = Arc::new(RwLock::new(store));
+        let (count, cleanup) = tokio::time::timeout(Duration::from_secs(20), async {
+            tokio::join!(store.merge_if_due(), store.merge_wal())
+        })
+        .await
+        .expect("same-store preparation must not hold a read lock waiting for the committing merge's budget");
+        assert_eq!(count.unwrap() + cleanup.unwrap(), 3);
+        assert_eq!(
+            store.read().await.pending_wal_generations().await.unwrap(),
+            0
+        );
+        assert_eq!(store.read().await.count_base_rows().await.unwrap(), 3);
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    #[tokio::test]
+    async fn merge_admission_wait_releases_store_lock_and_other_tables_keep_merging() {
+        let first_dir = TempDir::new().unwrap();
+        let second_dir = TempDir::new().unwrap();
+        let first = generic_with_pending(&first_dir, 3, 3).await;
+        let second = generic_with_pending(&second_dir, 3, 3).await;
+        let gate = { first.read().await.merge_preparation_gate() };
+        let held = gate.lock().await;
+        let waiting = first.merge_if_due();
+        tokio::pin!(waiting);
+        assert!(futures::poll!(&mut waiting).is_pending());
+        // Admission must await the gate outside even a shared store guard.
+        assert!(first.try_write().is_ok());
+        tokio::time::timeout(Duration::from_secs(30), async {
+            first
+                .read()
+                .await
+                .add(&[json!({"id": "concurrent-ingest"})
+                    .as_object()
+                    .unwrap()
+                    .clone()])
+                .await
+                .unwrap();
+            assert_eq!(
+                first.read().await.pending_wal_generations().await.unwrap(),
+                4
+            );
+            assert_eq!(second.merge_if_due().await.unwrap(), 3);
+            assert_eq!(
+                second.read().await.pending_wal_generations().await.unwrap(),
+                0
+            );
+        })
+        .await
+        .expect("reads, ingestion and another table must progress while one merge waits");
+        drop(held);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(30), waiting)
+                .await
+                .unwrap()
+                .unwrap(),
+            4
+        );
+        assert_eq!(
+            first.read().await.pending_wal_generations().await.unwrap(),
+            0
+        );
+        assert_eq!(first.read().await.count_base_rows().await.unwrap(), 4);
     }
 
     async fn generic_with_pending(
