@@ -1993,7 +1993,7 @@ mod tests {
         let lease = response.kvs().first().unwrap().lease();
         assert_ne!(lease, 0);
         client.lease_revoke(lease).await.unwrap();
-        state.task_store.recover_orphaned().await.unwrap();
+        // Normal admission recovers orphaned tasks before claiming.
         let successor = state.task_store.claim_next().await.unwrap().unwrap();
         assert_eq!(successor.task.id, task.id);
         let error = finish_task(&state, old, Ok("stale success".into()))
