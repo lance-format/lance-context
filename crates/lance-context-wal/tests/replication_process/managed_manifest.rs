@@ -146,6 +146,25 @@ impl Managed {
 }
 
 impl Managed {
+    fn reader(
+        &self,
+    ) -> lance::Result<lance_context_wal::replication::publication::lance::ManagedManifest> {
+        let layout: Layout = {
+            let c = self.cluster.lock().unwrap();
+            serde_json::from_slice(
+                &std::fs::read(c.root.path().join("layout.json")).map_err(error)?,
+            )
+            .map_err(error)?
+        };
+        lance_context_wal::replication::publication::lance::ManagedManifest::reader(
+            Arc::new(self.clone()),
+            self.base.clone(),
+            &layout,
+            self.scope.authority.table,
+            self.scope.incarnation,
+        )
+        .map_err(error)
+    }
     fn adapter(
         &self,
     ) -> lance::Result<lance_context_wal::replication::publication::lance::ManagedManifest> {
@@ -365,7 +384,7 @@ pub(super) async fn publish_and_recover(c: Cluster, attempt: Attempt, mode: Mode
             pause: None,
         });
         let base = lance::dataset::builder::DatasetBuilder::from_uri(&attempt.uri)
-            .with_commit_handler(handler.clone())
+            .with_commit_handler(Arc::new(handler.reader()?))
             .load()
             .await?;
         commit(Arc::new(base), attempt.tx, handler.clone()).await?;
@@ -490,7 +509,7 @@ pub(super) async fn publish_and_recover(c: Cluster, attempt: Attempt, mode: Mode
     // Both version lookup and latest lookup are strict catalog reads. A raw
     // URI reader cannot discover this unique path and is not a managed reader.
     let latest = lance::dataset::builder::DatasetBuilder::from_uri(&attempt.uri)
-        .with_commit_handler(handler.clone())
+        .with_commit_handler(Arc::new(handler.reader()?))
         .load()
         .await?;
     assert_eq!(latest.version().version, 2);

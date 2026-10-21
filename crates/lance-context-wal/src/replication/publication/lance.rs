@@ -81,9 +81,46 @@ impl ManifestCommit {
 pub struct ManagedManifest {
     catalog: Arc<dyn ManifestCatalog>,
     base: Path,
-    scope: ManifestCommit,
+    binding: ManifestBinding,
+    scope: Option<ManifestCommit>,
+}
+
+#[derive(Clone, Debug)]
+struct ManifestBinding {
+    cluster: Uuid,
+    layout: [u8; 32],
+    group: u64,
+    table: Uuid,
+    incarnation: Uuid,
 }
 impl ManagedManifest {
+    /// Open catalog-selected manifests without acquiring publisher ownership or
+    /// fabricating a pending plan. Resolve table/incarnation and the backing
+    /// object store from the authorized catalog before constructing the reader.
+    pub fn reader(
+        catalog: Arc<dyn ManifestCatalog>,
+        base: Path,
+        layout: &Layout,
+        table: Uuid,
+        incarnation: Uuid,
+    ) -> Result<Self> {
+        ensure!(
+            !table.is_nil() && !incarnation.is_nil(),
+            "invalid managed reader identity"
+        );
+        Ok(Self {
+            catalog,
+            base,
+            binding: ManifestBinding {
+                cluster: layout.cluster,
+                layout: layout.fingerprint()?,
+                group: super::control_group(layout),
+                table,
+                incarnation,
+            },
+            scope: None,
+        })
+    }
     pub fn new(
         catalog: Arc<dyn ManifestCatalog>,
         base: Path,
@@ -102,11 +139,15 @@ impl ManagedManifest {
                 && (2..(1u64 << 63)).contains(&scope.target),
             "invalid managed manifest commit identity"
         );
-        Ok(Self {
+        let mut handler = Self::reader(
             catalog,
             base,
-            scope,
-        })
+            layout,
+            scope.authority.table,
+            scope.incarnation,
+        )?;
+        handler.scope = Some(scope);
+        Ok(handler)
     }
     fn check_base(&self, base: &Path) -> ::lance::Result<()> {
         if base != &self.base {
@@ -122,9 +163,11 @@ impl ManagedManifest {
             record.index > 0
                 && !record.transaction.is_nil()
                 && record.identity
-                    == manifest::identity(
-                        &self.scope.authority,
-                        self.scope.incarnation,
+                    == manifest::identity_for_binding(
+                        self.binding.cluster,
+                        self.binding.layout,
+                        self.binding.table,
+                        self.binding.incarnation,
                         record.version,
                         record.index
                     ),
@@ -155,13 +198,13 @@ impl ManagedManifest {
         }
         let query::Outcome::Observed { cut, value } = self
             .catalog
-            .read_manifest(self.scope.authority.table, version)
+            .read_manifest(self.binding.table, version)
             .await
             .map_err(error)?
         else {
             return Err(error("manifest quorum read outcome unknown"));
         };
-        let a = &self.scope.authority;
+        let a = &self.binding;
         if cut.cluster != a.cluster
             || cut.layout != a.layout
             || cut.group != a.group
@@ -305,10 +348,14 @@ impl CommitHandler for ManagedManifest {
         transaction: Option<Transaction>,
     ) -> std::result::Result<ManifestLocation, CommitError> {
         self.check_base(base)?;
-        if manifest.version != self.scope.target
+        let scope = self
+            .scope
+            .as_ref()
+            .ok_or_else(|| ::lance::Error::not_supported("read-only managed manifest handler"))?;
+        if manifest.version != scope.target
             || transaction
                 .as_ref()
-                .is_none_or(|tx| tx.as_pb().uuid != self.scope.transaction.to_string())
+                .is_none_or(|tx| tx.as_pb().uuid != scope.transaction.to_string())
         {
             return Err(CommitError::CommitConflict);
         }
@@ -324,10 +371,10 @@ impl CommitHandler for ManagedManifest {
             bytes: written.size as u64,
             v2_names: naming == ManifestNamingScheme::V2,
         };
-        object.validate(self.scope.target).map_err(error)?;
+        object.validate(scope.target).map_err(error)?;
         let outcome = self
             .catalog
-            .reserve_manifest(self.scope.request(object))
+            .reserve_manifest(scope.request(object))
             .await
             .map_err(error)?;
         let Outcome::Committed(Applied::Publisher(super::Reply::ManifestReserved(record))) =
@@ -338,11 +385,11 @@ impl CommitHandler for ManagedManifest {
             );
         };
         self.validate_record(&record).map_err(error)?;
-        if record.version != self.scope.target
-            || record.transaction != self.scope.transaction
-            || record.plan_index != self.scope.plan_index
-            || record.prepared_index != self.scope.prepared_index
-            || record.descriptor_digest != self.scope.descriptor_digest
+        if record.version != scope.target
+            || record.transaction != scope.transaction
+            || record.plan_index != scope.plan_index
+            || record.prepared_index != scope.prepared_index
+            || record.descriptor_digest != scope.descriptor_digest
             || record.index <= record.prepared_index
         {
             return Err(error("manifest reservation returned a different publication").into());

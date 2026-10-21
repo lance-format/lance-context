@@ -218,7 +218,7 @@ pub(super) async fn qualify(uri: &str, handler: Arc<Managed>) -> Result<()> {
         let decoded = lance_context_wal::ipc::decode(recovered.body, rows.schema())?;
         let base = Arc::new(
             lance::dataset::builder::DatasetBuilder::from_uri(uri)
-                .with_commit_handler(run.handler.clone())
+                .with_commit_handler(Arc::new(run.handler.reader()?))
                 .load()
                 .await?,
         );

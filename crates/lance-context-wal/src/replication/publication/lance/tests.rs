@@ -131,7 +131,7 @@ async fn catalog_reads_reject_foreign_scope_identity_and_unknown_outcomes() -> R
     *c.override_read.lock().unwrap() = Some(query::Outcome::Observed {
         cut: c.cut.clone(),
         value: query::Value::ManifestRetired(super::super::HistoryBoundary {
-            incarnation: h.scope.incarnation,
+            incarnation: h.binding.incarnation,
             bootstrap_version: 1,
             retained_from: 3,
         }),
@@ -204,7 +204,7 @@ async fn fixed_target_rejects_before_upload_and_ambiguous_reservation_retains_st
     );
     let transaction = Transaction {
         inner: lance_table::format::pb::Transaction {
-            uuid: h.scope.transaction.to_string(),
+            uuid: h.scope.as_ref().unwrap().transaction.to_string(),
             ..Default::default()
         },
     };
@@ -249,5 +249,84 @@ async fn fixed_target_rejects_before_upload_and_ambiguous_reservation_retains_st
     assert_eq!(request.target, 4);
     let path = Path::parse(format!("{}/{}", h.base, request.object.path))?;
     assert_eq!(store.inner.head(&path).await?.size, request.object.bytes);
+    Ok(())
+}
+
+#[tokio::test]
+async fn reader_opens_bootstrap_without_a_publication_plan_and_cannot_upload() -> Result<()> {
+    let (writer, c, store) = fixture()?;
+    c.records.lock().unwrap().retain(|version, _| *version == 1);
+    let layout = Layout {
+        cluster: writer.binding.cluster,
+        nodes: (1..=3)
+            .map(|id| (id, format!("wal-{id}.example.invalid:7800")))
+            .collect(),
+        groups: BTreeMap::from([(10, vec![1, 2, 3])]),
+        buckets: vec![10],
+    };
+    let reader = ManagedManifest::reader(
+        c.clone(),
+        writer.base.clone(),
+        &layout,
+        writer.binding.table,
+        writer.binding.incarnation,
+    )?;
+    assert!(reader.scope.is_none());
+    assert_eq!(
+        reader
+            .resolve_latest_location(&reader.base, &store)
+            .await?
+            .version,
+        1
+    );
+    let versions: Vec<_> = reader
+        .list_manifest_locations_since(&reader.base, &store, 0)
+        .try_collect()
+        .await?;
+    assert_eq!(versions.len(), 1);
+    assert_eq!(versions[0].version, 1);
+    let mut manifest = Manifest::new(
+        Default::default(),
+        Arc::new(vec![]),
+        Default::default(),
+        Default::default(),
+    );
+    manifest.version = writer.scope.as_ref().unwrap().target;
+    let transaction = Transaction {
+        inner: lance_table::format::pb::Transaction {
+            uuid: writer.scope.as_ref().unwrap().transaction.to_string(),
+            ..Default::default()
+        },
+    };
+    assert!(reader
+        .commit(
+            &mut manifest,
+            None,
+            &reader.base,
+            &store,
+            lance_table::io::commit::write_manifest_file_to_path,
+            ManifestNamingScheme::V1,
+            Some(transaction)
+        )
+        .await
+        .is_err());
+    assert!(c.reservations.lock().unwrap().is_empty());
+    assert!(store
+        .inner
+        .list(None)
+        .try_collect::<Vec<_>>()
+        .await?
+        .is_empty());
+    let foreign = ManagedManifest::reader(
+        c,
+        reader.base.clone(),
+        &layout,
+        Uuid::new_v4(),
+        reader.binding.incarnation,
+    )?;
+    assert!(foreign
+        .resolve_latest_location(&foreign.base, &store)
+        .await
+        .is_err());
     Ok(())
 }

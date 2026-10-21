@@ -68,3 +68,11 @@ in-memory object-store manifest. The tests do not establish cloud throughput or
 loss of a quorum's persistent volumes.
 
 Tracking: [#378](https://github.com/lance-format/lance-context/issues/378).
+
+A reader can use `ManagedManifest::reader` with the authorized table generation,
+incarnation, layout and dataset path. It needs no publisher owner, preparation or
+pending transaction. This supports a bootstrapped table before its first append
+and readers after publication has advanced. The reader rejects `commit` before
+uploading an object or sending a reservation; it still uses the same catalog
+scope and incarnation identity checks. `ManagedManifest::new` retains the full
+fixed-target writer contract.

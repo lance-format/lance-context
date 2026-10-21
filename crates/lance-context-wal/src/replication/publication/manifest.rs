@@ -146,11 +146,29 @@ impl ReserveManifest {
 }
 
 pub(super) fn identity(authority: &Authority, incarnation: Uuid, version: u64, index: u64) -> Uuid {
+    identity_for_binding(
+        authority.cluster,
+        authority.layout,
+        authority.table,
+        incarnation,
+        version,
+        index,
+    )
+}
+
+pub(super) fn identity_for_binding(
+    cluster: Uuid,
+    layout: [u8; 32],
+    table: Uuid,
+    incarnation: Uuid,
+    version: u64,
+    index: u64,
+) -> Uuid {
     let mut hash = Sha256::new();
     hash.update(b"lance-context/manifest-identity/v1");
-    hash.update(authority.cluster.as_bytes());
-    hash.update(authority.layout);
-    hash.update(authority.table.as_bytes());
+    hash.update(cluster.as_bytes());
+    hash.update(layout);
+    hash.update(table.as_bytes());
     hash.update(incarnation.as_bytes());
     hash.update(version.to_le_bytes());
     hash.update(index.to_le_bytes());
