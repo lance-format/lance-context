@@ -4995,6 +4995,105 @@ mod tests {
         });
     }
 
+    async fn compact_after_peer_rewrite(incremental: bool, prepared: bool) {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut writer = RolloutStore::open_with_options(
+            uri,
+            RolloutStoreOptions {
+                shard_id: Some("writer".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        for i in 0..3 {
+            writer
+                .add(&[assistant_record(&format!("row-{i}"))])
+                .await
+                .unwrap();
+            writer.flush().await.unwrap();
+            writer.cleanup_own_shard().await.unwrap();
+        }
+        let mut cached =
+            RolloutStore::open_existing_with_options(uri, RolloutStoreOptions::default())
+                .await
+                .unwrap();
+        let cached_version = cached.version();
+        assert_eq!(cached.base.dataset.count_fragments(), 3);
+        assert!(writer.compact(None).await.unwrap().fragments_removed > 0);
+        // A later append must also survive the next compactor's stale handle.
+        writer
+            .add(&[artifact_record("row-3", b"peer-blob")])
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        writer.cleanup_own_shard().await.unwrap();
+        let latest_version = writer.version();
+        assert!(latest_version > cached_version);
+        assert_eq!(cached.version(), cached_version);
+        let mut pinned =
+            RolloutStore::open_existing_with_options(uri, RolloutStoreOptions::default())
+                .await
+                .unwrap();
+        pinned.checkout(cached_version).await.unwrap();
+        assert!(pinned
+            .compact(None)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("read-only"));
+        assert!(pinned
+            .prepare_compaction(CompactionConfig::default())
+            .await
+            .err()
+            .expect("historical handles must not prepare writes")
+            .to_string()
+            .contains("read-only"));
+        assert_eq!(pinned.version(), cached_version);
+        let config = CompactionConfig {
+            max_source_fragments: incremental.then_some(128),
+            ..Default::default()
+        };
+        let metrics = if prepared {
+            let work = cached.prepare_compaction(config).await.unwrap();
+            assert_eq!(work.read_version(), latest_version);
+            // Preparing a fresh immutable snapshot does not change the cached handle.
+            assert_eq!(cached.version(), cached_version);
+            cached.commit_prepared_compaction(work).await.unwrap()
+        } else {
+            cached.compact(Some(config)).await.unwrap()
+        };
+        assert_eq!(metrics.fragments_removed, 2);
+        assert_eq!(cached.base.dataset.count_fragments(), 1);
+        let mut ids: Vec<_> = cached
+            .list(None, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, ["row-0", "row-1", "row-2", "row-3"]);
+        assert_eq!(
+            cached.get_blob("row-3").await.unwrap().as_deref(),
+            Some(b"peer-blob".as_slice())
+        );
+        writer.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn compact_refreshes_after_peer_rewrite() {
+        for incremental in [false, true] {
+            compact_after_peer_rewrite(incremental, false).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_compact_refreshes_after_peer_rewrite() {
+        compact_after_peer_rewrite(true, true).await;
+    }
+
     #[test]
     fn should_compact_respects_min_fragments() {
         let dir = TempDir::new().unwrap();

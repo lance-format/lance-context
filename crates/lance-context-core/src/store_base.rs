@@ -1744,17 +1744,22 @@ impl StorageBase {
         config: CompactionConfig,
     ) -> LanceResult<PreparedCompaction> {
         self.ensure_writable()?;
+        // A resident handle may predate another executor's completed rewrite.
+        // Prepare against a fresh immutable view, without changing the caller's
+        // cached handle or the read versions carried into the commit checks.
+        let mut dataset = self.dataset.clone();
+        dataset.checkout_latest().await?;
         let options = Self::compaction_options(&config);
         let tasks = prepare_compaction_files(
-            &self.dataset,
+            &dataset,
             options.clone(),
             config.max_source_fragments.unwrap_or(usize::MAX).max(1),
         )
         .await?;
         Ok(PreparedCompaction {
-            read_version: self.dataset.version().version,
-            uri: self.dataset.uri().to_owned(),
-            schema: Schema::from(self.dataset.schema()),
+            read_version: dataset.version().version,
+            uri: dataset.uri().to_owned(),
+            schema: Schema::from(dataset.schema()),
             options,
             tasks,
         })
@@ -1825,6 +1830,11 @@ impl StorageBase {
         options: Option<CompactionConfig>,
     ) -> LanceResult<CompactionMetrics> {
         self.ensure_writable()?;
+        // Refresh before planning: retrying a stale handle can otherwise keep
+        // rewriting fragments a peer already replaced, even with serial calls.
+        // A rewrite racing after this refresh still goes through Lance's normal
+        // commit conflict checks.
+        self.dataset.checkout_latest().await?;
         let config = options.unwrap_or_default();
 
         let lance_options = Self::compaction_options(&config);
