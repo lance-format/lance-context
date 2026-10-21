@@ -396,7 +396,7 @@ mod tests {
         .await
         .unwrap();
         assert!(state.merge_executions.running.lock().await.is_empty());
-        tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::time::timeout(Duration::from_secs(20), async {
             loop {
                 if coordinator
                     .request_page(None)
@@ -408,7 +408,22 @@ mod tests {
                 {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(20)).await;
+                // Publication has a bounded metadata timeout. Model the next
+                // periodic flush after a deferred publish while retaining the
+                // occupied execution slot; retry must not need merge capacity.
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    sweeper::flush_pass_coordinated(
+                        vec![("hot".into(), store.clone())],
+                        Duration::from_secs(5),
+                        state.merge_slots.clone(),
+                        Some(state.clone()),
+                    ),
+                )
+                .await
+                .expect("metadata retry must not hold the flush sweep");
+                assert!(state.merge_executions.running.lock().await.is_empty());
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
         })
         .await
