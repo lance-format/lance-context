@@ -32,7 +32,10 @@ records whose original worker is no longer configured. It observes actual
 execution progress before cancellation, reconciles ambiguous commits through
 the existing storage barrier, and never treats an empty endpoint list as a
 successful catchup. New-table demand can enqueue fenced worker fanout without
-adding a static owned target.
+adding a static owned target. Until automatic native routing is enabled, an
+existing append wildcard applies only to explicitly owned tables; new targets
+continue through fenced worker fanout instead of entering an ineligible local
+execution path.
 
 Worker HTTP compaction is refused in this mode; tracked master maintenance must
 handle it. This prevents an untracked worker rewrite from bypassing merge

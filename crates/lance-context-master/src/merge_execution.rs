@@ -78,7 +78,9 @@ pub(crate) async fn run_merge_wal(
     {
         return Err("no worker endpoints configured".into());
     }
-    if state.config.append.enabled(target) || crate::local_merge::selected(&state.config, target) {
+    if (state.config.merge_rollout.owned(target) && state.config.append.enabled(target))
+        || crate::local_merge::selected(&state.config, target)
+    {
         if let Some(old) = coordinator.get(target).await? {
             ensure_recovery_due(&coordinator, &old).await?;
             if old.maintenance.is_none() {
@@ -852,6 +854,52 @@ mod tests {
             .await
             .unwrap();
         (Coordinator::new(client, prefix), proof)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn append_wildcard_does_not_adopt_new_tables_before_native_routing() {
+        use clap::Parser;
+        use lance_context_api::TaskKind;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::MasterConfig::parse_from(["test"]);
+        cfg.data_dir = dir.path().to_string_lossy().into();
+        cfg.etcd.etcd_endpoints = vec![std::env::var("ETCD_TEST_ENDPOINTS").unwrap()];
+        cfg.etcd.etcd_prefix = format!("/merge-fenced-routing/{}", uuid::Uuid::new_v4());
+        cfg.merge_rollout.fence_legacy = true;
+        cfg.append.rollout_append_targets = vec!["*".into()];
+        assert!(cfg.merge_rollout.owned_targets.is_empty());
+        assert!(!crate::local_merge::selected(&cfg, "table"));
+        let mut state = MasterState::new(cfg).await.unwrap();
+        let coordinator = state.task_store.merge_coordinator();
+        let good = Worker {
+            coordinator: coordinator.clone(),
+            calls: Arc::new(AtomicUsize::new(0)),
+            fail: false,
+            stall_first: false,
+            name: "fenced-worker",
+            events: Arc::new(Mutex::new(Vec::new())),
+        };
+        let (endpoint, server) = worker(good.clone()).await;
+        Arc::get_mut(&mut state).unwrap().config.worker_endpoints = vec![endpoint];
+        state
+            .task_store
+            .enqueue(TaskKind::MergeWal, "table", Vec::new())
+            .await
+            .unwrap();
+        let claim = state
+            .task_store
+            .claim_next_of_kinds(crate::task_store::TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        let outcome = run_merge_wal(&state, &claim).await;
+        server.abort();
+        assert!(outcome.as_ref().unwrap().contains("merged 7 generations"));
+        assert_eq!(good.calls.load(Ordering::SeqCst), 1);
+        assert!(coordinator.get("table").await.unwrap().is_none());
+        state.task_store.finish(claim, outcome).await.unwrap();
     }
 
     #[tokio::test]
