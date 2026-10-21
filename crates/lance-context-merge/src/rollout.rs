@@ -75,6 +75,27 @@ impl Coordinator {
         Ok(())
     }
 
+    /// Read one target's demand after completing a resident merge. The normal
+    /// paged scan remains the crash/retry fallback; this lookup adds no scan.
+    pub async fn get_merge_request(&self, target: &str) -> Result<Option<MergeRequest>> {
+        let response = self
+            .client
+            .clone()
+            .get(self.request_key(target), None)
+            .await
+            .map_err(|e| e.to_string())?;
+        let Some(kv) = response.kvs().first() else {
+            return Ok(None);
+        };
+        if kv.value() != target.as_bytes() {
+            return Err("merge request target does not match its key".into());
+        }
+        Ok(Some(MergeRequest {
+            target: target.to_owned(),
+            revision: kv.mod_revision(),
+        }))
+    }
+
     pub async fn request_page(
         &self,
         after: Option<&str>,

@@ -213,7 +213,7 @@ async fn run_task(state: &Arc<MasterState>, mut claim: TaskClaim, timing: TaskCl
         }
     }
     let commit_start = std::time::Instant::now();
-    let finished = state.task_store.finish(claim, outcome).await;
+    let finished = finish_task(state, claim, outcome).await;
     metrics::histogram!("master_task_phase_duration_seconds", "kind" => kind, "phase" => "commit")
         .record(commit_start.elapsed().as_secs_f64());
     if let Err(error) = finished {
@@ -238,6 +238,37 @@ async fn run_task(state: &Arc<MasterState>, mut claim: TaskClaim, timing: TaskCl
         metrics::histogram!("master_compaction_phase_duration_seconds", "phase" => "stats_refresh")
             .record(started.elapsed().as_secs_f64());
     }
+}
+
+/// Publish completion before admitting any continuation for the same target.
+async fn finish_task(
+    state: &Arc<MasterState>,
+    claim: TaskClaim,
+    outcome: Result<String, String>,
+) -> lance::Result<()> {
+    let target = claim.task.target.clone();
+    let continue_resident = claim.task.kind == TaskKind::MergeWal
+        && outcome.is_ok()
+        && crate::local_merge::selected(&state.config, &target);
+    state.task_store.finish(claim, outcome).await?;
+    if continue_resident {
+        // The previous task and its write authority are durably released first.
+        // Retain ordinary queue fairness, dedupe and permits for the successor.
+        // Any failure here leaves durable demand for the periodic recovery scan;
+        // it must not turn a completed storage operation into a failed task.
+        let coordinator = state.task_store.merge_coordinator();
+        let result = async {
+            if let Some(request) = coordinator.get_merge_request(&target).await? {
+                enqueue_merge_request(state, &coordinator, &request).await?;
+            }
+            Ok::<_, String>(())
+        }
+        .await;
+        if let Err(error) = result {
+            tracing::warn!(%target, %error, "resident merge continuation enqueue deferred to recovery");
+        }
+    }
+    Ok(())
 }
 
 /// Whether a task error is the deterministic "manifest names a data file
@@ -1858,6 +1889,196 @@ mod tests {
             0,
             "deduped tasks do not spend the budget"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn resident_completion_enqueues_durable_demand_without_periodic_scan() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.local_merge.master_local_merge_targets = vec!["exp".into()];
+        cfg.catchup.shards = vec!["writer".into()];
+        let state = MasterState::new(cfg).await.unwrap();
+        let coordinator = state.task_store.merge_coordinator();
+        let first = enqueue(&state, TaskKind::MergeWal, "exp").await.unwrap();
+        let claim = state.task_store.claim_next().await.unwrap().unwrap();
+        coordinator.request_merge("exp").await.unwrap();
+        finish_task(
+            &state,
+            claim,
+            Ok("local WAL merge reclaimed 2 generations".into()),
+        )
+        .await
+        .unwrap();
+        // No scheduler, scan, or explicit enqueue call runs after completion.
+        let next = state
+            .task_store
+            .get_active_id(TaskKind::MergeWal, "exp")
+            .await
+            .unwrap()
+            .expect("successful native pass must enqueue its durable continuation");
+        assert_ne!(first.id, next);
+        let successor = state.task_store.claim_next().await.unwrap().unwrap();
+        assert_eq!(successor.task.id, next);
+        assert!(coordinator.request_page(None).await.unwrap().0.is_empty());
+        // An empty pass with no new demand must not create a zero-work chain.
+        finish_task(
+            &state,
+            successor,
+            Ok("local WAL merge reclaimed 0 generations".into()),
+        )
+        .await
+        .unwrap();
+        assert!(state
+            .task_store
+            .get_active_id(TaskKind::MergeWal, "exp")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn resident_completion_does_not_fast_retry_failures_or_legacy_work() {
+        for resident in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let mut cfg = config(&dir);
+            if resident {
+                cfg.local_merge.master_local_merge_targets = vec!["exp".into()];
+                cfg.catchup.shards = vec!["writer".into()];
+            }
+            let state = MasterState::new(cfg).await.unwrap();
+            let coordinator = state.task_store.merge_coordinator();
+            enqueue(&state, TaskKind::MergeWal, "exp").await.unwrap();
+            let claim = state.task_store.claim_next().await.unwrap().unwrap();
+            coordinator.request_merge("exp").await.unwrap();
+            let outcome = if resident {
+                Err("injected merge failure".into())
+            } else {
+                Ok("legacy RPC succeeded".into())
+            };
+            finish_task(&state, claim, outcome).await.unwrap();
+            assert!(state
+                .task_store
+                .get_active_id(TaskKind::MergeWal, "exp")
+                .await
+                .unwrap()
+                .is_none());
+            assert!(coordinator
+                .get_merge_request("exp")
+                .await
+                .unwrap()
+                .is_some());
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn resident_completion_with_lost_claim_preserves_successor_and_demand() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.local_merge.master_local_merge_targets = vec!["exp".into()];
+        cfg.catchup.shards = vec!["writer".into()];
+        let state = MasterState::new(cfg).await.unwrap();
+        let coordinator = state.task_store.merge_coordinator();
+        let task = enqueue(&state, TaskKind::MergeWal, "exp").await.unwrap();
+        let old = state.task_store.claim_next().await.unwrap().unwrap();
+        coordinator.request_merge("exp").await.unwrap();
+        let demand = coordinator.get_merge_request("exp").await.unwrap().unwrap();
+        // Revoke this test's real etcd lease, then elect a replacement for the
+        // same canonical task before letting the stale executor report success.
+        let mut client = state.task_store.etcd_client().clone();
+        let key = format!("{}/claims/{}", state.config.etcd.prefix(), task.id);
+        let response = client.get(key, None).await.unwrap();
+        let lease = response.kvs().first().unwrap().lease();
+        assert_ne!(lease, 0);
+        client.lease_revoke(lease).await.unwrap();
+        state.task_store.recover_orphaned().await.unwrap();
+        let successor = state.task_store.claim_next().await.unwrap().unwrap();
+        assert_eq!(successor.task.id, task.id);
+        let error = finish_task(&state, old, Ok("stale success".into()))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("lost its etcd claim"), "{error}");
+        assert_eq!(
+            state
+                .task_store
+                .get_active_id(TaskKind::MergeWal, "exp")
+                .await
+                .unwrap(),
+            Some(task.id)
+        );
+        assert_eq!(
+            coordinator
+                .get_merge_request("exp")
+                .await
+                .unwrap()
+                .unwrap()
+                .revision,
+            demand.revision
+        );
+        state
+            .task_store
+            .finish(successor, Ok("replacement completed".into()))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn resident_target_lookup_preserves_newer_demand_after_enqueue() {
+        let dir = TempDir::new().unwrap();
+        let state = MasterState::new(config(&dir)).await.unwrap();
+        let coordinator = state.task_store.merge_coordinator();
+        coordinator.request_merge("exp-0").await.unwrap();
+        assert!(coordinator
+            .get_merge_request("exp")
+            .await
+            .unwrap()
+            .is_none());
+        coordinator.request_merge("exp").await.unwrap();
+        let before = coordinator.get_merge_request("exp").await.unwrap().unwrap();
+        coordinator.request_merge("exp").await.unwrap();
+        let after = coordinator.get_merge_request("exp").await.unwrap().unwrap();
+        assert!(after.revision > before.revision);
+        enqueue_merge_request(&state, &coordinator, &before)
+            .await
+            .unwrap();
+        assert_eq!(
+            coordinator
+                .get_merge_request("exp")
+                .await
+                .unwrap()
+                .unwrap()
+                .revision,
+            after.revision
+        );
+        assert!(coordinator
+            .get_merge_request("exp-0")
+            .await
+            .unwrap()
+            .is_some());
+        let first = state
+            .task_store
+            .get_active_id(TaskKind::MergeWal, "exp")
+            .await
+            .unwrap();
+        enqueue_merge_request(&state, &coordinator, &after)
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .task_store
+                .get_active_id(TaskKind::MergeWal, "exp")
+                .await
+                .unwrap(),
+            first
+        );
+        assert!(coordinator
+            .get_merge_request("exp")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
