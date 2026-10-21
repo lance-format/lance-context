@@ -2048,14 +2048,14 @@ mod tests {
             assert!(upstream.starts_with("127.0.0.1:") || upstream.starts_with("localhost:"));
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let endpoint = format!("http://{}", listener.local_addr().unwrap());
-            let (online, status) = tokio::sync::watch::channel(true);
+            let (online, mut status) = tokio::sync::watch::channel(true);
             let task = tokio::spawn(async move {
                 let mut connections = tokio::task::JoinSet::new();
                 loop {
                     tokio::select! {
                         accepted = listener.accept() => {
                             let (mut downstream, _) = accepted.unwrap();
-                            if !*status.borrow() {
+                            if !*status.borrow_and_update() {
                                 continue;
                             }
                             let mut status = status.clone();
@@ -2122,6 +2122,17 @@ mod tests {
         proxy.online.send(false).unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         proxy.online.send(true).unwrap();
+        // Prove that the proxy really restored transport before checking lease
+        // recovery. New connections must not inherit an unseen old cut event.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut probe = Client::connect([proxy.endpoint.as_str()], None)
+                .await
+                .unwrap();
+            let values = probe.get(key.clone(), None).await.unwrap();
+            assert_eq!(values.kvs()[0].value(), token.as_bytes());
+        })
+        .await
+        .expect("proxy did not restore etcd connectivity");
         // Survive more than the original lease lifetime after a real TCP cut.
         tokio::time::sleep(Duration::from_secs(10)).await;
         let values = observer.get(key.clone(), None).await.unwrap();
