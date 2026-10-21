@@ -28,6 +28,7 @@ use std::{
 };
 use tokio::sync::{mpsc as async_mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 
+mod images;
 #[cfg(feature = "peer-transport")]
 pub mod peer;
 
@@ -208,7 +209,10 @@ enum Work {
     Commit(u64, Box<Command>, Completion<Outcome>),
     Query(u64, query::Query, Completion<query::Outcome>),
     Campaign(Completion<()>),
+    Local(LocalWork),
 }
+type AfterPoll = Box<dyn FnOnce() + Send>;
+type LocalWork = Box<dyn FnOnce(&mut Node) -> AfterPoll + Send>;
 struct PeerWork {
     packet: Packet,
     credit: Credit,
@@ -246,10 +250,16 @@ pub struct Observation {
 pub struct Outbound {
     packet: Packet,
     _credit: Credit,
+    image: Option<Arc<super::checkpoint::Image>>,
 }
 impl Outbound {
     pub fn packet(&self) -> &Packet {
         &self.packet
+    }
+    /// Captured with the outgoing snapshot, before a later checkpoint can
+    /// replace it. Retain this owner through transfer and report its outcome.
+    pub fn snapshot_image(&self) -> Option<&Arc<super::checkpoint::Image>> {
+        self.image.as_ref()
     }
 }
 
@@ -588,7 +598,7 @@ impl Worker {
             }
         }
     }
-    fn work(&mut self, work: Work, campaigns: &mut Vec<Completion<()>>) {
+    fn work(&mut self, work: Work, after_poll: &mut Vec<AfterPoll>) {
         match work {
             Work::Append(token, batch, reply) => {
                 let result = self.node.propose(self.group, token, batch);
@@ -607,11 +617,12 @@ impl Worker {
                 }
             },
             Work::Campaign(reply) => match self.node.campaign(self.group) {
-                Ok(()) => campaigns.push(reply),
+                Ok(()) => after_poll.push(Box::new(move || reply.finish(Ok(())))),
                 Err(e) => {
                     reply.finish(Err(e));
                 }
             },
+            Work::Local(work) => after_poll.push(work(&mut self.node)),
         }
     }
     fn drive(&mut self) -> Result<()> {
@@ -619,11 +630,11 @@ impl Worker {
         while !self.shared.stopped.load(Ordering::Acquire) {
             let mut activity = false;
             let mut peer_credits = Vec::new();
-            let mut campaigns = Vec::new();
+            let mut after_poll = Vec::new();
             for _ in 0..self.options.batch_requests {
                 let mut any = false;
                 if let Ok(work) = self.control.try_recv() {
-                    self.work(work, &mut campaigns);
+                    self.work(work, &mut after_poll);
                     any = true;
                 }
                 if let Ok(peer) = self.peers.try_recv() {
@@ -636,7 +647,7 @@ impl Worker {
                     any = true;
                 }
                 if let Ok(work) = self.data.try_recv() {
-                    self.work(work, &mut campaigns);
+                    self.work(work, &mut after_poll);
                     any = true;
                 }
                 activity |= any;
@@ -667,6 +678,23 @@ impl Worker {
                     pending.finish(Ok(done.outcome));
                 }
                 for packet in events.messages {
+                    let destination = packet.message.to;
+                    let snapshot = packet.message.snapshot.is_some();
+                    let image = if snapshot {
+                        match self
+                            .node
+                            .snapshot_image(packet.group, packet.message.get_snapshot())
+                        {
+                            Ok(image) => Some(image),
+                            Err(_) => {
+                                self.node.report_snapshot(self.group, destination, false)?;
+                                self.shared.dropped_outgoing.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     let bytes = packet.message.compute_size() as usize;
                     let sent = self
                         .shared
@@ -678,15 +706,19 @@ impl Worker {
                                 .try_send(Outbound {
                                     packet,
                                     _credit: credit,
+                                    image,
                                 })
                                 .is_ok()
                         });
                     if !sent {
                         self.shared.dropped_outgoing.fetch_add(1, Ordering::Relaxed);
+                        if snapshot {
+                            self.node.report_snapshot(self.group, destination, false)?;
+                        }
                     }
                 }
-                for campaign in campaigns {
-                    campaign.finish(Ok(()));
+                for completion in after_poll {
+                    completion();
                 }
                 let status = self.node.status(self.group)?;
                 let mut observation = self.observation.lock().unwrap();

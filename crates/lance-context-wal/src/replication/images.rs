@@ -139,6 +139,10 @@ pub struct PreparedCheckpoint {
     received: Option<Packet>,
 }
 impl PreparedCheckpoint {
+    /// The hosted group bound to these fully validated image files.
+    pub fn group(&self) -> u64 {
+        self.group
+    }
     pub fn image(&self) -> Arc<Image> {
         self.loaded.image.clone()
     }

@@ -1,0 +1,51 @@
+# Image and maintenance transitions in the replica runtime
+
+The `runtime::Handle` now exposes the existing durable node's image lifecycle.
+`prepare_checkpoint` captures an applied cut; run that task on an admitted
+blocking worker, then pass its result to `install_checkpoint`. Newer log entries
+remain after installation. Image building does not hold a Raft Ready or prevent
+the owner from accepting ordinary append and peer work.
+
+For an authenticated incoming snapshot, reserve transfer and disk capacity before
+calling `receive_snapshot`. Feed sequential file chunks and finish validation on
+the blocking worker, then call `step_snapshot` with the completed image. The
+owner revalidates scope and hands it to Raft, which may ignore an obsolete cut.
+The runtime releases the result only after a successful durable poll. An error
+or panic leaves an uncertain outcome; a completed download or queued install is
+not a durable acknowledgment.
+
+Each outgoing snapshot captures its corresponding `Arc<Image>` immediately
+after poll. The `Outbound` owner protects that image from collection through the
+transfer, even when a newer checkpoint replaces the installed image. Report the
+transfer result with `report_snapshot`; a full runtime outbox reports failure so
+Raft can retry. Successful network transmission alone does not prove persistence.
+
+`prepare_image_collection` returns the existing resumable, bounded directory scan.
+One physical-node image permit excludes concurrent builders, receivers and
+collectors across all sibling groups. `prepare_log_maintenance` returns a handle
+for the shared physical engine: schedule one pass per node, not one per group.
+Its native rewrite can delay persistence and needs reserved rewrite space.
+
+Control credits cover queued transitions and unconsumed replies. The returned
+image tasks additionally own the physical-node image permit and captured state,
+whose size is governed by the replicated node policy, not the control-lane byte
+allowance. After consuming a future, callers own its returned handles and must
+budget, serialize and join the blocking work before shutdown/reopen. Dropping an
+install future cannot revoke an already queued operation. Captured tasks and
+images keep the native engine lock alive after runtime shutdown.
+
+This is the runtime integration boundary. It does not schedule automatic
+maintenance, impose a disk quota or add snapshot framing to `peer-transport`.
+Do not enable periodic compaction until the embedding transport serves images
+with authenticated routing, bounded resources, deadlines and failure reporting.
+
+Tests use real files and owner threads with a test-only image relay. They cover
+two compacted groups catching up a lagging follower, every original engine
+reopening with full payload and exact retry indices, sibling image exclusion,
+cancelled installation, collection retaining a captured old image, physical
+maintenance and native-lock ownership after shutdown. A partial transfer cannot
+advance applied state; injected installation sync failure stops sibling workers
+and releases neither a successful completion nor a peer response. Existing TLS
+process tests also run, but do not yet transfer images through the network.
+
+Tracking: #378.

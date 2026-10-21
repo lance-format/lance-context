@@ -13,6 +13,10 @@ leadership loss. `Handle::query` resolves through the existing safe read-index
 path. `campaign` only schedules an election and is not a leadership receipt.
 `observation` returns a cached local view, whose timestamp is not a quorum lease.
 
+The [image and maintenance interface](wal-runtime-images.md) routes checkpoint
+and snapshot transitions through the same durable owner. It returns captured
+file-work handles for separately admitted blocking workers.
+
 ## Ownership and progress
 
 Data, control and incoming peer lanes have separate bounded queues. Request and
@@ -43,7 +47,8 @@ This module does not open a network listener. The optional
 connections for these workers. The embedding service still needs
 authenticated routing, bounded framing before allocation, deadlines and retry
 reconciliation, durable snapshot transfer, physical disk admission and automatic
-maintenance. Snapshot packets are rejected until that transfer path is connected.
+maintenance. The TLS transport rejects snapshot frames until its transfer path
+is connected; do not enable periodic compaction with that transport yet.
 Logical frame budgets are not a measurement of allocator use: transport must
 also account for oversized backing allocations retained by small byte slices,
 decode buffers, application state and results retained after consuming futures.

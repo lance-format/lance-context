@@ -6,6 +6,8 @@ use crate::replication::{
 use std::path::Path;
 use tokio::time::{sleep, timeout};
 
+mod images;
+
 // Actual dedicated workers and durable engines. This relay deliberately drops
 // selected links; it is not the production peer transport or a throughput test.
 struct Cluster {
@@ -13,6 +15,7 @@ struct Cluster {
     handles: Arc<BTreeMap<u64, Handle>>,
     relays: Vec<tokio::task::JoinHandle<()>>,
     isolated: Arc<AtomicU64>,
+    snapshot_transfers: Arc<AtomicU64>,
 }
 impl Cluster {
     fn open(root: &Path, options: Options) -> Result<Self> {
@@ -28,16 +31,43 @@ impl Cluster {
         }
         let handles = Arc::new(handles);
         let isolated = Arc::new(AtomicU64::new(0));
+        let snapshot_transfers = Arc::new(AtomicU64::new(0));
         let relays = outboxes
             .into_iter()
             .map(|mut outbox| {
                 let handles = handles.clone();
                 let isolated = isolated.clone();
+                let snapshot_transfers = snapshot_transfers.clone();
                 tokio::spawn(async move {
                     while let Some(outgoing) = outbox.recv().await {
                         let p = outgoing.packet();
                         let id = isolated.load(Ordering::Acquire);
                         if id == p.message.from || id == p.message.to {
+                            if outgoing.snapshot_image().is_some() {
+                                if let Ok(report) = handles[&p.message.from].report_snapshot(
+                                    p.group,
+                                    p.message.to,
+                                    false,
+                                ) {
+                                    let _ = report.await;
+                                }
+                            }
+                            continue;
+                        }
+                        if outgoing.snapshot_image().is_some() {
+                            let delivered = images::transfer(&handles[&p.message.to], &outgoing)
+                                .await
+                                .is_ok();
+                            if delivered {
+                                snapshot_transfers.fetch_add(1, Ordering::Relaxed);
+                            }
+                            if let Ok(report) = handles[&p.message.from].report_snapshot(
+                                p.group,
+                                p.message.to,
+                                delivered,
+                            ) {
+                                let _ = report.await;
+                            }
                             continue;
                         }
                         // Retain the outgoing credit until the destination takes its
@@ -52,6 +82,7 @@ impl Cluster {
             handles,
             relays,
             isolated,
+            snapshot_transfers,
         })
     }
     async fn elect(&self, id: u64, group: u64) -> Result<()> {
