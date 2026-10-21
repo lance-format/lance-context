@@ -1154,7 +1154,8 @@ pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
     // WAL merge draws from its own budget so a backlog of slow HTTP fan-outs
     // cannot occupy every general slot and starve compaction. `0` opts back
     // into the shared pool.
-    let merge_sem = (state.config.merge_wal_concurrency > 0)
+    let claim_merges = state.config.maintenance.claim_wal_merges;
+    let merge_sem = (claim_merges && state.config.merge_wal_concurrency > 0)
         .then(|| Arc::new(Semaphore::new(state.config.merge_wal_concurrency)));
 
     // One poller per pool, each claiming only the kinds its pool runs.
@@ -1179,7 +1180,7 @@ pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
     let general = spawn_pool_poller(
         state.clone(),
         sem.clone(),
-        if merge_sem.is_some() {
+        if !claim_merges || merge_sem.is_some() {
             TaskKinds::GENERAL.without_compact()
         } else {
             // No separate merge budget: the general pool runs everything, so it
@@ -1192,7 +1193,8 @@ pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
     if let Some(merge) = merge_sem {
         spawn_pool_poller(state.clone(), merge, TaskKinds::MERGE_WAL, false);
     }
-    if crate::local_merge::enabled(&state.config)
+    if claim_merges
+        && crate::local_merge::enabled(&state.config)
         && state.config.append.rollout_append_local_task_concurrency > 0
     {
         // Reserve before claiming. A saturated legacy RPC pool cannot consume
@@ -3257,6 +3259,68 @@ mod tests {
         let b = enqueue(&state, TaskKind::Compact, "x").await.unwrap();
         assert_eq!(a.id, b.id, "second enqueue returns the same task");
         assert_eq!(state.task_store.list().await.unwrap().len(), 1);
+    }
+
+    /// Maintenance-only masters leave merge tasks available to their peers.
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn disabled_merge_claims_preserve_maintenance_and_other_executor_admission() {
+        // Cover the general-pool fallback, dedicated RPC pool and resident
+        // pool. A zero concurrency budget alone used to claim MergeWal too.
+        for (merge_concurrency, resident) in [(0, false), (2, false), (2, true)] {
+            let dir = TempDir::new().unwrap();
+            let mut cfg = config(&dir);
+            cfg.maintenance.claim_wal_merges = false;
+            cfg.merge_wal_concurrency = merge_concurrency;
+            if resident {
+                cfg.local_merge.master_local_merge_targets = vec!["exp".into()];
+                cfg.catchup.shards = vec!["writer".into()];
+                cfg.catchup.slice_secs = 2;
+                cfg.catchup.merge_max_bytes = 1024 * 1024;
+            }
+            let state = MasterState::new(cfg).await.unwrap();
+            for name in ["exp", "other"] {
+                let mut store = RolloutStore::open(&state.rollout_uri(name)).await.unwrap();
+                store.add(&[rollout_record("row")]).await.unwrap();
+                store.cleanup_own_shard().await.unwrap();
+            }
+            let merge = enqueue(&state, TaskKind::MergeWal, "exp").await.unwrap();
+            let compact = enqueue(&state, TaskKind::Compact, "exp").await.unwrap();
+            let index = enqueue(&state, TaskKind::IndexId, "other").await.unwrap();
+            let scheduler = spawn_scheduler(&state);
+            for task in [&compact, &index] {
+                let terminal = await_terminal(&state, &task.id).await;
+                assert_eq!(terminal.state, TaskState::Done, "{terminal:?}");
+            }
+            // Observe more than one poll interval, then close admission and
+            // join admitted work before checking the durable claim state.
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            state.admission.begin_drain();
+            tokio::time::timeout(Duration::from_secs(10), state.admission.wait_drained())
+                .await
+                .unwrap();
+            scheduler.abort();
+            let queued = state.task_store.get(&merge.id).await.unwrap().unwrap();
+            assert_eq!(queued.state, TaskState::Queued, "{queued:?}");
+            assert!(
+                queued.started_at.is_none(),
+                "disabled executor claimed merge"
+            );
+            // The task and its target remain available to an enabled peer;
+            // the setting is local dispatch policy, not a global queue pause.
+            let peer = state
+                .task_store
+                .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(peer.task.id, merge.id);
+            state
+                .task_store
+                .finish(peer, Ok("peer accepted".into()))
+                .await
+                .unwrap();
+        }
     }
 
     /// A MergeWal task with no configured endpoints fails fast with a clear msg.

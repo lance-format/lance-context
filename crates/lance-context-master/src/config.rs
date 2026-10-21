@@ -321,11 +321,28 @@ mod tests {
         assert_eq!(config.compaction_max_source_fragments, 32);
         assert_eq!(config.compaction_max_bytes_per_file, 1024 * 1024 * 1024);
     }
+
+    #[test]
+    fn wal_claims_default_on_and_can_be_explicitly_disabled() {
+        let default = MasterConfig::try_parse_from(["lance-context-master"]).unwrap();
+        assert!(default.maintenance.claim_wal_merges);
+        assert!(MaintenanceConfig::default().claim_wal_merges);
+        let disabled =
+            MasterConfig::try_parse_from(["lance-context-master", "--claim-wal-merges=false"])
+                .unwrap();
+        assert!(!disabled.maintenance.claim_wal_merges);
+    }
 }
 
 /// Admission and progress deadlines for local master table mutations.
 #[derive(Debug, Clone, clap::Args)]
 pub struct MaintenanceConfig {
+    /// Allow this master's scheduler to claim queued MergeWal tasks. Set false
+    /// for maintenance-only executors; Compact, IndexId and Repair still run.
+    /// This is independent of enqueue intervals and concurrency budgets, and
+    /// is not a runtime drain or proof that a predecessor's writes have ended.
+    #[arg(long, env = "MASTER_CLAIM_WAL_MERGES", default_value_t = true, action = clap::ArgAction::Set)]
+    pub claim_wal_merges: bool,
     /// Fence new master compact/index/repair executions even for rollout and
     /// generic targets still using legacy worker merges. This does not migrate
     /// worker admission or retroactively fence pre-upgrade writes.
@@ -367,6 +384,7 @@ pub struct MaintenanceConfig {
 impl Default for MaintenanceConfig {
     fn default() -> Self {
         Self {
+            claim_wal_merges: true,
             fence_legacy_maintenance: false,
             compaction_prepare_targets: Vec::new(),
             index_prepare_targets: Vec::new(),

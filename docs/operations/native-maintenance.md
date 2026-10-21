@@ -1,5 +1,17 @@
 # Maintenance beside persistent native catch-up owners
 
+For a master assigned only to Compact, IndexId and Repair, set
+`MASTER_CLAIM_WAL_MERGES=false`. The default is `true`. This excludes queued
+MergeWal work from its general, dedicated merge and resident merge pollers;
+it leaves that work queued for other masters. It does not stop enqueue sweeps,
+cancel accepted operations or change ownership/fencing. Set enqueue intervals
+separately when the executor should not generate new periodic work.
+
+`MERGE_WAL_INTERVAL_SECS=0` only disables periodic enqueueing, not claiming.
+`MERGE_WAL_CONCURRENCY=0` shares the general pool and also does not disable
+claiming. Changing the claim setting requires a new process; retiring an older
+process still requires its supported drain and storage-quiescence evidence.
+
 `MAINTENANCE_CATCHUP_TARGETS` is an explicit comma-separated list of rollout
 targets. It defaults to empty and does not support `*`. A target must also be
 owned by the merge protocol, non-generic, and not draining. Enable it only
