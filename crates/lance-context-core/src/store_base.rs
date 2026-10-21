@@ -795,28 +795,15 @@ impl StorageBase {
             .acquire()
             .await
             .expect("WAL recovery semaphore is never closed");
-        {
-            let mut guard = self.write_writer.lock().await;
-            // An append may have opened/replayed it while we waited.
-            if guard.is_none() {
-                // Manifest WAL-tip hints can lag acknowledged PUTs. An existing
-                // own shard must be replayed even if its hint says it is empty.
-                // Lance streams replay and seals along the way. These are soft
-                // byte ceilings: one indivisible WAL entry can exceed them.
-                let config = ShardWriterConfig {
-                    shard_id: self.write_shard,
-                    max_memtable_size: 32 * 1024 * 1024,
-                    max_unflushed_memtable_bytes: 128 * 1024 * 1024,
-                    ..Default::default()
-                };
-                info!(shard = %self.write_shard, "recovering own WAL before cleanup merge");
-                let writer = self
-                    .dataset
-                    .mem_wal_writer(self.write_shard, config)
-                    .await?;
-                *guard = Some(Arc::new(writer));
-            }
-        }
+        // Manifest WAL-tip hints can lag acknowledged PUTs, so an existing
+        // own shard needs replay even if its hint says it is empty. The normal
+        // writer open rechecks under its mutex if ingest won the race. Reuse its
+        // normal replay limits (including Lance's streaming seals); changing
+        // those here would also change future ingest's generation sizes because
+        // this writer remains resident. One indivisible entry can exceed the
+        // configured soft memory ceiling.
+        info!(shard = %self.write_shard, "recovering own WAL before cleanup merge");
+        self.resident_writer().await?;
         // Keep the recovered writer resident so concurrent ingest shares it;
         // a later cheap flush can also finish sealing if this caller is cancelled.
         self.flush().await
