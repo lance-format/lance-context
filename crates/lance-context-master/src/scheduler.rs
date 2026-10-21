@@ -1280,13 +1280,14 @@ fn spawn_filtered_pool_poller(
                 let Ok(permit) = pool.clone().try_acquire_owned() else {
                     break;
                 };
-                let Some(operation) = state.admission.try_admit() else {
+                let Some(operation) = state.admission.try_admit_named(pool_label) else {
                     break;
                 };
                 // Held across the await so a poller aborted mid-claim (drain,
                 // shutdown, test teardown) still pays the gauge back.
                 claiming.increment(1.0);
                 let claiming_hold = GaugeHold(claiming.clone());
+                operation.phase("claiming");
                 let claim_start = std::time::Instant::now();
                 let claim = if resident_only {
                     state
@@ -1299,6 +1300,7 @@ fn spawn_filtered_pool_poller(
                 drop(claiming_hold);
                 match claim {
                     Ok(Some(claim)) => {
+                        operation.task(&claim.task.id, &claim.task.target);
                         let claim_elapsed = claim_start.elapsed();
                         // Local capacity was reserved before the claim. No
                         // claimed table waits on a compaction semaphore.
@@ -3461,6 +3463,16 @@ mod tests {
         let draining = state.admission.status();
         assert!(!draining.accepting);
         assert!(draining.active_operations > 0);
+        assert_eq!(draining.active_operations, draining.operations.len());
+        let admitted = draining
+            .operations
+            .values()
+            .find(|operation| operation.task_id.as_deref() == Some(current.id.as_str()))
+            .expect("running merge must identify its durable task");
+        assert_eq!(admitted.target.as_deref(), Some("exp"));
+        assert_eq!(admitted.kind, "merge");
+        assert_eq!(admitted.phase, "running");
+        assert!(admitted.progress.is_none(), "no fabricated merge progress");
         let next = enqueue(&state, TaskKind::MergeWal, "exp-1").await.unwrap();
         release.add_permits(2);
         tokio::time::timeout(Duration::from_secs(10), state.admission.wait_drained())

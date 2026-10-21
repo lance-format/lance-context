@@ -102,7 +102,7 @@ async fn tick(state: &Arc<MasterState>, now: i64) -> Result<usize, String> {
     if !enabled(&state.config) {
         return Ok(0);
     }
-    let Some(_admission) = state.admission.try_admit() else {
+    let Some(_admission) = state.admission.try_admit_named("resident_discovery") else {
         return Ok(0);
     };
     let key = format!(

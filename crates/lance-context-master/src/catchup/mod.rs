@@ -268,9 +268,10 @@ async fn admit(
     row: Option<&StatRow>,
     request: &Trigger,
 ) -> Result<Decision> {
-    let Some(_operation) = state.admission.try_admit() else {
+    let Some(operation) = state.admission.try_admit_named("catchup_admission") else {
         return Ok(Decision::new(&request.target, "executor_draining"));
     };
+    operation.target(&request.target);
     let now = chrono::Utc::now().timestamp_millis();
     let target = &request.target;
     if let Some(reason) = eligibility(&state.config, row, target, now) {
@@ -436,7 +437,7 @@ async fn reconcile_record(
 }
 
 async fn tick(state: &Arc<MasterState>, cursor: &mut usize) -> Result<()> {
-    let Some(_operation) = state.admission.try_admit() else {
+    let Some(_operation) = state.admission.try_admit_named("catchup_reconcile") else {
         return Ok(());
     };
     let inventory = Inventory::new(state);

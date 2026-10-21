@@ -208,12 +208,14 @@ async fn maintain_registry(
 /// for experiments no longer in the registry. Returns the number of
 /// experiments successfully observed.
 pub async fn scan_once(state: &Arc<MasterState>) -> lance::Result<usize> {
-    let _operation = state
+    let operation = state
         .admission
-        .try_admit()
+        .try_admit_named("stats_scan")
         .ok_or_else(|| lance::Error::io("master executor is draining; stats scan not admitted"))?;
+    operation.phase("coordination_lock");
     let guard = state.task_store.coordination_lock("stats-writer").await?;
-    let result = scan_once_inner(state).await;
+    let result = scan_once_inner(state, &operation).await;
+    operation.phase("release_coordination_lock");
     let release = state.task_store.release_coordination_lock(guard).await;
     match (result, release) {
         (Ok(count), Ok(())) => Ok(count),
@@ -223,9 +225,10 @@ pub async fn scan_once(state: &Arc<MasterState>) -> lance::Result<usize> {
 }
 
 async fn try_scan_once(state: &Arc<MasterState>, maintain: bool) -> lance::Result<Option<usize>> {
-    let Some(_operation) = state.admission.try_admit() else {
+    let Some(operation) = state.admission.try_admit_named("stats_scan") else {
         return Ok(None);
     };
+    operation.phase("coordination_lock");
     let Some(guard) = state
         .task_store
         .try_coordination_lock("stats-writer")
@@ -233,10 +236,11 @@ async fn try_scan_once(state: &Arc<MasterState>, maintain: bool) -> lance::Resul
     else {
         return Ok(None);
     };
-    let result = scan_once_inner(state).await;
+    let result = scan_once_inner(state, &operation).await;
     // Maintenance runs under the same writer lock as the scan that just
     // created the versions, and its failure never fails the scan round.
     if maintain {
+        operation.phase("stats_maintenance");
         if let Err(e) = maintain_stats(state).await {
             tracing::warn!(error = %e, "stats maintenance failed");
         }
@@ -264,6 +268,7 @@ async fn try_scan_once(state: &Arc<MasterState>, maintain: bool) -> lance::Resul
             }
         }
     }
+    operation.phase("release_coordination_lock");
     let release = state.task_store.release_coordination_lock(guard).await;
     match (result, release) {
         (Ok(count), Ok(())) => Ok(Some(count)),
@@ -272,7 +277,11 @@ async fn try_scan_once(state: &Arc<MasterState>, maintain: bool) -> lance::Resul
     }
 }
 
-async fn scan_once_inner(state: &Arc<MasterState>) -> lance::Result<usize> {
+async fn scan_once_inner(
+    state: &Arc<MasterState>,
+    operation: &crate::admission::Operation,
+) -> lance::Result<usize> {
+    operation.phase("registry_read");
     let scan_start = std::time::Instant::now();
     // Rollout experiments under their bare name; generic stores under the
     // `generic:` task-target prefix, so they occupy distinct rows and the
@@ -309,6 +318,7 @@ async fn scan_once_inner(state: &Arc<MasterState>) -> lance::Result<usize> {
     // needed) and its compaction counters (which are carried forward). This
     // used to be a `stats.get()` per experiment, taking the stats lock once per
     // experiment per round.
+    operation.phase("previous_snapshot");
     let previous: HashMap<String, StatRow> = {
         let mut stats = state.stats.lock().await;
         stats
@@ -325,6 +335,7 @@ async fn scan_once_inner(state: &Arc<MasterState>) -> lance::Result<usize> {
     // Observe experiments concurrently (bounded). `None` means this round could
     // not observe that experiment; its previous row is carried over below
     // rather than dropped.
+    operation.phase("observe_tables");
     let observed: Vec<(String, Option<(StatRow, bool)>)> = stream::iter(entries)
         .map(|entry| {
             let previous = previous.clone();
@@ -344,6 +355,7 @@ async fn scan_once_inner(state: &Arc<MasterState>) -> lance::Result<usize> {
                 };
                 match observed {
                     Ok(result) => {
+                        operation.observed_table();
                         // Demand reconciliation rides the scan: publish every
                         // shard's watermark as a scan-sourced event. Detached
                         // and bounded; the scan never waits on it.
@@ -431,6 +443,7 @@ async fn scan_once_inner(state: &Arc<MasterState>) -> lance::Result<usize> {
         .filter(|row| !row.name.starts_with("generic:"))
         .cloned()
         .collect();
+    operation.phase("retire_cold_tables");
     let retired = retire_cold_experiments(
         &rollout_rows,
         retire_after,
@@ -447,6 +460,7 @@ async fn scan_once_inner(state: &Arc<MasterState>) -> lance::Result<usize> {
         .record(retire_start.elapsed().as_secs_f64());
     metrics::gauge!("master_stats_hot_experiments").set(snapshot.len() as f64);
 
+    operation.phase("commit_snapshot");
     let mut stats = state.stats.lock().await;
 
     let mut total_rows: i64 = 0;

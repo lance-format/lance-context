@@ -1,5 +1,6 @@
 //! Executor-local admission and joined shutdown, independent of table ownership.
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::watch;
 
@@ -9,6 +10,28 @@ pub struct Status {
     pub accepting: bool,
     /// Includes claim RPCs in flight, admitted tasks, and scanner passes.
     pub active_operations: usize,
+    /// Local diagnostics only. Neither an empty list nor stale progress fences
+    /// storage writes or authorizes cancellation of another executor.
+    pub operations: BTreeMap<String, OperationStatus>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct OperationStatus {
+    pub kind: &'static str,
+    pub phase: &'static str,
+    pub task_id: Option<String>,
+    pub target: Option<String>,
+    pub started_at_ms: i64,
+    /// None means this operation has no instrumented progress counter. It
+    /// must not be interpreted as zero progress or permission to kill it.
+    pub progress: Option<Progress>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct Progress {
+    pub unit: &'static str,
+    pub completed: u64,
+    pub last_completed_at_ms: i64,
 }
 
 impl Status {
@@ -27,6 +50,7 @@ impl Default for Admission {
             executor_id: lance_context_core::generate_id(),
             accepting: true,
             active_operations: 0,
+            operations: BTreeMap::new(),
         });
         Self { state }
     }
@@ -39,16 +63,36 @@ impl Admission {
 
     /// The same lock closes admission and reserves an operation before its
     /// first ownership RPC. Drain cannot miss an accepted but delayed claim.
+    #[cfg(test)]
     pub fn try_admit(self: &Arc<Self>) -> Option<Operation> {
+        self.try_admit_named("unspecified")
+    }
+
+    pub fn try_admit_named(self: &Arc<Self>, kind: &'static str) -> Option<Operation> {
         let mut admitted = false;
+        let id = lance_context_core::generate_id();
         self.state.send_if_modified(|state| {
             if state.accepting {
                 state.active_operations += 1;
+                state.operations.insert(
+                    id.clone(),
+                    OperationStatus {
+                        kind,
+                        phase: "admitted",
+                        task_id: None,
+                        target: None,
+                        started_at_ms: chrono::Utc::now().timestamp_millis(),
+                        progress: None,
+                    },
+                );
                 admitted = true;
             }
             admitted
         });
-        admitted.then(|| Operation(self.clone()))
+        admitted.then(|| Operation {
+            admission: self.clone(),
+            id,
+        })
     }
 
     pub fn begin_drain(&self) -> Status {
@@ -67,13 +111,61 @@ impl Admission {
     }
 }
 
-pub struct Operation(Arc<Admission>);
+pub struct Operation {
+    admission: Arc<Admission>,
+    id: String,
+}
+
+impl Operation {
+    pub fn phase(&self, phase: &'static str) {
+        self.update(|operation| operation.phase = phase);
+    }
+
+    pub fn target(&self, target: &str) {
+        self.update(|operation| operation.target = Some(target.to_owned()));
+    }
+
+    pub fn task(&self, id: &str, target: &str) {
+        self.update(|operation| {
+            operation.task_id = Some(id.to_owned());
+            operation.target = Some(target.to_owned());
+            operation.phase = "running";
+        });
+    }
+
+    /// Record completed work, never a heartbeat, poll, lease renewal, or retry.
+    pub fn observed_table(&self) {
+        self.update(|operation| {
+            let progress = operation.progress.get_or_insert(Progress {
+                unit: "tables_observed",
+                completed: 0,
+                last_completed_at_ms: 0,
+            });
+            progress.completed = progress.completed.saturating_add(1);
+            progress.last_completed_at_ms = chrono::Utc::now().timestamp_millis();
+        });
+    }
+
+    fn update(&self, update: impl FnOnce(&mut OperationStatus)) {
+        self.admission.state.send_modify(|state| {
+            // The operation guard owns this entry until Drop. No separate
+            // registry lock can disagree with the admission/drain count.
+            update(
+                state
+                    .operations
+                    .get_mut(&self.id)
+                    .expect("admitted operation"),
+            );
+        });
+    }
+}
 
 impl Drop for Operation {
     fn drop(&mut self) {
-        self.0
-            .state
-            .send_modify(|state| state.active_operations -= 1);
+        self.admission.state.send_modify(|state| {
+            state.operations.remove(&self.id);
+            state.active_operations -= 1;
+        });
     }
 }
 
@@ -109,5 +201,67 @@ mod tests {
         let admission = Arc::new(Admission::default());
         admission.begin_drain();
         admission.wait_drained().await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_progress_does_not_mask_a_different_stalled_operation() {
+        let admission = Arc::new(Admission::default());
+        let merge = admission.try_admit_named("merge").unwrap();
+        merge.phase("claiming");
+        merge.task("task-1", "hot-table");
+        let scan = admission.try_admit_named("stats_scan").unwrap();
+        scan.phase("observe_tables");
+        let scan_id = scan.id.clone();
+        let merge_id = merge.id.clone();
+        admission.begin_drain();
+        let (done, wait_done) = tokio::sync::oneshot::channel();
+        let (release, wait_release) = tokio::sync::oneshot::channel();
+        let scanner = tokio::spawn(async move {
+            for _ in 0..100 {
+                scan.observed_table();
+                tokio::task::yield_now().await;
+            }
+            done.send(()).unwrap();
+            wait_release.await.unwrap();
+            drop(scan);
+        });
+        for _ in 0..100 {
+            let status = admission.status();
+            assert_eq!(status.active_operations, status.operations.len());
+            let pending = &status.operations[&merge_id];
+            assert_eq!(pending.task_id.as_deref(), Some("task-1"));
+            assert_eq!(pending.target.as_deref(), Some("hot-table"));
+            assert!(
+                pending.progress.is_none(),
+                "another operation cannot show merge progress"
+            );
+            assert!(!status.drained());
+            tokio::task::yield_now().await;
+        }
+        wait_done.await.unwrap();
+        let status = admission.status();
+        assert_eq!(
+            status.operations[&scan_id]
+                .progress
+                .as_ref()
+                .unwrap()
+                .completed,
+            100
+        );
+        let before = serde_json::to_value(&status.operations[&scan_id].progress).unwrap();
+        // Status reads and phase transitions are not progress events.
+        merge.phase("running");
+        assert_eq!(
+            before,
+            serde_json::to_value(&admission.status().operations[&scan_id].progress).unwrap()
+        );
+        assert!(admission.try_admit_named("new_work").is_none());
+        drop(merge);
+        assert_eq!(admission.status().active_operations, 1);
+        assert!(!admission.status().drained());
+        release.send(()).unwrap();
+        scanner.await.unwrap();
+        admission.wait_drained().await;
+        assert!(admission.status().operations.is_empty());
     }
 }
