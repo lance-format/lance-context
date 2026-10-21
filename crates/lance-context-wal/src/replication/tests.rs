@@ -25,7 +25,7 @@ pub(super) fn batch(sequence: u64) -> Batch {
     )
 }
 
-fn pump(nodes: &mut [Node]) -> Result<Vec<Completion>> {
+pub(super) fn pump(nodes: &mut [Node]) -> Result<Vec<Completion>> {
     let mut completions = Vec::new();
     for _ in 0..100 {
         let mut messages = Vec::new();

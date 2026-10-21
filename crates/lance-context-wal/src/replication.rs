@@ -19,6 +19,8 @@ pub use images::{ImageCollection, ImageCollectionProgress};
 pub mod producer;
 pub mod publication;
 pub mod query;
+#[cfg(feature = "runtime")]
+pub mod runtime;
 pub mod source;
 mod state;
 #[cfg(test)]
