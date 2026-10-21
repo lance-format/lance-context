@@ -702,6 +702,15 @@ impl RolloutStore {
         self.base.prepare_cleanup_merge().await
     }
 
+    /// Recover this instance's unsealed WAL, then prepare cleanup. The caller
+    /// must exclusively own the ingestion writer ID, as when appending. Never
+    /// use this to merge a live worker's shard from a maintenance master.
+    pub async fn prepare_recovered_cleanup_merge(
+        &self,
+    ) -> LanceResult<Option<(ShardManifestStore, ShardManifest, PreparedMerge)>> {
+        self.base.prepare_recovered_cleanup_merge().await
+    }
+
     /// Commit a merge prepared by [`Self::prepare_merge_if_ready`].
     pub async fn commit_prepared_merge(
         &mut self,
@@ -4714,7 +4723,7 @@ mod tests {
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let mut other = RolloutStore::open_with_options(
+            let other = RolloutStore::open_with_options(
                 &uri,
                 RolloutStoreOptions {
                     shard_id: Some("different-live-writer".into()),
@@ -4723,7 +4732,11 @@ mod tests {
             )
             .await
             .unwrap();
-            assert_eq!(other.cleanup_own_shard().await.unwrap(), 0);
+            assert!(other
+                .prepare_recovered_cleanup_merge()
+                .await
+                .unwrap()
+                .is_none());
             assert!(other.own_shard_watermark().await.unwrap().is_none());
             assert!(other
                 .get_by_id("durable-before-exit")
@@ -4742,7 +4755,7 @@ mod tests {
                 .is_none());
             // Exercise the split-lock route used by the actual HTTP merge.
             let (manifests, manifest, prepared) = recovered
-                .prepare_cleanup_merge()
+                .prepare_recovered_cleanup_merge()
                 .await
                 .unwrap()
                 .expect("cleanup must replay acknowledged but unsealed WAL");

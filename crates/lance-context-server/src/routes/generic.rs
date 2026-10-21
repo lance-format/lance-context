@@ -338,7 +338,7 @@ pub(crate) async fn merge_generic_wal_owned(
     let prepared = {
         let guard = store.read().await;
         guard
-            .prepare_cleanup_merge()
+            .prepare_recovered_cleanup_merge()
             .await
             .map_err(AppError::from_lance)?
     };

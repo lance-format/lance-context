@@ -116,7 +116,7 @@ impl Sweepable for Arc<RwLock<RolloutStore>> {
         let prepared = {
             let guard = self.read().await;
             guard
-                .prepare_cleanup_merge()
+                .prepare_recovered_cleanup_merge()
                 .await
                 .map_err(|e| e.to_string())?
         };
@@ -205,7 +205,7 @@ impl Sweepable for Arc<RwLock<GenericStore>> {
         let prepared = {
             let guard = self.read().await;
             guard
-                .prepare_cleanup_merge()
+                .prepare_recovered_cleanup_merge()
                 .await
                 .map_err(|e| e.to_string())?
         };

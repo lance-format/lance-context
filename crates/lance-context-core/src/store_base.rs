@@ -920,9 +920,7 @@ impl StorageBase {
     /// the merge — leaving rows durable but permanently invisible until a
     /// process restart replayed the WAL.
     pub async fn cleanup_own_shard(&mut self) -> LanceResult<usize> {
-        if !self.recover_and_flush_own_wal().await? {
-            return Ok(0);
-        }
+        self.flush().await?;
         // Threshold `1`: merge whenever at least one generation is pending. The
         // time trigger must not depend on the count threshold — that is what
         // makes the two triggers a true OR.
@@ -1034,6 +1032,19 @@ impl StorageBase {
         self.prepare_merge_if_ready_inner(1, true).await
     }
 
+    /// Recover and seal this instance's durable WAL before preparing cleanup.
+    /// The caller MUST own the ingestion writer ID exclusively. A maintenance
+    /// master merging a live worker's sealed shard must use the ordinary
+    /// preparation methods, which never acquire an ingestion epoch.
+    pub async fn prepare_recovered_cleanup_merge(
+        &self,
+    ) -> LanceResult<Option<(ShardManifestStore, ShardManifest, PreparedMerge)>> {
+        if !self.recover_and_flush_own_wal().await? {
+            return Ok(None);
+        }
+        self.prepare_merge_if_ready_inner(1, false).await
+    }
+
     async fn prepare_merge_if_ready_inner(
         &self,
         threshold: usize,
@@ -1043,10 +1054,8 @@ impl StorageBase {
         if self.is_version_pinned() || self.deleted {
             return Ok(None);
         }
-        // Materialize anything buffered so it is eligible for this pass. An
-        // absent own shard has already been checked; do not scan it twice.
-        if seal_first && !self.recover_and_flush_own_wal().await? {
-            return Ok(None);
+        if seal_first {
+            self.flush().await?;
         }
         let object_store = self.dataset.object_store(None).await?;
         let branch_location = self.dataset.branch_location();
@@ -2801,15 +2810,18 @@ mod cold_recovery_tests {
     #[tokio::test]
     async fn empty_shard_cleanup_does_not_wait_for_other_recovery() {
         let dir = tempfile::TempDir::new().unwrap();
-        let mut store = RolloutStore::open(dir.path().to_str().unwrap())
+        let store = RolloutStore::open(dir.path().to_str().unwrap())
             .await
             .unwrap();
         let _occupied = OWN_WAL_RECOVERY_SLOT.acquire().await.unwrap();
-        let reclaimed = tokio::time::timeout(Duration::from_secs(2), store.cleanup_own_shard())
-            .await
-            .expect("absent own shard must bypass cold recovery admission")
-            .unwrap();
-        assert_eq!(reclaimed, 0);
+        let prepared = tokio::time::timeout(
+            Duration::from_secs(2),
+            store.prepare_recovered_cleanup_merge(),
+        )
+        .await
+        .expect("absent own shard must bypass cold recovery admission")
+        .unwrap();
+        assert!(prepared.is_none());
         assert!(store.own_shard_watermark().await.unwrap().is_none());
     }
 }

@@ -700,6 +700,15 @@ impl GenericStore {
         self.base.prepare_cleanup_merge().await
     }
 
+    /// Recover this instance's unsealed WAL, then prepare cleanup. The caller
+    /// must exclusively own the ingestion writer ID, as when appending. Never
+    /// use this to merge a live worker's shard from a maintenance master.
+    pub async fn prepare_recovered_cleanup_merge(
+        &self,
+    ) -> LanceResult<Option<(ShardManifestStore, ShardManifest, PreparedMerge)>> {
+        self.base.prepare_recovered_cleanup_merge().await
+    }
+
     /// Commit a merge prepared by [`Self::prepare_cleanup_merge`].
     pub async fn commit_prepared_merge(
         &mut self,
@@ -1383,6 +1392,55 @@ mod tests {
         });
     }
 
+    #[tokio::test]
+    async fn cold_maintenance_cleanup_does_not_claim_a_live_ingestion_epoch() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let options = GenericStoreOptions {
+            shard_id: Some("live-ingestion-writer".into()),
+            ..Default::default()
+        };
+        let writer = GenericStore::open(uri, spec(), options.clone())
+            .await
+            .unwrap();
+        writer
+            .add(&[row(json!({"id":"shared", "score":1.0}))])
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        let before = writer
+            .own_shard_watermark()
+            .await
+            .unwrap()
+            .unwrap()
+            .writer_epoch;
+        let mut maintenance = GenericStore::open_existing(uri, options).await.unwrap();
+        let (manifests, manifest, prepared) =
+            maintenance.prepare_cleanup_merge().await.unwrap().unwrap();
+        maintenance
+            .commit_prepared_merge(&manifests, &manifest, prepared)
+            .await
+            .unwrap();
+        writer
+            .add(&[row(json!({"id":"shared", "score":2.0}))])
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        assert_eq!(
+            writer
+                .own_shard_watermark()
+                .await
+                .unwrap()
+                .unwrap()
+                .writer_epoch,
+            before
+        );
+        assert_eq!(
+            writer.get("shared", None).await.unwrap().unwrap()["score"],
+            json!(2.0)
+        );
+    }
+
     #[test]
     fn cleanup_recovers_own_wal_updates_without_new_ingest_after_runtime_exit() {
         let dir = TempDir::new().unwrap();
@@ -1416,7 +1474,18 @@ mod tests {
                 recovered.get("shared", None).await.unwrap().unwrap()["score"],
                 json!(1.0)
             );
-            assert!(recovered.cleanup_wal().await.unwrap() > 0);
+            let (manifests, manifest, prepared) = recovered
+                .prepare_recovered_cleanup_merge()
+                .await
+                .unwrap()
+                .expect("own WAL must recover without a new append");
+            assert!(
+                recovered
+                    .commit_prepared_merge(&manifests, &manifest, prepared)
+                    .await
+                    .unwrap()
+                    > 0
+            );
             assert_eq!(
                 recovered.get("shared", None).await.unwrap().unwrap()["score"],
                 json!(2.0)

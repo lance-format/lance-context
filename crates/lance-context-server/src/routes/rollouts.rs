@@ -756,7 +756,7 @@ pub(crate) async fn merge_wal_owned(
         let store = store_lock.read().await;
         ::metrics::histogram!("rollout_wal_merge_lock_wait_seconds")
             .record(lock_start.elapsed().as_secs_f64());
-        match store.prepare_cleanup_merge().await {
+        match store.prepare_recovered_cleanup_merge().await {
             Ok(prepared) => prepared,
             Err(e) => {
                 ::metrics::counter!("rollout_wal_cleanup_total", "result" => "failed").increment(1);
