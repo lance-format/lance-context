@@ -276,6 +276,28 @@ async fn inventory_does_not_collect_record_ids_or_invalid_store_identifiers() {
 
 #[test]
 fn shutdown_log_cap_does_not_discard_unreported_handlers() {
+    // Tracing's callsite interest cache is process-wide. Other drain tests emit
+    // these same events without a subscriber, so capture logs in an isolated
+    // test process instead of racing their callsite registration.
+    const ISOLATED: &str = "LANCE_CONTEXT_DRAIN_INVENTORY_LOG_TEST";
+    if std::env::var_os(ISOLATED).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "drain::tests::shutdown_log_cap_does_not_discard_unreported_handlers",
+                "--nocapture",
+            ])
+            .env(ISOLATED, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated log test failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
     #[derive(Clone)]
     struct Log(Arc<Mutex<Vec<u8>>>);
     impl io::Write for Log {
