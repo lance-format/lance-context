@@ -2214,6 +2214,10 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(3)).await;
         proxy.responses.send(false).unwrap();
         tokio::time::sleep(Duration::from_secs(6)).await;
+        // Restore responses before any observer RPC: a slow linearizable
+        // read must not silently extend the injected six-second outage.
+        let renewal_still_running = !claim.backend.keepalive.task.is_finished();
+        proxy.responses.send(true).unwrap();
         let values = observer.get(key.clone(), None).await.unwrap();
         assert_eq!(
             values.kvs().len(),
@@ -2230,8 +2234,7 @@ mod tests {
                 .ttl()
                 > 0
         );
-        proxy.responses.send(true).unwrap();
-        assert!(!claim.backend.keepalive.task.is_finished(),
+        assert!(renewal_still_running,
             "unacknowledged renewals must be retried on the same lease within a bounded recovery window");
         tokio::time::sleep(Duration::from_secs(8)).await;
         let values = observer.get(key, None).await.unwrap();
@@ -2270,13 +2273,22 @@ mod tests {
         let key = claim.backend.claim_key.clone();
         proxy.online.send(false).unwrap();
         tokio::time::timeout(Duration::from_secs(10), async {
-            while !claim.backend.keepalive.task.is_finished()
-                || !observer
-                    .get(key.clone(), None)
-                    .await
-                    .unwrap()
-                    .kvs()
-                    .is_empty()
+            while !claim.backend.keepalive.task.is_finished() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("renewal task exceeded its bounded recovery window");
+        // Client termination and server-side lease deletion are separate:
+        // etcd may delay its expiry transaction or this linearizable read.
+        // A slow observer must not mask whether the client stopped in time.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !observer
+                .get(key.clone(), None)
+                .await
+                .unwrap()
+                .kvs()
+                .is_empty()
             {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
