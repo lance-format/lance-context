@@ -28,6 +28,9 @@ use std::{
 };
 use tokio::sync::{mpsc as async_mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 
+#[cfg(feature = "peer-transport")]
+pub mod peer;
+
 /// Logical owned frame bytes and requests shared across all physical groups.
 /// Counts do not include caller allocations or an oversized allocation pinned
 /// by a small Bytes slice. The transport must account for those owners too.
@@ -149,6 +152,8 @@ impl<T> Future for Pending<T> {
 struct Credits {
     slots: Arc<Semaphore>,
     bytes: Arc<Semaphore>,
+    #[cfg(feature = "peer-transport")]
+    capacity_bytes: usize,
 }
 struct Credit {
     _slot: OwnedSemaphorePermit,
@@ -159,6 +164,8 @@ impl Credits {
         Self {
             slots: Arc::new(Semaphore::new(slots)),
             bytes: Arc::new(Semaphore::new(bytes)),
+            #[cfg(feature = "peer-transport")]
+            capacity_bytes: bytes,
         }
     }
     fn reserve(&self, bytes: usize) -> Result<Credit> {

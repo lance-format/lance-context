@@ -86,10 +86,10 @@ jobs:
         run: |
           cargo clippy -p lance-context-wal --features client-journal --all-targets -- -D warnings
           cargo test -p lance-context-wal --features client-journal --lib client_journal
-      - name: Replicated WAL quorum and process recovery
+      - name: Replicated WAL quorum, TLS peers and process recovery
         run: |
-          cargo clippy -p lance-context-wal --features runtime --all-targets -- -D warnings
-          cargo test -p lance-context-wal --features runtime --lib --test replication_process
+          cargo clippy -p lance-context-wal --features peer-transport --all-targets -- -D warnings
+          cargo test -p lance-context-wal --features peer-transport --lib --test replication_process
       - name: Prepared WAL descriptors with real Lance files and process recovery
         run: |
           cargo test -p lance-context-wal --features lance-integration --lib replication::publication::lance

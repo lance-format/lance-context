@@ -38,7 +38,9 @@ timing out shutdown cannot cancel filesystem operations already in progress.
 
 ## Integration boundary
 
-This module does not open a network listener. The embedding service still needs
+This module does not open a network listener. The optional
+[`peer-transport` feature](wal-peer-transport.md) provides authenticated TCP/TLS
+connections for these workers. The embedding service still needs
 authenticated routing, bounded framing before allocation, deadlines and retry
 reconciliation, durable snapshot transfer, physical disk admission and automatic
 maintenance. Snapshot packets are rejected until that transfer path is connected.

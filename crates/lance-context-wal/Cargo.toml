@@ -7,6 +7,7 @@ publish = false
 description = "Independent Rust WAL experiments owned by lance-context"
 
 [features]
+peer-transport = ["runtime", "vectored-io", "dep:tokio-rustls", "tokio/net", "tokio/time", "tokio/macros"]
 runtime = ["replication", "dep:tokio", "tokio/sync", "tokio/rt"]
 # Real Lance materialization/recovery qualification; normal WAL replicas do not link Lance.
 lance-integration = ["replication", "ipc", "arrow-contract", "dep:lance", "dep:lance-table", "dep:lance-io", "dep:object_store", "dep:async-trait", "dep:futures", "dep:serde_json"]
@@ -24,6 +25,7 @@ ipc = ["dep:anyhow", "dep:arrow-array", "dep:arrow-buffer", "dep:arrow-ipc", "de
 lab = ["ipc", "dep:clap", "dep:hdrhistogram", "dep:raft-engine", "raft-engine/internals", "dep:raft-proto", "dep:serde_json"]
 
 [dependencies]
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"], optional = true }
 lance = { version = "13.0.0", optional = true }
 lance-table = { version = "13.0.0", optional = true }
 lance-io = { version = "13.0.0", optional = true }
@@ -53,6 +55,7 @@ sha2 = { version = "0.10", optional = true }
 uuid = { version = "1", features = ["serde"], optional = true }
 
 [dev-dependencies]
+rcgen = "0.14"
 sha2 = "0.10"
 libc = "0.2"
 slog = "2"
