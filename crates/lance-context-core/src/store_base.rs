@@ -773,12 +773,14 @@ impl StorageBase {
     /// as with `put`, the caller must have exclusive ownership of that writer ID.
     /// Opening a writer claims its epoch, so this is not a mechanism for taking
     /// over an instance that is still alive.
-    async fn recover_and_flush_own_wal(&self) -> LanceResult<()> {
+    /// Returns false when there is no own shard to merge.
+    async fn recover_and_flush_own_wal(&self) -> LanceResult<bool> {
         if self.is_version_pinned() || self.deleted {
-            return Ok(());
+            return Ok(false);
         }
         if self.write_writer.lock().await.is_some() {
-            return self.flush().await;
+            self.flush().await?;
+            return Ok(true);
         }
         let manifest_store = ShardManifestStore::new(
             self.dataset.object_store(None).await?,
@@ -789,7 +791,7 @@ impl StorageBase {
         // A worker with no own shard must not queue behind another table's
         // recovery. Serial master fan-out visits many such workers.
         if manifest_store.refresh_latest().await?.is_none() {
-            return Ok(());
+            return Ok(false);
         }
         let _recovery_slot = OWN_WAL_RECOVERY_SLOT
             .acquire()
@@ -806,7 +808,8 @@ impl StorageBase {
         self.resident_writer().await?;
         // Keep the recovered writer resident so concurrent ingest shares it;
         // a later cheap flush can also finish sealing if this caller is cancelled.
-        self.flush().await
+        self.flush().await?;
+        Ok(true)
     }
 
     async fn flush_inner(&self) -> LanceResult<FlushOutcome> {
@@ -917,7 +920,9 @@ impl StorageBase {
     /// the merge — leaving rows durable but permanently invisible until a
     /// process restart replayed the WAL.
     pub async fn cleanup_own_shard(&mut self) -> LanceResult<usize> {
-        self.recover_and_flush_own_wal().await?;
+        if !self.recover_and_flush_own_wal().await? {
+            return Ok(0);
+        }
         // Threshold `1`: merge whenever at least one generation is pending. The
         // time trigger must not depend on the count threshold — that is what
         // makes the two triggers a true OR.
@@ -1038,9 +1043,10 @@ impl StorageBase {
         if self.is_version_pinned() || self.deleted {
             return Ok(None);
         }
-        if seal_first {
-            // Materialize anything buffered so it is eligible for this pass.
-            self.recover_and_flush_own_wal().await?;
+        // Materialize anything buffered so it is eligible for this pass. An
+        // absent own shard has already been checked; do not scan it twice.
+        if seal_first && !self.recover_and_flush_own_wal().await? {
+            return Ok(None);
         }
         let object_store = self.dataset.object_store(None).await?;
         let branch_location = self.dataset.branch_location();
