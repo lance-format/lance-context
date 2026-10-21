@@ -433,14 +433,10 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
     async fn another_tables_success_does_not_renew_a_stalled_executor() {
-        let (state, coordinator, _dir) = fixture(2, 2).await;
+        let (state, coordinator, _dir) = fixture(2, 10).await;
         let slow = pending(&state, "slow").await;
         let fast = pending(&state, "fast").await;
         let held = slow.write().await;
-        let stalled = spawn_background(state.clone(), "slow".into())
-            .await
-            .unwrap();
-        running(&coordinator, "slow").await;
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let commits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let healthy = tokio::spawn({
@@ -469,7 +465,23 @@ mod tests {
                 }
             }
         });
-        let error = tokio::time::timeout(Duration::from_secs(10), stalled)
+        // Establish actual commit traffic before the idle window starts. Cold
+        // index/storage setup can otherwise consume the entire short window on
+        // a busy test host without ever exercising concurrent progress.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while commits.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+                assert!(!healthy.is_finished());
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let stalled = spawn_background(state.clone(), "slow".into())
+            .await
+            .unwrap();
+        running(&coordinator, "slow").await;
+        let before = commits.load(std::sync::atomic::Ordering::SeqCst);
+        let error = tokio::time::timeout(Duration::from_secs(30), stalled)
             .await
             .unwrap()
             .unwrap()
@@ -478,7 +490,7 @@ mod tests {
         assert!(!healthy.is_finished());
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
         healthy.await.unwrap();
-        assert!(commits.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+        assert!(commits.load(std::sync::atomic::Ordering::SeqCst) - before >= 2);
         assert!(error.contains("no-progress"), "{error}");
         assert!(coordinator.get("slow").await.unwrap().is_none());
         drop(held);
