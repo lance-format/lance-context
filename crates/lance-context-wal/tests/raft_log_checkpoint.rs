@@ -12,6 +12,11 @@ use raft::{GetEntriesContext, Storage, StorageError};
 use raft_proto::eraftpb::{Entry, HardState, Snapshot};
 use uuid::Uuid;
 
+// A concurrent fork briefly inherits other tests' flock descriptors until exec.
+// Exclude that window between independent reopen cases, while preserving the
+// real subprocess/crash behavior exercised within each case.
+static TEST_CASE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn layout() -> Layout {
     Layout {
         cluster: Uuid::from_u128(22),
@@ -60,6 +65,7 @@ fn read(log: &GroupLog, low: u64, high: u64) -> raft::Result<Vec<Entry>> {
 
 #[test]
 fn checkpoint_preserves_suffix_vote_and_other_group_across_reopen() -> Result<()> {
+    let _case = TEST_CASE.lock().unwrap();
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("log");
     let original: Vec<_> = (1..=6)
@@ -143,6 +149,7 @@ fn checkpoint_preserves_suffix_vote_and_other_group_across_reopen() -> Result<()
 
 #[test]
 fn invalid_or_changed_checkpoint_never_changes_usable_log() -> Result<()> {
+    let _case = TEST_CASE.lock().unwrap();
     let directory = tempfile::tempdir()?;
     let log = PhysicalLog::open(&directory.path().join("log"), &layout(), 1)?;
     let group = log.group(10)?;
@@ -193,6 +200,7 @@ fn invalid_or_changed_checkpoint_never_changes_usable_log() -> Result<()> {
 
 #[test]
 fn missing_corrupt_or_inconsistent_checkpoint_fails_reopen() -> Result<()> {
+    let _case = TEST_CASE.lock().unwrap();
     for corruption in 0..5 {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("log");
@@ -225,10 +233,31 @@ fn missing_corrupt_or_inconsistent_checkpoint_fails_reopen() -> Result<()> {
             }
             engine.write(&mut batch, true)?;
         }
-        assert!(
-            PhysicalLog::open(&path, &layout(), 1).is_err(),
-            "accepted corruption {corruption}"
-        );
+        let error = match PhysicalLog::open(&path, &layout(), 1) {
+            Ok(_) => anyhow::bail!("accepted corruption {corruption}"),
+            Err(error) => error,
+        };
+        // A transient lock failure is not evidence that corrupt state was
+        // rejected. Require the actual validation failure for every case.
+        match corruption {
+            0 | 2 => assert!(
+                error.to_string().contains("invalid durable term index"),
+                "{error:#}"
+            ),
+            1 => assert!(
+                error.downcast_ref::<protobuf::ProtobufError>().is_some(),
+                "{error:#}"
+            ),
+            3 => assert!(
+                error.to_string().contains("oversized durable snapshot"),
+                "{error:#}"
+            ),
+            4 => assert!(
+                error.to_string().contains("unbound checkpoint"),
+                "{error:#}"
+            ),
+            _ => unreachable!(),
+        }
     }
     Ok(())
 }
@@ -271,6 +300,7 @@ mod process {
 
     #[test]
     fn checkpoint_survives_sigkill() -> Result<()> {
+        let _case = TEST_CASE.lock().unwrap();
         use std::os::unix::process::ExitStatusExt;
         for phase in ["before", "after"] {
             let directory = tempfile::tempdir()?;

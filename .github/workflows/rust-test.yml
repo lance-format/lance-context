@@ -30,8 +30,7 @@ env:
 jobs:
   test:
     runs-on: ubuntu-24.04
-    # The focused HA suite builds a second feature graph after workspace tests;
-    # cold native dependency builds can exhaust 30 minutes before HA tests run.
+    # Keep workspace tests independent of the optional feature build graphs.
     timeout-minutes: 60
     strategy:
       matrix:
@@ -60,18 +59,30 @@ jobs:
         # regression test was dead weight in CI. `--workspace` covers the crates
         # that were silently untested (api, server, client, metrics, the facade).
         run: cargo test --workspace --all-targets
+
+  wal-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup rust toolchain
+        run: |
+          rustup toolchain install stable
+          rustup default stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "lance-context-wal-deps"
+          workspaces: "."
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y clang libclang-dev protobuf-compiler
       - name: WAL component correctness smoke tests
         run: |
           cargo run -p lance-context-wal --features lab --bin context-wal-lab -- codec --payload-bytes 1024 --rows 8 --iterations 2
           cargo test -p lance-context-wal --features lab --bin context-wal-lab
           cargo test -p lance-context-wal --features lab --test engine_cache
           cargo run -p lance-context-wal --features lab --bin context-wal-lab -- disk --directory "$RUNNER_TEMP/wal-disk-smoke" --payload-bytes 1024 --batch 4 --writers 2 --groups-per-writer 2 --rounds 8
-      - name: Optional Lance object-store metrics
-        run: |
-          cargo test -p lance-context-core --features lance-io-metrics --test lance_io_metrics
-          cargo test -p lance-context-core --all-features --lib latency_histograms_carry_only_bounded_labels
-          cargo check -p lance-context-server --features lance-io-metrics
-          cargo check -p lance-context-core --no-default-features
       - name: WAL placement, admission, record, contract and IPC decoding tests
         run: |
           cargo test -p lance-context-wal --features placement,admission,ipc,record,arrow-contract,vectored-io --lib
@@ -90,10 +101,6 @@ jobs:
         run: |
           cargo clippy -p lance-context-wal --features peer-transport --all-targets -- -D warnings
           cargo test -p lance-context-wal --features peer-transport --lib --test replication_process
-      - name: Prepared WAL descriptors with real Lance files and process recovery
-        run: |
-          cargo test -p lance-context-wal --features lance-integration --lib replication::publication::lance
-          cargo test -p lance-context-wal --features lance-integration --test replication_process lance_publication
       - name: WAL resource observation in a container cgroup namespace
         run: |
           cargo test -p lance-context-wal --features runner --test resource --no-run --message-format=json > "$RUNNER_TEMP/wal-resource-build.jsonl"
@@ -105,6 +112,52 @@ jobs:
             mount -t cgroup2 cgroup2 /sys/fs/cgroup
             exec setpriv --reuid "$1" --regid "$2" --clear-groups --no-new-privs "$3"
           ' sh "$(id -u)" "$(id -g)" "$wal_resource_test"
+
+  lance-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup rust toolchain
+        run: |
+          rustup toolchain install stable
+          rustup default stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "lance-context-lance-deps"
+          workspaces: "."
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y clang libclang-dev protobuf-compiler
+      - name: Optional Lance object-store metrics
+        run: |
+          cargo test -p lance-context-core --features lance-io-metrics --test lance_io_metrics
+          cargo test -p lance-context-core --all-features --lib latency_histograms_carry_only_bounded_labels
+          cargo check -p lance-context-server --features lance-io-metrics
+          cargo check -p lance-context-core --no-default-features
+      - name: Prepared WAL descriptors with real Lance files and process recovery
+        run: |
+          cargo test -p lance-context-wal --features lance-integration --lib replication::publication::lance
+          cargo test -p lance-context-wal --features lance-integration --test replication_process lance_publication
+
+  ha-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup rust toolchain
+        run: |
+          rustup toolchain install stable
+          rustup default stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "lance-context-ha-deps"
+          workspaces: "."
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y clang libclang-dev protobuf-compiler
       - name: Start etcd for HA scheduler test
         run: |
           ETCD_VERSION=3.7.0

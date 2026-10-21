@@ -604,4 +604,4 @@ async fn read_packet<R: AsyncRead + Unpin>(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

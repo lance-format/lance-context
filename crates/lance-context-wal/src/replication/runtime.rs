@@ -13,7 +13,7 @@ use super::{producer, publication as p, query, source, Node, Outcome, Packet, St
 use crate::record::{Batch, RecordKind};
 use anyhow::{ensure, Context, Result};
 use protobuf::Message as _;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     future::Future,
@@ -28,6 +28,8 @@ use std::{
 };
 use tokio::sync::{mpsc as async_mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 
+#[cfg(feature = "peer-transport")]
+pub mod client;
 mod images;
 #[cfg(feature = "peer-transport")]
 pub mod peer;
@@ -85,7 +87,7 @@ impl Options {
 
 /// Typed commands preserve Node's existing validation and durable formats.
 /// This scheduling enum is not a network or persisted wire format.
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Command {
     Append { group: u64, batch: Batch },
     Acquire(p::Acquire),

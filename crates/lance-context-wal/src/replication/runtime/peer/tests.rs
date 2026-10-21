@@ -17,11 +17,11 @@ use std::{net::SocketAddr, path::Path};
 mod process;
 mod snapshots;
 
-struct Tls {
-    client: Arc<rustls::ClientConfig>,
-    server: Arc<rustls::ServerConfig>,
-    certificate: [u8; 32],
-    name: String,
+pub(crate) struct Tls {
+    pub(crate) client: Arc<rustls::ClientConfig>,
+    pub(crate) server: Arc<rustls::ServerConfig>,
+    pub(crate) certificate: [u8; 32],
+    pub(crate) name: String,
 }
 fn certificates() -> Result<BTreeMap<u64, Tls>> {
     // Fresh keys and ordinary verifying TLS, including client certificates.
@@ -71,19 +71,19 @@ fn certificates() -> Result<BTreeMap<u64, Tls>> {
     Ok(configs)
 }
 
-struct Running {
-    runtime: Runtime,
-    network: Transport,
-    handle: Handle,
+pub(crate) struct Running {
+    pub(crate) runtime: Runtime,
+    pub(crate) network: Transport,
+    pub(crate) handle: Handle,
 }
-struct Cluster {
-    nodes: BTreeMap<u64, Running>,
-    tls: BTreeMap<u64, Tls>,
-    addresses: BTreeMap<u64, SocketAddr>,
+pub(crate) struct Cluster {
+    pub(crate) nodes: BTreeMap<u64, Running>,
+    pub(crate) tls: BTreeMap<u64, Tls>,
+    pub(crate) addresses: BTreeMap<u64, SocketAddr>,
     network_options: Options,
 }
 impl Cluster {
-    async fn open(root: &Path) -> Result<Self> {
+    pub(crate) async fn open(root: &Path) -> Result<Self> {
         Self::with_options(root, Options::default()).await
     }
     async fn with_options(root: &Path, network_options: Options) -> Result<Self> {
@@ -144,12 +144,12 @@ impl Cluster {
         );
         Ok(())
     }
-    async fn stop(&mut self, id: u64) -> Result<()> {
+    pub(crate) async fn stop(&mut self, id: u64) -> Result<()> {
         let node = self.nodes.remove(&id).context("missing test node")?;
         node.network.shutdown().await?;
         node.runtime.shutdown().await
     }
-    async fn leader(&self, group: u64) -> Result<u64> {
+    pub(crate) async fn leader(&self, group: u64) -> Result<u64> {
         timeout(Duration::from_secs(10), async {
             loop {
                 let leaders = self
@@ -166,7 +166,7 @@ impl Cluster {
         .await
         .context("TLS replica election did not settle")
     }
-    async fn shutdown(mut self) -> Result<()> {
+    pub(crate) async fn shutdown(mut self) -> Result<()> {
         let ids: Vec<_> = self.nodes.keys().copied().collect();
         for id in ids {
             self.stop(id).await?;
