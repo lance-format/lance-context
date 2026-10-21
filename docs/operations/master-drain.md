@@ -55,3 +55,20 @@ Older images do not implement this protocol. Observing zero tasks and then
 deleting an old Pod is not an atomic drain, and installing this release does
 not retroactively add the endpoint to running old processes. Do not claim an
 old executor is drained merely from an idle metrics sample or SIGTERM receipt.
+
+## Route future WAL claims to a normal master
+
+`MASTER_WAL_CLAIM_TARGETS=hot-table,generic:events` limits that master's future
+WAL task claims to exact table names. Unset accepts every table; `*` and empty
+entries are rejected. The filter applies before dependency and ownership checks
+in shared, separate merge, and reserved resident pools. Compact, IndexId and
+Repair claims remain unrestricted. Other masters can still claim the excluded
+tasks from the same queue.
+
+This setting does not enable native merge, change the owned-target allowlist,
+reorder workers, enqueue tasks, override cooldowns, or reclaim an existing
+writer. Selected tasks retain their normal table-lock and fencing checks.
+`MASTER_CLAIM_WAL_MERGES=false` still disables scheduler WAL claims altogether.
+The setting is read at startup; preserve accepted operations when replacing an
+executor. A busy legacy worker can still block an admitted task, so routing
+alone does not establish autonomous recovery or completion.

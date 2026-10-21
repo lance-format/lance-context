@@ -122,6 +122,7 @@ struct EtcdTaskStore {
     prepare_targets: Vec<String>,
     index_prepare_targets: Vec<String>,
     maintenance_catchup_targets: Vec<String>,
+    wal_claim_targets: Vec<String>,
     rollout: lance_context_merge::rollout::MergeRollout,
     auto_local_merge: bool,
 }
@@ -743,6 +744,7 @@ impl EtcdTaskStore {
             prepare_targets: config.maintenance.compaction_prepare_targets.clone(),
             index_prepare_targets: config.maintenance.index_prepare_targets.clone(),
             maintenance_catchup_targets: config.maintenance.maintenance_catchup_targets.clone(),
+            wal_claim_targets: config.maintenance.wal_claim_targets.clone(),
             rollout: config.merge_rollout.clone(),
             auto_local_merge: config.local_merge.master_local_merge_auto,
         })
@@ -891,6 +893,16 @@ impl EtcdTaskStore {
                 .collect::<lance::Result<Vec<_>>>()?;
 
             for mut task in queued {
+                // Local routing policy only. Apply before dependency probes or
+                // ownership RPCs, including shared and reserved resident pools.
+                // Unselected tasks stay available to other masters. The normal
+                // claim transaction and execution protocol remain unchanged.
+                if task.kind == TaskKind::MergeWal
+                    && !self.wal_claim_targets.is_empty()
+                    && !self.wal_claim_targets.contains(&task.target)
+                {
+                    continue;
+                }
                 // Cheap kind/resident filtering happens before the dependency
                 // probe: an unrunnable kind should cost nothing, and this is
                 // what lets a scarce kind be found behind a dominant one.
@@ -2774,6 +2786,94 @@ mod tests {
             task_cooldown_max_secs: 21_600,
             ui_dir: None,
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn wal_claim_targets_preserve_queue_peers_and_writer_exclusion() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.etcd.etcd_endpoints = std::env::var("ETCD_TEST_ENDPOINTS")
+            .unwrap()
+            .split(',')
+            .map(str::to_owned)
+            .collect();
+        cfg.etcd.etcd_prefix = format!("/wal-claim-targets/{}", generate_id());
+        let peer = TaskStore::open(&cfg).await.unwrap();
+        cfg.maintenance.wal_claim_targets = vec!["hot".into()];
+        let selected = TaskStore::open(&cfg).await.unwrap();
+        let broken = peer
+            .enqueue(
+                TaskKind::MergeWal,
+                "excluded-dependency",
+                vec!["missing".into()],
+            )
+            .await
+            .unwrap();
+        // Reach the selected target on a later queue page, without consuming
+        // unrelated tasks or evaluating their dependencies.
+        for i in 0..TASK_POLL_BATCH {
+            peer.enqueue(TaskKind::MergeWal, &format!("other-{i}"), vec![])
+                .await
+                .unwrap();
+        }
+        let hot = peer
+            .enqueue(TaskKind::MergeWal, "hot", vec![])
+            .await
+            .unwrap();
+        let claim = selected.claim_next().await.unwrap().unwrap();
+        assert_eq!(claim.task.id, hot.id);
+        assert_eq!(
+            selected.get(&broken.id).await.unwrap().unwrap().state,
+            TaskState::Queued
+        );
+        assert_eq!(peer.queue_depth().await.unwrap(), TASK_POLL_BATCH + 1);
+        // The filter cannot bypass an existing owner, even on the same process.
+        peer.enqueue(TaskKind::Compact, "hot", vec![])
+            .await
+            .unwrap();
+        assert!(selected.claim_next().await.unwrap().is_none());
+        assert!(selected
+            .claim_resident_merge(&["other-0".into()])
+            .await
+            .unwrap()
+            .is_none());
+        // Maintenance on unselected tables and claims by another master remain
+        // independent of this master's local routing restriction.
+        let index = peer
+            .enqueue(TaskKind::IndexId, "outside", vec![])
+            .await
+            .unwrap();
+        let maintenance = selected.claim_next().await.unwrap().unwrap();
+        assert_eq!(maintenance.task.id, index.id);
+        selected
+            .finish(maintenance, Ok("index done".into()))
+            .await
+            .unwrap();
+        let other = peer
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(other.task.target.starts_with("other-"));
+        peer.finish(other, Ok("peer done".into())).await.unwrap();
+        selected.finish(claim, Ok("hot done".into())).await.unwrap();
+        let compact = selected.claim_next().await.unwrap().unwrap();
+        assert_eq!(compact.task.kind, TaskKind::Compact);
+        assert_eq!(compact.task.target, "hot");
+        selected
+            .finish(compact, Ok("compact done".into()))
+            .await
+            .unwrap();
+        peer.inner
+            .client
+            .clone()
+            .delete(
+                cfg.etcd.etcd_prefix,
+                Some(etcd_client::DeleteOptions::new().with_prefix()),
+            )
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

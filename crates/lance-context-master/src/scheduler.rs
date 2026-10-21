@@ -3263,6 +3263,63 @@ mod tests {
         assert_eq!(state.task_store.list().await.unwrap().len(), 1);
     }
 
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn wal_claim_targets_apply_to_shared_merge_and_resident_pools() {
+        for (merge_concurrency, resident) in [(0, false), (2, false), (2, true)] {
+            let dir = TempDir::new().unwrap();
+            let mut cfg = config(&dir);
+            cfg.maintenance.wal_claim_targets = vec!["hot".into()];
+            cfg.merge_wal_concurrency = merge_concurrency;
+            if resident {
+                cfg.local_merge.master_local_merge_targets = vec!["excluded".into()];
+                cfg.catchup.shards = vec!["writer".into()];
+                cfg.catchup.slice_secs = 2;
+                cfg.catchup.merge_max_bytes = 1024 * 1024;
+            }
+            let mut peer_cfg = cfg.clone();
+            peer_cfg.maintenance.wal_claim_targets.clear();
+            let state = MasterState::new(cfg).await.unwrap();
+            let mut store = RolloutStore::open(&state.rollout_uri("outside"))
+                .await
+                .unwrap();
+            store.add(&[rollout_record("row")]).await.unwrap();
+            store.cleanup_own_shard().await.unwrap();
+            let excluded = enqueue(&state, TaskKind::MergeWal, "excluded")
+                .await
+                .unwrap();
+            let hot = enqueue(&state, TaskKind::MergeWal, "hot").await.unwrap();
+            let compact = enqueue(&state, TaskKind::Compact, "outside").await.unwrap();
+            let scheduler = spawn_scheduler(&state);
+            let selected = await_terminal(&state, &hot.id).await;
+            assert_eq!(selected.state, TaskState::Failed);
+            assert!(selected.error.unwrap().contains("worker endpoints"));
+            assert_eq!(
+                await_terminal(&state, &compact.id).await.state,
+                TaskState::Done
+            );
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            state.admission.begin_drain();
+            tokio::time::timeout(Duration::from_secs(10), state.admission.wait_drained())
+                .await
+                .unwrap();
+            scheduler.abort();
+            let queued = state.task_store.get(&excluded.id).await.unwrap().unwrap();
+            assert_eq!(queued.state, TaskState::Queued);
+            assert!(queued.started_at.is_none());
+            let peer = crate::task_store::TaskStore::open(&peer_cfg).await.unwrap();
+            let claim = peer
+                .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(claim.task.id, excluded.id);
+            peer.finish(claim, Ok("peer accepted".into()))
+                .await
+                .unwrap();
+        }
+    }
+
     /// Maintenance-only masters leave merge tasks available to their peers.
     #[tokio::test]
     #[ignore = "requires ETCD_TEST_ENDPOINTS"]

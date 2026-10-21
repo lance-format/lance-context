@@ -332,6 +332,26 @@ mod tests {
                 .unwrap();
         assert!(!disabled.maintenance.claim_wal_merges);
     }
+
+    #[test]
+    fn wal_claim_targets_are_exact_and_do_not_enable_native_ownership() {
+        let default = MasterConfig::try_parse_from(["lance-context-master"]).unwrap();
+        assert!(default.maintenance.wal_claim_targets.is_empty());
+        let selected = MasterConfig::try_parse_from([
+            "lance-context-master",
+            "--wal-claim-targets=hot,generic:events",
+        ])
+        .unwrap();
+        assert_eq!(
+            selected.maintenance.wal_claim_targets,
+            ["hot", "generic:events"]
+        );
+        assert!(!selected.merge_rollout.owned("hot"));
+        assert!(!crate::local_merge::selected(&selected, "hot"));
+        for invalid in ["--wal-claim-targets=", "--wal-claim-targets=*"] {
+            assert!(MasterConfig::try_parse_from(["lance-context-master", invalid]).is_err());
+        }
+    }
 }
 
 /// Admission and progress deadlines for local master table mutations.
@@ -343,6 +363,11 @@ pub struct MaintenanceConfig {
     /// is not a runtime drain or proof that a predecessor's writes have ended.
     #[arg(long, env = "MASTER_CLAIM_WAL_MERGES", default_value_t = true, action = clap::ArgAction::Set)]
     pub claim_wal_merges: bool,
+    /// Restrict this master's WAL task claims to these exact table names.
+    /// Empty (unset) accepts all targets. This does not select an execution
+    /// protocol, grant ownership, cancel existing work, or restrict maintenance.
+    #[arg(long, env = "MASTER_WAL_CLAIM_TARGETS", value_delimiter = ',', value_parser = parse_wal_claim_target)]
+    pub wal_claim_targets: Vec<String>,
     /// Fence new master compact/index/repair executions even for rollout and
     /// generic targets still using legacy worker merges. This does not migrate
     /// worker admission or retroactively fence pre-upgrade writes.
@@ -385,6 +410,7 @@ impl Default for MaintenanceConfig {
     fn default() -> Self {
         Self {
             claim_wal_merges: true,
+            wal_claim_targets: Vec::new(),
             fence_legacy_maintenance: false,
             compaction_prepare_targets: Vec::new(),
             index_prepare_targets: Vec::new(),
@@ -396,4 +422,11 @@ impl Default for MaintenanceConfig {
             maintenance_drain_timeout_secs: 30,
         }
     }
+}
+
+fn parse_wal_claim_target(value: &str) -> Result<String, String> {
+    if value.trim().is_empty() || value == "*" {
+        return Err("WAL claim targets must be nonempty exact table names; omit the option to accept all tables".into());
+    }
+    Ok(value.to_owned())
 }
