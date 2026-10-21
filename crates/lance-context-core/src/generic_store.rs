@@ -35,7 +35,9 @@ use lance_index::mem_wal::ShardManifest;
 use crate::generic_codec::{batch_to_rows, rows_to_batch, Row};
 use crate::merge_budget::MergeMemoryBudget;
 use crate::store::{CompactionConfig, CompactionStats};
-use crate::store_base::{ListSource, PreparedMerge, StorageBase, StorageBaseOptions};
+use crate::store_base::{
+    is_not_found_error, ListSource, PreparedMerge, StorageBase, StorageBaseOptions,
+};
 use lance_context_api::schema_spec::{SchemaSpec, ID_COLUMN};
 use lance_context_api::MAX_BATCH_GET_IDS;
 
@@ -444,26 +446,38 @@ impl GenericStore {
         if let Some(filter) = filter {
             // Keep point/filtered reads on this handle's view. The server's
             // refresh-on-miss path refreshes the cached handle itself; reading
-            // a newer clone here would bypass that cache update.
-            let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
-            let mut scanner = self
-                .base
-                .lsm_scanner()
-                .await?
-                .project(&refs)?
-                .filter(filter)?;
-            if limit.is_some() || offset.is_some() {
-                scanner = scanner.limit(
-                    map_i64_bound("limit", limit)?,
-                    map_i64_bound("offset", offset)?,
-                )?;
+            // a newer clone on every lookup would bypass that cache update.
+            let result = async {
+                let snapshots = self.base.wal_shard_snapshots().await?;
+                self.scan_filtered_snapshot(
+                    self.base.dataset.clone(),
+                    snapshots,
+                    filter,
+                    limit,
+                    offset,
+                    columns,
+                )
+                .await
             }
-            let mut stream = scanner.try_into_stream().await?;
-            let mut rows = Vec::new();
-            while let Some(batch) = stream.try_next().await? {
-                rows.extend(batch_to_rows(&self.spec, &batch)?);
+            .await;
+            if !self.base.is_version_pinned()
+                && matches!(&result, Err(error) if is_not_found_error(error)
+                    && !matches!(error, LanceError::InvalidInput { .. } | LanceError::SchemaMismatch { .. }))
+            {
+                // GC can remove an opened generation during the scan. An
+                // error is not an absent row: retry a fresh consistent view.
+                // Successful reads and ordinary misses retain cache semantics.
+                return self
+                    .base
+                    .read_consistent(ListSource::All, |dataset, snapshots| {
+                        self.scan_filtered_snapshot(
+                            dataset, snapshots, filter, limit, offset, columns,
+                        )
+                    })
+                    .boxed()
+                    .await;
             }
-            return Ok(rows);
+            return result;
         }
 
         // Only unfiltered lists use this compatibility recovery. Keep retries
@@ -507,6 +521,34 @@ impl GenericStore {
             // layout query depth before they can run).
             .boxed()
             .await
+    }
+
+    async fn scan_filtered_snapshot(
+        &self,
+        dataset: lance::Dataset,
+        snapshots: Vec<ShardSnapshot>,
+        filter: &str,
+        limit: Option<usize>,
+        offset: Option<usize>,
+        columns: &[String],
+    ) -> LanceResult<Vec<Row>> {
+        let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+        let mut scanner =
+            StorageBase::lsm_scanner_for_dataset(&dataset, ID_COLUMN, ListSource::All, snapshots)
+                .project(&refs)?
+                .filter(filter)?;
+        if limit.is_some() || offset.is_some() {
+            scanner = scanner.limit(
+                map_i64_bound("limit", limit)?,
+                map_i64_bound("offset", offset)?,
+            )?;
+        }
+        let mut stream = scanner.try_into_stream().await?;
+        let mut rows = Vec::new();
+        while let Some(batch) = stream.try_next().await? {
+            rows.extend(batch_to_rows(&self.spec, &batch)?);
+        }
+        Ok(rows)
     }
 
     /// Narrow compatibility path for Lance 9's broken batched PK sidecars.
@@ -849,6 +891,68 @@ mod tests {
     use lance_context_api::schema_spec::{ColumnSpec, ColumnType};
     use serde_json::json;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn filtered_point_snapshot_recovers_peer_gc_and_preserves_filter() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let writer = GenericStore::open(uri, spec(), sealing()).await.unwrap();
+        writer
+            .add(&[
+                row(json!({"id":"wanted", "user_id":"value"})),
+                row(json!({"id":"other", "user_id":"hidden"})),
+            ])
+            .await
+            .unwrap();
+        let reader = GenericStore::open_existing(uri, Default::default())
+            .await
+            .unwrap();
+        let writer = tokio::sync::Mutex::new(writer);
+        let attempts = AtomicUsize::new(0);
+        let columns = vec!["id".to_string(), "user_id".to_string()];
+        let rows = reader
+            .base
+            .read_consistent(ListSource::All, |dataset, snapshots| {
+                let reader = &reader;
+                let writer = &writer;
+                let attempts = &attempts;
+                let columns = &columns;
+                async move {
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        writer.lock().await.cleanup_wal().await.unwrap();
+                        for snapshot in &snapshots {
+                            for generation in &snapshot.sstables {
+                                let path = reader
+                                    .base
+                                    .flushed_generation_uri(snapshot.shard_id, &generation.path);
+                                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                                    while std::path::Path::new(&path).exists() {
+                                        tokio::task::yield_now().await;
+                                    }
+                                })
+                                .await
+                                .unwrap();
+                            }
+                        }
+                    }
+                    reader
+                        .scan_filtered_snapshot(
+                            dataset,
+                            snapshots,
+                            "id = 'wanted'",
+                            Some(1),
+                            None,
+                            columns,
+                        )
+                        .await
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(rows, vec![row(json!({"id":"wanted", "user_id":"value"}))]);
+    }
 
     fn spec() -> SchemaSpec {
         SchemaSpec::new(vec![

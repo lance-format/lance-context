@@ -48,6 +48,11 @@ three missing-file failures without a new base commit still stop the request.
 No additional attempt starts after the two-second retry budget is consumed;
 that budget does not cancel an otherwise valid long scan. Reads never return
 partial results or discard required WAL generations to satisfy this bound.
+Rollout point reads apply that recovery to their WAL fallback while preserving
+the cheap cached-base hit and WAL-only semantics. Generic filtered/point reads
+keep their cached-view behavior on success or ordinary miss, but recover an
+actual missing-file race through a fresh consistent snapshot. Pinned reads do
+not advance; invalid filters are not retried as missing storage.
 
 ## Persisted protocol and startup
 
