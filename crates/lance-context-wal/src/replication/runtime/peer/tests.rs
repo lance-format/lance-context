@@ -15,6 +15,7 @@ use rustls::{
 use std::{net::SocketAddr, path::Path};
 
 mod process;
+mod snapshots;
 
 struct Tls {
     client: Arc<rustls::ClientConfig>,

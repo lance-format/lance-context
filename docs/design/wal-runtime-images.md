@@ -42,9 +42,9 @@ install future cannot revoke an already queued operation. Captured tasks and
 images keep the native engine lock alive after runtime shutdown.
 
 This is the runtime integration boundary. It does not schedule automatic
-maintenance, impose a disk quota or add snapshot framing to `peer-transport`.
-Do not enable periodic compaction until the embedding transport serves images
-with authenticated routing, bounded resources, deadlines and failure reporting.
+maintenance or impose a disk quota. The optional `peer::snapshot::Transport`
+provides separate authenticated image streams; attach it and supply physical
+disk admission before enabling compaction. See `wal-snapshot-transport.md`.
 
 Tests use real files and owner threads with a test-only image relay. They cover
 two compacted groups catching up a lagging follower, every original engine
@@ -55,6 +55,8 @@ advance applied state; injected installation sync failure stops sibling workers
 and releases neither a successful completion nor a peer response. Cancellation
 with all sender control credits held still retries and catches up the follower,
 and every original engine reopens with the complete payload. Existing TLS
-process tests also run, but do not yet transfer images through the network.
+process tests also run. Separate snapshot tests use actual TLS and files;
+a separate three-process qualification kills a receiver mid-file and verifies
+rejoin, leader loss and complete engine restart with exact payloads and retries.
 
 Tracking: #378.

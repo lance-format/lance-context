@@ -111,6 +111,12 @@ impl Worker {
 }
 
 impl Handle {
+    /// Validate exact incoming image lengths without creating files. The
+    /// authenticated transport uses this before reserving physical disk space.
+    pub fn snapshot_sizes(&self, packet: Packet) -> Result<Pending<[u64; 2]>> {
+        self.local(packet.group, move |node| node.snapshot_sizes(&packet))
+    }
+
     // Only these typed library operations can access the owner. Their result is
     // held until the next successful durable poll; an error/panic drops the
     // completion as uncertain. Heavy image work stays in the returned task.

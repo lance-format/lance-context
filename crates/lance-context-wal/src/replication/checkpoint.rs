@@ -169,6 +169,16 @@ impl Descriptor {
     }
 }
 
+pub(super) fn snapshot_sizes(
+    snapshot: &Snapshot,
+    layout: &Layout,
+    limits: &Limits,
+    group: u64,
+) -> Result<[u64; 2]> {
+    let descriptor = Descriptor::decode(snapshot, layout, limits, group)?;
+    Ok([descriptor.metadata_bytes, descriptor.payload_bytes])
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Part {
     Metadata,

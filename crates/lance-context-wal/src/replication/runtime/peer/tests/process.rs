@@ -14,12 +14,18 @@ use std::{
 #[derive(Serialize, Deserialize)]
 struct Address {
     peer: SocketAddr,
+    image: SocketAddr,
     control: SocketAddr,
     pid: u32,
 }
 #[derive(Serialize, Deserialize)]
 enum Request {
-    Start(BTreeMap<u64, SocketAddr>),
+    Start {
+        peers: BTreeMap<u64, SocketAddr>,
+        images: BTreeMap<u64, SocketAddr>,
+    },
+    Checkpoint(u64),
+    ImageStatus,
     Campaign(u64),
     Status(u64),
     Append(u64, Batch),
@@ -27,6 +33,7 @@ enum Request {
 #[derive(Serialize, Deserialize)]
 enum Reply {
     Ready,
+    Images { installed: u64 },
     Status(crate::replication::Status),
     Append(Outcome),
     Failed(String),
@@ -104,10 +111,18 @@ async fn tls_peer_process_fixture() -> Result<()> {
     let root = PathBuf::from(std::env::var("CONTEXT_TLS_PEER_TEST_ROOT")?);
     let id: u64 = std::env::var("CONTEXT_TLS_PEER_TEST_ID")?.parse()?;
     let address_file = PathBuf::from(std::env::var("CONTEXT_TLS_PEER_TEST_ADDRESS")?);
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let listener = TcpListener::bind(
+        std::env::var("CONTEXT_TLS_PEER_BIND").unwrap_or_else(|_| "127.0.0.1:0".into()),
+    )
+    .await?;
+    let image_listener = TcpListener::bind(
+        std::env::var("CONTEXT_TLS_IMAGE_BIND").unwrap_or_else(|_| "127.0.0.1:0".into()),
+    )
+    .await?;
     let control = TcpListener::bind("127.0.0.1:0").await?;
     let address = Address {
         peer: listener.local_addr()?,
+        image: image_listener.local_addr()?,
         control: control.local_addr()?,
         pid: std::process::id(),
     };
@@ -117,7 +132,11 @@ async fn tls_peer_process_fixture() -> Result<()> {
     )?;
     fs::rename(address_file.with_extension("tmp"), &address_file)?;
     let (mut stream, _) = control.accept().await?;
-    let Request::Start(addresses) = receive(&mut stream).await? else {
+    let Request::Start {
+        peers: addresses,
+        images: image_addresses,
+    } = receive(&mut stream).await?
+    else {
         anyhow::bail!("missing startup configuration");
     };
     let (client, server, pins) = tls(&root, id)?;
@@ -143,7 +162,11 @@ async fn tls_peer_process_fixture() -> Result<()> {
             )
         })
         .collect();
-    let network = Transport::spawn(
+    let mut image_client = (*client).clone();
+    let mut image_server = (*server).clone();
+    image_client.alpn_protocols = vec![super::super::snapshot::ALPN.to_vec()];
+    image_server.alpn_protocols = vec![super::super::snapshot::ALPN.to_vec()];
+    let mut network = Transport::spawn(
         handle.clone(),
         outbox,
         listener,
@@ -152,18 +175,61 @@ async fn tls_peer_process_fixture() -> Result<()> {
         server,
         Options::default(),
     )?;
+    let images = super::super::snapshot::Transport::spawn(
+        handle.clone(),
+        image_listener,
+        super::super::snapshot::Settings {
+            peers: image_addresses
+                .into_iter()
+                .filter(|(peer, _)| *peer != id)
+                .map(|(peer, address)| {
+                    (
+                        peer,
+                        super::super::Peer {
+                            address: address.to_string(),
+                            server_name: format!("wal-{peer}.example.invalid"),
+                            certificate: pins[&peer],
+                        },
+                    )
+                })
+                .collect(),
+            client_tls: Arc::new(image_client),
+            server_tls: Arc::new(image_server),
+            options: super::super::snapshot::Options {
+                pause_after_payload_chunk: std::env::var_os("CONTEXT_TLS_IMAGE_PAUSE")
+                    .map(PathBuf::from),
+                ..Default::default()
+            },
+            admission: Arc::new(super::snapshots::Quota::open(
+                &root.join(format!("node-{id}")),
+            )?),
+        },
+    )?;
+    network.attach_snapshots(images.route())?;
     respond(&mut stream, Reply::Ready).await?;
     loop {
         let request = match receive(&mut stream).await {
             Ok(request) => request,
             Err(_) => {
+                images.shutdown().await?;
                 network.shutdown().await?;
                 return runtime.shutdown().await;
             }
         };
         let result: Result<Reply> = async {
             Ok(match request {
-                Request::Start(_) => anyhow::bail!("duplicate process startup"),
+                Request::Start { .. } => anyhow::bail!("duplicate process startup"),
+                Request::Checkpoint(group) => {
+                    let task = handle
+                        .prepare_checkpoint(group, uuid::Uuid::new_v4())?
+                        .await?;
+                    let image = tokio::task::spawn_blocking(move || task.run()).await??;
+                    handle.install_checkpoint(image)?.await?;
+                    Reply::Ready
+                }
+                Request::ImageStatus => Reply::Images {
+                    installed: images.statistics().installed.load(Ordering::Acquire),
+                },
                 Request::Campaign(group) => {
                     handle.campaign(group)?.await?;
                     Reply::Ready
@@ -191,11 +257,30 @@ struct Process {
     child: Child,
     stream: ControlStream,
     address: SocketAddr,
+    image_address: SocketAddr,
 }
 impl Process {
     fn spawn(root: &Path, id: u64, incarnation: u64) -> Result<Self> {
+        Self::spawn_at(root, id, incarnation, None, None)
+    }
+    fn spawn_at(
+        root: &Path,
+        id: u64,
+        incarnation: u64,
+        bind: Option<(SocketAddr, SocketAddr)>,
+        pause: Option<&Path>,
+    ) -> Result<Self> {
         let address_file = root.join(format!("address-{id}-{incarnation}"));
-        let mut child = ProcessCommand::new(std::env::current_exe()?)
+        let mut command = ProcessCommand::new(std::env::current_exe()?);
+        if let Some((peer, image)) = bind {
+            command
+                .env("CONTEXT_TLS_PEER_BIND", peer.to_string())
+                .env("CONTEXT_TLS_IMAGE_BIND", image.to_string());
+        }
+        if let Some(pause) = pause {
+            command.env("CONTEXT_TLS_IMAGE_PAUSE", pause);
+        }
+        let mut child = command
             .args([
                 "--exact",
                 "replication::runtime::peer::tests::process::tls_peer_process_fixture",
@@ -218,7 +303,7 @@ impl Process {
                     .open(root.join(format!("stderr-{id}-{incarnation}")))?,
             ))
             .spawn()?;
-        let result = (|| -> Result<(ControlStream, SocketAddr)> {
+        let result = (|| -> Result<(ControlStream, SocketAddr, SocketAddr)> {
             let deadline = Instant::now() + Duration::from_secs(10);
             while !address_file.exists() {
                 ensure!(child.try_wait()?.is_none(), "TLS peer exited at startup");
@@ -234,13 +319,20 @@ impl Process {
             stream.set_nodelay(true)?;
             stream.set_read_timeout(Some(Duration::from_secs(15)))?;
             stream.set_write_timeout(Some(Duration::from_secs(15)))?;
-            Ok((stream, address.peer))
+            if let Some((peer, image)) = bind {
+                ensure!(
+                    address.peer == peer && address.image == image,
+                    "original peer endpoints changed"
+                );
+            }
+            Ok((stream, address.peer, address.image))
         })();
         match result {
-            Ok((stream, address)) => Ok(Self {
+            Ok((stream, address, image_address)) => Ok(Self {
                 child,
                 stream,
                 address,
+                image_address,
             }),
             Err(e) => {
                 let _ = child.kill();
@@ -306,9 +398,20 @@ impl Processes {
             .iter()
             .map(|(&id, node)| (id, node.address))
             .collect();
+        let images = self
+            .nodes
+            .iter()
+            .map(|(&id, n)| (id, n.image_address))
+            .collect::<BTreeMap<_, _>>();
         for node in self.nodes.values_mut() {
             ensure!(
-                matches!(node.call(Request::Start(addresses.clone()))?, Reply::Ready),
+                matches!(
+                    node.call(Request::Start {
+                        peers: addresses.clone(),
+                        images: images.clone()
+                    })?,
+                    Reply::Ready
+                ),
                 "peer not ready"
             );
         }
@@ -435,5 +538,151 @@ fn tls_process_leader_crash_full_restart_and_exact_retries_preserve_all_payloads
         }
     }
     fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
+fn tls_snapshot_process_kill_mid_file_preserves_payloads_after_rejoin_and_full_restart(
+) -> Result<()> {
+    let root = tempfile::tempdir()?.keep();
+    eprintln!(
+        "TLS snapshot process qualification artifacts: {}",
+        root.display()
+    );
+    provision(&root)?;
+    let mut c = Processes {
+        nodes: BTreeMap::new(),
+        root: root.clone(),
+        incarnation: 0,
+    };
+    c.start_all()?;
+    c.nodes.get_mut(&1).unwrap().call(Request::Campaign(10))?;
+    let leader = c.leader(10)?;
+    let follower = *c.nodes.keys().rfind(|&&id| id != leader).unwrap();
+    let mut stopped = c.nodes.remove(&follower).unwrap();
+    let original_endpoints = (stopped.address, stopped.image_address);
+    stopped.kill()?;
+    let mut expected = Vec::new();
+    for sequence in 1..=8 {
+        let b = process_batch(sequence);
+        expected.push((c.append(10, b.clone())?, b));
+    }
+    let leader = c.leader(10)?;
+    assert!(matches!(
+        c.nodes
+            .get_mut(&leader)
+            .unwrap()
+            .call(Request::Checkpoint(10))?,
+        Reply::Ready
+    ));
+    let marker = root.join("received-payload-chunk");
+    restart_follower(&mut c, follower, original_endpoints, Some(&marker))?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !marker.exists() {
+        ensure!(
+            c.nodes
+                .get_mut(&follower)
+                .unwrap()
+                .child
+                .try_wait()?
+                .is_none(),
+            "receiver exited before chunk pause"
+        );
+        ensure!(
+            Instant::now() < deadline,
+            "actual TLS payload chunk not observed"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(fs::read_to_string(&marker)?.parse::<u64>()?, 1 << 20);
+    assert_eq!(c.status(follower, 10)?.accepted_records, 0);
+    // The follower's actual file thread is paused after writing a payload
+    // chunk. Healthy replicas must continue committing before it is killed.
+    let b = process_batch(9);
+    expected.push((c.append(10, b.clone())?, b));
+    c.nodes.remove(&follower).unwrap().kill()?;
+    let partial_bytes: u64 = fs::read_dir(root.join(format!("node-{follower}")))?
+        .collect::<std::io::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|p| {
+            p.file_name()
+                .to_string_lossy()
+                .starts_with("context-application-")
+        })
+        .map(|p| p.metadata().map(|m| m.len()))
+        .collect::<std::io::Result<Vec<_>>>()?
+        .into_iter()
+        .sum();
+    assert!(
+        partial_bytes >= 1 << 20,
+        "test never wrote an actual partial image"
+    );
+    for sequence in 10..=12 {
+        let b = process_batch(sequence);
+        expected.push((c.append(10, b.clone())?, b));
+    }
+    restart_follower(&mut c, follower, original_endpoints, None)?;
+    c.applied(10, expected.last().unwrap().0)?;
+    assert!(
+        matches!(c.nodes.get_mut(&follower).unwrap().call(Request::ImageStatus)?, Reply::Images { installed } if installed > 0)
+    );
+    let leader = c.leader(10)?;
+    c.nodes.remove(&leader).unwrap().kill()?;
+    let b = process_batch(13);
+    expected.push((c.append(10, b.clone())?, b));
+    c.stop_all()?;
+    c.start_all()?;
+    let (last, batch) = expected.last().unwrap();
+    c.applied(10, *last)?;
+    assert_eq!(c.append(10, batch.clone())?, *last);
+    c.stop_all()?;
+    for id in 1..=3 {
+        let node = Node::open(
+            &root.join(format!("node-{id}")),
+            layout(),
+            id,
+            Limits::default(),
+        )?;
+        for (index, batch) in &expected {
+            assert_eq!(node.read_accepted(10, *index)?, Some(batch.clone()));
+        }
+    }
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
+fn process_batch(sequence: u64) -> Batch {
+    let base = batch(sequence);
+    Batch::new(
+        base.meta.stream,
+        0,
+        base.meta.producer,
+        sequence,
+        Bytes::from(vec![sequence as u8; 1 << 20]),
+    )
+}
+fn restart_follower(
+    c: &mut Processes,
+    id: u64,
+    endpoints: (SocketAddr, SocketAddr),
+    pause: Option<&Path>,
+) -> Result<()> {
+    c.incarnation += 1;
+    c.nodes.insert(
+        id,
+        Process::spawn_at(&c.root, id, c.incarnation, Some(endpoints), pause)?,
+    );
+    let peers = c.nodes.iter().map(|(&id, n)| (id, n.address)).collect();
+    let images = c
+        .nodes
+        .iter()
+        .map(|(&id, n)| (id, n.image_address))
+        .collect();
+    assert!(matches!(
+        c.nodes
+            .get_mut(&id)
+            .unwrap()
+            .call(Request::Start { peers, images })?,
+        Reply::Ready
+    ));
     Ok(())
 }

@@ -4,7 +4,8 @@
 //! verifies certificate chains/names; an explicit leaf-certificate fingerprint
 //! binds each connection to its configured Raft node. Use standard verifying
 //! rustls configurations with mutual authentication and the required ALPN.
-//! No client ingestion or snapshot transfer is exposed here.
+//! Optional snapshots use a separate listener and bounded transfer workers.
+//! No client ingestion is exposed here.
 use super::{Handle, Outbound, Packet};
 use anyhow::{ensure, Context, Result};
 use bytes::{Bytes, BytesMut};
@@ -13,7 +14,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
     time::Duration,
 };
@@ -28,6 +29,8 @@ use tokio_rustls::{
     rustls::{self, pki_types::ServerName},
     TlsAcceptor, TlsConnector,
 };
+
+pub mod snapshot;
 
 pub const ALPN: &[u8] = b"lance-context-wal-peer/1";
 const MAGIC: &[u8; 8] = b"LCWPEER1";
@@ -102,6 +105,8 @@ pub struct Transport {
     stop: watch::Sender<bool>,
     tasks: Vec<JoinHandle<Result<()>>>,
     statistics: Arc<Statistics>,
+    snapshots: Arc<OnceLock<snapshot::Route>>,
+    owner: Arc<super::Shared>,
 }
 impl Transport {
     /// The caller owns certificate provisioning/rotation and the already-bound
@@ -155,6 +160,8 @@ impl Transport {
         );
         let (stop, shutdown) = watch::channel(false);
         let statistics = Arc::new(Statistics::default());
+        let snapshots = Arc::new(OnceLock::new());
+        let owner = handle.shared.clone();
         let mut tasks = Vec::new();
         let mut routes = BTreeMap::new();
         for (id, peer) in peers {
@@ -181,6 +188,7 @@ impl Transport {
         tasks.push(tokio::spawn(dispatch(
             outbox,
             routes,
+            snapshots.clone(),
             shutdown.clone(),
             statistics.clone(),
         )));
@@ -197,7 +205,20 @@ impl Transport {
             stop,
             tasks,
             statistics,
+            snapshots,
+            owner,
         })
+    }
+    /// Attach the same runtime's separate snapshot service before compacting.
+    /// Shut down both transports and join their work before reopening storage.
+    pub fn attach_snapshots(&mut self, route: snapshot::Route) -> Result<()> {
+        ensure!(
+            Arc::ptr_eq(&route.owner, &self.owner),
+            "foreign snapshot runtime"
+        );
+        self.snapshots
+            .set(route)
+            .map_err(|_| anyhow::anyhow!("snapshot route already attached"))
     }
     pub fn statistics(&self) -> &Arc<Statistics> {
         &self.statistics
@@ -255,6 +276,7 @@ impl Route {
 async fn dispatch(
     mut outbox: mpsc::Receiver<Outbound>,
     routes: BTreeMap<u64, Route>,
+    snapshots: Arc<OnceLock<snapshot::Route>>,
     mut stop: watch::Receiver<bool>,
     statistics: Arc<Statistics>,
 ) -> Result<()> {
@@ -263,8 +285,12 @@ async fn dispatch(
             _ = stop.changed() => return Ok(()),
             packet = outbox.recv() => {
                 let Some(packet) = packet else { return Ok(()); };
-                let sent = routes.get(&packet.packet().message.to)
-                    .is_some_and(|route| route.enqueue(packet));
+                let sent = if packet.snapshot_image().is_some() {
+                    snapshots.get().is_some_and(|route| route.enqueue(packet))
+                } else {
+                    routes.get(&packet.packet().message.to)
+                        .is_some_and(|route| route.enqueue(packet))
+                };
                 if !sent { statistics.dropped_outbound.fetch_add(1, Ordering::Relaxed); }
             }
         }

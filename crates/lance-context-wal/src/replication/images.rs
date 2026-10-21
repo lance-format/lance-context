@@ -278,15 +278,27 @@ impl Node {
         Ok(image.clone())
     }
 
-    pub fn receive_snapshot(&self, packet: Packet, local_id: Uuid) -> Result<SnapshotReceiver> {
+    /// Validate an incoming descriptor and return exact file lengths without
+    /// creating files. Disk admission must precede `receive_snapshot`.
+    pub fn snapshot_sizes(&self, packet: &Packet) -> Result<[u64; 2]> {
         self.healthy()?;
-        self.validate_packet(&packet)?;
+        self.validate_packet(packet)?;
         ensure!(
             packet.message.get_msg_type() == MessageType::MsgSnapshot
                 && packet.message.entries.is_empty()
                 && packet.message.has_snapshot(),
             "expected snapshot-only message"
         );
+        checkpoint::snapshot_sizes(
+            packet.message.get_snapshot(),
+            &self.layout,
+            &self.limits,
+            packet.group,
+        )
+    }
+
+    pub fn receive_snapshot(&self, packet: Packet, local_id: Uuid) -> Result<SnapshotReceiver> {
+        self.snapshot_sizes(&packet)?;
         let permit = self.images.acquire()?;
         let receiver = checkpoint::Receiver::new(
             &self.images.directory,

@@ -155,6 +155,8 @@ struct Credits {
     bytes: Arc<Semaphore>,
     #[cfg(feature = "peer-transport")]
     capacity_bytes: usize,
+    #[cfg(feature = "peer-transport")]
+    capacity_slots: usize,
 }
 struct Credit {
     _slot: OwnedSemaphorePermit,
@@ -167,6 +169,8 @@ impl Credits {
             bytes: Arc::new(Semaphore::new(bytes)),
             #[cfg(feature = "peer-transport")]
             capacity_bytes: bytes,
+            #[cfg(feature = "peer-transport")]
+            capacity_slots: slots,
         }
     }
     fn reserve(&self, bytes: usize) -> Result<Credit> {
