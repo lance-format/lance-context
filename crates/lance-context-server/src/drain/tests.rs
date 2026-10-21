@@ -140,7 +140,7 @@ async fn panicking_and_failed_handlers_release_all_join_waiters() {
         assert_eq!(response.status(), status);
     }
     // Both observers must wake, including a waiter registered just before drop.
-    let guard = drain.admit().unwrap();
+    let guard = drain.admit(RequestInfo::default()).unwrap();
     drain.close_admission();
     let a = {
         let d = drain.clone();
@@ -158,6 +158,160 @@ async fn panicking_and_failed_handlers_release_all_join_waiters() {
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn inventory_keeps_disconnected_mutation_and_distinguishes_targets() {
+    let drain = Arc::new(Drain::default());
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let handler = {
+        let (entered, release) = (entered.clone(), release.clone());
+        move |axum::extract::Path(name): axum::extract::Path<String>| {
+            let (entered, release) = (entered.clone(), release.clone());
+            async move {
+                // Metadata extraction must preserve the router's decoded params.
+                assert!(["table-one", "table-two"].contains(&name.as_str()));
+                entered.add_permits(1);
+                release.acquire().await.unwrap().forget();
+                StatusCode::NO_CONTENT
+            }
+        }
+    };
+    let app = Router::new()
+        .route("/api/v1/internal/merge-wal/{name}", post(handler.clone()))
+        .route("/api/v1/rollouts/{name}", axum::routing::delete(handler))
+        .layer(middleware::from_fn_with_state(drain.clone(), track_handler));
+    let merge = tokio::spawn(
+        app.clone().oneshot(
+            Request::post("/api/v1/internal/merge-wal/table%2Done?token=secret-query")
+                .header("authorization", "secret-header")
+                .body(Body::from("secret-body"))
+                .unwrap(),
+        ),
+    );
+    let deletion = tokio::spawn(
+        app.oneshot(
+            Request::delete("/api/v1/rollouts/table-two")
+                .body(Body::empty())
+                .unwrap(),
+        ),
+    );
+    tokio::time::timeout(Duration::from_secs(2), entered.acquire_many(2))
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    merge.abort();
+    assert!(merge.await.unwrap_err().is_cancelled());
+    drain.close_admission();
+    {
+        let admission = drain.admission.lock().unwrap();
+        assert_eq!(admission.active.len(), 2);
+        let values: Vec<_> = admission.active.values().collect();
+        assert!(values.iter().any(|r| r.method == "POST"
+            && r.target.as_deref() == Some("table-one")
+            && r.route.as_deref() == Some("/api/v1/internal/merge-wal/{name}")));
+        assert!(values
+            .iter()
+            .any(|r| r.method == "DELETE" && r.target.as_deref() == Some("table-two")));
+        assert!(!format!("{values:?}").contains("secret"));
+    }
+    // The detached mutation is still part of the join even without its caller.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), drain.joined())
+            .await
+            .is_err()
+    );
+    release.add_permits(2);
+    deletion.await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(2), drain.joined())
+        .await
+        .unwrap();
+    assert!(drain.admission.lock().unwrap().active.is_empty());
+}
+
+#[tokio::test]
+async fn inventory_does_not_collect_record_ids_or_invalid_store_identifiers() {
+    let drain = Arc::new(Drain::default());
+    let app = Router::new()
+        .route(
+            "/api/v1/rollouts/{name}/records/{id}/blob",
+            get({
+                let drain = drain.clone();
+                move || {
+                    let drain = drain.clone();
+                    async move {
+                        let admission = drain.admission.lock().unwrap();
+                        let info = admission.active.values().next().unwrap();
+                        assert_eq!(info.method, "GET");
+                        assert_eq!(
+                            info.route.as_deref(),
+                            Some("/api/v1/rollouts/{name}/records/{id}/blob")
+                        );
+                        assert!(info.target.is_none());
+                        assert!(!format!("{info:?}").contains("private-record"));
+                        StatusCode::OK
+                    }
+                }
+            }),
+        )
+        .layer(middleware::from_fn_with_state(drain.clone(), track_handler));
+    for name in ["bad%2Fname", "%FF"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/api/v1/rollouts/{name}/records/private-record/blob?credential=secret"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    drain.joined().await;
+}
+
+#[test]
+fn shutdown_log_cap_does_not_discard_unreported_handlers() {
+    #[derive(Clone)]
+    struct Log(Arc<Mutex<Vec<u8>>>);
+    impl io::Write for Log {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let log = Log(Arc::default());
+    let sink = log.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_writer(move || sink.clone())
+        .finish();
+    let drain = Arc::new(Drain::default());
+    let handlers: Vec<_> = (0..130)
+        .map(|_| drain.admit(RequestInfo::default()).unwrap())
+        .collect();
+    tracing::subscriber::with_default(subscriber, || drain.close_admission());
+    let output = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+    assert_eq!(
+        output
+            .matches("HTTP handler outstanding at shutdown")
+            .count(),
+        128
+    );
+    assert!(output.contains("active_http_handlers=130"));
+    assert!(output.contains("inventory_truncated=true"));
+    assert_eq!(drain.admission.lock().unwrap().active.len(), 130);
+    assert!(drain.admit(RequestInfo::default()).is_none());
+    drop(handlers);
+    assert!(drain.admission.lock().unwrap().active.is_empty());
 }
 
 #[tokio::test]

@@ -6,7 +6,7 @@
 use tracing::Instrument;
 
 use axum::{
-    extract::{Request, State},
+    extract::{FromRequestParts, MatchedPath, RawPathParams, Request, State},
     http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Response},
@@ -14,6 +14,7 @@ use axum::{
     Router,
 };
 use std::{
+    collections::BTreeMap,
     future::Future,
     io,
     net::{Shutdown, SocketAddr},
@@ -69,40 +70,134 @@ pub(crate) async fn serve(
 #[derive(Default)]
 struct Admission {
     closed: bool,
-    active: usize,
+    next_id: u64,
+    active: BTreeMap<u64, RequestInfo>,
 }
-#[derive(Default)]
 pub(crate) struct Drain {
+    id: uuid::Uuid,
     admission: Mutex<Admission>,
     changed: Notify,
     connections: Mutex<Vec<Weak<Connection>>>,
 }
-struct Handler(Arc<Drain>);
+impl Default for Drain {
+    fn default() -> Self {
+        Self {
+            id: uuid::Uuid::new_v4(),
+            admission: Mutex::default(),
+            changed: Notify::default(),
+            connections: Mutex::default(),
+        }
+    }
+}
+
+/// Only route templates and validated store identifiers, never raw URLs,
+/// query strings, record IDs, request bodies, or authentication headers.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct RequestInfo {
+    method: String,
+    route: Option<String>,
+    target: Option<String>,
+}
+
+impl RequestInfo {
+    async fn extract(parts: &mut axum::http::request::Parts) -> Self {
+        let method = match parts.method.as_str() {
+            method @ ("GET" | "HEAD" | "POST" | "PUT" | "DELETE" | "CONNECT" | "OPTIONS"
+            | "TRACE" | "PATCH") => method.to_owned(),
+            _ => "OTHER".into(),
+        };
+        let route = parts
+            .extensions
+            .get::<MatchedPath>()
+            .map(|p| p.as_str().to_owned());
+        let target = match RawPathParams::from_request_parts(parts, &()).await {
+            Ok(params) => params.iter().find_map(|(key, value)| {
+                if !matches!(key, "name" | "context_id")
+                    || lance_context_core::validate_store_name(value).is_err()
+                {
+                    return None;
+                }
+                Some(value.to_owned())
+            }),
+            Err(_) => None,
+        };
+        Self {
+            method,
+            route,
+            target,
+        }
+    }
+}
+
+struct Handler {
+    drain: Arc<Drain>,
+    id: u64,
+}
 impl Drop for Handler {
     fn drop(&mut self) {
-        let mut admission = self.0.admission.lock().unwrap();
-        admission.active -= 1;
-        self.0.changed.notify_waiters();
+        let (closed, remaining, request) = {
+            let mut admission = self.drain.admission.lock().unwrap();
+            let request = admission.active.remove(&self.id);
+            self.drain.changed.notify_waiters();
+            (admission.closed, admission.active.len(), request)
+        };
+        if closed {
+            tracing::info!(
+                drain_id = %self.drain.id,
+                request_id = self.id,
+                request = ?request,
+                active_http_handlers = remaining,
+                "accepted HTTP handler joined during shutdown"
+            );
+        }
     }
 }
 impl Drain {
-    fn admit(self: &Arc<Self>) -> Option<Handler> {
+    fn admit(self: &Arc<Self>, request: RequestInfo) -> Option<Handler> {
         let mut admission = self.admission.lock().unwrap();
         if admission.closed {
             return None;
         }
-        admission.active += 1;
-        Some(Handler(self.clone()))
+        let id = admission.next_id;
+        admission.next_id = id
+            .checked_add(1)
+            .expect("HTTP request identifier exhausted");
+        admission.active.insert(id, request);
+        Some(Handler {
+            drain: self.clone(),
+            id,
+        })
     }
     pub(crate) fn close_admission(&self) {
-        let mut admission = self.admission.lock().unwrap();
-        if !admission.closed {
-            tracing::info!(
-                active_http_handlers = admission.active,
-                "closed HTTP admission; joining accepted work"
-            );
+        // Snapshot while closing admission, then release the lock before log IO.
+        // Completion logs may race the inventory; correlate by drain/request ID.
+        let (count, requests) = {
+            let mut admission = self.admission.lock().unwrap();
+            if admission.closed {
+                return;
+            }
             admission.closed = true;
             self.changed.notify_waiters();
+            (
+                admission.active.len(),
+                admission
+                    .active
+                    .iter()
+                    .take(128)
+                    .map(|(id, request)| (*id, request.clone()))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        tracing::info!(
+            drain_id = %self.id,
+            active_http_handlers = count,
+            reported_http_handlers = requests.len(),
+            inventory_truncated = requests.len() < count,
+            "closed HTTP admission; joining accepted work"
+        );
+        for (id, request) in requests {
+            tracing::info!(drain_id = %self.id, request_id = id, ?request,
+                "HTTP handler outstanding at shutdown");
         }
     }
     pub(crate) async fn joined(&self) {
@@ -110,7 +205,7 @@ impl Drain {
             let changed = self.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            if self.admission.lock().unwrap().active == 0 {
+            if self.admission.lock().unwrap().active.is_empty() {
                 return;
             }
             changed.await;
@@ -162,7 +257,10 @@ pub(crate) async fn track_handler(
     request: Request,
     next: Next,
 ) -> Response {
-    let Some(handler) = drain.admit() else {
+    let (mut parts, body) = request.into_parts();
+    let info = RequestInfo::extract(&mut parts).await;
+    let request = Request::from_parts(parts, body);
+    let Some(handler) = drain.admit(info) else {
         return (StatusCode::SERVICE_UNAVAILABLE, "worker is draining").into_response();
     };
     // Dropping a JoinHandle detaches it. A client disconnect therefore cannot
