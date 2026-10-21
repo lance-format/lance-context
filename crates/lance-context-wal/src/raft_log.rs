@@ -16,7 +16,9 @@
 //! Only the owning process may modify the files.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(any(test, feature = "replication"))]
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard};
 
@@ -62,7 +64,9 @@ impl MessageExt for EntryIndex {
 
 struct NodeEngine {
     engine: LogEngine,
+    #[cfg(any(test, feature = "replication"))]
     directory: PathBuf,
+    #[cfg(feature = "replication")]
     target_file_bytes: u64,
     written: Arc<AtomicU64>,
     budget: OnceLock<Arc<crate::admission::Budget>>,
@@ -424,7 +428,9 @@ impl PhysicalLog {
         let node_id = node;
         let node = Arc::new(NodeEngine {
             engine,
+            #[cfg(any(test, feature = "replication"))]
             directory: PathBuf::from(directory),
+            #[cfg(feature = "replication")]
             target_file_bytes: options.target_file_bytes,
             written: Arc::new(AtomicU64::new(0)),
             budget: OnceLock::new(),

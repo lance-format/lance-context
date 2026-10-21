@@ -1,6 +1,8 @@
 //! One physical directory's admission and measurement lifecycle.
 use super::*;
-use crate::admission::{Budget, Snapshot};
+#[cfg(any(test, feature = "replication"))]
+use crate::admission::Budget;
+use crate::admission::Snapshot;
 
 /// Local admission policy, independent of replicated layout/state. Producer
 /// proposals stop at `data_bytes`; new images preserve `headroom_bytes` for
@@ -12,6 +14,7 @@ pub struct DiskOptions {
     pub data_bytes: usize,
     pub headroom_bytes: usize,
 }
+#[cfg(any(test, feature = "replication"))]
 impl DiskOptions {
     pub(crate) fn validate(&self) -> Result<()> {
         ensure!(
@@ -47,12 +50,14 @@ impl DiskMeasurement {
 }
 
 impl GroupLog {
+    #[cfg(feature = "replication")]
     pub(crate) fn allocation_headroom(&self) -> Result<u64> {
         self.node
             .target_file_bytes
             .checked_mul(2)
             .context("log file headroom overflow")
     }
+    #[cfg(any(test, feature = "replication"))]
     pub(crate) fn configure_disk(&self, options: DiskOptions) -> Result<()> {
         options.validate()?;
         let _guard = self
@@ -84,6 +89,7 @@ impl GroupLog {
             .map_err(|_| anyhow::anyhow!("node disk budget already configured"))?;
         Ok(())
     }
+    #[cfg(any(test, feature = "replication"))]
     pub(crate) fn disk_budget(&self) -> Option<&Arc<Budget>> {
         self.node.budget.get()
     }
@@ -96,12 +102,14 @@ impl GroupLog {
             node: self.node.clone(),
         })
     }
+    #[cfg(any(test, feature = "replication"))]
     pub(crate) fn image_collection_guard(&self) -> Result<std::sync::RwLockWriteGuard<'_, ()>> {
         self.node
             .filesystem
             .write()
             .map_err(|_| anyhow::anyhow!("maintenance gate poisoned"))
     }
+    #[cfg(feature = "replication")]
     pub(crate) fn refresh_disk_exclusive(&self) -> Result<()> {
         if let Some(budget) = self.node.budget.get() {
             budget.refresh_exclusive()?;
