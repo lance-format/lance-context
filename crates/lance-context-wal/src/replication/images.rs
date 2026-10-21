@@ -31,6 +31,16 @@ struct Registry {
     installed: BTreeMap<u64, (u64, Uuid)>,
 }
 impl Owner {
+    pub(super) fn configure_disk(
+        self: &Arc<Self>,
+        options: crate::raft_log::DiskOptions,
+    ) -> Result<()> {
+        let _permit = self.acquire()?;
+        self.store.configure_disk(options)
+    }
+    pub(super) fn store(&self) -> &GroupLog {
+        &self.store
+    }
     pub fn new(directory: &Path, groups: BTreeSet<u64>, store: GroupLog) -> Result<Arc<Self>> {
         Ok(Arc::new(Self {
             directory: directory.canonicalize()?,
@@ -111,6 +121,14 @@ impl CheckpointTask {
             state,
         } = self;
         let group = cut.group;
+        let _disk = permit
+            .0
+            .store
+            .disk_budget()
+            .map(|budget| {
+                budget.reserve_files(&checkpoint::build_sizes(&layout, &limits, &cut, &state)?)
+            })
+            .transpose()?;
         let loaded = checkpoint::build(
             &permit.0.directory,
             &layout,
@@ -151,9 +169,13 @@ impl PreparedCheckpoint {
 /// Bounded transfer state. Socket I/O stays outside the Raft owner; move this
 /// object to the admitted worker and feed exact, sequential file chunks.
 pub struct SnapshotReceiver {
-    permit: Permit,
     packet: Packet,
     receiver: checkpoint::Receiver,
+    // Declared after receiver: buffered file writes must finish before the
+    // pending charge turns into counted retained growth, including on Drop.
+    _disk: Option<crate::admission::FileReservation>,
+    // Release the image/engine owner only after buffered writers and accounting.
+    permit: Permit,
 }
 impl SnapshotReceiver {
     pub fn write(&mut self, part: Part, offset: u64, bytes: &[u8]) -> Result<()> {
@@ -298,8 +320,14 @@ impl Node {
     }
 
     pub fn receive_snapshot(&self, packet: Packet, local_id: Uuid) -> Result<SnapshotReceiver> {
-        self.snapshot_sizes(&packet)?;
+        let sizes = self.snapshot_sizes(&packet)?;
         let permit = self.images.acquire()?;
+        let disk = self
+            .images
+            .store
+            .disk_budget()
+            .map(|budget| budget.reserve_files(&sizes))
+            .transpose()?;
         let receiver = checkpoint::Receiver::new(
             &self.images.directory,
             packet.message.get_snapshot(),
@@ -312,6 +340,7 @@ impl Node {
             permit,
             packet,
             receiver,
+            _disk: disk,
         })
     }
 
@@ -397,7 +426,7 @@ pub(super) fn install_received(
     prepared.permit.0.installed(&prepared.loaded.image)?;
     g.state = prepared.loaded.state;
     g.image = Some(prepared.loaded.image);
-    for (_, (request, _)) in std::mem::take(&mut g.pending) {
+    for (_, (request, _, _reservation)) in std::mem::take(&mut g.pending) {
         events.completions.push(Completion {
             group: id,
             request,

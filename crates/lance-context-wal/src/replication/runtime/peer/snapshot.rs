@@ -1,8 +1,8 @@
 //! Authenticated image streams on separate sockets and one joined file worker.
-//! Snapshot I/O never occupies ordinary peer sockets. Disk admission is supplied
-//! by the embedding service and must account for installed and orphaned files,
-//! concurrent log growth and maintenance headroom; concurrent-transfer credits
-//! alone are not a physical disk quota.
+//! Snapshot I/O never occupies ordinary peer sockets. A configured node disk
+//! budget is required; it reserves exact file lengths before creation and keeps
+//! installed and orphaned files charged alongside log growth. An optional extra
+//! admission policy may impose stricter service limits. This is not an OS quota.
 use super::*;
 use crate::replication::checkpoint::{Image, Part, CHUNK_BYTES};
 use std::{future::Future, thread};
@@ -31,12 +31,13 @@ impl Incoming {
     }
 }
 
-/// Required physical disk admission, executed on the bounded file worker.
+/// Optional additional admission, executed on the bounded file worker.
+/// The required node budget is enforced independently before file creation.
 /// The returned owner spans pending file work, even when its network task is
 /// cancelled. Dropping it MUST NOT release space still used by installed or
 /// orphaned files. Reclaim that charge only after actual collection. Reopening
 /// the service must recover accounting from its existing files. There is no
-/// permissive default implementation.
+/// weakening of the node budget when this additional policy is absent.
 pub trait Admission: Send + Sync + 'static {
     fn reserve(&self, incoming: &Incoming) -> Result<Arc<dyn Send + Sync>>;
 }
@@ -72,7 +73,7 @@ pub struct Settings {
     pub client_tls: Arc<rustls::ClientConfig>,
     pub server_tls: Arc<rustls::ServerConfig>,
     pub options: Options,
-    pub admission: Arc<dyn Admission>,
+    pub admission: Option<Arc<dyn Admission>>,
 }
 
 #[derive(Default)]
@@ -148,6 +149,10 @@ pub struct Transport {
 }
 impl Transport {
     pub fn spawn(handle: Handle, listener: TcpListener, settings: Settings) -> Result<Self> {
+        ensure!(
+            handle.disk.is_some(),
+            "snapshot transport requires configured node disk admission"
+        );
         let Settings {
             peers,
             client_tls,
@@ -367,7 +372,7 @@ async fn listen(
     fingerprints: Arc<BTreeMap<[u8; 32], u64>>,
     files: Files,
     options: Options,
-    admission: Arc<dyn Admission>,
+    admission: Option<Arc<dyn Admission>>,
     stop: watch::Receiver<bool>,
     statistics: Arc<Statistics>,
 ) -> Result<()> {
@@ -519,7 +524,7 @@ async fn receive_image<S: AsyncRead + AsyncWrite + Unpin>(
     peer: u64,
     files: &Files,
     options: &Options,
-    admission: Arc<dyn Admission>,
+    admission: Option<Arc<dyn Admission>>,
 ) -> Result<()> {
     let packet = read_header(stream, handle, peer).await?;
     let sizes = handle.snapshot_sizes(packet.clone())?.await?;
@@ -534,7 +539,9 @@ async fn receive_image<S: AsyncRead + AsyncWrite + Unpin>(
         incoming.bytes()? <= options.max_image_bytes,
         "snapshot exceeds receive budget"
     );
-    let reservation = files.run(move || admission.reserve(&incoming)).await?;
+    let reservation = files
+        .run(move || admission.map(|a| a.reserve(&incoming)).transpose())
+        .await?;
     let mut receiver = handle
         .receive_snapshot(packet, uuid::Uuid::new_v4())?
         .await?;

@@ -106,7 +106,8 @@ impl Cluster {
         Ok(c)
     }
     fn start(&mut self, root: &Path, id: u64, listener: TcpListener) -> Result<()> {
-        let node = Node::open(&root.join(id.to_string()), layout(), id, Limits::default())?;
+        let node = Node::open(&root.join(id.to_string()), layout(), id, Limits::default())?
+            .with_disk_budget(disk_options())?;
         let (runtime, outbox) = Runtime::spawn(node, super::super::Options::default())?;
         let handle = runtime.handle();
         let peers = self
@@ -467,4 +468,12 @@ async fn framing_shares_outbound_payload_and_rejects_unfunded_bodies_before_read
     drop(decoded);
     assert_eq!(credits.available_permits(), 4 << 20);
     runtime.shutdown().await
+}
+
+fn disk_options() -> crate::raft_log::DiskOptions {
+    crate::raft_log::DiskOptions {
+        max_bytes: 512 << 20,
+        data_bytes: 128 << 20,
+        headroom_bytes: 256 << 20,
+    }
 }

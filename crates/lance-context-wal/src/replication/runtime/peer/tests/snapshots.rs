@@ -105,7 +105,7 @@ impl Images {
                     transfer_timeout: Duration::from_secs(60),
                     ..Default::default()
                 },
-                admission,
+                admission: Some(admission),
             },
         )?;
         self.net

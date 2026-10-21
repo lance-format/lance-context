@@ -1,6 +1,8 @@
 use super::*;
 use bytes::Bytes;
 
+#[path = "tests/disk_budget.rs"]
+mod disk_budget;
 #[path = "tests/image_collection.rs"]
 mod image_collection;
 

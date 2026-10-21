@@ -21,6 +21,19 @@ impl LogMaintenance {
     /// per-call byte/time bound, so callers must measure its latency and reserve
     /// rewrite headroom. This API alone does not impose a disk quota.
     pub fn run(&self) -> Result<Vec<u64>> {
+        // Admission failure occurs before touching native storage and must not
+        // fence a healthy node. Existing accepted traffic still owns its window.
+        let _reservation = self
+            .node
+            .budget
+            .get()
+            .map(|budget| {
+                budget.reserve(
+                    usize::try_from(budget.snapshot().accounted_disk_bytes)?,
+                    false,
+                )
+            })
+            .transpose()?;
         let result = self.run_locked();
         if result.is_err() {
             self.node.failed.store(true, Ordering::Release);
@@ -48,6 +61,11 @@ impl LogMaintenance {
         // The maintenance gate drained pending appends and checkpoint writes.
         // Establish an explicit durable marker before the native rewrite too.
         self.node.sync_locked()?;
+        let _files = self
+            .node
+            .filesystem
+            .write()
+            .map_err(|_| anyhow::anyhow!("filesystem lifecycle lock poisoned"))?;
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.node.engine.purge_expired_files()
         }));
@@ -65,6 +83,11 @@ impl LogMaintenance {
         groups.retain(|group| *group != 0);
         groups.sort_unstable();
         groups.dedup();
+        if let Some(budget) = self.node.budget.get() {
+            // Native rewrites are outside Engine::write. While every appender
+            // and image collector is excluded, replace the measured baseline.
+            budget.refresh_exclusive()?;
+        }
         self.node.check()?;
         Ok(groups)
     }

@@ -22,21 +22,23 @@ already running filesystem operation. Dropping a transport requests shutdown;
 call `shutdown().await` before reopening storage. A stalled image connection does
 not occupy an ordinary Raft connection.
 
-The embedding service must supply `Admission`; there is no permissive default.
-Its accounting must cover existing installed images, orphaned/partial files,
-concurrent log growth and maintenance headroom, and recover after restart. A
-reservation owner spans pending file work. Releasing the owner must not release
-charges for files that still exist. Collection, rather than network completion,
-reclaims those charges. `max_image_bytes` and connection counts do not impose a
-physical node disk quota. The shared production disk-admission implementation,
-automatic maintenance and public ingestion integration remain follow-up work.
+The node must configure `with_disk_budget` before starting this transport. Its
+shared policy covers installed images, orphaned/partial files, encoded log
+growth and reserved maintenance headroom. A reservation spans pending file work;
+completion or cancellation does not return space still used by files. An optional
+`Admission` callback can impose additional service restrictions. Neither that
+callback nor `max_image_bytes` replaces shared accounting. See
+`wal-node-disk-admission.md` for its limits: this is not a hard filesystem quota,
+and automatic maintenance, peer disk credits and public ingestion integration
+remain follow-up work.
 
 Tests exercise actual mutual TLS and files, including two compacted groups,
 reopening all original engines with complete payload and exact retries, stalled
 snapshot isolation from healthy quorum commits, admission rejection before
 files, interrupted reception without successful acknowledgment, and retained
-orphan charges. The test admission provider is a conservative image-only budget;
-it does not implement the missing production-wide disk policy. A three-process qualification also pauses after a real payload chunk is written,
+orphan charges. Additional rejection tests use a conservative image-only policy
+on top of the node budget. A three-process qualification uses the built-in shared
+budget alone and pauses after a real payload chunk is written,
 kills that receiver, rejoins its original files and endpoints, kills the leader,
 and restarts all original engines. Every payload and exact retry index must
 survive. The parent carries only test control requests; TLS carries both Raft

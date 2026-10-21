@@ -4,7 +4,7 @@
 //! snapshot/GC and replica-pressure coordination are required for sustained use.
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex, RwLock, TryLockError,
 };
 
@@ -16,7 +16,9 @@ pub struct Snapshot {
     pub measured_disk_bytes: u64,
     pub accounted_disk_bytes: u64,
     pub reserved_proposal_bytes: u64,
+    pub reserved_file_bytes: u64,
     pub data_limit: u64,
+    pub file_limit: u64,
     pub max_log_bytes: u64,
 }
 #[derive(Debug)]
@@ -24,12 +26,15 @@ struct Accounting {
     measured: u64,
     counter_at_measurement: u64,
     pending: u64,
+    pending_files: u64,
 }
 #[derive(Debug)]
 pub struct Budget {
     directory: PathBuf,
     written: Arc<AtomicU64>,
     data_limit: AtomicU64,
+    file_limit: AtomicU64,
+    failed: AtomicBool,
     max: u64,
     accounting: Mutex<Accounting>,
     filesystem: Arc<RwLock<()>>,
@@ -59,10 +64,13 @@ impl Budget {
             filesystem,
             max: max as u64,
             data_limit: AtomicU64::new((max - reserve) as u64),
+            file_limit: AtomicU64::new(max as u64),
+            failed: AtomicBool::new(false),
             accounting: Mutex::new(Accounting {
                 measured,
                 counter_at_measurement: counter,
                 pending: 0,
+                pending_files: 0,
             }),
         }))
     }
@@ -91,25 +99,77 @@ impl Budget {
     /// write counts include peer traffic and control/HardState writes across all
     /// groups; pending proposals are charged atomically on top of that baseline.
     pub fn reserve(self: &Arc<Self>, bytes: usize, data: bool) -> Result<Reservation> {
+        self.reserve_below(bytes, false, || {
+            if data {
+                self.data_limit.load(Ordering::Acquire)
+            } else {
+                self.max
+            }
+        })
+    }
+    fn reserve_below(
+        self: &Arc<Self>,
+        bytes: usize,
+        file: bool,
+        limit: impl FnOnce() -> u64,
+    ) -> Result<Reservation> {
         let bytes = u64::try_from(bytes)?;
         let mut state = self.accounting.lock().unwrap();
-        let limit = if data {
-            self.data_limit.load(Ordering::Acquire)
-        } else {
-            self.max
-        };
+        ensure!(
+            !self.failed.load(Ordering::Acquire),
+            "disk accounting failed"
+        );
         ensure!(
             self.accounted(&state)
-                .saturating_add(state.pending)
-                .saturating_add(bytes)
-                <= limit,
+                .checked_add(state.pending)
+                .and_then(|n| n.checked_add(bytes))
+                .is_some_and(|n| n <= limit()),
             "node proposal disk budget exhausted; data admission preserves control window"
         );
         state.pending += bytes;
+        if file {
+            state.pending_files += bytes;
+        }
         Ok(Reservation {
             budget: self.clone(),
             bytes,
+            file,
         })
+    }
+
+    /// Preserve a separate log/control/rewrite window from new image files.
+    /// Apply before exposing the node. Already held reservations remain charged.
+    pub fn limit_files(&self, bytes: usize) -> Result<()> {
+        let bytes = u64::try_from(bytes)?;
+        let _state = self.accounting.lock().unwrap();
+        ensure!(
+            bytes > 0 && bytes <= self.file_limit.load(Ordering::Acquire),
+            "invalid file ceiling"
+        );
+        self.file_limit.store(bytes, Ordering::Release);
+        Ok(())
+    }
+
+    /// Reserve complete file lengths before creation, rounded independently to
+    /// 4 KiB. Keep the owner until all writes (including buffered drops) finish.
+    /// Drop converts the whole reservation to counted growth: interrupted and
+    /// installed files remain charged until a later directory measurement.
+    /// Filesystem allocation can exceed this rounding; this is admission with
+    /// reserved headroom, not an OS quota or a physical free-space guarantee.
+    pub fn reserve_files(self: &Arc<Self>, lengths: &[u64]) -> Result<FileReservation> {
+        let bytes = lengths.iter().try_fold(0u64, |sum, length| {
+            let rounded = length
+                .checked_add(4095)
+                .map(|n| n / 4096 * 4096)
+                .ok_or_else(|| anyhow::anyhow!("file reservation overflow"))?;
+            sum.checked_add(rounded)
+                .ok_or_else(|| anyhow::anyhow!("file reservation overflow"))
+        })?;
+        Ok(FileReservation(self.reserve_below(
+            usize::try_from(bytes)?,
+            true,
+            || self.file_limit.load(Ordering::Acquire),
+        )?))
     }
     /// Refresh after persistence and on explicit status reads. Sampling the
     /// counter BEFORE reading directory metadata makes overlapping appends count
@@ -117,6 +177,10 @@ impl Budget {
     /// Engine append writes must not acquire the accounting mutex: independent
     /// group writes can still coalesce in the engine.
     pub fn refresh(&self) -> Result<()> {
+        ensure!(
+            !self.failed.load(Ordering::Acquire),
+            "disk accounting failed"
+        );
         let _files = match self.filesystem.try_read() {
             Ok(guard) => guard,
             Err(TryLockError::WouldBlock) => return Ok(()),
@@ -126,7 +190,7 @@ impl Budget {
     }
     /// Caller owns a directory lifecycle read/write guard. No unlink/purge can
     /// overlap this measurement or its accounting update. Engine appends can.
-    fn refresh_exclusive(&self) -> Result<()> {
+    pub(crate) fn refresh_exclusive(&self) -> Result<()> {
         let counter = self.written.load(Ordering::Acquire);
         let measured = retained_disk_bytes(&self.directory)?;
         let mut state = self.accounting.lock().unwrap();
@@ -141,9 +205,31 @@ impl Budget {
         Snapshot {
             measured_disk_bytes: state.measured,
             accounted_disk_bytes: self.accounted(&state),
-            reserved_proposal_bytes: state.pending,
+            reserved_proposal_bytes: state.pending - state.pending_files,
+            reserved_file_bytes: state.pending_files,
             data_limit: self.data_limit.load(Ordering::Acquire),
+            file_limit: self.file_limit.load(Ordering::Acquire),
             max_log_bytes: self.max,
+        }
+    }
+}
+
+/// A physical-file operation's charge outlives network cancellation. Unlike a
+/// proposal reservation, dropping this owner does not return retained disk space.
+pub struct FileReservation(Reservation);
+impl Drop for FileReservation {
+    fn drop(&mut self) {
+        let budget = &self.0.budget;
+        // Publish growth before Reservation's drop releases its pending charge.
+        // A racing refresh sees the existing files or retains this growth delta.
+        if budget
+            .written
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                n.checked_add(self.0.bytes)
+            })
+            .is_err()
+        {
+            budget.failed.store(true, Ordering::Release);
         }
     }
 }
@@ -151,10 +237,15 @@ impl Budget {
 pub struct Reservation {
     budget: Arc<Budget>,
     bytes: u64,
+    file: bool,
 }
 impl Drop for Reservation {
     fn drop(&mut self) {
-        self.budget.accounting.lock().unwrap().pending -= self.bytes;
+        let mut state = self.budget.accounting.lock().unwrap();
+        state.pending -= self.bytes;
+        if self.file {
+            state.pending_files -= self.bytes;
+        }
     }
 }
 
@@ -186,6 +277,51 @@ fn retained_disk_bytes(directory: &Path) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn interrupted_files_stay_charged_until_measurement_and_actual_collection() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let lifecycle = Arc::new(RwLock::new(()));
+        let budget = Budget::new(
+            directory.path(),
+            Arc::new(AtomicU64::new(0)),
+            8 << 20,
+            lifecycle.clone(),
+        )?;
+        budget.limit_data(4 << 20)?;
+        budget.limit_files(5 << 20)?;
+        let receiving = budget.reserve_files(&[3 << 20, 1])?;
+        assert!(budget.reserve(1 << 20, true).is_err());
+        let path = directory.path().join("partial.pack");
+        std::fs::write(&path, vec![7; 1 << 20])?;
+        // A measurement while the writer still exists cannot return its credit.
+        budget.refresh()?;
+        drop(receiving);
+        assert_eq!(budget.snapshot().reserved_proposal_bytes, 0);
+        assert!(budget.snapshot().accounted_disk_bytes >= 3 << 20);
+        assert!(budget.reserve(2 << 20, true).is_err());
+        budget.refresh()?;
+        assert_eq!(budget.snapshot().accounted_disk_bytes, 1 << 20);
+        let reopened = Budget::new(
+            directory.path(),
+            Arc::new(AtomicU64::new(0)),
+            8 << 20,
+            lifecycle.clone(),
+        )?;
+        assert_eq!(reopened.snapshot().accounted_disk_bytes, 1 << 20);
+        {
+            let _files = lifecycle.write().unwrap();
+            std::fs::remove_file(path)?;
+            budget.refresh_exclusive()?;
+        }
+        assert_eq!(budget.snapshot().accounted_disk_bytes, 0);
+        assert!(budget.reserve_files(&[u64::MAX]).is_err());
+        assert!(budget.reserve_files(&[5 << 20, 1]).is_err());
+        assert!(
+            budget.reserve(6 << 20, false).is_ok(),
+            "control window remains independent"
+        );
+        Ok(())
+    }
     #[test]
     fn lower_ceiling_keeps_pending_proposals_and_maintenance_charged() -> Result<()> {
         let directory = tempfile::tempdir()?;

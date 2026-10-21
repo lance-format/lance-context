@@ -111,6 +111,15 @@ impl Worker {
 }
 
 impl Handle {
+    pub fn disk_budget(&self) -> Option<crate::admission::Snapshot> {
+        self.disk.as_ref().map(|budget| budget.snapshot())
+    }
+    /// Capture a blocking directory measurement retaining the physical engine.
+    /// Run this on the maintenance worker, never on an async executor thread.
+    pub fn prepare_disk_measurement(&self) -> Result<Pending<crate::raft_log::DiskMeasurement>> {
+        let group = *self.routes.keys().next().context("no hosted group")?;
+        self.local(group, |node| node.prepare_disk_measurement())
+    }
     /// Validate exact incoming image lengths without creating files. The
     /// authenticated transport uses this before reserving physical disk space.
     pub fn snapshot_sizes(&self, packet: Packet) -> Result<Pending<[u64; 2]>> {

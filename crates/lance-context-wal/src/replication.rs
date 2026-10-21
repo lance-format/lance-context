@@ -8,8 +8,9 @@
 //! The owner schedules ticks, bounded network I/O and calls on one thread. This
 //! component supports explicit application checkpoints and prepared snapshot
 //! transfer and explicit collection of unreferenced application images. Raft
-//! segment reclamation, production scheduling and bounded disk admission remain
-//! separate responsibilities.
+//! segment reclamation and production scheduling remain separate responsibilities.
+//! Optional shared node disk admission covers proposals and image files while
+//! preserving a window for accepted peer traffic; it is not a filesystem quota.
 //! Message scope checks are not authentication. Do not expose it to untrusted
 //! transport or enable ingestion without the remaining admission/lifecycle work.
 
@@ -246,7 +247,7 @@ struct Group {
     raw: RawNode<GroupLog>,
     state: State,
     // Index AND term prevents suffix replacement from completing another input.
-    pending: BTreeMap<(u64, u64), (u64, BatchMeta)>,
+    pending: BTreeMap<(u64, u64), (u64, BatchMeta, Option<crate::admission::Reservation>)>,
     reads: query::Tracker,
     image: Option<Arc<checkpoint::Image>>,
     incoming: Option<PreparedCheckpoint>,
@@ -270,6 +271,44 @@ pub struct Node {
 }
 
 impl Node {
+    /// Configure one shared physical-directory budget before splitting group
+    /// owners or starting transports. Reopens reconstruct installed/orphan/log
+    /// usage from the same directory. This does not alter replicated identity.
+    pub fn with_disk_budget(self, options: crate::raft_log::DiskOptions) -> Result<Self> {
+        options.validate()?;
+        ensure!(
+            self.groups.len()
+                == self
+                    .layout
+                    .groups
+                    .values()
+                    .filter(|v| v.contains(&self.id))
+                    .count(),
+            "configure disk admission before splitting groups"
+        );
+        let allocation = self.images.store().allocation_headroom()?;
+        let reserve = self
+            .limits
+            .max_uncommitted_bytes
+            .checked_mul(self.groups.len() as u64)
+            .and_then(|n| n.checked_add(allocation))
+            .context("replication headroom overflow")?;
+        ensure!(
+            options.headroom_bytes as u64 >= reserve,
+            "headroom must cover hosted uncommitted windows and two log files"
+        );
+        self.images.configure_disk(options)?;
+        Ok(self)
+    }
+
+    pub fn disk_budget(&self) -> Option<crate::admission::Snapshot> {
+        self.images.store().disk_budget().map(|b| b.snapshot())
+    }
+
+    pub fn prepare_disk_measurement(&self) -> Result<crate::raft_log::DiskMeasurement> {
+        self.healthy()?;
+        self.images.store().disk_measurement()
+    }
     /// Give each group to an independent worker while retaining the shared
     /// physical engine and its sync/failure fence. Consumes the aggregate owner;
     /// it never clones a RawNode or permits two owners of one group.
@@ -679,6 +718,19 @@ impl Node {
         );
         let index = g.raw.raft.raft_log.last_index() + 1;
         let term = g.raw.raft.term;
+        let reservation = g
+            .raw
+            .store()
+            .disk_budget()
+            .map(|budget| {
+                let bytes = batch
+                    .body
+                    .len()
+                    .checked_add(4096)
+                    .context("proposal disk reservation overflow")?;
+                budget.reserve(bytes, batch.meta.kind == crate::record::RecordKind::Data)
+            })
+            .transpose()?;
         // RawNode::propose accepts Vec and would copy the opaque Bytes. This is
         // the equivalent raft-rs proposal path with shared entry.data ownership.
         let entry = Entry {
@@ -695,7 +747,8 @@ impl Node {
             g.raw.raft.raft_log.last_index() == index,
             "proposal was not queued"
         );
-        g.pending.insert((index, term), (request, batch.meta));
+        g.pending
+            .insert((index, term), (request, batch.meta, reservation));
         Ok(())
     }
 
@@ -819,7 +872,7 @@ impl Node {
                 })
                 .collect();
             for key in uncertain {
-                let (request, _) = group.pending.remove(&key).unwrap();
+                let (request, _, _reservation) = group.pending.remove(&key).unwrap();
                 events.completions.push(Completion {
                     group: *id,
                     request,
@@ -901,7 +954,9 @@ fn apply(
             "application precedes durable commit"
         );
         let result = group.state.apply(&entry, limits)?;
-        if let Some((request, meta)) = group.pending.remove(&(entry.index, entry.term)) {
+        if let Some((request, meta, _reservation)) =
+            group.pending.remove(&(entry.index, entry.term))
+        {
             ensure!(
                 state::decode_meta(&entry.context)? == meta,
                 "pending proposal identity changed"

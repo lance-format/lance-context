@@ -145,7 +145,8 @@ async fn tls_peer_process_fixture() -> Result<()> {
         layout(),
         id,
         Limits::default(),
-    )?;
+    )?
+    .with_disk_budget(super::disk_options())?;
     let (runtime, outbox) = Runtime::spawn(node, super::super::super::Options::default())?;
     let handle = runtime.handle();
     let peers = addresses
@@ -200,9 +201,7 @@ async fn tls_peer_process_fixture() -> Result<()> {
                     .map(PathBuf::from),
                 ..Default::default()
             },
-            admission: Arc::new(super::snapshots::Quota::open(
-                &root.join(format!("node-{id}")),
-            )?),
+            admission: None,
         },
     )?;
     network.attach_snapshots(images.route())?;

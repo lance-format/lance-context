@@ -462,6 +462,100 @@ fn locations(state: &State) -> Result<(BTreeMap<u64, Location>, u64)> {
     Ok((locations, offset))
 }
 
+fn write_metadata(
+    metadata: &mut impl Write,
+    descriptor: &Descriptor,
+    state: &State,
+    limits: &Limits,
+) -> Result<()> {
+    metadata.write_all(magic(limits))?;
+    write_frame(metadata, &codec().serialize(&descriptor.binding)?)?;
+    write_u64(metadata, descriptor.records)?;
+    write_u64(metadata, descriptor.producers)?;
+    write_u64(metadata, descriptor.tables)?;
+    write_u64(metadata, descriptor.pins)?;
+    write_u64(metadata, descriptor.closed)?;
+    write_u64(metadata, descriptor.retired)?;
+    for (index, meta) in &state.accepted {
+        write_meta(metadata, *index, meta)?;
+    }
+    for (meta, index) in state.producers.values() {
+        write_meta(metadata, *index, meta)?;
+    }
+    for table in state.catalog.tables.values() {
+        write_frame(metadata, &publication::encode_table(table)?)?;
+    }
+    for pin in state.pins.values() {
+        write_frame(metadata, &source::encode_pin(pin)?)?;
+    }
+    for closed in state.closed.values() {
+        write_frame(metadata, &source::encode_closed(closed)?)?;
+    }
+    for (key, retired) in &state.retired {
+        write_frame(metadata, &state::encode_retired(*key, *retired)?)?;
+    }
+    // A flat, policy-sized cell table; decoding never trusts an allocation count
+    // supplied by the file. Zero-slot groups retain the exact legacy layout.
+    if limits.producer_slots > 0 {
+        write_u64(metadata, u64::from(limits.producer_slots))?;
+        for cell in &state.producer_slots {
+            write_frame(metadata, &producer::encode_cell(cell)?)?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct Count(u64);
+impl Write for Count {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| std::io::Error::other("image length overflow"))?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Count only bounded metadata; payloads remain opaque and are never decoded or
+/// copied here. The writer uses the same encoder, so this is its exact length.
+pub(super) fn build_sizes(
+    layout: &Layout,
+    limits: &Limits,
+    cut: &Cut,
+    state: &State,
+) -> Result<[u64; 2]> {
+    let payload_bytes = state.accepted.values().try_fold(0u64, |n, meta| {
+        n.checked_add(meta.body_bytes)
+            .context("image payload overflow")
+    })?;
+    let descriptor = Descriptor {
+        format: format(limits),
+        binding: Binding::new(layout, limits, cut.group, cut.index, cut.term)?,
+        id: cut.id,
+        records: state.accepted.len() as u64,
+        producers: state.producers.len() as u64,
+        tables: state.catalog.tables.len() as u64,
+        pins: state.pins.len() as u64,
+        closed: state.closed.len() as u64,
+        retired: state.retired.len() as u64,
+        metadata_bytes: 0,
+        payload_bytes,
+        metadata_digest: [0; 32],
+        payload_digest: [0; 32],
+    };
+    let mut count = Count::default();
+    write_metadata(&mut count, &descriptor, state, limits)?;
+    ensure!(
+        count.0 <= metadata_limit(limits),
+        "image metadata exceeds policy"
+    );
+    Ok([count.0, payload_bytes])
+}
+
 /// Inputs must be a captured, immutable applied cut. The owner retains its log
 /// and prior image while this worker reads one bounded body at a time.
 pub(super) fn build(
@@ -499,40 +593,7 @@ pub(super) fn build(
     };
     let paths = descriptor.paths(directory);
     let mut metadata = Writer::new(&paths[0], metadata_limit(limits))?;
-    metadata.write_all(magic(limits))?;
-    write_frame(&mut metadata, &codec().serialize(&descriptor.binding)?)?;
-    write_u64(&mut metadata, descriptor.records)?;
-    write_u64(&mut metadata, descriptor.producers)?;
-    write_u64(&mut metadata, descriptor.tables)?;
-    write_u64(&mut metadata, descriptor.pins)?;
-    write_u64(&mut metadata, descriptor.closed)?;
-    write_u64(&mut metadata, descriptor.retired)?;
-    for (index, meta) in &state.accepted {
-        write_meta(&mut metadata, *index, meta)?;
-    }
-    for (meta, index) in state.producers.values() {
-        write_meta(&mut metadata, *index, meta)?;
-    }
-    for table in state.catalog.tables.values() {
-        write_frame(&mut metadata, &publication::encode_table(table)?)?;
-    }
-    for pin in state.pins.values() {
-        write_frame(&mut metadata, &source::encode_pin(pin)?)?;
-    }
-    for closed in state.closed.values() {
-        write_frame(&mut metadata, &source::encode_closed(closed)?)?;
-    }
-    for (key, retired) in &state.retired {
-        write_frame(&mut metadata, &state::encode_retired(*key, *retired)?)?;
-    }
-    // A flat, policy-sized cell table; decoding never trusts an allocation count
-    // supplied by the file. Zero-slot groups retain the exact legacy layout.
-    if limits.producer_slots > 0 {
-        write_u64(&mut metadata, u64::from(limits.producer_slots))?;
-        for cell in &state.producer_slots {
-            write_frame(&mut metadata, &producer::encode_cell(cell)?)?;
-        }
-    }
+    write_metadata(&mut metadata, &descriptor, &state, limits)?;
     (descriptor.metadata_bytes, descriptor.metadata_digest) = metadata.finish()?;
     let mut pack = Writer::new(&paths[1], payload_bytes)?;
     for (index, meta) in &state.accepted {

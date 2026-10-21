@@ -8,7 +8,7 @@
 //! A transport must authenticate peers/callers, enforce frame limits before
 //! allocation, hold outbound ownership through transmission, and implement
 //! snapshot transfer and maintenance. This module is the worker layer, not a
-//! network listener, disk admission policy, or complete ingestion service.
+//! network listener, automatic maintenance scheduler, or complete ingestion service.
 use super::{producer, publication as p, query, source, Node, Outcome, Packet, Status};
 use crate::record::{Batch, RecordKind};
 use anyhow::{ensure, Context, Result};
@@ -270,6 +270,7 @@ impl Outbound {
 
 #[derive(Clone)]
 pub struct Handle {
+    disk: Option<Arc<crate::admission::Budget>>,
     routes: Arc<BTreeMap<u64, Route>>,
     shared: Arc<Shared>,
     catalog: u64,
@@ -449,8 +450,8 @@ pub struct Runtime {
 }
 impl Runtime {
     /// Pass an already opened, configured node with any required signing keys.
-    /// Queue credits do not establish physical disk bounds. Integrate node-wide
-    /// disk admission, maintenance and snapshot transfer before exposing ingress.
+    /// Queue credits do not establish physical disk bounds. Configure the Node's
+    /// shared disk admission, maintenance and snapshot transfer before ingress.
     pub fn spawn(node: Node, options: Options) -> Result<(Self, async_mpsc::Receiver<Outbound>)> {
         options.validate()?;
         node.healthy()?;
@@ -466,6 +467,7 @@ impl Runtime {
         });
         let (outbox, receive) = async_mpsc::channel(options.peer_requests);
         let mut handle = Handle {
+            disk: node.images.store().disk_budget().cloned(),
             routes: Arc::new(BTreeMap::new()),
             shared: shared.clone(),
             catalog: p::control_group(&node.layout),

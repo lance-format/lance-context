@@ -42,6 +42,7 @@ impl ImageCollection {
             "invalid image collection batch size"
         );
         self.permit.0.store.initial_state()?;
+        let _files = self.permit.0.store.image_collection_guard()?;
         let mut progress = ImageCollectionProgress::default();
         for _ in 0..max_entries {
             if self.finished {
@@ -88,6 +89,9 @@ impl ImageCollection {
             File::open(&self.permit.0.directory)?.sync_all()?;
         }
         progress.finished = self.finished;
+        if self.finished {
+            self.permit.0.store.refresh_disk_exclusive()?;
+        }
         Ok(progress)
     }
 }

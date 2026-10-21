@@ -43,8 +43,9 @@ images keep the native engine lock alive after runtime shutdown.
 
 This is the runtime integration boundary. It does not schedule automatic
 maintenance or impose a disk quota. The optional `peer::snapshot::Transport`
-provides separate authenticated image streams; attach it and supply physical
-disk admission before enabling compaction. See `wal-snapshot-transport.md`.
+provides separate authenticated image streams and requires configured shared
+node disk admission; attach it before enabling compaction. See
+`wal-snapshot-transport.md` and `wal-node-disk-admission.md`.
 
 Tests use real files and owner threads with a test-only image relay. They cover
 two compacted groups catching up a lagging follower, every original engine
