@@ -81,6 +81,10 @@ pub(crate) const DEFAULT_MANIFEST_SCAN_BATCH_SIZE: usize = 16;
 /// concurrently while collecting observability metrics.
 pub(crate) const DEFAULT_OBSERVE_CONCURRENCY: usize = 16;
 
+// Cold WAL replay decodes payloads. Serialize maintenance-triggered recovery
+// across tables rather than opening a writer for every cold store at once.
+static OWN_WAL_RECOVERY_SLOT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
 /// Flushed generations folded into the base table by one merge pass, by default.
 ///
 /// A merge buffers every row of every generation it takes before appending, and
@@ -763,6 +767,61 @@ impl StorageBase {
         result.map(|_| ())
     }
 
+    /// Recover a restarted instance's durable WAL before its cleanup merge.
+    /// Ordinary flush sweeps stay cheap: they only touch resident writers.
+    /// This path is for this handle's OWN write shard, never a foreign shard;
+    /// as with `put`, the caller must have exclusive ownership of that writer ID.
+    /// Opening a writer claims its epoch, so this is not a mechanism for taking
+    /// over an instance that is still alive.
+    async fn recover_and_flush_own_wal(&self) -> LanceResult<()> {
+        if self.is_version_pinned() || self.deleted {
+            return Ok(());
+        }
+        if self.write_writer.lock().await.is_some() {
+            return self.flush().await;
+        }
+        let manifest_store = ShardManifestStore::new(
+            self.dataset.object_store(None).await?,
+            &self.dataset.branch_location().path,
+            self.write_shard,
+            DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
+        );
+        // A worker with no own shard must not queue behind another table's
+        // recovery. Serial master fan-out visits many such workers.
+        if manifest_store.refresh_latest().await?.is_none() {
+            return Ok(());
+        }
+        let _recovery_slot = OWN_WAL_RECOVERY_SLOT
+            .acquire()
+            .await
+            .expect("WAL recovery semaphore is never closed");
+        {
+            let mut guard = self.write_writer.lock().await;
+            // An append may have opened/replayed it while we waited.
+            if guard.is_none() {
+                // Manifest WAL-tip hints can lag acknowledged PUTs. An existing
+                // own shard must be replayed even if its hint says it is empty.
+                // Lance streams replay and seals along the way. These are soft
+                // byte ceilings: one indivisible WAL entry can exceed them.
+                let config = ShardWriterConfig {
+                    shard_id: self.write_shard,
+                    max_memtable_size: 32 * 1024 * 1024,
+                    max_unflushed_memtable_bytes: 128 * 1024 * 1024,
+                    ..Default::default()
+                };
+                info!(shard = %self.write_shard, "recovering own WAL before cleanup merge");
+                let writer = self
+                    .dataset
+                    .mem_wal_writer(self.write_shard, config)
+                    .await?;
+                *guard = Some(Arc::new(writer));
+            }
+        }
+        // Keep the recovered writer resident so concurrent ingest shares it;
+        // a later cheap flush can also finish sealing if this caller is cancelled.
+        self.flush().await
+    }
+
     async fn flush_inner(&self) -> LanceResult<FlushOutcome> {
         let writer = {
             let guard = self.write_writer.lock().await;
@@ -871,7 +930,7 @@ impl StorageBase {
     /// the merge — leaving rows durable but permanently invisible until a
     /// process restart replayed the WAL.
     pub async fn cleanup_own_shard(&mut self) -> LanceResult<usize> {
-        self.flush().await?;
+        self.recover_and_flush_own_wal().await?;
         // Threshold `1`: merge whenever at least one generation is pending. The
         // time trigger must not depend on the count threshold — that is what
         // makes the two triggers a true OR.
@@ -994,7 +1053,7 @@ impl StorageBase {
         }
         if seal_first {
             // Materialize anything buffered so it is eligible for this pass.
-            self.flush().await?;
+            self.recover_and_flush_own_wal().await?;
         }
         let object_store = self.dataset.object_store(None).await?;
         let branch_location = self.dataset.branch_location();
@@ -2738,4 +2797,26 @@ fn note_read_refused(_uri: &str) {
 pub fn derive_shard_id(instance_id: Option<&str>) -> Uuid {
     let input = instance_id.unwrap_or("default");
     Uuid::new_v5(&Uuid::NAMESPACE_OID, input.as_bytes())
+}
+
+#[cfg(test)]
+mod cold_recovery_tests {
+    use super::OWN_WAL_RECOVERY_SLOT;
+    use crate::RolloutStore;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn empty_shard_cleanup_does_not_wait_for_other_recovery() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut store = RolloutStore::open(dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let _occupied = OWN_WAL_RECOVERY_SLOT.acquire().await.unwrap();
+        let reclaimed = tokio::time::timeout(Duration::from_secs(2), store.cleanup_own_shard())
+            .await
+            .expect("absent own shard must bypass cold recovery admission")
+            .unwrap();
+        assert_eq!(reclaimed, 0);
+        assert!(store.own_shard_watermark().await.unwrap().is_none());
+    }
 }

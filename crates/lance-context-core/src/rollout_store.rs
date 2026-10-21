@@ -4687,6 +4687,94 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_recovers_own_wal_without_new_ingest_after_runtime_exit() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let options = RolloutStoreOptions {
+            shard_id: Some("restarted-writer".into()),
+            ..Default::default()
+        };
+        let payload = vec![37; 64 * 1024];
+        let old_runtime = tokio::runtime::Runtime::new().unwrap();
+        let old = old_runtime.block_on(async {
+            let store = RolloutStore::open_with_options(&uri, options.clone())
+                .await
+                .unwrap();
+            store
+                .add(&[artifact_record("durable-before-exit", &payload)])
+                .await
+                .unwrap();
+            assert_eq!(flushed_generation_count(&store).await, 0);
+            store
+        });
+        // Stop every old background task before dropping the store outside a
+        // runtime. Do not run its graceful close (which would hide this bug).
+        drop(old_runtime);
+        drop(old);
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut other = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    shard_id: Some("different-live-writer".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(other.cleanup_own_shard().await.unwrap(), 0);
+            assert!(other.own_shard_watermark().await.unwrap().is_none());
+            assert!(other
+                .get_by_id("durable-before-exit")
+                .await
+                .unwrap()
+                .is_none());
+
+            let mut recovered = RolloutStore::open_with_options(&uri, options)
+                .await
+                .unwrap();
+            recovered.flush().await.unwrap();
+            assert!(recovered
+                .get_by_id("durable-before-exit")
+                .await
+                .unwrap()
+                .is_none());
+            // Exercise the split-lock route used by the actual HTTP merge.
+            let (manifests, manifest, prepared) = recovered
+                .prepare_cleanup_merge()
+                .await
+                .unwrap()
+                .expect("cleanup must replay acknowledged but unsealed WAL");
+            assert!(
+                recovered
+                    .commit_prepared_merge(&manifests, &manifest, prepared)
+                    .await
+                    .unwrap()
+                    > 0
+            );
+            assert_eq!(
+                recovered.get_blob("durable-before-exit").await.unwrap(),
+                Some(payload)
+            );
+            assert_eq!(recovered.cleanup_own_shard().await.unwrap(), 0);
+            let epoch = shard_writer_epoch(&recovered).await;
+            recovered
+                .add(&[assistant_record("after-recovery")])
+                .await
+                .unwrap();
+            recovered.cleanup_own_shard().await.unwrap();
+            assert_eq!(
+                shard_writer_epoch(&recovered).await,
+                epoch,
+                "live writer must be reused"
+            );
+            assert_eq!(recovered.list(None, None).await.unwrap().len(), 2);
+            recovered.close().await.unwrap();
+        });
+    }
+
+    #[test]
     fn flush_is_noop_without_writes() {
         // flush() with no resident writer / nothing buffered must be a harmless
         // no-op (the periodic sweeper calls it on every resident store each tick).

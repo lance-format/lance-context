@@ -1384,6 +1384,50 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_recovers_own_wal_updates_without_new_ingest_after_runtime_exit() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let options = GenericStoreOptions {
+            shard_id: Some("restarted-generic-writer".into()),
+            ..Default::default()
+        };
+        let old_runtime = tokio::runtime::Runtime::new().unwrap();
+        let old = old_runtime.block_on(async {
+            let store = GenericStore::open(&uri, spec(), options.clone())
+                .await
+                .unwrap();
+            store
+                .add(&[row(json!({"id":"shared", "score":1.0}))])
+                .await
+                .unwrap();
+            store.flush().await.unwrap();
+            store
+                .add(&[row(json!({"id":"shared", "score":2.0}))])
+                .await
+                .unwrap();
+            store
+        });
+        drop(old_runtime);
+        drop(old);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut recovered = GenericStore::open_existing(&uri, options).await.unwrap();
+            assert_eq!(
+                recovered.get("shared", None).await.unwrap().unwrap()["score"],
+                json!(1.0)
+            );
+            assert!(recovered.cleanup_wal().await.unwrap() > 0);
+            assert_eq!(
+                recovered.get("shared", None).await.unwrap().unwrap()["score"],
+                json!(2.0)
+            );
+            assert_eq!(recovered.list(None, None).await.unwrap().len(), 1);
+            assert_eq!(recovered.cleanup_wal().await.unwrap(), 0);
+            recovered.close().await.unwrap();
+        });
+    }
+
+    #[test]
     fn seal_mode_survives_a_reopen() {
         // The mode is a property of the store, not of whoever opens it. Before
         // it was persisted, a reopen silently reverted to the caller's default
