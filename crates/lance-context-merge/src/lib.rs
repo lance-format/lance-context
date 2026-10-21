@@ -237,6 +237,31 @@ impl Coordinator {
         {
             return Err("invalid merge execution reservation".into());
         }
+        self.reserve_record(claim, execution).await
+    }
+
+    /// Record an unfenced HTTP execution BEFORE sending its request. Protocol 0
+    /// cannot be recovered using protocol 2 storage barriers. Running is
+    /// deliberate: a legacy worker cannot CAS Reserved -> Running, so even a
+    /// crash before send must conservatively retain ownership.
+    pub async fn admit_legacy(
+        &self,
+        claim: &ClaimProof,
+        target: &str,
+        endpoint: &str,
+    ) -> Result<Execution> {
+        let mut execution = Execution::new(target, endpoint, "legacy-http", 1);
+        execution.protocol = 0;
+        execution.phase = Phase::Running;
+        if !self.reserve_record(claim, &execution).await? {
+            return Err(
+                "claim lost or execution already present before legacy merge admission".into(),
+            );
+        }
+        Ok(execution)
+    }
+
+    async fn reserve_record(&self, claim: &ClaimProof, execution: &Execution) -> Result<bool> {
         let key = execution_key(&self.prefix, &execution.target);
         self.transact(
             vec![
