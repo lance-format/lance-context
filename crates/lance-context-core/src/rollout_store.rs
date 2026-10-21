@@ -2693,6 +2693,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_survives_several_progressing_peer_merges() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let writer = RolloutStore::open_with_options(
+            uri,
+            RolloutStoreOptions {
+                shard_id: Some("continuous-merge-writer".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        writer.add(&[assistant_record("row-0")]).await.unwrap();
+        writer.flush().await.unwrap();
+        let reader = RolloutStore::open(uri).await.unwrap();
+        let writer = tokio::sync::Mutex::new(writer);
+        let attempts = AtomicUsize::new(0);
+
+        let rows = reader
+            .base
+            .read_consistent(ListSource::All, |dataset, snapshots| {
+                let writer = &writer;
+                let reader = &reader;
+                let attempts = &attempts;
+                async move {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                    if attempt < 4 {
+                        // Each failed snapshot loses a DIFFERENT generation to
+                        // a real successful merge. This is useful progress, not
+                        // a permanently missing file to retry indefinitely.
+                        let mut writer = writer.lock().await;
+                        assert_eq!(writer.cleanup_own_shard().await.unwrap(), 1);
+                        for snapshot in &snapshots {
+                            for generation in &snapshot.sstables {
+                                let path = reader
+                                    .flushed_generation_uri(snapshot.shard_id, &generation.path);
+                                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                                    while std::path::Path::new(&path).exists() {
+                                        tokio::time::sleep(std::time::Duration::from_millis(1))
+                                            .await;
+                                    }
+                                })
+                                .await
+                                .expect("the actual merge GC must invalidate this snapshot");
+                            }
+                        }
+                        writer
+                            .add(&[assistant_record(&format!("row-{}", attempt + 1))])
+                            .await
+                            .unwrap();
+                        writer.flush().await.unwrap();
+                    }
+                    reader.list_non_blob_snapshot(dataset, snapshots).await
+                }
+            })
+            .await
+            .expect("healthy merge progress must not exhaust a three-attempt read limit");
+        assert_eq!(attempts.load(Ordering::SeqCst), 5);
+        let ids: HashSet<_> = rows.into_iter().map(|row| row.id).collect();
+        assert_eq!(ids, (0..5).map(|i| format!("row-{i}")).collect());
+    }
+
+    #[tokio::test]
     async fn consistent_read_bounds_missing_generation_retries() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let dir = tempfile::tempdir().unwrap();

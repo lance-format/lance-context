@@ -38,6 +38,14 @@ Worker HTTP compaction is refused in this mode; tracked master maintenance must
 handle it. This prevents an untracked worker rewrite from bypassing merge
 ownership.
 
+Concurrent merge progress can invalidate several read snapshots in well under
+a second. Consistent reads now distinguish that progress from repeated missing
+data at the same base version: up to 16 snapshot attempts are allowed, while
+three missing-file failures without a new base commit still stop the request.
+No additional attempt starts after the two-second retry budget is consumed;
+that budget does not cancel an otherwise valid long scan. Reads never return
+partial results or discard required WAL generations to satisfy this bound.
+
 ## Persisted protocol and startup
 
 The private-etcd `worker-merge-admission-mode` key is persistent and unleased.

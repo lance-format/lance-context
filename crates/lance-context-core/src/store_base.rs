@@ -2299,7 +2299,10 @@ impl StorageBase {
     /// read of that snapshot. Retry missing generations even when the base
     /// version is unchanged; never return a partial result after one disappears.
     /// Ordinary WAL appends do not force retries. Pinned reads use only their
-    /// selected base version.
+    /// selected base version. A progressing merge may invalidate several fresh
+    /// views in a few milliseconds: bound refreshes separately from repeated
+    /// missing-file failures at the same base version. The retry budget limits
+    /// starting another attempt, not the duration of an otherwise valid scan.
     pub async fn read_consistent<T, F, Fut>(
         &self,
         source: ListSource,
@@ -2309,7 +2312,16 @@ impl StorageBase {
         F: FnMut(Dataset, Vec<ShardSnapshot>) -> Fut,
         Fut: std::future::Future<Output = LanceResult<T>>,
     {
-        for attempt in 0..3 {
+        const MAX_SNAPSHOT_ATTEMPTS: usize = 16;
+        const MAX_MISSING_AT_VERSION: usize = 3;
+        let started = std::time::Instant::now();
+        let retry_budget = std::time::Duration::from_secs(2);
+        let mut last_missing_version = None;
+        let mut missing_at_version = 0;
+        for attempt in 0..MAX_SNAPSHOT_ATTEMPTS {
+            if attempt != 0 && started.elapsed() >= retry_budget {
+                break;
+            }
             let mut dataset = self.dataset.clone();
             if !self.is_version_pinned() {
                 dataset.checkout_latest().await?;
@@ -2335,7 +2347,23 @@ impl StorageBase {
                 return result;
             }
             if let Err(err) = &result {
-                if !is_not_found_error(err) || attempt == 2 {
+                if !is_not_found_error(err) {
+                    return result;
+                }
+                if last_missing_version == Some(version) {
+                    missing_at_version += 1;
+                } else {
+                    last_missing_version = Some(version);
+                    missing_at_version = 1;
+                }
+                // Actual base commits justify refreshing again, but repeated
+                // failures without base progress retain the old three-attempt
+                // bound. Neither continuous commits nor missing data permit
+                // unlimited repeated payload decoding.
+                if missing_at_version >= MAX_MISSING_AT_VERSION
+                    || attempt + 1 == MAX_SNAPSHOT_ATTEMPTS
+                    || started.elapsed() >= retry_budget
+                {
                     return result;
                 }
                 // A merge may already have committed before this read began.
