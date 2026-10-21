@@ -5046,8 +5046,7 @@ mod tests {
         assert!(pinned
             .prepare_compaction(CompactionConfig::default())
             .await
-            .err()
-            .expect("historical handles must not prepare writes")
+            .expect_err("historical handles must not prepare writes")
             .to_string()
             .contains("read-only"));
         assert_eq!(pinned.version(), cached_version);
