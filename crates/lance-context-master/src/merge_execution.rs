@@ -1471,7 +1471,7 @@ mod legacy_connection_tests {
             .unwrap();
         let outcome = run_legacy_workers_inner(
             &http,
-            &[endpoint.clone()],
+            std::slice::from_ref(&endpoint),
             "table",
             LegacyOwnership::Durable {
                 coordinator: &coordinator,
