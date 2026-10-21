@@ -866,7 +866,10 @@ mod tests {
         let mut cfg = crate::config::MasterConfig::parse_from(["test"]);
         cfg.data_dir = dir.path().to_string_lossy().into();
         cfg.etcd.etcd_endpoints = vec![std::env::var("ETCD_TEST_ENDPOINTS").unwrap()];
-        cfg.etcd.etcd_prefix = format!("/merge-fenced-routing/{}", uuid::Uuid::new_v4());
+        cfg.etcd.etcd_prefix = format!(
+            "/merge-fenced-routing/{}",
+            lance_context_core::generate_id()
+        );
         cfg.merge_rollout.fence_legacy = true;
         cfg.append.rollout_append_targets = vec!["*".into()];
         assert!(cfg.merge_rollout.owned_targets.is_empty());
