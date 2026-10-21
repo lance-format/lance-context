@@ -16,9 +16,16 @@ not a durable acknowledgment.
 
 Each outgoing snapshot captures its corresponding `Arc<Image>` immediately
 after poll. The `Outbound` owner protects that image from collection through the
-transfer, even when a newer checkpoint replaces the installed image. Report the
-transfer result with `report_snapshot`; a full runtime outbox reports failure so
-Raft can retry. Successful network transmission alone does not prove persistence.
+transfer, even when a newer checkpoint replaces the installed image. Consume it
+with `Outbound::finish_snapshot` after the remote durable installation response.
+Dropping an unfinished owner reports failure automatically, including rejection
+by a full queue, cancellation and network disconnection. Successful network
+transmission alone does not prove persistence.
+
+Transfer feedback has a separate bounded lane and retains its original outgoing
+credit until the worker polls. It cannot be denied by ordinary control traffic.
+Feedback from an earlier transfer attempt, term or snapshot index cannot change
+a newer pending transfer. Failure of this reserved lane fences the runtime.
 
 `prepare_image_collection` returns the existing resumable, bounded directory scan.
 One physical-node image permit excludes concurrent builders, receivers and
@@ -45,7 +52,9 @@ reopening with full payload and exact retry indices, sibling image exclusion,
 cancelled installation, collection retaining a captured old image, physical
 maintenance and native-lock ownership after shutdown. A partial transfer cannot
 advance applied state; injected installation sync failure stops sibling workers
-and releases neither a successful completion nor a peer response. Existing TLS
+and releases neither a successful completion nor a peer response. Cancellation
+with all sender control credits held still retries and catches up the follower,
+and every original engine reopens with the complete payload. Existing TLS
 process tests also run, but do not yet transfer images through the network.
 
 Tracking: #378.

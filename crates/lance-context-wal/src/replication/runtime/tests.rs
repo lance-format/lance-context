@@ -16,6 +16,8 @@ struct Cluster {
     relays: Vec<tokio::task::JoinHandle<()>>,
     isolated: Arc<AtomicU64>,
     snapshot_transfers: Arc<AtomicU64>,
+    hold_snapshots: Arc<AtomicBool>,
+    held_snapshots: Arc<Mutex<Vec<Outbound>>>,
 }
 impl Cluster {
     fn open(root: &Path, options: Options) -> Result<Self> {
@@ -32,42 +34,35 @@ impl Cluster {
         let handles = Arc::new(handles);
         let isolated = Arc::new(AtomicU64::new(0));
         let snapshot_transfers = Arc::new(AtomicU64::new(0));
+        let hold_snapshots = Arc::new(AtomicBool::new(false));
+        let held_snapshots = Arc::new(Mutex::new(Vec::new()));
         let relays = outboxes
             .into_iter()
             .map(|mut outbox| {
                 let handles = handles.clone();
                 let isolated = isolated.clone();
                 let snapshot_transfers = snapshot_transfers.clone();
+                let hold_snapshots = hold_snapshots.clone();
+                let held_snapshots = held_snapshots.clone();
                 tokio::spawn(async move {
                     while let Some(outgoing) = outbox.recv().await {
                         let p = outgoing.packet();
                         let id = isolated.load(Ordering::Acquire);
                         if id == p.message.from || id == p.message.to {
-                            if outgoing.snapshot_image().is_some() {
-                                if let Ok(report) = handles[&p.message.from].report_snapshot(
-                                    p.group,
-                                    p.message.to,
-                                    false,
-                                ) {
-                                    let _ = report.await;
-                                }
-                            }
                             continue;
                         }
                         if outgoing.snapshot_image().is_some() {
+                            if hold_snapshots.load(Ordering::Acquire) {
+                                held_snapshots.lock().unwrap().push(outgoing);
+                                continue;
+                            }
                             let delivered = images::transfer(&handles[&p.message.to], &outgoing)
                                 .await
                                 .is_ok();
                             if delivered {
                                 snapshot_transfers.fetch_add(1, Ordering::Relaxed);
                             }
-                            if let Ok(report) = handles[&p.message.from].report_snapshot(
-                                p.group,
-                                p.message.to,
-                                delivered,
-                            ) {
-                                let _ = report.await;
-                            }
+                            let _ = outgoing.finish_snapshot(delivered);
                             continue;
                         }
                         // Retain the outgoing credit until the destination takes its
@@ -83,6 +78,8 @@ impl Cluster {
             relays,
             isolated,
             snapshot_transfers,
+            hold_snapshots,
+            held_snapshots,
         })
     }
     async fn elect(&self, id: u64, group: u64) -> Result<()> {
@@ -108,6 +105,7 @@ impl Cluster {
             task.abort();
             let _ = task.await;
         }
+        self.held_snapshots.lock().unwrap().clear();
         for runtime in self.runtimes.drain(..) {
             runtime.shutdown().await?;
         }

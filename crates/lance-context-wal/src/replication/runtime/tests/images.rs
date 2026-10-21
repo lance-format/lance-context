@@ -145,6 +145,61 @@ async fn runtime_snapshot_catches_up_compacted_follower_and_preserves_restart_re
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_snapshot_retries_with_sender_control_credits_exhausted() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let options = Options {
+        control_requests: 4,
+        ..Options::default()
+    };
+    let c = Cluster::open(root.path(), options)?;
+    c.elect(1, 10).await?;
+    c.elect(1, 20).await?;
+    c.isolated.store(3, Ordering::Release);
+    let original = commit(&c.handles[&1], 10, batch(1)).await?;
+    drop(checkpoint(&c.handles[&1], 10).await?);
+    c.hold_snapshots.store(true, Ordering::Release);
+    c.isolated.store(0, Ordering::Release);
+    wait_for(|| !c.held_snapshots.lock().unwrap().is_empty()).await?;
+
+    // Real unconsumed quorum-query replies retain every sender control slot.
+    // Snapshot failure must still reach the owner and trigger a fresh transfer.
+    let held: Vec<_> = (0..4)
+        .map(|_| c.handles[&1].query(20, query::Query::Accepted { after: 0, limit: 1 }))
+        .collect::<Result<_>>()?;
+    assert!(c.handles[&1].report_snapshot(10, 3, false).is_err());
+    assert_eq!(c.handles[&1].shared.control.slots.available_permits(), 0);
+    c.hold_snapshots.store(false, Ordering::Release);
+    // Simulate a cancelled transport task: no explicit success/failure callback.
+    c.held_snapshots.lock().unwrap().clear();
+    wait_for(|| {
+        c.snapshot_transfers.load(Ordering::Acquire) > 0
+            && c.handles[&3]
+                .observation(10)
+                .unwrap()
+                .status
+                .accepted_records
+                == 1
+    })
+    .await?;
+    assert_eq!(c.handles[&1].shared.control.slots.available_permits(), 0);
+    assert_eq!(commit(&c.handles[&1], 10, batch(1)).await?, original);
+    for reply in held {
+        reply.await?;
+    }
+    c.shutdown().await?;
+    for id in 1..=3 {
+        let node = Node::open(
+            &root.path().join(id.to_string()),
+            layout(),
+            id,
+            Limits::default(),
+        )?;
+        assert_eq!(node.read_accepted(10, original)?, Some(batch(1)));
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runtime_image_tasks_exclude_siblings_and_keep_engine_ownership_after_shutdown(
 ) -> Result<()> {
     let root = tempfile::tempdir()?;

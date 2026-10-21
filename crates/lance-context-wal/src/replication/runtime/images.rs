@@ -8,6 +8,108 @@ use crate::{
     replication::{CheckpointTask, ImageCollection, PreparedCheckpoint, SnapshotReceiver},
 };
 
+// Every queued result retains its original outgoing credit. The lane has as
+// many slots as the entire physical node's outgoing allowance, so it cannot
+// fill while another valid owner is trying to return its slot. Control-lane
+// saturation must never suppress snapshot failure feedback.
+pub(super) struct SnapshotResult {
+    to: u64,
+    term: u64,
+    index: u64,
+    attempt: u64,
+    delivered: bool,
+    pub(super) credit: Credit,
+}
+
+pub(super) struct SnapshotFeedback {
+    to: u64,
+    term: u64,
+    index: u64,
+    attempt: u64,
+    send: mpsc::SyncSender<SnapshotResult>,
+    wake: Thread,
+    shared: Arc<Shared>,
+}
+impl SnapshotFeedback {
+    fn send(self, credit: Credit, delivered: bool) -> Result<()> {
+        let result = self.send.try_send(SnapshotResult {
+            to: self.to,
+            term: self.term,
+            index: self.index,
+            attempt: self.attempt,
+            delivered,
+            credit,
+        });
+        if result.is_err() {
+            // Disconnection during shutdown is expected. Otherwise fence the
+            // node instead of silently abandoning Raft's pending snapshot.
+            self.shared.stopped.store(true, Ordering::Release);
+        }
+        self.wake.unpark();
+        result.map_err(|_| anyhow::anyhow!("snapshot feedback unavailable; runtime stopped"))
+    }
+}
+
+impl Outbound {
+    /// Consume a snapshot owner and return its transfer result on a reserved
+    /// lane. Report success only after the remote durable installation response.
+    /// This queues local Raft feedback; it is not a client durability receipt.
+    /// Dropping an unfinished owner automatically reports failure, including
+    /// queue rejection, network cancellation and disconnection.
+    pub fn finish_snapshot(mut self, delivered: bool) -> Result<()> {
+        let feedback = self
+            .snapshot_feedback
+            .take()
+            .context("outbound packet is not a snapshot")?;
+        feedback.send(self._credit.take().expect("outbound credit"), delivered)
+    }
+}
+impl Drop for Outbound {
+    fn drop(&mut self) {
+        if let Some(feedback) = self.snapshot_feedback.take() {
+            let _ = feedback.send(self._credit.take().expect("outbound credit"), false);
+        }
+    }
+}
+
+impl Worker {
+    pub(super) fn snapshot_feedback(&mut self, packet: &Packet) -> Result<SnapshotFeedback> {
+        self.snapshot_attempt = self
+            .snapshot_attempt
+            .checked_add(1)
+            .context("snapshot attempt identities exhausted")?;
+        self.snapshot_attempts
+            .insert(packet.message.to, self.snapshot_attempt);
+        Ok(SnapshotFeedback {
+            to: packet.message.to,
+            term: packet.message.term,
+            index: packet.message.get_snapshot().get_metadata().index,
+            attempt: self.snapshot_attempt,
+            send: self.snapshot_feedback.clone(),
+            wake: thread::current(),
+            shared: self.shared.clone(),
+        })
+    }
+
+    pub(super) fn snapshot_result(&mut self, result: &SnapshotResult) -> Result<()> {
+        if self.snapshot_attempts.get(&result.to) != Some(&result.attempt) {
+            return Ok(());
+        }
+        self.snapshot_attempts.remove(&result.to);
+        let raft = &self.node.groups[&self.group].raw.raft;
+        if raft.term == result.term
+            && raft
+                .prs()
+                .get(result.to)
+                .is_some_and(|progress| progress.pending_snapshot == result.index)
+        {
+            self.node
+                .report_snapshot(self.group, result.to, result.delivered)?;
+        }
+        Ok(())
+    }
+}
+
 impl Handle {
     // Only these typed library operations can access the owner. Their result is
     // held until the next successful durable poll; an error/panic drops the
@@ -86,8 +188,9 @@ impl Handle {
         self.local(image.group(), move |node| node.step_snapshot(image))
     }
 
-    /// Report the original snapshot transfer outcome to its sender's Raft group.
-    /// A successful socket write alone does not prove follower persistence.
+    /// Manual control-lane reporting for callers managing Node-level traffic.
+    /// Runtime transports must consume `Outbound::finish_snapshot` instead: it
+    /// retains reserved feedback capacity and rejects stale transfer outcomes.
     pub fn report_snapshot(&self, group: u64, to: u64, delivered: bool) -> Result<Pending<()>> {
         self.local(group, move |node| {
             node.report_snapshot(group, to, delivered)

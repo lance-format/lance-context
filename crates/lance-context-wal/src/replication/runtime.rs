@@ -249,8 +249,9 @@ pub struct Observation {
 /// drops peer traffic without blocking persistence workers; Raft retransmits.
 pub struct Outbound {
     packet: Packet,
-    _credit: Credit,
+    _credit: Option<Credit>,
     image: Option<Arc<super::checkpoint::Image>>,
+    snapshot_feedback: Option<images::SnapshotFeedback>,
 }
 impl Outbound {
     pub fn packet(&self) -> &Packet {
@@ -495,12 +496,17 @@ impl Runtime {
             let (data, dr) = mpsc::sync_channel(options.data_requests);
             let (control, cr) = mpsc::sync_channel(options.control_requests);
             let (peers, pr) = mpsc::sync_channel(options.peer_requests);
+            let (snapshot_feedback, snapshot_results) = mpsc::sync_channel(options.peer_requests);
             let worker = Worker {
                 node,
                 group,
                 data: dr,
                 control: cr,
                 peers: pr,
+                snapshot_feedback,
+                snapshot_results,
+                snapshot_attempt: 0,
+                snapshot_attempts: BTreeMap::new(),
                 shared: shared.clone(),
                 outbox: outbox.clone(),
                 observation: observation.clone(),
@@ -580,6 +586,10 @@ struct Worker {
     data: mpsc::Receiver<Work>,
     control: mpsc::Receiver<Work>,
     peers: mpsc::Receiver<PeerWork>,
+    snapshot_feedback: mpsc::SyncSender<images::SnapshotResult>,
+    snapshot_results: mpsc::Receiver<images::SnapshotResult>,
+    snapshot_attempt: u64,
+    snapshot_attempts: BTreeMap<u64, u64>,
     shared: Arc<Shared>,
     outbox: async_mpsc::Sender<Outbound>,
     observation: Arc<Mutex<Observation>>,
@@ -633,6 +643,11 @@ impl Worker {
             let mut after_poll = Vec::new();
             for _ in 0..self.options.batch_requests {
                 let mut any = false;
+                if let Ok(result) = self.snapshot_results.try_recv() {
+                    self.snapshot_result(&result)?;
+                    peer_credits.push(result.credit);
+                    any = true;
+                }
                 if let Ok(work) = self.control.try_recv() {
                     self.work(work, &mut after_poll);
                     any = true;
@@ -696,25 +711,34 @@ impl Worker {
                         None
                     };
                     let bytes = packet.message.compute_size() as usize;
-                    let sent = self
-                        .shared
-                        .outgoing
-                        .reserve(bytes)
-                        .ok()
-                        .is_some_and(|credit| {
-                            self.outbox
-                                .try_send(Outbound {
-                                    packet,
-                                    _credit: credit,
-                                    image,
-                                })
-                                .is_ok()
-                        });
-                    if !sent {
-                        self.shared.dropped_outgoing.fetch_add(1, Ordering::Relaxed);
-                        if snapshot {
-                            self.node.report_snapshot(self.group, destination, false)?;
+                    let credit = match self.shared.outgoing.reserve(bytes) {
+                        Ok(credit) => credit,
+                        Err(_) => {
+                            if snapshot {
+                                self.node.report_snapshot(self.group, destination, false)?;
+                            }
+                            self.shared.dropped_outgoing.fetch_add(1, Ordering::Relaxed);
+                            continue;
                         }
+                    };
+                    let snapshot_feedback = if snapshot {
+                        Some(self.snapshot_feedback(&packet)?)
+                    } else {
+                        None
+                    };
+                    // A rejected snapshot owner reports failure via its reserved
+                    // feedback lane. Do not also report it inline.
+                    if self
+                        .outbox
+                        .try_send(Outbound {
+                            packet,
+                            _credit: Some(credit),
+                            image,
+                            snapshot_feedback,
+                        })
+                        .is_err()
+                    {
+                        self.shared.dropped_outgoing.fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 for completion in after_poll {
