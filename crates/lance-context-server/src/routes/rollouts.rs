@@ -535,25 +535,13 @@ pub async fn list_rollouts(
     }))
 }
 
-/// Run the normal shared-lock point lookup first, then refresh and retry under
-/// the exclusive lock only when it would otherwise return a false miss from a
-/// stale cached base dataset.
-async fn get_rollout_refreshing_on_miss(
+/// Core point reads refresh cloned snapshots around WAL fallback. A stale-base
+/// hit or final miss therefore stays under the shared store guard.
+async fn get_rollout_shared(
     store_lock: &RwLock<RolloutStore>,
     id: &str,
 ) -> Result<Option<RolloutRecord>, AppError> {
-    {
-        let store = store_lock.read().await;
-        let record = store.get_by_id(id).await.map_err(AppError::from_lance)?;
-        if record.is_some() || store.is_version_pinned() {
-            return Ok(record);
-        }
-    }
-
-    let mut store = store_lock.write().await;
-    if !store.is_version_pinned() {
-        store.refresh_latest().await.map_err(AppError::from_lance)?;
-    }
+    let store = store_lock.read().await;
     store.get_by_id(id).await.map_err(AppError::from_lance)
 }
 
@@ -574,7 +562,7 @@ pub async fn get_rollout(
 ) -> Result<Json<GetRolloutResponse>, AppError> {
     let store_lock = state.get_or_open_rollout_store(&name).await?;
 
-    let record = get_rollout_refreshing_on_miss(&store_lock, &id).await?;
+    let record = get_rollout_shared(&store_lock, &id).await?;
 
     Ok(Json(GetRolloutResponse {
         record: record.map(rollout_record_to_dto),
@@ -1228,7 +1216,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn point_lookup_routes_refresh_stale_base_only_after_a_miss() {
+    async fn point_lookup_routes_keep_shared_guard_for_fresh_base_and_miss() {
         let (state, _dir) = rollout_state().await;
         let cached = state.get_or_open_rollout_store("rl").await.unwrap();
         let uri = state.rollout_uri("rl");
@@ -1249,14 +1237,36 @@ mod tests {
         assert_eq!(writer.pending_wal_generations().await.unwrap(), 0);
         assert!(writer.version() > cached.read().await.version());
 
-        let Json(found) = get_rollout(
-            State(state.clone()),
-            Path(("rl".to_string(), first.id.clone())),
+        let resident_read = cached.read().await;
+        let original_version = resident_read.version();
+        let Json(found) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            get_rollout(
+                State(state.clone()),
+                Path(("rl".to_string(), first.id.clone())),
+            ),
         )
         .await
+        .expect("a newly merged row must not wait for an exclusive store lock")
         .unwrap();
         assert_eq!(found.record.unwrap().id, first.id);
-        assert_eq!(cached.read().await.version(), writer.version());
+        let Json(missing) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            get_rollout(
+                State(state.clone()),
+                Path(("rl".to_string(), "absent".to_string())),
+            ),
+        )
+        .await
+        .expect("a missing row must not wait for an exclusive store lock")
+        .unwrap();
+        assert!(missing.record.is_none());
+        assert_eq!(resident_read.version(), original_version);
+        drop(resident_read);
+
+        // Establish a cached base hit for the second half of the test without
+        // making point reads mutate the resident store.
+        cached.write().await.refresh_latest().await.unwrap();
 
         let cached_version = cached.read().await.version();
         let payload = b"externally-merged-blob".to_vec();

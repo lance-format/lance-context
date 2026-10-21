@@ -427,6 +427,15 @@ pub struct RolloutStore {
     base: StorageBase,
     #[cfg(test)]
     blob_read_pause: std::sync::Mutex<Option<Arc<BlobReadPause>>>,
+    #[cfg(test)]
+    point_read_pause: std::sync::Mutex<Option<Arc<PointReadPause>>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct PointReadPause {
+    checked_base: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
 }
 
 #[cfg(test)]
@@ -536,6 +545,8 @@ impl RolloutStore {
             base,
             #[cfg(test)]
             blob_read_pause: Default::default(),
+            #[cfg(test)]
+            point_read_pause: Default::default(),
         })
     }
     /// URI of the underlying Lance dataset.
@@ -1517,12 +1528,39 @@ impl RolloutStore {
             ListSource::Fragments => self.scan_one_by_id(id, ListSource::Fragments).await,
             ListSource::Wal => self.scan_one_by_id(id, ListSource::Wal).await,
             ListSource::All => {
-                // Base-table-first: try the immutable base with no manifest
-                // reads, then fall back to the flushed-WAL union only on a miss.
-                if let Some(record) = self.scan_one_by_id(id, ListSource::Fragments).await? {
-                    return Ok(Some(record));
+                let cached = self.scan_one_by_id(id, ListSource::Fragments).await?;
+                if cached.is_some() || self.base.is_version_pinned() {
+                    return Ok(cached);
                 }
-                self.scan_one_by_id(id, ListSource::Wal).await
+
+                // Another executor may have merged this row since the resident
+                // handle opened. Check a fresh clone before discovering unrelated
+                // WAL generations or enforcing their pending-generation cap.
+                // The resident handle stays unchanged, so callers need no write lock.
+                let mut latest = self.base.dataset.clone();
+                latest.checkout_latest().await?;
+                if latest.manifest.version != self.base.dataset.manifest.version {
+                    if let Some(record) = self
+                        .scan_one_by_id_snapshot(id, ListSource::Fragments, latest, Vec::new())
+                        .await?
+                    {
+                        return Ok(Some(record));
+                    }
+                }
+
+                // Include the captured base as well as WAL: a merge can commit
+                // and drain this row between the fast base check and discovery.
+                // Existing consistent-read retries handle missing-file races;
+                // persistent errors and the WAL admission cap still propagate.
+                #[cfg(test)]
+                {
+                    let pause = self.point_read_pause.lock().unwrap().take();
+                    if let Some(pause) = pause {
+                        pause.checked_base.notify_one();
+                        pause.resume.notified().await;
+                    }
+                }
+                self.scan_one_by_id(id, ListSource::All).await
             }
         }
     }
@@ -1573,8 +1611,8 @@ impl RolloutStore {
         source: ListSource,
     ) -> LanceResult<Option<RolloutRecord>> {
         if source == ListSource::Fragments {
-            // Keep the cached base hit cheap. A WAL-only miss still reaches
-            // the server's existing refresh-on-miss path, updating its cache.
+            // Explicit fragment reads retain the resident snapshot. All-source
+            // point reads refresh clones around this fast path instead.
             return self
                 .scan_one_by_id_snapshot(id, source, self.base.dataset.clone(), Vec::new())
                 .await;
@@ -3453,6 +3491,7 @@ mod tests {
         // time migration, so the fixtures really contain the legacy schema.
         let mut store = RolloutStore {
             blob_read_pause: Default::default(),
+            point_read_pause: Default::default(),
             base: StorageBase::open(
                 &uri,
                 StorageBaseOptions {
@@ -6844,6 +6883,98 @@ mod tests {
         .unwrap()
         .unwrap_err();
         assert!(is_not_found_error(&error), "unexpected error: {error}");
+    }
+
+    #[tokio::test]
+    async fn point_lookup_finds_row_merged_after_fresh_base_miss() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let open = |shard: &str| {
+            RolloutStore::open_with_options(
+                uri,
+                RolloutStoreOptions {
+                    shard_id: Some(shard.to_owned()),
+                    ..Default::default()
+                },
+            )
+        };
+        let mut writer = open("point-race-writer").await.unwrap();
+        let reader = open("point-race-reader").await.unwrap();
+        let original_version = reader.version();
+        let record = assistant_record("target");
+        writer.add(std::slice::from_ref(&record)).await.unwrap();
+        writer.flush().await.unwrap();
+        let pause = Arc::new(PointReadPause::default());
+        *reader.point_read_pause.lock().unwrap() = Some(pause.clone());
+        let reading = tokio::spawn(async move {
+            let result = reader.get_by_id("target").await;
+            (result, reader.version())
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            pause.checked_base.notified(),
+        )
+        .await
+        .unwrap();
+        // The fresh base lacked this row, but the WAL capture has not started.
+        // A WAL-only fallback would now incorrectly return a missing record.
+        assert_eq!(writer.cleanup_own_shard().await.unwrap(), 1);
+        assert_eq!(flushed_generation_count(&writer).await, 0);
+        pause.resume.notify_one();
+        let (result, version) = tokio::time::timeout(std::time::Duration::from_secs(30), reading)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_records_eq(&result.unwrap().unwrap(), &record);
+        assert_eq!(version, original_version);
+    }
+
+    #[tokio::test]
+    async fn point_lookup_refreshes_base_before_opening_unrelated_wal() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let open = |shard: &str| {
+            RolloutStore::open_with_options(
+                uri,
+                RolloutStoreOptions {
+                    shard_id: Some(shard.to_owned()),
+                    pending_generations_max: Some(1),
+                    ..Default::default()
+                },
+            )
+        };
+        let mut writer = open("point-writer").await.unwrap();
+        let reader = open("point-reader").await.unwrap();
+        let mut pinned = open("point-pinned").await.unwrap();
+        let original_version = reader.version();
+        pinned.checkout(pinned.version()).await.unwrap();
+        let record = assistant_record("new-base-row");
+        writer.add(std::slice::from_ref(&record)).await.unwrap();
+        writer.flush().await.unwrap();
+        writer.cleanup_own_shard().await.unwrap();
+        assert!(writer.version() > original_version);
+        for id in ["unrelated-1", "unrelated-2"] {
+            writer.add(&[assistant_record(id)]).await.unwrap();
+            writer.flush().await.unwrap();
+        }
+        assert!(reader.wal_shard_snapshots().await.is_err());
+        let found = reader.get_by_id(&record.id).await.unwrap().unwrap();
+        assert_records_eq(&found, &record);
+        assert_eq!(reader.version(), original_version);
+        // Explicit source/version choices remain unchanged; a true WAL lookup
+        // still respects the cap, whereas a historical read stays historical.
+        assert!(reader
+            .get_by_id_source(&record.id, ListSource::Fragments)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(reader
+            .get_by_id_source(&record.id, ListSource::Wal)
+            .await
+            .is_err());
+        assert!(reader.get_by_id("unrelated-1").await.is_err());
+        assert!(pinned.get_by_id(&record.id).await.unwrap().is_none());
+        assert_eq!(pinned.version(), original_version);
     }
 
     #[tokio::test]
