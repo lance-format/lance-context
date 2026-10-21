@@ -3273,6 +3273,7 @@ mod tests {
             cfg.merge_wal_concurrency = merge_concurrency;
             if resident {
                 cfg.local_merge.master_local_merge_targets = vec!["excluded".into()];
+                cfg.merge_rollout.owned_targets = vec!["excluded".into()];
                 cfg.catchup.shards = vec!["writer".into()];
                 cfg.catchup.slice_secs = 2;
                 cfg.catchup.merge_max_bytes = 1024 * 1024;
