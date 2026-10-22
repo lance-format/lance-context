@@ -98,7 +98,7 @@ store.add({
     "content": "The answer is 42.",
     "reward": 1.0,
     "policy_version": "ckpt-100",
-})
+}, flush=True)  # make this row readable before add returns
 
 for row in store.list():
     print(row["rollout_id"], row["reward"])
@@ -119,8 +119,18 @@ your event loop:
 from lance_context import AsyncRolloutStore
 
 store = await AsyncRolloutStore.connect_or_create("http://localhost:8080", "rl-run-1")
-await store.add({"rollout_id": "traj-1", "role": "assistant", "reward": 1.0})
+await store.add(
+    {"id": "step-1", "rollout_id": "traj-1", "role": "assistant", "reward": 1.0},
+    flush=True,
+)
+rows = await store.list()  # includes step-1 without polling
 ```
+
+By default, `add` returns after the write is durable in the WAL. Remote servers
+make it readable later on a timer; embedded stores need `flush=True` or
+`store.flush()`. Use `flush=True` only when the next operation must read the new
+rows because it adds write latency. If flushing fails, the append may still be
+durable. Reuse stable `id` values when retrying.
 
 ## Rust
 
