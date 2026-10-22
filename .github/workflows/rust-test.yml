@@ -47,9 +47,15 @@ jobs:
           shared-key: "lance-context-deps"
           workspaces: "."
       - name: Install dependencies
+        timeout-minutes: 10
         run: |
-          sudo apt update
-          sudo apt install -y clang libclang-dev protobuf-compiler
+          # Use the official archive directly when the hosted image supplies a mirror list.
+          if [[ -f /etc/apt/apt-mirrors.txt ]]; then
+            sudo sed -i 's|https\?://azure\.archive\.ubuntu\.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt
+          fi
+          apt_options=(-o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+          sudo apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update
+          sudo apt-get "${apt_options[@]}" install -y clang libclang-dev protobuf-compiler
       - name: Build tests
         run: cargo test --workspace --all-targets --no-run
       - name: Run unit and integration tests
@@ -74,9 +80,15 @@ jobs:
           shared-key: "lance-context-wal-deps"
           workspaces: "."
       - name: Install dependencies
+        timeout-minutes: 10
         run: |
-          sudo apt update
-          sudo apt install -y clang libclang-dev protobuf-compiler
+          # Use the official archive directly when the hosted image supplies a mirror list.
+          if [[ -f /etc/apt/apt-mirrors.txt ]]; then
+            sudo sed -i 's|https\?://azure\.archive\.ubuntu\.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt
+          fi
+          apt_options=(-o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+          sudo apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update
+          sudo apt-get "${apt_options[@]}" install -y clang libclang-dev protobuf-compiler
       - name: WAL component correctness smoke tests
         run: |
           cargo run -p lance-context-wal --features lab --bin context-wal-lab -- codec --payload-bytes 1024 --rows 8 --iterations 2
@@ -131,9 +143,15 @@ jobs:
           shared-key: "lance-context-lance-deps"
           workspaces: "."
       - name: Install dependencies
+        timeout-minutes: 10
         run: |
-          sudo apt update
-          sudo apt install -y clang libclang-dev protobuf-compiler
+          # Use the official archive directly when the hosted image supplies a mirror list.
+          if [[ -f /etc/apt/apt-mirrors.txt ]]; then
+            sudo sed -i 's|https\?://azure\.archive\.ubuntu\.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt
+          fi
+          apt_options=(-o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+          sudo apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update
+          sudo apt-get "${apt_options[@]}" install -y clang libclang-dev protobuf-compiler
       - name: Optional Lance object-store metrics
         run: |
           cargo test -p lance-context-core --features lance-io-metrics --test lance_io_metrics
@@ -159,9 +177,15 @@ jobs:
           shared-key: "lance-context-ha-deps"
           workspaces: "."
       - name: Install dependencies
+        timeout-minutes: 10
         run: |
-          sudo apt update
-          sudo apt install -y clang libclang-dev protobuf-compiler
+          # Use the official archive directly when the hosted image supplies a mirror list.
+          if [[ -f /etc/apt/apt-mirrors.txt ]]; then
+            sudo sed -i 's|https\?://azure\.archive\.ubuntu\.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt
+          fi
+          apt_options=(-o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+          sudo apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update
+          sudo apt-get "${apt_options[@]}" install -y clang libclang-dev protobuf-compiler
       - name: Rollout materialization through the WAL client
         run: |
           cargo clippy -p lance-context-ingest --features materializer --all-targets -- -D warnings
@@ -238,9 +262,15 @@ jobs:
           shared-key: "lance-context-coverage"
           workspaces: "."
       - name: Install dependencies
+        timeout-minutes: 10
         run: |
-          sudo apt update
-          sudo apt install -y clang libclang-dev protobuf-compiler
+          # Use the official archive directly when the hosted image supplies a mirror list.
+          if [[ -f /etc/apt/apt-mirrors.txt ]]; then
+            sudo sed -i 's|https\?://azure\.archive\.ubuntu\.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt
+          fi
+          apt_options=(-o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+          sudo apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update
+          sudo apt-get "${apt_options[@]}" install -y clang libclang-dev protobuf-compiler
       - uses: taiki-e/install-action@cargo-llvm-cov
       - name: Start etcd for HA scheduler test
         run: |
