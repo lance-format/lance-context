@@ -108,6 +108,14 @@ pub struct Acquisition {
     pub expected_epoch: u64,
 }
 
+/// Volatile hints from quorum-observed pages containing no rows for this table.
+/// Keep them across scheduling claims, without advancing durable checkpoints.
+#[cfg(feature = "worker")]
+pub(crate) struct ScanProgress {
+    scope: Arc<Scope>,
+    empty_cursors: BTreeMap<u64, u64>,
+}
+
 pub struct Publisher {
     ingress: Ingress,
     storage: Storage,
@@ -187,6 +195,22 @@ impl Publisher {
     #[cfg(feature = "worker")]
     pub(crate) fn observe_with(&mut self, phases: Arc<PhaseCounters>) {
         self.phases = phases;
+    }
+    #[cfg(feature = "worker")]
+    pub(crate) fn resume_scanning(&mut self, progress: ScanProgress) -> Result<()> {
+        ensure!(
+            progress.scope == self.ingress.scope,
+            "scan progress belongs to another table binding"
+        );
+        self.empty_cursors = progress.empty_cursors;
+        Ok(())
+    }
+    #[cfg(feature = "worker")]
+    pub(crate) fn take_scan_progress(&mut self) -> ScanProgress {
+        ScanProgress {
+            scope: self.ingress.scope.clone(),
+            empty_cursors: std::mem::take(&mut self.empty_cursors),
+        }
     }
     pub fn authority(&self) -> &p::Authority {
         &self.authority

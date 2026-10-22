@@ -64,6 +64,110 @@ async fn append(
         .await?;
     Ok((body, ingress.append(&prepared).await?))
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires ETCD_TEST_ENDPOINTS; executed by the etcd CI suite"]
+async fn worker_releases_claims_without_losing_progress_past_other_tables() -> Result<()> {
+    let (mut etcd, claims, prefix) = fixture().await?;
+    let root = tempfile::tempdir()?;
+    let c = network::Cluster::open_signed(root.path(), layout()).await?;
+    let path = root.path().join("target.lance");
+    bootstrap(&c, &path, &binding()).await?;
+    let target = connect(&c, binding()).await?;
+    let target_storage = storage(&path).await?;
+    let mut foreign = binding();
+    foreign.table = Uuid::from_u128(71);
+    foreign.incarnation = Uuid::from_u128(72);
+    foreign.destination.dataset = "other.lance".into();
+    foreign.qualified_table = "other".into();
+    let other_path = root.path().join("other.lance");
+    bootstrap(&c, &other_path, &foreign).await?;
+    let other = connect(&c, foreign.clone()).await?;
+    let open = |slot| ProducerOpen {
+        bucket: 0,
+        slot,
+        expected_generation: 0,
+        operation: Uuid::new_v4(),
+    };
+    let producer = other.open_producer(open(0)).await?;
+    let session = (0..1000)
+        .map(|n| format!("other-session-{n}"))
+        .find(|s| {
+            layout()
+                .session_bucket(&foreign.tenant, &foreign.qualified_table, s)
+                .unwrap()
+                == 0
+        })
+        .context("foreign bucket session")?;
+    // More retained records than one scan page. No foreign publisher runs, so
+    // their metadata remains in the shared source group on every target claim.
+    let body = ipc_file(&[batch(&["foreign-row"], &[&session])?])?;
+    for sequence in 1..=129 {
+        let prepared = other
+            .prepare(
+                other.reserve_upload(body.len()).await?,
+                body.clone(),
+                &producer,
+                sequence,
+            )
+            .await?;
+        other.append(&prepared).await?;
+    }
+    let producer = target.open_producer(open(1)).await?;
+    let (body, receipt) = append(&target, &producer, 1, "target-row").await?;
+    let expected = ipc::decode(body, Arc::new(rollout_schema()))?;
+    let budget = MergeMemoryBudget::new(32 << 20);
+    let mut limits = options();
+    limits.publication.scan_pages_per_group = 1;
+    limits.publications_per_claim = 1;
+    let worker = Worker::start(
+        claims,
+        vec![Assignment {
+            ingress: target.clone(),
+            storage: target_storage.clone(),
+        }],
+        limits,
+        budget.clone(),
+    )?;
+    let published = target
+        .wait_published(&receipt, Duration::from_secs(10))
+        .await;
+    let observation = worker.observation();
+    worker.shutdown().await?;
+    assert_eq!(budget.reserved(), 0);
+    // Collect the fixture even for the negative control's publication timeout.
+    let dataset = publication::read_dataset(&target, &target_storage, None).await?;
+    let actual = dataset
+        .scan()
+        .try_into_stream()
+        .await?
+        .try_collect::<Vec<_>>()
+        .await?;
+    let other_storage = storage(&other_path).await?;
+    let foreign_rows = publication::read_dataset(&other, &other_storage, None)
+        .await?
+        .count_rows(None)
+        .await?;
+    etcd.delete(
+        prefix,
+        Some(etcd_client::DeleteOptions::new().with_prefix()),
+    )
+    .await?;
+    drop((dataset, target, other));
+    c.shutdown().await?;
+    assert!(
+        observation.claims >= 2,
+        "test must cross a scheduling claim"
+    );
+    assert_eq!(foreign_rows, 0, "target must not publish another table");
+    assert_eq!(
+        published.context("worker repeatedly rescanned the foreign prefix")?,
+        2
+    );
+    assert_eq!(actual, expected);
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires ETCD_TEST_ENDPOINTS; executed by the etcd CI suite"]
 async fn expired_claim_cannot_steal_successor_epoch_and_workers_resume_prepared_lance() -> Result<()>

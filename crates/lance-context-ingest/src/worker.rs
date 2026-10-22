@@ -2,7 +2,9 @@
 //! durable WAL epochs and manifest selection fence stale workers. The input
 //! assignments must come from the application's authorized table registry.
 use super::*;
-use crate::materializer::{Acquisition, Options as PublishOptions, Publisher, Storage};
+use crate::materializer::{
+    Acquisition, Options as PublishOptions, Publisher, ScanProgress, Storage,
+};
 use std::{
     collections::BTreeSet,
     sync::{
@@ -189,7 +191,10 @@ async fn run(
     mut stop: watch::Receiver<bool>,
     counters: Arc<Counters>,
 ) -> Result<()> {
-    let mut jobs: JoinSet<(usize, Result<()>)> = JoinSet::new();
+    let mut jobs: JoinSet<(usize, Result<()>, Option<ScanProgress>)> = JoinSet::new();
+    // One bounded map per fixed assignment, moved into its only active job.
+    // Releasing an idle claim must not restart scanning at the durable cursor.
+    let mut scans: Vec<Option<ScanProgress>> = (0..assignments.len()).map(|_| None).collect();
     let mut active = BTreeSet::new();
     let mut cursor = Uuid::new_v4().as_u128() as usize % assignments.len();
     let mut tick = tokio::time::interval(options.poll_interval);
@@ -204,8 +209,9 @@ async fn run(
             done = jobs.join_next(), if !jobs.is_empty() => {
                 counters.active.fetch_sub(1, Ordering::Release);
                 match done {
-                    Some(Ok((index, result))) => {
+                    Some(Ok((index, result, progress))) => {
                         active.remove(&index);
+                        scans[index] = progress;
                         if let Err(error) = result { counters.failed(assignments[index].ingress.scope.table, &error); }
                     }
                     Some(Err(error)) => {
@@ -228,9 +234,10 @@ async fn run(
                         claims.clone(), assignments[index].clone(), options.clone(),
                         budget.clone(), stop.clone(), counters.clone(),
                     );
+                    let mut progress = scans[index].take();
                     jobs.spawn(async move {
-                        let result = publish_claim(claims, assignment, options, budget, stop, counters).await;
-                        (index, result)
+                        let result = publish_claim(claims, assignment, options, budget, stop, counters, &mut progress).await;
+                        (index, result, progress)
                     });
                 }
             }
@@ -241,8 +248,8 @@ async fn run(
     while let Some(done) = jobs.join_next().await {
         counters.active.fetch_sub(1, Ordering::Release);
         match done {
-            Ok((_, Ok(()))) => {}
-            Ok((index, Err(error))) => {
+            Ok((_, Ok(()), _)) => {}
+            Ok((index, Err(error), _)) => {
                 counters.failed(assignments[index].ingress.scope.table, &error);
             }
             Err(error) => {
@@ -262,6 +269,7 @@ async fn publish_claim(
     budget: Arc<MergeMemoryBudget>,
     stop: watch::Receiver<bool>,
     counters: Arc<Counters>,
+    scan_progress: &mut Option<ScanProgress>,
 ) -> Result<()> {
     use crate::materializer::observation::Phase;
     let Some(claim) = counters
@@ -288,26 +296,36 @@ async fn publish_claim(
         else {
             return Ok(());
         };
+        if let Some(progress) = scan_progress.take() {
+            publisher.resume_scanning(progress)?;
+        }
         publisher.observe_with(counters.phases.clone());
         #[cfg(feature = "service")]
         if let Some(pool) = options.preparers {
             publisher.use_preparers(pool);
         }
-        for _ in 0..options.publications_per_claim {
-            if *stop.borrow() || !claim.valid().await? {
-                break;
+        let result = async {
+            for _ in 0..options.publications_per_claim {
+                if *stop.borrow() || !claim.valid().await? {
+                    break;
+                }
+                if publisher
+                    .run_once()
+                    .await
+                    .context("publishing Lance data")?
+                    .is_none()
+                {
+                    break;
+                }
+                counters.published.fetch_add(1, Ordering::Relaxed);
             }
-            if publisher
-                .run_once()
-                .await
-                .context("publishing Lance data")?
-                .is_none()
-            {
-                break;
-            }
-            counters.published.fetch_add(1, Ordering::Relaxed);
+            Ok::<_, anyhow::Error>(())
         }
-        Ok::<_, anyhow::Error>(())
+        .await;
+        // Even an error after an empty page does not invalidate that observed
+        // prefix. Selected records are never included in these skip hints.
+        *scan_progress = Some(publisher.take_scan_progress());
+        result
     }
     .await;
     let release = claim.release().await;
