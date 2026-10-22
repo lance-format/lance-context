@@ -32,11 +32,11 @@ pub(crate) async fn enqueue_recovery(
     let Some(task_kind) = retry_kind(&execution.endpoint) else {
         return Ok(());
     };
-    if !state.config.merge_rollout.owned(&execution.target)
-        && !state.config.merge_rollout.draining(&execution.target)
-        // A recorded fenced execution needs reconciliation even if the
-        // enrollment/maintenance flag was disabled after its admission.
-        && !(execution.protocol == 2 && execution.maintenance.is_some())
+    // A recorded fenced execution needs reconciliation even if the
+    // enrollment/maintenance flag was disabled after its admission.
+    if !(state.config.merge_rollout.owned(&execution.target)
+        || state.config.merge_rollout.draining(&execution.target)
+        || execution.protocol == 2 && execution.maintenance.is_some())
     {
         return Ok(());
     }

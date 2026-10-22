@@ -992,10 +992,10 @@ pub(crate) async fn enqueue_merge_request(
 ) -> Result<(), String> {
     if !state.config.merge_rollout.owned(&request.target)
         && !state.config.merge_rollout.fence_legacy
-        && !coordinator
+        && coordinator
             .get(&request.target)
             .await?
-            .is_some_and(|e| e.maintenance.is_none())
+            .is_none_or(|e| e.maintenance.is_some())
     {
         return Ok(());
     }
