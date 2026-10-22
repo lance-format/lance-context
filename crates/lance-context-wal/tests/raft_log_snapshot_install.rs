@@ -322,7 +322,7 @@ mod process {
     fn inherited_lock_child() {}
 
     #[test]
-    fn pre_exec_child_retains_an_unrelated_directory_lock_until_exec() -> Result<()> {
+    fn pre_exec_child_does_not_extend_an_unrelated_engine_lock() -> Result<()> {
         use std::{
             io::{Read, Write},
             os::{fd::AsRawFd, unix::net::UnixStream, unix::process::CommandExt},
@@ -370,11 +370,16 @@ mod process {
             Ok(status)
         });
         let ready = parent.read_exact(&mut [0]);
+        let live_excluded = ready.is_ok() && PhysicalLog::open(&path, &layout(), 2).is_err();
         drop(log);
-        let blocked = ready
+        let reopened = ready
             .as_ref()
             .ok()
             .map(|_| PhysicalLog::open(&path, &layout(), 2));
+        // The child is still parked before exec with the inherited descriptor.
+        // The replacement owner must nevertheless acquire and hold a fresh lock.
+        let replacement_excluded = reopened.as_ref().is_some_and(Result::is_ok)
+            && PhysicalLog::open(&path, &layout(), 2).is_err();
         // Always release and join the bounded child before propagating any error.
         let released = parent.write_all(&[1]);
         let child = spawn
@@ -383,14 +388,18 @@ mod process {
         ready?;
         released?;
         assert!(child?.success());
-        let error = blocked
-            .expect("child ready")
-            .err()
-            .context("child must retain the inherited flock until exec")?;
-        assert!(format!("{error:#}").contains("Failed to lock file"));
-        let reopened = PhysicalLog::open(&path, &layout(), 2)?;
+        assert!(live_excluded, "live engine must exclude another owner");
+        let reopened = reopened.expect("child ready")?;
+        assert!(replacement_excluded, "replacement must own its lock");
+        assert!(
+            PhysicalLog::open(&path, &layout(), 2).is_err(),
+            "child exec must not release the replacement's lock"
+        );
         assert_eq!(read(&reopened.group(10)?, 1, 8)?, original());
         assert_eq!(read(&reopened.group(20)?, 1, 2)?, vec![entry(1, 7)]);
+        drop(reopened);
+        let reopened_again = PhysicalLog::open(&path, &layout(), 2)?;
+        assert_eq!(read(&reopened_again.group(10)?, 1, 8)?, original());
         Ok(())
     }
 }
