@@ -21,7 +21,8 @@ pub const ARROW_FILE: &str = "application/vnd.apache.arrow.file";
 pub const PRODUCER: &str = "x-lance-producer";
 pub const SEQUENCE: &str = "x-lance-sequence";
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Options {
     pub data_requests: usize,
     pub control_requests: usize,

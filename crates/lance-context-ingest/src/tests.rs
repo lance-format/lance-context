@@ -475,3 +475,6 @@ async fn durable_core_ack_receipt_and_exact_retry_survive_three_replica_restart(
     ));
     c.shutdown().await
 }
+
+#[cfg(all(feature = "service", unix))]
+mod application;

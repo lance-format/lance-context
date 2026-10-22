@@ -5,7 +5,10 @@ use super::*;
 use crate::materializer::{Acquisition, Options as PublishOptions, Publisher, Storage};
 use std::{
     collections::BTreeSet,
-    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
+    sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Mutex,
+    },
 };
 use tokio::{
     sync::watch,
@@ -20,7 +23,8 @@ pub struct Assignment {
     pub ingress: Ingress,
     pub storage: Storage,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Options {
     pub parallel_tables: usize,
     /// Release a healthy claim periodically so another worker can take a turn.
@@ -44,6 +48,42 @@ struct Counters {
     claimed: AtomicU64,
     published: AtomicU64,
     errors: AtomicU64,
+    last_failure: Mutex<Option<Failure>>,
+}
+/// A bounded diagnostic retained only on failure, never a payload or config dump.
+#[derive(Debug, Clone, Serialize)]
+pub struct Failure {
+    pub table: Uuid,
+    pub message: String,
+}
+impl Counters {
+    fn failed(&self, table: Uuid, error: &anyhow::Error) {
+        // Stop formatting at the limit, including inside backend error Display
+        // implementations. Do not first allocate an unbounded error chain.
+        struct Bounded(String);
+        impl std::fmt::Write for Bounded {
+            fn write_str(&mut self, value: &str) -> std::fmt::Result {
+                let available = 2048 - self.0.len();
+                let mut end = available.min(value.len());
+                while !value.is_char_boundary(end) {
+                    end -= 1;
+                }
+                self.0.push_str(&value[..end]);
+                if end < value.len() {
+                    Err(std::fmt::Error)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let mut message = Bounded(String::new());
+        let _ = std::fmt::write(&mut message, format_args!("{error:#}"));
+        *self.last_failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(Failure {
+            table,
+            message: message.0,
+        });
+        self.errors.fetch_add(1, Ordering::Relaxed);
+    }
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct Observation {
@@ -52,6 +92,7 @@ pub struct Observation {
     pub claims: u64,
     pub publications: u64,
     pub errors: u64,
+    pub last_failure: Option<Failure>,
     pub draining: bool,
 }
 pub struct Worker {
@@ -114,6 +155,12 @@ impl Worker {
             claims: self.counters.claimed.load(Ordering::Relaxed),
             publications: self.counters.published.load(Ordering::Relaxed),
             errors: self.counters.errors.load(Ordering::Relaxed),
+            last_failure: self
+                .counters
+                .last_failure
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone(),
             draining: *self.stop.borrow(),
         }
     }
@@ -150,7 +197,7 @@ async fn run(
                 match done {
                     Some(Ok((index, result))) => {
                         active.remove(&index);
-                        if result.is_err() { counters.errors.fetch_add(1, Ordering::Relaxed); }
+                        if let Err(error) = result { counters.failed(assignments[index].ingress.scope.table, &error); }
                     }
                     Some(Err(error)) => {
                         failure = Some(error);
@@ -186,8 +233,8 @@ async fn run(
         counters.active.fetch_sub(1, Ordering::Release);
         match done {
             Ok((_, Ok(()))) => {}
-            Ok((_, Err(_))) => {
-                counters.errors.fetch_add(1, Ordering::Relaxed);
+            Ok((index, Err(error))) => {
+                counters.failed(assignments[index].ingress.scope.table, &error);
             }
             Err(error) => {
                 failure = Some(error);
@@ -207,7 +254,11 @@ async fn publish_claim(
     stop: watch::Receiver<bool>,
     counters: Arc<Counters>,
 ) -> Result<()> {
-    let Some(claim) = claims.take(&assignment.ingress).await? else {
+    let Some(claim) = claims
+        .take(&assignment.ingress)
+        .await
+        .context("acquiring scheduling claim")?
+    else {
         return Ok(());
     };
     counters.claimed.fetch_add(1, Ordering::Relaxed);
@@ -217,7 +268,8 @@ async fn publish_claim(
         }
         let Some(mut publisher) = claim
             .acquire(assignment, options.publication, budget)
-            .await?
+            .await
+            .context("acquiring publisher epoch")?
         else {
             return Ok(());
         };
@@ -225,7 +277,12 @@ async fn publish_claim(
             if *stop.borrow() || !claim.valid().await? {
                 break;
             }
-            if publisher.run_once().await?.is_none() {
+            if publisher
+                .run_once()
+                .await
+                .context("publishing Lance data")?
+                .is_none()
+            {
                 break;
             }
             counters.published.fetch_add(1, Ordering::Relaxed);

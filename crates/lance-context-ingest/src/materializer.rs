@@ -19,7 +19,8 @@ pub struct Storage {
     pub session: Arc<lance::session::Session>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Options {
     pub max_source_bytes: usize,
     pub max_records: usize,

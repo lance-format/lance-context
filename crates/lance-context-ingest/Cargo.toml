@@ -7,12 +7,14 @@ publish = false
 description = "Durable rollout ingress over the independent lance-context WAL"
 
 [features]
+service = ["worker", "http", "dep:tokio-rustls", "tokio/rt-multi-thread", "tokio/macros", "tokio/net", "tokio/signal"]
 worker = ["materializer", "dep:etcd-client"]
 http = ["dep:axum", "dep:http-body-util"]
 http-client = ["http", "dep:reqwest", "lance-context-wal/client-journal"]
 materializer = ["lance-context-wal/lance-integration", "dep:lance", "dep:lance-table", "dep:lance-io", "dep:object_store", "dep:futures"]
 
 [dependencies]
+tokio-rustls = { version = "0.26.4", optional = true, default-features = false, features = ["ring", "tls12"] }
 etcd-client = { version = "0.19", features = ["tls"], optional = true }
 axum = { version = "0.8", optional = true, default-features = false, features = ["json", "http1", "tokio"] }
 http-body-util = { version = "0.1", optional = true }
@@ -44,3 +46,8 @@ rcgen = "0.14"
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
+
+[[bin]]
+name = "lance-context-ingest"
+path = "src/bin/ingest.rs"
+required-features = ["service"]

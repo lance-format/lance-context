@@ -202,6 +202,25 @@ jobs:
           cargo test -p lance-context-core registry --lib -- --ignored
           cargo test -p lance-context-ingest --features worker --lib tests::worker -- --ignored
 
+      - name: Ingestion application process recovery
+        env:
+          ETCD_TEST_ENDPOINTS: http://127.0.0.1:2379
+          INGEST_TEST_BIN: ${{ github.workspace }}/target/debug/lance-context-ingest
+          INGEST_TEST_ARTIFACTS: ${{ runner.temp }}/ingest-application
+        run: |
+          mkdir -p "$INGEST_TEST_ARTIFACTS"
+          cargo build -p lance-context-ingest --features service,http-client --bin lance-context-ingest
+          cargo clippy -p lance-context-ingest --features service,http-client --all-targets -- -D warnings
+          cargo test -p lance-context-ingest --features service,http-client --lib tests::application -- --ignored
+      - name: Save ingestion application failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ingest-application-failure-logs
+          path: ${{ runner.temp }}/ingest-application/**/*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
   coverage:
     runs-on: ubuntu-24.04
     # Coverage builds are much slower than the plain test job: instrumentation

@@ -29,6 +29,8 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, sync::Arc, time::Duration};
 use uuid::Uuid;
 
+#[cfg(feature = "service")]
+pub mod application;
 #[cfg(feature = "materializer")]
 pub mod bootstrap;
 #[cfg(feature = "http")]

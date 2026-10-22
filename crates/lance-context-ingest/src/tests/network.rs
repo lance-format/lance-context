@@ -22,17 +22,37 @@ struct Tls {
     server: rustls::ServerConfig,
     certificate: [u8; 32],
     name: String,
+    #[cfg(feature = "service")]
+    files: crate::application::config::TlsFiles,
 }
-fn certificates() -> Result<BTreeMap<u64, Tls>> {
+fn certificates(_root: &Path) -> Result<BTreeMap<u64, Tls>> {
     let mut identities = Vec::new();
     let mut roots = RootCertStore::empty();
+    #[cfg(feature = "service")]
+    let mut root_pem = String::new();
+    #[cfg(feature = "service")]
+    let mut files = BTreeMap::new();
     for id in 1..=4 {
         let name = format!("wal-{id}.example.invalid");
         let certified = rcgen::generate_simple_self_signed(vec![name.clone()])?;
         let der: CertificateDer<'static> = certified.cert.der().clone();
         roots.add(der.clone())?;
+        #[cfg(feature = "service")]
+        {
+            let identity = crate::application::config::TlsFiles {
+                certificate: _root.join(format!("tls-{id}.pem")),
+                private_key: _root.join(format!("tls-{id}.key")),
+                roots: _root.join("roots.pem"),
+            };
+            std::fs::write(&identity.certificate, certified.cert.pem())?;
+            std::fs::write(&identity.private_key, certified.signing_key.serialize_pem())?;
+            root_pem.push_str(&certified.cert.pem());
+            files.insert(id, identity);
+        }
         identities.push((id, name, der, certified.signing_key.serialize_der()));
     }
+    #[cfg(feature = "service")]
+    std::fs::write(_root.join("roots.pem"), root_pem)?;
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let roots = Arc::new(roots);
     let mut configs = BTreeMap::new();
@@ -63,6 +83,8 @@ fn certificates() -> Result<BTreeMap<u64, Tls>> {
                 server,
                 certificate,
                 name,
+                #[cfg(feature = "service")]
+                files: files.remove(&id).unwrap(),
             },
         );
     }
@@ -72,6 +94,8 @@ fn certificates() -> Result<BTreeMap<u64, Tls>> {
 pub(super) struct Cluster {
     pub client: Arc<Client>,
     nodes: Vec<(Runtime, peer::Transport, client::Server)>,
+    #[cfg(feature = "service")]
+    pub application: crate::application::Config,
 }
 type Signers = (
     Arc<lance_context_wal::replication::source::CatalogSigner>,
@@ -114,7 +138,7 @@ impl Cluster {
         layout: Arc<Layout>,
         signers: Option<Signers>,
     ) -> Result<Self> {
-        let tls = certificates()?;
+        let tls = certificates(root)?;
         let limits = Limits {
             producer_slots: 16,
             catalog_key: signers.as_ref().map(|s| s.0.public_key()),
@@ -205,6 +229,40 @@ impl Cluster {
         }
         let mut config = tls[&4].client.clone();
         config.alpn_protocols = vec![client::ALPN.to_vec()];
+        #[cfg(feature = "service")]
+        let application = crate::application::Config {
+            layout: (*layout).clone(),
+            limits: limits.clone(),
+            endpoints: endpoints
+                .iter()
+                .map(|(&id, e)| {
+                    (
+                        id,
+                        crate::application::config::Endpoint {
+                            data_address: e.data_address.clone(),
+                            control_address: e.control_address.clone(),
+                            server_name: e.server_name.clone(),
+                            certificate: e.certificate,
+                        },
+                    )
+                })
+                .collect(),
+            tls: tls[&4].files.clone(),
+            rpc: Default::default(),
+            tables: vec![],
+            ingress_memory_bytes: 32 << 20,
+            materializer_memory_bytes: 64 << 20,
+            http: None,
+            etcd: None,
+            worker: crate::worker::Options {
+                publication: crate::materializer::Options {
+                    max_source_bytes: 1 << 20,
+                    max_records: 8,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        };
         let client = Arc::new(Client::new(
             &layout,
             &limits,
@@ -228,7 +286,12 @@ impl Cluster {
             })
             .await?;
         }
-        Ok(Self { client, nodes })
+        Ok(Self {
+            client,
+            nodes,
+            #[cfg(feature = "service")]
+            application,
+        })
     }
     pub async fn shutdown(self) -> Result<()> {
         for (runtime, peer, rpc) in self.nodes {
