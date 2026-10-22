@@ -38,6 +38,7 @@ tokio = { version = "1", features = ["rt", "sync", "time"] }
 uuid = { version = "1.20.0", features = ["v4", "serde"] }
 
 [dev-dependencies]
+async-trait = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
 arrow-ipc = "58"
 lance = "13.0.0"

@@ -7,6 +7,10 @@ use lance::deps::datafusion::{
 };
 use tokio::sync::Semaphore;
 
+#[cfg(test)]
+#[path = "pipeline/overlap_tests.rs"]
+mod overlap_tests;
+
 pub(super) async fn materialize(
     ingress: Ingress,
     options: Options,
@@ -73,19 +77,49 @@ async fn write_streams(
         let reservation = reservation.clone();
         async move {
             let _reservation = reservation;
+            // Poll source RPC/decode futures while the writer awaits object
+            // storage. One queued Arrow batch moves ownership without copying
+            // its buffers; the existing shared permits still bound fetches.
+            let (sender, receiver) = tokio::sync::mpsc::channel(1);
+            let schema = source.schema();
+            let buffered = stream::unfold(receiver, |mut receiver| async {
+                receiver.recv().await.map(|batch| (batch, receiver))
+            });
+            let buffered: SendableRecordBatchStream =
+                Box::pin(RecordBatchStreamAdapter::new(schema, buffered));
+            let pump = async move {
+                let mut source = source;
+                loop {
+                    let item = tokio::select! {
+                        biased;
+                        _ = sender.closed() => bail!("file writer stopped before source completion"),
+                        item = source.next() => item,
+                    };
+                    let Some(item) = item else { return Ok::<_, anyhow::Error>(()); };
+                    let failed = item.is_err();
+                    sender.send(item).await.map_err(|_| anyhow::anyhow!(
+                        "file writer stopped before source completion"
+                    ))?;
+                    ensure!(!failed, "source stream failed");
+                }
+            };
             // This enclosing phase includes time waiting for source records;
             // fetch/decode counters overlap it and must not be added to it.
-            let staged = phases
-                .measure(
-                    Phase::BlobWrite,
-                    InsertBuilder::new(dataset)
-                        .with_params(&WriteParams {
-                            mode: WriteMode::Append,
-                            ..Default::default()
-                        })
-                        .execute_uncommitted_stream(source),
-                )
-                .await?;
+            let params = WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            };
+            let builder = InsertBuilder::new(dataset).with_params(&params);
+            let writing = phases.measure(
+                Phase::BlobWrite,
+                builder.execute_uncommitted_stream(buffered),
+            );
+            // A writer failure closes its receiver and stops the pump. A
+            // source failure reaches the writer as a stream error. Join both
+            // before releasing the reservation or returning any descriptors.
+            let (staged, pumped) = tokio::join!(writing, pump);
+            let staged = staged?;
+            pumped?;
             let Operation::Append { fragments } = staged.operation else {
                 bail!("materialization did not produce append fragments");
             };
