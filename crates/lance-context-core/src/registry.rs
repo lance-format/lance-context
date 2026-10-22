@@ -46,6 +46,10 @@ pub struct RegistryEntry {
 ///
 /// The name says which stores exist; the dataset on object storage is the
 /// data. Implementations must be safe to share across tasks (`&self`).
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait adds must_use to boxed futures"
+)]
 #[async_trait::async_trait]
 pub trait StoreRegistry: Send + Sync {
     /// Whether a store named `name` exists.

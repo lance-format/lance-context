@@ -1,0 +1,1855 @@
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use lance_context_ingestion::{
+    Aligner, BacklogPolicy, BatchPolicy, Binding, Consumer, Entry, Error, HistoryLoader, Journal,
+    Partition, PipelineConfig, Position, Reducer, Request, Result, SessionCheckpoints, Sink,
+    Transition,
+};
+
+use object_store::{memory::InMemory, path::Path, ObjectStore, ObjectStoreExt};
+use tokio::sync::Semaphore;
+use tokio::time::timeout;
+
+fn backlog(consumers: &[&str], max_segments: u64) -> BacklogPolicy {
+    BacklogPolicy {
+        consumers: consumers.iter().map(|name| (*name).into()).collect(),
+        max_segments,
+        poll_interval: Duration::from_millis(1),
+    }
+}
+
+fn wal_entry(sequence: u64) -> Entry {
+    Entry {
+        sequence,
+        session: "session-a".into(),
+        receipt: format!("receipt-{sequence}"),
+        input_digest: "digest".into(),
+        transition: Transition {
+            delta: serde_json::to_vec(&sequence).unwrap(),
+            records: vec![],
+        },
+    }
+}
+
+#[tokio::test]
+async fn backlog_waits_for_every_required_consumer_and_reopens_without_reset() {
+    let journal = journal(Arc::new(InMemory::new()), 0);
+    let mut writer = journal.acquire().await.unwrap();
+    for n in 1..=3 {
+        writer.append(vec![wal_entry(n)]).await.unwrap();
+    }
+    // Enabling the limit on an existing backlog must preserve all its data.
+    let mut writer = journal
+        .acquire()
+        .await
+        .unwrap()
+        .with_backlog(backlog(&["table", "checkpoint"], 2))
+        .unwrap();
+    assert_eq!(
+        journal.consumer_position("table").await.unwrap(),
+        Position::default()
+    );
+    let mut append = Box::pin(writer.append(vec![wal_entry(4)]));
+    assert!(timeout(Duration::from_millis(20), &mut append)
+        .await
+        .is_err());
+    let mut table = Consumer::open(journal.clone(), "table").await.unwrap();
+    let mut checkpoint = Consumer::open(journal.clone(), "checkpoint").await.unwrap();
+    let mut table_sink = Collect::new();
+    let mut checkpoint_sink = Collect::new();
+    assert_eq!(table.consume(&mut table_sink, 3, 16384).await.unwrap(), 3);
+    assert!(timeout(Duration::from_millis(20), &mut append)
+        .await
+        .is_err());
+    assert_eq!(
+        checkpoint
+            .consume(&mut checkpoint_sink, 1, 16384)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(timeout(Duration::from_millis(20), &mut append)
+        .await
+        .is_err());
+    assert_eq!(
+        checkpoint
+            .consume(&mut checkpoint_sink, 1, 16384)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        timeout(Duration::from_secs(2), append)
+            .await
+            .unwrap()
+            .unwrap()
+            .sequence,
+        4
+    );
+    assert_eq!(journal.position().await.unwrap().generation, 4);
+    assert_eq!(
+        journal
+            .consumer_position("checkpoint")
+            .await
+            .unwrap()
+            .generation,
+        2
+    );
+}
+
+#[tokio::test]
+async fn cancelling_or_reassigning_a_backlog_paused_writer_fences_it() {
+    let journal = journal(Arc::new(InMemory::new()), 0);
+    let mut writer = journal
+        .acquire()
+        .await
+        .unwrap()
+        .with_backlog(backlog(&["table"], 1))
+        .unwrap();
+    writer.append(vec![wal_entry(1)]).await.unwrap();
+    // This timeout drops the actual append future, unlike the retained futures above.
+    assert!(
+        timeout(Duration::from_millis(20), writer.append(vec![wal_entry(2)]))
+            .await
+            .is_err()
+    );
+    assert!(matches!(
+        writer.append(vec![wal_entry(2)]).await,
+        Err(Error::Fenced)
+    ));
+    let mut writer = journal
+        .acquire()
+        .await
+        .unwrap()
+        .with_backlog(backlog(&["table"], 1))
+        .unwrap();
+    let mut append = Box::pin(writer.append(vec![wal_entry(2)]));
+    assert!(timeout(Duration::from_millis(20), &mut append)
+        .await
+        .is_err());
+    let mut replacement = journal
+        .acquire()
+        .await
+        .unwrap()
+        .with_backlog(backlog(&["table"], 1))
+        .unwrap();
+    assert!(matches!(
+        timeout(Duration::from_secs(2), append).await.unwrap(),
+        Err(Error::Fenced)
+    ));
+    let mut table = Consumer::open(journal.clone(), "table").await.unwrap();
+    assert_eq!(
+        table.consume(&mut Collect::new(), 1, 16384).await.unwrap(),
+        1
+    );
+    replacement.append(vec![wal_entry(2)]).await.unwrap();
+    assert_eq!(journal.position().await.unwrap().sequence, 2);
+}
+
+#[tokio::test]
+async fn pipeline_backpressure_keeps_retries_live_and_other_partitions_independent() {
+    let store = Arc::new(InMemory::new());
+    let j = journal(store.clone(), 0);
+    let mut cfg = config();
+    cfg.wal.max_entries = 1;
+    let pipeline = Partition::start(
+        j.acquire()
+            .await
+            .unwrap()
+            .with_backlog(backlog(&["table"], 1))
+            .unwrap(),
+        Counter::new(Arc::default()),
+        cfg,
+    )
+    .await
+    .unwrap();
+    pipeline
+        .enqueue(request(1))
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    let mut next = Box::pin(pipeline.enqueue(request(2)).await.unwrap().wait());
+    assert!(timeout(Duration::from_millis(30), &mut next).await.is_err());
+    // Already durable retries must not wait for a table consumer to catch up.
+    timeout(
+        Duration::from_secs(2),
+        pipeline.enqueue(request(1)).await.unwrap().wait(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let other = journal(store, 1);
+    other
+        .acquire()
+        .await
+        .unwrap()
+        .with_backlog(backlog(&["table"], 1))
+        .unwrap()
+        .append(vec![wal_entry(1)])
+        .await
+        .unwrap();
+    assert_eq!(j.position().await.unwrap().sequence, 1);
+    let mut consumer = Consumer::open(j.clone(), "table").await.unwrap();
+    consumer
+        .consume(&mut Collect::new(), 1, 16384)
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(2), &mut next)
+        .await
+        .unwrap()
+        .unwrap();
+    pipeline.shutdown().await.unwrap();
+    assert_eq!(j.position().await.unwrap().sequence, 2);
+}
+
+#[tokio::test]
+async fn backlog_rejects_forged_cursor_even_when_its_generation_would_release_capacity() {
+    let store = Arc::new(InMemory::new());
+    let j = journal(store.clone(), 0);
+    let mut writer = j
+        .acquire()
+        .await
+        .unwrap()
+        .with_backlog(backlog(&["table"], 1))
+        .unwrap();
+    let committed = writer.append(vec![wal_entry(1)]).await.unwrap();
+    let forged = Position {
+        segment: Some(uuid::Uuid::new_v4().to_string()),
+        ..committed.clone()
+    };
+    let path = Path::from("run/partition-0/consumers/table.json");
+    store
+        .put(
+            &path,
+            serde_json::to_vec(&serde_json::json!({"binding":binding(0),"position":forged}))
+                .unwrap()
+                .into(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        writer.append(vec![wal_entry(2)]).await,
+        Err(Error::Invalid(_))
+    ));
+    assert_eq!(j.position().await.unwrap(), committed);
+    assert!(matches!(
+        writer.append(vec![wal_entry(2)]).await,
+        Err(Error::Fenced)
+    ));
+}
+
+#[tokio::test]
+async fn lagging_recovery_and_consumers_page_without_loading_entire_wal() {
+    let store = Arc::new(InMemory::new());
+    let journal = Journal::new(store, Path::from("paged"), binding(0), 1 << 20, 3).unwrap();
+    let mut writer = journal.acquire().await.unwrap();
+    for sequence in 1..=35 {
+        writer
+            .append(vec![Entry {
+                sequence,
+                session: "s".into(),
+                receipt: format!("r-{sequence}"),
+                input_digest: "digest".into(),
+                transition: Transition {
+                    delta: serde_json::to_vec(&sequence).unwrap(),
+                    records: vec![],
+                },
+            }])
+            .await
+            .unwrap();
+    }
+    let head = writer.position().clone();
+    let mut position = Position::default();
+    let mut seen = Vec::new();
+    while position != head {
+        let page = journal.pending(&position, &head).await.unwrap();
+        assert!(!page.is_empty() && page.len() <= 3);
+        seen.extend(page.iter().map(|p| p.sequence));
+        position = page.last().unwrap().clone();
+    }
+    assert_eq!(seen, (1..=35).collect::<Vec<_>>());
+    let mut consumer = Consumer::open(journal.clone(), "table").await.unwrap();
+    let mut sink = Collect::new();
+    while consumer.consume(&mut sink, 2, 16384).await.unwrap() != 0 {}
+    assert_eq!(sink.entries.lock().unwrap().len(), 35);
+    let observed: Arc<Mutex<Vec<(u64, u64)>>> = Arc::default();
+    let pipeline = Partition::start(
+        journal.acquire().await.unwrap(),
+        Counter::new(observed.clone()),
+        config(),
+    )
+    .await
+    .unwrap();
+    let mut next = request(36);
+    next.session = "s".into();
+    pipeline.enqueue(next).await.unwrap().wait().await.unwrap();
+    assert_eq!(*observed.lock().unwrap(), vec![(36, 36)]);
+    pipeline.shutdown().await.unwrap();
+}
+
+struct AddDelta {
+    fail_b: Arc<std::sync::atomic::AtomicBool>,
+    a_calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Reducer for AddDelta {
+    async fn apply(&self, session: &str, state: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
+        if session == "b" && self.fail_b.load(Ordering::SeqCst) {
+            return Err(Error::Stage("injected checkpoint failure".into()));
+        }
+        if session == "a" {
+            self.a_calls.fetch_add(1, Ordering::SeqCst);
+        }
+        let value = if state.is_empty() {
+            0
+        } else {
+            serde_json::from_slice::<u64>(state)?
+        };
+        Ok(serde_json::to_vec(
+            &(value + serde_json::from_slice::<u64>(delta)?),
+        )?)
+    }
+}
+
+#[tokio::test]
+async fn partial_checkpoint_batch_recovery_skips_already_applied_session_deltas() {
+    let journal = journal(Arc::new(InMemory::new()), 0);
+    let mut writer = journal.acquire().await.unwrap();
+    for (sequence, session) in [(1, "a"), (2, "b"), (3, "a")] {
+        writer
+            .append(vec![Entry {
+                sequence,
+                session: session.into(),
+                receipt: format!("r-{sequence}"),
+                input_digest: "digest".into(),
+                transition: Transition {
+                    delta: b"1".to_vec(),
+                    records: vec![],
+                },
+            }])
+            .await
+            .unwrap();
+    }
+    let fail_b = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let a_calls = Arc::new(AtomicUsize::new(0));
+    let checkpoints = SessionCheckpoints::new(journal.clone(), 1024).unwrap();
+    let mut sink = checkpoints
+        .sink(
+            AddDelta {
+                fail_b: fail_b.clone(),
+                a_calls: a_calls.clone(),
+            },
+            1,
+        )
+        .unwrap();
+    let mut consumer = Consumer::open(journal.clone(), "checkpoint").await.unwrap();
+    assert!(consumer.consume(&mut sink, 10, 16384).await.is_err());
+    assert_eq!(consumer.position().sequence, 0);
+    let a = checkpoints.load("a").await.unwrap().unwrap();
+    assert_eq!(a.through_sequence, 3);
+    assert_eq!(a.value, b"2");
+    assert!(checkpoints.load("b").await.unwrap().is_none());
+    fail_b.store(false, Ordering::SeqCst);
+    let mut consumer = Consumer::open(journal.clone(), "checkpoint").await.unwrap();
+    assert_eq!(consumer.consume(&mut sink, 10, 16384).await.unwrap(), 3);
+    assert_eq!(consumer.position().sequence, 3);
+    assert_eq!(checkpoints.load("a").await.unwrap().unwrap(), a);
+    assert_eq!(
+        a_calls.load(Ordering::SeqCst),
+        2,
+        "retry must not apply delta to a twice"
+    );
+    assert_eq!(checkpoints.load("b").await.unwrap().unwrap().value, b"1");
+}
+
+#[tokio::test]
+async fn lazy_session_recovery_reads_only_suffix_and_handles_uncached_sessions() {
+    let store = Arc::new(InMemory::new());
+    // One-segment pages force recovery to consume several pages.
+    let journal = Journal::new(store.clone(), Path::from("lazy"), binding(0), 1 << 20, 1).unwrap();
+    let mut writer = journal.acquire().await.unwrap();
+    let first = writer.append(vec![wal_entry(1)]).await.unwrap();
+    let checkpoints = SessionCheckpoints::new(journal.clone(), 1024).unwrap();
+    let reducer = || AddDelta {
+        fail_b: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        a_calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let mut sink = checkpoints.sink(reducer(), 1).unwrap();
+    let mut consumer = Consumer::open(journal.clone(), "checkpoint").await.unwrap();
+    consumer.consume(&mut sink, 10, 16384).await.unwrap();
+    // The checkpoint replaces these payload reads, but not immutable link metadata.
+    // Deliberately deleting data here is a regression test, not a GC protocol.
+    store
+        .delete(&Path::from(format!(
+            "lazy/segments/{}.json",
+            first.segment.unwrap()
+        )))
+        .await
+        .unwrap();
+    for sequence in 2..=5 {
+        writer.append(vec![wal_entry(sequence)]).await.unwrap();
+    }
+    let recovered = checkpoints
+        .recover("checkpoint", "session-a", &reducer())
+        .await
+        .unwrap();
+    assert_eq!(recovered.state.value, b"15");
+    assert_eq!(recovered.state.through_sequence, 5);
+    assert_eq!(recovered.position, *writer.position());
+    assert_eq!(
+        checkpoints.load("session-a").await.unwrap().unwrap().value,
+        b"1",
+        "readonly recovery must not publish a new checkpoint"
+    );
+    assert_eq!(
+        journal
+            .consumer_position("checkpoint")
+            .await
+            .unwrap()
+            .sequence,
+        1
+    );
+    let missing = checkpoints
+        .recover("checkpoint", "new-session", &reducer())
+        .await
+        .unwrap();
+    assert!(missing.state.value.is_empty());
+    assert_eq!(missing.state.through_sequence, 0);
+    assert_eq!(missing.position, recovered.position);
+}
+
+#[tokio::test]
+async fn lazy_recovery_skips_partially_published_state_and_propagates_reducer_errors() {
+    let journal = journal(Arc::new(InMemory::new()), 0);
+    let mut writer = journal.acquire().await.unwrap();
+    for (sequence, session) in [(1, "a"), (2, "b"), (3, "a")] {
+        let mut entry = wal_entry(sequence);
+        entry.session = session.into();
+        entry.transition.delta = b"1".to_vec();
+        writer.append(vec![entry]).await.unwrap();
+    }
+    let checkpoints = SessionCheckpoints::new(journal.clone(), 1024).unwrap();
+    let fail_b = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let a_calls = Arc::new(AtomicUsize::new(0));
+    let reducer = || AddDelta {
+        fail_b: fail_b.clone(),
+        a_calls: a_calls.clone(),
+    };
+    let mut sink = checkpoints.sink(reducer(), 1).unwrap();
+    let mut consumer = Consumer::open(journal.clone(), "checkpoint").await.unwrap();
+    assert!(consumer.consume(&mut sink, 10, 16384).await.is_err());
+    assert_eq!(consumer.position().sequence, 0);
+    let a = checkpoints
+        .recover("checkpoint", "a", &reducer())
+        .await
+        .unwrap();
+    assert_eq!(a.state.value, b"2");
+    assert_eq!(
+        a_calls.load(Ordering::SeqCst),
+        2,
+        "already checkpointed deltas must not replay"
+    );
+    assert!(checkpoints
+        .recover("checkpoint", "b", &reducer())
+        .await
+        .is_err());
+    fail_b.store(false, Ordering::SeqCst);
+    let b = checkpoints
+        .recover("checkpoint", "b", &reducer())
+        .await
+        .unwrap();
+    assert_eq!(b.state.value, b"1");
+    assert_eq!(b.state.through_sequence, 2);
+    assert_eq!(b.position.sequence, 3);
+    assert!(checkpoints.load("b").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn lazy_recovery_rejects_wrong_chain_cursor_and_oversized_reduction() {
+    let store = Arc::new(InMemory::new());
+    let journal = journal(store.clone(), 0);
+    let mut writer = journal.acquire().await.unwrap();
+    let head = writer.append(vec![wal_entry(1)]).await.unwrap();
+    let checkpoints = SessionCheckpoints::new(journal.clone(), 1).unwrap();
+    assert!(checkpoints
+        .recover("checkpoint", "session-a", &OversizedBatch)
+        .await
+        .is_err());
+    let mut wrong = head;
+    wrong.segment = Some(uuid::Uuid::new_v4().to_string());
+    store
+        .put(
+            &Path::from("run/partition-0/consumers/checkpoint.json"),
+            serde_json::to_vec(&serde_json::json!({"binding": binding(0), "position": wrong}))
+                .unwrap()
+                .into(),
+        )
+        .await
+        .unwrap();
+    assert!(checkpoints
+        .recover("checkpoint", "new-session", &ReplaceDelta)
+        .await
+        .is_err());
+}
+
+type SessionDeltas = (String, Vec<u64>);
+
+struct OrderedBatch {
+    batches: Arc<Mutex<Vec<SessionDeltas>>>,
+    fail_b: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl Reducer for OrderedBatch {
+    async fn apply(&self, _: &str, _: &[u8], _: &[u8]) -> Result<Vec<u8>> {
+        Err(Error::Stage("unexpected per-delta reduction".into()))
+    }
+
+    async fn apply_batch(
+        &self,
+        session: &str,
+        state: &[u8],
+        deltas: &[&[u8]],
+        max_state_bytes: usize,
+    ) -> Result<Vec<u8>> {
+        let deltas = deltas
+            .iter()
+            .map(|delta| serde_json::from_slice::<u64>(delta))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        self.batches
+            .lock()
+            .unwrap()
+            .push((session.into(), deltas.clone()));
+        let mut values: Vec<u64> = if state.is_empty() {
+            Vec::new()
+        } else {
+            serde_json::from_slice(state)?
+        };
+        values.extend(deltas);
+        let result = serde_json::to_vec(&values)?;
+        // This representation only grows, so the final bound covers each prefix.
+        if result.len() > max_state_bytes {
+            return Err(Error::Invalid("test state budget exceeded".into()));
+        }
+        if session == "b" && self.fail_b.load(Ordering::SeqCst) {
+            return Err(Error::Stage("injected batch reduction failure".into()));
+        }
+        Ok(result)
+    }
+}
+
+#[tokio::test]
+async fn checkpoint_batch_override_coalesces_ordered_deltas_and_skips_committed_prefix() {
+    let journal = journal(Arc::new(InMemory::new()), 0);
+    let mut writer = journal.acquire().await.unwrap();
+    for sequence in 1..=5 {
+        let mut entry = wal_entry(sequence);
+        entry.session = if sequence % 2 == 1 { "a" } else { "b" }.into();
+        writer.append(vec![entry]).await.unwrap();
+    }
+    let batches = Arc::new(Mutex::new(Vec::new()));
+    let fail_b = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let checkpoints = SessionCheckpoints::new(journal.clone(), 1024).unwrap();
+    let mut sink = checkpoints
+        .sink(
+            OrderedBatch {
+                batches: batches.clone(),
+                fail_b: fail_b.clone(),
+            },
+            1,
+        )
+        .unwrap();
+    let mut consumer = Consumer::open(journal.clone(), "checkpoint").await.unwrap();
+    assert!(consumer.consume(&mut sink, 10, 16384).await.is_err());
+    assert_eq!(consumer.position(), &Position::default());
+    let a = checkpoints.load("a").await.unwrap().unwrap();
+    assert_eq!(a.through_sequence, 5);
+    assert_eq!(a.value, b"[1,3,5]");
+    assert!(checkpoints.load("b").await.unwrap().is_none());
+    assert_eq!(
+        *batches.lock().unwrap(),
+        vec![("a".into(), vec![1, 3, 5]), ("b".into(), vec![2, 4])]
+    );
+
+    fail_b.store(false, Ordering::SeqCst);
+    let mut consumer = Consumer::open(journal.clone(), "checkpoint").await.unwrap();
+    // Regroup the retry across different consumer batch boundaries. Session a
+    // is ahead of the global prefix and must not be reduced again, even partly.
+    assert_eq!(consumer.consume(&mut sink, 2, 16384).await.unwrap(), 2);
+    assert_eq!(consumer.consume(&mut sink, 3, 16384).await.unwrap(), 3);
+    assert_eq!(checkpoints.load("a").await.unwrap().unwrap(), a);
+    assert_eq!(
+        checkpoints.load("b").await.unwrap().unwrap().value,
+        b"[2,4]"
+    );
+    assert_eq!(
+        *batches.lock().unwrap(),
+        vec![
+            ("a".into(), vec![1, 3, 5]),
+            ("b".into(), vec![2, 4]),
+            ("b".into(), vec![2]),
+            ("b".into(), vec![4]),
+        ]
+    );
+
+    let mut next = wal_entry(6);
+    next.session = "a".into();
+    writer.append(vec![next]).await.unwrap();
+    assert_eq!(consumer.consume(&mut sink, 10, 16384).await.unwrap(), 1);
+    let a = checkpoints.load("a").await.unwrap().unwrap();
+    assert_eq!(a.through_sequence, 6);
+    assert_eq!(a.value, b"[1,3,5,6]");
+    assert_eq!(batches.lock().unwrap().last(), Some(&("a".into(), vec![6])));
+    assert_eq!(consumer.consume(&mut sink, 10, 16384).await.unwrap(), 0);
+}
+
+struct ReplaceDelta;
+
+#[async_trait]
+impl Reducer for ReplaceDelta {
+    async fn apply(&self, _: &str, _: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
+        Ok(delta.to_vec())
+    }
+}
+
+struct OversizedBatch;
+
+#[async_trait]
+impl Reducer for OversizedBatch {
+    async fn apply(&self, _: &str, _: &[u8], _: &[u8]) -> Result<Vec<u8>> {
+        unreachable!("batch override is required")
+    }
+
+    async fn apply_batch(&self, _: &str, _: &[u8], _: &[&[u8]], _: usize) -> Result<Vec<u8>> {
+        // Deliberately violate the callback's budget contract. The sink still
+        // rejects oversized output without publishing it or advancing progress.
+        Ok(vec![0; 9])
+    }
+}
+
+async fn checkpoint_budget_rejects_without_advancing<R: Reducer>(reducer: R) {
+    let journal = journal(Arc::new(InMemory::new()), 0);
+    let mut writer = journal.acquire().await.unwrap();
+    let mut entries = vec![wal_entry(1), wal_entry(2)];
+    entries[0].transition.delta = vec![1; 9];
+    entries[1].transition.delta = vec![2; 1];
+    writer.append(entries).await.unwrap();
+    let checkpoints = SessionCheckpoints::new(journal.clone(), 8).unwrap();
+    let mut sink = checkpoints.sink(reducer, 1).unwrap();
+    let mut consumer = Consumer::open(journal.clone(), "checkpoint").await.unwrap();
+    assert!(matches!(
+        consumer.consume(&mut sink, 10, 16384).await,
+        Err(Error::Invalid(_))
+    ));
+    assert_eq!(consumer.position(), &Position::default());
+    assert!(checkpoints.load("session-a").await.unwrap().is_none());
+    assert_eq!(
+        journal.consumer_position("checkpoint").await.unwrap(),
+        Position::default()
+    );
+    // Recovery with sufficient budget consumes the unchanged WAL normally.
+    let checkpoints = SessionCheckpoints::new(journal.clone(), 16).unwrap();
+    let mut sink = checkpoints.sink(ReplaceDelta, 1).unwrap();
+    let mut consumer = Consumer::open(journal.clone(), "checkpoint").await.unwrap();
+    assert_eq!(consumer.consume(&mut sink, 10, 16384).await.unwrap(), 2);
+    let state = checkpoints.load("session-a").await.unwrap().unwrap();
+    assert_eq!(state.through_sequence, 2);
+    assert_eq!(state.value, vec![2]);
+}
+
+#[tokio::test]
+async fn checkpoint_default_batch_rejects_oversized_intermediate_state() {
+    checkpoint_budget_rejects_without_advancing(ReplaceDelta).await;
+}
+
+#[tokio::test]
+async fn checkpoint_batch_override_cannot_publish_oversized_output() {
+    checkpoint_budget_rejects_without_advancing(OversizedBatch).await;
+}
+
+fn binding(partition: u32) -> Binding {
+    Binding {
+        run: "run-1".into(),
+        schema: "test-delta-v1".into(),
+        partition,
+    }
+}
+
+fn journal(store: Arc<dyn ObjectStore>, partition: u32) -> Journal {
+    Journal::new(
+        store,
+        Path::from(format!("run/partition-{partition}")),
+        binding(partition),
+        1 << 20,
+        100,
+    )
+    .unwrap()
+}
+
+fn config() -> PipelineConfig {
+    PipelineConfig {
+        queue_entries: 4,
+        load_concurrency: 4,
+        memory_bytes: 1 << 20,
+        max_input_bytes: 1024,
+        max_transition_bytes: 1024,
+        max_history_bytes: 0,
+        wal: BatchPolicy {
+            max_entries: 3,
+            max_bytes: 16 * 1024,
+            max_delay: Duration::from_millis(10),
+        },
+    }
+}
+
+fn request(sequence: u64) -> Request {
+    Request {
+        sequence,
+        session: "session-a".into(),
+        receipt: format!("receipt-{sequence}"),
+        payload: vec![sequence as u8],
+    }
+}
+
+struct Counter {
+    states: BTreeMap<String, u64>,
+    observed: Arc<Mutex<Vec<(u64, u64)>>>,
+    align_gate: Option<Arc<Semaphore>>,
+}
+
+struct ReorderedLoads {
+    first: Arc<Semaphore>,
+    second_loaded: Arc<Semaphore>,
+}
+
+#[async_trait]
+impl HistoryLoader for ReorderedLoads {
+    async fn load(&self, request: &Request, _max_bytes: usize) -> Result<Vec<u8>> {
+        if request.sequence == 1 {
+            self.first.acquire().await.unwrap().forget();
+        } else {
+            self.second_loaded.add_permits(1);
+        }
+        Ok(Vec::new())
+    }
+}
+
+#[tokio::test]
+async fn history_prefetch_is_concurrent_but_same_session_alignment_keeps_input_order() {
+    let first = Arc::new(Semaphore::new(0));
+    let second_loaded = Arc::new(Semaphore::new(0));
+    let observed: Arc<Mutex<Vec<(u64, u64)>>> = Arc::default();
+    let journal = journal(Arc::new(InMemory::new()), 0);
+    let pipeline = Partition::start_with_loader(
+        journal.acquire().await.unwrap(),
+        Counter::new(observed.clone()),
+        ReorderedLoads {
+            first: first.clone(),
+            second_loaded: second_loaded.clone(),
+        },
+        config(),
+    )
+    .await
+    .unwrap();
+    let a = pipeline.enqueue(request(1)).await.unwrap();
+    let b = pipeline.enqueue(request(2)).await.unwrap();
+    timeout(Duration::from_secs(2), second_loaded.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    assert!(
+        observed.lock().unwrap().is_empty(),
+        "prefetch finishing out of order cannot reorder alignment"
+    );
+    first.add_permits(1);
+    a.wait().await.unwrap();
+    b.wait().await.unwrap();
+    assert_eq!(*observed.lock().unwrap(), vec![(1, 1), (2, 2)]);
+    pipeline.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn dropping_partition_discards_uncommitted_suffix_before_recovery() {
+    let journal = journal(Arc::new(InMemory::new()), 0);
+    let mut aligner = Counter::new(Arc::default());
+    aligner.align_gate = Some(Arc::new(Semaphore::new(0)));
+    let pipeline = Partition::start(journal.acquire().await.unwrap(), aligner, config())
+        .await
+        .unwrap();
+    let ack = pipeline.enqueue(request(1)).await.unwrap();
+    drop(pipeline);
+    assert!(timeout(Duration::from_secs(2), ack.wait())
+        .await
+        .unwrap()
+        .is_err());
+    assert_eq!(journal.position().await.unwrap(), Position::default());
+    let observed: Arc<Mutex<Vec<(u64, u64)>>> = Arc::default();
+    let pipeline = Partition::start(
+        journal.acquire().await.unwrap(),
+        Counter::new(observed.clone()),
+        config(),
+    )
+    .await
+    .unwrap();
+    pipeline
+        .enqueue(request(1))
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    assert_eq!(*observed.lock().unwrap(), vec![(1, 1)]);
+    pipeline.shutdown().await.unwrap();
+}
+
+impl Counter {
+    fn new(observed: Arc<Mutex<Vec<(u64, u64)>>>) -> Self {
+        Self {
+            states: BTreeMap::new(),
+            observed,
+            align_gate: None,
+        }
+    }
+}
+
+#[async_trait]
+impl Aligner for Counter {
+    async fn restore(&mut self, _binding: &Binding) -> Result<Position> {
+        Ok(Position::default())
+    }
+
+    async fn replay(&mut self, entry: &Entry) -> Result<()> {
+        self.states.insert(
+            entry.session.clone(),
+            serde_json::from_slice(&entry.transition.delta)?,
+        );
+        Ok(())
+    }
+
+    async fn align(&mut self, request: &Request, _history: &[u8]) -> Result<Transition> {
+        if let Some(gate) = &self.align_gate {
+            gate.acquire().await.unwrap().forget();
+        }
+        let state = self.states.entry(request.session.clone()).or_default();
+        *state += 1;
+        self.observed
+            .lock()
+            .unwrap()
+            .push((request.sequence, *state));
+        Ok(Transition {
+            delta: serde_json::to_vec(state)?,
+            records: request.payload.clone(),
+        })
+    }
+}
+
+struct Collect {
+    entries: Arc<Mutex<BTreeMap<u64, Entry>>>,
+    gate: Option<Arc<Semaphore>>,
+    calls: Arc<AtomicUsize>,
+    fail_after_apply: bool,
+}
+
+impl Collect {
+    fn new() -> Self {
+        Self {
+            entries: Arc::default(),
+            gate: None,
+            calls: Arc::default(),
+            fail_after_apply: false,
+        }
+    }
+}
+
+#[async_trait]
+impl Sink for Collect {
+    async fn apply(&mut self, _binding: &Binding, entries: &[Entry]) -> Result<()> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(gate) = &self.gate {
+            gate.acquire().await.unwrap().forget();
+        }
+        for entry in entries {
+            if let Some(previous) = self
+                .entries
+                .lock()
+                .unwrap()
+                .insert(entry.sequence, entry.clone())
+            {
+                assert_eq!(previous, *entry);
+            }
+        }
+        if self.fail_after_apply {
+            return Err(Error::Stage("injected lost sink response".into()));
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn durable_ack_and_alignment_continue_while_checkpoint_is_blocked() {
+    let journal = journal(Arc::new(InMemory::new()), 0);
+    let observed = Arc::default();
+    let pipeline = Partition::start(
+        journal.acquire().await.unwrap(),
+        Counter::new(observed),
+        config(),
+    )
+    .await
+    .unwrap();
+    let first = pipeline.enqueue(request(1)).await.unwrap();
+    assert_eq!(first.wait().await.unwrap().sequence, 1);
+
+    let gate = Arc::new(Semaphore::new(0));
+    let mut checkpoint = Consumer::open(journal.clone(), "checkpoint").await.unwrap();
+    let mut sink = Collect::new();
+    sink.gate = Some(gate.clone());
+    let calls = sink.calls.clone();
+    let stalled = tokio::spawn(async move {
+        checkpoint.consume(&mut sink, 10, 64 * 1024).await.unwrap();
+        checkpoint.position().clone()
+    });
+    timeout(Duration::from_secs(2), async {
+        while calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let second = pipeline.enqueue(request(2)).await.unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(2), second.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .sequence,
+        2
+    );
+    assert!(!stalled.is_finished());
+    let mut merge = Consumer::open(journal.clone(), "table").await.unwrap();
+    let mut table = Collect::new();
+    assert_eq!(merge.consume(&mut table, 10, 64 * 1024).await.unwrap(), 2);
+    assert_eq!(
+        table.calls.load(Ordering::SeqCst),
+        1,
+        "merge independently coalesces two WAL batches"
+    );
+    assert_eq!(merge.position().sequence, 2);
+    gate.add_permits(1);
+    assert_eq!(stalled.await.unwrap().sequence, 1);
+    pipeline.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn restart_replays_committed_suffix_and_retry_does_not_align_twice() {
+    let journal = journal(Arc::new(InMemory::new()), 0);
+    let observed = Arc::default();
+    let pipeline = Partition::start(
+        journal.acquire().await.unwrap(),
+        Counter::new(observed),
+        config(),
+    )
+    .await
+    .unwrap();
+    let ack = pipeline.enqueue(request(1)).await.unwrap();
+    drop(ack); // client disappeared; admitted work still commits
+    pipeline.shutdown().await.unwrap();
+    assert_eq!(journal.position().await.unwrap().sequence, 1);
+
+    let observed: Arc<Mutex<Vec<(u64, u64)>>> = Arc::default();
+    let pipeline = Partition::start(
+        journal.acquire().await.unwrap(),
+        Counter::new(observed.clone()),
+        config(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        pipeline
+            .enqueue(request(1))
+            .await
+            .unwrap()
+            .wait()
+            .await
+            .unwrap()
+            .sequence,
+        1
+    );
+    let mut changed = request(1);
+    changed.payload = vec![99];
+    assert!(pipeline
+        .enqueue(changed)
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .is_err());
+    assert!(observed.lock().unwrap().is_empty());
+    assert!(
+        pipeline
+            .enqueue(request(3))
+            .await
+            .unwrap()
+            .wait()
+            .await
+            .is_err(),
+        "cannot skip missing source receipt"
+    );
+    assert_eq!(
+        pipeline
+            .enqueue(request(2))
+            .await
+            .unwrap()
+            .wait()
+            .await
+            .unwrap()
+            .sequence,
+        2
+    );
+    assert_eq!(
+        *observed.lock().unwrap(),
+        vec![(2, 2)],
+        "restored state determines next aligned ID"
+    );
+    pipeline.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn independent_partition_progresses_while_another_alignment_is_stalled() {
+    let store = Arc::new(InMemory::new());
+    let gate = Arc::new(Semaphore::new(0));
+    let mut slow = Counter::new(Arc::default());
+    slow.align_gate = Some(gate.clone());
+    let a = Partition::start(
+        journal(store.clone(), 0).acquire().await.unwrap(),
+        slow,
+        config(),
+    )
+    .await
+    .unwrap();
+    let b = Partition::start(
+        journal(store, 1).acquire().await.unwrap(),
+        Counter::new(Arc::default()),
+        config(),
+    )
+    .await
+    .unwrap();
+    let blocked = a.enqueue(request(1)).await.unwrap();
+    let fast = b.enqueue(request(1)).await.unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(2), fast.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .sequence,
+        1
+    );
+    assert_eq!(a.durable_position().sequence, 0);
+    gate.add_permits(1);
+    assert_eq!(blocked.wait().await.unwrap().sequence, 1);
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn stale_writer_upload_is_not_recoverable_or_acknowledged() {
+    let journal = journal(Arc::new(InMemory::new()), 0);
+    let mut old = journal.acquire().await.unwrap();
+    let mut new = journal.acquire().await.unwrap();
+    let entry = Entry {
+        sequence: 1,
+        session: "s".into(),
+        receipt: "r".into(),
+        input_digest: "hash".into(),
+        transition: Transition {
+            delta: vec![1],
+            records: vec![2],
+        },
+    };
+    assert!(old.append(vec![entry.clone()]).await.is_err());
+    assert!(matches!(
+        old.append(vec![entry.clone()]).await,
+        Err(Error::Fenced)
+    ));
+    assert_eq!(journal.position().await.unwrap().sequence, 0);
+    let committed = new.append(vec![entry.clone()]).await.unwrap();
+    let positions = journal
+        .pending(&Position::default(), &committed)
+        .await
+        .unwrap();
+    assert_eq!(positions, vec![committed.clone()]);
+    assert_eq!(journal.entries(&committed).await.unwrap(), vec![entry]);
+}
+
+#[tokio::test]
+async fn consumer_uncertain_apply_replays_without_skipping_or_duplicating_output() {
+    let journal = journal(Arc::new(InMemory::new()), 0);
+    let pipeline = Partition::start(
+        journal.acquire().await.unwrap(),
+        Counter::new(Arc::default()),
+        config(),
+    )
+    .await
+    .unwrap();
+    pipeline
+        .enqueue(request(1))
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    let mut consumer = Consumer::open(journal.clone(), "table").await.unwrap();
+    let mut sink = Collect::new();
+    sink.fail_after_apply = true;
+    assert!(consumer.consume(&mut sink, 5, 32 * 1024).await.is_err());
+    assert_eq!(consumer.position().sequence, 0);
+    assert!(matches!(
+        consumer.consume(&mut sink, 5, 32 * 1024).await,
+        Err(Error::Fenced)
+    ));
+    let mut recovered = Consumer::open(journal.clone(), "table").await.unwrap();
+    assert_eq!(recovered.position().sequence, 0);
+    sink.fail_after_apply = false;
+    recovered.consume(&mut sink, 1, 32 * 1024).await.unwrap();
+    assert_eq!(sink.entries.lock().unwrap().len(), 1);
+    assert_eq!(sink.calls.load(Ordering::SeqCst), 2);
+    pipeline.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn byte_admission_is_bounded_and_sparse_wal_flushes_on_timer() {
+    let mut cfg = config();
+    // Exactly one maximum-sized input/output reservation fits.
+    cfg.memory_bytes = (cfg.max_input_bytes + cfg.max_transition_bytes) * 16 + 4096;
+    cfg.wal.max_delay = Duration::from_millis(50);
+    let gate = Arc::new(Semaphore::new(0));
+    let mut aligner = Counter::new(Arc::default());
+    aligner.align_gate = Some(gate.clone());
+    let pipeline = Partition::start(
+        journal(Arc::new(InMemory::new()), 0)
+            .acquire()
+            .await
+            .unwrap(),
+        aligner,
+        cfg,
+    )
+    .await
+    .unwrap();
+    let first = pipeline.enqueue(request(1)).await.unwrap();
+    assert!(
+        timeout(Duration::from_millis(30), pipeline.enqueue(request(2)))
+            .await
+            .is_err()
+    );
+    gate.add_permits(1);
+    assert_eq!(
+        timeout(Duration::from_secs(2), first.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .sequence,
+        1
+    );
+    let second = pipeline.enqueue(request(2)).await.unwrap();
+    gate.add_permits(1);
+    assert_eq!(second.wait().await.unwrap().sequence, 2);
+    pipeline.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn corrupt_committed_segment_fails_recovery_and_binding_cannot_change() {
+    let store = Arc::new(InMemory::new());
+    let journal = journal(store.clone(), 0);
+    let pipeline = Partition::start(
+        journal.acquire().await.unwrap(),
+        Counter::new(Arc::default()),
+        config(),
+    )
+    .await
+    .unwrap();
+    let position = pipeline
+        .enqueue(request(1))
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    pipeline.shutdown().await.unwrap();
+    let wrong = Journal::new(
+        store.clone(),
+        Path::from("run/partition-0"),
+        binding(1),
+        1 << 20,
+        100,
+    )
+    .unwrap();
+    assert!(wrong.acquire().await.is_err());
+    let segment = Path::from(format!(
+        "run/partition-0/segments/{}.json",
+        position.segment.unwrap()
+    ));
+    store
+        .put(&segment, b"corrupt".to_vec().into())
+        .await
+        .unwrap();
+    assert!(Partition::start(
+        journal.acquire().await.unwrap(),
+        Counter::new(Arc::default()),
+        config()
+    )
+    .await
+    .is_err());
+}
+
+struct EmptyHistory;
+
+#[async_trait]
+impl HistoryLoader for EmptyHistory {
+    async fn load(&self, _: &Request, _: usize) -> Result<Vec<u8>> {
+        Ok(Vec::new())
+    }
+}
+
+struct LaneCounter {
+    counter: Counter,
+    slow: Arc<Semaphore>,
+    fast_done: Arc<Semaphore>,
+    failure: Option<(u64, bool)>,
+    slow_started: Arc<Semaphore>,
+}
+
+#[async_trait]
+impl Aligner for LaneCounter {
+    async fn restore(&mut self, binding: &Binding) -> Result<Position> {
+        self.counter.restore(binding).await
+    }
+    async fn replay(&mut self, entry: &Entry) -> Result<()> {
+        self.counter.replay(entry).await
+    }
+    async fn align(&mut self, request: &Request, history: &[u8]) -> Result<Transition> {
+        if request.session == "slow" {
+            self.slow_started.add_permits(1);
+            self.slow.acquire().await.unwrap().forget();
+        }
+        if let Some((sequence, panic)) = self.failure {
+            if request.sequence == sequence {
+                assert!(!panic, "injected later lane panic");
+                return Err(Error::Stage("injected lane failure".into()));
+            }
+        }
+        let transition = self.counter.align(request, history).await?;
+        if request.session == "fast" {
+            self.fast_done.add_permits(1);
+        }
+        Ok(transition)
+    }
+}
+
+fn lane_request(sequence: u64, session: &str) -> Request {
+    Request {
+        session: session.into(),
+        ..request(sequence)
+    }
+}
+
+#[tokio::test]
+async fn independent_alignment_lanes_overlap_but_wal_and_same_session_stay_ordered() {
+    let journal = journal(Arc::new(InMemory::new()), 0);
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let slow = Arc::new(Semaphore::new(0));
+    let fast_done = Arc::new(Semaphore::new(0));
+    let aligners = (0..2)
+        .map(|_| LaneCounter {
+            counter: Counter::new(observed.clone()),
+            slow: slow.clone(),
+            fast_done: fast_done.clone(),
+            failure: None,
+            slow_started: Arc::new(Semaphore::new(0)),
+        })
+        .collect();
+    let pipeline = Partition::start_with_aligners(
+        journal.acquire().await.unwrap(),
+        aligners,
+        EmptyHistory,
+        config(),
+    )
+    .await
+    .unwrap();
+    let mut acks = Vec::new();
+    for (sequence, session) in [(1, "slow"), (2, "fast"), (3, "slow")] {
+        acks.push(
+            pipeline
+                .enqueue(lane_request(sequence, session))
+                .await
+                .unwrap(),
+        );
+    }
+    timeout(Duration::from_secs(2), fast_done.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    assert_eq!(
+        *observed.lock().unwrap(),
+        vec![(2, 1)],
+        "fast session must execute while earlier slow session is blocked"
+    );
+    assert_eq!(
+        journal.position().await.unwrap().sequence,
+        0,
+        "later completed lane cannot publish ahead of the first entry"
+    );
+    slow.add_permits(2);
+    for ack in acks {
+        timeout(Duration::from_secs(2), ack.wait())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    pipeline.shutdown().await.unwrap();
+    let mut consumer = Consumer::open(journal.clone(), "check").await.unwrap();
+    let mut sink = Collect::new();
+    consumer.consume(&mut sink, 100, 16384).await.unwrap();
+    {
+        let rows = sink.entries.lock().unwrap();
+        assert_eq!(rows.keys().copied().collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert_eq!(
+            rows.values()
+                .map(|v| serde_json::from_slice::<u64>(&v.transition.delta).unwrap())
+                .collect::<Vec<_>>(),
+            vec![1, 1, 2]
+        );
+    }
+    // Lane count is process-local: replay routes each durable session to its new
+    // lane without changing the journal binding or allocating its IDs again.
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let aligners = (0..3).map(|_| Counter::new(observed.clone())).collect();
+    let pipeline = Partition::start_with_aligners(
+        journal.acquire().await.unwrap(),
+        aligners,
+        EmptyHistory,
+        config(),
+    )
+    .await
+    .unwrap();
+    pipeline
+        .enqueue(lane_request(3, "slow"))
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    assert!(
+        observed.lock().unwrap().is_empty(),
+        "durable retry must not realign"
+    );
+    pipeline
+        .enqueue(lane_request(4, "slow"))
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    assert_eq!(*observed.lock().unwrap(), vec![(4, 3)]);
+    pipeline.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_alignment_lane_discards_later_speculation_and_reopens_cleanly() {
+    let journal = journal(Arc::new(InMemory::new()), 0);
+    let slow = Arc::new(Semaphore::new(0));
+    let fast_done = Arc::new(Semaphore::new(0));
+    let aligners = (0..2)
+        .map(|_| LaneCounter {
+            counter: Counter::new(Arc::default()),
+            slow: slow.clone(),
+            fast_done: fast_done.clone(),
+            failure: Some((1, false)),
+            slow_started: Arc::new(Semaphore::new(0)),
+        })
+        .collect();
+    let pipeline = Partition::start_with_aligners(
+        journal.acquire().await.unwrap(),
+        aligners,
+        EmptyHistory,
+        config(),
+    )
+    .await
+    .unwrap();
+    let first = pipeline.enqueue(lane_request(1, "slow")).await.unwrap();
+    let second = pipeline.enqueue(lane_request(2, "fast")).await.unwrap();
+    timeout(Duration::from_secs(2), fast_done.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    slow.add_permits(1);
+    assert!(timeout(Duration::from_secs(2), first.wait())
+        .await
+        .unwrap()
+        .is_err());
+    assert!(timeout(Duration::from_secs(2), second.wait())
+        .await
+        .unwrap()
+        .is_err());
+    assert!(timeout(Duration::from_secs(2), pipeline.shutdown())
+        .await
+        .unwrap()
+        .is_err());
+    assert_eq!(journal.position().await.unwrap().sequence, 0);
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let pipeline = Partition::start_with_aligners(
+        journal.acquire().await.unwrap(),
+        (0..2).map(|_| Counter::new(observed.clone())).collect(),
+        EmptyHistory,
+        config(),
+    )
+    .await
+    .unwrap();
+    for (sequence, session) in [(1, "slow"), (2, "fast")] {
+        pipeline
+            .enqueue(lane_request(sequence, session))
+            .await
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+    }
+    assert_eq!(*observed.lock().unwrap(), vec![(1, 1), (2, 1)]);
+    pipeline.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn dropping_alignment_supervisor_cancels_blocked_lanes_without_publishing_a_gap() {
+    let journal = journal(Arc::new(InMemory::new()), 0);
+    let slow = Arc::new(Semaphore::new(0));
+    let fast_done = Arc::new(Semaphore::new(0));
+    let pipeline = Partition::start_with_aligners(
+        journal.acquire().await.unwrap(),
+        (0..2)
+            .map(|_| LaneCounter {
+                counter: Counter::new(Arc::default()),
+                slow: slow.clone(),
+                fast_done: fast_done.clone(),
+                failure: None,
+                slow_started: Arc::new(Semaphore::new(0)),
+            })
+            .collect(),
+        EmptyHistory,
+        config(),
+    )
+    .await
+    .unwrap();
+    let first = pipeline.enqueue(lane_request(1, "slow")).await.unwrap();
+    let second = pipeline.enqueue(lane_request(2, "fast")).await.unwrap();
+    timeout(Duration::from_secs(2), fast_done.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    drop(pipeline);
+    assert!(timeout(Duration::from_secs(2), first.wait())
+        .await
+        .unwrap()
+        .is_err());
+    assert!(timeout(Duration::from_secs(2), second.wait())
+        .await
+        .unwrap()
+        .is_err());
+    assert_eq!(journal.position().await.unwrap().sequence, 0);
+}
+
+#[tokio::test]
+async fn later_lane_error_or_panic_cancels_an_earlier_blocked_request() {
+    for panic in [false, true] {
+        let journal = journal(Arc::new(InMemory::new()), 0);
+        let slow = Arc::new(Semaphore::new(0));
+        let slow_started = Arc::new(Semaphore::new(0));
+        let pipeline = Partition::start_with_aligners(
+            journal.acquire().await.unwrap(),
+            (0..2)
+                .map(|_| LaneCounter {
+                    counter: Counter::new(Arc::default()),
+                    slow: slow.clone(),
+                    slow_started: slow_started.clone(),
+                    fast_done: Arc::new(Semaphore::new(0)),
+                    failure: Some((2, panic)),
+                })
+                .collect(),
+            EmptyHistory,
+            config(),
+        )
+        .await
+        .unwrap();
+        let first = pipeline.enqueue(lane_request(1, "slow")).await.unwrap();
+        timeout(Duration::from_secs(2), slow_started.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        let second = pipeline.enqueue(lane_request(2, "fast")).await.unwrap();
+        // Never release the first lane: observing only ordered output would hang.
+        assert!(timeout(Duration::from_secs(2), first.wait())
+            .await
+            .unwrap()
+            .is_err());
+        assert!(timeout(Duration::from_secs(2), second.wait())
+            .await
+            .unwrap()
+            .is_err());
+        assert!(timeout(Duration::from_secs(2), pipeline.shutdown())
+            .await
+            .unwrap()
+            .is_err());
+        timeout(Duration::from_secs(2), async {
+            while Arc::strong_count(&slow) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(journal.position().await.unwrap().sequence, 0);
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let pipeline = Partition::start_with_aligners(
+            journal.acquire().await.unwrap(),
+            (0..2).map(|_| Counter::new(observed.clone())).collect(),
+            EmptyHistory,
+            config(),
+        )
+        .await
+        .unwrap();
+        for (sequence, session) in [(1, "slow"), (2, "fast")] {
+            pipeline
+                .enqueue(lane_request(sequence, session))
+                .await
+                .unwrap()
+                .wait()
+                .await
+                .unwrap();
+        }
+        assert_eq!(*observed.lock().unwrap(), vec![(1, 1), (2, 1)]);
+        pipeline.shutdown().await.unwrap();
+    }
+}
+
+struct FailSecondHistory;
+
+#[async_trait]
+impl HistoryLoader for FailSecondHistory {
+    async fn load(&self, request: &Request, _: usize) -> Result<Vec<u8>> {
+        if request.sequence == 2 {
+            return Err(Error::Stage("history failed".into()));
+        }
+        Ok(Vec::new())
+    }
+}
+
+#[tokio::test]
+async fn history_failure_also_cancels_an_already_blocked_alignment_lane() {
+    let journal = journal(Arc::new(InMemory::new()), 0);
+    let slow = Arc::new(Semaphore::new(0));
+    let slow_started = Arc::new(Semaphore::new(0));
+    let pipeline = Partition::start_with_aligners(
+        journal.acquire().await.unwrap(),
+        (0..2)
+            .map(|_| LaneCounter {
+                counter: Counter::new(Arc::default()),
+                slow: slow.clone(),
+                slow_started: slow_started.clone(),
+                fast_done: Arc::new(Semaphore::new(0)),
+                failure: None,
+            })
+            .collect(),
+        FailSecondHistory,
+        config(),
+    )
+    .await
+    .unwrap();
+    let first = pipeline.enqueue(lane_request(1, "slow")).await.unwrap();
+    timeout(Duration::from_secs(2), slow_started.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    let second = pipeline.enqueue(lane_request(2, "fast")).await.unwrap();
+    assert!(timeout(Duration::from_secs(2), first.wait())
+        .await
+        .unwrap()
+        .is_err());
+    assert!(timeout(Duration::from_secs(2), second.wait())
+        .await
+        .unwrap()
+        .is_err());
+    assert!(timeout(Duration::from_secs(2), pipeline.shutdown())
+        .await
+        .unwrap()
+        .is_err());
+    timeout(Duration::from_secs(2), async {
+        while Arc::strong_count(&slow) != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(journal.position().await.unwrap().sequence, 0);
+}
+
+#[tokio::test]
+async fn wal_failure_cancels_a_blocked_alignment_lane_without_publishing_a_gap() {
+    let journal = Journal::new(
+        Arc::new(InMemory::new()),
+        Path::from("small-wal"),
+        binding(0),
+        512,
+        100,
+    )
+    .unwrap();
+    let slow = Arc::new(Semaphore::new(0));
+    let slow_started = Arc::new(Semaphore::new(0));
+    let release_first = Arc::new(Semaphore::new(0));
+    let mut config = config();
+    config.wal.max_entries = 1;
+    let pipeline = Partition::start_with_aligners(
+        journal.acquire().await.unwrap(),
+        (0..2)
+            .map(|_| {
+                let mut counter = Counter::new(Arc::default());
+                counter.align_gate = Some(release_first.clone());
+                LaneCounter {
+                    counter,
+                    slow: slow.clone(),
+                    slow_started: slow_started.clone(),
+                    fast_done: Arc::new(Semaphore::new(0)),
+                    failure: None,
+                }
+            })
+            .collect(),
+        EmptyHistory,
+        config,
+    )
+    .await
+    .unwrap();
+    let mut request = lane_request(1, "fast");
+    // Fits admission/alignment, but its encoded WAL segment exceeds 512 bytes.
+    request.payload = vec![1; 256];
+    let first = pipeline.enqueue(request).await.unwrap();
+    let second = pipeline.enqueue(lane_request(2, "slow")).await.unwrap();
+    timeout(Duration::from_secs(2), slow_started.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    release_first.add_permits(1);
+    assert!(timeout(Duration::from_secs(2), first.wait())
+        .await
+        .unwrap()
+        .is_err());
+    assert!(timeout(Duration::from_secs(2), second.wait())
+        .await
+        .unwrap()
+        .is_err());
+    assert!(timeout(Duration::from_secs(2), pipeline.shutdown())
+        .await
+        .unwrap()
+        .is_err());
+    timeout(Duration::from_secs(2), async {
+        while Arc::strong_count(&slow) != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(journal.position().await.unwrap().sequence, 0);
+    assert_eq!(journal.acquire().await.unwrap().position().sequence, 0);
+}
+
+#[cfg(target_pointer_width = "64")]
+#[tokio::test]
+async fn budget_over_four_gib_runs_two_large_reservations_and_bounds_the_third() {
+    let journal = journal(Arc::new(InMemory::new()), 0);
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let slow = Arc::new(Semaphore::new(0));
+    let fast_done = Arc::new(Semaphore::new(0));
+    let alignment_gate = Arc::new(Semaphore::new(0));
+    let aligners = (0..2)
+        .map(|_| LaneCounter {
+            counter: {
+                let mut counter = Counter::new(observed.clone());
+                counter.align_gate = Some(alignment_gate.clone());
+                counter
+            },
+            slow: slow.clone(),
+            fast_done: fast_done.clone(),
+            failure: None,
+            slow_started: Arc::new(Semaphore::new(0)),
+        })
+        .collect();
+    let mut cfg = config();
+    cfg.max_input_bytes = 16 << 20;
+    cfg.max_transition_bytes = 32 << 20;
+    cfg.max_history_bytes = 97 << 20;
+    cfg.memory_bytes = 6144 << 20;
+    assert!(cfg.reservation_bytes().unwrap() > (2 << 30));
+    assert_eq!(
+        cfg.memory_bytes / cfg.reservation_bytes().unwrap() as usize,
+        2
+    );
+    // Semaphore reservations are accounting, not allocations of these GiBs.
+    let pipeline = Partition::start_with_aligners(
+        journal.acquire().await.unwrap(),
+        aligners,
+        EmptyHistory,
+        cfg,
+    )
+    .await
+    .unwrap();
+    let first = pipeline.enqueue(lane_request(1, "slow")).await.unwrap();
+    let second = timeout(
+        Duration::from_secs(2),
+        pipeline.enqueue(lane_request(2, "fast")),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    // Both active alignments retain their full reservations: a third cannot enter.
+    let mut third = Box::pin(pipeline.enqueue(lane_request(3, "fast")));
+    assert!(timeout(Duration::from_millis(30), &mut third)
+        .await
+        .is_err());
+    alignment_gate.add_permits(1);
+    timeout(Duration::from_secs(2), fast_done.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    assert_eq!(*observed.lock().unwrap(), vec![(2, 1)]);
+    assert_eq!(journal.position().await.unwrap().sequence, 0);
+    // Finished out-of-order output keeps its smaller reservation. The third
+    // alignment can enter even while the first blocks ordered WAL publication.
+    let third = timeout(Duration::from_secs(2), third)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(journal.position().await.unwrap().sequence, 0);
+    slow.add_permits(1);
+    alignment_gate.add_permits(2);
+    for ack in [first, second, third] {
+        timeout(Duration::from_secs(2), ack.wait())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    pipeline.shutdown().await.unwrap();
+    assert_eq!(journal.position().await.unwrap().sequence, 3);
+}
+
+#[tokio::test]
+async fn unsupported_semaphore_capacity_is_rejected_without_panicking() {
+    let journal = journal(Arc::new(InMemory::new()), 0);
+    let mut cfg = config();
+    cfg.memory_bytes = usize::MAX;
+    assert!(Partition::start(
+        journal.acquire().await.unwrap(),
+        Counter::new(Arc::default()),
+        cfg
+    )
+    .await
+    .is_err());
+}
+
+#[tokio::test]
+async fn completed_alignment_releases_history_budget_before_a_batched_durable_ack() {
+    let journal = journal(Arc::new(InMemory::new()), 0);
+    let mut cfg = config();
+    cfg.max_history_bytes = 8 << 20;
+    cfg.memory_bytes = 200 << 20;
+    assert_eq!(
+        cfg.memory_bytes / cfg.reservation_bytes().unwrap() as usize,
+        1
+    );
+    cfg.wal.max_entries = 3;
+    // The test must fill one batch; waiting for a sparse flush cannot pass.
+    cfg.wal.max_delay = Duration::from_secs(60);
+    let pipeline = Partition::start_with_aligners(
+        journal.acquire().await.unwrap(),
+        vec![Counter::new(Arc::default())],
+        EmptyHistory,
+        cfg,
+    )
+    .await
+    .unwrap();
+    let mut acks = Vec::new();
+    for sequence in 1..=3 {
+        acks.push(
+            timeout(Duration::from_secs(2), pipeline.enqueue(request(sequence)))
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    for ack in acks {
+        let position = timeout(Duration::from_secs(2), ack.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(position.sequence, 3);
+        assert_eq!(position.generation, 1);
+    }
+    pipeline.shutdown().await.unwrap();
+    let mut sink = Collect::new();
+    let mut consumer = Consumer::open(journal.clone(), "table").await.unwrap();
+    assert_eq!(consumer.consume(&mut sink, 1, 16384).await.unwrap(), 3);
+    assert_eq!(sink.entries.lock().unwrap().len(), 3);
+    assert_eq!(journal.position().await.unwrap().generation, 1);
+}
+
+#[tokio::test]
+async fn completed_output_stays_charged_until_wal_durability() {
+    let journal = journal(Arc::new(InMemory::new()), 0);
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let mut cfg = config();
+    cfg.max_transition_bytes = 2048;
+    cfg.memory_bytes = cfg.reservation_bytes().unwrap() as usize;
+    cfg.wal.max_delay = Duration::from_secs(60);
+    let pipeline = Partition::start(
+        journal.acquire().await.unwrap(),
+        Counter::new(observed.clone()),
+        cfg,
+    )
+    .await
+    .unwrap();
+    let mut first_request = request(1);
+    first_request.payload = vec![b'x'; 900];
+    let mut second_request = request(2);
+    second_request.payload = vec![b'y'; 900];
+    let first = pipeline.enqueue(first_request).await.unwrap();
+    timeout(Duration::from_secs(2), async {
+        while observed.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    // The first transition's retained capacity prevents another large input
+    // from entering, even though its history/input loading reservation is gone.
+    assert!(
+        timeout(Duration::from_millis(30), pipeline.enqueue(second_request))
+            .await
+            .is_err()
+    );
+    assert_eq!(journal.position().await.unwrap().sequence, 0);
+    timeout(Duration::from_secs(2), pipeline.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.wait().await.unwrap().sequence, 1);
+    assert_eq!(journal.position().await.unwrap().sequence, 1);
+}
