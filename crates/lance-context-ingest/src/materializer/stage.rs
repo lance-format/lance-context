@@ -15,19 +15,30 @@ pub(super) async fn materialize(
     reservation: Arc<MergeReservation>,
     phases: Arc<PhaseCounters>,
 ) -> Result<p::Descriptors> {
+    let inputs = pending
+        .plan
+        .sources
+        .iter()
+        .flat_map(|(&group, range)| {
+            range
+                .records
+                .iter()
+                .map(move |(index, meta)| (group, *index, meta.clone()))
+        })
+        .collect::<Vec<_>>();
+    materialize_inputs(ingress, options, inputs, dataset, reservation, phases).await
+}
+
+pub(crate) async fn materialize_inputs(
+    ingress: Ingress,
+    options: Options,
+    inputs: Vec<(u64, u64, BatchMeta)>,
+    dataset: Dataset,
+    reservation: Arc<MergeReservation>,
+    phases: Arc<PhaseCounters>,
+) -> Result<p::Descriptors> {
     tokio::spawn(async move {
         let _reservation = reservation.clone();
-        let inputs = pending
-            .plan
-            .sources
-            .iter()
-            .flat_map(|(&group, range)| {
-                range
-                    .records
-                    .iter()
-                    .map(move |(index, meta)| (group, *index, meta.clone()))
-            })
-            .collect::<Vec<_>>();
         if options.pipeline_preparation {
             return super::pipeline::materialize(
                 ingress,

@@ -22,6 +22,8 @@ mod http;
 #[cfg(feature = "materializer")]
 mod materializer;
 mod network;
+#[cfg(feature = "service")]
+mod preparation;
 #[cfg(feature = "worker")]
 mod worker;
 

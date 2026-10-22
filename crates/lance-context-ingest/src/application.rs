@@ -82,11 +82,36 @@ impl Registry {
             .context("worker requires etcd scheduling configuration")?
             .claims()
             .await?;
+        let mut options = config.worker.clone();
+        if let Some(preparation) = &config.preparation {
+            let token = config::read(&preparation.bearer_token_file, 4096)?;
+            options.preparers = Some(crate::preparation::Pool::new(
+                &preparation.endpoints,
+                std::str::from_utf8(&token)?.trim().to_owned(),
+                preparation.timeout,
+            )?);
+        }
         Worker::start(
             claims,
             self.tables.values().cloned().collect(),
-            config.worker.clone(),
+            options,
             MergeMemoryBudget::new(config.materializer_memory_bytes),
+        )
+    }
+    pub fn preparer(&self, config: &Config) -> Result<crate::preparation::Service> {
+        let options = config
+            .preparation
+            .as_ref()
+            .context("preparer configuration missing")?;
+        crate::preparation::Service::new(
+            self.tables
+                .values()
+                .map(|a| (a.ingress.clone(), a.storage.clone()))
+                .collect(),
+            config.worker.publication.clone(),
+            MergeMemoryBudget::new(config.materializer_memory_bytes),
+            options.active,
+            options.retained_results,
         )
     }
     pub async fn read(&self, table: &str, version: Option<u64>) -> Result<lance::Dataset> {
@@ -211,4 +236,34 @@ pub async fn serve_worker(
         }
     }
     worker.shutdown().await
+}
+
+/// Preparers write immutable data files only. The route has no publication,
+/// source-retirement or owner-acquisition operation. TLS is supplied by the edge
+/// proxy, as for the application ingress; requests require the workload token.
+pub async fn serve_preparer(
+    registry: &Registry,
+    config: &Config,
+    listener: TcpListener,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<()> {
+    let options = config
+        .preparation
+        .as_ref()
+        .context("preparer configuration missing")?;
+    let auth = Arc::new(Authorization::load(&options.bearer_token_file)?);
+    let service = registry.preparer(config)?;
+    let app = service
+        .router()
+        .layer(middleware::from_fn_with_state(auth, authorize));
+    let draining = service.clone();
+    let result = axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            shutdown.await;
+            draining.shutdown().await;
+        })
+        .await;
+    service.shutdown().await;
+    result?;
+    Ok(())
 }

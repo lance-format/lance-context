@@ -6,7 +6,7 @@ use std::path::Path;
 async fn main() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.len() < 2 || args.len() > 3 {
-        bail!("usage: lance-context-ingest <bootstrap|ingress|worker|inspect> CONFIG [TABLE]");
+        bail!("usage: lance-context-ingest <bootstrap|ingress|worker|preparer|inspect> CONFIG [TABLE]");
     }
     let config = Config::read(Path::new(&args[1]))?;
     if args[0] == "bootstrap" && args.len() == 2 {
@@ -28,6 +28,15 @@ async fn main() -> Result<()> {
         }
         "worker" if args.len() == 2 => {
             application::serve_worker(&registry, &config, signals.wait()).await
+        }
+        "preparer" if args.len() == 2 => {
+            let address = config
+                .preparation
+                .as_ref()
+                .and_then(|p| p.listen)
+                .context("preparer requires a listen address")?;
+            let listener = tokio::net::TcpListener::bind(address).await?;
+            application::serve_preparer(&registry, &config, listener, signals.wait()).await
         }
         "inspect" if args.len() == 3 => {
             let dataset = registry.read(&args[2], None).await?;

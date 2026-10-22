@@ -42,6 +42,7 @@ fn options() -> Options {
             retained_manifest_versions: 2,
             ..Default::default()
         },
+        ..Default::default()
     }
 }
 async fn append(

@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, HashMap};
 
 pub mod observation;
 mod pipeline;
-mod stage;
+pub(crate) mod stage;
 use observation::{Counters as PhaseCounters, Phase};
 
 /// Resolve this from the authorized namespace, never from an append request.
@@ -51,7 +51,12 @@ impl Default for Options {
     }
 }
 impl Options {
-    fn workspace(&self, contract: &IngestContract, bytes: usize, records: usize) -> Result<usize> {
+    pub(crate) fn workspace(
+        &self,
+        contract: &IngestContract,
+        bytes: usize,
+        records: usize,
+    ) -> Result<usize> {
         bytes
             .checked_mul(3)
             .and_then(|v| {
@@ -109,6 +114,8 @@ pub struct Publisher {
     plan_attempt: Option<p::Plan>,
     prepared_attempt: Option<p::PrepareRequest>,
     phases: Arc<PhaseCounters>,
+    #[cfg(feature = "service")]
+    preparers: Option<Arc<crate::preparation::Pool>>,
 }
 
 impl Publisher {
@@ -162,6 +169,8 @@ impl Publisher {
             plan_attempt: None,
             prepared_attempt: None,
             phases: Arc::default(),
+            #[cfg(feature = "service")]
+            preparers: None,
         };
         value.state().await?;
         Ok(value)
@@ -175,6 +184,12 @@ impl Publisher {
     }
     pub fn authority(&self) -> &p::Authority {
         &self.authority
+    }
+    /// File preparation may run on separate processes. This publisher retains
+    /// sole authority to record the complete result and commit the manifest.
+    #[cfg(feature = "service")]
+    pub fn use_preparers(&mut self, pool: Arc<crate::preparation::Pool>) {
+        self.preparers = Some(pool);
     }
     pub async fn state(&self) -> Result<Box<p::Table>> {
         self.phases
@@ -269,33 +284,7 @@ impl Publisher {
         }
         if self.prepared_attempt.is_none() {
             self.pin(&pending).await?;
-            let dataset = self.read_dataset(Some(pending.plan.read_version)).await?;
-            let bytes = usize::try_from(pending.plan.source_bytes()?)?;
-            let count = pending.plan.sources.values().map(|s| s.records.len()).sum();
-            let reservation = Arc::new(
-                self.phases
-                    .measure(Phase::Admission, async {
-                        Ok::<_, anyhow::Error>(
-                            self.budget
-                                .reserve(self.options.workspace(
-                                    &self.ingress.scope.contract,
-                                    bytes,
-                                    count,
-                                )?)
-                                .await,
-                        )
-                    })
-                    .await?,
-            );
-            let descriptors = stage::materialize(
-                self.ingress.clone(),
-                self.options.clone(),
-                pending.clone(),
-                dataset,
-                reservation,
-                self.phases.clone(),
-            )
-            .await?;
+            let descriptors = self.materialize(&pending).await?;
             descriptors.validate(self.ingress.client.max_descriptor_bytes())?;
             self.prepared_attempt = Some(p::PrepareRequest {
                 authority: self.authority.clone(),
@@ -314,6 +303,41 @@ impl Publisher {
             "materialization result rejected: {reply:?}"
         );
         Ok(self.state().await?.progress.prepared)
+    }
+    async fn materialize(&self, pending: &Arc<p::PendingPlan>) -> Result<p::Descriptors> {
+        #[cfg(feature = "service")]
+        if let Some(pool) = &self.preparers {
+            return pool
+                .prepare(&self.ingress, pending.clone(), self.budget.clone())
+                .await;
+        }
+        let dataset = self.read_dataset(Some(pending.plan.read_version)).await?;
+        let bytes = usize::try_from(pending.plan.source_bytes()?)?;
+        let count = pending.plan.sources.values().map(|s| s.records.len()).sum();
+        let reservation = Arc::new(
+            self.phases
+                .measure(Phase::Admission, async {
+                    Ok::<_, anyhow::Error>(
+                        self.budget
+                            .reserve(self.options.workspace(
+                                &self.ingress.scope.contract,
+                                bytes,
+                                count,
+                            )?)
+                            .await,
+                    )
+                })
+                .await?,
+        );
+        stage::materialize(
+            self.ingress.clone(),
+            self.options.clone(),
+            pending.clone(),
+            dataset,
+            reservation,
+            self.phases.clone(),
+        )
+        .await
     }
 
     /// Publish the fixed target and confirm its exact identity. Errors preserve

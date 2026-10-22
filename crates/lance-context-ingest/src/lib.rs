@@ -37,6 +37,8 @@ pub mod bootstrap;
 pub mod http;
 #[cfg(feature = "materializer")]
 pub mod materializer;
+#[cfg(feature = "service")]
+pub mod preparation;
 pub mod receipt;
 #[cfg(feature = "worker")]
 pub mod worker;

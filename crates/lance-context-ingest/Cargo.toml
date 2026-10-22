@@ -7,7 +7,7 @@ publish = false
 description = "Durable rollout ingress over the independent lance-context WAL"
 
 [features]
-service = ["worker", "http", "dep:tokio-rustls", "tokio/rt-multi-thread", "tokio/macros", "tokio/net", "tokio/signal"]
+service = ["worker", "http", "dep:reqwest", "dep:tokio-rustls", "tokio/rt-multi-thread", "tokio/macros", "tokio/net", "tokio/signal"]
 worker = ["materializer", "dep:etcd-client"]
 http = ["dep:axum", "dep:http-body-util"]
 http-client = ["http", "dep:reqwest", "lance-context-wal/client-journal"]

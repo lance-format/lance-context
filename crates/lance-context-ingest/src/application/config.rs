@@ -82,6 +82,29 @@ pub struct Http {
     pub options: http::Options,
 }
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Preparation {
+    pub listen: Option<SocketAddr>,
+    pub bearer_token_file: PathBuf,
+    /// Empty on a preparation-only process; worker processes require 1–8 peers.
+    pub endpoints: Vec<String>,
+    pub timeout: Duration,
+    pub active: usize,
+    pub retained_results: usize,
+}
+impl Default for Preparation {
+    fn default() -> Self {
+        Self {
+            listen: None,
+            bearer_token_file: PathBuf::new(),
+            endpoints: vec![],
+            timeout: Duration::from_secs(120),
+            active: 4,
+            retained_results: 32,
+        }
+    }
+}
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub layout: Layout,
@@ -96,6 +119,8 @@ pub struct Config {
     pub materializer_memory_bytes: usize,
     pub http: Option<Http>,
     pub etcd: Option<Etcd>,
+    #[serde(default)]
+    pub preparation: Option<Preparation>,
     #[serde(default)]
     pub worker: worker::Options,
 }
@@ -121,6 +146,9 @@ impl Config {
         if let Some(h) = &mut v.http {
             resolve(base, &mut h.bearer_token_file);
             resolve(base, &mut h.receipt_key_file);
+        }
+        if let Some(p) = &mut v.preparation {
+            resolve(base, &mut p.bearer_token_file);
         }
         if let Some(e) = v.etcd.as_mut().and_then(|e| e.tls.as_mut()) {
             tls(base, &mut e.identity);

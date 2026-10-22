@@ -31,6 +31,10 @@ pub struct Options {
     pub publications_per_claim: usize,
     pub poll_interval: Duration,
     pub publication: PublishOptions,
+    /// Runtime pool resolved from deployment configuration, never from uploads.
+    #[cfg(feature = "service")]
+    #[serde(skip)]
+    pub preparers: Option<Arc<crate::preparation::Pool>>,
 }
 impl Default for Options {
     fn default() -> Self {
@@ -39,6 +43,8 @@ impl Default for Options {
             publications_per_claim: 16,
             poll_interval: Duration::from_millis(500),
             publication: PublishOptions::default(),
+            #[cfg(feature = "service")]
+            preparers: None,
         }
     }
 }
@@ -283,6 +289,10 @@ async fn publish_claim(
             return Ok(());
         };
         publisher.observe_with(counters.phases.clone());
+        #[cfg(feature = "service")]
+        if let Some(pool) = options.preparers {
+            publisher.use_preparers(pool);
+        }
         for _ in 0..options.publications_per_claim {
             if *stop.borrow() || !claim.valid().await? {
                 break;
