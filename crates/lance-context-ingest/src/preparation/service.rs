@@ -7,6 +7,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use futures::{stream, StreamExt, TryStreamExt};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Mutex,
@@ -230,28 +231,37 @@ impl Service {
                     <= self.0.options.max_records,
             "preparation plan exceeds configured bounds"
         );
-        for &group in pending.plan.sources.keys() {
-            let query::Value::SourcePin(Some(pin)) = query(
-                ingress,
-                group,
-                query::Query::SourcePin { table: task.table },
-            )
-            .await?
-            else {
-                bail!("source pin missing");
-            };
-            let selection = pin.permit.selection();
-            ensure!(
-                selection.table == task.table
-                    && selection.transaction == task.transaction
-                    && selection.plan_index == task.plan_index
-                    && selection.read_version == task.read_version
-                    && selection.group == group
-                    && selection.ingest == ingress.scope.contract
-                    && selection.range == pending.plan.sources[&group],
-                "source pin differs from preparation plan"
-            );
-        }
+        // Each group proves the same immutable plan independently. Bound these
+        // quorum reads by the existing fetch limit, and validate every pin
+        // before reserving payload workspace or starting any file writer.
+        let sources = &pending.plan.sources;
+        stream::iter(sources.keys().copied())
+            .map(|group| async move {
+                let query::Value::SourcePin(Some(pin)) = query(
+                    ingress,
+                    group,
+                    query::Query::SourcePin { table: task.table },
+                )
+                .await?
+                else {
+                    bail!("source pin missing");
+                };
+                let selection = pin.permit.selection();
+                ensure!(
+                    selection.table == task.table
+                        && selection.transaction == task.transaction
+                        && selection.plan_index == task.plan_index
+                        && selection.read_version == task.read_version
+                        && selection.group == group
+                        && selection.ingest == ingress.scope.contract
+                        && selection.range == sources[&group],
+                    "source pin differs from preparation plan"
+                );
+                Ok::<_, anyhow::Error>(())
+            })
+            .buffer_unordered(self.0.options.fetch_parallelism)
+            .try_collect::<Vec<_>>()
+            .await?;
         let bytes = inputs.iter().try_fold(0usize, |sum, (_, _, meta)| {
             sum.checked_add(usize::try_from(meta.body_bytes)?)
                 .context("partition source overflow")
