@@ -203,6 +203,17 @@ pub struct MasterConfig {
     #[arg(long, env = "MERGE_WAL_CONCURRENCY", default_value_t = 4)]
     pub merge_wal_concurrency: usize,
 
+    /// Maximum retained legacy HTTP responses, including foreground requests.
+    /// No request is sent when this independent observation budget is full.
+    #[arg(long, env = "LEGACY_MERGE_RESPONSE_CONCURRENCY", default_value_t = 32)]
+    pub legacy_merge_response_concurrency: usize,
+
+    /// Yield the scheduler slot after this observation interval, without
+    /// cancelling the request or declaring its worker stalled. Its exact late
+    /// acknowledgement is still persisted before ownership may be released.
+    #[arg(long, env = "LEGACY_MERGE_FOREGROUND_SECS", default_value_t = 30)]
+    pub legacy_merge_foreground_secs: u64,
+
     /// etcd connection. Scheduler state (task queue, lease-based claims,
     /// per-experiment write locks) lives in etcd so several stateless master
     /// replicas can share one queue. `ETCD_ENDPOINTS` is required.

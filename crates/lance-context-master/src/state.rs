@@ -107,6 +107,7 @@ pub struct MasterState {
     pub admission: Arc<crate::admission::Admission>,
     /// Shared HTTP client for fanning `MergeWal` tasks out to worker endpoints.
     pub http: reqwest::Client,
+    pub(crate) legacy_responses: Arc<Semaphore>,
     /// Explicit resident-master staging shares one byte budget and cache session.
     pub(crate) local_append: Option<crate::rollout_append::LocalStaging>,
     /// Process-wide compaction permits shared by scheduler and retirement work.
@@ -148,6 +149,12 @@ impl MasterState {
         {
             return Err(lance::Error::invalid_input(
                 "maintenance deadlines must be positive",
+            ));
+        }
+        if config.legacy_merge_response_concurrency == 0 || config.legacy_merge_foreground_secs == 0
+        {
+            return Err(lance::Error::invalid_input(
+                "legacy response budgets must be positive",
             ));
         }
         let task_store = TaskStore::open(&config).await?;
@@ -241,6 +248,7 @@ impl MasterState {
             )),
             rollout_session,
             base_uri,
+            legacy_responses: Arc::new(Semaphore::new(config.legacy_merge_response_concurrency)),
             config,
             task_store,
             admission: Arc::new(crate::admission::Admission::default()),
@@ -360,6 +368,8 @@ mod tests {
             worker_endpoints: vec![],
             task_concurrency: 4,
             merge_wal_concurrency: 4,
+            legacy_merge_response_concurrency: 32,
+            legacy_merge_foreground_secs: 30,
             etcd: lance_context_core::etcd::EtcdConfig {
                 etcd_endpoints: std::env::var("ETCD_TEST_ENDPOINTS")
                     .map(|value| value.split(',').map(str::to_string).collect())

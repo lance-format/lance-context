@@ -88,6 +88,11 @@ pub struct Execution {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "protocol_absent")]
     pub protocol: u32,
+    /// Serial fan-out continuation after this exact legacy HTTP reply. None is
+    /// an older record with no persisted continuation. A reader which drops
+    /// this field cannot CAS/release the execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_remaining_endpoints: Option<Vec<String>>,
 }
 
 fn protocol_absent(protocol: &u32) -> bool {
@@ -118,6 +123,7 @@ impl Execution {
             reclaimed: 0,
             error: None,
             protocol: 2,
+            legacy_remaining_endpoints: None,
         }
     }
 
@@ -250,7 +256,19 @@ impl Coordinator {
         target: &str,
         endpoint: &str,
     ) -> Result<Execution> {
+        self.admit_legacy_with_continuation(claim, target, endpoint, None)
+            .await
+    }
+
+    pub async fn admit_legacy_with_continuation(
+        &self,
+        claim: &ClaimProof,
+        target: &str,
+        endpoint: &str,
+        remaining: Option<Vec<String>>,
+    ) -> Result<Execution> {
         let mut execution = Execution::new(target, endpoint, "legacy-http", 1);
+        execution.legacy_remaining_endpoints = remaining;
         execution.protocol = 0;
         execution.phase = Phase::Running;
         if !self.reserve_record(claim, &execution).await? {

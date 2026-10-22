@@ -1076,6 +1076,8 @@ mod tests {
             worker_endpoints: vec![],
             task_concurrency: 4,
             merge_wal_concurrency: 4,
+            legacy_merge_response_concurrency: 32,
+            legacy_merge_foreground_secs: 30,
             etcd: lance_context_core::etcd::EtcdConfig {
                 etcd_endpoints: test_etcd_endpoints(),
                 etcd_prefix: format!("/lance-context/test/{}", generate_id()),
