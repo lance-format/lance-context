@@ -13,6 +13,7 @@ pub mod error;
 pub mod executors;
 pub mod local_merge;
 mod maintenance_execution;
+mod merge_capacity;
 mod merge_execution;
 mod resident_recovery;
 pub mod rollout_append;

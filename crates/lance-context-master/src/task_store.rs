@@ -2037,19 +2037,19 @@ fn etcd_error(action: &'static str) -> impl FnOnce(etcd_client::Error) -> lance:
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    pub(crate) struct LeaseTestProxy {
-        pub(crate) endpoint: String,
-        pub(crate) online: tokio::sync::watch::Sender<bool>,
+    struct LeaseTestProxy {
+        endpoint: String,
+        online: tokio::sync::watch::Sender<bool>,
         responses: tokio::sync::watch::Sender<bool>,
         task: JoinHandle<()>,
     }
 
     impl LeaseTestProxy {
-        pub(crate) async fn start(upstream: &str) -> Self {
+        async fn start(upstream: &str) -> Self {
             let upstream = upstream.strip_prefix("http://").unwrap().to_owned();
             assert!(upstream.starts_with("127.0.0.1:") || upstream.starts_with("localhost:"));
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2772,7 +2772,7 @@ pub(crate) mod tests {
             worker_endpoints: vec![],
             task_concurrency: 4,
             merge_wal_concurrency: 4,
-            legacy_merge_response_concurrency: 32,
+            legacy_merge_wait_concurrency: 32,
             legacy_merge_foreground_secs: 30,
             etcd: lance_context_core::etcd::EtcdConfig {
                 etcd_endpoints: vec![],

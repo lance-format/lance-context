@@ -203,14 +203,12 @@ pub struct MasterConfig {
     #[arg(long, env = "MERGE_WAL_CONCURRENCY", default_value_t = 4)]
     pub merge_wal_concurrency: usize,
 
-    /// Maximum retained legacy HTTP responses, including foreground requests.
-    /// No request is sent when this independent observation budget is full.
-    #[arg(long, env = "LEGACY_MERGE_RESPONSE_CONCURRENCY", default_value_t = 32)]
-    pub legacy_merge_response_concurrency: usize,
+    /// Additional legacy HTTP waits allowed outside the scheduler execution
+    /// slots. Zero disables yielding. Requests/tasks/claims stay alive.
+    #[arg(long, env = "LEGACY_MERGE_WAIT_CONCURRENCY", default_value_t = 32)]
+    pub legacy_merge_wait_concurrency: usize,
 
-    /// Yield the scheduler slot after this observation interval, without
-    /// cancelling the request or declaring its worker stalled. Its exact late
-    /// acknowledgement is still persisted before ownership may be released.
+    /// Scheduler observation interval, not a worker execution timeout.
     #[arg(long, env = "LEGACY_MERGE_FOREGROUND_SECS", default_value_t = 30)]
     pub legacy_merge_foreground_secs: u64,
 
