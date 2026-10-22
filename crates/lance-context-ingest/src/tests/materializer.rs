@@ -1,5 +1,5 @@
 use super::*;
-use crate::materializer::{Acquisition, Options, Publisher, Storage};
+use crate::materializer::{Acquisition, Options, Publisher, SourceReadPolicy, Storage};
 use futures::TryStreamExt;
 use object_store::path::Path as ObjectPath;
 use std::collections::HashMap;
@@ -11,14 +11,23 @@ pub(super) async fn publisher(
     budget: &Arc<MergeMemoryBudget>,
     epoch: u64,
 ) -> Result<Publisher> {
-    publisher_with_pipeline(ingress, storage, budget, epoch, false).await
+    publisher_with_mode(
+        ingress,
+        storage,
+        budget,
+        epoch,
+        false,
+        SourceReadPolicy::FirstVoter,
+    )
+    .await
 }
-async fn publisher_with_pipeline(
+async fn publisher_with_mode(
     ingress: &Ingress,
     storage: &Storage,
     budget: &Arc<MergeMemoryBudget>,
     epoch: u64,
     pipeline_preparation: bool,
+    source_read_policy: SourceReadPolicy,
 ) -> Result<Publisher> {
     Publisher::acquire(
         ingress.clone(),
@@ -28,6 +37,7 @@ async fn publisher_with_pipeline(
             max_records: 8,
             write_parallelism: 2,
             pipeline_preparation,
+            source_read_policy,
             retained_manifest_versions: 2,
             ..Options::default()
         },
@@ -120,14 +130,129 @@ pub(super) fn remember(expected: &mut BTreeMap<String, RecordBatch>, body: Bytes
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_rollout_files_resume_after_preparation_and_publication_restart_then_retire(
 ) -> Result<()> {
-    real_rollout_recovery(false).await
+    real_rollout_recovery(false, SourceReadPolicy::FirstVoter).await
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn streamed_rollout_files_resume_after_preparation_and_publication_restart_then_retire(
 ) -> Result<()> {
-    real_rollout_recovery(true).await
+    real_rollout_recovery(true, SourceReadPolicy::FirstVoter).await
 }
-async fn real_rollout_recovery(pipeline: bool) -> Result<()> {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn spread_source_reads_resume_buffered_rollouts_and_retire() -> Result<()> {
+    real_rollout_recovery(false, SourceReadPolicy::Spread).await
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn spread_source_reads_resume_streamed_rollouts_and_retire() -> Result<()> {
+    real_rollout_recovery(true, SourceReadPolicy::Spread).await
+}
+
+#[cfg(feature = "service")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn spread_source_reads_publish_with_only_each_single_data_endpoint_reachable() -> Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let rejected = Arc::new(AtomicUsize::new(0));
+    for reachable in 1..=3 {
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("fallback.lance");
+        let cluster = network::Cluster::open_signed(root.path(), layout()).await?;
+        bootstrap(&cluster, &path, &binding()).await?;
+        let producer = connect(&cluster, binding()).await?;
+        let mut expected = BTreeMap::new();
+        for bucket in 0..4 {
+            let open = ProducerOpen {
+                bucket,
+                slot: bucket,
+                expected_generation: 0,
+                operation: Uuid::new_v4(),
+            };
+            let id = format!("record-{bucket}");
+            let (body, accepted) = append(&producer, &open, 1, &[&id]).await?;
+            remember(&mut expected, body)?;
+            // A successful quorum append need not have reached the particular
+            // follower this iteration retains as its only payload endpoint.
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let response = cluster
+                        .client
+                        .request(
+                            reachable,
+                            Request::Fetch {
+                                group: accepted.position().group,
+                                index: accepted.position().index,
+                            },
+                        )
+                        .await?;
+                    if matches!(response.reply, Reply::Record(Some(_))) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Ok::<_, anyhow::Error>(())
+            })
+            .await??;
+        }
+        // Inject connection failure only for payload RPCs. All three actual
+        // WAL replicas and their quorum/control/peer endpoints remain running.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let unavailable = listener.local_addr()?.to_string();
+        let failures = rejected.clone();
+        let resetter = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                failures.fetch_add(1, Ordering::Relaxed);
+                drop(stream);
+            }
+        });
+        let mut config = cluster.application.clone();
+        config.tables.push(crate::application::config::Table {
+            binding: binding(),
+            uri: path.to_str().unwrap().into(),
+            storage_options: Default::default(),
+            bootstrap: bootstrap::identity(),
+        });
+        for (&node, endpoint) in &mut config.endpoints {
+            if node != reachable {
+                endpoint.data_address = unavailable.clone();
+            }
+        }
+        let reader = Ingress::connect(
+            config.client()?,
+            layout(),
+            binding(),
+            MergeMemoryBudget::new(8 << 20),
+        )
+        .await?;
+        let storage = Storage::resolve(
+            path.to_str().unwrap().into(),
+            Default::default(),
+            Arc::default(),
+        )
+        .await?;
+        let budget = MergeMemoryBudget::new(32 << 20);
+        let mut publisher = publisher_with_mode(
+            &reader,
+            &storage,
+            &budget,
+            1,
+            true,
+            SourceReadPolicy::Spread,
+        )
+        .await?;
+        assert!(publisher.run_once().await?.is_some());
+        verify(&publisher, &expected, 2).await?;
+        assert_eq!(budget.reserved(), 0);
+        drop((publisher, reader, producer));
+        resetter.abort();
+        let _ = resetter.await;
+        cluster.shutdown().await?;
+    }
+    assert!(
+        rejected.load(Ordering::Relaxed) > 0,
+        "no failed route exercised"
+    );
+    Ok(())
+}
+
+async fn real_rollout_recovery(pipeline: bool, source_read_policy: SourceReadPolicy) -> Result<()> {
     let root = tempfile::tempdir()?;
     let path = root.path().join("rollouts.lance");
     let c = network::Cluster::open_signed(root.path(), layout()).await?;
@@ -164,7 +289,8 @@ async fn real_rollout_recovery(pipeline: bool) -> Result<()> {
         remember(&mut expected, body.clone())?;
         originals.push((open, body, receipt));
     }
-    let mut first = publisher_with_pipeline(&ingress, &storage, &budget, 1, pipeline).await?;
+    let mut first =
+        publisher_with_mode(&ingress, &storage, &budget, 1, pipeline, source_read_policy).await?;
     let saved = first
         .prepare_next()
         .await?
@@ -204,7 +330,8 @@ async fn real_rollout_recovery(pipeline: bool) -> Result<()> {
 
     let c = network::Cluster::open_signed(root.path(), layout()).await?;
     let ingress = connect(&c, binding()).await?;
-    let mut second = publisher_with_pipeline(&ingress, &storage, &budget, 2, pipeline).await?;
+    let mut second =
+        publisher_with_mode(&ingress, &storage, &budget, 2, pipeline, source_read_policy).await?;
     assert_eq!(
         second.prepare_next().await?.unwrap(),
         saved,
@@ -245,7 +372,8 @@ async fn real_rollout_recovery(pipeline: bool) -> Result<()> {
 
     let c = network::Cluster::open_signed(root.path(), layout()).await?;
     let ingress = connect(&c, binding()).await?;
-    let mut third = publisher_with_pipeline(&ingress, &storage, &budget, 3, pipeline).await?;
+    let mut third =
+        publisher_with_mode(&ingress, &storage, &budget, 3, pipeline, source_read_policy).await?;
     assert_eq!(third.commit_pending().await?.unwrap(), published);
     let advanced = third
         .finish_pending()
@@ -313,7 +441,8 @@ async fn real_rollout_recovery(pipeline: bool) -> Result<()> {
 
     let c = network::Cluster::open_signed(root.path(), layout()).await?;
     let ingress = connect(&c, binding()).await?;
-    let mut final_owner = publisher_with_pipeline(&ingress, &storage, &budget, 4, pipeline).await?;
+    let mut final_owner =
+        publisher_with_mode(&ingress, &storage, &budget, 4, pipeline, source_read_policy).await?;
     assert!(final_owner.run_once().await?.is_none());
     verify(&final_owner, &expected, 6).await?;
     assert!(

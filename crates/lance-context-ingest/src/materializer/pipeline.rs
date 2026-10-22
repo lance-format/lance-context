@@ -23,6 +23,7 @@ pub(super) async fn materialize(
         partitions[i % writers].push(record);
     }
     let permits = Arc::new(Semaphore::new(options.fetch_parallelism));
+    let policy = options.source_read_policy;
     let streams = partitions
         .into_iter()
         .map(|partition| {
@@ -40,9 +41,8 @@ pub(super) async fn materialize(
                     let permit = permits.acquire_owned().await?;
                     super::stage::fetch(
                         ingress,
-                        group,
-                        index,
-                        meta,
+                        (group, index, meta),
+                        policy,
                         reservation,
                         phases,
                         Some(permit),

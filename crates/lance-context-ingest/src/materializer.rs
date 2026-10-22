@@ -10,8 +10,10 @@ use std::collections::{BTreeMap, HashMap};
 
 pub mod observation;
 mod pipeline;
+mod read_policy;
 pub(crate) mod stage;
 use observation::{Counters as PhaseCounters, Phase};
+pub use read_policy::SourceReadPolicy;
 
 /// Resolve this from the authorized namespace, never from an append request.
 #[derive(Clone)]
@@ -29,6 +31,9 @@ pub struct Options {
     pub max_records: usize,
     pub fetch_parallelism: usize,
     pub write_parallelism: usize,
+    /// Initial voter for immutable source reads; all other voters remain fallbacks.
+    /// Experimental spreading changes read placement, not durable source identity.
+    pub source_read_policy: SourceReadPolicy,
     /// Feed bounded decoded streams to file writers before all sources arrive.
     /// Experimental; disabled until a same-workload comparison supports it.
     pub pipeline_preparation: bool,
@@ -44,6 +49,7 @@ impl Default for Options {
             max_records: 128,
             fetch_parallelism: 4,
             write_parallelism: 2,
+            source_read_policy: SourceReadPolicy::FirstVoter,
             pipeline_preparation: false,
             scan_pages_per_group: 4,
             retained_manifest_versions: 64,

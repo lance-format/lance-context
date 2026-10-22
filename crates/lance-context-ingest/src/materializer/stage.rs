@@ -53,9 +53,8 @@ pub(crate) async fn materialize_inputs(
         let decoded = stream::iter(inputs.into_iter().map(|(group, index, meta)| {
             fetch(
                 ingress.clone(),
-                group,
-                index,
-                meta,
+                (group, index, meta),
+                options.source_read_policy,
                 reservation.clone(),
                 phases.clone(),
                 None,
@@ -115,9 +114,8 @@ pub(crate) async fn materialize_inputs(
 /// while that job still uses the admitted workspace.
 pub(super) async fn fetch(
     ingress: Ingress,
-    group: u64,
-    index: u64,
-    meta: BatchMeta,
+    (group, index, meta): (u64, u64, BatchMeta),
+    policy: SourceReadPolicy,
     reservation: Arc<MergeReservation>,
     phases: Arc<PhaseCounters>,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
@@ -125,7 +123,7 @@ pub(super) async fn fetch(
     let response = phases
         .measure(Phase::Fetch, async {
             let mut fetched = None;
-            for &node in &ingress.layout.groups[&group] {
+            for node in policy.candidates(&ingress.layout.groups[&group], group, index) {
                 if let Ok(response) = ingress
                     .client
                     .request(node, Request::Fetch { group, index })
