@@ -171,6 +171,8 @@ jobs:
           cargo clippy -p lance-context-ingest --features http --all-targets -- -D warnings
           cargo clippy -p lance-context-ingest --features http-client,materializer --all-targets -- -D warnings
           cargo test -p lance-context-ingest --features http-client,materializer --lib
+      - name: Materializer worker feature checks
+        run: cargo clippy -p lance-context-ingest --features worker --all-targets -- -D warnings
       - name: Start etcd for HA scheduler test
         run: |
           ETCD_VERSION=3.7.0
@@ -198,6 +200,7 @@ jobs:
         run: |
           cargo test -p lance-context-master -p lance-context-server -p lance-context-merge -- --ignored
           cargo test -p lance-context-core registry --lib -- --ignored
+          cargo test -p lance-context-ingest --features worker --lib tests::worker -- --ignored
 
   coverage:
     runs-on: ubuntu-24.04
@@ -263,6 +266,8 @@ jobs:
             -p lance-context-master -p lance-context-server -p lance-context-merge -- --ignored
           cargo llvm-cov --no-report --all-features \
             -p lance-context-core --lib -- registry --ignored
+          cargo llvm-cov --no-report --all-features \
+            -p lance-context-ingest --lib -- tests::worker --ignored
       - name: Merge coverage reports
         run: cargo llvm-cov report --lcov --output-path lcov.info
       - name: Save coverage report

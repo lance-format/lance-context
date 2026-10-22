@@ -15,6 +15,8 @@ mod http;
 #[cfg(feature = "materializer")]
 mod materializer;
 mod network;
+#[cfg(feature = "worker")]
+mod worker;
 
 fn layout() -> Arc<Layout> {
     Arc::new(Layout {

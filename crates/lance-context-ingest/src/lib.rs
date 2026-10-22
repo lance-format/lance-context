@@ -34,6 +34,8 @@ pub mod http;
 #[cfg(feature = "materializer")]
 pub mod materializer;
 pub mod receipt;
+#[cfg(feature = "worker")]
+pub mod worker;
 
 /// Resolved by the application's authorized catalog, not an uploaded URI/UUID.
 #[derive(Clone, Debug)]

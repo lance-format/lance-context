@@ -117,11 +117,13 @@ async fn tls_peer_process_fixture() -> Result<()> {
     let listener = TcpListener::bind(
         std::env::var("CONTEXT_TLS_PEER_BIND").unwrap_or_else(|_| "127.0.0.1:0".into()),
     )
-    .await?;
+    .await
+    .context("bind peer listener")?;
     let image_listener = TcpListener::bind(
         std::env::var("CONTEXT_TLS_IMAGE_BIND").unwrap_or_else(|_| "127.0.0.1:0".into()),
     )
-    .await?;
+    .await
+    .context("bind image listener")?;
     let control = TcpListener::bind("127.0.0.1:0").await?;
     let rpc_data = TcpListener::bind("127.0.0.1:0").await?;
     let rpc_control = TcpListener::bind("127.0.0.1:0").await?;
@@ -358,7 +360,15 @@ impl Process {
             Err(e) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                Err(e)
+                let stdout = fs::read_to_string(root.join(format!("stdout-{id}-{incarnation}")))
+                    .unwrap_or_else(|error| format!("cannot read child stdout: {error}"));
+                let stderr = fs::read_to_string(root.join(format!("stderr-{id}-{incarnation}")))
+                    .unwrap_or_else(|error| format!("cannot read child stderr: {error}"));
+                Err(e).with_context(|| {
+                    format!(
+                        "TLS peer {id} incarnation {incarnation} startup failed; child stdout:\n{stdout}\nchild stderr:\n{stderr}"
+                    )
+                })
             }
         }
     }

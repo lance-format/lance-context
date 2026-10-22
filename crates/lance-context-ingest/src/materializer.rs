@@ -54,7 +54,7 @@ impl Options {
             })
             .context("materializer workspace overflow")
     }
-    fn validate(&self, ingress: &Ingress, budget: &MergeMemoryBudget) -> Result<()> {
+    pub(super) fn validate(&self, ingress: &Ingress, budget: &MergeMemoryBudget) -> Result<()> {
         ensure!(
             self.max_source_bytes >= ingress.scope.contract.max_record_bytes as usize
                 && self.max_source_bytes as u64 <= ingress.client.max_plan_source_bytes(),
@@ -183,31 +183,9 @@ impl Publisher {
         );
         Ok(view)
     }
-    fn reader(&self) -> Result<p::lance::ManagedManifest> {
-        p::lance::ManagedManifest::reader(
-            Arc::new(self.ingress.client.manifest_catalog()),
-            self.storage.base.clone(),
-            &self.ingress.layout,
-            self.authority.table,
-            self.ingress.scope.incarnation,
-        )
-    }
     /// Readers of this managed table must use its catalog-selected manifest.
     pub async fn read_dataset(&self, version: Option<u64>) -> Result<Dataset> {
-        let mut builder = DatasetBuilder::from_uri(&self.storage.uri)
-            .with_storage_options(self.storage.options.clone())
-            .with_session(self.storage.session.clone())
-            .with_commit_handler(Arc::new(self.reader()?));
-        if let Some(version) = version {
-            builder = builder.with_version(version);
-        }
-        let dataset = builder.load().await?;
-        let schema: arrow_schema::Schema = dataset.schema().into();
-        ensure!(
-            schema == rollout_schema(),
-            "managed dataset is not the bound rollout schema"
-        );
-        Ok(dataset)
+        read_dataset(&self.ingress, &self.storage, version).await
     }
 
     /// Select a complete bounded prefix, pin every source, write immutable Lance
@@ -627,7 +605,41 @@ impl Publisher {
     }
 }
 
-async fn query(ingress: &Ingress, group: u64, value: query::Query) -> Result<query::Value> {
+/// Open a catalog-selected dataset without acquiring publisher ownership.
+/// The application resolves and authorizes both the binding and storage first.
+pub async fn read_dataset(
+    ingress: &Ingress,
+    storage: &Storage,
+    version: Option<u64>,
+) -> Result<Dataset> {
+    let reader = p::lance::ManagedManifest::reader(
+        Arc::new(ingress.client.manifest_catalog()),
+        storage.base.clone(),
+        &ingress.layout,
+        ingress.scope.table,
+        ingress.scope.incarnation,
+    )?;
+    let mut builder = DatasetBuilder::from_uri(&storage.uri)
+        .with_storage_options(storage.options.clone())
+        .with_session(storage.session.clone())
+        .with_commit_handler(Arc::new(reader));
+    if let Some(version) = version {
+        builder = builder.with_version(version);
+    }
+    let dataset = builder.load().await?;
+    let schema: arrow_schema::Schema = dataset.schema().into();
+    ensure!(
+        schema == rollout_schema(),
+        "managed dataset is not the bound rollout schema"
+    );
+    Ok(dataset)
+}
+
+pub(super) async fn query(
+    ingress: &Ingress,
+    group: u64,
+    value: query::Query,
+) -> Result<query::Value> {
     let response = ingress
         .client
         .request_routed(Request::Query {

@@ -7,11 +7,13 @@ publish = false
 description = "Durable rollout ingress over the independent lance-context WAL"
 
 [features]
+worker = ["materializer", "dep:etcd-client"]
 http = ["dep:axum", "dep:http-body-util"]
 http-client = ["http", "dep:reqwest", "lance-context-wal/client-journal"]
 materializer = ["lance-context-wal/lance-integration", "dep:lance", "dep:lance-table", "dep:object_store", "dep:futures"]
 
 [dependencies]
+etcd-client = { version = "0.19", features = ["tls"], optional = true }
 axum = { version = "0.8", optional = true, default-features = false, features = ["json", "http1", "tokio"] }
 http-body-util = { version = "0.1", optional = true }
 reqwest = { version = "0.12", optional = true, default-features = false, features = ["json", "rustls-tls"] }

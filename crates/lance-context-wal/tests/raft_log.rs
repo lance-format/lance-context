@@ -10,6 +10,11 @@ use raft::{GetEntriesContext, Storage};
 use raft_proto::eraftpb::{Entry, EntryType, HardState};
 use uuid::Uuid;
 
+// A child spawned by another case can briefly inherit this case's flock until
+// exec. Exclude that window around open/drop/reopen sequences. Concurrency and
+// real child crashes within a case remain part of the test.
+static TEST_CASE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn layout() -> Layout {
     Layout {
         cluster: Uuid::from_u128(1),
@@ -45,6 +50,7 @@ fn read(log: &GroupLog, low: u64, high: u64, limit: Option<u64>) -> raft::Result
 
 #[test]
 fn recovers_two_groups_and_rejects_layout_changes() -> Result<()> {
+    let _case = TEST_CASE.lock().unwrap();
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("log");
     let entries = vec![
@@ -98,6 +104,7 @@ fn recovers_two_groups_and_rejects_layout_changes() -> Result<()> {
 
 #[test]
 fn foreign_engine_and_invalid_metadata_are_rejected_without_rebinding() -> Result<()> {
+    let _case = TEST_CASE.lock().unwrap();
     fn engine(path: &std::path::Path) -> Result<raft_engine::Engine> {
         Ok(raft_engine::Engine::open(raft_engine::Config {
             dir: path.to_str().unwrap().to_owned(),
@@ -143,6 +150,7 @@ fn foreign_engine_and_invalid_metadata_are_rejected_without_rebinding() -> Resul
 
 #[test]
 fn replaces_only_uncommitted_suffix_and_preserves_vote() -> Result<()> {
+    let _case = TEST_CASE.lock().unwrap();
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("log");
     let expected = vec![
@@ -193,6 +201,7 @@ fn replaces_only_uncommitted_suffix_and_preserves_vote() -> Result<()> {
 
 #[test]
 fn read_size_and_chunk_boundaries_obey_raft_storage_contract() -> Result<()> {
+    let _case = TEST_CASE.lock().unwrap();
     let directory = tempfile::tempdir()?;
     let log = PhysicalLog::open(&directory.path().join("log"), &layout(), 1)?;
     let group = log.group(10)?;
@@ -227,6 +236,7 @@ fn read_size_and_chunk_boundaries_obey_raft_storage_contract() -> Result<()> {
 
 #[test]
 fn concurrent_groups_share_engine_without_sharing_positions() -> Result<()> {
+    let _case = TEST_CASE.lock().unwrap();
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("log");
     {
@@ -265,6 +275,7 @@ fn concurrent_groups_share_engine_without_sharing_positions() -> Result<()> {
 
 #[test]
 fn raft_ready_persistence_preserves_committed_data_through_election_and_restart() -> Result<()> {
+    let _case = TEST_CASE.lock().unwrap();
     use raft::{Config, RawNode, StateRole};
     use std::path::Path;
 
@@ -541,6 +552,7 @@ mod process {
     use std::path::Path;
 
     fn run_child(mode: &str) -> Result<()> {
+        let _case = TEST_CASE.lock().unwrap();
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("log");
         let stdout = directory.path().join("worker.stdout");

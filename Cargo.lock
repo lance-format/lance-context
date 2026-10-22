@@ -4185,6 +4185,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "bytes",
+ "etcd-client",
  "futures",
  "http-body-util",
  "lance",
