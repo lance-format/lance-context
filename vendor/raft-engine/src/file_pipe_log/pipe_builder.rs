@@ -79,7 +79,7 @@ pub struct DualPipesBuilder<F: FileSystem> {
 
     /// Only filled after a successful call of `DualPipesBuilder::scan`.
     dirs: Paths,
-    dir_locks: Vec<StdFile>,
+    dir_locks: Vec<DirectoryLock>,
 
     pub(crate) append_file_names: Vec<FileName>,
     pub(crate) rewrite_file_names: Vec<FileName>,
@@ -615,8 +615,27 @@ impl<F: FileSystem> DualPipesBuilder<F> {
     }
 }
 
+/// Owns the directory lock independently of duplicated/inherited descriptors.
+/// Closing a descriptor alone keeps a Unix flock held until every descriptor
+/// sharing that open file description has closed, including a concurrent child
+/// between fork and exec. Only the acquiring process may explicitly unlock it.
+pub(super) struct DirectoryLock {
+    file: StdFile,
+    owner: u32,
+}
+
+impl Drop for DirectoryLock {
+    fn drop(&mut self) {
+        if self.owner == std::process::id() {
+            if let Err(error) = FileExt::unlock(&self.file) {
+                error!("failed to release engine directory lock: {}", error);
+            }
+        }
+    }
+}
+
 /// Creates and exclusively locks a lock file under the given directory.
-pub(super) fn lock_dir<P: AsRef<Path>>(dir: P) -> Result<StdFile> {
+pub(super) fn lock_dir<P: AsRef<Path>>(dir: P) -> Result<DirectoryLock> {
     let lock_file = StdFile::create(lock_file_path(dir))?;
     lock_file.try_lock_exclusive().map_err(|e| {
         Error::Other(box_err!(
@@ -624,7 +643,10 @@ pub(super) fn lock_dir<P: AsRef<Path>>(dir: P) -> Result<StdFile> {
             e
         ))
     })?;
-    Ok(lock_file)
+    Ok(DirectoryLock {
+        file: lock_file,
+        owner: std::process::id(),
+    })
 }
 
 pub(crate) struct FileName {

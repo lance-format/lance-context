@@ -45,6 +45,41 @@ fn relative_directory_reopens_and_missing_parent_does_not_create_ancestors() -> 
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn owner_close_releases_lock_while_a_duplicated_description_remains_open() -> Result<()> {
+    use std::os::{fd::BorrowedFd, unix::fs::MetadataExt};
+    let dir = tempfile::tempdir()?;
+    let (journal, _) = Journal::open(dir.path(), b"inherited-lock", 1, settings())?;
+    let lock = std::fs::metadata(dir.path().join("LOCK"))?;
+    let mut inherited = None;
+    for entry in std::fs::read_dir("/proc/self/fd")? {
+        let entry = entry?;
+        let Ok(metadata) = std::fs::metadata(entry.path()) else {
+            continue;
+        };
+        if metadata.dev() == lock.dev() && metadata.ino() == lock.ino() {
+            let fd: i32 = entry.file_name().to_str().unwrap().parse()?;
+            // SAFETY: this unique journal owns the identified lock descriptor
+            // until drop(journal) below; its worker never closes that lock. The
+            // borrow only duplicates it and does not assume ownership of it.
+            inherited = Some(unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()?);
+            break;
+        }
+    }
+    let inherited = inherited.context("journal lock descriptor missing")?;
+    assert!(Journal::open(dir.path(), b"inherited-lock", 1, settings()).is_err());
+    // dup and fork share an open file description. Keep it alive deterministically
+    // instead of hoping to hit the short fork-to-exec window of another test.
+    drop(journal);
+    let (replacement, _) = Journal::open(dir.path(), b"inherited-lock", 1, settings())?;
+    drop(inherited);
+    assert!(Journal::open(dir.path(), b"inherited-lock", 1, settings()).is_err());
+    drop(replacement);
+    assert!(Journal::open(dir.path(), b"inherited-lock", 1, settings()).is_ok());
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_replacements_reclaim_and_reopen_exact_latest_values() -> Result<()> {
     let dir = tempfile::tempdir()?;

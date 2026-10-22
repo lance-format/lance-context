@@ -7,7 +7,7 @@ installation marker is omitted. The generated Cargo manifest is unchanged.
 The registry archive checksum is
 `1213c3a24e3fee8afcc74b2be08c4081adde96f092e0fc1c607abb3e16ae722e`.
 
-Only `src/engine.rs` and `src/purge.rs` have local source changes. The accompanying
+The entry-cache correction changes `src/engine.rs` and `src/purge.rs`. The accompanying
 `read-cache-identity.patch` records their complete delta against the published
 source. This correction belongs to the ingestion work tracked in
 [lance-context #378](https://github.com/lance-format/lance-context/issues/378).
@@ -43,3 +43,21 @@ rewrite followed by fresh-thread readback after reopening. The standalone
 qualification of these same four cases returned wrong payloads with the original
 dependency and passed with this source correction. Application and full workspace
 checks remain separate requirements; this is not a production WAL enablement.
+# Explicit directory-lock release
+
+Engine shutdown now explicitly unlocks its directory before closing the owner's
+lock descriptor. On Unix, a duplicated descriptor (including one inherited by a
+concurrent child before exec) shares the same open file description and can keep
+`flock` held after the engine has closed. The guard records its acquiring process
+ID so a forked child's destructor cannot unlock the parent's live engine. The
+guard is still released only after the engine's pipe owners finish dropping.
+
+`directory-lock-release.patch` records this additional vendor change. A Linux
+client-journal regression duplicates the actual engine lock descriptor, verifies
+exclusion while the owner is live, closes the journal, and reopens it while the
+duplicate remains open. Closing that old duplicate must not unlock the new owner.
+The regression fails before the change and passes after it without retry/sleep.
+
+```sh
+cargo test -p lance-context-wal --features client-journal --lib
+```

@@ -1,0 +1,91 @@
+diff --git a/vendor/raft-engine/src/file_pipe_log/pipe.rs b/vendor/raft-engine/src/file_pipe_log/pipe.rs
+index 27ea826..dc09a98 100644
+--- a/vendor/raft-engine/src/file_pipe_log/pipe.rs
++++ b/vendor/raft-engine/src/file_pipe_log/pipe.rs
+@@ -1,7 +1,6 @@
+ // Copyright (c) 2017-present, PingCAP, Inc. Licensed under Apache-2.0.
+ 
+ use std::collections::VecDeque;
+-use std::fs::File as StdFile;
+ use std::path::PathBuf;
+ use std::sync::Arc;
+ 
+@@ -23,6 +22,7 @@ use crate::{perf_context, Error, Result};
+ use super::format::{build_reserved_file_name, FileNameExt, LogFileFormat};
+ use super::log_file::build_file_reader;
+ use super::log_file::{build_file_writer, LogFileWriter};
++use super::pipe_builder::DirectoryLock;
+ 
+ pub type PathId = usize;
+ pub type Paths = Vec<PathBuf>;
+@@ -464,14 +464,14 @@ impl<F: FileSystem> SinglePipe<F> {
+ pub struct DualPipes<F: FileSystem> {
+     pipes: [SinglePipe<F>; 2],
+ 
+-    _dir_locks: Vec<StdFile>,
++    _dir_locks: Vec<DirectoryLock>,
+ }
+ 
+ impl<F: FileSystem> DualPipes<F> {
+     /// Open a new [`DualPipes`]. Assumes the two [`SinglePipe`]s share the
+     /// same directory, and that directory is locked by `dir_lock`.
+     pub(super) fn open(
+-        dir_locks: Vec<StdFile>,
++        dir_locks: Vec<DirectoryLock>,
+         appender: SinglePipe<F>,
+         rewriter: SinglePipe<F>,
+     ) -> Result<Self> {
+diff --git a/vendor/raft-engine/src/file_pipe_log/pipe_builder.rs b/vendor/raft-engine/src/file_pipe_log/pipe_builder.rs
+index 25ca433..6e88d4f 100644
+--- a/vendor/raft-engine/src/file_pipe_log/pipe_builder.rs
++++ b/vendor/raft-engine/src/file_pipe_log/pipe_builder.rs
+@@ -79,7 +79,7 @@ pub struct DualPipesBuilder<F: FileSystem> {
+ 
+     /// Only filled after a successful call of `DualPipesBuilder::scan`.
+     dirs: Paths,
+-    dir_locks: Vec<StdFile>,
++    dir_locks: Vec<DirectoryLock>,
+ 
+     pub(crate) append_file_names: Vec<FileName>,
+     pub(crate) rewrite_file_names: Vec<FileName>,
+@@ -615,8 +615,27 @@ impl<F: FileSystem> DualPipesBuilder<F> {
+     }
+ }
+ 
++/// Owns the directory lock independently of duplicated/inherited descriptors.
++/// Closing a descriptor alone keeps a Unix flock held until every descriptor
++/// sharing that open file description has closed, including a concurrent child
++/// between fork and exec. Only the acquiring process may explicitly unlock it.
++pub(super) struct DirectoryLock {
++    file: StdFile,
++    owner: u32,
++}
++
++impl Drop for DirectoryLock {
++    fn drop(&mut self) {
++        if self.owner == std::process::id() {
++            if let Err(error) = FileExt::unlock(&self.file) {
++                error!("failed to release engine directory lock: {}", error);
++            }
++        }
++    }
++}
++
+ /// Creates and exclusively locks a lock file under the given directory.
+-pub(super) fn lock_dir<P: AsRef<Path>>(dir: P) -> Result<StdFile> {
++pub(super) fn lock_dir<P: AsRef<Path>>(dir: P) -> Result<DirectoryLock> {
+     let lock_file = StdFile::create(lock_file_path(dir))?;
+     lock_file.try_lock_exclusive().map_err(|e| {
+         Error::Other(box_err!(
+@@ -624,7 +643,10 @@ pub(super) fn lock_dir<P: AsRef<Path>>(dir: P) -> Result<StdFile> {
+             e
+         ))
+     })?;
+-    Ok(lock_file)
++    Ok(DirectoryLock {
++        file: lock_file,
++        owner: std::process::id(),
++    })
+ }
+ 
+ pub(crate) struct FileName {

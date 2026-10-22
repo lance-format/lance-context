@@ -1,7 +1,6 @@
 // Copyright (c) 2017-present, PingCAP, Inc. Licensed under Apache-2.0.
 
 use std::collections::VecDeque;
-use std::fs::File as StdFile;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -23,6 +22,7 @@ use crate::{perf_context, Error, Result};
 use super::format::{build_reserved_file_name, FileNameExt, LogFileFormat};
 use super::log_file::build_file_reader;
 use super::log_file::{build_file_writer, LogFileWriter};
+use super::pipe_builder::DirectoryLock;
 
 pub type PathId = usize;
 pub type Paths = Vec<PathBuf>;
@@ -464,14 +464,14 @@ impl<F: FileSystem> SinglePipe<F> {
 pub struct DualPipes<F: FileSystem> {
     pipes: [SinglePipe<F>; 2],
 
-    _dir_locks: Vec<StdFile>,
+    _dir_locks: Vec<DirectoryLock>,
 }
 
 impl<F: FileSystem> DualPipes<F> {
     /// Open a new [`DualPipes`]. Assumes the two [`SinglePipe`]s share the
     /// same directory, and that directory is locked by `dir_lock`.
     pub(super) fn open(
-        dir_locks: Vec<StdFile>,
+        dir_locks: Vec<DirectoryLock>,
         appender: SinglePipe<F>,
         rewriter: SinglePipe<F>,
     ) -> Result<Self> {
