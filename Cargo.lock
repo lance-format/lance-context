@@ -4191,6 +4191,7 @@ dependencies = [
  "lance",
  "lance-context-core",
  "lance-context-wal",
+ "lance-io",
  "lance-table",
  "object_store 0.14.2",
  "rcgen",

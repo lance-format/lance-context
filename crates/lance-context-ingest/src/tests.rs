@@ -1,15 +1,22 @@
 use super::*;
 use arrow_array::{
     new_null_array, types::Int8Type, ArrayRef, DictionaryArray, Int32Array, Int8Array,
-    LargeBinaryArray, RecordBatch, RecordBatchIterator, TimestampMicrosecondArray,
+    LargeBinaryArray, RecordBatch, TimestampMicrosecondArray,
 };
 use arrow_ipc::writer::FileWriter;
-use lance::{dataset::WriteParams, Dataset};
+use lance::Dataset;
 use lance_context_wal::replication::publication as p;
-use lance_table::io::commit::{ConditionalPutCommitHandler, ManifestNamingScheme};
 use receipt::ReceiptKeys;
 use std::collections::BTreeMap;
+#[cfg(not(feature = "materializer"))]
+use {
+    arrow_array::RecordBatchIterator,
+    lance::dataset::WriteParams,
+    lance_table::io::commit::{ConditionalPutCommitHandler, ManifestNamingScheme},
+};
 
+#[cfg(feature = "materializer")]
+mod bootstrap;
 #[cfg(all(feature = "http-client", feature = "materializer"))]
 mod http;
 #[cfg(feature = "materializer")]
@@ -181,6 +188,30 @@ async fn validates_whole_atomic_batch_and_preserves_original_buffer() -> Result<
     Ok(())
 }
 
+#[cfg(feature = "materializer")]
+async fn bootstrap(
+    c: &network::Cluster,
+    path: &std::path::Path,
+    binding: &TableBinding,
+) -> Result<()> {
+    let storage = crate::materializer::Storage::resolve(
+        path.to_str().context("test URI")?.into(),
+        Default::default(),
+        Arc::new(lance::session::Session::default()),
+    )
+    .await?;
+    crate::bootstrap::provision(
+        c.client.clone(),
+        layout(),
+        binding.clone(),
+        storage,
+        bootstrap::identity(),
+    )
+    .await?;
+    Ok(())
+}
+
+#[cfg(not(feature = "materializer"))]
 async fn bootstrap(
     c: &network::Cluster,
     path: &std::path::Path,

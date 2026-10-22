@@ -29,6 +29,8 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, sync::Arc, time::Duration};
 use uuid::Uuid;
 
+#[cfg(feature = "materializer")]
+pub mod bootstrap;
 #[cfg(feature = "http")]
 pub mod http;
 #[cfg(feature = "materializer")]
@@ -38,7 +40,8 @@ pub mod receipt;
 pub mod worker;
 
 /// Resolved by the application's authorized catalog, not an uploaded URI/UUID.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TableBinding {
     pub table: Uuid,
     pub destination: Destination,
