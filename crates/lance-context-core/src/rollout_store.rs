@@ -3079,15 +3079,20 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_merge_joins_inflight_commit_then_retries_without_losing_blob_or_new_wal() {
-        cancellation_recovery_case(false).await;
+        cancellation_recovery_case(false, false).await;
     }
 
     #[tokio::test]
     async fn recovery_barrier_allows_retry_before_late_old_append_returns() {
-        cancellation_recovery_case(true).await;
+        cancellation_recovery_case(true, false).await;
     }
 
-    async fn cancellation_recovery_case(fence_old: bool) {
+    #[tokio::test]
+    async fn legacy_retirement_barrier_rejects_delayed_unfenced_base_commit() {
+        cancellation_recovery_case(true, true).await;
+    }
+
+    async fn cancellation_recovery_case(fence_old: bool, retired_legacy: bool) {
         use crate::merge_write_scope::{GuardedCommit, MergeWriteScope};
         use lance_table::format::{IndexMetadata, Manifest, Transaction};
         use lance_table::io::commit::{
@@ -3178,7 +3183,14 @@ mod tests {
             .unwrap();
         let store = Arc::new(tokio::sync::Mutex::new(store));
         let gate = Arc::new(Gate::default());
-        let scope = MergeWriteScope::with_authorizer(gate.clone());
+        // A retired legacy process never recorded commit permits in etcd. Its
+        // application future is gone, but an already issued immutable storage
+        // leaf may still complete. There is no authorizer in this variant.
+        let scope = if retired_legacy {
+            MergeWriteScope::new()
+        } else {
+            MergeWriteScope::with_authorizer(gate.clone())
+        };
         let worker_scope = scope.clone();
         let writer = store.clone();
         let merge = tokio::spawn(async move {
@@ -3206,9 +3218,20 @@ mod tests {
         }
         if fence_old {
             gate.closed.store(true, Ordering::SeqCst);
-            let high = gate.high.load(Ordering::SeqCst);
-            assert!(high > 0);
-            let plan = std::collections::BTreeMap::from([("base".to_string(), high)]);
+            let plan = if retired_legacy {
+                assert_eq!(
+                    gate.high.load(Ordering::SeqCst),
+                    0,
+                    "legacy writer has no commit permits"
+                );
+                crate::legacy_retirement::snapshot_retired_writer(uri, None, "default")
+                    .await
+                    .unwrap()
+            } else {
+                let high = gate.high.load(Ordering::SeqCst);
+                assert!(high > 0);
+                std::collections::BTreeMap::from([("base".to_string(), high)])
+            };
             crate::merge_write_scope::fence_manifest_versions(uri, None, &plan, "test-recovery")
                 .await
                 .unwrap();

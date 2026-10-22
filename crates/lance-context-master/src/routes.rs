@@ -960,6 +960,7 @@ async fn drain_executor(
 pub fn api_router() -> Router<Arc<MasterState>> {
     Router::new()
         .route("/executor", get(executor_status))
+        .route("/merge-retirements", post(crate::legacy_retirement::route))
         .route("/merge-progress", get(merge_progress))
         .route("/executor/drain", post(drain_executor))
         .route("/experiments", get(list_experiments))
@@ -1044,6 +1045,7 @@ mod tests {
 
     fn test_config(dir: &TempDir) -> MasterConfig {
         MasterConfig {
+            legacy_retirement_request: None,
             local_merge: Default::default(),
             append: Default::default(),
             catchup: Default::default(),

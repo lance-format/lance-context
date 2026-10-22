@@ -21,6 +21,29 @@ async fn main() {
         .init();
 
     let config = MasterConfig::parse();
+    if let Some(path) = &config.legacy_retirement_request {
+        let result = async {
+            let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+            if bytes.len() > 8192 {
+                return Err("retirement request exceeds metadata bound".to_string());
+            }
+            let request = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+            let coordinator = lance_context_merge::Coordinator::new(
+                config.etcd.connect().await.map_err(|e| e.to_string())?,
+                config.etcd.etcd_prefix.clone(),
+            );
+            lance_context_master::legacy_retirement::execute(&config, &coordinator, request).await
+        }
+        .await;
+        match result {
+            Ok(response) => println!("{}", serde_json::to_string(&response).unwrap()),
+            Err(error) => {
+                tracing::error!(%error, "legacy retirement incomplete; ownership retained");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     let addr = format!("{}:{}", config.host, config.port);
 
     // Install the recorder before state recovery and scheduler startup so

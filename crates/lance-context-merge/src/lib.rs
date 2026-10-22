@@ -8,6 +8,7 @@ pub mod background;
 pub mod demand;
 pub mod failure;
 pub mod fencing;
+pub mod legacy_retirement;
 mod mode;
 pub mod progress;
 pub mod rollout;

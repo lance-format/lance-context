@@ -6,6 +6,10 @@ use clap::Parser;
 #[derive(Debug, Clone, Parser)]
 #[command(name = "lance-context-master", version)]
 pub struct MasterConfig {
+    /// Run one identity-verified legacy retirement request from JSON and exit.
+    /// Uses the existing master's service account; starts no scheduler or scans.
+    #[arg(long)]
+    pub legacy_retirement_request: Option<std::path::PathBuf>,
     #[command(flatten)]
     pub merge_rollout: lance_context_merge::rollout::MergeRollout,
     #[command(flatten)]

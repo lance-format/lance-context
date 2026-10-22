@@ -12,6 +12,7 @@ pub mod generic_codec;
 mod generic_store;
 mod id;
 mod key_index;
+pub mod legacy_retirement;
 pub mod merge_budget;
 pub mod merge_write_scope;
 pub mod metrics;

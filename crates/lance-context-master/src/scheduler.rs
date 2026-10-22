@@ -1347,6 +1347,7 @@ mod tests {
 
     fn config(dir: &TempDir) -> MasterConfig {
         MasterConfig {
+            legacy_retirement_request: None,
             local_merge: Default::default(),
             append: Default::default(),
             catchup: Default::default(),
@@ -3401,6 +3402,13 @@ mod tests {
         worker.abort();
     }
 
+    fn legacy_stub(app: axum::Router) -> axum::Router {
+        app.route("/api/v1/internal/merge-executor", axum::routing::get(|| async {
+            axum::Json(serde_json::json!({"protocol":2,"instance":"legacy","timeout_secs":600,
+                "queue_timeout_secs":600,"idle_timeout_secs":600,"progress_protocol":1,"owned_targets":[]}))
+        }))
+    }
+
     /// Wrap test workers in the production ownership wire protocol, preserving
     /// their individual route assertions and injected delays/errors.
     async fn owned_stub(app: axum::Router, cfg: &MasterConfig) -> axum::Router {
@@ -3501,6 +3509,7 @@ mod tests {
         cfg.legacy_merge_foreground_secs = 1;
         cfg.legacy_merge_wait_concurrency = 2;
         cfg.worker_endpoints = vec![format!("http://{}", listener.local_addr().unwrap())];
+        let app = legacy_stub(app);
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let state = MasterState::new(cfg).await.unwrap();
         let slow = enqueue(&state, TaskKind::MergeWal, "slow").await.unwrap();
@@ -3714,6 +3723,7 @@ mod tests {
         cfg.catchup.shards = vec!["writer".into()];
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         cfg.worker_endpoints = vec![format!("http://{}", listener.local_addr().unwrap())];
+        let app = legacy_stub(app);
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let state = MasterState::new(cfg).await.unwrap();
         let writer = RolloutStore::open_with_options(

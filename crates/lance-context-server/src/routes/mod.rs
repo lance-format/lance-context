@@ -27,6 +27,10 @@ pub fn router() -> Router<Arc<AppState>> {
             get(crate::merge_execution::capabilities),
         )
         .route(
+            "/api/v1/internal/merge-executor/retirement",
+            get(crate::merge_execution::retirement_status),
+        )
+        .route(
             "/api/v1/internal/merge-executor/start",
             post(crate::merge_execution::start),
         )

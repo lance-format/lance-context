@@ -238,12 +238,50 @@ pub async fn capabilities(
         "idle_timeout_secs": state.merge_executions.idle_timeout_secs,
         "progress_protocol": 1,
         "legacy_progress_protocol": 1,
+        "merge_admission_ready": state.merge_executions.fencing_mode_known().is_some(),
         "fenced_legacy_merges": state.merge_executions.fencing_mode_known() == Some(true),
         "rollout_append_protocol": 1,
         "shard_name": state.instance_id,
         "owned_targets": state.merge_executions.rollout.owned_targets,
         "drain_targets": state.merge_executions.rollout.drain_targets}),
     ))
+}
+
+/// A replacement must resolve both the persisted admission mode and the exact
+/// old execution from its own coordinator before legacy retirement can proceed.
+#[derive(serde::Deserialize)]
+pub struct RetirementQuery {
+    target: String,
+}
+
+pub async fn retirement_status(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(query): axum::extract::Query<RetirementQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    if query.target.is_empty() || query.target.len() > 512 {
+        return Err(AppError::InvalidRequest(
+            "one explicit retirement target is required".into(),
+        ));
+    }
+    if !state.merge_executions.fenced_mode().await? {
+        return Err(AppError::Overloaded(
+            "replacement must fence all legacy merge admission".into(),
+        ));
+    }
+    let execution = state
+        .merge_executions
+        .coordinator()
+        .await?
+        .get(&query.target)
+        .await
+        .map_err(AppError::Internal)?;
+    Ok(Json(serde_json::json!({
+        "instance": state.merge_executions.instance,
+        "base_uri": state.base_uri,
+        "shard_name": state.instance_id,
+        "fenced_legacy_merges": true,
+        "execution": execution,
+    })))
 }
 
 pub async fn start(
@@ -647,6 +685,57 @@ mod tests {
         .await
         .unwrap();
         (state, coordinator, proof, dir)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn legacy_retirement_status_resolves_mode_and_returns_exact_coordinator_record() {
+        let (mut state, coordinator, proof, _dir) = deadline_fixture().await;
+        let local = Arc::get_mut(&mut state).unwrap();
+        local.merge_executions.rollout.fence_legacy = true;
+        local.merge_executions.endpoint = Some("http://replacement:3000".into());
+        local.instance_id = Some("worker-9".into());
+        let execution = coordinator
+            .admit_legacy(&proof, "hot", "http://old:3000")
+            .await
+            .unwrap();
+        let Json(reply) = retirement_status(
+            State(state.clone()),
+            axum::extract::Query(RetirementQuery {
+                target: "hot".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply["fenced_legacy_merges"], true);
+        assert_eq!(
+            reply["execution"],
+            serde_json::to_value(&execution).unwrap()
+        );
+        assert_eq!(reply["base_uri"], state.base_uri);
+        assert_eq!(reply["shard_name"], "worker-9");
+        assert_eq!(coordinator.get("hot").await.unwrap(), Some(execution));
+        assert!(coordinator.legacy_fencing_mode(false).await.unwrap());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn legacy_retirement_status_rejects_unfenced_replacement() {
+        let (state, coordinator, proof, _dir) = deadline_fixture().await;
+        let execution = coordinator
+            .admit_legacy(&proof, "hot", "http://old:3000")
+            .await
+            .unwrap();
+        assert!(retirement_status(
+            State(state),
+            axum::extract::Query(RetirementQuery {
+                target: "hot".into()
+            })
+        )
+        .await
+        .is_err());
+        assert_eq!(coordinator.get("hot").await.unwrap(), Some(execution));
+        assert!(!coordinator.legacy_fencing_mode(false).await.unwrap());
     }
 
     async fn terminal(coordinator: &Coordinator) -> Execution {

@@ -2740,6 +2740,7 @@ mod tests {
 
     fn config(dir: &TempDir) -> MasterConfig {
         MasterConfig {
+            legacy_retirement_request: None,
             local_merge: Default::default(),
             append: Default::default(),
             catchup: Default::default(),
