@@ -448,6 +448,21 @@ struct NodePools {
     data: Pool,
     control: Pool,
 }
+
+fn disconnected(error: &anyhow::Error) -> bool {
+    use std::io::ErrorKind;
+    error.downcast_ref::<std::io::Error>().is_some_and(|e| {
+        matches!(
+            e.kind(),
+            ErrorKind::UnexpectedEof
+                | ErrorKind::BrokenPipe
+                | ErrorKind::ConnectionReset
+                | ErrorKind::ConnectionAborted
+                | ErrorKind::NotConnected
+        )
+    })
+}
+
 pub struct Client {
     nodes: BTreeMap<u64, NodePools>,
     connector: TlsConnector,
@@ -521,15 +536,18 @@ impl Client {
         })
     }
     /// A failure/cancellation is an unknown outcome. Retain and reconcile the
-    /// original producer sequence/control identity. This method never silently
-    /// retries, advances a sequence, or treats a cached leader hint as an ACK.
+    /// original producer sequence/control identity. Mutations are never silently
+    /// retried. A read on a disconnected pooled stream may reconnect once within
+    /// the original deadline; a cached leader hint is never treated as an ACK.
     pub async fn request(&self, node: u64, request: Request) -> Result<Response> {
         timeout(self.options.timeout, self.exchange(node, request))
             .await
             .context("client exchange timed out; outcome unknown")?
     }
     /// Follow configured-voter hints only when the remote confirms it did not
-    /// submit the request. Unknown outcomes are returned for explicit exact retry.
+    /// submit the request. Unknown mutation outcomes require explicit exact retry.
+    /// Read-only pooled disconnects may reconnect once per target, within this
+    /// method's single overall deadline.
     pub async fn request_routed(&self, request: Request) -> Result<Response> {
         timeout(self.options.timeout, async {
             let group = match &request {
@@ -620,6 +638,10 @@ impl Client {
             Request::Status { group } => (WireRequest::Status { group }, Bytes::new()),
         };
         let data = wire.data();
+        let read_only = matches!(
+            wire,
+            WireRequest::Query { .. } | WireRequest::Fetch { .. } | WireRequest::Status { .. }
+        );
         let fetch = matches!(wire, WireRequest::Fetch { .. });
         let reply_kind = match &wire {
             WireRequest::Append { .. } | WireRequest::Control(_) => 0,
@@ -645,75 +667,93 @@ impl Client {
         let metadata = codec().serialize(&(&expected, wire))?;
         let pool = if data { &pools.data } else { &pools.control };
         let _slot = pool.slots.clone().acquire_owned().await?;
-        let idle = pool.idle.lock().unwrap().pop();
-        let mut stream = match idle {
-            Some(stream) => stream,
-            None => {
-                let address = if data {
-                    &pools.endpoint.data_address
-                } else {
-                    &pools.endpoint.control_address
-                };
-                let tcp = TcpStream::connect(address).await?;
-                tcp.set_nodelay(true)?;
-                let stream = self
-                    .connector
-                    .connect(
-                        ServerName::try_from(pools.endpoint.server_name.clone())?,
-                        tcp,
-                    )
-                    .await?;
+        let mut idle = pool.idle.lock().unwrap().pop();
+        let mut reconnect_read = read_only && idle.is_some();
+        loop {
+            let mut stream = match idle.take() {
+                Some(stream) => stream,
+                None => {
+                    let address = if data {
+                        &pools.endpoint.data_address
+                    } else {
+                        &pools.endpoint.control_address
+                    };
+                    let tcp = TcpStream::connect(address).await?;
+                    tcp.set_nodelay(true)?;
+                    let stream = self
+                        .connector
+                        .connect(
+                            ServerName::try_from(pools.endpoint.server_name.clone())?,
+                            tcp,
+                        )
+                        .await?;
+                    ensure!(
+                        stream.get_ref().1.alpn_protocol() == Some(ALPN)
+                            && certificate(stream.get_ref().1.peer_certificates())?
+                                == pools.endpoint.certificate,
+                        "foreign WAL service identity"
+                    );
+                    stream
+                }
+            };
+            let response: Result<(Reply, Bytes)> = async {
+                let id = self
+                    .next
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+                    .map_err(|_| anyhow::anyhow!("client request ids exhausted"))?;
+                send(&mut stream, id, &metadata, &body).await?;
+                let (received_id, meta_len, body_len) =
+                    prefix(&mut stream, if fetch { self.max_record } else { 0 }).await?;
+                ensure!(received_id == id, "client response correlation mismatch");
+                let metadata = receive(&mut stream, meta_len).await?;
+                let (observed, reply): (Scope, Reply) = codec().deserialize(&metadata)?;
+                ensure!(observed == expected, "foreign client response scope");
                 ensure!(
-                    stream.get_ref().1.alpn_protocol() == Some(ALPN)
-                        && certificate(stream.get_ref().1.peer_certificates())?
-                            == pools.endpoint.certificate,
-                    "foreign WAL service identity"
+                    matches!(reply, Reply::Unknown | Reply::Redirect { .. })
+                        || matches!(
+                            (&reply, reply_kind),
+                            (Reply::Commit(_), 0)
+                                | (Reply::Query(_), 1)
+                                | (Reply::Record(_), 2)
+                                | (Reply::Status(_), 3)
+                        ),
+                    "unexpected response type"
                 );
-                stream
+                match &reply {
+                    Reply::Record(Some(meta)) if fetch => {
+                        meta.check_body_length(body_len, self.max_record)?
+                    }
+                    Reply::Record(None) | Reply::Unknown if fetch => {
+                        ensure!(body_len == 0, "unexpected record payload")
+                    }
+                    Reply::Record(_) => anyhow::bail!("record reply for non-fetch request"),
+                    _ => ensure!(body_len == 0 && !fetch, "unexpected response payload/type"),
+                }
+                let body = receive(&mut stream, body_len).await?;
+                Ok((reply, body))
             }
-        };
-        let id = self
-            .next
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-            .map_err(|_| anyhow::anyhow!("client request ids exhausted"))?;
-        send(&mut stream, id, &metadata, &body).await?;
-        let (received_id, meta_len, body_len) =
-            prefix(&mut stream, if fetch { self.max_record } else { 0 }).await?;
-        ensure!(received_id == id, "client response correlation mismatch");
-        let metadata = receive(&mut stream, meta_len).await?;
-        let (observed, reply): (Scope, Reply) = codec().deserialize(&metadata)?;
-        ensure!(observed == expected, "foreign client response scope");
-        ensure!(
-            matches!(reply, Reply::Unknown | Reply::Redirect { .. })
-                || matches!(
-                    (&reply, reply_kind),
-                    (Reply::Commit(_), 0)
-                        | (Reply::Query(_), 1)
-                        | (Reply::Record(_), 2)
-                        | (Reply::Status(_), 3)
-                ),
-            "unexpected response type"
-        );
-        match &reply {
-            Reply::Record(Some(meta)) if fetch => {
-                meta.check_body_length(body_len, self.max_record)?
-            }
-            Reply::Record(None) | Reply::Unknown if fetch => {
-                ensure!(body_len == 0, "unexpected record payload")
-            }
-            Reply::Record(_) => anyhow::bail!("record reply for non-fetch request"),
-            _ => ensure!(body_len == 0 && !fetch, "unexpected response payload/type"),
+            .await;
+            let (reply, body) = match response {
+                Ok(response) => response,
+                Err(error) if reconnect_read && disconnected(&error) => {
+                    // Only a reused connection gets this one read-only recovery.
+                    // Keep the same byte/connection credits; reconnect authenticates
+                    // normally, and fresh-stream failures and invalid replies escape.
+                    reconnect_read = false;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            // The durable owner already validated fetched bytes; checking corruption
+            // here belongs off the async executor for large records. TLS authenticates
+            // this transmission; consumers still match metadata against their pin.
+            pool.idle.lock().unwrap().push(stream);
+            return Ok(Response {
+                reply,
+                body,
+                _credit: credit,
+            });
         }
-        let body = receive(&mut stream, body_len).await?;
-        // The durable owner already validated fetched bytes; checking corruption
-        // here belongs off the async executor for large records. TLS authenticates
-        // this transmission; consumers still match metadata against their pin.
-        pool.idle.lock().unwrap().push(stream);
-        Ok(Response {
-            reply,
-            body,
-            _credit: credit,
-        })
     }
 }
 

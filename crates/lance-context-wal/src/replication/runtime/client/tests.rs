@@ -6,6 +6,8 @@ use crate::replication::{
 };
 use tokio::time::sleep;
 
+mod reconnect;
+
 struct RpcCluster {
     net: Cluster,
     servers: Vec<Server>,
@@ -14,6 +16,13 @@ struct RpcCluster {
 }
 impl RpcCluster {
     async fn open(root: &std::path::Path, options: Options) -> Result<Self> {
+        Self::open_with_options(root, options.clone(), options).await
+    }
+    async fn open_with_options(
+        root: &std::path::Path,
+        server_options: Options,
+        client_options: Options,
+    ) -> Result<Self> {
         let net = Cluster::open(root).await?;
         let mut endpoints = BTreeMap::new();
         let mut servers = Vec::new();
@@ -37,7 +46,7 @@ impl RpcCluster {
                 control,
                 BTreeSet::from([net.tls[&4].certificate]),
                 Arc::new(config),
-                options.clone(),
+                server_options.clone(),
             )?);
         }
         let mut config = (*net.tls[&4].client).clone();
@@ -47,7 +56,7 @@ impl RpcCluster {
             &Limits::default(),
             endpoints.clone(),
             Arc::new(config),
-            options,
+            client_options,
         )?;
         net.nodes[&1].handle.campaign(10)?.await?;
         net.leader(10).await?;
@@ -110,6 +119,167 @@ async fn producer(client: &Client, leader: u64, batch: &Batch) -> Result<Option<
         }) => Ok(value.as_ref().map(|(_, index)| *index)),
         other => anyhow::bail!("expected producer quorum query, got {other:?}"),
     }
+}
+
+// Wait for the real TLS listener to close its idle connection. Readiness does
+// not consume the EOF: the next request must encounter and handle it itself.
+async fn wait_for_idle_close(pool: &Pool) -> Result<()> {
+    let stream = pool.idle.lock().unwrap().pop().context("no idle stream")?;
+    timeout(Duration::from_secs(5), stream.get_ref().0.readable()).await??;
+    pool.idle.lock().unwrap().push(stream);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quorum_read_recovers_after_server_closes_idle_tls_connection() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let c = RpcCluster::open_with_options(
+        dir.path(),
+        Options {
+            timeout: Duration::from_millis(500),
+            ..Options::default()
+        },
+        Options::default(),
+    )
+    .await?;
+    let leader = c.leader().await?;
+    assert_eq!(producer(&c.client, leader, &batch(1)).await?, None);
+    wait_for_idle_close(&c.client.nodes[&leader].control).await?;
+    let observed = producer(&c.client, leader, &batch(1)).await;
+    assert_eq!(observed?, None);
+    wait_for_idle_close(&c.client.nodes[&leader].control).await?;
+    let response = c
+        .client
+        .request_routed(Request::Query {
+            group: 10,
+            query: query::Query::Producer {
+                table: batch(1).meta.stream,
+                bucket: batch(1).meta.bucket,
+                producer: batch(1).meta.producer,
+            },
+        })
+        .await?;
+    assert!(matches!(
+        response.reply,
+        Reply::Query(query::Outcome::Observed { .. })
+    ));
+    drop(response);
+    wait_for_idle_close(&c.client.nodes[&leader].control).await?;
+    let response = c
+        .client
+        .request(leader, Request::Status { group: 10 })
+        .await?;
+    assert!(matches!(response.reply, Reply::Status(_)));
+    drop(response);
+    assert_eq!(
+        c.client.budgets.control.available_permits(),
+        c.client.options.control_bytes
+    );
+    wait_for_idle_close(&c.client.nodes[&leader].control).await?;
+    let command = Command::Acquire(crate::replication::publication::Acquire {
+        table: batch(1).meta.stream,
+        destination: crate::replication::publication::Destination {
+            namespace: uuid::Uuid::from_u128(101),
+            dataset: "canonical/table".into(),
+        },
+        ingest: crate::ingest_contract::IngestContract {
+            tenant: "tenant".into(),
+            qualified_table: "table".into(),
+            schema: [3; 32],
+            policy: crate::ingest_contract::WritePolicy::ImmutableUniqueIds,
+            max_record_bytes: 1024 * 1024,
+            max_rows: 1024,
+        },
+        owner: uuid::Uuid::from_u128(100),
+        request: uuid::Uuid::from_u128(102),
+        expected_epoch: 0,
+    });
+    assert!(c
+        .client
+        .request(leader, Request::Commit(Box::new(command)))
+        .await
+        .is_err());
+    assert!(c.client.nodes[&leader]
+        .control
+        .idle
+        .lock()
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        c.client.budgets.control.available_permits(),
+        c.client.options.control_bytes
+    );
+    c.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closed_data_connection_recovers_fetch_but_does_not_replay_append() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let c = RpcCluster::open_with_options(
+        dir.path(),
+        Options {
+            timeout: Duration::from_millis(500),
+            ..Options::default()
+        },
+        Options::default(),
+    )
+    .await?;
+    let leader = c.leader().await?;
+    let first = batch(1);
+    let response = c
+        .client
+        .request(
+            leader,
+            Request::Append {
+                group: 10,
+                batch: first.clone(),
+            },
+        )
+        .await?;
+    let index = accepted(&response);
+    drop(response);
+    wait_for_idle_close(&c.client.nodes[&leader].data).await?;
+    let response = c
+        .client
+        .request(leader, Request::Fetch { group: 10, index })
+        .await?;
+    assert_eq!(response.body, first.body);
+    assert!(matches!(&response.reply, Reply::Record(Some(meta)) if meta == &first.meta));
+    assert!(c.client.budgets.data.available_permits() < c.client.options.data_bytes);
+    drop(response);
+    wait_for_idle_close(&c.client.nodes[&leader].data).await?;
+    let second = batch(2);
+    assert!(c
+        .client
+        .request(
+            leader,
+            Request::Append {
+                group: 10,
+                batch: second.clone()
+            }
+        )
+        .await
+        .is_err());
+    assert_eq!(producer(&c.client, leader, &first).await?, Some(index));
+    assert!(c.client.nodes[&leader].data.idle.lock().unwrap().is_empty());
+    assert_eq!(
+        c.client.budgets.data.available_permits(),
+        c.client.options.data_bytes
+    );
+    // The caller explicitly retries the exact original identity after reconciling.
+    let response = c
+        .client
+        .request(
+            leader,
+            Request::Append {
+                group: 10,
+                batch: second,
+            },
+        )
+        .await?;
+    assert!(accepted(&response) > index);
+    drop(response);
+    c.shutdown().await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
