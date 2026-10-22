@@ -9,6 +9,7 @@ use object_store::path::Path as ObjectPath;
 use std::collections::{BTreeMap, HashMap};
 
 pub mod observation;
+mod pipeline;
 mod stage;
 use observation::{Counters as PhaseCounters, Phase};
 
@@ -28,6 +29,9 @@ pub struct Options {
     pub max_records: usize,
     pub fetch_parallelism: usize,
     pub write_parallelism: usize,
+    /// Feed bounded decoded streams to file writers before all sources arrive.
+    /// Experimental; disabled until a same-workload comparison supports it.
+    pub pipeline_preparation: bool,
     /// Each poll bounds scanning of other tables sharing the same source group.
     pub scan_pages_per_group: usize,
     /// Catalog metadata only; retiring it never deletes immutable blob objects.
@@ -40,6 +44,7 @@ impl Default for Options {
             max_records: 128,
             fetch_parallelism: 4,
             write_parallelism: 2,
+            pipeline_preparation: false,
             scan_pages_per_group: 4,
             retained_manifest_versions: 64,
         }

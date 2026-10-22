@@ -4,11 +4,21 @@ use futures::TryStreamExt;
 use object_store::path::Path as ObjectPath;
 use std::collections::HashMap;
 
+#[cfg(any(feature = "worker", feature = "http-client"))]
 pub(super) async fn publisher(
     ingress: &Ingress,
     storage: &Storage,
     budget: &Arc<MergeMemoryBudget>,
     epoch: u64,
+) -> Result<Publisher> {
+    publisher_with_pipeline(ingress, storage, budget, epoch, false).await
+}
+async fn publisher_with_pipeline(
+    ingress: &Ingress,
+    storage: &Storage,
+    budget: &Arc<MergeMemoryBudget>,
+    epoch: u64,
+    pipeline_preparation: bool,
 ) -> Result<Publisher> {
     Publisher::acquire(
         ingress.clone(),
@@ -17,6 +27,7 @@ pub(super) async fn publisher(
             max_source_bytes: 1 << 20,
             max_records: 8,
             write_parallelism: 2,
+            pipeline_preparation,
             retained_manifest_versions: 2,
             ..Options::default()
         },
@@ -109,6 +120,14 @@ pub(super) fn remember(expected: &mut BTreeMap<String, RecordBatch>, body: Bytes
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_rollout_files_resume_after_preparation_and_publication_restart_then_retire(
 ) -> Result<()> {
+    real_rollout_recovery(false).await
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn streamed_rollout_files_resume_after_preparation_and_publication_restart_then_retire(
+) -> Result<()> {
+    real_rollout_recovery(true).await
+}
+async fn real_rollout_recovery(pipeline: bool) -> Result<()> {
     let root = tempfile::tempdir()?;
     let path = root.path().join("rollouts.lance");
     let c = network::Cluster::open_signed(root.path(), layout()).await?;
@@ -145,7 +164,7 @@ async fn real_rollout_files_resume_after_preparation_and_publication_restart_the
         remember(&mut expected, body.clone())?;
         originals.push((open, body, receipt));
     }
-    let mut first = publisher(&ingress, &storage, &budget, 1).await?;
+    let mut first = publisher_with_pipeline(&ingress, &storage, &budget, 1, pipeline).await?;
     let saved = first
         .prepare_next()
         .await?
@@ -185,7 +204,7 @@ async fn real_rollout_files_resume_after_preparation_and_publication_restart_the
 
     let c = network::Cluster::open_signed(root.path(), layout()).await?;
     let ingress = connect(&c, binding()).await?;
-    let mut second = publisher(&ingress, &storage, &budget, 2).await?;
+    let mut second = publisher_with_pipeline(&ingress, &storage, &budget, 2, pipeline).await?;
     assert_eq!(
         second.prepare_next().await?.unwrap(),
         saved,
@@ -226,7 +245,7 @@ async fn real_rollout_files_resume_after_preparation_and_publication_restart_the
 
     let c = network::Cluster::open_signed(root.path(), layout()).await?;
     let ingress = connect(&c, binding()).await?;
-    let mut third = publisher(&ingress, &storage, &budget, 3).await?;
+    let mut third = publisher_with_pipeline(&ingress, &storage, &budget, 3, pipeline).await?;
     assert_eq!(third.commit_pending().await?.unwrap(), published);
     let advanced = third
         .finish_pending()
@@ -294,7 +313,7 @@ async fn real_rollout_files_resume_after_preparation_and_publication_restart_the
 
     let c = network::Cluster::open_signed(root.path(), layout()).await?;
     let ingress = connect(&c, binding()).await?;
-    let mut final_owner = publisher(&ingress, &storage, &budget, 4).await?;
+    let mut final_owner = publisher_with_pipeline(&ingress, &storage, &budget, 4, pipeline).await?;
     assert!(final_owner.run_once().await?.is_none());
     verify(&final_owner, &expected, 6).await?;
     assert!(

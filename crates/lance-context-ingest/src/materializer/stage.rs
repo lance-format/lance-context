@@ -28,54 +28,27 @@ pub(super) async fn materialize(
                     .map(move |(index, meta)| (group, *index, meta.clone()))
             })
             .collect::<Vec<_>>();
+        if options.pipeline_preparation {
+            return super::pipeline::materialize(
+                ingress,
+                options,
+                inputs,
+                dataset,
+                reservation,
+                phases,
+            )
+            .await;
+        }
         let decoded = stream::iter(inputs.into_iter().map(|(group, index, meta)| {
-            let ingress = ingress.clone();
-            let phases = phases.clone();
-            let reservation = reservation.clone();
-            async move {
-                // Fetch is a local committed read. Retry other configured voters
-                // only for this same pinned record; none can change its identity.
-                let response = phases
-                    .measure(Phase::Fetch, async {
-                        let mut fetched = None;
-                        for &node in &ingress.layout.groups[&group] {
-                            if let Ok(response) = ingress
-                                .client
-                                .request(node, Request::Fetch { group, index })
-                                .await
-                            {
-                                if let Reply::Record(Some(observed)) = &response.reply {
-                                    ensure!(
-                                        observed == &meta,
-                                        "fetched record differs from durable source pin"
-                                    );
-                                    fetched = Some(response);
-                                    break;
-                                }
-                            }
-                        }
-                        fetched.context("pinned source unavailable on every voter")
-                    })
-                    .await?;
-                tokio::task::spawn_blocking(move || {
-                    let _reservation = reservation;
-                    phases.blocking(Phase::DecodeValidate, || {
-                        meta.validate_payload(
-                            &response.body,
-                            ingress.scope.contract.max_record_bytes as usize,
-                        )?;
-                        let batches = ipc::decode(response.body.clone(), ingress.schema.clone())?;
-                        validate_rows(
-                            &batches,
-                            &ingress.scope.contract,
-                            &ingress.layout,
-                            meta.bucket,
-                        )?;
-                        Ok::<_, anyhow::Error>(batches)
-                    })
-                })
-                .await?
-            }
+            fetch(
+                ingress.clone(),
+                group,
+                index,
+                meta,
+                reservation.clone(),
+                phases.clone(),
+                None,
+            )
         }))
         .buffered(options.fetch_parallelism)
         .try_collect::<Vec<_>>()
@@ -122,6 +95,61 @@ pub(super) async fn materialize(
             .flatten()
             .collect::<Vec<_>>();
         p::Descriptors::lance_fragments(Bytes::from(serde_json::to_vec(&fragments)?))
+    })
+    .await?
+}
+
+/// The optional shared permit covers both the RPC and blocking decode. Moving
+/// it into the blocking job prevents cancelled streams from releasing capacity
+/// while that job still uses the admitted workspace.
+pub(super) async fn fetch(
+    ingress: Ingress,
+    group: u64,
+    index: u64,
+    meta: BatchMeta,
+    reservation: Arc<MergeReservation>,
+    phases: Arc<PhaseCounters>,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+) -> Result<Vec<RecordBatch>> {
+    let response = phases
+        .measure(Phase::Fetch, async {
+            let mut fetched = None;
+            for &node in &ingress.layout.groups[&group] {
+                if let Ok(response) = ingress
+                    .client
+                    .request(node, Request::Fetch { group, index })
+                    .await
+                {
+                    if let Reply::Record(Some(observed)) = &response.reply {
+                        ensure!(
+                            observed == &meta,
+                            "fetched record differs from durable source pin"
+                        );
+                        fetched = Some(response);
+                        break;
+                    }
+                }
+            }
+            fetched.context("pinned source unavailable on every voter")
+        })
+        .await?;
+    tokio::task::spawn_blocking(move || {
+        let _reservation = reservation;
+        let _permit = permit;
+        phases.blocking(Phase::DecodeValidate, || {
+            meta.validate_payload(
+                &response.body,
+                ingress.scope.contract.max_record_bytes as usize,
+            )?;
+            let batches = ipc::decode(response.body, ingress.schema.clone())?;
+            validate_rows(
+                &batches,
+                &ingress.scope.contract,
+                &ingress.layout,
+                meta.bucket,
+            )?;
+            Ok(batches)
+        })
     })
     .await?
 }
