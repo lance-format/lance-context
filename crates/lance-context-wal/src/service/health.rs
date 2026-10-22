@@ -25,6 +25,7 @@ struct Group {
     observed_age_ms: u64,
     polling: bool,
     stopped: bool,
+    fetch: runtime::FetchObservation,
 }
 #[derive(Serialize)]
 struct View {
@@ -57,6 +58,7 @@ impl State {
                     observed_age_ms: age.as_millis().min(u64::MAX as u128) as u64,
                     polling: o.polling,
                     stopped: o.stopped,
+                    fetch: o.fetch,
                 },
             );
         }

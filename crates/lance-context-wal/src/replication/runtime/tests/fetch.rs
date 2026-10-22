@@ -66,6 +66,10 @@ fn committed_fetch_finishes_before_a_later_failed_sync_without_acknowledging_new
         })?;
         let existing = handle.read_accepted(10, original_index)?;
         let uncommitted = handle.read_accepted(10, proposed_index)?;
+        let held_since = Instant::now();
+        thread::sleep(Duration::from_millis(20));
+        let held_micros = held_since.elapsed().as_micros() as u64;
+        assert_eq!(handle.observation(10)?.fetch.completed, 0);
         drop(resume);
         executor.block_on(wait_for(|| {
             store.appended_index_for_test() == Some(proposed_index)
@@ -74,6 +78,15 @@ fn committed_fetch_finishes_before_a_later_failed_sync_without_acknowledging_new
         let existing_ready = !existing.0.is_empty();
         let uncommitted_ready = !uncommitted.0.is_empty();
         let new_append_unacknowledged = pending.0.is_empty();
+        let fetch = handle.observation(10)?.fetch;
+        assert_eq!(fetch.completed, 2);
+        assert_eq!(fetch.found, 1);
+        assert_eq!(fetch.missing, 1);
+        assert_eq!(fetch.failed, 0);
+        assert_eq!(fetch.body_bytes, original.body.len() as u64);
+        assert!(fetch.queue_max_micros >= held_micros);
+        assert!(fetch.queue_micros >= fetch.queue_max_micros);
+        assert!(fetch.service_micros >= fetch.service_max_micros);
         drop(blocked);
         let existing_result = executor.block_on(existing);
         let uncommitted_result = executor.block_on(uncommitted);

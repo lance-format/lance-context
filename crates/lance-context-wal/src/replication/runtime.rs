@@ -266,7 +266,7 @@ enum Work {
     Query(u64, query::Query, Completion<query::Outcome>),
     Campaign(Completion<()>),
     #[cfg(feature = "peer-transport")]
-    Fetch(u64, Completion<Option<Batch>>),
+    Fetch(u64, Instant, Completion<Option<Batch>>),
     Local(LocalWork),
 }
 type AfterPoll = Box<dyn FnOnce() + Send>;
@@ -303,6 +303,46 @@ pub struct Observation {
     pub polling: bool,
     pub stopped: bool,
     pub failure: Option<String>,
+    /// Completed local fetch work. Excludes RPC admission and reply transport.
+    pub fetch: FetchObservation,
+}
+
+/// Bounded cumulative timings for serviced local fetch requests, including
+/// missing records and failures. These are wall times, not CPU or quorum data.
+/// Queued requests dropped on shutdown are not completed work and are excluded.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct FetchObservation {
+    pub completed: u64,
+    pub found: u64,
+    pub missing: u64,
+    pub failed: u64,
+    pub body_bytes: u64,
+    pub queue_micros: u64,
+    pub queue_max_micros: u64,
+    pub service_micros: u64,
+    pub service_max_micros: u64,
+}
+
+#[cfg(feature = "peer-transport")]
+impl FetchObservation {
+    fn record(&mut self, queued: Duration, service: Duration, result: &Result<Option<Batch>>) {
+        let micros = |duration: Duration| duration.as_micros().min(u64::MAX as u128) as u64;
+        let queued = micros(queued);
+        let service = micros(service);
+        self.completed = self.completed.saturating_add(1);
+        self.queue_micros = self.queue_micros.saturating_add(queued);
+        self.queue_max_micros = self.queue_max_micros.max(queued);
+        self.service_micros = self.service_micros.saturating_add(service);
+        self.service_max_micros = self.service_max_micros.max(service);
+        match result {
+            Ok(Some(batch)) => {
+                self.found = self.found.saturating_add(1);
+                self.body_bytes = self.body_bytes.saturating_add(batch.body.len() as u64);
+            }
+            Ok(None) => self.missing = self.missing.saturating_add(1),
+            Err(_) => self.failed = self.failed.saturating_add(1),
+        }
+    }
 }
 
 /// Keep this owner alive while encoding/transmitting its packet. A full outbox
@@ -567,6 +607,7 @@ impl Runtime {
         let mut workers: Vec<JoinHandle<Result<()>>> = Vec::new();
         for (node, group, status, checkpoint_index) in nodes {
             let observation = Arc::new(Mutex::new(Observation {
+                fetch: FetchObservation::default(),
                 status,
                 checkpoint_index,
                 observed_at: Instant::now(),
@@ -714,11 +755,19 @@ impl Worker {
                 }
             },
             #[cfg(feature = "peer-transport")]
-            Work::Fetch(index, reply) => {
+            Work::Fetch(index, queued_at, reply) => {
                 // Only previously durable applied state is readable here. The
                 // owned, validated payload needs no subsequent poll; this does
                 // not release commits, quorum reads, or image mutations early.
-                reply.finish(self.node.read_accepted(self.group, index));
+                let started = Instant::now();
+                let result = self.node.read_accepted(self.group, index);
+                let service = started.elapsed();
+                self.observation.lock().unwrap().fetch.record(
+                    started.duration_since(queued_at),
+                    service,
+                    &result,
+                );
+                reply.finish(result);
             }
             Work::Local(work) => after_poll.push(work(&mut self.node)),
         }

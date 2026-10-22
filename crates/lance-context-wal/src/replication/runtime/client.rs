@@ -21,7 +21,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -253,7 +253,7 @@ impl Handle {
             reply,
             _credit: credit,
         };
-        self.enqueue(route, Work::Fetch(index, completion), true)?;
+        self.enqueue(route, Work::Fetch(index, Instant::now(), completion), true)?;
         Ok(Pending(receive))
     }
 }
