@@ -59,7 +59,14 @@ any RBAC or ConfigMaps.
    bounds. After actual process death, old application code cannot select new
    versions or retry conflicts; delayed immutable storage writes are therefore
    covered. The barrier preserves current WAL entries and writer epoch. A
-   missing shard remains unresolved rather than being treated as quiescence.
+   missing shard records an initial-publication bound of version 1. Completion
+   conditionally creates the empty initial manifest (epoch 0, without opening
+   a writer), then crosses that bound. Context writers must publish their
+   initial manifest before appending WAL, so an absent initial manifest cannot
+   hide acknowledged WAL from that writer. A late initial PUT conflicts; if
+   another publication won first, its WAL entries and epoch are preserved.
+   This applies only to a persisted plan that originally observed absence. A
+   previously published shard that disappears remains unresolved.
 5. Only after both barriers succeed does an etcd compare-and-swap mark the
    exact old execution terminal. The API never deletes or replaces the target
    lock or task claim. Normal scheduler reconciliation releases it using a

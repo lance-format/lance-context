@@ -263,9 +263,10 @@ async fn execute_inner(
                     .plan_legacy_retirement(&record, versions)
                     .await?;
             }
-            lance_context_core::merge_write_scope::fence_manifest_versions(
+            lance_context_core::legacy_retirement::fence_retired_writer(
                 &uri,
                 None,
+                &record.process.writer_id,
                 record.versions.as_ref().unwrap(),
                 &execution.id,
             )
