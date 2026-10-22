@@ -84,6 +84,11 @@ must eventually stop; checkpoints cannot discard that data to improve a score.
 ## Observation and qualification
 
 The diagnostic HTTP listener serves `/health/live`, `/health/ready` and `/status`.
+The status and readiness responses include `admission` observations for data,
+control, incoming peers and outgoing peers. Each lane reports request and byte
+capacity, current usage, and separate rejection counters. These independently
+sampled local values distinguish request pressure from response-byte pressure;
+they exclude the transport's separate budgets and do not change readiness.
 It allows at most 16 connections, bounds header buffers, disables keepalive and
 uses a two-second connection deadline, independently of WAL RPC capacity.
 Readiness reports active local workers and fresh local observations; it is not
