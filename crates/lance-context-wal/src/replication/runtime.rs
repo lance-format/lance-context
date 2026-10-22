@@ -265,6 +265,8 @@ enum Work {
     Commit(u64, Box<Command>, Completion<Outcome>),
     Query(u64, query::Query, Completion<query::Outcome>),
     Campaign(Completion<()>),
+    #[cfg(feature = "peer-transport")]
+    Fetch(u64, Completion<Option<Batch>>),
     Local(LocalWork),
 }
 type AfterPoll = Box<dyn FnOnce() + Send>;
@@ -711,6 +713,13 @@ impl Worker {
                     reply.finish(Err(e));
                 }
             },
+            #[cfg(feature = "peer-transport")]
+            Work::Fetch(index, reply) => {
+                // Only previously durable applied state is readable here. The
+                // owned, validated payload needs no subsequent poll; this does
+                // not release commits, quorum reads, or image mutations early.
+                reply.finish(self.node.read_accepted(self.group, index));
+            }
             Work::Local(work) => after_poll.push(work(&mut self.node)),
         }
     }

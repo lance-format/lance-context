@@ -236,6 +236,8 @@ async fn send<W: AsyncWrite + Unpin>(
 impl Handle {
     /// Read on the owner thread with data-lane credit, separate from small
     /// control replies. Returned bytes describe local committed state only.
+    /// Complete after validating that already durable payload, without waiting
+    /// for the next poll to persist unrelated proposals or peer updates.
     pub fn read_accepted(&self, group: u64, index: u64) -> Result<Pending<Option<Batch>>> {
         ensure!(index > 0 && index < u64::MAX, "invalid accepted index");
         let route = self.route(group)?;
@@ -245,14 +247,7 @@ impl Handle {
             reply,
             _credit: credit,
         };
-        self.enqueue(
-            route,
-            Work::Local(Box::new(move |node| {
-                let result = node.read_accepted(group, index);
-                Box::new(move || completion.finish(result))
-            })),
-            true,
-        )?;
+        self.enqueue(route, Work::Fetch(index, completion), true)?;
         Ok(Pending(receive))
     }
 }

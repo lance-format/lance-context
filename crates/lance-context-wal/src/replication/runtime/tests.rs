@@ -7,6 +7,8 @@ use std::path::Path;
 use tokio::time::{sleep, timeout};
 
 mod early;
+#[cfg(feature = "peer-transport")]
+mod fetch;
 mod images;
 
 // Actual dedicated workers and durable engines. This relay deliberately drops
