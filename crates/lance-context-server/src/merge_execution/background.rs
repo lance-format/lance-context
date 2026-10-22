@@ -411,6 +411,22 @@ mod tests {
         successor.merge_executions.endpoint = Some("http://127.0.0.1:1".into());
         let successor = Arc::new(successor);
         assert_ne!(successor.merge_executions.instance(), old.instance);
+        // Cancellation retains the ordinary retry budget. Wait for its exact
+        // first retry deadline rather than erasing failures during handoff.
+        let failure = coordinator
+            .failure("hot", &old.endpoint)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failure.consecutive_attempts, 1);
+        let wait_ms = failure
+            .next_retry_ms
+            .saturating_sub(lance_context_merge::failure::now_ms());
+        assert!(
+            wait_ms <= 2_000,
+            "unexpected cancellation retry policy: {failure:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(wait_ms + 10)).await;
         let Json(_) =
             rollouts::merge_wal(State(successor.clone()), axum::extract::Path("hot".into()))
                 .await
