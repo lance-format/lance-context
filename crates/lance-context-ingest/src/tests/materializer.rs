@@ -4,6 +4,149 @@ use futures::TryStreamExt;
 use object_store::path::Path as ObjectPath;
 use std::collections::HashMap;
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn byte_limited_selection_serves_skipped_groups_after_restart_and_wraparound() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let mut topology = (*layout()).clone();
+    topology.groups.insert(30, vec![1, 2, 3]);
+    topology.buckets = vec![10, 20, 30, 10];
+    let topology = Arc::new(topology);
+    let mut binding = binding();
+    let mut bodies = Vec::new();
+    for bucket in 0..3 {
+        let session = (0..1000)
+            .map(|i| format!("session-{i}"))
+            .find(|s| topology.session_bucket("tenant", "rollouts", s).unwrap() == bucket)
+            .unwrap();
+        for sequence in 1..=2 {
+            if bucket == 1 && sequence == 2 {
+                continue;
+            }
+            let id = format!("{bucket}-{sequence}");
+            let record = batch(&[&id], &[&session])?;
+            let mut columns = record.columns().to_vec();
+            let size = if bucket == 1 { 128 << 10 } else { 16 << 10 };
+            columns[record.schema().index_of("binary_payload")?] =
+                Arc::new(LargeBinaryArray::from_iter_values([vec![0x5a; size]]));
+            let body = ipc_file(&[RecordBatch::try_new(record.schema(), columns)?])?;
+            bodies.push((bucket, sequence, body));
+        }
+    }
+    // The large record fits an empty plan, but cannot fit after either small
+    // record. Continuing the scan can still select the other small group.
+    let cap = bodies.iter().map(|(_, _, b)| b.len()).max().unwrap();
+    binding.max_record_bytes = cap.try_into()?;
+    let storage = Storage::resolve(
+        root.path().join("fair.lance").to_str().unwrap().into(),
+        Default::default(),
+        Arc::default(),
+    )
+    .await?;
+    let mut cluster = network::Cluster::open_signed(root.path(), topology.clone()).await?;
+    crate::bootstrap::provision(
+        cluster.client.clone(),
+        topology.clone(),
+        binding.clone(),
+        storage.clone(),
+        bootstrap::identity(),
+    )
+    .await?;
+    let budget = MergeMemoryBudget::new(8 << 20);
+    let mut expected = BTreeMap::new();
+    let mut receipts = Vec::new();
+    let opens = (0..3)
+        .map(|bucket| ProducerOpen {
+            bucket,
+            slot: bucket,
+            expected_generation: 0,
+            operation: Uuid::new_v4(),
+        })
+        .collect::<Vec<_>>();
+    for round in 0..3 {
+        let ingress = Ingress::connect(
+            cluster.client.clone(),
+            topology.clone(),
+            binding.clone(),
+            MergeMemoryBudget::new(8 << 20),
+        )
+        .await?;
+        for (bucket, sequence, body) in &bodies {
+            if *sequence != round + 1 {
+                continue;
+            }
+            let producer = ingress
+                .open_producer(opens[*bucket as usize].clone())
+                .await?;
+            let prepared = ingress
+                .prepare(
+                    ingress.reserve_upload(body.len()).await?,
+                    body.clone(),
+                    &producer,
+                    *sequence,
+                )
+                .await?;
+            receipts.push((*bucket, ingress.append(&prepared).await?));
+        }
+        let mut publisher = Publisher::acquire(
+            ingress.clone(),
+            storage.clone(),
+            Options {
+                max_source_bytes: cap,
+                max_records: 8,
+                ..Options::default()
+            },
+            budget.clone(),
+            Acquisition {
+                owner: Uuid::new_v4(),
+                request: Uuid::new_v4(),
+                expected_epoch: round + 1,
+            },
+        )
+        .await?;
+        let advanced = publisher.run_once().await?.context("no publication")?;
+        let groups = advanced.sources.keys().copied().collect::<Vec<_>>();
+        assert_eq!(
+            groups,
+            if round == 1 { vec![20] } else { vec![10, 30] },
+            "a skipped group must receive an empty byte budget on its turn"
+        );
+        for (bucket, sequence, body) in &bodies {
+            if (*bucket == 1 && round == 1)
+                || (*bucket != 1 && *sequence == if round == 0 { 1 } else { 2 } && round != 1)
+            {
+                remember(&mut expected, body.clone())?;
+            }
+        }
+        verify(&publisher, &expected, round + 2).await?;
+        assert_eq!(budget.reserved(), 0);
+        if round == 1 {
+            let receipt = &receipts.iter().find(|(bucket, _)| *bucket == 1).unwrap().1;
+            assert!(matches!(
+                ingress.publication_status(receipt).await?,
+                PublicationStatus::Published { .. }
+            ));
+        }
+        if round == 2 {
+            for (_, receipt) in &receipts {
+                assert!(matches!(
+                    ingress.publication_status(receipt).await?,
+                    PublicationStatus::Published { .. }
+                ));
+            }
+        }
+        drop((publisher, ingress));
+        cluster.shutdown().await?;
+        if round < 2 {
+            // No process-local cursor survives: restore the same durable logs
+            // and acquire a new publisher epoch before the next selection.
+            cluster = network::Cluster::open_signed(root.path(), topology.clone()).await?;
+        } else {
+            break;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(any(feature = "http-client", feature = "service"))]
 pub(super) async fn publisher(
     ingress: &Ingress,
