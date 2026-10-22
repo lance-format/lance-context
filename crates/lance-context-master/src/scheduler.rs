@@ -41,7 +41,7 @@ use crate::task_store::{TaskClaim, TaskKinds};
 /// task per row over the threshold, so at tens of thousands of experiments a
 /// single tick could flood the queue. Capping keeps each tick's work bounded;
 /// anything still over the threshold is picked up by the next tick.
-const MAX_SWEEP_ENQUEUE: usize = 256;
+pub(crate) const MAX_SWEEP_ENQUEUE: usize = 256;
 
 /// How many candidate rows a merge sweep reads per new task it may enqueue.
 /// Candidates already in flight are deduped and do not count against the cap.
