@@ -51,6 +51,10 @@ pub struct Options {
     pub tick_interval: Duration,
     /// Maximum commands from each lane before polling durable Raft progress.
     pub batch_requests: usize,
+    /// Overlap ordinary peer messages with local persistence. Persistence-bound
+    /// replies, snapshots and client completions retain their existing barriers.
+    /// Experimental; disabled until a controlled comparison supports it.
+    pub pipeline_replication: bool,
 }
 impl Default for Options {
     fn default() -> Self {
@@ -63,6 +67,7 @@ impl Default for Options {
             peer_bytes: 64 << 20,
             tick_interval: Duration::from_millis(100),
             batch_requests: 32,
+            pipeline_replication: false,
         }
     }
 }
@@ -751,7 +756,32 @@ impl Worker {
             }
             if activity {
                 self.observation.lock().unwrap().polling = true;
-                let events = self.node.poll()?;
+                let events = if self.options.pipeline_replication {
+                    let shared = &self.shared;
+                    let outbox = &self.outbox;
+                    self.node.poll_with_early_messages(|packet| {
+                        // Move the packet, including shared payload buffers,
+                        // through the same node-wide outbound credits. A full
+                        // transport never blocks the durable owner thread.
+                        let bytes = packet.message.compute_size() as usize;
+                        if let Ok(credit) = shared.outgoing.reserve(bytes) {
+                            if outbox
+                                .try_send(Outbound {
+                                    packet,
+                                    _credit: Some(credit),
+                                    image: None,
+                                    snapshot_feedback: None,
+                                })
+                                .is_ok()
+                            {
+                                return;
+                            }
+                        }
+                        shared.dropped_outgoing.fetch_add(1, Ordering::Relaxed);
+                    })?
+                } else {
+                    self.node.poll()?
+                };
                 for done in events.completions {
                     let pending = self
                         .writes

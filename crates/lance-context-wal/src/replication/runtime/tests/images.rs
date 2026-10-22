@@ -72,8 +72,21 @@ async fn collect(handle: &Handle) -> Result<u64> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runtime_snapshot_catches_up_compacted_follower_and_preserves_restart_retries() -> Result<()>
 {
+    snapshot_restart_retries(false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pipelined_replication_keeps_snapshot_ownership_and_restart_retries() -> Result<()> {
+    snapshot_restart_retries(true).await
+}
+
+async fn snapshot_restart_retries(pipeline_replication: bool) -> Result<()> {
+    let options = Options {
+        pipeline_replication,
+        ..Options::default()
+    };
     let root = tempfile::tempdir()?;
-    let c = Cluster::open(root.path(), Options::default())?;
+    let c = Cluster::open(root.path(), options.clone())?;
     c.elect(1, 10).await?;
     c.elect(1, 20).await?;
     c.isolated.store(3, Ordering::Release);
@@ -129,7 +142,7 @@ async fn runtime_snapshot_catches_up_compacted_follower_and_preserves_restart_re
             assert_eq!(node.read_accepted(*group, *i)?, Some(b.clone()));
         }
     }
-    let c = Cluster::open(root.path(), Options::default())?;
+    let c = Cluster::open(root.path(), options)?;
     c.elect(3, 10).await?;
     c.elect(3, 20).await?;
     // Only the latest identity is exactly retryable; sequence5 must not have

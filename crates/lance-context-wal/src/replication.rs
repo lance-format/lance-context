@@ -825,20 +825,55 @@ impl Node {
     /// Performs blocking storage I/O. The transport may drop output messages;
     /// Raft will retransmit. On error NONE of this call's events are released.
     pub fn poll(&mut self) -> Result<Events> {
+        self.poll_inner(None)
+    }
+
+    /// Dispatch ordinary non-snapshot Ready messages before local persistence.
+    /// The callback must not block. Messages requiring persistence, snapshots,
+    /// completions and quorum reads retain the synchronous poll boundary.
+    /// An error may follow an early message; it never establishes a durable ACK.
+    #[cfg(feature = "runtime")]
+    pub(crate) fn poll_with_early_messages(
+        &mut self,
+        mut send: impl FnMut(Packet),
+    ) -> Result<Events> {
+        self.poll_inner(Some(&mut send))
+    }
+
+    fn poll_inner(&mut self, send: Option<&mut dyn FnMut(Packet)>) -> Result<Events> {
         self.healthy()?;
-        let result = self.drive();
+        let result = self.drive(send);
         if result.is_err() {
             self.failed = true;
         }
         result
     }
 
-    fn drive(&mut self) -> Result<Events> {
+    fn drive(&mut self, mut early: Option<&mut dyn FnMut(Packet)>) -> Result<Events> {
         let mut events = Events::default();
         for (id, group) in &mut self.groups {
             let mut outbound = Vec::new();
             while group.raw.has_ready() {
                 let mut ready = group.raw.ready();
+                if let Some(send) = early.as_deref_mut() {
+                    // raft-rs separates these from persisted_messages. Keep
+                    // snapshots on the existing captured-image/feedback path.
+                    for message in ready.take_messages() {
+                        if message.snapshot.is_some()
+                            || message.get_msg_type() == MessageType::MsgSnapshot
+                        {
+                            outbound.push(message);
+                        } else {
+                            send(Packet {
+                                cluster: self.layout.cluster,
+                                layout: self.layout_hash,
+                                policy: self.policy,
+                                group: *id,
+                                message,
+                            });
+                        }
+                    }
+                }
                 if ready.snapshot().is_empty() {
                     group.raw.store().persist(ready.entries(), ready.hs())?;
                 } else {

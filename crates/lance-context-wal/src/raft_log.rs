@@ -562,6 +562,17 @@ pub struct GroupLog {
 }
 
 impl GroupLog {
+    #[cfg(all(test, feature = "runtime"))]
+    pub(crate) fn block_sync_for_test(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.node.sync_gate.lock().unwrap()
+    }
+
+    /// Engine append visibility is deliberately not a sync/durability receipt.
+    #[cfg(all(test, feature = "runtime"))]
+    pub(crate) fn appended_index_for_test(&self) -> Option<u64> {
+        self.node.engine.last_index(self.group)
+    }
+
     #[cfg(all(test, feature = "replication"))]
     pub(crate) fn fail_next_sync_for_test(&self) {
         self.node.fault.fail_sync_for_test();
