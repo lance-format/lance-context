@@ -97,7 +97,12 @@ async fn main() {
     tracing::info!("Starting lance-context-server on {}", addr);
 
     let listener = TcpListener::bind(&addr).await.unwrap();
-    let result = drain::serve(listener, app, response_idle, wait_for_shutdown_signal()).await;
+    let shutdown_state = state.clone();
+    let result = drain::serve(listener, app, response_idle, async move {
+        wait_for_shutdown_signal().await;
+        shutdown_state.merge_executions.begin_shutdown().await;
+    })
+    .await;
 
     // Accepted HTTP handlers, including those whose clients disconnected, have
     // joined before we close resident writers.

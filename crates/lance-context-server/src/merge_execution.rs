@@ -70,6 +70,8 @@ pub struct Executions {
     instance: String,
     timeout_secs: u64,
     running: Mutex<HashMap<String, watch::Sender<bool>>>,
+    // Updated while holding `running`, so no executor can slip past shutdown.
+    closing: std::sync::atomic::AtomicBool,
 }
 
 impl Executions {
@@ -92,6 +94,7 @@ impl Executions {
             instance: uuid::Uuid::new_v4().to_string(),
             timeout_secs,
             running: Mutex::new(HashMap::new()),
+            closing: std::sync::atomic::AtomicBool::new(false),
         }
     }
     pub(crate) fn configured(
@@ -120,6 +123,7 @@ impl Executions {
             idle_timeout_secs,
             instance: uuid::Uuid::new_v4().to_string(),
             running: Mutex::new(HashMap::new()),
+            closing: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -221,12 +225,21 @@ impl Executions {
             .await
     }
 
-    /// Invoked after HTTP admission has stopped. Detached executors are not
-    /// drained by axum's connection shutdown.
-    pub(crate) async fn shutdown(&self) {
-        for cancel in self.running.lock().await.values() {
+    /// Close executor admission and request cancellation BEFORE joining HTTP
+    /// handlers: a direct merge handler can itself be waiting on an executor.
+    /// This does not acknowledge storage completion or discard its durable fence.
+    pub(crate) async fn begin_shutdown(&self) {
+        let running = self.running.lock().await;
+        self.closing
+            .store(true, std::sync::atomic::Ordering::Release);
+        for cancel in running.values() {
             let _ = cancel.send(true);
         }
+    }
+
+    /// Detached executors retain their storage barriers while shutting down.
+    pub(crate) async fn shutdown(&self) {
+        self.begin_shutdown().await;
         while !self.running.lock().await.is_empty() {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -332,6 +345,15 @@ pub async fn start(
         .unwrap_or(&execution.target);
     lance_context_core::validate_store_name(name).map_err(AppError::InvalidRequest)?;
     let mut running = state.merge_executions.running.lock().await;
+    if state
+        .merge_executions
+        .closing
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return Err(AppError::Overloaded(
+            "merge executor is shutting down".into(),
+        ));
+    }
     if running.contains_key(&execution.id) {
         return Ok(StatusCode::ACCEPTED);
     }

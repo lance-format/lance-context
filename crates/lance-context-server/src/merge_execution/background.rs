@@ -117,12 +117,19 @@ pub(crate) async fn spawn_background(
     execution.queue_timeout_secs = state.merge_executions.queue_timeout_secs;
     execution.idle_timeout_secs = state.merge_executions.idle_timeout_secs;
     let (cancel, cancelled) = watch::channel(false);
-    state
-        .merge_executions
-        .running
-        .lock()
-        .await
-        .insert(execution.id.clone(), cancel);
+    {
+        let mut running = state.merge_executions.running.lock().await;
+        if state
+            .merge_executions
+            .closing
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(AppError::Overloaded(
+                "merge executor is shutting down".into(),
+            ));
+        }
+        running.insert(execution.id.clone(), cancel);
+    }
     let (reply, result) = oneshot::channel();
     // Retain reconciliation BEFORE the first fallible coordinator operation.
     tokio::spawn(async move {
@@ -327,6 +334,100 @@ mod tests {
         );
         assert!(store.read().await.get_by_id("row").await.unwrap().is_some());
         assert_eq!(state.merge_slots.as_ref().unwrap().available_permits(), 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn shutdown_handoff_cancels_waiting_http_merge_and_successor_reclaims_wal() {
+        let (state, coordinator, dir) = fixture(2, 600).await;
+        let store = pending(&state, "hot").await;
+        let held = store.write().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = crate::routes::router().with_state(state.clone());
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let shutdown_state = state.clone();
+        let server = tokio::spawn(crate::drain::serve(
+            listener,
+            app,
+            Duration::from_millis(100),
+            async move {
+                stopped.await.unwrap();
+                shutdown_state.merge_executions.begin_shutdown().await;
+            },
+        ));
+        let request = tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(format!("http://{address}/api/v1/internal/merge-wal/hot"))
+                .send()
+                .await
+                .unwrap()
+        });
+        let old = running(&coordinator, "hot").await;
+        stop.send(()).unwrap();
+        // The locked store stays locked: shutdown must cancel this executor,
+        // not wait for its 600-second idle deadline or an unrelated unlock.
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(!request.await.unwrap().status().is_success());
+        tokio::time::timeout(Duration::from_secs(5), state.merge_executions.shutdown())
+            .await
+            .unwrap();
+        assert!(coordinator.get("hot").await.unwrap().is_none());
+        assert!(state.merge_executions.running.lock().await.is_empty());
+        // A racing timer or already-accepted HTTP handler cannot admit more
+        // detached work after the initial cancellation snapshot.
+        assert!(spawn_background(state.clone(), "late".into())
+            .await
+            .is_err());
+        let late = Execution::new(
+            "late",
+            "http://127.0.0.1:1",
+            state.merge_executions.instance(),
+            3600,
+        );
+        assert!(
+            matches!(super::super::start(State(state.clone()), Json(late)).await, Err(AppError::Overloaded(message)) if message == "merge executor is shutting down")
+        );
+        assert!(coordinator.get("late").await.unwrap().is_none());
+        drop(held);
+        assert_eq!(
+            store.read().await.pending_wal_generations().await.unwrap(),
+            1
+        );
+        state.shutdown().await;
+
+        let mut successor = AppState::new_for_test(dir.path().to_path_buf()).await;
+        successor.merge_slots = Some(Arc::new(tokio::sync::Semaphore::new(1)));
+        successor.merge_executions = Executions::new(Some(coordinator.clone()), 3600);
+        successor.merge_executions.rollout.fence_legacy = true;
+        successor.merge_executions.endpoint = Some("http://127.0.0.1:1".into());
+        let successor = Arc::new(successor);
+        assert_ne!(successor.merge_executions.instance(), old.instance);
+        rollouts::merge_wal(State(successor.clone()), axum::extract::Path("hot".into()))
+            .await
+            .unwrap();
+        let recovered = successor.get_or_open_rollout_store("hot").await.unwrap();
+        assert_eq!(
+            recovered
+                .read()
+                .await
+                .pending_wal_generations()
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(recovered
+            .read()
+            .await
+            .get_by_id("row")
+            .await
+            .unwrap()
+            .is_some());
+        successor.shutdown().await;
     }
 
     #[tokio::test]
