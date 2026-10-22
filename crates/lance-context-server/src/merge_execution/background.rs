@@ -357,11 +357,14 @@ mod tests {
             },
         ));
         let request = tokio::spawn(async move {
-            reqwest::Client::new()
-                .post(format!("http://{address}/api/v1/internal/merge-wal/hot"))
-                .send()
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            stream.write_all(b"POST /api/v1/internal/merge-wal/hot HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                 .await
-                .unwrap()
+                .unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.unwrap();
+            String::from_utf8(response).unwrap()
         });
         let old = running(&coordinator, "hot").await;
         stop.send(()).unwrap();
@@ -372,7 +375,8 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
-        assert!(!request.await.unwrap().status().is_success());
+        let response = request.await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 500"), "{response}");
         tokio::time::timeout(Duration::from_secs(5), state.merge_executions.shutdown())
             .await
             .unwrap();
@@ -407,9 +411,10 @@ mod tests {
         successor.merge_executions.endpoint = Some("http://127.0.0.1:1".into());
         let successor = Arc::new(successor);
         assert_ne!(successor.merge_executions.instance(), old.instance);
-        rollouts::merge_wal(State(successor.clone()), axum::extract::Path("hot".into()))
-            .await
-            .unwrap();
+        let Json(_) =
+            rollouts::merge_wal(State(successor.clone()), axum::extract::Path("hot".into()))
+                .await
+                .unwrap();
         let recovered = successor.get_or_open_rollout_store("hot").await.unwrap();
         assert_eq!(
             recovered
