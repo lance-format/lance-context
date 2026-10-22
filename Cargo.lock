@@ -4175,6 +4175,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "lance-context-ingest"
+version = "0.6.7"
+dependencies = [
+ "anyhow",
+ "arrow-array",
+ "arrow-ipc",
+ "arrow-schema",
+ "base64 0.22.1",
+ "bytes",
+ "lance",
+ "lance-context-core",
+ "lance-context-wal",
+ "lance-table",
+ "rcgen",
+ "ring",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "uuid",
+]
+
+[[package]]
 name = "lance-context-master"
 version = "0.6.3"
 dependencies = [

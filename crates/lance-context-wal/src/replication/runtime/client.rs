@@ -457,12 +457,25 @@ pub struct Client {
     layout: [u8; 32],
     policy: [u8; 32],
     max_record: usize,
+    producer_slots: u32,
     next: AtomicU64,
     voters: BTreeMap<u64, Vec<u64>>,
     catalog: u64,
     leaders: Mutex<BTreeMap<u64, u64>>,
 }
 impl Client {
+    pub fn identity(&self) -> (uuid::Uuid, [u8; 32]) {
+        (self.cluster, self.layout)
+    }
+    pub fn max_record_bytes(&self) -> usize {
+        self.max_record
+    }
+    pub fn producer_slots(&self) -> u32 {
+        self.producer_slots
+    }
+    pub fn catalog_group(&self) -> u64 {
+        self.catalog
+    }
     pub fn new(
         layout: &Layout,
         limits: &Limits,
@@ -498,6 +511,7 @@ impl Client {
             layout: layout.fingerprint()?,
             policy: Sha256::digest(limits.identity()?).into(),
             max_record: limits.max_record_bytes as usize,
+            producer_slots: limits.producer_slots,
             connector: TlsConnector::from(tls),
             budgets: Budgets::new(&options),
             nodes: endpoints

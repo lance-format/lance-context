@@ -48,6 +48,10 @@ pub enum Query {
     ProducerSlot {
         slot: u32,
     },
+    /// Compact table binding and publication cursors, without plans/descriptors.
+    Visibility {
+        table: Uuid,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +72,16 @@ pub enum Value {
     /// missing-object result nor proof that a supplied staging object lost.
     ManifestRetired(publication::HistoryBoundary),
     ProducerSlot(Option<producer::View>),
+    Visibility(Option<Box<Visibility>>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Visibility {
+    pub destination: publication::Destination,
+    pub ingest: crate::ingest_contract::IngestContract,
+    pub incarnation: Option<Uuid>,
+    pub checkpoint: BTreeMap<u64, u64>,
+    pub minimum_read_version: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,7 +150,7 @@ impl Query {
             | Self::ClosedProof { table } => {
                 ensure!(!table.is_nil(), "nil source table")
             }
-            Self::Publisher { table } => ensure!(
+            Self::Publisher { table } | Self::Visibility { table } => ensure!(
                 !table.is_nil() && group == publication::control_group(layout),
                 "invalid publisher query scope"
             ),
@@ -266,6 +280,17 @@ impl Query {
             Self::SourcePin { table } => Value::SourcePin(state.pins.get(table).cloned()),
             Self::Publisher { table } => {
                 Value::Publisher(state.catalog.tables.get(table).cloned().map(Box::new))
+            }
+            Self::Visibility { table } => {
+                Value::Visibility(state.catalog.tables.get(table).map(|table| {
+                    Box::new(Visibility {
+                        destination: table.destination.clone(),
+                        ingest: table.ingest.clone(),
+                        incarnation: table.manifests.as_ref().map(|m| m.incarnation),
+                        checkpoint: table.progress.checkpoint.clone(),
+                        minimum_read_version: table.progress.minimum_read_version,
+                    })
+                }))
             }
             Self::Accepted { after, .. } if *after > state.applied => Value::CursorAhead {
                 applied: state.applied,

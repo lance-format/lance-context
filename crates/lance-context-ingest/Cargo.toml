@@ -1,0 +1,30 @@
+[package]
+name = "lance-context-ingest"
+version = "0.6.7"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "Durable rollout ingress over the independent lance-context WAL"
+
+[dependencies]
+anyhow = "1"
+arrow-array = "58"
+arrow-schema = "58"
+base64 = "0.22"
+bytes = "1"
+lance-context-core = { version = "0.6.7", path = "../lance-context-core" }
+lance-context-wal = { version = "0.6.7", path = "../lance-context-wal", features = ["peer-transport", "ipc", "arrow-contract"] }
+ring = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "sync", "time"] }
+uuid = { version = "1.20.0", features = ["v4", "serde"] }
+
+[dev-dependencies]
+arrow-ipc = "58"
+lance = "13.0.0"
+lance-table = "13.0.0"
+rcgen = "0.14"
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }

@@ -75,7 +75,9 @@ jobs:
 
       - name: Validate Rust crate packages
         if: github.event_name == 'pull_request'
-        run: cargo package --workspace --exclude lance-context-python --allow-dirty --no-verify --all-features --locked
+        # The private ingress adapter depends on the unpublished WAL crate.
+        # Rust Tests checks this workspace-only integration with its features.
+        run: cargo package --workspace --exclude lance-context-python --exclude lance-context-ingest --allow-dirty --no-verify --all-features --locked
 
       - name: Publish Rust crates
         if: github.event_name != 'pull_request'

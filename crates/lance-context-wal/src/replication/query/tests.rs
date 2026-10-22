@@ -47,6 +47,67 @@ fn evaluate(query: &Query, cut: &Cut, state: &State) -> Result<Value> {
 }
 
 #[test]
+fn compact_visibility_uses_catalog_quorum_and_fits_control_reply_budget() -> Result<()> {
+    let (_root, mut nodes) = nodes(Limits::default())?;
+    nodes[0].campaign(10)?;
+    nodes[0].campaign(20)?;
+    pump(&mut nodes)?;
+    let acquire = publication::Acquire {
+        table: Uuid::from_u128(10),
+        destination: publication::Destination {
+            namespace: Uuid::from_u128(11),
+            dataset: "x".repeat(4096),
+        },
+        ingest: crate::ingest_contract::IngestContract {
+            tenant: "x".repeat(1024),
+            qualified_table: "x".repeat(1024),
+            schema: [3; 32],
+            policy: crate::ingest_contract::WritePolicy::ImmutableUniqueIds,
+            max_record_bytes: 1024 * 1024,
+            max_rows: 1024,
+        },
+        owner: Uuid::from_u128(12),
+        request: Uuid::from_u128(13),
+        expected_epoch: 0,
+    };
+    let query = Query::Visibility {
+        table: acquire.table,
+    };
+    assert!(nodes[0].query(20, 1, query.clone()).is_err());
+    nodes[0].query(10, 1, query.clone())?;
+    assert!(matches!(
+        &pump(&mut nodes)?.reads[0].outcome,
+        Outcome::Observed {
+            value: Value::Visibility(None),
+            ..
+        }
+    ));
+    nodes[0].acquire_publisher(2, acquire.clone())?;
+    pump(&mut nodes)?;
+    nodes[0].query(10, 3, query)?;
+    let observed = pump(&mut nodes)?;
+    let Outcome::Observed {
+        cut,
+        value: Value::Visibility(Some(view)),
+    } = &observed.reads[0].outcome
+    else {
+        anyhow::bail!("missing quorum visibility");
+    };
+    assert!(cut.quorum_index > 0 && cut.applied >= cut.quorum_index);
+    assert_eq!(view.destination, acquire.destination);
+    assert_eq!(view.ingest, acquire.ingest);
+    assert_eq!(view.incarnation, None);
+    assert!(view.checkpoint.is_empty());
+    // Maximum configured group count, even with maximal binding strings,
+    // remains below the runtime's generic control reply allowance.
+    let mut maximum = view.clone();
+    maximum.incarnation = Some(Uuid::from_u128(100));
+    maximum.checkpoint = (1..=64).map(|group| (group, u64::MAX - 1)).collect();
+    assert!(bincode::serialized_size(&maximum)? < 16 * 1024);
+    Ok(())
+}
+
+#[test]
 fn new_leader_rejects_reads_until_its_first_current_term_entry_commits() -> Result<()> {
     let (_root, mut nodes) = nodes(Limits {
         max_pending: 1,
