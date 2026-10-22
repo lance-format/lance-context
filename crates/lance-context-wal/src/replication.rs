@@ -92,7 +92,7 @@ impl Default for Limits {
     }
 }
 impl Limits {
-    fn identity(&self) -> Result<Vec<u8>> {
+    pub(crate) fn identity(&self) -> Result<Vec<u8>> {
         ensure!(
             (1..=16_384).contains(&self.max_tables)
                 && self.catalog_key.is_none_or(|key| key != [0; 32])
@@ -523,6 +523,18 @@ impl Node {
             pending: g.pending.len(),
             pending_reads: g.reads.len(),
         })
+    }
+
+    pub(crate) fn checkpoint_index(&self, group: u64) -> Result<u64> {
+        self.healthy()?;
+        Ok(self
+            .groups
+            .get(&group)
+            .context("unhosted group")?
+            .raw
+            .store()
+            .first_index()?
+            .saturating_sub(1))
     }
 
     fn request_pending(&self, request: u64) -> bool {

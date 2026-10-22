@@ -7,6 +7,7 @@ publish = false
 description = "Independent Rust WAL experiments owned by lance-context"
 
 [features]
+service = ["peer-transport", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:clap", "tokio/signal", "tokio/rt-multi-thread"]
 peer-transport = ["runtime", "vectored-io", "dep:tokio-rustls", "tokio/net", "tokio/time", "tokio/macros"]
 runtime = ["replication", "dep:tokio", "tokio/sync", "tokio/rt"]
 # Real Lance materialization/recovery qualification; normal WAL replicas do not link Lance.
@@ -25,6 +26,9 @@ ipc = ["dep:anyhow", "dep:arrow-array", "dep:arrow-buffer", "dep:arrow-ipc", "de
 lab = ["ipc", "dep:clap", "dep:hdrhistogram", "dep:raft-engine", "raft-engine/internals", "dep:raft-proto", "dep:serde_json"]
 
 [dependencies]
+hyper = { version = "1", features = ["server", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+http-body-util = { version = "0.1", optional = true }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"], optional = true }
 lance = { version = "13.0.0", optional = true }
 lance-table = { version = "13.0.0", optional = true }
@@ -65,6 +69,11 @@ arrow-ipc = { version = "58", features = ["zstd"] }
 tempfile = "3"
 
 [[bin]]
+name = "context-wal-node"
+path = "src/bin/node.rs"
+required-features = ["service"]
+
+[[bin]]
 name = "context-wal-runner"
 path = "src/bin/runner.rs"
 required-features = ["runner"]
@@ -78,3 +87,7 @@ required-features = ["runner"]
 name = "context-wal-lab"
 path = "src/bin/lab.rs"
 required-features = ["lab"]
+
+[[test]]
+name = "node_service"
+required-features = ["service"]

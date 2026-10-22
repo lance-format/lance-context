@@ -50,6 +50,8 @@ pub struct Peer {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "service", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "service", serde(default, deny_unknown_fields))]
 pub struct Options {
     pub receive_bytes: usize,
     pub connections: usize,
@@ -58,7 +60,9 @@ pub struct Options {
     /// follower cannot retain the entire runtime outbox's byte allowance.
     pub peer_bytes: usize,
     /// Deadline for a complete handshake or frame, including bounded admission.
+    #[cfg_attr(feature = "service", serde(with = "crate::service::duration_millis"))]
     pub io_timeout: Duration,
+    #[cfg_attr(feature = "service", serde(with = "crate::service::duration_millis"))]
     pub reconnect_delay: Duration,
 }
 impl Default for Options {
@@ -74,7 +78,7 @@ impl Default for Options {
     }
 }
 impl Options {
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         ensure!(
             (MAX_HEADER + MAX_BODY..=256 << 20).contains(&self.receive_bytes)
                 && (1..=128).contains(&self.connections)
@@ -222,6 +226,10 @@ impl Transport {
     }
     pub fn statistics(&self) -> &Arc<Statistics> {
         &self.statistics
+    }
+    /// A listener or peer supervisor ended; the embedding service must drain.
+    pub fn is_finished(&self) -> bool {
+        self.tasks.iter().any(|task| task.is_finished())
     }
     /// Close network tasks before shutting down/reopening the worker runtime.
     pub async fn shutdown(mut self) -> Result<()> {

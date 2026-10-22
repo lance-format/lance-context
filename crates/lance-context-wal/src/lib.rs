@@ -14,6 +14,9 @@ pub mod raft_log;
 #[cfg(feature = "replication")]
 pub mod replication;
 
+#[cfg(feature = "service")]
+pub mod service;
+
 #[cfg(feature = "admission")]
 pub mod admission;
 

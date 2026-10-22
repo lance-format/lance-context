@@ -38,6 +38,8 @@ pub mod peer;
 /// Counts do not include caller allocations or an oversized allocation pinned
 /// by a small Bytes slice. The transport must account for those owners too.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "service", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "service", serde(default, deny_unknown_fields))]
 pub struct Options {
     pub data_requests: usize,
     pub data_bytes: usize,
@@ -45,6 +47,7 @@ pub struct Options {
     pub control_bytes: usize,
     pub peer_requests: usize,
     pub peer_bytes: usize,
+    #[cfg_attr(feature = "service", serde(with = "crate::service::duration_millis"))]
     pub tick_interval: Duration,
     /// Maximum commands from each lane before polling durable Raft progress.
     pub batch_requests: usize,
@@ -64,7 +67,7 @@ impl Default for Options {
     }
 }
 impl Options {
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         for (count, bytes) in [
             (self.data_requests, self.data_bytes),
             (self.control_requests, self.control_bytes),
@@ -245,6 +248,8 @@ struct Shared {
 #[derive(Clone, Debug)]
 pub struct Observation {
     pub status: Status,
+    /// Persisted image boundary; local scheduling data, not a quorum result.
+    pub checkpoint_index: u64,
     pub observed_at: Instant,
     pub polling: bool,
     pub stopped: bool,
@@ -477,7 +482,14 @@ impl Runtime {
             layout: node.layout_hash,
             policy: node.policy,
             id: node.id,
-            voters: Arc::new(node.layout.groups.clone()),
+            voters: Arc::new(
+                node.layout
+                    .groups
+                    .iter()
+                    .filter(|(_, voters)| voters.contains(&node.id))
+                    .map(|(&group, voters)| (group, voters.clone()))
+                    .collect(),
+            ),
             max_record: node.limits.max_record_bytes as usize,
         };
         // Validate every initial view before starting any thread. A failure
@@ -488,14 +500,16 @@ impl Runtime {
             .map(|node| {
                 let group = *node.groups.keys().next().context("empty worker group")?;
                 let status = node.status(group)?;
-                Ok((node, group, status))
+                let checkpoint_index = node.checkpoint_index(group)?;
+                Ok((node, group, status, checkpoint_index))
             })
             .collect::<Result<Vec<_>>>()?;
         let mut routes = BTreeMap::new();
         let mut workers: Vec<JoinHandle<Result<()>>> = Vec::new();
-        for (node, group, status) in nodes {
+        for (node, group, status, checkpoint_index) in nodes {
             let observation = Arc::new(Mutex::new(Observation {
                 status,
+                checkpoint_index,
                 observed_at: Instant::now(),
                 polling: false,
                 stopped: false,
@@ -753,8 +767,10 @@ impl Worker {
                     completion();
                 }
                 let status = self.node.status(self.group)?;
+                let checkpoint_index = self.node.checkpoint_index(self.group)?;
                 let mut observation = self.observation.lock().unwrap();
                 observation.status = status;
+                observation.checkpoint_index = checkpoint_index;
                 observation.observed_at = Instant::now();
                 observation.polling = false;
             }

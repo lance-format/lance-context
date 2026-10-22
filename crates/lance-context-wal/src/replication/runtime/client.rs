@@ -49,6 +49,8 @@ pub struct Endpoint {
     pub certificate: [u8; 32],
 }
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "service", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "service", serde(default, deny_unknown_fields))]
 pub struct Options {
     /// Logical live request/response bytes, independent for the two lanes.
     /// Caller allocations and allocator/decoded metadata overhead are separate.
@@ -59,6 +61,7 @@ pub struct Options {
     /// Per server listener, shared across all independently running clients.
     pub server_connections: usize,
     /// Entire exchange, including pool/admission waits and durable completion.
+    #[cfg_attr(feature = "service", serde(with = "crate::service::duration_millis"))]
     pub timeout: Duration,
 }
 impl Default for Options {
@@ -73,7 +76,7 @@ impl Default for Options {
     }
 }
 impl Options {
-    fn validate(&self, max_record: usize) -> Result<()> {
+    pub(crate) fn validate(&self, max_record: usize) -> Result<()> {
         ensure!(
             (1..=32).contains(&self.connections)
                 && (1..=256).contains(&self.server_connections)
@@ -259,6 +262,9 @@ pub struct Server {
     tasks: Vec<JoinHandle<Result<()>>>,
 }
 impl Server {
+    pub fn is_finished(&self) -> bool {
+        self.tasks.iter().any(|task| task.is_finished())
+    }
     /// Trusted service certificates may access this node's configured groups.
     /// End-user authorization and table binding stay at the application ingress.
     pub fn spawn(

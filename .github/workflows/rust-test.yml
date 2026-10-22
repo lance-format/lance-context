@@ -101,6 +101,10 @@ jobs:
         run: |
           cargo clippy -p lance-context-wal --features peer-transport --all-targets -- -D warnings
           cargo test -p lance-context-wal --features peer-transport --lib --test replication_process
+      - name: Standalone WAL service and automatic maintenance
+        run: |
+          cargo clippy -p lance-context-wal --features service --all-targets -- -D warnings
+          cargo test -p lance-context-wal --features service --test node_service
       - name: WAL resource observation in a container cgroup namespace
         run: |
           cargo test -p lance-context-wal --features runner --test resource --no-run --message-format=json > "$RUNNER_TEMP/wal-resource-build.jsonl"

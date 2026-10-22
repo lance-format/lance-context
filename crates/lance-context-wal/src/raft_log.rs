@@ -348,6 +348,8 @@ pub struct PhysicalLog {
 /// Local physical-file tuning, independent of the replicated layout and policy.
 /// Thresholds trigger explicit maintenance; they are not disk-admission quotas.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "service", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "service", serde(default, deny_unknown_fields))]
 pub struct LogOptions {
     pub target_file_bytes: u64,
     /// Native file-count size estimate; oversized batches can exceed it.

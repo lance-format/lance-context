@@ -43,6 +43,8 @@ pub trait Admission: Send + Sync + 'static {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "service", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "service", serde(default, deny_unknown_fields))]
 pub struct Options {
     /// Total queued and active outgoing transfers across all destinations.
     pub outbound_transfers: usize,
@@ -51,8 +53,10 @@ pub struct Options {
     pub max_image_bytes: u64,
     /// Whole transfer deadline, not reset on every chunk. A filesystem call
     /// already in progress is still joined, not cancelled, at shutdown.
+    #[cfg_attr(feature = "service", serde(with = "crate::service::duration_millis"))]
     pub transfer_timeout: Duration,
     #[cfg(test)]
+    #[cfg_attr(feature = "service", serde(skip))]
     pub(super) pause_after_payload_chunk: Option<std::path::PathBuf>,
 }
 impl Default for Options {
@@ -148,6 +152,11 @@ pub struct Transport {
     statistics: Arc<Statistics>,
 }
 impl Transport {
+    pub fn is_finished(&self) -> bool {
+        self.supervisor
+            .as_ref()
+            .is_none_or(|task| task.is_finished())
+    }
     pub fn spawn(handle: Handle, listener: TcpListener, settings: Settings) -> Result<Self> {
         ensure!(
             handle.disk.is_some(),

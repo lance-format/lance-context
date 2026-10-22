@@ -9,6 +9,8 @@ use crate::admission::Snapshot;
 /// accepted Raft/control traffic and physical rewrites. Peer writes must still
 /// persist and can consume this window. This is not a hard filesystem quota.
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "service", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "service", serde(deny_unknown_fields))]
 pub struct DiskOptions {
     pub max_bytes: usize,
     pub data_bytes: usize,
