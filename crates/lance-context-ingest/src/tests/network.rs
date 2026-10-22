@@ -180,6 +180,13 @@ impl Cluster {
         }
         let mut nodes = Vec::new();
         for (id, listener, data, control) in listeners {
+            let extra_headroom = layout
+                .groups
+                .values()
+                .filter(|voters| voters.contains(&id))
+                .count()
+                .saturating_sub(2)
+                * usize::try_from(limits.max_uncommitted_bytes)?;
             let mut node = Node::open(
                 &root.join(id.to_string()),
                 layout.clone(),
@@ -187,9 +194,9 @@ impl Cluster {
                 limits.clone(),
             )?
             .with_disk_budget(DiskOptions {
-                max_bytes: 512 << 20,
+                max_bytes: (512 << 20) + extra_headroom,
                 data_bytes: 128 << 20,
-                headroom_bytes: 256 << 20,
+                headroom_bytes: (256 << 20) + extra_headroom,
             })?;
             if let Some((catalog, sources)) = &signers {
                 node.set_catalog_signer(catalog.clone())?;

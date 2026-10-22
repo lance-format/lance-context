@@ -586,20 +586,18 @@ impl Publisher {
             .keys()
             .copied()
             .collect::<Vec<_>>();
-        if let Some(last) = view
-            .progress
-            .advanced
-            .as_ref()
-            .and_then(|a| a.sources.keys().next_back())
-        {
-            let offset = groups.iter().position(|g| g > last).unwrap_or(0);
-            groups.rotate_left(offset);
-        }
+        // Each completed publication gives the next group an empty byte budget.
+        // Resuming after the largest selected key can repeatedly skip a group
+        // whose records do not fit after smaller records from earlier groups.
+        // The completed version survives takeover/restart and advances only
+        // after source closure, so no process-local or new WAL cursor is needed.
+        let offset = ((view.progress.minimum_read_version - 1) % groups.len() as u64) as usize;
+        groups.rotate_left(offset);
         let mut sources = BTreeMap::new();
         let mut bytes = 0usize;
         let mut count = 0usize;
-        let mut next_group = groups[0];
-        for (ordinal, &group) in groups.iter().enumerate() {
+        let next_group = groups[1 % groups.len()];
+        for &group in &groups {
             let after = view.progress.checkpoint.get(&group).copied().unwrap_or(0);
             let mut cursor = self
                 .empty_cursors
@@ -666,7 +664,6 @@ impl Publisher {
                         records,
                     },
                 );
-                next_group = groups[(ordinal + 1) % groups.len()];
             }
             if bytes == self.options.max_source_bytes || count == self.options.max_records {
                 break;
