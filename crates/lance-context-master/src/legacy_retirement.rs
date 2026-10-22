@@ -39,6 +39,58 @@ pub struct Response {
     pub target_lock_released: bool,
 }
 
+/// A prepared journal is an explicit migration intent, not a timeout heuristic.
+/// Canonical task retries finish that handoff themselves once the exact old
+/// process is terminated. Unknown legacy writers still require preparation.
+pub(crate) async fn reconcile_prepared(
+    config: &MasterConfig,
+    coordinator: &Coordinator,
+    execution: lance_context_merge::Execution,
+) -> Result<lance_context_merge::Execution> {
+    if execution.protocol != 0
+        || !matches!(
+            execution.phase,
+            lance_context_merge::Phase::Running | lance_context_merge::Phase::Uncertain
+        )
+    {
+        return Ok(execution);
+    }
+    let Some(record) = coordinator.legacy_retirement(&execution.id).await? else {
+        return Ok(execution);
+    };
+    let request = completion_request(&execution, &record)?;
+    let result = execute(config, coordinator, request).await;
+    metrics::counter!("master_legacy_retirement_attempts_total", "result" => if result.is_ok() { "completed" } else { "unresolved" }).increment(1);
+    result?;
+    let current = coordinator
+        .get(&execution.target)
+        .await?
+        .ok_or("retired execution disappeared before canonical reconciliation")?;
+    if current.id != execution.id || current.phase != lance_context_merge::Phase::Finished {
+        return Err("retired execution changed before canonical reconciliation".into());
+    }
+    tracing::info!(target = %execution.target, execution_id = %execution.id,
+        "verified legacy retirement completed by canonical merge task");
+    Ok(current)
+}
+
+fn completion_request(
+    execution: &lance_context_merge::Execution,
+    record: &Retirement,
+) -> Result<Request> {
+    if record.completed || record.execution != *execution {
+        return Err("prepared retirement does not match current execution".into());
+    }
+    Ok(Request {
+        action: Action::Complete,
+        target: execution.target.clone(),
+        execution_id: execution.id.clone(),
+        namespace: record.process.namespace.clone(),
+        pod: record.process.pod.clone(),
+        container: record.process.container.clone(),
+    })
+}
+
 pub async fn route(
     State(state): State<Arc<MasterState>>,
     Json(request): Json<Request>,
@@ -439,6 +491,36 @@ mod tests {
         let capability =
             json!({"instance":"new-instance","protocol":2,"fenced_legacy_merges":true});
         (request, pod, old, capability)
+    }
+
+    #[test]
+    fn legacy_retirement_automatic_completion_cannot_adopt_another_execution() {
+        let (_, _, process, _) = fixture();
+        let mut execution =
+            lance_context_merge::Execution::new("table", "worker", "legacy-http", 1);
+        execution.protocol = 0;
+        execution.phase = lance_context_merge::Phase::Running;
+        let record = Retirement {
+            execution: execution.clone(),
+            process,
+            versions: None,
+            completed: false,
+        };
+        let request = completion_request(&execution, &record).unwrap();
+        assert!(matches!(request.action, Action::Complete));
+        assert_eq!(request.execution_id, execution.id);
+        assert_eq!(request.pod, "worker-9");
+        let mut successor = execution.clone();
+        successor.id = lance_context_core::generate_id();
+        assert!(completion_request(&successor, &record).is_err());
+        let mut different_endpoint = execution.clone();
+        different_endpoint.endpoint = "other-worker".into();
+        assert!(completion_request(&different_endpoint, &record).is_err());
+        let completed = Retirement {
+            completed: true,
+            ..record
+        };
+        assert!(completion_request(&execution, &completed).is_err());
     }
 
     #[test]

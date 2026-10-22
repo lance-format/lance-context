@@ -39,7 +39,10 @@ any RBAC or ConfigMaps.
    have `MERGE_FENCE_LEGACY=true`, a stable `MERGE_EXECUTOR_ENDPOINT`, the same
    writer ID and the same data/coordinator configuration. Deploy the master's
    mixed-worker routing support before enabling fenced worker admission.
-3. **Complete with the same request and `"action":"complete"`.** The master
+3. **The next canonical merge task completes the prepared handoff.** Normal
+   task retries read the exact execution's journal and run completion without
+   another agent call. For immediate completion, the same request with
+   `"action":"complete"` is also supported. The master
    requires the same Pod UID, a different running container/instance, and a
    Kubernetes `lastState.terminated` receipt for the exact old container. A
    missing Pod, a changed Pod UID, Ready alone, or lease expiry does not qualify.
@@ -56,6 +59,12 @@ any RBAC or ConfigMaps.
    lock or task claim. Normal scheduler reconciliation releases it using a
    valid claim, then schedules the replacement. Persisted plans survive retries;
    an old recovery request cannot change a successor execution.
+
+`master_legacy_retirement_attempts_total{result="completed"|"unresolved"}`
+reports canonical completion attempts. An unresolved proof keeps the execution
+and lock intact. No per-target preparation is inferred from another table's
+journal: old protocol-0 records do not persist their process instance, so an
+endpoint alone is insufficient evidence to adopt an unprepared execution.
 
 This is a migration tool, not an automatic process killer. It deliberately
 requires preparation before termination and a same-Pod container replacement.

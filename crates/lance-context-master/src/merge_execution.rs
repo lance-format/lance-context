@@ -46,6 +46,9 @@ pub(crate) async fn run_merge_wal(
         // A drain stops new work, but must still resolve an already-owned
         // execution. Otherwise rollback would strand its persistent lock.
         if let Some(old) = coordinator.get(target).await? {
+            let old =
+                crate::legacy_retirement::reconcile_prepared(&state.config, &coordinator, old)
+                    .await?;
             ensure_recovery_due(&coordinator, &old).await?;
             if reconcile(&state.http, &coordinator, &proof, old, false)
                 .await
@@ -60,6 +63,9 @@ pub(crate) async fn run_merge_wal(
     }
     if !state.config.merge_rollout.owned(target) && !state.config.merge_rollout.fence_legacy {
         if let Some(old) = coordinator.get(target).await? {
+            let old =
+                crate::legacy_retirement::reconcile_prepared(&state.config, &coordinator, old)
+                    .await?;
             // Turning off new admission must never disable recovery of durable
             // worker records. Observe useful progress before considering cancel.
             if old.protocol == 0 && old.phase == Phase::Finished {
@@ -92,6 +98,9 @@ pub(crate) async fn run_merge_wal(
         || crate::local_merge::selected(&state.config, target)
     {
         if let Some(old) = coordinator.get(target).await? {
+            let old =
+                crate::legacy_retirement::reconcile_prepared(&state.config, &coordinator, old)
+                    .await?;
             ensure_recovery_due(&coordinator, &old).await?;
             if old.maintenance.is_none() {
                 // A newly selected resident target may still have useful
@@ -127,6 +136,9 @@ pub(crate) async fn run_merge_wal(
     // after a completed barrier lets healthy shards progress in this task.
     for recovery_round in 0..2 {
         if let Some(old) = coordinator.get(&claim.task.target).await? {
+            let old =
+                crate::legacy_retirement::reconcile_prepared(&state.config, &coordinator, old)
+                    .await?;
             ensure_recovery_due(&coordinator, &old).await?;
             if recovery_round > 0 || matches!(old.phase, Phase::Recovering | Phase::Uncertain) {
                 recover_execution(state, &coordinator, &proof, old).await?;
