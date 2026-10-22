@@ -29,6 +29,8 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, sync::Arc, time::Duration};
 use uuid::Uuid;
 
+#[cfg(feature = "http")]
+pub mod http;
 #[cfg(feature = "materializer")]
 pub mod materializer;
 pub mod receipt;

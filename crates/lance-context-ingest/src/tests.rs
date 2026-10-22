@@ -10,6 +10,8 @@ use lance_table::io::commit::{ConditionalPutCommitHandler, ManifestNamingScheme}
 use receipt::ReceiptKeys;
 use std::collections::BTreeMap;
 
+#[cfg(all(feature = "http-client", feature = "materializer"))]
+mod http;
 #[cfg(feature = "materializer")]
 mod materializer;
 mod network;

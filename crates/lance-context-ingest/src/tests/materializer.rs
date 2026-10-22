@@ -4,7 +4,7 @@ use futures::TryStreamExt;
 use object_store::path::Path as ObjectPath;
 use std::collections::HashMap;
 
-async fn publisher(
+pub(super) async fn publisher(
     ingress: &Ingress,
     storage: &Storage,
     budget: &Arc<MergeMemoryBudget>,
@@ -49,7 +49,7 @@ async fn append(
     let accepted = ingress.append(&prepared).await?;
     Ok((body, accepted))
 }
-async fn verify(
+pub(super) async fn verify(
     publisher: &Publisher,
     expected: &BTreeMap<String, RecordBatch>,
     version: u64,
@@ -90,7 +90,7 @@ async fn verify(
     );
     Ok(())
 }
-fn remember(expected: &mut BTreeMap<String, RecordBatch>, body: Bytes) -> Result<()> {
+pub(super) fn remember(expected: &mut BTreeMap<String, RecordBatch>, body: Bytes) -> Result<()> {
     for batch in ipc::decode(body, Arc::new(rollout_schema()))? {
         let ids = batch
             .column_by_name("id")

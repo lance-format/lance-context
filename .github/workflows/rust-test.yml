@@ -166,6 +166,11 @@ jobs:
         run: |
           cargo clippy -p lance-context-ingest --features materializer --all-targets -- -D warnings
           cargo test -p lance-context-ingest --features materializer --lib
+      - name: HTTP ingestion and recoverable producer journal
+        run: |
+          cargo clippy -p lance-context-ingest --features http --all-targets -- -D warnings
+          cargo clippy -p lance-context-ingest --features http-client,materializer --all-targets -- -D warnings
+          cargo test -p lance-context-ingest --features http-client,materializer --lib
       - name: Start etcd for HA scheduler test
         run: |
           ETCD_VERSION=3.7.0
