@@ -155,11 +155,41 @@ impl<T> Future for Pending<T> {
 struct Credits {
     slots: Arc<Semaphore>,
     bytes: Arc<Semaphore>,
-    #[cfg(feature = "peer-transport")]
     capacity_bytes: usize,
-    #[cfg(feature = "peer-transport")]
     capacity_slots: usize,
+    rejected_slots: AtomicU64,
+    rejected_bytes: AtomicU64,
 }
+
+/// Local admission counters, shared across the node's Raft groups. Fields are
+/// sampled independently, so this is not an atomic snapshot or a quorum result.
+#[derive(Clone, Debug, Serialize)]
+pub struct AdmissionLane {
+    pub capacity_requests: usize,
+    pub used_requests: usize,
+    pub capacity_bytes: usize,
+    pub used_bytes: usize,
+    /// Attempts rejected while acquiring a request permit.
+    pub rejected_requests: u64,
+    /// Attempts rejected while acquiring byte permits, after a request permit.
+    pub rejected_bytes: u64,
+}
+
+/// Physical runtime admission, excluding the transport's separate budgets.
+#[derive(Clone, Debug, Serialize)]
+pub struct Admission {
+    pub data: AdmissionLane,
+    pub control: AdmissionLane,
+    pub incoming_peers: AdmissionLane,
+    pub outgoing_peers: AdmissionLane,
+}
+
+fn increment_rejection(counter: &AtomicU64) {
+    let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        Some(value.saturating_add(1))
+    });
+}
+
 struct Credit {
     _slot: OwnedSemaphorePermit,
     _bytes: OwnedSemaphorePermit,
@@ -169,10 +199,20 @@ impl Credits {
         Self {
             slots: Arc::new(Semaphore::new(slots)),
             bytes: Arc::new(Semaphore::new(bytes)),
-            #[cfg(feature = "peer-transport")]
             capacity_bytes: bytes,
-            #[cfg(feature = "peer-transport")]
             capacity_slots: slots,
+            rejected_slots: AtomicU64::new(0),
+            rejected_bytes: AtomicU64::new(0),
+        }
+    }
+    fn observation(&self) -> AdmissionLane {
+        AdmissionLane {
+            capacity_requests: self.capacity_slots,
+            used_requests: self.capacity_slots - self.slots.available_permits(),
+            capacity_bytes: self.capacity_bytes,
+            used_bytes: self.capacity_bytes - self.bytes.available_permits(),
+            rejected_requests: self.rejected_slots.load(Ordering::Relaxed),
+            rejected_bytes: self.rejected_bytes.load(Ordering::Relaxed),
         }
     }
     fn reserve(&self, bytes: usize) -> Result<Credit> {
@@ -180,6 +220,7 @@ impl Credits {
             .slots
             .clone()
             .try_acquire_owned()
+            .inspect_err(|_| increment_rejection(&self.rejected_slots))
             .context("runtime request credits exhausted")?;
         let bytes = u32::try_from(
             bytes
@@ -190,6 +231,7 @@ impl Credits {
             .bytes
             .clone()
             .try_acquire_many_owned(bytes)
+            .inspect_err(|_| increment_rejection(&self.rejected_bytes))
             .context("runtime byte credits exhausted")?;
         Ok(Credit {
             _slot: slot,
@@ -443,6 +485,16 @@ impl Handle {
             self.shared.dropped_outgoing.load(Ordering::Relaxed),
             self.shared.rejected_incoming.load(Ordering::Relaxed),
         )
+    }
+    /// Observe bounded local admission without contacting peers or allocating
+    /// payloads. Successful admissions do not update rejection counters.
+    pub fn admission(&self) -> Admission {
+        Admission {
+            data: self.shared.data.observation(),
+            control: self.shared.control.observation(),
+            incoming_peers: self.shared.incoming.observation(),
+            outgoing_peers: self.shared.outgoing.observation(),
+        }
     }
 }
 

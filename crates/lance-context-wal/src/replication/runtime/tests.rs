@@ -342,6 +342,87 @@ async fn completed_unconsumed_replies_cannot_bypass_shared_admission() -> Result
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_publisher_reads_distinguish_byte_and_request_admission_limits() -> Result<()> {
+    // Sixteen materializer tasks must fit both the response-byte and request
+    // limits. Use real quorum reads, retaining each response credit until its
+    // caller consumes the result, rather than measuring a semaphore in isolation.
+    for (control_bytes, control_requests, accepted, byte_rejections, slot_rejections) in [
+        (4 << 20, 64, 2, 14, 0),
+        (32 << 20, 64, 16, 0, 0),
+        (32 << 20, 2, 2, 0, 14),
+    ] {
+        let directory = tempfile::tempdir()?;
+        let c = Cluster::open(
+            directory.path(),
+            Options {
+                control_bytes,
+                control_requests,
+                ..Options::default()
+            },
+        )?;
+        c.elect(1, 10).await?;
+        let handle = &c.handles[&1];
+        commit(handle, 10, batch(1)).await?;
+        let before = handle.admission();
+        let mut reads = Vec::new();
+        for _ in 0..16 {
+            match handle.query(
+                10,
+                query::Query::Publisher {
+                    table: batch(1).meta.stream,
+                },
+            ) {
+                Ok(read) => reads.push(read),
+                Err(error) => assert!(error.to_string().contains("credits exhausted"), "{error:#}"),
+            }
+        }
+        assert_eq!(reads.len(), accepted);
+        let busy = handle.admission();
+        assert_eq!(busy.control.capacity_bytes, control_bytes);
+        assert_eq!(busy.control.capacity_requests, control_requests);
+        assert_eq!(busy.control.used_requests, accepted);
+        assert!(busy.control.used_bytes > 0 && busy.control.used_bytes <= control_bytes);
+        assert_eq!(
+            busy.control.rejected_bytes - before.control.rejected_bytes,
+            byte_rejections
+        );
+        assert_eq!(
+            busy.control.rejected_requests - before.control.rejected_requests,
+            slot_rejections
+        );
+        assert_eq!(busy.data.rejected_requests, before.data.rejected_requests);
+        assert_eq!(busy.data.rejected_bytes, before.data.rejected_bytes);
+        for read in reads {
+            assert!(matches!(
+                read.await?,
+                query::Outcome::Observed {
+                    value: query::Value::Publisher(None),
+                    ..
+                }
+            ));
+        }
+        let drained = handle.admission();
+        assert_eq!(drained.control.used_requests, 0);
+        assert_eq!(drained.control.used_bytes, 0);
+        // Observing counters does not consume or restore capacity. Admission
+        // recovers because the original pending owners released their credits.
+        assert!(matches!(
+            handle
+                .query(
+                    10,
+                    query::Query::Publisher {
+                        table: batch(1).meta.stream,
+                    }
+                )?
+                .await?,
+            query::Outcome::Observed { .. }
+        ));
+        c.shutdown().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_durable_poll_stops_sibling_workers_and_releases_no_peer_response() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let mut nodes = (1..=3)
