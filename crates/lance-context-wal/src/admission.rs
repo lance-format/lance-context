@@ -293,6 +293,20 @@ mod tests {
         assert!(budget.reserve(1 << 20, true).is_err());
         let path = directory.path().join("partial.pack");
         std::fs::write(&path, vec![7; 1 << 20])?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)?
+            .sync_all()?;
+        let metadata = std::fs::metadata(&path)?;
+        let occupied = metadata.len();
+        #[cfg(unix)]
+        let occupied = {
+            use std::os::unix::fs::MetadataExt;
+            occupied.max(metadata.blocks() * 512)
+        };
+        // Allocation may exceed logical length, but must still distinguish the
+        // partial file from the larger unfinished-file reservation in this case.
+        assert!((1 << 20..3 << 20).contains(&occupied));
         // A measurement while the writer still exists cannot return its credit.
         budget.refresh()?;
         drop(receiving);
@@ -300,14 +314,14 @@ mod tests {
         assert!(budget.snapshot().accounted_disk_bytes >= 3 << 20);
         assert!(budget.reserve(2 << 20, true).is_err());
         budget.refresh()?;
-        assert_eq!(budget.snapshot().accounted_disk_bytes, 1 << 20);
+        assert_eq!(budget.snapshot().accounted_disk_bytes, occupied);
         let reopened = Budget::new(
             directory.path(),
             Arc::new(AtomicU64::new(0)),
             8 << 20,
             lifecycle.clone(),
         )?;
-        assert_eq!(reopened.snapshot().accounted_disk_bytes, 1 << 20);
+        assert_eq!(reopened.snapshot().accounted_disk_bytes, occupied);
         {
             let _files = lifecycle.write().unwrap();
             std::fs::remove_file(path)?;
