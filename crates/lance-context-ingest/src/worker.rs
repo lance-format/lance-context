@@ -44,6 +44,7 @@ impl Default for Options {
 }
 #[derive(Default)]
 struct Counters {
+    phases: Arc<crate::materializer::observation::Counters>,
     active: AtomicUsize,
     claimed: AtomicU64,
     published: AtomicU64,
@@ -87,6 +88,7 @@ impl Counters {
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct Observation {
+    pub phases: [crate::materializer::observation::Observation; 10],
     pub running: bool,
     pub active: usize,
     pub claims: u64,
@@ -150,6 +152,7 @@ impl Worker {
     }
     pub fn observation(&self) -> Observation {
         Observation {
+            phases: self.counters.phases.observation(),
             running: self.task.as_ref().is_some_and(|task| !task.is_finished()),
             active: self.counters.active.load(Ordering::Acquire),
             claims: self.counters.claimed.load(Ordering::Relaxed),
@@ -254,8 +257,10 @@ async fn publish_claim(
     stop: watch::Receiver<bool>,
     counters: Arc<Counters>,
 ) -> Result<()> {
-    let Some(claim) = claims
-        .take(&assignment.ingress)
+    use crate::materializer::observation::Phase;
+    let Some(claim) = counters
+        .phases
+        .measure(Phase::Claim, claims.take(&assignment.ingress))
         .await
         .context("acquiring scheduling claim")?
     else {
@@ -266,13 +271,18 @@ async fn publish_claim(
         if *stop.borrow() {
             return Ok(());
         }
-        let Some(mut publisher) = claim
-            .acquire(assignment, options.publication, budget)
+        let Some(mut publisher) = counters
+            .phases
+            .measure(
+                Phase::Acquire,
+                claim.acquire(assignment, options.publication, budget),
+            )
             .await
             .context("acquiring publisher epoch")?
         else {
             return Ok(());
         };
+        publisher.observe_with(counters.phases.clone());
         for _ in 0..options.publications_per_claim {
             if *stop.borrow() || !claim.valid().await? {
                 break;

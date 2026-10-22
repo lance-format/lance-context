@@ -13,6 +13,7 @@ pub(super) async fn materialize(
     pending: Arc<p::PendingPlan>,
     dataset: Dataset,
     reservation: Arc<MergeReservation>,
+    phases: Arc<PhaseCounters>,
 ) -> Result<p::Descriptors> {
     tokio::spawn(async move {
         let _reservation = reservation.clone();
@@ -29,42 +30,49 @@ pub(super) async fn materialize(
             .collect::<Vec<_>>();
         let decoded = stream::iter(inputs.into_iter().map(|(group, index, meta)| {
             let ingress = ingress.clone();
+            let phases = phases.clone();
             let reservation = reservation.clone();
             async move {
                 // Fetch is a local committed read. Retry other configured voters
                 // only for this same pinned record; none can change its identity.
-                let mut fetched = None;
-                for &node in &ingress.layout.groups[&group] {
-                    if let Ok(response) = ingress
-                        .client
-                        .request(node, Request::Fetch { group, index })
-                        .await
-                    {
-                        if let Reply::Record(Some(observed)) = &response.reply {
-                            ensure!(
-                                observed == &meta,
-                                "fetched record differs from durable source pin"
-                            );
-                            fetched = Some(response);
-                            break;
+                let response = phases
+                    .measure(Phase::Fetch, async {
+                        let mut fetched = None;
+                        for &node in &ingress.layout.groups[&group] {
+                            if let Ok(response) = ingress
+                                .client
+                                .request(node, Request::Fetch { group, index })
+                                .await
+                            {
+                                if let Reply::Record(Some(observed)) = &response.reply {
+                                    ensure!(
+                                        observed == &meta,
+                                        "fetched record differs from durable source pin"
+                                    );
+                                    fetched = Some(response);
+                                    break;
+                                }
+                            }
                         }
-                    }
-                }
-                let response = fetched.context("pinned source unavailable on every voter")?;
+                        fetched.context("pinned source unavailable on every voter")
+                    })
+                    .await?;
                 tokio::task::spawn_blocking(move || {
                     let _reservation = reservation;
-                    meta.validate_payload(
-                        &response.body,
-                        ingress.scope.contract.max_record_bytes as usize,
-                    )?;
-                    let batches = ipc::decode(response.body.clone(), ingress.schema.clone())?;
-                    validate_rows(
-                        &batches,
-                        &ingress.scope.contract,
-                        &ingress.layout,
-                        meta.bucket,
-                    )?;
-                    Ok::<_, anyhow::Error>(batches)
+                    phases.blocking(Phase::DecodeValidate, || {
+                        meta.validate_payload(
+                            &response.body,
+                            ingress.scope.contract.max_record_bytes as usize,
+                        )?;
+                        let batches = ipc::decode(response.body.clone(), ingress.schema.clone())?;
+                        validate_rows(
+                            &batches,
+                            &ingress.scope.contract,
+                            &ingress.layout,
+                            meta.bucket,
+                        )?;
+                        Ok::<_, anyhow::Error>(batches)
+                    })
                 })
                 .await?
             }
@@ -83,15 +91,20 @@ pub(super) async fn materialize(
         let dataset = Arc::new(dataset);
         let tasks = partitions.into_iter().map(|batches| {
             let dataset = dataset.clone();
+            let phases = phases.clone();
             let reservation = reservation.clone();
             async move {
                 let _reservation = reservation;
-                let staged = InsertBuilder::new(dataset)
-                    .with_params(&WriteParams {
-                        mode: WriteMode::Append,
-                        ..Default::default()
-                    })
-                    .execute_uncommitted(batches)
+                let staged = phases
+                    .measure(
+                        Phase::BlobWrite,
+                        InsertBuilder::new(dataset)
+                            .with_params(&WriteParams {
+                                mode: WriteMode::Append,
+                                ..Default::default()
+                            })
+                            .execute_uncommitted(batches),
+                    )
                     .await?;
                 let Operation::Append { fragments } = staged.operation else {
                     bail!("materialization did not produce append fragments");

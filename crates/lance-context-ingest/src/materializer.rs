@@ -8,7 +8,9 @@ use lance_context_wal::replication::{publication as p, source};
 use object_store::path::Path as ObjectPath;
 use std::collections::{BTreeMap, HashMap};
 
+pub mod observation;
 mod stage;
+use observation::{Counters as PhaseCounters, Phase};
 
 /// Resolve this from the authorized namespace, never from an append request.
 #[derive(Clone)]
@@ -101,6 +103,7 @@ pub struct Publisher {
     empty_cursors: BTreeMap<u64, u64>,
     plan_attempt: Option<p::Plan>,
     prepared_attempt: Option<p::PrepareRequest>,
+    phases: Arc<PhaseCounters>,
 }
 
 impl Publisher {
@@ -153,14 +156,28 @@ impl Publisher {
             empty_cursors: BTreeMap::new(),
             plan_attempt: None,
             prepared_attempt: None,
+            phases: Arc::default(),
         };
         value.state().await?;
         Ok(value)
+    }
+    pub fn phase_observation(&self) -> [observation::Observation; 10] {
+        self.phases.observation()
+    }
+    #[cfg(feature = "worker")]
+    pub(crate) fn observe_with(&mut self, phases: Arc<PhaseCounters>) {
+        self.phases = phases;
     }
     pub fn authority(&self) -> &p::Authority {
         &self.authority
     }
     pub async fn state(&self) -> Result<Box<p::Table>> {
+        self.phases
+            .clone()
+            .measure(Phase::State, self.state_inner())
+            .await
+    }
+    async fn state_inner(&self) -> Result<Box<p::Table>> {
         let query::Value::Publisher(Some(view)) = query(
             &self.ingress,
             self.authority.group,
@@ -192,6 +209,12 @@ impl Publisher {
     /// Select a complete bounded prefix, pin every source, write immutable Lance
     /// files and record descriptors. Existing prepared files are reused.
     pub async fn prepare_next(&mut self) -> Result<Option<Arc<p::Prepared>>> {
+        self.phases
+            .clone()
+            .measure(Phase::Prepare, self.prepare_next_inner())
+            .await
+    }
+    async fn prepare_next_inner(&mut self) -> Result<Option<Arc<p::Prepared>>> {
         let mut view = self.state().await?;
         if view.progress.pending.is_none() {
             self.retire_history(&view).await?;
@@ -245,12 +268,19 @@ impl Publisher {
             let bytes = usize::try_from(pending.plan.source_bytes()?)?;
             let count = pending.plan.sources.values().map(|s| s.records.len()).sum();
             let reservation = Arc::new(
-                self.budget
-                    .reserve(
-                        self.options
-                            .workspace(&self.ingress.scope.contract, bytes, count)?,
-                    )
-                    .await,
+                self.phases
+                    .measure(Phase::Admission, async {
+                        Ok::<_, anyhow::Error>(
+                            self.budget
+                                .reserve(self.options.workspace(
+                                    &self.ingress.scope.contract,
+                                    bytes,
+                                    count,
+                                )?)
+                                .await,
+                        )
+                    })
+                    .await?,
             );
             let descriptors = stage::materialize(
                 self.ingress.clone(),
@@ -258,6 +288,7 @@ impl Publisher {
                 pending.clone(),
                 dataset,
                 reservation,
+                self.phases.clone(),
             )
             .await?;
             descriptors.validate(self.ingress.client.max_descriptor_bytes())?;
@@ -283,6 +314,12 @@ impl Publisher {
     /// Publish the fixed target and confirm its exact identity. Errors preserve
     /// both the prepared files and source pins for explicit reconciliation.
     pub async fn commit_pending(&self) -> Result<Option<Arc<p::Published>>> {
+        self.phases
+            .clone()
+            .measure(Phase::Commit, self.commit_pending_inner())
+            .await
+    }
+    async fn commit_pending_inner(&self) -> Result<Option<Arc<p::Published>>> {
         let view = self.state().await?;
         if let Some(published) = view.progress.published {
             return Ok(Some(published));
@@ -345,6 +382,12 @@ impl Publisher {
     /// Retire payloads only with catalog-issued closure authorization, then
     /// advance independent source cursors using their quorum closure proofs.
     pub async fn finish_pending(&self) -> Result<Option<Arc<p::Advanced>>> {
+        self.phases
+            .clone()
+            .measure(Phase::Retire, self.finish_pending_inner())
+            .await
+    }
+    async fn finish_pending_inner(&self) -> Result<Option<Arc<p::Advanced>>> {
         let view = self.state().await?;
         let Some(pending) = view.progress.pending else {
             return Ok(None);

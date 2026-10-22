@@ -150,6 +150,21 @@ async fn real_rollout_files_resume_after_preparation_and_publication_restart_the
         .prepare_next()
         .await?
         .context("no staged publication")?;
+    let phases = first.phase_observation();
+    for name in [
+        "state",
+        "prepare",
+        "fetch",
+        "decode_validate",
+        "blob_write",
+        "admission",
+    ] {
+        let phase = phases.iter().find(|p| p.phase == name).unwrap();
+        assert!(phase.started > 0, "missing actual phase {name}");
+        assert_eq!(phase.completed, phase.started, "unfinished phase {name}");
+        assert_eq!(phase.failed, 0, "failed phase {name}");
+        assert_eq!(phase.cancelled, 0, "cancelled phase {name}");
+    }
     assert_eq!(
         first
             .state()
