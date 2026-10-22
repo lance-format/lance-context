@@ -6,6 +6,7 @@ use crate::replication::{
 };
 use tokio::time::sleep;
 
+mod deadline;
 mod reconnect;
 
 struct RpcCluster {

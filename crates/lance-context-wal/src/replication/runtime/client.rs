@@ -60,7 +60,10 @@ pub struct Options {
     pub connections: usize,
     /// Per server listener, shared across all independently running clients.
     pub server_connections: usize,
-    /// Entire exchange, including pool/admission waits and durable completion.
+    /// Client: entire exchange, including pool/admission and durable completion.
+    /// Server: separate handshake, idle, and active-request deadlines. The active
+    /// deadline starts at the first request bytes and includes the remaining
+    /// frame, admission, durable completion, and reply transmission.
     #[cfg_attr(feature = "service", serde(with = "crate::service::duration_millis"))]
     pub timeout: Duration,
 }
@@ -195,6 +198,9 @@ fn scope(handle: &Handle) -> Scope {
 async fn prefix<R: AsyncRead + Unpin>(io: &mut R, max_body: usize) -> Result<(u64, usize, usize)> {
     let mut fixed = [0; PREFIX];
     io.read_exact(&mut fixed).await?;
+    decode_prefix(&fixed, max_body)
+}
+fn decode_prefix(fixed: &[u8; PREFIX], max_body: usize) -> Result<(u64, usize, usize)> {
     ensure!(&fixed[..8] == MAGIC, "foreign client protocol");
     let id = u64::from_le_bytes(fixed[8..16].try_into()?);
     let meta = u32::from_le_bytes(fixed[16..20].try_into()?) as usize;
@@ -349,7 +355,20 @@ async fn listen(
                         Ok::<_, anyhow::Error>(stream)
                     };
                     if let Ok(Ok(mut stream)) = timeout(options.timeout, connection).await {
-                        loop { if !matches!(timeout(options.timeout, serve_one(&mut stream, data, &handle, &budgets)).await, Ok(Ok(()))) { break; } }
+                        loop {
+                            // Idle time cannot shorten the following request's
+                            // processing budget. Start it on the first bytes,
+                            // so a partial header is still deadline-bounded.
+                            let mut fixed = [0; PREFIX];
+                            let Ok(Ok(count)) = timeout(options.timeout, stream.read(&mut fixed)).await else { break; };
+                            if count == 0 { break; }
+                            let exchange = async {
+                                stream.read_exact(&mut fixed[count..]).await?;
+                                let header = decode_prefix(&fixed, if data { handle.max_record } else { 0 })?;
+                                serve_one(&mut stream, data, &handle, &budgets, header).await
+                            };
+                            if !matches!(timeout(options.timeout, exchange).await, Ok(Ok(()))) { break; }
+                        }
                     }
                 });
             }
@@ -364,8 +383,8 @@ async fn serve_one<S: AsyncRead + AsyncWrite + Unpin>(
     data: bool,
     handle: &Handle,
     budgets: &Budgets,
+    (id, meta_len, body_len): (u64, usize, usize),
 ) -> Result<()> {
-    let (id, meta_len, body_len) = prefix(io, if data { handle.max_record } else { 0 }).await?;
     // Reserve reply capacity too, before reading any variable-length allocation.
     let _credit = budgets
         .reserve(
