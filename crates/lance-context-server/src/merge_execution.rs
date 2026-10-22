@@ -47,12 +47,19 @@ impl lance_context_core::merge_write_scope::CommitAuthorizer for OwnedCommitGuar
     }
 }
 
+#[derive(Default)]
+pub(crate) struct WorkerAdmission {
+    pub writer_id: Option<String>,
+    pub enable_fencing: bool,
+}
+
 pub struct Executions {
     pub(crate) legacy: crate::legacy_merge::LegacyMerges,
     coordinator: OnceCell<Coordinator>,
     etcd: Option<lance_context_merge::EtcdConfig>,
     pub(crate) rollout: lance_context_merge::rollout::MergeRollout,
     endpoint: Option<String>,
+    worker_admission: WorkerAdmission,
     fencing_mode: OnceCell<bool>,
     mode_pending: std::sync::atomic::AtomicBool,
     background_targets: std::sync::Mutex<std::collections::HashSet<String>>,
@@ -74,6 +81,7 @@ impl Executions {
             etcd: None,
             rollout: Default::default(),
             endpoint: None,
+            worker_admission: WorkerAdmission::default(),
             fencing_mode: OnceCell::new(),
             mode_pending: std::sync::atomic::AtomicBool::new(false),
             background_targets: Default::default(),
@@ -86,13 +94,14 @@ impl Executions {
             running: Mutex::new(HashMap::new()),
         }
     }
-    pub fn configured(
+    pub(crate) fn configured(
         etcd: lance_context_merge::EtcdConfig,
         rollout: lance_context_merge::rollout::MergeRollout,
         endpoint: Option<String>,
         timeout_secs: u64,
         queue_timeout_secs: u64,
         idle_timeout_secs: u64,
+        worker_admission: WorkerAdmission,
     ) -> Self {
         Self {
             legacy: Default::default(),
@@ -100,6 +109,7 @@ impl Executions {
             etcd: Some(etcd),
             rollout,
             endpoint,
+            worker_admission,
             fencing_mode: OnceCell::new(),
             mode_pending: std::sync::atomic::AtomicBool::new(false),
             background_targets: Default::default(),
@@ -117,6 +127,7 @@ impl Executions {
     /// is persisted so a configuration rollback cannot reopen untracked writes.
     pub(crate) fn fencing_mode_known(&self) -> Option<bool> {
         if !self.rollout.fence_legacy
+            && !self.worker_admission.enable_fencing
             && self.coordinator.get().is_none()
             && self
                 .etcd
@@ -133,8 +144,15 @@ impl Executions {
             return Ok(mode);
         }
         self.fencing_mode.get_or_try_init(|| async {
-            let mode = self.coordinator().await?.legacy_fencing_mode(self.rollout.fence_legacy)
+            let coordinator = self.coordinator().await?;
+            let cluster_mode = coordinator.legacy_fencing_mode(self.rollout.fence_legacy)
                 .await.map_err(AppError::Internal)?;
+            let mode = match self.worker_admission.writer_id.as_deref() {
+                Some(writer) => coordinator.worker_fencing_mode(writer, self.worker_admission.enable_fencing)
+                    .await.map_err(AppError::Internal)?,
+                None if self.worker_admission.enable_fencing => return Err(AppError::InvalidRequest("worker fencing requires a stable writer identity".into())),
+                None => cluster_mode,
+            };
             if mode && self.endpoint.is_none() {
                 return Err(AppError::InvalidRequest("persisted merge protocol requires MERGE_EXECUTOR_ENDPOINT; refusing legacy rollback".into()));
             }
@@ -692,7 +710,10 @@ mod tests {
     async fn legacy_retirement_status_resolves_mode_and_returns_exact_coordinator_record() {
         let (mut state, coordinator, proof, _dir) = deadline_fixture().await;
         let local = Arc::get_mut(&mut state).unwrap();
-        local.merge_executions.rollout.fence_legacy = true;
+        local.merge_executions.worker_admission = WorkerAdmission {
+            writer_id: Some("worker-9".into()),
+            enable_fencing: true,
+        };
         local.merge_executions.endpoint = Some("http://replacement:3000".into());
         local.instance_id = Some("worker-9".into());
         let execution = coordinator
@@ -715,7 +736,15 @@ mod tests {
         assert_eq!(reply["base_uri"], state.base_uri);
         assert_eq!(reply["shard_name"], "worker-9");
         assert_eq!(coordinator.get("hot").await.unwrap(), Some(execution));
-        assert!(coordinator.legacy_fencing_mode(false).await.unwrap());
+        assert!(coordinator
+            .worker_fencing_mode("worker-9", false)
+            .await
+            .unwrap());
+        assert!(!coordinator
+            .worker_fencing_mode("worker-8", false)
+            .await
+            .unwrap());
+        assert!(!coordinator.legacy_fencing_mode(false).await.unwrap());
     }
 
     #[tokio::test]

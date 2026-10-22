@@ -36,9 +36,15 @@ any RBAC or ConfigMaps.
    container ID and writer ID in etcd. The execution and target lock stay held.
 2. **Replace the old process with a fenced worker.** This API never sends a
    signal or interprets elapsed time as a reason to kill. The replacement must
-   have `MERGE_FENCE_LEGACY=true`, a stable `MERGE_EXECUTOR_ENDPOINT`, the same
+   have `MERGE_FENCE_THIS_WORKER=true`, a stable `MERGE_EXECUTOR_ENDPOINT`, the same
    writer ID and the same data/coordinator configuration. Deploy the master's
    mixed-worker routing support before enabling fenced worker admission.
+   This worker-specific switch persists against its stable writer ID in etcd;
+   it does not set the cluster-wide `MERGE_FENCE_LEGACY` marker or change other
+   workers' startup mode. Existing cluster-wide fencing remains authoritative.
+   A restarted worker cannot disable its persisted mode by removing this flag.
+   Older binaries that do not understand this marker are not a supported
+   rollback: retaining the upgraded worker binary is part of the handoff.
 3. **The next canonical merge task completes the prepared handoff.** Normal
    task retries read the exact execution's journal and run completion without
    another agent call. For immediate completion, the same request with

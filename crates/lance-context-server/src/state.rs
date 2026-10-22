@@ -364,7 +364,15 @@ impl AppState {
                 "merge execution, queue and idle timeouts must be positive".into(),
             ));
         }
-        if config.merge_rollout.fence_legacy || config.merge_executor_endpoint.is_some() {
+        if config.merge_fence_this_worker && instance_id.as_deref().is_none_or(str::is_empty) {
+            return Err(AppError::InvalidRequest(
+                "worker fencing requires a stable INSTANCE_ID or HOSTNAME".into(),
+            ));
+        }
+        if config.merge_rollout.fence_legacy
+            || config.merge_fence_this_worker
+            || config.merge_executor_endpoint.is_some()
+        {
             let endpoint = config.merge_executor_endpoint.as_deref().unwrap_or("");
             let valid_endpoint = endpoint.parse::<axum::http::Uri>().is_ok_and(|url| {
                 matches!(url.scheme_str(), Some("http" | "https"))
@@ -392,6 +400,10 @@ impl AppState {
                 config.merge_execution_timeout_secs,
                 config.merge_queue_timeout_secs,
                 config.merge_idle_timeout_secs,
+                crate::merge_execution::WorkerAdmission {
+                    writer_id: instance_id.clone(),
+                    enable_fencing: config.merge_fence_this_worker,
+                },
             ),
             stores: RwLock::new(std::collections::HashMap::new()),
             rollout_stores: Mutex::new(LruCache::new(capacity)),
