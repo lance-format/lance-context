@@ -7,6 +7,7 @@
 //! issued immutable manifest writes can target at most latest + 1. Occupying
 //! those versions therefore also covers storage replies delayed past process exit.
 
+use futures::TryStreamExt;
 use lance::{
     dataset::builder::DatasetBuilder, dataset::mem_wal::ShardManifestStore, Error, Result,
 };
@@ -40,6 +41,9 @@ pub async fn snapshot_retired_writer(
         16,
     );
     let manifest = manifests.refresh_latest().await?;
+    if manifest.is_none() {
+        require_unpublished_shard(&dataset, shard).await?;
+    }
     let next = |version: u64| {
         version
             .checked_add(1)
@@ -96,6 +100,7 @@ pub async fn fence_retired_writer(
             16,
         );
         if manifests.refresh_latest().await?.is_none() {
+            require_unpublished_shard(&dataset, shard).await?;
             // Context uses manually assigned shards (spec 0, no field values).
             // initialize_shard uses PUT-if-absent and re-reads on a collision.
             // Epoch 0 makes this a metadata barrier, not a new writer claim.
@@ -104,6 +109,28 @@ pub async fn fence_retired_writer(
     }
     crate::merge_write_scope::fence_manifest_versions(uri, storage_options, versions, recovery_id)
         .await
+}
+
+// A broken/missing version hint plus a sparse old manifest history must not
+// turn an existing shard into an empty one. Stop at the first object; do not
+// collect a shard listing or read any WAL payload. A concurrent publication
+// conservatively retries through refresh_latest on the next completion.
+async fn require_unpublished_shard(dataset: &lance::Dataset, shard: uuid::Uuid) -> Result<()> {
+    let store = dataset.object_store(None).await?;
+    let prefix =
+        lance::dataset::mem_wal::util::shard_base_path(&dataset.branch_location().path, &shard);
+    let mut objects = store.inner.list(Some(&prefix));
+    if objects
+        .try_next()
+        .await
+        .map_err(|error| Error::io(format!("cannot verify unpublished shard: {error}")))?
+        .is_some()
+    {
+        return Err(Error::io(
+            "retired shard has stored objects but no discoverable manifest; publication unresolved",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -262,6 +289,42 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn undiscoverable_shard_objects_are_not_replaced_by_empty_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut creator = GenericStore::open(uri, spec(), GenericStoreOptions::default())
+            .await
+            .unwrap();
+        creator.close().await.unwrap();
+        let writer = "retired-worker";
+        let plan = snapshot_retired_writer(uri, None, writer).await.unwrap();
+        let dataset = DatasetBuilder::from_uri(uri).load().await.unwrap();
+        let shard = crate::store_base::derive_shard_id(Some(writer));
+        let prefix =
+            lance::dataset::mem_wal::util::shard_base_path(&dataset.branch_location().path, &shard);
+        let store = dataset.object_store(None).await.unwrap();
+        store
+            .put_if_absent(
+                &prefix.join("orphan-wal"),
+                bytes::Bytes::from_static(b"must preserve").into(),
+            )
+            .await
+            .unwrap();
+        for error in [
+            snapshot_retired_writer(uri, None, writer)
+                .await
+                .unwrap_err(),
+            fence_retired_writer(uri, None, writer, &plan, "retired")
+                .await
+                .unwrap_err(),
+        ] {
+            assert!(error.to_string().contains("stored objects"), "{error}");
+        }
+        let manifests = ShardManifestStore::new(store, &dataset.branch_location().path, shard, 16);
+        assert!(manifests.refresh_latest().await.unwrap().is_none());
     }
 
     #[tokio::test]
