@@ -158,6 +158,10 @@ jobs:
         run: |
           sudo apt update
           sudo apt install -y clang libclang-dev protobuf-compiler
+      - name: Rollout materialization through the WAL client
+        run: |
+          cargo clippy -p lance-context-ingest --features materializer --all-targets -- -D warnings
+          cargo test -p lance-context-ingest --features materializer --lib
       - name: Start etcd for HA scheduler test
         run: |
           ETCD_VERSION=3.7.0

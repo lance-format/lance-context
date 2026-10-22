@@ -73,11 +73,59 @@ pub(super) struct Cluster {
     pub client: Arc<Client>,
     nodes: Vec<(Runtime, peer::Transport, client::Server)>,
 }
+type Signers = (
+    Arc<lance_context_wal::replication::source::CatalogSigner>,
+    BTreeMap<u64, Arc<lance_context_wal::replication::source::SourceSigner>>,
+);
 impl Cluster {
     pub async fn open(root: &Path, layout: Arc<Layout>) -> Result<Self> {
+        Self::open_inner(root, layout, None).await
+    }
+    #[cfg(feature = "materializer")]
+    pub async fn open_signed(root: &Path, layout: Arc<Layout>) -> Result<Self> {
+        use lance_context_wal::replication::source::{CatalogSigner, SourceSigner};
+        fn key(path: &Path) -> Result<Vec<u8>> {
+            if !path.exists() {
+                let key = ring::signature::Ed25519KeyPair::generate_pkcs8(
+                    &ring::rand::SystemRandom::new(),
+                )
+                .map_err(|_| anyhow::anyhow!("test signing key generation"))?;
+                std::fs::write(path, key.as_ref())?;
+            }
+            Ok(std::fs::read(path)?)
+        }
+        let catalog = Arc::new(CatalogSigner::from_pkcs8(&key(&root.join("catalog.pk8"))?)?);
+        let sources = layout
+            .groups
+            .keys()
+            .map(|&group| {
+                Ok((
+                    group,
+                    Arc::new(SourceSigner::from_pkcs8(&key(
+                        &root.join(format!("source-{group}.pk8"))
+                    )?)?),
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        Self::open_inner(root, layout, Some((catalog, sources))).await
+    }
+    async fn open_inner(
+        root: &Path,
+        layout: Arc<Layout>,
+        signers: Option<Signers>,
+    ) -> Result<Self> {
         let tls = certificates()?;
         let limits = Limits {
             producer_slots: 16,
+            catalog_key: signers.as_ref().map(|s| s.0.public_key()),
+            source_keys: signers
+                .as_ref()
+                .map(|s| {
+                    s.1.iter()
+                        .map(|(&group, key)| (group, key.public_key()))
+                        .collect()
+                })
+                .unwrap_or_default(),
             ..Limits::default()
         };
         let mut peers = BTreeMap::new();
@@ -108,7 +156,7 @@ impl Cluster {
         }
         let mut nodes = Vec::new();
         for (id, listener, data, control) in listeners {
-            let node = Node::open(
+            let mut node = Node::open(
                 &root.join(id.to_string()),
                 layout.clone(),
                 id,
@@ -119,6 +167,12 @@ impl Cluster {
                 data_bytes: 128 << 20,
                 headroom_bytes: 256 << 20,
             })?;
+            if let Some((catalog, sources)) = &signers {
+                node.set_catalog_signer(catalog.clone())?;
+                for (&group, key) in sources {
+                    node.set_source_signer(group, key.clone())?;
+                }
+            }
             let (runtime, outbox) = Runtime::spawn(node, runtime::Options::default())?;
             let mut server = tls[&id].server.clone();
             server.alpn_protocols = vec![peer::ALPN.to_vec()];

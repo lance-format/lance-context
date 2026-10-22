@@ -5,7 +5,7 @@
 //! migrate or replace legacy merge/upsert tables, or authenticate an HTTP caller.
 //! One atomic append must fit one virtual bucket; reject mixed buckets before ACK.
 use anyhow::{bail, ensure, Context, Result};
-use arrow_array::{Array, StringArray};
+use arrow_array::{Array, RecordBatch, StringArray};
 use arrow_schema::SchemaRef;
 use bytes::Bytes;
 use lance_context_core::{rollout_schema, MergeMemoryBudget, MergeReservation};
@@ -29,6 +29,8 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, sync::Arc, time::Duration};
 use uuid::Uuid;
 
+#[cfg(feature = "materializer")]
+pub mod materializer;
 pub mod receipt;
 
 /// Resolved by the application's authorized catalog, not an uploaded URI/UUID.
@@ -500,12 +502,39 @@ fn prepare(
     layout: &Layout,
 ) -> Result<PreparedAppend> {
     let batches = ipc::decode(body.clone(), schema)?;
+    let rows = validate_rows(
+        &batches,
+        &upload.scope.contract,
+        layout,
+        producer.open.bucket,
+    )?;
+    let batch = Batch::new(
+        upload.scope.table,
+        producer.open.bucket,
+        producer.id,
+        sequence,
+        body,
+    );
+    Ok(PreparedAppend {
+        scope: upload.scope,
+        batch,
+        rows,
+        _reservation: upload.reservation,
+    })
+}
+
+fn validate_rows(
+    batches: &[RecordBatch],
+    contract: &IngestContract,
+    layout: &Layout,
+    expected_bucket: u32,
+) -> Result<u32> {
     let mut ids = HashSet::new();
     let mut rows = 0u32;
     let mut previous_session = None;
-    for batch in &batches {
+    for batch in batches {
         ensure!(
-            batch.num_rows() <= (upload.scope.contract.max_rows - rows) as usize,
+            batch.num_rows() <= (contract.max_rows - rows) as usize,
             "upload exceeds registered row limit"
         );
         for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
@@ -532,13 +561,10 @@ fn prepare(
             // Consecutive rows in a rollout share routing. Borrow the decoded
             // string and hash only when the session changes; no string copy.
             if previous_session != Some(session) {
-                let bucket = layout.session_bucket(
-                    &upload.scope.contract.tenant,
-                    &upload.scope.contract.qualified_table,
-                    session,
-                )?;
+                let bucket =
+                    layout.session_bucket(&contract.tenant, &contract.qualified_table, session)?;
                 ensure!(
-                    bucket == producer.open.bucket,
+                    bucket == expected_bucket,
                     "atomic append spans producer bucket"
                 );
                 previous_session = Some(session);
@@ -547,19 +573,7 @@ fn prepare(
         }
     }
     ensure!(rows > 0, "empty append");
-    let batch = Batch::new(
-        upload.scope.table,
-        producer.open.bucket,
-        producer.id,
-        sequence,
-        body,
-    );
-    Ok(PreparedAppend {
-        scope: upload.scope,
-        batch,
-        rows,
-        _reservation: upload.reservation,
-    })
+    Ok(rows)
 }
 
 #[cfg(test)]
