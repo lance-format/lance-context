@@ -61,3 +61,20 @@ The regression fails before the change and passes after it without retry/sleep.
 ```sh
 cargo test -p lance-context-wal --features client-journal --lib
 ```
+
+# Reuse uncompressed read buffers
+
+The scalar, batched, and rewrite entry readers now move their freshly read block
+into the decoder. An uncompressed block retains that allocation after the same
+complete block checksum succeeds; only the trailing checksum is truncated. The
+LZ4 path retains its existing decompression and checksum checks. Cache identity,
+entry parsing, file formats, persistence, and reclamation rules are unchanged.
+This removes one block-sized allocation and copy on an uncompressed cache miss;
+it does not remove Protobuf field copies or make the ingestion path zero-copy.
+
+`owned-block-read.patch` records this additional vendor delta. The actual-file
+`engine_cache` suite also exercises both compression modes after reopen, all
+entry fields, corruption on a cache miss, and successful reads after restoring
+the original byte. Separately recorded Rust diagnostics measure the real log
+read path and allocator-requested bytes; they are not end-to-end throughput or
+RSS benchmarks.

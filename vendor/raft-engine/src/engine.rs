@@ -609,8 +609,8 @@ where
             cache.insert(
                 owner,
                 idx.entries.unwrap(),
-                LogBatch::decode_entries_block(
-                    &pipe_log.read_bytes(idx.entries.unwrap())?,
+                LogBatch::decode_entries_block_owned(
+                    pipe_log.read_bytes(idx.entries.unwrap())?,
                     idx.entries.unwrap(),
                     idx.compression_type,
                 )?,
@@ -638,8 +638,8 @@ where
             cache.insert(
                 owner,
                 idx.entries.unwrap(),
-                LogBatch::decode_entries_block(
-                    &pipe_log.read_bytes(idx.entries.unwrap())?,
+                LogBatch::decode_entries_block_owned(
+                    pipe_log.read_bytes(idx.entries.unwrap())?,
                     idx.entries.unwrap(),
                     idx.compression_type,
                 )?,

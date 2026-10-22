@@ -938,6 +938,32 @@ impl LogBatch {
         Ok((offset, compression_type, len))
     }
 
+    /// Decode a block read into an owned allocation. Uncompressed entries keep
+    /// that allocation after verifying the complete original checksum, avoiding
+    /// a second block-sized allocation and copy on a read-cache miss.
+    pub(crate) fn decode_entries_block_owned(
+        mut buf: Vec<u8>,
+        handle: FileBlockHandle,
+        compression: CompressionType,
+    ) -> Result<Vec<u8>> {
+        let encoded = buf.get(..handle.len).ok_or_else(|| {
+            Error::Corruption(format!(
+                "Entry block length {} exceeds read length {}",
+                handle.len,
+                buf.len()
+            ))
+        })?;
+        match (handle.len, compression) {
+            (0, _) => Ok(Vec::new()),
+            (_, CompressionType::None) => {
+                verify_checksum_with_signature(encoded, None)?;
+                buf.truncate(handle.len - LOG_BATCH_CHECKSUM_LEN);
+                Ok(buf)
+            }
+            (_, CompressionType::Lz4) => Self::decode_entries_block(encoded, handle, compression),
+        }
+    }
+
     /// Unfolds bytes of multiple user entries from an encoded block.
     pub(crate) fn decode_entries_block(
         buf: &[u8],
