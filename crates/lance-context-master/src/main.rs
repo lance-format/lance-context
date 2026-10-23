@@ -32,7 +32,8 @@ async fn main() {
                 config.etcd.connect().await.map_err(|e| e.to_string())?,
                 config.etcd.etcd_prefix.clone(),
             );
-            lance_context_master::legacy_retirement::execute(&config, &coordinator, request).await
+            lance_context_master::legacy_retirement::execute_command(&config, &coordinator, request)
+                .await
         }
         .await;
         match result {

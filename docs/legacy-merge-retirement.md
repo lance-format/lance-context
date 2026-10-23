@@ -96,9 +96,54 @@ inherited: this target must obtain its own storage snapshot and barriers.
 Normal canonical completion and lock release then apply. Remove the optional
 witness field when sending an explicit `complete` request.
 
-No witness is selected automatically from an endpoint or empty progress
-telemetry. A changed Pod UID, another restart that loses the exact termination
+Completed target witnesses are not selected automatically from an endpoint or
+empty progress telemetry. A changed Pod UID, another restart that loses the exact termination
 receipt, an incomplete witness, or changed ownership keeps recovery protected.
+
+## Workers with no current execution
+
+An empty inventory is not an admission barrier: a previously probed caller can
+publish a legacy execution during replacement. Before replacing an otherwise
+idle worker, capture a **worker retirement intent** through the same API or
+`--legacy-retirement-request` CLI flag:
+
+```json
+{
+  "action": "prepare_worker",
+  "intent_id": "67d91ff4-7cd1-45ec-a9cd-a14a7c135975",
+  "endpoint": "http://worker-7.workers.production.svc.cluster.local:3000",
+  "namespace": "production",
+  "pod": "worker-7",
+  "container": "worker"
+}
+```
+
+Use a new UUID for the intent and retain that request for retries. The master
+captures the live Pod UID, container ID, worker instance and shard identity;
+the client cannot supply process evidence. One transaction persists the intent
+and its exact-endpoint index in the application's etcd. It creates no target
+execution, task claim, storage version or target lock. The intent ID and endpoint
+cannot subsequently be rebound to a different process.
+
+Perform a qualified **graceful same-Pod replacement**. This path requires the
+old container's exact termination record with exit code 0 and reason `Completed`;
+an OOM, forced termination, changed Pod UID or missing receipt is rejected.
+The replacement must enable fenced legacy admission. Verify acknowledged rows
+and blobs across shutdown, including writes not yet sealed, before using this
+path in production. Registering an intent alone never makes a restart safe.
+
+If an ordinary task subsequently discovers a legacy execution for that endpoint,
+the master finds the explicitly registered intent, rechecks graceful process
+death and the fenced successor, and prepares this target's own journal. The
+existing storage barriers and canonical completion then run automatically.
+No agent needs to bind each late target. For a manual `prepare` request,
+`"worker_witness_id":"the-intent-uuid"` is supported instead of
+`witness_execution_id`; supplying both is rejected. Explicit `complete`
+requests omit both witness fields.
+
+The intent is retained for late admissions and cannot authorize recovery after
+a second restart loses the original termination receipt. It is a one-time
+legacy transition record, not a replacement for native fenced-worker recovery.
 
 This is a migration tool, not an automatic process killer. It deliberately
 requires verified process evidence and a same-Pod container replacement.
