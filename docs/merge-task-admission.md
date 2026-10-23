@@ -71,3 +71,18 @@ times and actual subsequent WAL publication; Pod readiness alone is insufficient
 
 This change does not modify merge slots, staging concurrency, append commits,
 retry budgets, native ownership guards, or master/worker deployment settings.
+
+A claim call lazily creates one private lease and establishes renewal before its
+first ownership transaction. A definitively rejected claim CAS has published no
+keys on that lease, so later candidates in the same call reuse it. The first
+accepted (or successfully reconciled) claim takes exclusive ownership of the
+lease and renewal task. Separate calls, pools and accepted tasks never share a
+lease. An empty scan or error stops renewal and revokes any untransferred lease;
+cancellation drops renewal, leaving the existing TTL-based recovery behavior.
+
+`master_scheduler_claim_lease_attempts_total` counts actual grant attempts;
+`master_scheduler_claim_lease_reuses_total` counts reuse for later candidates.
+`master_scheduler_claim_results_total{outcome}` continues to count individual CAS
+results. Grant attempts therefore need not equal accepted plus contended results.
+This optimization avoids lease churn after losing claims; it neither removes
+contention nor attributes all cluster lease traffic to the scheduler.

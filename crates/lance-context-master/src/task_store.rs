@@ -223,6 +223,13 @@ struct LeaseKeepalive {
     task: JoinHandle<()>,
 }
 
+/// Private to one claim call. Failed claim transactions have published no keys
+/// on this lease; the first successful transaction transfers it to TaskClaim.
+struct UnclaimedLease {
+    id: i64,
+    keepalive: LeaseKeepalive,
+}
+
 impl Drop for LeaseKeepalive {
     fn drop(&mut self) {
         if let Some(stop) = self.stop.take() {
@@ -1236,7 +1243,31 @@ impl EtcdTaskStore {
         kinds: TaskKinds,
         only_id: Option<(&str, &str)>,
         resident_targets: Option<&[String]>,
+        scan: Option<&mut SchedulerClaimScan<'_>>,
+    ) -> lance::Result<(Option<TaskClaim>, bool)> {
+        let mut lease = None;
+        let result = self
+            .claim_next_with_lease(kinds, only_id, resident_targets, scan, &mut lease)
+            .await;
+        if let Some(lease) = lease {
+            drop(lease.keepalive);
+            let cleanup = self.revoke_lease(lease.id).await;
+            // Preserve the original failure, but do not hide a failed cleanup
+            // after an otherwise successful empty scan.
+            if result.is_ok() {
+                cleanup?;
+            }
+        }
+        result
+    }
+
+    async fn claim_next_with_lease(
+        &self,
+        kinds: TaskKinds,
+        only_id: Option<(&str, &str)>,
+        resident_targets: Option<&[String]>,
         mut scan: Option<&mut SchedulerClaimScan<'_>>,
+        lease: &mut Option<UnclaimedLease>,
     ) -> lance::Result<(Option<TaskClaim>, bool)> {
         let prefix = only_id.map_or_else(|| self.queue_prefix(), |(id, _)| self.queue_key(id));
         let range_end = if only_id.is_some() {
@@ -1465,27 +1496,37 @@ impl EtcdTaskStore {
                     }
                 }
                 let token = generate_id();
-                if let Some(operation) = operation {
-                    operation.claim_phase("lease_grant");
-                }
                 // Do not reuse advisory reads after any ownership mutation.
                 // Every candidate still passes the original claim/fence CAS.
                 candidate_reads.clear();
-                metrics::counter!("master_scheduler_claim_lease_attempts_total").increment(1);
-                let lease_id = self.grant_lease().await?;
-                if let Some(operation) = operation {
-                    operation.claim_completed(1, 0, 0);
-                    operation.claim_phase("lease_keepalive");
-                }
-                // Establish renewal before publishing ownership, so a slow
-                // keepalive handshake cannot strand an already accepted claim.
-                let keepalive = match self.start_keepalive(lease_id).await {
-                    Ok(keepalive) => keepalive,
-                    Err(error) => {
-                        let _ = self.revoke_lease(lease_id).await;
-                        return Err(error);
+                if lease.is_none() {
+                    if let Some(operation) = operation {
+                        operation.claim_phase("lease_grant");
                     }
-                };
+                    metrics::counter!("master_scheduler_claim_lease_attempts_total").increment(1);
+                    let id = self.grant_lease().await?;
+                    if let Some(operation) = operation {
+                        operation.claim_completed(1, 0, 0);
+                        operation.claim_phase("lease_keepalive");
+                    }
+                    // Establish renewal before publishing ownership, so a slow
+                    // handshake cannot strand an already accepted claim.
+                    let keepalive = match self.start_keepalive(id).await {
+                        Ok(keepalive) => keepalive,
+                        Err(error) => {
+                            let _ = self.revoke_lease(id).await;
+                            return Err(error);
+                        }
+                    };
+                    *lease = Some(UnclaimedLease { id, keepalive });
+                } else {
+                    metrics::counter!("master_scheduler_claim_lease_reuses_total").increment(1);
+                }
+                let unclaimed = lease.as_ref().expect("claim lease was initialized");
+                if unclaimed.keepalive.task.is_finished() {
+                    return Err(lance::Error::io("unclaimed task lease renewal stopped"));
+                }
+                let lease_id = unclaimed.id;
                 if let Some(operation) = operation {
                     operation.claim_phase("claim_transaction");
                 }
@@ -1594,22 +1635,15 @@ impl EtcdTaskStore {
                 if let Some(operation) = operation {
                     operation.claim_phase("claim_reconciliation");
                 }
-                let claimed = match self
+                let claimed = self
                     .resolve_claim_response(response, &claim_key, &token)
-                    .await
-                {
-                    Ok(claimed) => claimed,
-                    Err(error) => {
-                        drop(keepalive);
-                        let _ = self.revoke_lease(lease_id).await;
-                        return Err(error);
-                    }
-                };
+                    .await?;
                 if let Some(operation) = operation {
                     operation.claim_completed(1, 0, 0);
                 }
                 metrics::counter!("master_scheduler_claim_results_total", "outcome" => if claimed { "accepted" } else { "contended" }).increment(1);
                 if claimed {
+                    let keepalive = lease.take().expect("accepted claim owns lease").keepalive;
                     advance(&mut scan);
                     return Ok((
                         Some(TaskClaim {
@@ -1627,8 +1661,9 @@ impl EtcdTaskStore {
                         dependency_failed,
                     ));
                 }
-                drop(keepalive);
-                self.revoke_lease(lease_id).await?;
+                // A definitively rejected transaction published no ownership.
+                // Keep this private lease for the next candidate in this call;
+                // never share it between calls, pools, or accepted tasks.
                 advance(&mut scan);
             }
 
@@ -3444,6 +3479,173 @@ mod tests {
             .finish(claim, Ok("test completion".into()))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn claim_scan_reuses_private_lease_after_rejected_cas() {
+        let (_dir, store) = bounded_scheduler_store(vec![]).await;
+        let mut client = store.inner.client.clone();
+        let mut changed = Vec::new();
+        for i in 0..10 {
+            let mut task = store
+                .enqueue(TaskKind::MergeWal, &format!("changed-{i}"), vec![])
+                .await
+                .unwrap();
+            // Deterministic lost CAS: canonical state changed after the queue
+            // snapshot, while the advisory ownership keys remain unoccupied.
+            task.detail = Some("concurrent update".into());
+            client
+                .put(
+                    store.inner.task_key(&task.id),
+                    encode_task(&task).unwrap(),
+                    None,
+                )
+                .await
+                .unwrap();
+            changed.push(task);
+        }
+        let tail = store
+            .enqueue(TaskKind::MergeWal, "runnable", vec![])
+            .await
+            .unwrap();
+        let admission = Arc::new(crate::admission::Admission::default());
+        let operation = admission.try_admit_named("merge").unwrap();
+        let mut cursor = SchedulerClaimCursor::default();
+        let claim = store
+            .claim_scheduler_slice(TaskKinds::MERGE_WAL, None, &mut cursor, &operation)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.task.id, tail.id);
+        let status = admission.status();
+        let progress = status
+            .operations
+            .values()
+            .next()
+            .unwrap()
+            .claim_progress
+            .as_ref()
+            .unwrap();
+        assert_eq!(progress.queue_candidates, 11);
+        assert_eq!(
+            progress.completed_etcd_responses, 25,
+            "two pages + eleven snapshots + eleven CAS responses + one lease grant; {progress:?}"
+        );
+        let id = claim.backend.lease_id;
+        assert!(client.lease_time_to_live(id, None).await.unwrap().ttl() > 0);
+        for task in changed {
+            assert_eq!(store.get(&task.id).await.unwrap().unwrap(), task);
+            assert!(client
+                .get(store.inner.target_lock_key(&task.target), None)
+                .await
+                .unwrap()
+                .kvs()
+                .is_empty());
+        }
+        // Finishing the accepted task revokes the transferred lease normally.
+        store.finish(claim, Ok("done".into())).await.unwrap();
+        assert!(client.lease_time_to_live(id, None).await.unwrap().ttl() <= 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn claim_scan_never_shares_a_lease_between_accepted_tasks() {
+        let (_dir, store) = bounded_scheduler_store(vec![]).await;
+        for target in ["first", "second"] {
+            store
+                .enqueue(TaskKind::MergeWal, target, vec![])
+                .await
+                .unwrap();
+        }
+        let first = store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        let second = store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(first.backend.lease_id, second.backend.lease_id);
+        let second_id = second.backend.lease_id;
+        store.finish(first, Ok("done".into())).await.unwrap();
+        assert!(
+            store
+                .inner
+                .client
+                .clone()
+                .lease_time_to_live(second_id, None)
+                .await
+                .unwrap()
+                .ttl()
+                > 0
+        );
+        assert_eq!(
+            store
+                .inner
+                .get_text(&second.backend.claim_key)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(second.backend.token.as_str())
+        );
+        store.finish(second, Ok("done".into())).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn claim_scan_cleans_up_after_exhaustion_and_late_dependency_error() {
+        let (_dir, store) = bounded_scheduler_store(vec![]).await;
+        let mut client = store.inner.client.clone();
+        let mut changed = store
+            .enqueue(TaskKind::MergeWal, "changed", vec![])
+            .await
+            .unwrap();
+        changed.detail = Some("concurrent update".into());
+        client
+            .put(
+                store.inner.task_key(&changed.id),
+                encode_task(&changed).unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .is_none());
+        let later = store
+            .enqueue(TaskKind::MergeWal, "later", vec!["malformed".into()])
+            .await
+            .unwrap();
+        client
+            .put(store.inner.task_key("malformed"), "invalid-json", None)
+            .await
+            .unwrap();
+        assert!(store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .is_err());
+        for task in [&changed, &later] {
+            assert_eq!(store.get(&task.id).await.unwrap().unwrap(), *task);
+            assert!(client
+                .get(store.inner.claim_key(&task.id), None)
+                .await
+                .unwrap()
+                .kvs()
+                .is_empty());
+            assert!(client
+                .get(store.inner.target_lock_key(&task.target), None)
+                .await
+                .unwrap()
+                .kvs()
+                .is_empty());
+        }
+        // The isolated-etcd validation also verifies no lease remains after
+        // these empty/error paths, not just absence of task ownership keys.
     }
 
     #[tokio::test]
