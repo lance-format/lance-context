@@ -1612,8 +1612,10 @@ impl StorageBase {
     }
 
     /// Publish on a fresh fenced handle. Appends may have added uncovered
-    /// fragments; changes to the indexed snapshot or same-name index require
-    /// rebuilding. Keep the original read version for Lance conflict checks.
+    /// fragments; deletion vectors can hide indexed rows without changing their
+    /// values or addresses. Other source or same-name index changes require
+    /// rebuilding. Keep the original read version so Lance still rejects a
+    /// concurrent restore that could make previously deleted rows visible.
     pub async fn commit_prepared_key_index(
         &mut self,
         prepared: PreparedKeyIndex,
@@ -1638,11 +1640,19 @@ impl StorageBase {
             .iter()
             .map(|f| (f.id, f))
             .collect();
-        if prepared
-            .fragments
-            .iter()
-            .any(|old| sources.get(&old.id).copied() != Some(old))
-        {
+        if prepared.fragments.iter().any(|old| {
+            let Some(current) = sources.get(&old.id).copied() else {
+                return true;
+            };
+            // Upsert deletes old rows before appending replacements. A
+            // changed deletion vector does not invalidate the prepared
+            // index: reads still apply the current deletion mask, and the
+            // new fragments remain uncovered. Compare every other field,
+            // including files, overlays, row IDs and physical row counts.
+            let mut expected = old.clone();
+            expected.deletion_file = current.deletion_file.clone();
+            current != &expected
+        }) {
             return Err(LanceError::invalid_input(
                 MaintenanceErrorCode::StalePreparation
                     .tag("index source fragment changed; reprepare"),

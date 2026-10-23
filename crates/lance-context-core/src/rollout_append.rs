@@ -1248,6 +1248,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepared_index_survives_partial_delete_and_upsert() {
+        use lance::index::DatasetIndexExt;
+        for kind in [crate::KeyIndexType::Btree, crate::KeyIndexType::Zonemap] {
+            let dir = tempfile::tempdir().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let (_writer, _) = prepared_compaction_fixture(uri).await;
+            let mut publisher =
+                RolloutStore::open_existing_with_options(uri, RolloutStoreOptions::default())
+                    .await
+                    .unwrap();
+            publisher
+                .compact(Some(crate::CompactionConfig {
+                    target_rows_per_fragment: 1024,
+                    ..Default::default()
+                }))
+                .await
+                .unwrap();
+            let before = Dataset::open(uri).await.unwrap();
+            assert_eq!(before.manifest().fragments.len(), 1);
+            let prepared = prepare_index_without_commit(uri, kind).await;
+            // Normal upsert tombstones an old row and appends its replacement.
+            // The remaining source rows and their addresses have not changed.
+            put(&publisher, "seed-0", 8192).await;
+            publisher.cleanup_own_shard().await.unwrap();
+            Dataset::open(uri)
+                .await
+                .unwrap()
+                .delete("id = 'seed-1'")
+                .await
+                .unwrap();
+            let current = Dataset::open(uri).await.unwrap();
+            assert_eq!(current.manifest().fragments.len(), 2);
+            let old = &before.manifest().fragments[0];
+            let now = current
+                .manifest()
+                .fragments
+                .iter()
+                .find(|f| f.id == old.id)
+                .unwrap();
+            assert_eq!(old.files, now.files);
+            assert_ne!(old.deletion_file, now.deletion_file);
+            publisher
+                .commit_prepared_id_key_index(prepared)
+                .await
+                .unwrap();
+            let reader =
+                RolloutStore::open_existing_with_options(uri, RolloutStoreOptions::default())
+                    .await
+                    .unwrap();
+            assert_eq!(
+                reader.get_blob("seed-0").await.unwrap().unwrap(),
+                vec![42; 8192]
+            );
+            assert!(reader.get_blob("seed-1").await.unwrap().is_none());
+            assert_eq!(
+                reader.get_blob("seed-2").await.unwrap().unwrap(),
+                vec![42; 4096]
+            );
+            assert_eq!(rows(uri).await, 3);
+            let current = Dataset::open(uri).await.unwrap();
+            let indices = current.load_indices().await.unwrap();
+            let key = indices
+                .iter()
+                .find(|i| i.name == crate::store_base::ID_INDEX_NAME)
+                .unwrap();
+            assert!(key
+                .fragment_bitmap
+                .as_ref()
+                .unwrap()
+                .contains(old.id as u32));
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_index_rejects_restore_of_deleted_rows() {
+        for kind in [crate::KeyIndexType::Btree, crate::KeyIndexType::Zonemap] {
+            let dir = tempfile::tempdir().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let (_writer, _) = prepared_compaction_fixture(uri).await;
+            let mut publisher =
+                RolloutStore::open_existing_with_options(uri, RolloutStoreOptions::default())
+                    .await
+                    .unwrap();
+            publisher
+                .compact(Some(crate::CompactionConfig {
+                    target_rows_per_fragment: 1024,
+                    ..Default::default()
+                }))
+                .await
+                .unwrap();
+            let before = Dataset::open(uri).await.unwrap();
+            let mut deleted = before.clone();
+            deleted.delete("id = 'seed-0'").await.unwrap();
+            let prepared = prepare_index_without_commit(uri, kind).await;
+            let mut restored = deleted
+                .checkout_version(before.version().version)
+                .await
+                .unwrap();
+            restored.restore().await.unwrap();
+            assert_eq!(rows(uri).await, 4);
+            let version = Dataset::open(uri).await.unwrap().version().version;
+            // The index was prepared without seed-0. Merely ignoring deletion
+            // metadata is insufficient: retaining its original read version
+            // must let Lance reject the intervening Restore transaction.
+            publisher
+                .commit_prepared_id_key_index(prepared)
+                .await
+                .unwrap_err();
+            assert_eq!(Dataset::open(uri).await.unwrap().version().version, version);
+        }
+    }
+
+    #[tokio::test]
     async fn prepared_index_rejects_changed_sources_schema_or_replacement() {
         for mutation in ["delete", "compact", "index", "schema"] {
             let dir = tempfile::tempdir().unwrap();
