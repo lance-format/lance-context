@@ -162,12 +162,38 @@ async fn watch(
     executor_id: &str,
     task_id: &str,
 ) -> String {
+    let mut publisher = coordinator.work_progress_publisher(execution);
+    watch_with_publisher(execution, scope, executor_id, task_id, &mut publisher).await
+}
+
+trait ProgressPublisher: Send {
+    fn publish(
+        &mut self,
+        sequence: u64,
+        report: serde_json::Value,
+    ) -> impl Future<Output = Result<bool, String>> + Send;
+}
+
+impl ProgressPublisher for lance_context_merge::progress::WorkProgressPublisher {
+    async fn publish(&mut self, sequence: u64, report: serde_json::Value) -> Result<bool, String> {
+        self.publish(sequence, report).await
+    }
+}
+
+async fn watch_with_publisher(
+    execution: &Execution,
+    scope: &MergeWriteScope,
+    executor_id: &str,
+    task_id: &str,
+    publisher: &mut impl ProgressPublisher,
+) -> String {
     let mut sequence = scope.completed_steps();
     if sequence > 0 {
         crate::merge_capacity::observed_work();
     }
     let mut changed = tokio::time::Instant::now();
     let mut last_progress_at_ms = (sequence > 0).then(lance_context_merge::failure::now_ms);
+    let mut publication_failed = false;
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
         let current = scope.completed_steps();
@@ -197,13 +223,28 @@ async fn watch(
             "idle_timeout_secs": execution.idle_timeout_secs,
             "work": scope.work(),
         });
-        match coordinator
-            .publish_work_progress(execution, sequence, report)
-            .await
-        {
-            Ok(true) => {}
+        match publisher.publish(sequence, report).await {
+            Ok(true) => {
+                if publication_failed {
+                    metrics::counter!("master_maintenance_progress_publication_recovered_total")
+                        .increment(1);
+                }
+                publication_failed = false;
+            }
             Ok(false) => return "maintenance ownership revoked".into(),
-            Err(error) => return format!("maintenance progress publication failed: {error}"),
+            Err(error) => {
+                metrics::counter!("master_maintenance_progress_publication_errors_total")
+                    .increment(1);
+                if publication_failed {
+                    return format!("maintenance progress publication failed twice: {error}");
+                }
+                publication_failed = true;
+                // One bounded retry on the next normal tick. This does not
+                // reset the actual-work deadline or authorize a storage write;
+                // every manifest still obtains its own fenced commit permit.
+                tracing::warn!(target = %execution.target, execution = %execution.id, task_id,
+                    %error, "maintenance progress publication failed; retrying once without resetting progress");
+            }
         }
     }
 }
@@ -424,6 +465,74 @@ mod tests {
     use crate::{config::MasterConfig, task_store::TaskKinds};
     use clap::Parser;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct ScriptedProgress {
+        replies: std::collections::VecDeque<Result<bool, String>>,
+        calls: usize,
+    }
+
+    impl ProgressPublisher for ScriptedProgress {
+        async fn publish(
+            &mut self,
+            _sequence: u64,
+            _report: serde_json::Value,
+        ) -> Result<bool, String> {
+            self.calls += 1;
+            self.replies.pop_front().unwrap_or(Ok(true))
+        }
+    }
+
+    #[tokio::test]
+    async fn progress_publication_retry_is_bounded_and_revocation_is_immediate() {
+        let mut execution = Execution::new("table", "master:catchup", "test", 60);
+        execution.idle_timeout_secs = 10;
+        let scope = MergeWriteScope::new();
+        for (replies, expected, calls) in [
+            (
+                vec![Err("temporary etcd timeout".into()), Ok(true), Ok(false)],
+                "ownership revoked",
+                3,
+            ),
+            (
+                vec![Err("first timeout".into()), Err("second timeout".into())],
+                "publication failed twice",
+                2,
+            ),
+            (vec![Ok(false)], "ownership revoked", 1),
+        ] {
+            let mut publisher = ScriptedProgress {
+                replies: replies.into(),
+                calls: 0,
+            };
+            let error = tokio::time::timeout(
+                Duration::from_secs(6),
+                watch_with_publisher(&execution, &scope, "executor", "task", &mut publisher),
+            )
+            .await
+            .unwrap();
+            assert!(error.contains(expected), "{error}");
+            assert_eq!(publisher.calls, calls);
+        }
+    }
+
+    #[tokio::test]
+    async fn progress_publication_retry_does_not_reset_no_progress_deadline() {
+        let mut execution = Execution::new("table", "master:catchup", "test", 60);
+        execution.idle_timeout_secs = 2;
+        let scope = MergeWriteScope::new();
+        let mut publisher = ScriptedProgress {
+            replies: vec![Err("temporary etcd timeout".into())].into(),
+            calls: 0,
+        };
+        let error = tokio::time::timeout(
+            Duration::from_secs(4),
+            watch_with_publisher(&execution, &scope, "executor", "task", &mut publisher),
+        )
+        .await
+        .unwrap();
+        assert!(error.contains("no-progress"), "{error}");
+        assert_eq!(publisher.calls, 1, "retry must not keep idle work alive");
+    }
 
     #[tokio::test]
     async fn legacy_file_progress_is_visible_without_masking_an_idle_operation() {

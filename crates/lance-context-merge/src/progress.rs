@@ -21,7 +21,106 @@ pub struct ProgressSnapshot {
     pub revision: i64,
 }
 
+/// Cache the last acknowledged progress revision. Every publication compares
+/// that revision as well as execution ownership, so an ambiguously completed
+/// RPC cannot overwrite a newer report when it eventually reaches etcd.
+pub struct WorkProgressPublisher {
+    coordinator: Coordinator,
+    execution: Execution,
+    revision: i64,
+    sequence: u64,
+}
+
+impl WorkProgressPublisher {
+    pub async fn publish(&mut self, sequence: u64, report: serde_json::Value) -> Result<bool> {
+        let execution_key = execution_key(&self.coordinator.prefix, &self.execution.target);
+        let progress_key = self.coordinator.progress_key(&self.execution);
+        let encoded = encode(&self.execution);
+        if sequence < self.sequence {
+            // A superseded retry is not new progress. Still check ownership.
+            return Ok(self.coordinator.get(&self.execution.target).await?.as_ref()
+                == Some(&self.execution));
+        }
+        for _ in 0..3 {
+            let response = self
+                .coordinator
+                .client
+                .clone()
+                .txn(
+                    Txn::new()
+                        .when(vec![
+                            Compare::value(
+                                execution_key.clone(),
+                                CompareOp::Equal,
+                                encoded.clone(),
+                            ),
+                            Compare::mod_revision(
+                                progress_key.clone(),
+                                CompareOp::Equal,
+                                self.revision,
+                            ),
+                        ])
+                        .and_then(vec![
+                            TxnOp::put(
+                                progress_key.clone(),
+                                serde_json::to_vec(&ExecutionProgress { sequence }).unwrap(),
+                                None,
+                            ),
+                            TxnOp::put(
+                                self.coordinator.work_key(&self.execution),
+                                serde_json::to_vec(&report).map_err(|e| e.to_string())?,
+                                None,
+                            ),
+                        ])
+                        .or_else(vec![
+                            TxnOp::get(execution_key.clone(), None),
+                            TxnOp::get(progress_key.clone(), None),
+                        ]),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            if response.succeeded() {
+                self.revision = response
+                    .header()
+                    .ok_or("progress publication missing revision")?
+                    .revision();
+                self.sequence = sequence;
+                return Ok(true);
+            }
+            // The failed CAS reads ownership and progress at the same revision.
+            // It also resolves a lost acknowledgement without another read RPC.
+            let responses = response.op_responses();
+            let [TxnOpResponse::Get(owner), TxnOpResponse::Get(progress)] = responses.as_slice()
+            else {
+                return Err("invalid progress publication conflict response".into());
+            };
+            if owner.kvs().first().map(|kv| kv.value()) != Some(encoded.as_slice()) {
+                return Ok(false);
+            }
+            let previous = progress.kvs().first();
+            self.revision = previous.map_or(0, |kv| kv.mod_revision());
+            self.sequence = previous
+                .map(|kv| serde_json::from_slice::<ExecutionProgress>(kv.value()))
+                .transpose()
+                .map_err(|e| e.to_string())?
+                .map_or(0, |p| p.sequence);
+            if previous.is_some() && self.sequence > sequence {
+                return Ok(true);
+            }
+        }
+        Err("progress publication contention exceeded limit".into())
+    }
+}
+
 impl Coordinator {
+    pub fn work_progress_publisher(&self, execution: &Execution) -> WorkProgressPublisher {
+        WorkProgressPublisher {
+            coordinator: self.clone(),
+            execution: execution.clone(),
+            revision: 0,
+            sequence: 0,
+        }
+    }
     fn work_key(&self, execution: &Execution) -> String {
         format!(
             "{}/merge-work/{}",
@@ -39,26 +138,9 @@ impl Coordinator {
         sequence: u64,
         report: serde_json::Value,
     ) -> Result<bool> {
-        self.transact(
-            vec![Compare::value(
-                execution_key(&self.prefix, &execution.target),
-                CompareOp::Equal,
-                encode(execution),
-            )],
-            vec![
-                TxnOp::put(
-                    self.progress_key(execution),
-                    serde_json::to_vec(&ExecutionProgress { sequence }).unwrap(),
-                    None,
-                ),
-                TxnOp::put(
-                    self.work_key(execution),
-                    serde_json::to_vec(&report).map_err(|e| e.to_string())?,
-                    None,
-                ),
-            ],
-        )
-        .await
+        self.work_progress_publisher(execution)
+            .publish(sequence, report)
+            .await
     }
 
     pub async fn work_progress(&self, execution: &Execution) -> Result<Option<serde_json::Value>> {

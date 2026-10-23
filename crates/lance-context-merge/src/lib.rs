@@ -798,6 +798,16 @@ mod tests {
             .publish_work_progress(&running, 4, report.clone())
             .await
             .unwrap());
+        assert_eq!(
+            coordinator
+                .progress(&running)
+                .await
+                .unwrap()
+                .unwrap()
+                .sequence,
+            5,
+            "a stale detailed report must not overwrite a newer sequence"
+        );
         assert!(coordinator
             .progress_snapshot("absent")
             .await
@@ -806,7 +816,8 @@ mod tests {
         // A stale observation cannot revoke completed new work. Details have
         // their own key, so the established exact-byte sequence CAS still works.
         assert!(!coordinator.revoke_stalled(&running, Some(3)).await.unwrap());
-        assert!(coordinator.revoke_stalled(&running, Some(4)).await.unwrap());
+        assert!(!coordinator.revoke_stalled(&running, Some(4)).await.unwrap());
+        assert!(coordinator.revoke_stalled(&running, Some(5)).await.unwrap());
         assert!(!coordinator
             .publish_work_progress(&running, 5, report.clone())
             .await
@@ -825,6 +836,81 @@ mod tests {
             .publish_work_progress(&running, 6, report)
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn retried_work_progress_cannot_regress_after_ambiguous_or_delayed_publication() {
+        let (coordinator, mut client, proof, _) = fixture().await;
+        let execution = Execution::new("table", "master:catchup", "boot", 3600);
+        assert!(coordinator.reserve(&proof, &execution).await.unwrap());
+        let running = coordinator.start(&execution).await.unwrap().unwrap();
+        let progress_key = format!("{}/merge-progress/{}", coordinator.prefix, running.id);
+        let work_key = format!("{}/merge-work/{}", coordinator.prefix, running.id);
+        // Hold an old request with its original compare revision, then allow
+        // a retry to publish first. This models an RPC whose outcome is unknown.
+        let delayed = Txn::new()
+            .when(vec![
+                Compare::value(
+                    execution_key(&coordinator.prefix, "table"),
+                    CompareOp::Equal,
+                    encode(&running),
+                ),
+                Compare::mod_revision(progress_key.clone(), CompareOp::Equal, 0),
+            ])
+            .and_then(vec![
+                TxnOp::put(progress_key.clone(), br#"{"sequence":1}"#.to_vec(), None),
+                TxnOp::put(work_key, br#"{"sequence":1}"#.to_vec(), None),
+            ]);
+        let mut publisher = coordinator.work_progress_publisher(&running);
+        assert!(publisher
+            .publish(2, serde_json::json!({"sequence":2}))
+            .await
+            .unwrap());
+        assert!(!client.txn(delayed).await.unwrap().succeeded());
+        // A client that lost the acknowledgement still has revision zero.
+        // It must resolve the conflict and preserve normal future publications.
+        let mut lost_ack = coordinator.work_progress_publisher(&running);
+        assert!(lost_ack
+            .publish(2, serde_json::json!({"sequence":2}))
+            .await
+            .unwrap());
+        assert!(lost_ack
+            .publish(3, serde_json::json!({"sequence":3}))
+            .await
+            .unwrap());
+        assert!(publisher
+            .publish(1, serde_json::json!({"sequence":1}))
+            .await
+            .unwrap());
+        let snapshot = coordinator
+            .progress_snapshot("table")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.progress.unwrap().sequence, 3);
+        assert_eq!(snapshot.work_report.unwrap()["sequence"], 3);
+        let frozen = coordinator.freeze(&proof, &running).await.unwrap().unwrap();
+        assert!(!lost_ack
+            .publish(4, serde_json::json!({"sequence":4}))
+            .await
+            .unwrap());
+        assert!(coordinator
+            .authorize_commit(&running, "file:///table", "base", 7)
+            .await
+            .is_err());
+        assert!(coordinator.finish_recovery(&proof, &frozen).await.unwrap());
+        let recovered = coordinator.get("table").await.unwrap().unwrap();
+        assert!(coordinator.release(&proof, &recovered).await.unwrap());
+        assert!(!publisher
+            .publish(5, serde_json::json!({"sequence":5}))
+            .await
+            .unwrap());
+        assert!(coordinator
+            .progress_snapshot("table")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
