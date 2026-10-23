@@ -329,7 +329,7 @@ async fn try_scan_once(state: &Arc<MasterState>, maintain: bool) -> lance::Resul
     let result = scan_once_inner(state, &operation).await;
     // Maintenance runs under the same writer lock as the scan that just
     // created the versions, and its failure never fails the scan round.
-    if maintain {
+    if maintain && result.is_ok() {
         operation.phase("stats_maintenance");
         if let Err(e) = maintain_stats(state).await {
             tracing::warn!(error = %e, "stats maintenance failed");
@@ -501,7 +501,6 @@ async fn scan_once_inner(
         }
     }
     snapshot.sort_by(|a, b| a.name.cmp(&b.name));
-    record_backlog_gauges(&snapshot);
 
     // Retire experiments with no writes for the configured window. Each is
     // merged, compacted and verified quiescent first; only then is its row
@@ -547,7 +546,6 @@ async fn scan_once_inner(
     }
     metrics::histogram!("master_stats_retire_duration_seconds")
         .record(retire_start.elapsed().as_secs_f64());
-    metrics::gauge!("master_stats_hot_experiments").set(snapshot.len() as f64);
 
     operation.phase("commit_snapshot");
     let mut stats = state.stats.lock().await;
@@ -563,30 +561,7 @@ async fn scan_once_inner(
         }
     }
 
-    // An empty snapshot is ambiguous at the store layer, so disambiguate here
-    // where the inputs are in scope. `carry_over` above already re-adds the
-    // previous row for every experiment that is still registered but failed to
-    // observe, so an empty snapshot with `failed > 0` means the failures were
-    // total -- refuse that wipe (write_snapshot no-ops). Empty with no failures
-    // means the registry drained to zero, or everything left was retired: a
-    // legitimate wipe that must be written through, otherwise rows for
-    // deregistered experiments persist forever and keep feeding the compaction
-    // and WAL-merge sweeps.
-    let write = if snapshot.is_empty() && failed == 0 {
-        stats.replace_snapshot(&snapshot).await
-    } else {
-        stats.write_snapshot(&snapshot).await
-    };
-    if let Err(e) = write {
-        tracing::warn!(error = %e, "stats snapshot write failed");
-    }
-
-    // Publish the round's snapshot for the read path. Done after the write so
-    // the cache never advertises rows that failed to commit, and while still
-    // holding the stats lock so a concurrent round cannot interleave and
-    // publish an older snapshot over a newer one.
-    *state.stats_cache.write().await = Arc::new(snapshot);
-    drop(stats);
+    publish_snapshot(&mut stats, &state.stats_cache, snapshot, failed).await?;
 
     metrics::histogram!("master_scan_duration_seconds").record(scan_start.elapsed().as_secs_f64());
     // How much of the round was avoided by the version check. A ratio near 1 is
@@ -615,7 +590,35 @@ async fn scan_once_inner(
     metrics::gauge!("master_experiments_total").set(live_count as f64);
     metrics::gauge!("master_rollout_rows_total").set(total_rows as f64);
     metrics::gauge!("master_rollout_fragments_total").set(total_fragments as f64);
+    drop(stats);
     Ok(count)
+}
+
+/// Caller holds the stats writer coordination lock and the local stats mutex.
+/// A failed or ambiguous write must not replace a previously published backlog
+/// with an uncommitted low/empty observation or count as a successful scan.
+async fn publish_snapshot(
+    stats: &mut crate::stats_store::StatsStore,
+    cache: &tokio::sync::RwLock<Arc<Vec<StatRow>>>,
+    snapshot: Vec<StatRow>,
+    failed_observations: usize,
+) -> lance::Result<()> {
+    // Failed observations normally carry their previous row forward. If no
+    // row survives, absence is unknown, not proof of an empty registry.
+    if snapshot.is_empty() && failed_observations > 0 {
+        return Err(lance::Error::io(
+            "empty stats snapshot contains failed observations; previous snapshot retained",
+        ));
+    }
+    // Empty with no failed observations is an intentional, durable clear.
+    stats.replace_snapshot(&snapshot).await?;
+    // Acquire the cache lock before publishing any gauges: cancellation while
+    // waiting must not expose new gauges paired with the previous cache.
+    let mut cached = cache.write().await;
+    record_backlog_gauges(&snapshot);
+    metrics::gauge!("master_stats_hot_experiments").set(snapshot.len() as f64);
+    *cached = Arc::new(snapshot);
+    Ok(())
 }
 
 /// Open one experiment read-only and refresh its stats row, skipping the
@@ -1329,6 +1332,96 @@ mod maintenance_alerting_tests {
             unreclaimed, 246_000,
             "a bloated table that has never been reclaimed must report its full backlog"
         );
+    }
+}
+
+#[cfg(test)]
+mod snapshot_publication_tests {
+    use super::*;
+    use crate::stats_store::StatsStore;
+    use tokio::sync::RwLock;
+
+    fn row(pending: i64) -> StatRow {
+        StatRow {
+            name: "hot".into(),
+            uri: "/unused/hot".into(),
+            row_count: 1,
+            fragment_count: 1,
+            last_updated: 1,
+            pending_wal_generations: pending,
+            last_compaction: StatRow::NO_COMPACTION,
+            total_compactions: 0,
+            scanned_at: 1,
+            version: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_commit_preserves_published_backlog_until_successful_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stats.lance");
+        let uri = path.to_str().unwrap();
+        let mut stats = StatsStore::open_or_create(uri, None).await.unwrap();
+        let cache = RwLock::new(Arc::new(Vec::new()));
+        publish_snapshot(&mut stats, &cache, vec![row(5000)], 0)
+            .await
+            .unwrap();
+        let previous = cache.read().await.clone();
+
+        // A real storage write failure, without mocking the publication path.
+        // Keep the committed dataset intact so recovery can verify its rows.
+        let retained = dir.path().join("retained.lance");
+        std::fs::rename(&path, &retained).unwrap();
+        std::fs::write(&path, b"storage unavailable").unwrap();
+        let result = publish_snapshot(&mut stats, &cache, vec![row(0)], 0).await;
+        std::fs::remove_file(&path).unwrap();
+        std::fs::rename(&retained, &path).unwrap();
+        assert!(result.is_err(), "a failed commit must fail the scan");
+        assert!(Arc::ptr_eq(&previous, &*cache.read().await));
+        assert_eq!(stats.get("hot").await.unwrap(), Some(row(5000)));
+
+        publish_snapshot(&mut stats, &cache, vec![row(0)], 0)
+            .await
+            .unwrap();
+        assert_eq!(cache.read().await.as_ref(), &vec![row(0)]);
+        assert_eq!(stats.get("hot").await.unwrap(), Some(row(0)));
+    }
+
+    #[tokio::test]
+    async fn failed_observations_cannot_publish_an_empty_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().join("stats.lance");
+        let mut stats = StatsStore::open_or_create(uri.to_str().unwrap(), None)
+            .await
+            .unwrap();
+        let cache = RwLock::new(Arc::new(Vec::new()));
+        publish_snapshot(&mut stats, &cache, vec![row(5000)], 0)
+            .await
+            .unwrap();
+        let previous = cache.read().await.clone();
+        assert!(publish_snapshot(&mut stats, &cache, Vec::new(), 1)
+            .await
+            .is_err());
+        assert!(Arc::ptr_eq(&previous, &*cache.read().await));
+        assert_eq!(stats.get("hot").await.unwrap(), Some(row(5000)));
+    }
+
+    #[tokio::test]
+    async fn confirmed_empty_snapshot_clears_storage_and_cache_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().join("stats.lance");
+        let mut stats = StatsStore::open_or_create(uri.to_str().unwrap(), None)
+            .await
+            .unwrap();
+        let cache = RwLock::new(Arc::new(Vec::new()));
+        publish_snapshot(&mut stats, &cache, vec![row(5000)], 0)
+            .await
+            .unwrap();
+        publish_snapshot(&mut stats, &cache, Vec::new(), 0)
+            .await
+            .unwrap();
+        assert!(cache.read().await.is_empty());
+        assert_eq!(stats.count(None).await.unwrap(), 0);
     }
 }
 
