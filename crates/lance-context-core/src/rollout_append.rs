@@ -362,6 +362,8 @@ pub(crate) async fn reconcile_shard(dataset: &Dataset, shard: Uuid) -> Result<us
 
 /// Metadata-only WAL demand probe for rollout and generic tables. This opens no
 /// writer, evolves no schema, and reads no generation payloads.
+///
+/// Use [`SealedWalProbe`] when checking shards repeatedly in one execution.
 pub async fn has_sealed_wal(
     uri: &str,
     session: Option<Arc<Session>>,
@@ -369,6 +371,33 @@ pub async fn has_sealed_wal(
 ) -> Result<bool> {
     let dataset = StorageBase::load_with_options(uri, None, session).await?;
     dataset_has_sealed_wal(&dataset, shards).await
+}
+
+/// Reuse the read-only base handle while refreshing each shard's latest manifest.
+/// The base version is used only to resolve storage and the WAL root; no base
+/// watermarks, shard manifests, or empty results are cached by this probe.
+pub struct SealedWalProbe {
+    dataset: Dataset,
+}
+
+impl SealedWalProbe {
+    pub async fn open(uri: &str, session: Option<Arc<Session>>) -> Result<Self> {
+        Ok(Self {
+            dataset: StorageBase::load_with_options(uri, None, session).await?,
+        })
+    }
+
+    pub async fn has_sealed_wal(&self, shard: &str) -> Result<bool> {
+        dataset_shard_has_sealed_wal(&self.dataset, derive_shard_id(Some(shard))).await
+    }
+}
+
+async fn dataset_shard_has_sealed_wal(dataset: &Dataset, shard: Uuid) -> Result<bool> {
+    Ok(shard_store(dataset, shard)
+        .await?
+        .refresh_latest()
+        .await?
+        .is_some_and(|manifest| !manifest.sstables.is_empty()))
 }
 
 async fn dataset_has_sealed_wal(dataset: &Dataset, shards: &[String]) -> Result<bool> {
@@ -380,12 +409,8 @@ async fn dataset_has_sealed_wal(dataset: &Dataset, shards: &[String]) -> Result<
     let mut seen = HashSet::new();
     for name in shards {
         let id = derive_shard_id(Some(name));
-        if seen.insert(id) {
-            if let Some(manifest) = shard_store(dataset, id).await?.refresh_latest().await? {
-                if !manifest.sstables.is_empty() {
-                    return Ok(true);
-                }
-            }
+        if seen.insert(id) && dataset_shard_has_sealed_wal(dataset, id).await? {
+            return Ok(true);
         }
     }
     Ok(false)

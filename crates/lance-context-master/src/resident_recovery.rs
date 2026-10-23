@@ -573,6 +573,165 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn empty_native_preflight_preserves_racing_flush_and_successor_catchup() {
+        let (_dir, initial) = generic_fixture_with_auto(true).await;
+        let mut cfg = initial.config.clone();
+        // Exercise the worst-case positive probe: only the final writer has WAL.
+        cfg.catchup.shards = (0..19).map(|i| format!("empty-{i}")).collect();
+        cfg.catchup.shards.push("writer".into());
+        let state = MasterState::new(cfg).await.unwrap();
+        let successor = MasterState::new(state.config.clone()).await.unwrap();
+        let generic = generic_writer(&state, "preflight").await;
+        let rollout = write(&state, "preflight", 0).await;
+
+        for target in ["generic:preflight", "preflight"] {
+            let uri = if target.starts_with("generic:") {
+                state.generic_uri("preflight")
+            } else {
+                state.rollout_uri("preflight")
+            };
+            let before = lance::Dataset::open(&uri).await.unwrap().version().version;
+            let probe = lance_context_core::rollout_append::SealedWalProbe::open(&uri, None)
+                .await
+                .unwrap();
+            assert!(!probe.has_sealed_wal("writer").await.unwrap());
+            let c = state.task_store.merge_coordinator();
+            state
+                .task_store
+                .enqueue(TaskKind::MergeWal, target, vec![])
+                .await
+                .unwrap();
+            let claim = state
+                .task_store
+                .claim_resident_merge(&crate::local_merge::targets(&state.config))
+                .await
+                .unwrap()
+                .unwrap();
+            let result = crate::merge_execution::run_merge_wal(&state, &claim).await;
+            assert_eq!(
+                result.as_ref().unwrap(),
+                "local WAL merge reclaimed 0 generations"
+            );
+            assert!(c.get(target).await.unwrap().is_none());
+            assert_eq!(
+                lance::Dataset::open(&uri).await.unwrap().version().version,
+                before,
+                "empty execution must not evolve schema or commit a base version"
+            );
+            assert!(
+                c.request_page(None).await.unwrap().0.is_empty(),
+                "an empty pass must not schedule its own continuation"
+            );
+
+            // A flush arrives after the empty observation but before task finish.
+            // The request must survive dedupe against that still-active task.
+            if target.starts_with("generic:") {
+                generic_write(&generic, "late", "preserved").await;
+            } else {
+                let dto = serde_json::from_value(serde_json::json!({
+                    "id": "late", "rollout_id": "r", "content": "preserved"
+                }))
+                .unwrap();
+                rollout
+                    .add(&[lance_context_core::rollout_record_from_add_request(&dto)])
+                    .await
+                    .unwrap();
+                rollout.flush().await.unwrap();
+            }
+            assert!(
+                probe.has_sealed_wal("writer").await.unwrap(),
+                "the retained base handle must observe a flush after its empty check"
+            );
+            c.request_merge(target).await.unwrap();
+            let request = c.request_page(None).await.unwrap().0.remove(0);
+            crate::scheduler::enqueue_merge_request(&successor, &c, &request)
+                .await
+                .unwrap();
+            assert_eq!(c.request_page(None).await.unwrap().0.len(), 1);
+            state.task_store.finish(claim, result).await.unwrap();
+            crate::scheduler::enqueue_merge_request(&successor, &c, &request)
+                .await
+                .unwrap();
+            let claim = successor
+                .task_store
+                .claim_resident_merge(&crate::local_merge::targets(&successor.config))
+                .await
+                .unwrap()
+                .unwrap();
+            let result = crate::merge_execution::run_merge_wal(&successor, &claim).await;
+            assert_eq!(
+                result.as_ref().unwrap(),
+                "local WAL merge reclaimed 1 generations"
+            );
+            successor.task_store.finish(claim, result).await.unwrap();
+            assert!(
+                !probe.has_sealed_wal("writer").await.unwrap(),
+                "the same probe must observe a drain after the base version changes"
+            );
+            assert_eq!(
+                lance::Dataset::open(&uri)
+                    .await
+                    .unwrap()
+                    .count_rows(None)
+                    .await
+                    .unwrap(),
+                1
+            );
+            assert!(!lance_context_core::rollout_append::has_sealed_wal(
+                &uri,
+                None,
+                &state.config.catchup.shards,
+            )
+            .await
+            .unwrap());
+            assert!(c.request_page(None).await.unwrap().0.is_empty());
+            assert_eq!(
+                successor.local_append.as_ref().unwrap().budget.reserved(),
+                0
+            );
+        }
+        assert_eq!(
+            generic.list(None, None).await.unwrap()[0]["text"],
+            "preserved"
+        );
+        assert_eq!(
+            rollout
+                .get_by_id("late")
+                .await
+                .unwrap()
+                .unwrap()
+                .content
+                .as_deref(),
+            Some("preserved")
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn unreadable_native_preflight_is_not_successful_empty_work() {
+        let (_dir, state) = generic_fixture_with_auto(true).await;
+        let target = "missing-table";
+        state
+            .task_store
+            .enqueue(TaskKind::MergeWal, target, vec![])
+            .await
+            .unwrap();
+        let claim = state
+            .task_store
+            .claim_resident_merge(&crate::local_merge::targets(&state.config))
+            .await
+            .unwrap()
+            .unwrap();
+        let result = crate::merge_execution::run_merge_wal(&state, &claim).await;
+        assert!(
+            result.is_err(),
+            "a failed metadata read must not become zero-work success"
+        );
+        state.task_store.finish(claim, result).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn automatic_new_table_waits_for_background_then_catches_up_across_masters() {
         use lance_context_merge::{Execution, Phase};
         let (_dir, state) = generic_fixture_with_auto(true).await;

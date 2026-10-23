@@ -2,6 +2,7 @@ use super::Result;
 use crate::{config::MasterConfig, maintenance_execution, state::MasterState};
 use futures::future::BoxFuture;
 use lance_context_api::TaskKind;
+use lance_context_core::rollout_append::SealedWalProbe;
 use lance_context_core::{
     GenericStore, GenericStoreOptions, MergeMemoryBudget, RolloutStore, RolloutStoreOptions,
 };
@@ -186,6 +187,17 @@ pub(crate) async fn merge_local(
         };
         format!("{prefix} {total} generations")
     };
+    // Canonical claim reconciliation and the maintenance fence already surround
+    // this future. Retain one read-only base handle and check fresh manifests
+    // before opening full stores, including the empty shards of a busy table.
+    // The normal activity/full-resweep policy below still applies.
+    let uri = match target.strip_prefix("generic:") {
+        Some(name) => state.generic_uri(name),
+        None => state.rollout_uri(target),
+    };
+    let probe = SealedWalProbe::open(&uri, Some(session.clone()))
+        .await
+        .map_err(|e| e.to_string())?;
     let started = tokio::time::Instant::now();
     // This is only an admission time slice. A progressing operation already
     // admitted may run beyond it; cancellation is based on lack of progress.
@@ -200,6 +212,7 @@ pub(crate) async fn merge_local(
         let reclaimed = run_pipeline(selected.iter().copied(), config.pipeline_enabled, |index| {
             let shard = &config.shards[index];
             let activity = &activity;
+            let probe = &probe;
             let session = session.clone();
             let budget = budget.clone();
             async move {
@@ -209,7 +222,11 @@ pub(crate) async fn merge_local(
                     return Ok(Box::pin(async { Ok(0usize) }) as BoxFuture<'_, Result<usize>>);
                 }
                 let read_started = tokio::time::Instant::now();
-                let commit = prepare_shard(state, target, shard, session, budget).await?;
+                // Keep the existing ordered activity/progress messages for
+                // empty shards as well; only their full store opens disappear.
+                let commit = prepare_nonempty_shard(state, target, shard, probe, session, budget)
+                    .await?
+                    .unwrap_or_else(|| Box::pin(async { Ok(0) }));
                 let prepare_secs = read_started.elapsed().as_secs_f64();
                 Ok(Box::pin(async move {
                     let commit_started = tokio::time::Instant::now();
@@ -253,6 +270,33 @@ pub(crate) async fn merge_local(
         metrics::counter!("master_resident_merge_continuations_total").increment(1);
     }
     Ok(detail(total))
+}
+
+async fn prepare_nonempty_shard(
+    state: &Arc<MasterState>,
+    target: &str,
+    shard: &str,
+    probe: &SealedWalProbe,
+    session: Arc<lance::session::Session>,
+    budget: Arc<MergeMemoryBudget>,
+) -> Result<Option<BoxFuture<'static, Result<usize>>>> {
+    let started = tokio::time::Instant::now();
+    // Every check refreshes the manifest; an earlier empty result does not hide
+    // a later flush. Errors retain the normal failure/recovery path.
+    let pending = probe
+        .has_sealed_wal(shard)
+        .await
+        .map_err(|e| e.to_string())?;
+    metrics::histogram!("master_catchup_shard_probe_seconds",
+        "result" => if pending { "pending" } else { "empty" })
+    .record(started.elapsed().as_secs_f64());
+    if !pending {
+        metrics::counter!("master_catchup_empty_shard_probes_total").increment(1);
+        return Ok(None);
+    }
+    prepare_shard(state, target, shard, session, budget)
+        .await
+        .map(Some)
 }
 
 /// Read sealed WAL without acquiring a writer epoch. The returned future owns
@@ -407,6 +451,148 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::{Notify, Semaphore};
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS; local metadata benchmark"]
+    async fn empty_preflight_storage_benchmark() {
+        use clap::Parser;
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = MasterConfig::parse_from(["test"]);
+        config.data_dir = dir.path().to_string_lossy().into();
+        config.etcd.etcd_endpoints = std::env::var("ETCD_TEST_ENDPOINTS")
+            .unwrap()
+            .split(',')
+            .map(str::to_owned)
+            .collect();
+        config.etcd.etcd_prefix = format!(
+            "/empty-preflight-bench/{}",
+            lance_context_core::generate_id()
+        );
+        config.catchup.shards = (0..20).map(|i| format!("writer-{i}")).collect();
+        config.worker_endpoints.clear();
+        config.stats_scan_interval_secs = 0;
+        let state = MasterState::new(config).await.unwrap();
+
+        async fn write_sample(
+            state: &MasterState,
+            target: &str,
+            shard: &str,
+            id: &str,
+        ) -> RolloutStore {
+            let writer = RolloutStore::open_with_options(
+                &state.rollout_uri(target),
+                RolloutStoreOptions {
+                    shard_id: Some(shard.into()),
+                    merge_after_generations: Some(0),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let dto = serde_json::from_value(serde_json::json!({
+                "id": id, "rollout_id": "r", "content": "benchmark"
+            }))
+            .unwrap();
+            writer
+                .add(&[lance_context_core::rollout_record_from_add_request(&dto)])
+                .await
+                .unwrap();
+            writer.flush().await.unwrap();
+            writer
+        }
+
+        // Equivalent tables with real, drained manifests on all twenty shards.
+        // Keep setup outside measurements and alternate which path runs first.
+        for target in ["baseline", "filtered"] {
+            for shard in &state.config.catchup.shards {
+                let mut writer = write_sample(&state, target, shard, shard).await;
+                assert_eq!(writer.cleanup_own_shard().await.unwrap(), 1);
+                writer.close().await.unwrap();
+            }
+        }
+        let session = RolloutStore::build_session(96 * 1024 * 1024, 32 * 1024 * 1024);
+        let budget = MergeMemoryBudget::new(state.config.catchup.merge_memory_bytes);
+        for case in ["empty", "first_shard", "last_shard", "all_shards"] {
+            for sample in 0..6 {
+                for filtered in if sample % 2 == 0 {
+                    [false, true]
+                } else {
+                    [true, false]
+                } {
+                    let target = if filtered { "filtered" } else { "baseline" };
+                    let mut writers = Vec::new();
+                    if case != "empty" {
+                        for (index, shard) in state.config.catchup.shards.iter().enumerate() {
+                            if case == "all_shards"
+                                || case == "last_shard" && index == 19
+                                || case == "first_shard" && index == 0
+                            {
+                                writers.push(
+                                    write_sample(
+                                        &state,
+                                        target,
+                                        shard,
+                                        &format!("{case}-{sample}-{index}"),
+                                    )
+                                    .await,
+                                );
+                            }
+                        }
+                    }
+                    let started = tokio::time::Instant::now();
+                    let probe = if filtered {
+                        Some(
+                            SealedWalProbe::open(&state.rollout_uri(target), Some(session.clone()))
+                                .await
+                                .unwrap(),
+                        )
+                    } else {
+                        None
+                    };
+                    let reclaimed = run_pipeline(
+                        state.config.catchup.shards.iter(),
+                        state.config.catchup.pipeline_enabled,
+                        |shard| {
+                            let probe = probe.as_ref();
+                            let state = &state;
+                            let session = session.clone();
+                            let budget = budget.clone();
+                            async move {
+                                if let Some(probe) = probe {
+                                    Ok(prepare_nonempty_shard(
+                                        state, target, shard, probe, session, budget,
+                                    )
+                                    .await?
+                                    .unwrap_or_else(|| Box::pin(async { Ok(0) })))
+                                } else {
+                                    prepare_shard(state, target, shard, session, budget).await
+                                }
+                            }
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    eprintln!("storage_benchmark case={case} sample={sample} filtered={filtered} micros={} reclaimed={reclaimed}", started.elapsed().as_micros());
+                    assert_eq!(reclaimed, writers.len());
+                    for writer in &mut writers {
+                        writer.close().await.unwrap();
+                    }
+                    assert_eq!(budget.reserved(), 0);
+                }
+            }
+        }
+        for target in ["baseline", "filtered"] {
+            assert_eq!(
+                lance::Dataset::open(&state.rollout_uri(target))
+                    .await
+                    .unwrap()
+                    .count_rows(None)
+                    .await
+                    .unwrap(),
+                20 + 6 + 6 + 6 * 20
+            );
+        }
+    }
 
     #[tokio::test]
     async fn sparse_shards_require_a_fresh_full_sweep_before_completion() {
