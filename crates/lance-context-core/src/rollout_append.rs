@@ -373,22 +373,33 @@ pub async fn has_sealed_wal(
     dataset_has_sealed_wal(&dataset, shards).await
 }
 
-/// Reuse the read-only base handle while refreshing each shard's latest manifest.
-/// The base version is used only to resolve storage and the WAL root; no base
-/// watermarks, shard manifests, or empty results are cached by this probe.
+/// Resolve the base's storage and WAL root once, then refresh each shard's latest
+/// manifest. Retain only the storage handle and path, so a long merge does not
+/// pin an obsolete base manifest. No watermarks or empty results are cached.
 pub struct SealedWalProbe {
-    dataset: Dataset,
+    store: Arc<lance_io::object_store::ObjectStore>,
+    root: object_store::path::Path,
 }
 
 impl SealedWalProbe {
     pub async fn open(uri: &str, session: Option<Arc<Session>>) -> Result<Self> {
+        let dataset = StorageBase::load_with_options(uri, None, session).await?;
         Ok(Self {
-            dataset: StorageBase::load_with_options(uri, None, session).await?,
+            store: dataset.object_store(None).await?,
+            root: dataset.branch_location().path.clone(),
         })
     }
 
     pub async fn has_sealed_wal(&self, shard: &str) -> Result<bool> {
-        dataset_shard_has_sealed_wal(&self.dataset, derive_shard_id(Some(shard))).await
+        Ok(ShardManifestStore::new(
+            self.store.clone(),
+            &self.root,
+            derive_shard_id(Some(shard)),
+            16,
+        )
+        .refresh_latest()
+        .await?
+        .is_some_and(|manifest| !manifest.sstables.is_empty()))
     }
 }
 

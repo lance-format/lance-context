@@ -188,7 +188,7 @@ pub(crate) async fn merge_local(
         format!("{prefix} {total} generations")
     };
     // Canonical claim reconciliation and the maintenance fence already surround
-    // this future. Retain one read-only base handle and check fresh manifests
+    // this future. Resolve the WAL root once and check fresh manifests
     // before opening full stores, including the empty shards of a busy table.
     // The normal activity/full-resweep policy below still applies.
     let uri = match target.strip_prefix("generic:") {
