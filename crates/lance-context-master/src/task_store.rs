@@ -22,6 +22,10 @@ use tokio::task::JoinHandle;
 use crate::config::MasterConfig;
 use crate::eligibility;
 
+#[path = "task_admission.rs"]
+mod diagnostic;
+pub(crate) use diagnostic::AdmissionExplanation;
+
 const TASK_POLL_BATCH: usize = 256;
 const SCHEDULER_CLAIM_MAX_CANDIDATES: usize = 64;
 const SCHEDULER_CLAIM_MAX_PAGES: usize = 4;
@@ -520,6 +524,13 @@ impl TaskStore {
 
     pub async fn get(&self, id: &str) -> lance::Result<Option<TaskRecord>> {
         self.inner.get(id).await
+    }
+
+    pub(crate) async fn explain_admission(
+        &self,
+        id: &str,
+    ) -> lance::Result<Option<AdmissionExplanation>> {
+        self.inner.explain_admission(id).await
     }
 
     pub async fn queue_depth(&self) -> lance::Result<usize> {

@@ -839,6 +839,45 @@ pub async fn get_task(
     }
 }
 
+/// `GET /api/v1/tasks/{id}/admission` explains this master's current task
+/// preconditions. On demand only: two bounded etcd reads, no fleet/payload scan,
+/// claim, recovery, or fencing action. Pool capacity and the final claim CAS
+/// remain separate; a successful precheck is not permission to replace an owner.
+async fn task_admission(
+    State(state): State<Arc<MasterState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, MasterError> {
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(MasterError::InvalidRequest("invalid task id".into()));
+    }
+    let diagnostic = state
+        .task_store
+        .explain_admission(&id)
+        .await
+        .map_err(MasterError::from_lance)?
+        .ok_or_else(|| MasterError::NotFound(format!("task '{id}' not found")))?;
+    let executor = state.admission.status();
+    let executor_blocker = if !executor.accepting {
+        Some("executor_draining")
+    } else if diagnostic.kind == TaskKind::MergeWal && !state.config.maintenance.claim_wal_merges {
+        Some("wal_claims_disabled")
+    } else {
+        None
+    };
+    Ok(Json(serde_json::json!({
+        "executor_id": executor.executor_id,
+        "executor_accepting": executor.accepting,
+        "wal_claims_enabled": state.config.maintenance.claim_wal_merges,
+        "executor_blocker": executor_blocker,
+        "diagnostic": diagnostic,
+    })))
+}
+
 /// Call through the exact Pod endpoint. The process identity prevents a load
 /// balancer or replacement Pod from draining a different executor by mistake.
 #[derive(Deserialize)]
@@ -986,6 +1025,7 @@ pub fn api_router() -> Router<Arc<MasterState>> {
         .route("/registry/diff", get(registry_diff))
         .route("/registry/backfill", post(registry_backfill))
         .route("/tasks/{id}", get(get_task))
+        .route("/tasks/{id}/admission", get(task_admission))
         .route("/rescan", post(rescan))
 }
 
@@ -1100,6 +1140,68 @@ mod tests {
         std::env::var("ETCD_TEST_ENDPOINTS")
             .map(|value| value.split(',').map(str::to_string).collect())
             .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn admission_diagnostic_route_reports_local_gates_and_never_claims() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config(&dir);
+        config.maintenance.claim_wal_merges = false;
+        let state = MasterState::new(config).await.unwrap();
+        let task = state
+            .task_store
+            .enqueue(TaskKind::MergeWal, "hot", vec![])
+            .await
+            .unwrap();
+        let router = api_router().with_state(state.clone());
+        let request = || {
+            Request::builder()
+                .uri(format!("/tasks/{}/admission", task.id))
+                .body(Body::empty())
+                .unwrap()
+        };
+        let response = router.clone().oneshot(request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(report["executor_id"], state.admission.status().executor_id);
+        assert_eq!(report["executor_blocker"], "wal_claims_disabled");
+        assert_eq!(
+            report["diagnostic"]["reason"],
+            "admission_preconditions_satisfied"
+        );
+        state.admission.begin_drain();
+        let response = router.clone().oneshot(request()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(report["executor_blocker"], "executor_draining");
+        assert_eq!(
+            state.task_store.get(&task.id).await.unwrap().unwrap().state,
+            TaskState::Queued
+        );
+        for (id, expected) in [
+            (generate_id(), StatusCode::NOT_FOUND),
+            ("x".repeat(129), StatusCode::BAD_REQUEST),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/tasks/{id}/admission"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
     }
 
     #[tokio::test]

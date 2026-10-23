@@ -13,7 +13,8 @@ use lance_context_api::TaskKind;
 use lance_context_merge::rollout::MergeRollout;
 
 /// Why a queued task was not attempted by this poller.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Skip {
     /// The poller's kind set does not include this task kind.
     KindNotRunnable,
@@ -51,7 +52,7 @@ pub struct Snapshot<'a> {
 }
 
 /// How the candidate would be claimed if admitted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct ClaimShape {
     /// Compact/IndexId preparing outside the table write lock.
     pub preparing: bool,
