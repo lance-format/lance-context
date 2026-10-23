@@ -101,3 +101,23 @@ The source paths and regression tests are implemented but final validation is
 still running. Keep automatic routing disabled until the initial transition
 is proven. Existing production helpers remain necessary until the handoff is
 demonstrated.
+
+### Native key-only delete qualification
+
+`MASTER_LOCAL_MERGE_KEY_ONLY_DELETE_TARGETS=hot-rollout` opts exact resident
+rollout targets into hash-based key deletion before the existing WAL append.
+The default is empty; wildcards, generic tables and draining targets are rejected.
+This does not enable append-only semantics: existing matching rows are still
+removed, and the claim, fencing, append and manifest-drain ordering stay intact.
+
+Each join uses at most 1,024 source rows, sharing the already budgeted WAL arrays.
+It supplies the complete source schema and disables indexed joins so the target
+scan projects only keys and row IDs, not inline payloads. If the base schema
+changes after preparation, the merge retains predicate deletion. Predicate deletion can
+be faster with a covering BTree, so qualify both latency and memory on a scoped
+native executor before enabling this option for a workload. Worker self-merges,
+generic tables and dedicated legacy execution retain their existing path.
+
+`rollout_wal_delete_batches_total{strategy="key_only_hash"}` counts completed
+new-path batches; compare it with `strategy="predicate"` during qualification.
+These counters establish execution-path use, not WAL reclamation or throughput.

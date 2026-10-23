@@ -15,6 +15,14 @@ pub struct LocalMergeConfig {
     /// Neither setting certifies that historical legacy writers have drained.
     #[arg(long, env = "MASTER_LOCAL_MERGE_TARGETS", value_delimiter = ',')]
     pub master_local_merge_targets: Vec<String>,
+    /// Exact rollout targets for bounded key-only hash deletion during native
+    /// upserts. Empty retains predicate deletion; qualify on traffic first.
+    #[arg(
+        long,
+        env = "MASTER_LOCAL_MERGE_KEY_ONLY_DELETE_TARGETS",
+        value_delimiter = ','
+    )]
+    pub master_local_merge_key_only_delete_targets: Vec<String>,
 }
 
 impl LocalMergeConfig {
@@ -56,6 +64,18 @@ pub(crate) fn targets(config: &MasterConfig) -> Vec<String> {
 }
 
 pub(crate) fn validate(config: &MasterConfig) -> Result<(), String> {
+    for target in &config
+        .local_merge
+        .master_local_merge_key_only_delete_targets
+    {
+        if target == "*"
+            || target.starts_with("generic:")
+            || lance_context_core::validate_store_name(target).is_err()
+            || !selected(config, target)
+        {
+            return Err("key-only deletes require exact resident rollout targets".into());
+        }
+    }
     if config.local_merge.master_local_merge_auto
         && (!config.merge_rollout.fence_legacy
             || config.local_merge.master_local_merge_targets != ["*"]
@@ -119,6 +139,28 @@ pub(crate) async fn run(state: &Arc<MasterState>, target: &str) -> Result<String
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn key_only_delete_requires_exact_selected_rollouts() {
+        let mut cfg = MasterConfig::parse_from(["test"]);
+        assert!(cfg
+            .local_merge
+            .master_local_merge_key_only_delete_targets
+            .is_empty());
+        cfg.local_merge.master_local_merge_auto = true;
+        cfg.local_merge.master_local_merge_targets = vec!["*".into()];
+        cfg.catchup.shards = vec!["writer".into()];
+        cfg.merge_rollout.fence_legacy = true;
+        cfg.maintenance.fence_legacy_maintenance = true;
+        for bad in ["*", "generic:rows", "../invalid"] {
+            cfg.local_merge.master_local_merge_key_only_delete_targets = vec![bad.into()];
+            assert!(validate(&cfg).is_err(), "{bad}");
+        }
+        cfg.local_merge.master_local_merge_key_only_delete_targets = vec!["hot".into()];
+        assert!(validate(&cfg).is_ok());
+        cfg.merge_rollout.drain_targets = vec!["hot".into()];
+        assert!(validate(&cfg).is_err());
+    }
 
     #[test]
     fn local_selection_preserves_legacy_and_append_boundaries() {

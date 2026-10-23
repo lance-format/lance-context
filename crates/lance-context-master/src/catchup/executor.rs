@@ -354,6 +354,15 @@ async fn prepare_shard(
             RolloutStore::open_existing_with_options(&state.rollout_uri(target), options)
                 .await
                 .map_err(|e| e.to_string())?;
+        store.set_merge_key_only_delete(
+            state.config.catchup.target.is_none()
+                && state
+                    .config
+                    .local_merge
+                    .master_local_merge_key_only_delete_targets
+                    .iter()
+                    .any(|name| name == target),
+        );
         match store
             .prepare_merge_if_ready(1)
             .await

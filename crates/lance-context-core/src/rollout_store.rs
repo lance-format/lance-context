@@ -669,6 +669,13 @@ impl RolloutStore {
         self.base.maybe_merge_own_shard().await
     }
 
+    /// Opt this handle into bounded key-only hash deletes during WAL upserts.
+    /// The default predicate path can be faster with a covering BTree. This
+    /// changes neither write ownership nor delete/append/drain crash ordering.
+    pub fn set_merge_key_only_delete(&mut self, enabled: bool) {
+        self.base.merge_key_only_delete = enabled;
+    }
+
     /// The shared-lock half of a merge; see `StorageBase::prepare_merge_if_ready`
     /// for the intended read-lock/write-lock split.
     pub async fn prepare_merge_if_ready(
@@ -3434,20 +3441,31 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_merge_joins_inflight_commit_then_retries_without_losing_blob_or_new_wal() {
-        cancellation_recovery_case(false, false).await;
+        cancellation_recovery_case(false, false, false).await;
     }
 
     #[tokio::test]
     async fn recovery_barrier_allows_retry_before_late_old_append_returns() {
-        cancellation_recovery_case(true, false).await;
+        cancellation_recovery_case(true, false, false).await;
     }
 
     #[tokio::test]
     async fn legacy_retirement_barrier_rejects_delayed_unfenced_base_commit() {
-        cancellation_recovery_case(true, true).await;
+        cancellation_recovery_case(true, true, false).await;
     }
 
-    async fn cancellation_recovery_case(fence_old: bool, retired_legacy: bool) {
+    #[tokio::test]
+    async fn key_only_merge_recovers_cancelled_and_fenced_upserts_with_blobs() {
+        for (fence_old, retired_legacy) in [(false, false), (true, false), (true, true)] {
+            cancellation_recovery_case(fence_old, retired_legacy, true).await;
+        }
+    }
+
+    async fn cancellation_recovery_case(
+        fence_old: bool,
+        retired_legacy: bool,
+        key_only_delete: bool,
+    ) {
         use crate::merge_write_scope::{GuardedCommit, MergeWriteScope};
         use lance_table::format::{IndexMetadata, Manifest, Transaction};
         use lance_table::io::commit::{
@@ -3515,6 +3533,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
         let mut store = RolloutStore::open(uri).await.unwrap();
+        if key_only_delete {
+            store
+                .add(&[artifact_record("large", &[1; 4096])])
+                .await
+                .unwrap();
+            store.flush().await.unwrap();
+            store.cleanup_own_shard().await.unwrap();
+            store.set_merge_key_only_delete(true);
+        }
         let bytes = vec![73u8; 2 * 1024 * 1024];
         store
             .add(&[artifact_record("large", &bytes)])
@@ -6085,6 +6112,125 @@ mod tests {
             base.id.clone_from(&wal.id);
             assert_records_eq(&base, &wal);
             assert_eq!(base.binary_payload, wal.binary_payload);
+        });
+    }
+
+    #[test]
+    fn key_only_merge_preserves_upserts_with_partial_indexes_and_large_payloads() {
+        use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched};
+        use lance::index::DatasetIndexExt;
+        use lance_index::{scalar::ScalarIndexParams, IndexType};
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            for index in [None, Some(IndexType::ZoneMap), Some(IndexType::BTree)] {
+                let dir = TempDir::new().unwrap();
+                let mut store = RolloutStore::open_with_options(
+                    &dir.path().to_string_lossy(),
+                    RolloutStoreOptions {
+                        merge_max_generations: Some(1),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+                for range in [0..2048, 2048..4096] {
+                    let records: Vec<_> = range
+                        .clone()
+                        .map(|i| artifact_record(&format!("key-{i}"), &[1; 4096]))
+                        .collect();
+                    store.add(&records).await.unwrap();
+                    store.flush().await.unwrap();
+                    assert_eq!(store.cleanup_own_shard().await.unwrap(), 1);
+                    if range.start == 0 {
+                        if let Some(kind) = index {
+                            store
+                                .base
+                                .dataset
+                                .create_index_builder(&["id"], kind, &ScalarIndexParams::default())
+                                .name(ROLLOUT_ID_INDEX_NAME.into())
+                                .replace(true)
+                                .await
+                                .unwrap();
+                        }
+                    }
+                }
+                // The second seed append leaves a partial index. Update both
+                // covered and uncovered keys, and append keys absent from base.
+                let ids: Vec<_> = (0..1024)
+                    .chain(3072..5120)
+                    .map(|i| format!("key-{i}"))
+                    .chain(std::iter::once("quote' AND false -- 你好".into()))
+                    .collect();
+                let records: Vec<_> = ids
+                    .iter()
+                    .map(|id| artifact_record(id, &[2; 4096]))
+                    .collect();
+                let source = store.records_to_batch(&records[..1024]).unwrap();
+                let plan = MergeInsertBuilder::try_new(
+                    Arc::new(store.base.dataset.clone()),
+                    vec!["id".into()],
+                )
+                .unwrap()
+                .when_matched(WhenMatched::Delete)
+                .when_not_matched(WhenNotMatched::DoNothing)
+                .use_index(false)
+                .try_build()
+                .unwrap()
+                .analyze_plan_batches(vec![source])
+                .await
+                .unwrap();
+                let scans: Vec<_> = plan
+                    .lines()
+                    .filter(|line| line.contains("LanceRead:"))
+                    .collect();
+                assert!(!scans.is_empty(), "{plan}");
+                assert!(
+                    scans.iter().all(|line| line.contains("projection=[id]")),
+                    "{plan}"
+                );
+                store.set_merge_key_only_delete(true);
+                // Multiple bounded chunks, followed by same-content replay.
+                for _ in 0..2 {
+                    store.add(&records).await.unwrap();
+                    store.flush().await.unwrap();
+                    assert_eq!(store.cleanup_own_shard().await.unwrap(), 1);
+                    assert_eq!(flushed_generation_count(&store).await, 0);
+                    assert_eq!(store.base.dataset.count_rows(None).await.unwrap(), 5121);
+                    let mut scanner = store.base.dataset.scan();
+                    scanner.project(&["id", "binary_payload"]).unwrap();
+                    let mut stream = scanner.try_into_stream().await.unwrap();
+                    let mut seen = std::collections::HashSet::new();
+                    while let Some(batch) = stream.try_next().await.unwrap() {
+                        let keys = batch
+                            .column_by_name("id")
+                            .unwrap()
+                            .as_any()
+                            .downcast_ref::<arrow_array::StringArray>()
+                            .unwrap();
+                        let blobs = batch
+                            .column_by_name("binary_payload")
+                            .unwrap()
+                            .as_any()
+                            .downcast_ref::<arrow_array::LargeBinaryArray>()
+                            .unwrap();
+                        for row in 0..batch.num_rows() {
+                            let key = keys.value(row);
+                            assert!(seen.insert(key.to_owned()), "duplicate {key}");
+                            let expected = if key.starts_with("quote")
+                                || key
+                                    .strip_prefix("key-")
+                                    .and_then(|key| key.parse::<usize>().ok())
+                                    .is_some_and(|i| !(1024..3072).contains(&i))
+                            {
+                                2
+                            } else {
+                                1
+                            };
+                            assert_eq!(blobs.value(row), &[expected; 4096], "{key}");
+                        }
+                    }
+                    assert_eq!(seen.len(), 5121);
+                }
+            }
         });
     }
 
