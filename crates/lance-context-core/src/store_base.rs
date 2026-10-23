@@ -54,7 +54,8 @@ use lance::dataset::optimize::{
     CompactionOptions, RewriteResult,
 };
 use lance::dataset::{
-    builder::DatasetBuilder, Dataset, NewColumnTransform, WriteMode, WriteParams,
+    builder::DatasetBuilder, Dataset, MergeInsertBuilder, NewColumnTransform, WhenMatched,
+    WhenNotMatched, WriteMode, WriteParams,
 };
 use lance::index::DatasetIndexExt;
 use lance::io::{ObjectStoreParams, StorageOptionsAccessor};
@@ -396,6 +397,8 @@ pub(crate) struct StorageBase {
     merge_max_generations: usize,
     merge_max_bytes: usize,
     key_index_type: crate::KeyIndexType,
+    /// Explicit per-handle qualification switch; predicate deletion stays default.
+    pub(crate) merge_key_only_delete: bool,
     /// Per-shard pending-generation count at which reads warn; `0` disables.
     pending_generations_warn: usize,
     /// Refuse reads that would open more flushed generations than this, per
@@ -553,6 +556,7 @@ impl StorageBase {
             merge_max_generations: merge_max_generations.unwrap_or(DEFAULT_MERGE_MAX_GENERATIONS),
             merge_max_bytes: merge_max_bytes.unwrap_or(DEFAULT_MERGE_MAX_BYTES),
             key_index_type,
+            merge_key_only_delete: false,
             pending_generations_warn: pending_generations_warn
                 .unwrap_or(DEFAULT_PENDING_GENERATIONS_WARN),
             pending_generations_max: pending_generations_max
@@ -1483,23 +1487,32 @@ impl StorageBase {
         // does not need to publish an index before every shard merge. Doing
         // that here made parallel shards compete on CreateIndex transactions
         // and repeatedly rebuild the same table-wide index.
-        let key_index = merge_schema.index_of(&self.key_column)?;
-        use datafusion::logical_expr::Expr;
-        let mut values = Vec::with_capacity(1024);
-        for batch in &batches {
-            for row in 0..batch.num_rows() {
-                values.push(Expr::Literal(
-                    ScalarValue::try_from_array(batch.column(key_index), row)
-                        .map_err(|e| LanceError::invalid_input(e.to_string()))?,
-                    None,
-                ));
-                if values.len() == 1024 {
-                    self.delete_key_values(std::mem::take(&mut values)).await?;
+        // Schema evolution after preparation can make the input incomplete.
+        // Such a join could project missing target payload columns; retain the
+        // predicate path unless the prepared source covers the current schema.
+        if self.merge_key_only_delete
+            && merge_schema.as_ref() == &Schema::from(self.dataset.schema())
+        {
+            self.delete_with_key_only_join(&batches).await?;
+        } else {
+            let key_index = merge_schema.index_of(&self.key_column)?;
+            use datafusion::logical_expr::Expr;
+            let mut values = Vec::with_capacity(1024);
+            for batch in &batches {
+                for row in 0..batch.num_rows() {
+                    values.push(Expr::Literal(
+                        ScalarValue::try_from_array(batch.column(key_index), row)
+                            .map_err(|e| LanceError::invalid_input(e.to_string()))?,
+                        None,
+                    ));
+                    if values.len() == 1024 {
+                        self.delete_key_values(std::mem::take(&mut values)).await?;
+                    }
                 }
             }
-        }
-        if !values.is_empty() {
-            self.delete_key_values(values).await?;
+            if !values.is_empty() {
+                self.delete_key_values(values).await?;
+            }
         }
 
         if let Some(watermark) = watermark {
@@ -1538,6 +1551,49 @@ impl StorageBase {
         Ok(())
     }
 
+    /// Keep the source schema complete: a key-only source makes Lance project
+    /// missing payload columns from the target. Materialized full-schema slices
+    /// instead let the optimizer retain only target keys and row IDs. Disable
+    /// index joins because that alternative can fetch target payload columns.
+    /// Slices share the already budgeted WAL arrays; hash input stays <=1024 rows.
+    async fn delete_with_key_only_join(&mut self, batches: &[RecordBatch]) -> LanceResult<()> {
+        let mut source = Vec::new();
+        let mut rows = 0;
+        for batch in batches {
+            let mut offset = 0;
+            while offset < batch.num_rows() {
+                let take = (1024 - rows).min(batch.num_rows() - offset);
+                source.push(batch.slice(offset, take));
+                rows += take;
+                offset += take;
+                if rows == 1024 {
+                    self.delete_key_batch(std::mem::take(&mut source)).await?;
+                    rows = 0;
+                }
+            }
+        }
+        if !source.is_empty() {
+            self.delete_key_batch(source).await?;
+        }
+        Ok(())
+    }
+
+    async fn delete_key_batch(&mut self, source: Vec<RecordBatch>) -> LanceResult<()> {
+        let job = MergeInsertBuilder::try_new(
+            Arc::new(self.dataset.clone()),
+            vec![self.key_column.clone()],
+        )?
+        .when_matched(WhenMatched::Delete)
+        .when_not_matched(WhenNotMatched::DoNothing)
+        .use_index(false)
+        .try_build()?;
+        let (dataset, _) = observe_phase!("delete_keys", job.execute_batches(source).await)?;
+        self.dataset = Arc::unwrap_or_clone(dataset);
+        count!(crate::metrics::ROLLOUT_WAL_DELETE_BATCHES, "strategy" => "key_only_hash");
+        crate::merge_write_scope::checkpoint();
+        Ok(())
+    }
+
     async fn delete_key_values(
         &mut self,
         values: Vec<datafusion::logical_expr::Expr>,
@@ -1554,6 +1610,7 @@ impl StorageBase {
             .await
         )?;
         self.dataset = Arc::unwrap_or_clone(result.new_dataset);
+        count!(crate::metrics::ROLLOUT_WAL_DELETE_BATCHES, "strategy" => "predicate");
         crate::merge_write_scope::checkpoint();
         Ok(())
     }

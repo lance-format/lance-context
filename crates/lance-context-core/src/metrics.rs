@@ -57,6 +57,10 @@ pub const ROLLOUT_FLUSH_ERRORS: &str = "rollout_flush_errors_total";
 /// `seal` | `read` | `append` | `claim_epoch` | `drain` | `delete`.
 pub const ROLLOUT_WAL_MERGE_DURATION: &str = "rollout_wal_merge_duration_seconds";
 
+/// Completed delete batches, labelled by `strategy`: predicate or key_only_hash.
+/// This is execution-path evidence, not a count of reclaimed WAL generations.
+pub const ROLLOUT_WAL_DELETE_BATCHES: &str = "rollout_wal_delete_batches_total";
+
 /// Failed WAL self-merge phases, labelled by the `phase` that failed. A merge
 /// aborts on the first failing phase, so this also identifies where it died.
 pub const ROLLOUT_WAL_MERGE_ERRORS: &str = "rollout_wal_merge_errors_total";
