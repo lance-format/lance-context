@@ -218,7 +218,9 @@ pub(crate) async fn merge_local(
             async move {
                 // Admission is checked after queue capacity becomes available.
                 // A prepared batch already admitted may finish beyond the slice.
-                if started.elapsed() >= admit_for {
+                if started.elapsed() >= admit_for
+                    || crate::local_merge::drain_requested(state, target)
+                {
                     return Ok(Box::pin(async { Ok(0usize) }) as BoxFuture<'_, Result<usize>>);
                 }
                 let read_started = tokio::time::Instant::now();
@@ -250,6 +252,12 @@ pub(crate) async fn merge_local(
         })
         .await?;
         total += reclaimed;
+        // A skipped batch is not evidence of an empty WAL. Join all admitted
+        // commits above, then publish continuation below before releasing the
+        // task/fence, including when drain preceded the very first batch.
+        if crate::local_merge::drain_requested(state, target) {
+            break;
+        }
         if activity.caught_up(&selected, reclaimed) && (total == 0 || started.elapsed() < admit_for)
         {
             // Empty metadata reads can consume the admission slice too. They

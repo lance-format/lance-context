@@ -68,6 +68,10 @@ impl Default for Admission {
 }
 
 impl Admission {
+    pub(crate) fn is_accepting(&self) -> bool {
+        self.state.borrow().accepting
+    }
+
     pub fn status(&self) -> Status {
         self.state.borrow().clone()
     }

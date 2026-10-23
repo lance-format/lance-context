@@ -122,6 +122,14 @@ pub(crate) async fn yield_to_maintenance(state: &MasterState, target: &str) -> b
     true
 }
 
+/// Closing executor admission also stops new resident batches. Already admitted
+/// preparation/commits are joined normally; this is not a cancellation or fence.
+pub(crate) fn drain_requested(state: &MasterState, target: &str) -> bool {
+    !state.admission.is_accepting()
+        && state.config.catchup.target.is_none()
+        && selected(&state.config, target)
+}
+
 /// The caller owns the canonical task and maintenance fence. No private queue,
 /// Pod, writer epoch, or independent per-table memory budget is created here.
 pub(crate) async fn run(state: &Arc<MasterState>, target: &str) -> Result<String, String> {
@@ -200,3 +208,7 @@ mod tests {
         assert!(validate(&cfg).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "local_merge_drain_tests.rs"]
+mod drain_tests;

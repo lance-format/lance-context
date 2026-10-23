@@ -301,11 +301,18 @@ pub(crate) async fn run(state: &Arc<MasterState>, target: &str) -> Result<String
     let started = tokio::time::Instant::now();
     let mut total = 0;
     for _ in 0..16 {
-        if started.elapsed() >= Duration::from_secs(state.config.catchup.slice_secs) {
+        if started.elapsed() >= Duration::from_secs(state.config.catchup.slice_secs)
+            || crate::local_merge::drain_requested(state, target)
+        {
             break;
         }
         let reclaimed = run_pass(state, target, &endpoints, &shards, &mut coordinator).await?;
         total += reclaimed;
+        // Skipping not-yet-started staging during drain must leave durable
+        // demand even when this pass reclaimed nothing.
+        if crate::local_merge::drain_requested(state, target) {
+            break;
+        }
         if reclaimed == 0 {
             return Ok(format!("staged append reclaimed {total} generations"));
         }
@@ -360,6 +367,12 @@ async fn run_pass(
         let uri = state.rollout_uri(&target);
         let local = local.clone();
         async move {
+            // Checked when buffer capacity admits this future, not when plans
+            // are constructed. Previously admitted staging is still awaited
+            // and committed under the existing owner/fence.
+            if crate::local_merge::drain_requested(state, &target) {
+                return Ok(None);
+            }
             let result = if let Some(local) = local {
                 lance_context_core::rollout_append::stage(&uri, plan.clone(), local.budget, Some(local.session))
                     .await.map_err(|e| e.to_string())
@@ -373,7 +386,7 @@ async fn run_pass(
                     }
                 }
             };
-            result.map_err(|error| (plan, error))
+            result.map(Some).map_err(|error| (plan, error))
         }.boxed()
     }).collect();
     let mut work = stream::iter(stage_futures).buffer_unordered(config.rollout_append_concurrency);
@@ -384,10 +397,11 @@ async fn run_pass(
     loop {
         tokio::select! {
             next = work.next() => match next {
-                Some(Ok(part)) => {
+                Some(Ok(Some(part))) => {
                     if group.is_empty() { flush = tokio::time::Instant::now() + Duration::from_secs(2); }
                     group.push(part);
                 },
+                Some(Ok(None)) => {},
                 Some(Err((plan, error))) => {
                     if local.is_some() && error.contains("merge memory budget busy while reading first generation; retry") {
                         memory_retries.push(plan);
@@ -413,6 +427,9 @@ async fn run_pass(
     // indivisible oversized generation serially within this pass. Other resident
     // tasks still share the budget, so contention can remain retryable.
     for plan in memory_retries {
+        if crate::local_merge::drain_requested(state, target) {
+            break;
+        }
         let local = local.as_ref().unwrap();
         match lance_context_core::rollout_append::stage(
             &state.rollout_uri(target),
