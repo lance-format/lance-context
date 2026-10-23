@@ -440,11 +440,61 @@ fn record_commit_turn(kind: TaskKind, waited: Duration, result: &'static str) {
         .increment(1);
 }
 
+/// Retain prepared files while the admitted writer completes real work. An
+/// unchanged heartbeat, a new reservation, or a regressed counter cannot keep
+/// preparation capacity forever. The first observation only establishes a
+/// baseline; it does not prove that old work happened during this wait.
+#[derive(Default)]
+struct CommitWaitProgress {
+    seen: Option<(String, u64)>,
+    last_advance: Duration,
+}
+
+impl CommitWaitProgress {
+    fn observe(
+        &mut self,
+        snapshot: &lance_context_merge::progress::ProgressSnapshot,
+        waited: Duration,
+    ) {
+        if snapshot.execution.phase != lance_context_merge::Phase::Running {
+            return;
+        }
+        let Some(progress) = &snapshot.progress else {
+            return;
+        };
+        let id = &snapshot.execution.id;
+        match &mut self.seen {
+            Some((previous_id, previous_sequence)) if previous_id == id => {
+                if progress.sequence > *previous_sequence {
+                    *previous_sequence = progress.sequence;
+                    self.last_advance = waited;
+                }
+            }
+            Some(previous) => {
+                // A subsequent shard with positive completed work is progress;
+                // mere execution-ID churn or queued heartbeats are not.
+                *previous = (id.clone(), progress.sequence);
+                if progress.sequence > 0 {
+                    self.last_advance = waited;
+                }
+            }
+            None => self.seen = Some((id.clone(), progress.sequence)),
+        }
+    }
+
+    fn idle_for(&self, waited: Duration) -> Duration {
+        waited.saturating_sub(self.last_advance)
+    }
+}
+
 async fn wait_for_maintenance_commit(
     state: &Arc<MasterState>,
     claim: &mut TaskClaim,
 ) -> Result<(), String> {
     let waiting = std::time::Instant::now();
+    let mut progress = CommitWaitProgress::default();
+    let mut next_progress_read = Duration::ZERO;
+    let coordinator = state.task_store.merge_coordinator();
     let wait_budget = match claim.task.kind {
         TaskKind::IndexId => state.config.maintenance.index_commit_wait_secs,
         _ => state.config.maintenance.compaction_commit_wait_secs,
@@ -475,9 +525,25 @@ async fn wait_for_maintenance_commit(
             record_commit_turn(claim.task.kind, waiting.elapsed(), "served");
             return Ok(());
         }
-        // Check only after promotion has definitively declined. Never cancel
-        // an in-flight acquisition and mistake an accepted claim for a timeout.
-        if waiting.elapsed() >= Duration::from_secs(wait_budget) {
+        // Observe at most once per second, only after promotion definitively
+        // declined. Progress is not ownership: the next promotion must still
+        // pass every existing claim/lock compare. Bound this optional read so
+        // unavailable progress cannot pin a preparation slot indefinitely.
+        if wait_budget > 0 && waiting.elapsed() >= next_progress_read {
+            if let Ok(Ok(Some(snapshot))) = tokio::time::timeout(
+                Duration::from_secs(1),
+                coordinator.progress_snapshot(&claim.task.target),
+            )
+            .await
+            {
+                progress.observe(&snapshot, waiting.elapsed());
+            }
+            next_progress_read = waiting.elapsed() + Duration::from_secs(1);
+        }
+        // Heartbeats and storage/ownership uncertainty never reset this idle
+        // budget. Never cancel an in-flight acquisition and mistake an accepted
+        // claim for a timeout. Expiry leaves the current writer untouched.
+        if progress.idle_for(waiting.elapsed()) >= Duration::from_secs(wait_budget) {
             record_commit_turn(claim.task.kind, waiting.elapsed(), "expired");
             return Err("maintenance commit ownership wait budget exhausted; reprepare".into());
         }
@@ -1415,6 +1481,196 @@ mod tests {
             task_history_ttl_secs: 86_400,
             ui_dir: None,
         }
+    }
+
+    #[test]
+    fn commit_wait_counts_completed_work_not_heartbeats_or_reservation_churn() {
+        use lance_context_merge::progress::{ExecutionProgress, ProgressSnapshot};
+        use lance_context_merge::{Execution, Phase};
+        let mut execution = Execution::new("exp", "worker", "instance", 600);
+        execution.phase = Phase::Running;
+        let mut snapshot = ProgressSnapshot {
+            execution,
+            progress: Some(ExecutionProgress { sequence: 7 }),
+            work_report: None,
+            revision: 1,
+        };
+        let mut wait = CommitWaitProgress::default();
+        wait.observe(&snapshot, Duration::from_secs(10));
+        assert_eq!(wait.idle_for(Duration::from_secs(10)).as_secs(), 10);
+        snapshot.revision += 1;
+        snapshot.work_report = Some(serde_json::json!({"observed_at_ms":999999}));
+        wait.observe(&snapshot, Duration::from_secs(11));
+        assert_eq!(wait.idle_for(Duration::from_secs(11)).as_secs(), 11);
+        snapshot.progress.as_mut().unwrap().sequence = 8;
+        wait.observe(&snapshot, Duration::from_secs(12));
+        assert_eq!(wait.idle_for(Duration::from_secs(13)).as_secs(), 1);
+        // A regression must not lower the baseline and make its replay progress.
+        snapshot.progress.as_mut().unwrap().sequence = 2;
+        wait.observe(&snapshot, Duration::from_secs(14));
+        snapshot.progress.as_mut().unwrap().sequence = 8;
+        wait.observe(&snapshot, Duration::from_secs(15));
+        assert_eq!(wait.idle_for(Duration::from_secs(15)).as_secs(), 3);
+        snapshot.execution.id = "next-shard".into();
+        snapshot.progress.as_mut().unwrap().sequence = 0;
+        wait.observe(&snapshot, Duration::from_secs(16));
+        assert_eq!(wait.idle_for(Duration::from_secs(16)).as_secs(), 4);
+        snapshot.execution.phase = Phase::Uncertain;
+        snapshot.progress.as_mut().unwrap().sequence = 1;
+        wait.observe(&snapshot, Duration::from_secs(17));
+        assert_eq!(wait.idle_for(Duration::from_secs(17)).as_secs(), 5);
+        snapshot.execution.phase = Phase::Running;
+        wait.observe(&snapshot, Duration::from_secs(18));
+        assert_eq!(wait.idle_for(Duration::from_secs(19)).as_secs(), 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn commit_wait_keeps_index_and_compact_turn_while_merge_progresses() {
+        for kind in [TaskKind::IndexId, TaskKind::Compact] {
+            exercise_commit_wait(kind, 16).await;
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn commit_wait_yields_on_unchanged_heartbeats_without_cancelling_merge() {
+        exercise_commit_wait(TaskKind::IndexId, 0).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn commit_wait_yields_when_real_progress_stops() {
+        exercise_commit_wait(TaskKind::IndexId, 2).await;
+    }
+
+    async fn exercise_commit_wait(kind: TaskKind, advancing_steps: u64) {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.maintenance.compaction_prepare_targets = vec!["exp".into()];
+        cfg.maintenance.index_prepare_targets = vec!["exp".into()];
+        cfg.maintenance.compaction_commit_wait_secs = 2;
+        cfg.maintenance.index_commit_wait_secs = 2;
+        let state = MasterState::new(cfg).await.unwrap();
+        enqueue(&state, kind, "exp").await.unwrap();
+        let mut prep = state
+            .task_store
+            .claim_next_of_kinds(TaskKinds::GENERAL)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(prep.preparing_maintenance());
+        enqueue(&state, TaskKind::MergeWal, "exp").await.unwrap();
+        let merge = state
+            .task_store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        let coordinator = state.task_store.merge_coordinator();
+        let proof = state.task_store.merge_claim(&merge);
+        let execution = lance_context_merge::Execution::new("exp", "worker", "instance", 600);
+        assert!(coordinator.reserve(&proof, &execution).await.unwrap());
+        let running = coordinator.start(&execution).await.unwrap().unwrap();
+        assert!(coordinator.publish_progress(&running, 0).await.unwrap());
+        // A busy unrelated table shares this coordinator, but must not reset
+        // this table's idle budget. This stays active even when exp stalls.
+        enqueue(&state, TaskKind::MergeWal, "other").await.unwrap();
+        let other_claim = state
+            .task_store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(other_claim.task.target, "other");
+        let other_proof = state.task_store.merge_claim(&other_claim);
+        let other = lance_context_merge::Execution::new("other", "worker", "instance", 600);
+        assert!(coordinator.reserve(&other_proof, &other).await.unwrap());
+        let other = coordinator.start(&other).await.unwrap().unwrap();
+        let publisher = coordinator.clone();
+        let progress_execution = running.clone();
+        let finish_state = state.clone();
+        let held = tokio::spawn(async move {
+            for step in 1..=16 {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                let sequence = step.min(advancing_steps);
+                assert!(publisher
+                    .publish_work_progress(
+                        &progress_execution,
+                        sequence,
+                        serde_json::json!({"observed_at_ms":step,"sequence":sequence})
+                    )
+                    .await
+                    .unwrap());
+                assert!(publisher.publish_progress(&other, step).await.unwrap());
+            }
+            assert!(publisher.finish(&other, Ok(1)).await.unwrap());
+            assert!(publisher
+                .release(&other_proof, &other.finished(Ok(1)))
+                .await
+                .unwrap());
+            finish_state
+                .task_store
+                .finish(other_claim, Ok("unrelated writer completed".into()))
+                .await
+                .unwrap();
+            // End only this original executor, through the usual protocol.
+            assert!(publisher.finish(&progress_execution, Ok(1)).await.unwrap());
+            assert!(publisher
+                .release(&proof, &progress_execution.finished(Ok(1)))
+                .await
+                .unwrap());
+            finish_state
+                .task_store
+                .finish(merge, Ok("writer completed".into()))
+                .await
+                .unwrap();
+        });
+        let start = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            wait_for_maintenance_commit(&state, &mut prep),
+        )
+        .await
+        .unwrap();
+        if advancing_steps == 16 {
+            outcome.unwrap();
+            assert!(start.elapsed() >= Duration::from_secs(4));
+            // Publication owns the write turn after the predecessor released it.
+            enqueue(&state, TaskKind::MergeWal, "exp").await.unwrap();
+            assert!(state
+                .task_store
+                .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+                .await
+                .unwrap()
+                .is_none());
+            state
+                .task_store
+                .finish(prep, Ok("prepared output committed".into()))
+                .await
+                .unwrap();
+            let next = state
+                .task_store
+                .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+                .await
+                .unwrap()
+                .unwrap();
+            state
+                .task_store
+                .finish(next, Ok("following writer continued".into()))
+                .await
+                .unwrap();
+        } else {
+            let error = outcome.unwrap_err();
+            assert!(error.contains("wait budget exhausted"), "{error}");
+            assert!(start.elapsed() < Duration::from_secs(4));
+            if advancing_steps > 0 {
+                assert!(start.elapsed() >= Duration::from_millis(2500));
+            }
+            assert_eq!(coordinator.get("exp").await.unwrap(), Some(running));
+            state.task_store.finish(prep, Err(error)).await.unwrap();
+        }
+        held.await.unwrap();
     }
 
     #[tokio::test]

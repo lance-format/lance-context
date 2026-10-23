@@ -401,12 +401,14 @@ pub struct MaintenanceConfig {
     /// Enable only after verifying publisher compatibility. No wildcard.
     #[arg(long, env = "MAINTENANCE_CATCHUP_TARGETS", value_delimiter = ',')]
     pub maintenance_catchup_targets: Vec<String>,
-    /// Yield prepared output after this long waiting for another table writer.
-    /// This limits local capacity retention; it never cancels the current writer.
+    /// Yield prepared output after this long without observed writer progress.
+    /// Completed work extends the wait; heartbeats do not. Expiry releases
+    /// preparation capacity and never cancels the current table writer.
     #[arg(long, env = "COMPACTION_COMMIT_WAIT_SECS", default_value_t = 120)]
     pub compaction_commit_wait_secs: u64,
-    /// Maximum wait for index publication ownership after files are ready.
-    /// Expiry releases preparation capacity, never interrupts the other writer.
+    /// Maximum wait without observed writer progress after index files are ready.
+    /// Completed work extends the wait; heartbeats do not. Expiry releases
+    /// preparation capacity, never interrupts the other writer.
     #[arg(long, env = "INDEX_COMMIT_WAIT_SECS", default_value_t = 120)]
     pub index_commit_wait_secs: u64,
     /// Legacy wire field; owned work now uses the real-progress idle timeout.
