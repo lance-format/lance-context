@@ -2567,6 +2567,115 @@ mod tests {
     use tempfile::TempDir;
 
     #[tokio::test]
+    async fn slow_payload_read_retries_a_generation_reclaimed_by_peer_merge() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let writer = RolloutStore::open(uri).await.unwrap();
+        writer
+            .add(&[assistant_record("survives-slow-read")])
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        let reader = RolloutStore::open(uri).await.unwrap();
+        let writer = tokio::sync::Mutex::new(writer);
+        let attempts = AtomicUsize::new(0);
+        let rows = reader
+            .base
+            .read_consistent(ListSource::All, |dataset, snapshots| {
+                let reader = &reader;
+                let writer = &writer;
+                let attempts = &attempts;
+                async move {
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        // A valid capture can lose a generation while the initial
+                        // payload read is slow. Use actual peer commit and GC,
+                        // rather than manufacturing a NotFound response.
+                        tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+                        assert_eq!(writer.lock().await.cleanup_own_shard().await.unwrap(), 1);
+                        for snapshot in &snapshots {
+                            for generation in &snapshot.sstables {
+                                let path = reader
+                                    .flushed_generation_uri(snapshot.shard_id, &generation.path);
+                                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                                    while std::path::Path::new(&path).exists() {
+                                        tokio::time::sleep(std::time::Duration::from_millis(1))
+                                            .await;
+                                    }
+                                })
+                                .await
+                                .unwrap();
+                            }
+                        }
+                    }
+                    reader.list_non_blob_snapshot(dataset, snapshots).await
+                }
+            })
+            .await
+            .expect("a slow first payload attempt must still recover reclaimed WAL");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "survives-slow-read");
+    }
+
+    #[tokio::test]
+    async fn slow_payload_recovery_stays_bounded_while_versions_change() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let writer = RolloutStore::open(uri).await.unwrap();
+        writer.add(&[assistant_record("row-0")]).await.unwrap();
+        writer.flush().await.unwrap();
+        let reader = RolloutStore::open(uri).await.unwrap();
+        let writer = tokio::sync::Mutex::new(writer);
+        let attempts = AtomicUsize::new(0);
+        let result = reader
+            .base
+            .read_consistent(ListSource::All, |dataset, snapshots| {
+                let reader = &reader;
+                let writer = &writer;
+                let attempts = &attempts;
+                async move {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(if attempt == 0 {
+                        2100
+                    } else {
+                        1100
+                    }))
+                    .await;
+                    let mut writer = writer.lock().await;
+                    assert_eq!(writer.cleanup_own_shard().await.unwrap(), 1);
+                    for snapshot in &snapshots {
+                        for generation in &snapshot.sstables {
+                            let path =
+                                reader.flushed_generation_uri(snapshot.shard_id, &generation.path);
+                            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                                while std::path::Path::new(&path).exists() {
+                                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                                }
+                            })
+                            .await
+                            .unwrap();
+                        }
+                    }
+                    // Every retry sees a different real base version and WAL file.
+                    // That must not reset the payload recovery window indefinitely.
+                    writer
+                        .add(&[assistant_record(&format!("row-{}", attempt + 1))])
+                        .await
+                        .unwrap();
+                    writer.flush().await.unwrap();
+                    reader.list_non_blob_snapshot(dataset, snapshots).await
+                }
+            })
+            .await;
+        assert!(result.is_err());
+        let count = attempts.load(Ordering::SeqCst);
+        assert!((2..=3).contains(&count), "payload attempts={count}");
+        writer.lock().await.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn slow_metadata_capture_still_gets_a_fresh_snapshot_after_merge() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
