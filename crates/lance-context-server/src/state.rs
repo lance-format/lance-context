@@ -77,6 +77,7 @@ impl<T> StoreHandles<T> {
 }
 
 pub struct AppState {
+    pub(crate) demand_publisher: Arc<crate::demand_publish::DemandPublisher>,
     pub merge_executions: crate::merge_execution::Executions,
     pub stores: RwLock<std::collections::HashMap<String, Arc<RwLock<ContextStore>>>>,
     /// Bounded LRU of resident rollout-store handles.
@@ -395,6 +396,7 @@ impl AppState {
             }
         }
         Ok(Self {
+            demand_publisher: crate::demand_publish::DemandPublisher::new(capacity.get()),
             merge_executions: crate::merge_execution::Executions::configured(
                 config.merge_etcd_config(),
                 config.merge_rollout.clone(),
@@ -491,6 +493,9 @@ impl AppState {
         .await
         .expect("open test datagen registry");
         Self {
+            demand_publisher: crate::demand_publish::DemandPublisher::new(
+                DEFAULT_ROLLOUT_CACHE_CAPACITY,
+            ),
             merge_executions: crate::merge_execution::Executions::new(None, 600),
             stores: RwLock::new(std::collections::HashMap::new()),
             rollout_stores: Mutex::new(LruCache::new(
