@@ -38,6 +38,9 @@ categories = [
 ]
 license = "Apache-2.0"
 repository = "https://github.com/lance-format/lance"
+# Retain the published manifest for provenance, but Cargo reserves this name
+# when maturin repackages this path dependency into a source distribution.
+exclude = ["Cargo.toml.orig", ".cargo_vcs_info.json"]
 
 [features]
 aws = [

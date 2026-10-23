@@ -22,7 +22,9 @@ lance-io-metrics = ["metrics", "lance/metrics"]
 [dependencies]
 async-trait = "0.1.92"
 lance-table = "13.0.0"
-lance-io = "13.0.0"
+# Keep this direct dependency a path as well as a workspace patch so maturin
+# includes the backport when rebuilding Python wheels from a source archive.
+lance-io = { version = "13.0.0", path = "../../vendor/lance-io" }
 lance-file = "13.0.0"
 object_store = "0.14.2"
 base64 = "0.22"

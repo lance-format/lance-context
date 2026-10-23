@@ -32,7 +32,8 @@ existing cloud storage features.
   36 parts, covering successful completion, one 503 followed by success, and
   exhausted 503 retries. It checks byte-identical block lists, retained headers
   and URI, no part re-upload, and preservation of the original storage error.
-- `Cargo.toml`: optional `quick-xml` dependency and cloud feature wiring.
+- `Cargo.toml`: optional `quick-xml` dependency, cloud feature wiring, and
+  exclusion of Cargo's reserved provenance filenames when repackaging.
 - `Cargo.lock`: standalone regression-test dependency resolution.
 - `LICENSE`: upstream Apache 2.0 license, copied from the Lance repository.
 - This provenance document. `Cargo.toml.orig` is retained as an unmodified
@@ -43,7 +44,15 @@ transport; they do not contact Azure or S3. Run them with:
 
 ```sh
 cargo test --locked --manifest-path vendor/lance-io/Cargo.toml --lib object_store::throttle::tests
+cargo +1.98.1 clippy --locked --manifest-path vendor/lance-io/Cargo.toml --all-targets -- -D warnings
 ```
+
+The tests also run on the context repository's current stable Rust. Linting the
+unchanged upstream source uses Lance 13's pinned Rust 1.98.1; newer Clippy reports
+`double_must_use` inside its existing `async_trait` macro expansions. The Python
+sdist includes this patch directory through core's explicit path dependency so
+wheel rebuilds use the same source as repository builds. CI also checks that the
+archive contains the byte-identical patched throttle source.
 
 Remove this patch after a compatible published Lance release includes the fix
 and the same regressions pass against that release.
