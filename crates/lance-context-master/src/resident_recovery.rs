@@ -253,11 +253,15 @@ async fn probe(state: &Arc<MasterState>, target: &str) -> Result<bool, String> {
     .await
     .map_err(|e| e.to_string())?;
     if pending {
-        state
-            .task_store
-            .merge_coordinator()
-            .request_merge(target)
-            .await?;
+        let coordinator = state.task_store.merge_coordinator();
+        // Persist demand before enqueueing so cancellation or an uncertain
+        // enqueue response is still recovered by the paged request scan.
+        // Discovery already knows this exact target: waiting for that scan's
+        // next 15-second tick only adds idle time before an available executor.
+        coordinator.request_merge(target).await?;
+        if let Some(request) = coordinator.get_merge_request(target).await? {
+            crate::scheduler::enqueue_merge_request(state, &coordinator, &request).await?;
+        }
     }
     metrics::counter!("master_resident_wal_probes_total", "result" => if pending { "requested" } else { "empty" }).increment(1);
     Ok(pending)
@@ -330,21 +334,34 @@ mod tests {
         let (one, two) = tokio::join!(tick(&state, now), tick(&second, now));
         assert_eq!(one.unwrap() + two.unwrap(), 1);
         let coordinator = state.task_store.merge_coordinator();
-        assert_eq!(
-            coordinator
-                .request_page(None)
-                .await
-                .unwrap()
-                .0
-                .iter()
-                .map(|r| r.target.as_str())
-                .collect::<Vec<_>>(),
-            ["b"]
-        );
+        // Neither master runs the scheduler/retry ticker in this fixture.
+        // Discovery itself must make the task immediately claimable, with
+        // the exact request acknowledged only after a durable queue entry.
+        let queued_b = state
+            .task_store
+            .get_active_id(TaskKind::MergeWal, "b")
+            .await
+            .unwrap()
+            .expect("discovery must enqueue without the retry ticker");
+        assert!(coordinator.request_page(None).await.unwrap().0.is_empty());
         assert_eq!(tick(&second, now + 1000).await.unwrap(), 0);
         let restarted = MasterState::new(state.config.clone()).await.unwrap();
         assert_eq!(tick(&restarted, now + 30_000).await.unwrap(), 1);
-        assert_eq!(coordinator.request_page(None).await.unwrap().0.len(), 2);
+        assert!(coordinator.request_page(None).await.unwrap().0.is_empty());
+        assert_eq!(
+            restarted
+                .task_store
+                .get_active_id(TaskKind::MergeWal, "b")
+                .await
+                .unwrap(),
+            Some(queued_b)
+        );
+        assert!(restarted
+            .task_store
+            .get_active_id(TaskKind::MergeWal, "e")
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]
@@ -730,10 +747,8 @@ mod tests {
         let (a, b) = tokio::join!(tick(&state, now), tick(&second, now));
         assert_eq!(a.unwrap() + b.unwrap(), 1);
         let coordinator = state.task_store.merge_coordinator();
-        let first = coordinator.request_page(None).await.unwrap().0.remove(0);
-        crate::scheduler::enqueue_merge_request(&state, &coordinator, &first)
-            .await
-            .unwrap();
+        // Discovery must admit generic work too, without a request-scan tick.
+        assert!(coordinator.request_page(None).await.unwrap().0.is_empty());
         let claim = state
             .task_store
             .claim_resident_merge(&crate::local_merge::targets(&state.config))
