@@ -2,6 +2,7 @@
 
 mod body_timeout;
 mod config;
+mod demand_publish;
 mod drain;
 mod error;
 mod legacy_merge;

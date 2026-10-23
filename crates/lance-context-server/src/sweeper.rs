@@ -22,6 +22,23 @@ use lance_context_core::{DatagenStore, GenericStore, RolloutStore};
 use lru::LruCache;
 use tokio::sync::{Mutex, RwLock, Semaphore};
 
+/// A deferred observation. Outer `None` means the cached store was evicted.
+type DemandProbe = futures::future::BoxFuture<
+    'static,
+    Option<Result<Option<lance_context_core::ShardWatermark>, String>>,
+>;
+
+fn weak_demand_probe<T: Send + Sync + 'static>(store: &Arc<RwLock<T>>) -> DemandProbe
+where
+    Arc<RwLock<T>>: Sweepable,
+{
+    let store = Arc::downgrade(store);
+    Box::pin(async move {
+        let store = store.upgrade()?;
+        Some(store.own_shard_watermark().await)
+    })
+}
+
 /// A store the sweepers can maintain.
 ///
 /// Implemented on `Arc<RwLock<Store>>` rather than on the store itself so each
@@ -59,12 +76,21 @@ pub(crate) trait Sweepable: Clone + Send + Sync + 'static {
         async { Ok(None) }
     }
 
+    /// Build a deferred metadata probe without keeping a cached dataset alive.
+    fn demand_probe(&self) -> DemandProbe {
+        Box::pin(async { Some(Ok(None)) })
+    }
+
     /// Fold **every** pending flushed generation into the base table; returns
     /// how many were reclaimed.
     fn merge_wal(&self) -> impl std::future::Future<Output = Result<usize, String>> + Send;
 }
 
 impl Sweepable for Arc<RwLock<RolloutStore>> {
+    fn demand_probe(&self) -> DemandProbe {
+        weak_demand_probe(self)
+    }
+
     fn kind() -> &'static str {
         "rollout"
     }
@@ -155,6 +181,10 @@ impl Sweepable for Arc<RwLock<DatagenStore>> {
 }
 
 impl Sweepable for Arc<RwLock<GenericStore>> {
+    fn demand_probe(&self) -> DemandProbe {
+        weak_demand_probe(self)
+    }
+
     fn kind() -> &'static str {
         "generic"
     }
@@ -403,76 +433,79 @@ async fn observe_legacy_merge<T, E>(
 /// Longer than any healthy path, far shorter than a flush pass timeout.
 const DEMAND_PUBLISH_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Bounded concurrency for detached publishes across every store in the
-/// process. When the slots are full the flush is not delayed; the publish is
-/// dropped and counted. The next flush republishes an absolute watermark,
-/// so a dropped publish loses nothing.
-static DEMAND_PUBLISH_SLOTS: std::sync::LazyLock<Arc<Semaphore>> =
-    std::sync::LazyLock::new(|| Arc::new(Semaphore::new(4)));
-
-/// Publish this writer's shard watermark off the flush path. Never awaited
-/// by the caller; bounded by `DEMAND_PUBLISH_TIMEOUT` and
-/// `DEMAND_PUBLISH_SLOTS`. Every outcome is counted under
-/// `rollout_wal_demand_events_total{result}`.
+/// Publish this writer's shard watermark off the flush path. The per-server
+/// bounded FIFO retains busy-slot observations and coalesces pending targets.
+/// Queued work owns neither the cached store nor server state. Each active
+/// observation keeps the existing metadata timeout and four-probe IO limit.
 fn spawn_publish_demand<S: Sweepable>(
     state: Arc<crate::state::AppState>,
     target: String,
     store: S,
 ) {
-    let Ok(permit) = DEMAND_PUBLISH_SLOTS.clone().try_acquire_owned() else {
+    let probe = store.demand_probe();
+    let weak_state = Arc::downgrade(&state);
+    let queued = state.demand_publisher.submit(
+        target.clone(),
+        Box::pin(async move {
+            let Some(state) = weak_state.upgrade() else {
+                return;
+            };
+            let result = tokio::time::timeout(DEMAND_PUBLISH_TIMEOUT, async {
+                let Some(observation) = probe.await else {
+                    return Ok("evicted");
+                };
+                let watermark = match observation? {
+                    Some(watermark) => watermark,
+                    None => return Ok("no_manifest"),
+                };
+                // Disabling local self-merge must not hide fresh backlog from the
+                // master until its next whole-fleet scan. Reuse this manifest read;
+                // queue publication has independent slots/coalescing and never
+                // waits for telemetry or admits a local merge. The master retains
+                // its normal ownership, dedupe, and retry checks.
+                let threshold = state.rollout_master_merge_after_generations;
+                if threshold > 0 && watermark.pending_generations >= threshold {
+                    crate::merge_execution::publish_background_request(
+                        state.clone(),
+                        target.clone(),
+                    );
+                }
+                let event = lance_context_merge::demand::DemandEvent {
+                    v: lance_context_merge::demand::SCHEMA_VERSION,
+                    shard: watermark.shard_id.to_string(),
+                    sealed_through: watermark.sealed_through,
+                    sealed_bytes_through: 0,
+                    merged_through: None,
+                    flushed_at_ms: chrono::Utc::now().timestamp_millis(),
+                    writer_epoch: watermark.writer_epoch,
+                    source: lance_context_merge::demand::EventSource::Writer,
+                    merged_epoch: None,
+                    sealed_times: Default::default(),
+                };
+                state
+                    .merge_executions
+                    .publish_demand_event(&target, &event)
+                    .await
+                    .map(|written| if written { "written" } else { "unchanged" })
+            })
+            .await;
+            let label = match result {
+                Ok(Ok(label)) => label,
+                Ok(Err(error)) => {
+                    tracing::debug!(target = %target, %error, "demand event publish failed");
+                    "failed"
+                }
+                Err(_) => {
+                    tracing::debug!(target = %target, "demand event publish timed out");
+                    "timeout"
+                }
+            };
+            metrics::counter!("rollout_wal_demand_events_total", "result" => label).increment(1);
+        }),
+    );
+    if !queued {
         metrics::counter!("rollout_wal_demand_events_total", "result" => "dropped").increment(1);
-        return;
-    };
-    tokio::spawn(async move {
-        let _permit = permit;
-        let result = tokio::time::timeout(DEMAND_PUBLISH_TIMEOUT, async {
-            let watermark = match store.own_shard_watermark().await? {
-                Some(watermark) => watermark,
-                None => return Ok(None),
-            };
-            // Disabling local self-merge must not hide fresh backlog from the
-            // master until its next whole-fleet scan. Reuse this manifest read;
-            // queue publication has independent slots/coalescing and never
-            // waits for telemetry or admits a local merge. The master retains
-            // its normal ownership, dedupe, and retry checks.
-            let threshold = state.rollout_master_merge_after_generations;
-            if threshold > 0 && watermark.pending_generations >= threshold {
-                crate::merge_execution::publish_background_request(state.clone(), target.clone());
-            }
-            let event = lance_context_merge::demand::DemandEvent {
-                v: lance_context_merge::demand::SCHEMA_VERSION,
-                shard: watermark.shard_id.to_string(),
-                sealed_through: watermark.sealed_through,
-                sealed_bytes_through: 0,
-                merged_through: None,
-                flushed_at_ms: chrono::Utc::now().timestamp_millis(),
-                writer_epoch: watermark.writer_epoch,
-                source: lance_context_merge::demand::EventSource::Writer,
-                merged_epoch: None,
-                sealed_times: Default::default(),
-            };
-            state
-                .merge_executions
-                .publish_demand_event(&target, &event)
-                .await
-                .map(Some)
-        })
-        .await;
-        let label = match result {
-            Ok(Ok(Some(true))) => "written",
-            Ok(Ok(Some(false))) => "unchanged",
-            Ok(Ok(None)) => "no_manifest",
-            Ok(Err(error)) => {
-                tracing::debug!(target = %target, %error, "demand event publish failed");
-                "failed"
-            }
-            Err(_) => {
-                tracing::debug!(target = %target, "demand event publish timed out");
-                "timeout"
-            }
-        };
-        metrics::counter!("rollout_wal_demand_events_total", "result" => label).increment(1);
-    });
+    }
 }
 
 /// Return true when routing handled the target (including drain/no-op).
@@ -581,6 +614,182 @@ mod tests {
     use serde_json::json;
     use tempfile::TempDir;
 
+    #[derive(Clone)]
+    struct GatedWatermark {
+        index: usize,
+        observed: Arc<Vec<std::sync::atomic::AtomicUsize>>,
+        gate: Arc<Semaphore>,
+    }
+
+    impl Sweepable for GatedWatermark {
+        fn demand_probe(&self) -> DemandProbe {
+            let probe = self.clone(); // Test metadata only, no cached dataset.
+            Box::pin(async move { Some(probe.own_shard_watermark().await) })
+        }
+        fn kind() -> &'static str {
+            "generic"
+        }
+        async fn flush(&self) -> Result<(), String> {
+            Ok(())
+        }
+        async fn own_shard_watermark(
+            &self,
+        ) -> Result<Option<lance_context_core::ShardWatermark>, String> {
+            self.observed[self.index].fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _permit = self.gate.acquire().await.unwrap();
+            Ok(None)
+        }
+        async fn merge_wal(&self) -> Result<usize, String> {
+            panic!("demand observation must not run a merge")
+        }
+    }
+
+    #[tokio::test]
+    async fn demand_waiting_behind_busy_metadata_slots_reaches_every_resident_table() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = TempDir::new().unwrap();
+        let mut state = crate::state::AppState::new_for_test(dir.path().to_path_buf()).await;
+        state.merge_executions.rollout.owned_targets =
+            (0..32).map(|i| format!("generic:queued-{i}")).collect();
+        let state = Arc::new(state);
+        let observed = Arc::new((0..32).map(|_| AtomicUsize::new(0)).collect::<Vec<_>>());
+        let gate = Arc::new(Semaphore::new(0));
+        let stores = (0..32)
+            .map(|index| {
+                (
+                    format!("queued-{index}"),
+                    GatedWatermark {
+                        index,
+                        observed: observed.clone(),
+                        gate: gate.clone(),
+                    },
+                )
+            })
+            .collect();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            flush_pass_coordinated(stores, Duration::from_secs(5), None, Some(state.clone())),
+        )
+        .await
+        .expect("flush must not wait for metadata capacity");
+        tokio::task::yield_now().await;
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|n| n.load(Ordering::SeqCst) > 0)
+                .count(),
+            4
+        );
+        gate.add_permits(4);
+        let covered = tokio::time::timeout(Duration::from_secs(1), async {
+            while observed.iter().any(|n| n.load(Ordering::SeqCst) == 0) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            covered.is_ok(),
+            "metadata slots became free but resident tables were forgotten: {:?}",
+            observed
+                .iter()
+                .enumerate()
+                .filter_map(|(i, n)| (n.load(Ordering::SeqCst) == 0).then_some(i))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_probe_does_not_pin_evicted_dataset() {
+        let dir = TempDir::new().unwrap();
+        let store = generic_with_pending(&dir, 8, 2).await;
+        let weak = Arc::downgrade(&store);
+        let probe = store.demand_probe();
+        drop(store);
+        assert!(weak.upgrade().is_none(), "queued probe pinned a dataset");
+        assert!(probe.await.is_none(), "evicted dataset must be skipped");
+    }
+
+    #[tokio::test]
+    async fn queued_publication_does_not_keep_server_alive() {
+        let dir = TempDir::new().unwrap();
+        let state = Arc::new(crate::state::AppState::new_for_test(dir.path().to_path_buf()).await);
+        let publisher = state.demand_publisher.clone();
+        let gate = Arc::new(Semaphore::new(0));
+        let (started, mut observed) = tokio::sync::mpsc::unbounded_channel();
+        for i in 0..4 {
+            let gate = gate.clone();
+            let started = started.clone();
+            publisher.submit(
+                format!("busy-{i}"),
+                Box::pin(async move {
+                    started.send(()).unwrap();
+                    let _permit = gate.acquire().await.unwrap();
+                }),
+            );
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            for _ in 0..4 {
+                observed.recv().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        let store = generic_with_pending(&dir, 8, 2).await;
+        spawn_publish_demand(state.clone(), "generic:queued".into(), store);
+        let weak = Arc::downgrade(&state);
+        drop(state);
+        assert!(
+            weak.upgrade().is_none(),
+            "queue created a server ownership cycle"
+        );
+        gate.add_permits(4);
+        let (done, joined) = tokio::sync::oneshot::channel();
+        publisher.submit(
+            "sentinel".into(),
+            Box::pin(async move {
+                done.send(()).unwrap();
+            }),
+        );
+        tokio::time::timeout(Duration::from_secs(1), joined)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn hung_probes_expire_and_queued_table_runs_without_another_flush() {
+        let dir = TempDir::new().unwrap();
+        let state = Arc::new(crate::state::AppState::new_for_test(dir.path().to_path_buf()).await);
+        let store = generic_with_pending(&dir, 8, 2).await;
+        for i in 0..4 {
+            spawn_publish_demand(
+                state.clone(),
+                format!("hung-{i}"),
+                HangingWatermark(store.clone()),
+            );
+        }
+        tokio::task::yield_now().await;
+        let observed = Arc::new(vec![std::sync::atomic::AtomicUsize::new(0)]);
+        spawn_publish_demand(
+            state.clone(),
+            "healthy".into(),
+            GatedWatermark {
+                index: 0,
+                observed: observed.clone(),
+                gate: Arc::new(Semaphore::new(1)),
+            },
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(observed[0].load(std::sync::atomic::Ordering::SeqCst), 0);
+        tokio::time::timeout(DEMAND_PUBLISH_TIMEOUT + Duration::from_secs(2), async {
+            while observed[0].load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("expired probes stranded the queued table");
+    }
+
     #[tokio::test]
     #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
     async fn owned_count_trigger_enqueues_without_bypassing_slots_or_preparing_payloads() {
@@ -610,7 +819,7 @@ mod tests {
             vec![("s".into(), store.clone())],
             Duration::from_secs(5),
             Some(slots),
-            Some(state),
+            Some(state.clone()),
         )
         .await;
         assert_eq!(
@@ -638,6 +847,9 @@ mod tests {
     struct HangingWatermark(Arc<RwLock<GenericStore>>);
 
     impl Sweepable for HangingWatermark {
+        fn demand_probe(&self) -> DemandProbe {
+            Box::pin(std::future::pending())
+        }
         fn kind() -> &'static str {
             "generic"
         }
@@ -823,7 +1035,7 @@ mod tests {
             vec![("s".into(), store.clone())],
             Duration::from_secs(5),
             None,
-            Some(state),
+            Some(state.clone()),
         )
         .await;
         let second = await_event(&client, &key, |e| e.sealed_through > first.sealed_through).await;
@@ -874,7 +1086,7 @@ mod tests {
                 vec![("s".into(), store.clone())],
                 Duration::from_secs(5),
                 None,
-                Some(state),
+                Some(state.clone()),
             )
             .await;
             if !drained {
