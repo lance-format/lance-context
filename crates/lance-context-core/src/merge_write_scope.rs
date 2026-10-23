@@ -15,7 +15,7 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
     },
 };
 use tokio::sync::{oneshot, Notify};
@@ -109,7 +109,10 @@ pub struct MergeWriteScope {
     /// Legacy diagnostics must not introduce detached storage tasks or alter
     /// cancellation/slot lifetimes before durable ownership is available.
     observation_only: bool,
-    local_io: Mutex<Vec<(lance_io::utils::tracking_store::IOTracker, u64)>>,
+    local_io: Mutex<Vec<LocalPreparationIo>>,
+    // Lance keys its store cache by wrapper allocation. Reuse within this
+    // execution, while keeping different executions' progress isolated.
+    preparation_wrapper: OnceLock<Arc<dyn lance_io::object_store::WrappingObjectStore>>,
     progress: Mutex<Progress>,
     changed: Notify,
     authorizer: Option<Arc<dyn CommitAuthorizer>>,
@@ -118,6 +121,14 @@ pub struct MergeWriteScope {
     /// Test-only storage shim applied **beneath** the progress wrapper, so a
     /// delayed or frozen store is still observed as real IO by the watchdog.
     io_shim: Option<Arc<dyn lance_io::object_store::WrappingObjectStore>>,
+}
+
+#[derive(Debug)]
+struct LocalPreparationIo {
+    // Retain the identity so its address cannot be reused while registered.
+    store: Arc<dyn object_store::ObjectStore>,
+    tracker: lance_io::utils::tracking_store::IOTracker,
+    baseline: u64,
 }
 
 /// Local write observations, not a durable fence or proof of remote quiescence.
@@ -143,13 +154,13 @@ impl MergeWriteScope {
     pub fn completed_steps(&self) -> u64 {
         self.local_io.lock().unwrap().iter().fold(
             self.completed_steps.load(Ordering::Relaxed),
-            |steps, (tracker, baseline)| {
-                let stats = tracker.stats();
+            |steps, io| {
+                let stats = io.tracker.stats();
                 steps.saturating_add(
                     stats
                         .read_bytes
                         .saturating_add(stats.written_bytes)
-                        .saturating_sub(*baseline),
+                        .saturating_sub(io.baseline),
                 )
             },
         )
@@ -347,19 +358,25 @@ pub(crate) fn preparation_store_wrapper(
     CURRENT
         .try_with(|scope| {
             scope.observe_file_io.then(|| {
-                let progress: Arc<dyn lance_io::object_store::WrappingObjectStore> = Arc::new(
-                    crate::preparation_io::ProgressWrapper(scope.completed_steps.clone()),
-                );
-                match &scope.io_shim {
-                    // Progress outermost: it counts the shimmed store's
-                    // completed operations, exactly as it would real storage.
-                    Some(shim) => Arc::new(Layered {
-                        outer: progress,
-                        inner: shim.clone(),
+                scope
+                    .preparation_wrapper
+                    .get_or_init(|| {
+                        let progress: Arc<dyn lance_io::object_store::WrappingObjectStore> =
+                            Arc::new(crate::preparation_io::ProgressWrapper(
+                                scope.completed_steps.clone(),
+                            ));
+                        match &scope.io_shim {
+                            // Progress outermost: it counts the shimmed store's
+                            // completed operations, exactly as it would real storage.
+                            Some(shim) => Arc::new(Layered {
+                                outer: progress,
+                                inner: shim.clone(),
+                            })
+                                as Arc<dyn lance_io::object_store::WrappingObjectStore>,
+                            None => progress,
+                        }
                     })
-                        as Arc<dyn lance_io::object_store::WrappingObjectStore>,
-                    None => progress,
-                }
+                    .clone()
             })
         })
         .ok()
@@ -406,12 +423,20 @@ pub(crate) fn register_local_preparation_io(store: &ObjectStore) {
     }
     let _ = CURRENT.try_with(|scope| {
         if scope.observe_file_io {
+            let mut registered = scope.local_io.lock().unwrap();
+            if registered
+                .iter()
+                .any(|io| Arc::ptr_eq(&io.store, &store.inner))
+            {
+                return;
+            }
             let tracker = store.io_tracker().clone();
             let stats = tracker.stats();
-            scope.local_io.lock().unwrap().push((
+            registered.push(LocalPreparationIo {
+                store: store.inner.clone(),
                 tracker,
-                stats.read_bytes.saturating_add(stats.written_bytes),
-            ));
+                baseline: stats.read_bytes.saturating_add(stats.written_bytes),
+            });
         }
     });
 }
@@ -872,6 +897,116 @@ mod create_tests;
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[tokio::test]
+    async fn preparation_store_cache_reuses_clients_without_cross_execution_progress() {
+        use lance_io::object_store::{ObjectStoreParams, ObjectStoreRegistry};
+        let registry = ObjectStoreRegistry::default();
+        let first = Arc::new(MergeWriteScope {
+            observe_file_io: true,
+            ..Default::default()
+        });
+        let second = Arc::new(MergeWriteScope {
+            observe_file_io: true,
+            ..Default::default()
+        });
+        let open = || async {
+            registry
+                .get_store(
+                    "memory://preparation-cache/table".parse().unwrap(),
+                    &ObjectStoreParams {
+                        object_store_wrapper: preparation_store_wrapper(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+        };
+        let store = first.run(open()).await;
+        for _ in 0..24 {
+            let reopened = first.run(open()).await;
+            assert!(
+                Arc::ptr_eq(&store, &reopened),
+                "each open rebuilt the client"
+            );
+        }
+        let other = second.run(open()).await;
+        let ordinary = open().await;
+        assert!(!Arc::ptr_eq(&store, &other));
+        assert!(!Arc::ptr_eq(&store, &ordinary));
+        let path = Path::from("data/batch");
+        store
+            .inner
+            .put_opts(
+                &path,
+                bytes::Bytes::from_static(b"payload").into(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.completed_steps(), 0);
+        // A cached handle keeps its original attribution even while another
+        // execution is current. Repeated real reads must not keep it alive.
+        for _ in 0..24 {
+            let before = first.completed_steps();
+            let body = second
+                .run(async {
+                    store
+                        .inner
+                        .get_opts(&path, Default::default())
+                        .await
+                        .unwrap()
+                        .bytes()
+                        .await
+                        .unwrap()
+                })
+                .await;
+            assert_eq!(body.as_ref(), b"payload");
+            assert!(first.completed_steps() > before);
+            assert_eq!(second.completed_steps(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn preparation_store_cache_registers_shared_local_tracker_once() {
+        use lance_io::object_store::{ObjectStoreParams, ObjectStoreRegistry};
+        let dir = tempfile::tempdir().unwrap();
+        let scope = Arc::new(MergeWriteScope {
+            observe_file_io: true,
+            ..Default::default()
+        });
+        scope
+            .run(async {
+                let registry = ObjectStoreRegistry::default();
+                let store = registry
+                    .get_store(
+                        format!("file://{}", dir.path().display()).parse().unwrap(),
+                        &ObjectStoreParams {
+                            object_store_wrapper: preparation_store_wrapper(),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert!(store.is_local());
+                register_local_preparation_io(&store);
+                store
+                    .io_tracker()
+                    .record_read("read", Path::from("data/file"), 7, None);
+                // Reopening must retain the initial baseline, not duplicate it or
+                // erase completed work by taking a new baseline on every open.
+                for _ in 0..24 {
+                    register_local_preparation_io(&store);
+                }
+                assert_eq!(scope.local_io.lock().unwrap().len(), 1);
+                assert_eq!(scope.completed_steps(), 7);
+                store
+                    .io_tracker()
+                    .record_read("read", Path::from("data/file"), 3, None);
+                assert_eq!(scope.completed_steps(), 10);
+            })
+            .await;
+    }
 
     #[tokio::test]
     async fn legacy_observation_retains_uncertainty_without_detaching_storage() {
