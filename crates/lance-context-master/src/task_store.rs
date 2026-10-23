@@ -1265,6 +1265,17 @@ impl EtcdTaskStore {
                     .map(serde_json::from_slice)
                     .transpose()
                     .map_err(|e| lance::Error::io(format!("invalid merge execution: {e}")))?;
+                if let Err(skip) = eligibility::execution_filter(
+                    task.kind,
+                    &task.target,
+                    &self.rollout,
+                    merge_execution.as_ref(),
+                ) {
+                    metrics::counter!("master_merge_legacy_execution_deferred_total").increment(1);
+                    tracing::debug!(task = %task.id, target = %task.target, ?skip,
+                        "merge deferred until legacy execution acknowledgement");
+                    continue;
+                }
                 let shape = eligibility::claim_shape(
                     task.kind,
                     &task.target,
@@ -4131,6 +4142,143 @@ mod tests {
             .await
             .unwrap();
         peer.inner
+            .client
+            .clone()
+            .delete(
+                cfg.etcd.etcd_prefix,
+                Some(etcd_client::DeleteOptions::new().with_prefix()),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn retained_legacy_execution_stays_queued_across_pollers_until_acknowledged() {
+        let (_dir, cfg, store) = preparation_test_store().await;
+        let original = store
+            .enqueue(TaskKind::MergeWal, "legacy", vec![])
+            .await
+            .unwrap();
+        let claim = store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        let coordinator = store.merge_coordinator();
+        let running = coordinator
+            .admit_legacy(&store.merge_claim(&claim), "legacy", "worker")
+            .await
+            .unwrap();
+        store
+            .finish(
+                claim,
+                Err("HTTP observation timed out; writer remains owned".into()),
+            )
+            .await
+            .unwrap();
+        let pending = store
+            .enqueue(TaskKind::MergeWal, "legacy", vec![])
+            .await
+            .unwrap();
+        assert_ne!(original.id, pending.id);
+        let execution_key = lance_context_merge::execution_key(&cfg.etcd.etcd_prefix, "legacy");
+        let before = store
+            .inner
+            .client
+            .clone()
+            .get(execution_key.clone(), None)
+            .await
+            .unwrap();
+        let owner = lance_context_merge::execution_owner(&running);
+
+        // Reopening the store models a restarted/second master; no local
+        // cooldown or in-memory suppression may be needed for correctness.
+        for _ in 0..3 {
+            let peer = TaskStore::open(&cfg).await.unwrap();
+            for _ in 0..3 {
+                assert!(peer
+                    .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+                    .await
+                    .unwrap()
+                    .is_none());
+                assert_eq!(
+                    peer.enqueue(TaskKind::MergeWal, "legacy", vec![])
+                        .await
+                        .unwrap()
+                        .id,
+                    pending.id
+                );
+            }
+            assert_eq!(
+                peer.get(&pending.id).await.unwrap().unwrap().state,
+                TaskState::Queued
+            );
+            assert!(peer
+                .inner
+                .get_text(&peer.inner.claim_key(&pending.id))
+                .await
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                peer.inner
+                    .get_text(&peer.inner.target_lock_key("legacy"))
+                    .await
+                    .unwrap(),
+                Some(owner.clone())
+            );
+        }
+        let after = store
+            .inner
+            .client
+            .clone()
+            .get(execution_key, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            before.kvs()[0].mod_revision(),
+            after.kvs()[0].mod_revision()
+        );
+        assert_eq!(
+            coordinator.get("legacy").await.unwrap(),
+            Some(running.clone())
+        );
+        assert_eq!(
+            store.list().await.unwrap().len(),
+            2,
+            "polls must not add terminal history"
+        );
+
+        // An older blocked queue entry must not starve unrelated merge or
+        // maintenance candidates.
+        for kind in [TaskKind::MergeWal, TaskKind::Compact, TaskKind::IndexId] {
+            let task = store.enqueue(kind, "unrelated", vec![]).await.unwrap();
+            let next = store.claim_next().await.unwrap().unwrap();
+            assert_eq!(next.task.id, task.id);
+            store
+                .finish(next, Ok("unrelated work continues".into()))
+                .await
+                .unwrap();
+        }
+        assert!(coordinator.finish(&running, Ok(7)).await.unwrap());
+        let acknowledged = coordinator.get("legacy").await.unwrap().unwrap();
+        let recovery = store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovery.task.id, pending.id);
+        assert!(coordinator
+            .release(&store.merge_claim(&recovery), &acknowledged)
+            .await
+            .unwrap());
+        store
+            .finish(recovery, Ok("acknowledged writer released".into()))
+            .await
+            .unwrap();
+        assert!(coordinator.get("legacy").await.unwrap().is_none());
+        store
+            .inner
             .client
             .clone()
             .delete(
