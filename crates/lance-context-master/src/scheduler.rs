@@ -1084,12 +1084,23 @@ pub(crate) async fn enqueue_merge_request(
     {
         return Ok(());
     }
-    let task = enqueue(state, TaskKind::MergeWal, &request.target)
+    let task = state
+        .task_store
+        .enqueue_merge_request(request)
         .await
         .map_err(|e| e.to_string())?;
-    if task.state == lance_context_api::TaskState::Queued {
-        coordinator.acknowledge_request(request).await?;
-    }
+    let outcome = match task {
+        Some(task) => {
+            metrics::counter!("master_task_enqueued_total", "kind" => kind_label(TaskKind::MergeWal)).increment(1);
+            if task.state == lance_context_api::TaskState::Queued {
+                "queued"
+            } else {
+                "running"
+            }
+        }
+        None => "superseded",
+    };
+    metrics::counter!("master_worker_demand_admission_total", "outcome" => outcome).increment(1);
     Ok(())
 }
 
@@ -2453,6 +2464,21 @@ mod tests {
             .get_active_id(TaskKind::MergeWal, "exp")
             .await
             .unwrap();
+        assert!(first.is_none(), "a stale request must not enqueue work");
+        enqueue_merge_request(&state, &coordinator, &after)
+            .await
+            .unwrap();
+        let admitted = state
+            .task_store
+            .get_active_id(TaskKind::MergeWal, "exp")
+            .await
+            .unwrap();
+        assert!(admitted.is_some(), "the current request must enqueue work");
+        assert!(coordinator
+            .get_merge_request("exp")
+            .await
+            .unwrap()
+            .is_none());
         enqueue_merge_request(&state, &coordinator, &after)
             .await
             .unwrap();
@@ -2462,13 +2488,9 @@ mod tests {
                 .get_active_id(TaskKind::MergeWal, "exp")
                 .await
                 .unwrap(),
-            first
+            admitted,
+            "a second scanner must not enqueue the acknowledged request"
         );
-        assert!(coordinator
-            .get_merge_request("exp")
-            .await
-            .unwrap()
-            .is_none());
     }
 
     #[tokio::test]

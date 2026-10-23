@@ -505,6 +505,15 @@ impl TaskStore {
         self.inner.enqueue(kind, target, depends_on).await
     }
 
+    /// Admit and acknowledge a writer hint atomically. An old scan page must
+    /// not create another merge after a peer has served the same request.
+    pub(crate) async fn enqueue_merge_request(
+        &self,
+        request: &lance_context_merge::rollout::MergeRequest,
+    ) -> lance::Result<Option<TaskRecord>> {
+        self.inner.enqueue_merge_request(request).await
+    }
+
     pub async fn list(&self) -> lance::Result<Vec<TaskRecord>> {
         self.inner.list().await
     }
@@ -895,6 +904,17 @@ impl EtcdTaskStore {
         let mut client = self.client.clone();
         if let Some(dedupe_key) = self.dedupe_key(kind, target, &task.depends_on) {
             for _ in 0..4 {
+                // Recovery scanners mostly rediscover an already-active task.
+                // Resolve those with reads instead of first proposing a write
+                // transaction that is guaranteed to lose the dedupe compare.
+                if let Some(existing_id) = self.get_text(&dedupe_key).await? {
+                    if let Some(existing) = self.get(&existing_id).await? {
+                        if matches!(existing.state, TaskState::Queued | TaskState::Running) {
+                            return Ok(existing);
+                        }
+                    }
+                    self.delete_owned_key(&dedupe_key, &existing_id).await?;
+                }
                 let txn = Txn::new()
                     .when([Compare::version(dedupe_key.as_str(), CompareOp::Equal, 0)])
                     .and_then([
@@ -910,14 +930,6 @@ impl EtcdTaskStore {
                 {
                     return Ok(task);
                 }
-                if let Some(existing_id) = self.get_text(&dedupe_key).await? {
-                    if let Some(existing) = self.get(&existing_id).await? {
-                        if matches!(existing.state, TaskState::Queued | TaskState::Running) {
-                            return Ok(existing);
-                        }
-                    }
-                    self.delete_owned_key(&dedupe_key, &existing_id).await?;
-                }
             }
             return Err(lance::Error::io(
                 "failed to resolve concurrent etcd task enqueue",
@@ -931,6 +943,114 @@ impl EtcdTaskStore {
             .await
             .map_err(etcd_error("enqueue task"))?;
         Ok(task)
+    }
+
+    async fn enqueue_merge_request(
+        &self,
+        request: &lance_context_merge::rollout::MergeRequest,
+    ) -> lance::Result<Option<TaskRecord>> {
+        if request.revision <= 0 {
+            return Err(lance::Error::io(
+                "merge demand requires an existing request revision",
+            ));
+        }
+        let target = &request.target;
+        let request_key = lance_context_merge::execution_key(&self.prefix, target)
+            .replace("/merge-executions/", "/merge-requests/");
+        let dedupe_key = self.dedupe_key(TaskKind::MergeWal, target, &[]).unwrap();
+        let task = new_task(TaskKind::MergeWal, target, vec![]);
+        let value = encode_task(&task)?;
+        let request_matches =
+            || Compare::mod_revision(request_key.as_str(), CompareOp::Equal, request.revision);
+        let mut client = self.client.clone();
+        for _ in 0..4 {
+            // This transaction is read-only on both branches. Stale hints and
+            // running-task dedupe therefore need no replicated write proposal.
+            let snapshot = client
+                .txn(
+                    Txn::new()
+                        .when([request_matches()])
+                        .and_then([TxnOp::get(dedupe_key.as_str(), None)]),
+                )
+                .await
+                .map_err(etcd_error("read merge demand admission"))?;
+            if !snapshot.succeeded() {
+                return Ok(None);
+            }
+            let existing_id = match snapshot.op_responses().into_iter().next() {
+                Some(TxnOpResponse::Get(response)) => response
+                    .kvs()
+                    .first()
+                    .map(|kv| String::from_utf8(kv.value().to_vec()))
+                    .transpose()
+                    .map_err(|e| lance::Error::io(e.to_string()))?,
+                _ => return Err(lance::Error::io("missing merge demand dedupe snapshot")),
+            };
+            if let Some(existing_id) = existing_id {
+                let record = client
+                    .get(self.task_key(&existing_id), None)
+                    .await
+                    .map_err(etcd_error("read merge demand task"))?;
+                if let Some(kv) = record.kvs().first() {
+                    let existing = decode_task(kv.value(), &existing_id)?;
+                    if existing.state == TaskState::Running {
+                        // This pass may already have visited the requesting
+                        // shard. Keep the demand for its durable continuation.
+                        return Ok(Some(existing));
+                    }
+                    if existing.state == TaskState::Queued {
+                        let acknowledged = client
+                            .txn(
+                                Txn::new()
+                                    .when([
+                                        request_matches(),
+                                        Compare::value(
+                                            dedupe_key.as_str(),
+                                            CompareOp::Equal,
+                                            existing_id.as_str(),
+                                        ),
+                                        Compare::mod_revision(
+                                            self.task_key(&existing_id),
+                                            CompareOp::Equal,
+                                            kv.mod_revision(),
+                                        ),
+                                    ])
+                                    .and_then([TxnOp::delete(request_key.as_str(), None)]),
+                            )
+                            .await
+                            .map_err(etcd_error("acknowledge queued merge demand"))?;
+                        if acknowledged.succeeded() {
+                            return Ok(Some(existing));
+                        }
+                        continue;
+                    }
+                }
+                self.delete_owned_key(&dedupe_key, &existing_id).await?;
+                continue;
+            }
+            let admitted = client
+                .txn(
+                    Txn::new()
+                        .when([
+                            request_matches(),
+                            Compare::version(dedupe_key.as_str(), CompareOp::Equal, 0),
+                        ])
+                        .and_then([
+                            TxnOp::put(self.task_key(&task.id), value.clone(), None),
+                            TxnOp::put(self.queue_key(&task.id), value.clone(), None),
+                            TxnOp::put(dedupe_key.as_str(), task.id.as_str(), None),
+                            TxnOp::delete(request_key.as_str(), None),
+                        ]),
+                )
+                .await
+                .map_err(etcd_error("admit merge demand"))?;
+            if admitted.succeeded() {
+                return Ok(Some(task));
+            }
+        }
+        Err(lance::Error::io(
+            "merge demand admission changed repeatedly; durable request retained",
+        ))
     }
 
     async fn get(&self, id: &str) -> lance::Result<Option<TaskRecord>> {
@@ -2596,6 +2716,171 @@ mod tests {
             .is_none());
         store
             .finish(claimed, Ok("fixture completed".into()))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn merge_demand_admission_does_not_replay_a_served_fresh_page() {
+        let (_dir, store) = bounded_scheduler_store(vec![]).await;
+        let coordinator = store.merge_coordinator();
+        coordinator.request_merge("hot").await.unwrap();
+        let request = coordinator.request_page(None).await.unwrap().0.remove(0);
+        let first = store
+            .enqueue_merge_request(&request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(coordinator
+            .get_merge_request("hot")
+            .await
+            .unwrap()
+            .is_none());
+        let claim = store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.task.id, first.id);
+        store
+            .finish(claim, Ok("peer served this request".into()))
+            .await
+            .unwrap();
+        // Another master fetched the same page before the peer served it. It
+        // may still be processing that page, without any failure or pause.
+        assert!(store
+            .enqueue_merge_request(&request)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(store.queue_depth().await.unwrap(), 0);
+        assert!(store
+            .get_active_id(TaskKind::MergeWal, "hot")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn merge_demand_admission_preserves_new_flushes_and_running_continuation() {
+        let (_dir, store) = bounded_scheduler_store(vec![]).await;
+        let coordinator = store.merge_coordinator();
+        let queued = store
+            .enqueue(TaskKind::MergeWal, "hot", vec![])
+            .await
+            .unwrap();
+        coordinator.request_merge("hot").await.unwrap();
+        let stale = coordinator.get_merge_request("hot").await.unwrap().unwrap();
+        coordinator.request_merge("hot").await.unwrap();
+        let fresh = coordinator.get_merge_request("hot").await.unwrap().unwrap();
+        assert!(fresh.revision > stale.revision);
+        assert!(store.enqueue_merge_request(&stale).await.unwrap().is_none());
+        assert_eq!(
+            coordinator
+                .get_merge_request("hot")
+                .await
+                .unwrap()
+                .unwrap()
+                .revision,
+            fresh.revision
+        );
+        assert_eq!(
+            store
+                .enqueue_merge_request(&fresh)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            queued.id
+        );
+        assert!(coordinator
+            .get_merge_request("hot")
+            .await
+            .unwrap()
+            .is_none());
+        let claim = store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        coordinator.request_merge("hot").await.unwrap();
+        let during_run = coordinator.get_merge_request("hot").await.unwrap().unwrap();
+        assert_eq!(
+            store
+                .enqueue_merge_request(&during_run)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            queued.id
+        );
+        assert!(coordinator
+            .get_merge_request("hot")
+            .await
+            .unwrap()
+            .is_some());
+        store
+            .finish(claim, Ok("pass completed".into()))
+            .await
+            .unwrap();
+        let next = store
+            .enqueue_merge_request(&during_run)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(next.id, queued.id);
+        assert!(coordinator
+            .get_merge_request("hot")
+            .await
+            .unwrap()
+            .is_none());
+        let claim = store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .finish(claim, Ok("continuation completed".into()))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn merge_demand_admission_concurrent_scanners_create_one_task() {
+        let (_dir, store) = bounded_scheduler_store(vec![]).await;
+        let coordinator = store.merge_coordinator();
+        coordinator.request_merge("hot").await.unwrap();
+        let request = coordinator.get_merge_request("hot").await.unwrap().unwrap();
+        let mut scanners = tokio::task::JoinSet::new();
+        for _ in 0..20 {
+            let store = store.clone();
+            let request = request.clone();
+            scanners.spawn(async move { store.enqueue_merge_request(&request).await.unwrap() });
+        }
+        let mut admitted = Vec::new();
+        while let Some(result) = scanners.join_next().await {
+            if let Some(task) = result.unwrap() {
+                admitted.push(task);
+            }
+        }
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(store.queue_depth().await.unwrap(), 1);
+        assert!(coordinator
+            .get_merge_request("hot")
+            .await
+            .unwrap()
+            .is_none());
+        let claim = store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.task.id, admitted[0].id);
+        store
+            .finish(claim, Ok("single pass completed".into()))
             .await
             .unwrap();
     }
