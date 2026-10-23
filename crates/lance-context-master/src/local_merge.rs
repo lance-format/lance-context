@@ -102,6 +102,26 @@ pub(crate) fn validate(config: &MasterConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// A prepared maintenance task already has a leased commit-turn marker which
+/// prevents the next merge from stealing its turn. Observe it only after all
+/// work in a shard pass completed. Mid-pass yields could repeatedly restart at
+/// the first hot shard and starve the remaining shards.
+pub(crate) async fn yield_to_maintenance(state: &MasterState, target: &str) -> bool {
+    if state.config.catchup.target.is_some() || !selected(&state.config, target) {
+        return false;
+    }
+    let reason = match state.task_store.maintenance_commit_requested(target).await {
+        Ok(false) => return false,
+        Ok(true) => "maintenance_waiting",
+        Err(error) => {
+            tracing::warn!(%target, %error, "yielding completed merge pass after commit-turn check failed");
+            "check_unavailable"
+        }
+    };
+    metrics::counter!("master_native_merge_pass_yields_total", "reason" => reason).increment(1);
+    true
+}
+
 /// The caller owns the canonical task and maintenance fence. No private queue,
 /// Pod, writer epoch, or independent per-table memory budget is created here.
 pub(crate) async fn run(state: &Arc<MasterState>, target: &str) -> Result<String, String> {

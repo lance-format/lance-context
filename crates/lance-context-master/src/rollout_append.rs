@@ -309,6 +309,9 @@ pub(crate) async fn run(state: &Arc<MasterState>, target: &str) -> Result<String
         if reclaimed == 0 {
             return Ok(format!("staged append reclaimed {total} generations"));
         }
+        if crate::local_merge::yield_to_maintenance(state, target).await {
+            break;
+        }
     }
     if crate::local_merge::selected(&state.config, target) && state.config.catchup.target.is_none()
     {

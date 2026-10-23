@@ -101,3 +101,18 @@ The source paths and regression tests are implemented but final validation is
 still running. Keep automatic routing disabled until the initial transition
 is proven. Existing production helpers remain necessary until the handoff is
 demonstrated.
+
+### Yielding a native merge to prepared maintenance
+
+Once an index or compaction has prepared its files, its existing leased commit
+request blocks new merge admission. Native upsert and staged-append executors
+also check that request after a completed shard pass. They publish continuation
+demand and finish through the normal fenced cleanup before the maintenance
+claim can acquire write ownership. The next merge resumes after maintenance.
+
+This is a cooperative pass boundary, not cancellation of progressing storage
+operations. Checking between completed passes avoids restarting every task at
+the first hot shard before later shards receive work. Dedicated legacy
+executors keep their existing behavior. A failed request lookup conservatively
+yields the completed pass; it never grants the waiting writer ownership.
+`master_native_merge_pass_yields_total{reason}` reports these boundaries.

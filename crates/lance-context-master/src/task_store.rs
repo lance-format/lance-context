@@ -218,6 +218,16 @@ impl Drop for LeaseKeepalive {
 }
 
 impl TaskStore {
+    /// Existing leased commit-turn request; presence asks an admitted writer
+    /// to yield at a completed pass, never grants ownership to another writer.
+    pub(crate) async fn maintenance_commit_requested(&self, target: &str) -> lance::Result<bool> {
+        let values = self
+            .inner
+            .read_values(&[self.inner.compaction_commit_key(target)])
+            .await?;
+        Ok(values[0].is_some())
+    }
+
     pub(crate) async fn preparation_owned(&self, claim: &TaskClaim) -> lance::Result<bool> {
         let Some(key) = &claim.backend.preparation_key else {
             return Ok(false);

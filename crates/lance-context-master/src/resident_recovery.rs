@@ -501,6 +501,169 @@ mod tests {
         assert!(!probe(&successor, "a").await.unwrap());
     }
 
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn native_pass_serves_prepared_index_before_continuing_every_shard() {
+        use crate::task_store::TaskKinds;
+        let record = |id: String| {
+            let dto = serde_json::from_value(serde_json::json!({
+                "id": id, "rollout_id": "fixture", "content": "kept",
+            }))
+            .unwrap();
+            lance_context_core::rollout_record_from_add_request(&dto)
+        };
+        for append in [false, true] {
+            let (_dir, original) = fixture().await;
+            let mut config = original.config.clone();
+            config.append.rollout_append_local = append;
+            config.append.rollout_append_targets = if append { vec!["*".into()] } else { vec![] };
+            config.local_merge.master_local_merge_targets = vec!["*".into()];
+            config.catchup.shards = vec!["early".into(), "late".into()];
+            config.catchup.merge_max_generations = 1;
+            config.maintenance.index_prepare_targets = vec!["a".into()];
+            let state = MasterState::new(config).await.unwrap();
+            let mut seed = RolloutStore::open(&state.rollout_uri("a")).await.unwrap();
+            seed.add(&[record("seed".into())]).await.unwrap();
+            seed.flush().await.unwrap();
+            seed.cleanup_own_shard().await.unwrap();
+            let prepared = seed.prepare_id_key_index().await.unwrap();
+            for shard in ["early", "late"] {
+                let writer = RolloutStore::open_with_options(
+                    &state.rollout_uri("a"),
+                    RolloutStoreOptions {
+                        shard_id: Some(shard.into()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+                for generation in 0..3 {
+                    writer
+                        .add(&[record(format!("{shard}-{generation}"))])
+                        .await
+                        .unwrap();
+                    writer.flush().await.unwrap();
+                }
+            }
+            state
+                .task_store
+                .enqueue(TaskKind::MergeWal, "a", vec![])
+                .await
+                .unwrap();
+            let merge = state
+                .task_store
+                .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+                .await
+                .unwrap()
+                .unwrap();
+            state
+                .task_store
+                .enqueue(TaskKind::IndexId, "a", vec![])
+                .await
+                .unwrap();
+            let mut index = state
+                .task_store
+                .claim_next_of_kinds(TaskKinds::GENERAL.without_compact())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(index.preparing_maintenance());
+            assert!(!state
+                .task_store
+                .maintenance_commit_requested("a")
+                .await
+                .unwrap());
+            assert!(state
+                .task_store
+                .request_maintenance_commit(&index)
+                .await
+                .unwrap());
+            assert!(state
+                .task_store
+                .maintenance_commit_requested("a")
+                .await
+                .unwrap());
+            assert!(!state
+                .task_store
+                .maintenance_commit_requested("b")
+                .await
+                .unwrap());
+            let result = crate::merge_execution::run_merge_wal(&state, &merge).await;
+            assert!(
+                result.as_ref().unwrap().contains("2 generations"),
+                "{result:?}, append={append}"
+            );
+            let reader = RolloutStore::open(&state.rollout_uri("a")).await.unwrap();
+            for shard in ["early", "late"] {
+                assert!(reader
+                    .get_by_id_source(
+                        &format!("{shard}-0"),
+                        lance_context_core::ListSource::Fragments
+                    )
+                    .await
+                    .unwrap()
+                    .is_some());
+                assert!(reader
+                    .get_by_id_source(
+                        &format!("{shard}-1"),
+                        lance_context_core::ListSource::Fragments
+                    )
+                    .await
+                    .unwrap()
+                    .is_none());
+            }
+            let coordinator = state.task_store.merge_coordinator();
+            let request = coordinator.get_merge_request("a").await.unwrap().unwrap();
+            state.task_store.finish(merge, result).await.unwrap();
+            crate::scheduler::enqueue_merge_request(&state, &coordinator, &request)
+                .await
+                .unwrap();
+            assert!(state
+                .task_store
+                .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+                .await
+                .unwrap()
+                .is_none());
+            assert!(state
+                .task_store
+                .promote_maintenance(&mut index)
+                .await
+                .unwrap());
+            let result = crate::maintenance_execution::run(&state, &index, async {
+                let mut writer = RolloutStore::open(&state.rollout_uri("a"))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                writer
+                    .commit_prepared_id_key_index(prepared)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok("index published".into())
+            })
+            .await;
+            assert!(result.is_ok(), "{result:?}");
+            state.task_store.finish(index, result).await.unwrap();
+            assert!(!state
+                .task_store
+                .maintenance_commit_requested("a")
+                .await
+                .unwrap());
+            let next = state
+                .task_store
+                .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+                .await
+                .unwrap()
+                .unwrap();
+            let result = crate::merge_execution::run_merge_wal(&state, &next).await;
+            assert!(
+                result.as_ref().unwrap().contains("4 generations"),
+                "{result:?}"
+            );
+            state.task_store.finish(next, result).await.unwrap();
+            let reader = lance::Dataset::open(&state.rollout_uri("a")).await.unwrap();
+            assert_eq!(reader.count_rows(None).await.unwrap(), 7);
+        }
+    }
+
     async fn generic_fixture() -> (tempfile::TempDir, Arc<MasterState>) {
         generic_fixture_with_auto(false).await
     }

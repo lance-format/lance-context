@@ -257,7 +257,9 @@ pub(crate) async fn merge_local(
             // bounded resident discovery will reassert any remaining demand.
             return Ok(detail(total));
         }
-        if started.elapsed() >= admit_for {
+        if started.elapsed() >= admit_for
+            || crate::local_merge::yield_to_maintenance(state, target).await
+        {
             break;
         }
     }
