@@ -194,9 +194,19 @@ async fn watch_with_publisher(
     let mut changed = tokio::time::Instant::now();
     let mut last_progress_at_ms = (sequence > 0).then(lance_context_merge::failure::now_ms);
     let mut publication_failed = false;
+    // Work observation is local and stays responsive. Publishing every local
+    // sample made each active task generate a replicated write every second,
+    // even when the progress sequence was unchanged. Coalesce reports, leaving
+    // several publication opportunities inside the actual-work idle budget.
+    let publish_every = Duration::from_secs((execution.idle_timeout_secs / 4).clamp(1, 5));
+    let mut next_publication = tokio::time::Instant::now();
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
         let current = scope.completed_steps();
+        // Publish resumed work promptly after a quiet period. Otherwise a
+        // buffered update near the idle boundary could unnecessarily widen
+        // the remote observer's stale-progress window.
+        let resumed = current != sequence && changed.elapsed() >= publish_every;
         if current > sequence {
             crate::merge_capacity::observed_work();
         }
@@ -211,8 +221,13 @@ async fn watch_with_publisher(
                 "maintenance stopped making progress; cancelling preparation before drain/fence recovery");
             return "maintenance no-progress deadline exceeded".into();
         }
-        // Publishing an unchanged sequence checks ownership but does not count
-        // as progress. A healthy lease never resets the idle deadline.
+        if !publication_failed && !resumed && tokio::time::Instant::now() < next_publication {
+            metrics::counter!("master_maintenance_progress_coalesced_samples_total").increment(1);
+            continue;
+        }
+        // An occasional unchanged report checks ownership and freshness; it
+        // never resets the local or remote actual-work deadline. Every storage
+        // commit still checks its own fence, including between these reports.
         let report = serde_json::json!({
             "executor_id": executor_id,
             "task_id": task_id,
@@ -223,8 +238,10 @@ async fn watch_with_publisher(
             "idle_timeout_secs": execution.idle_timeout_secs,
             "work": scope.work(),
         });
+        metrics::counter!("master_maintenance_progress_publications_total").increment(1);
         match publisher.publish(sequence, report).await {
             Ok(true) => {
+                next_publication = tokio::time::Instant::now() + publish_every;
                 if publication_failed {
                     metrics::counter!("master_maintenance_progress_publication_recovered_total")
                         .increment(1);
@@ -483,7 +500,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn progress_publication_retry_is_bounded_and_revocation_is_immediate() {
+    async fn progress_publication_retry_is_bounded_and_revocation_is_terminal() {
         let mut execution = Execution::new("table", "master:catchup", "test", 60);
         execution.idle_timeout_secs = 10;
         let scope = MergeWriteScope::new();
@@ -513,6 +530,129 @@ mod tests {
             assert!(error.contains(expected), "{error}");
             assert_eq!(publisher.calls, calls);
         }
+    }
+
+    #[tokio::test]
+    async fn progress_reports_coalesce_real_work_without_hiding_new_progress() {
+        struct Reports(tokio::sync::mpsc::UnboundedSender<serde_json::Value>);
+        impl ProgressPublisher for Reports {
+            async fn publish(
+                &mut self,
+                _sequence: u64,
+                report: serde_json::Value,
+            ) -> Result<bool, String> {
+                self.0.send(report).unwrap();
+                Ok(true)
+            }
+        }
+        let mut execution = Execution::new("table", "master:catchup", "test", 60);
+        execution.idle_timeout_secs = 60;
+        let scope = MergeWriteScope::new();
+        let (tx, mut reports) = tokio::sync::mpsc::unbounded_channel();
+        let mut publisher = Reports(tx);
+        let watch = watch_with_publisher(&execution, &scope, "executor", "task", &mut publisher);
+        let producer = async {
+            loop {
+                scope
+                    .run(async {
+                        lance_context_core::merge_write_scope::checkpoint();
+                    })
+                    .await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
+        let verify = async {
+            let first = reports.recv().await.unwrap();
+            let first_sequence = first["sequence"].as_u64().unwrap();
+            assert!(first_sequence > 0);
+            let started = tokio::time::Instant::now();
+            // Work continues, but repeated samples need not hit etcd.
+            assert!(tokio::time::timeout(Duration::from_secs(3), reports.recv())
+                .await
+                .is_err());
+            assert!(scope.completed_steps() > first_sequence);
+            let next = tokio::time::timeout(Duration::from_secs(4), reports.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(started.elapsed() >= Duration::from_secs(4));
+            assert!(next["sequence"].as_u64().unwrap() > first_sequence);
+            assert!(next["last_progress_at_ms"].as_u64() > first["last_progress_at_ms"].as_u64());
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                error = watch => panic!("progressing work stopped: {error}"),
+                _ = producer => unreachable!(),
+                _ = verify => {},
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn progress_resuming_after_quiet_does_not_wait_for_coalescing() {
+        struct ResumeAfterQuiet<'a> {
+            calls: usize,
+            scope: &'a Arc<MergeWriteScope>,
+        }
+        impl ProgressPublisher for ResumeAfterQuiet<'_> {
+            async fn publish(
+                &mut self,
+                _sequence: u64,
+                _report: serde_json::Value,
+            ) -> Result<bool, String> {
+                self.calls += 1;
+                if self.calls == 2 {
+                    // Resume just after a quiet freshness publication. The
+                    // next local observation must not wait another five seconds.
+                    self.scope
+                        .run(async {
+                            lance_context_core::merge_write_scope::checkpoint();
+                        })
+                        .await;
+                }
+                Ok(self.calls < 3)
+            }
+        }
+        let mut execution = Execution::new("table", "master:catchup", "test", 60);
+        execution.idle_timeout_secs = 60;
+        let scope = MergeWriteScope::new();
+        let mut publisher = ResumeAfterQuiet {
+            calls: 0,
+            scope: &scope,
+        };
+        let error = tokio::time::timeout(
+            Duration::from_secs(9),
+            watch_with_publisher(&execution, &scope, "executor", "task", &mut publisher),
+        )
+        .await
+        .unwrap();
+        assert!(error.contains("ownership revoked"));
+        assert_eq!(publisher.calls, 3);
+    }
+
+    #[tokio::test]
+    async fn quiet_reports_are_coalesced_without_extending_the_idle_deadline() {
+        let mut execution = Execution::new("table", "master:catchup", "test", 60);
+        execution.idle_timeout_secs = 8;
+        let scope = MergeWriteScope::new();
+        let mut publisher = ScriptedProgress {
+            replies: Default::default(),
+            calls: 0,
+        };
+        let error = tokio::time::timeout(
+            Duration::from_secs(10),
+            watch_with_publisher(&execution, &scope, "executor", "task", &mut publisher),
+        )
+        .await
+        .unwrap();
+        assert!(error.contains("no-progress"));
+        assert!(
+            (2..=4).contains(&publisher.calls),
+            "quiet work must publish bounded freshness updates without writing every second: {}",
+            publisher.calls
+        );
     }
 
     #[tokio::test]
@@ -810,6 +950,83 @@ mod tests {
         assert!(result.is_ok(), "{result:?}");
         assert!(coordinator.get("table").await.unwrap().is_none());
         state.task_store.finish(claim, result).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn coalesced_progress_reaches_etcd_and_preserves_revocation_cas() {
+        let (_dir, state) = fixture().await;
+        let claim = claim(&state, TaskKind::MergeWal).await;
+        let coordinator = state.task_store.merge_coordinator();
+        let mut execution = Execution::new("table", "master:catchup", "test", 60);
+        execution.idle_timeout_secs = 60;
+        assert!(coordinator
+            .reserve(&state.task_store.merge_claim(&claim), &execution)
+            .await
+            .unwrap());
+        let running = coordinator.start(&execution).await.unwrap().unwrap();
+        let scope = MergeWriteScope::new();
+        let watchdog = watch(
+            &coordinator,
+            &running,
+            &scope,
+            "executor-test",
+            &claim.task.id,
+        );
+        let verify = async {
+            let first = loop {
+                if let Some(report) = coordinator.work_progress(&running).await.unwrap() {
+                    break report;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            };
+            let first_sequence = first["sequence"].as_u64().unwrap();
+            for _ in 0..20 {
+                scope
+                    .run(async {
+                        lance_context_core::merge_write_scope::checkpoint();
+                    })
+                    .await;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            assert_eq!(
+                coordinator.work_progress(&running).await.unwrap().unwrap(),
+                first,
+                "local progress samples must not rewrite the report every second"
+            );
+            let latest = loop {
+                let report = coordinator.work_progress(&running).await.unwrap().unwrap();
+                if report["sequence"].as_u64() == Some(scope.completed_steps()) {
+                    break report;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            };
+            assert!(latest["sequence"].as_u64().unwrap() > first_sequence);
+            assert!(
+                !coordinator
+                    .revoke_stalled(&running, Some(first_sequence))
+                    .await
+                    .unwrap(),
+                "an old observation cannot revoke newly published progress"
+            );
+            assert!(coordinator.finish(&running, Ok(0)).await.unwrap());
+        };
+        let (error, ()) = tokio::time::timeout(Duration::from_secs(20), async {
+            tokio::join!(watchdog, verify)
+        })
+        .await
+        .unwrap();
+        assert!(error.contains("ownership revoked"));
+        let terminal = coordinator.get("table").await.unwrap().unwrap();
+        assert!(coordinator
+            .release(&state.task_store.merge_claim(&claim), &terminal)
+            .await
+            .unwrap());
+        state
+            .task_store
+            .finish(claim, Ok("coalescing fixture completed".into()))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
