@@ -394,6 +394,137 @@ async fn native_executor_preserves_live_ingestion_and_drains_sealed_shards() {
     }
 }
 
+#[tokio::test]
+#[ignore = "requires ETCD_TEST_ENDPOINTS"]
+async fn sparse_native_executor_preserves_upserts_and_rediscovers_cold_writes() {
+    use lance_context_core::{
+        ColumnSpec, ColumnType, GenericStore, GenericStoreOptions, SchemaSpec,
+    };
+    for pipelined in [false, true] {
+        let (_dir, state) = fixture().await.unwrap();
+        let target = "generic:hot";
+        let uri = state.generic_uri("hot");
+        let schema = SchemaSpec::new(vec![
+            (
+                "id".into(),
+                ColumnSpec::required(ColumnType::String { large: false }),
+            ),
+            (
+                "text".into(),
+                ColumnSpec::new(ColumnType::String { large: true }),
+            ),
+        ]);
+        let mut writers = Vec::new();
+        for (shard, generations) in [(0, 12), (19, 2)] {
+            let writer = GenericStore::open(
+                &uri,
+                schema.clone(),
+                GenericStoreOptions {
+                    shard_id: Some(format!("worker-{shard}")),
+                    merge_after_generations: Some(0),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            for generation in 0..generations {
+                writer
+                    .add(&[
+                        json!({"id":format!("{shard}-{generation}"),"text":"payload"})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                        json!({"id":format!("latest-{shard}"),"text":generation.to_string()})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ])
+                    .await
+                    .unwrap();
+                writer.flush().await.unwrap();
+            }
+            writers.push(writer);
+        }
+        let mut cfg = state.config.clone();
+        cfg.catchup.enabled = false;
+        cfg.catchup.shards = (0..20).map(|i| format!("worker-{i}")).collect();
+        cfg.catchup.pipeline_enabled = pipelined;
+        cfg.catchup.merge_max_generations = 1;
+        cfg.catchup.merge_max_bytes = 1024 * 1024;
+        cfg.catchup.merge_memory_bytes = 1024 * 1024;
+        cfg.merge_rollout.owned_targets.push(target.into());
+        cfg.catchup.target = Some(target.into());
+        cfg.catchup.job_name = Inventory::new(&state)
+            .reserve(target, "sparse-shards", 14, 100)
+            .await
+            .unwrap()
+            .job;
+        assert_eq!(
+            execute(cfg.clone(), target).await.unwrap(),
+            ExecuteOutcome::Completed
+        );
+        let reader = GenericStore::open_existing(&uri, GenericStoreOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(reader.pending_wal_generations().await.unwrap(), 0);
+        let rows = reader.list(None, None).await.unwrap();
+        assert_eq!(rows.len(), 16);
+        assert_eq!(
+            rows.iter().find(|r| r["id"] == "latest-0").unwrap()["text"],
+            "11"
+        );
+        assert_eq!(
+            rows.iter().find(|r| r["id"] == "latest-19").unwrap()["text"],
+            "1"
+        );
+        assert_eq!(
+            lance::Dataset::open(&uri)
+                .await
+                .unwrap()
+                .count_rows(None)
+                .await
+                .unwrap(),
+            16
+        );
+
+        // Reusing the ingestion handle is valid, and a new execution must not
+        // inherit the empty observation left by the previous execution.
+        writers[1]
+            .add(&[json!({"id":"cold-arrival","text":"new"})
+                .as_object()
+                .unwrap()
+                .clone()])
+            .await
+            .unwrap();
+        writers[1].flush().await.unwrap();
+        assert_eq!(
+            execute(cfg, target).await.unwrap(),
+            ExecuteOutcome::Completed
+        );
+        let reader = GenericStore::open_existing(&uri, GenericStoreOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(reader.pending_wal_generations().await.unwrap(), 0);
+        assert_eq!(reader.list(None, None).await.unwrap().len(), 17);
+        assert_eq!(
+            lance::Dataset::open(&uri)
+                .await
+                .unwrap()
+                .count_rows(None)
+                .await
+                .unwrap(),
+            17
+        );
+        assert!(state
+            .task_store
+            .merge_coordinator()
+            .get(target)
+            .await
+            .unwrap()
+            .is_none());
+    }
+}
+
 async fn native_executor_with_budget(memory_bytes: usize) {
     use lance_context_core::{
         ColumnSpec, ColumnType, GenericStore, GenericStoreOptions, SchemaSpec,

@@ -6,7 +6,48 @@ use lance_context_core::{
     GenericStore, GenericStoreOptions, MergeMemoryBudget, RolloutStore, RolloutStoreOptions,
 };
 use lance_context_merge::MaintenanceKind;
-use std::{future::Future, sync::Arc, time::Duration};
+use std::{
+    future::Future,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
+
+/// A successful empty pass is evidence to prioritize other shards, not proof
+/// that this shard will stay empty. Recheck all shards every fourth pass and
+/// whenever the previously productive set runs dry. State lasts one slice;
+/// another claim always starts by checking every configured writer again.
+struct ShardActivity(Vec<AtomicBool>);
+
+impl ShardActivity {
+    fn new(count: usize) -> Self {
+        Self((0..count).map(|_| AtomicBool::new(true)).collect())
+    }
+
+    fn select(&self, pass: usize) -> Vec<usize> {
+        let active: Vec<_> = self
+            .0
+            .iter()
+            .enumerate()
+            .filter_map(|(index, active)| active.load(Ordering::Relaxed).then_some(index))
+            .collect();
+        if pass.is_multiple_of(4) || active.is_empty() {
+            (0..self.0.len()).collect()
+        } else {
+            active
+        }
+    }
+
+    fn record(&self, index: usize, reclaimed: usize) {
+        self.0[index].store(reclaimed > 0, Ordering::Relaxed);
+    }
+
+    fn caught_up(&self, selected: &[usize], reclaimed: usize) -> bool {
+        selected.len() == self.0.len() && reclaimed == 0
+    }
+}
 
 /// A busy admission never acquired a task or entered recovery/payload work.
 /// Transport errors, including an unknown claim outcome, remain errors.
@@ -149,11 +190,16 @@ pub(crate) async fn merge_local(
     // This is only an admission time slice. A progressing operation already
     // admitted may run beyond it; cancellation is based on lack of progress.
     let admit_for = Duration::from_secs(config.slice_secs);
+    let activity = ShardActivity::new(config.shards.len());
     // Bound each slice even under continuous ingestion. Resident masters publish
     // continuation demand before releasing their claim; no full scan is required.
-    for _ in 0..16 {
-        let before = total;
-        total += run_pipeline(&config.shards, config.pipeline_enabled, |shard| {
+    for pass in 0..16 {
+        let selected = activity.select(pass);
+        metrics::counter!("master_catchup_empty_shards_skipped_total")
+            .increment((config.shards.len() - selected.len()) as u64);
+        let reclaimed = run_pipeline(selected.iter().copied(), config.pipeline_enabled, |index| {
+            let shard = &config.shards[index];
+            let activity = &activity;
             let session = session.clone();
             let budget = budget.clone();
             async move {
@@ -168,6 +214,9 @@ pub(crate) async fn merge_local(
                 Ok(Box::pin(async move {
                     let commit_started = tokio::time::Instant::now();
                     let reclaimed = commit.await?;
+                    // Only successful, actually admitted work informs the next
+                    // pass. An expired slice or an error is not an empty scan.
+                    activity.record(index, reclaimed);
                     let commit_secs = commit_started.elapsed().as_secs_f64();
                     metrics::counter!("master_catchup_generations_reclaimed_total")
                         .increment(reclaimed as u64);
@@ -183,7 +232,9 @@ pub(crate) async fn merge_local(
             }
         })
         .await?;
-        if total == before && (total == 0 || started.elapsed() < admit_for) {
+        total += reclaimed;
+        if activity.caught_up(&selected, reclaimed) && (total == 0 || started.elapsed() < admit_for)
+        {
             // Empty metadata reads can consume the admission slice too. They
             // must not create a self-sustaining chain of zero-work tasks;
             // bounded resident discovery will reassert any remaining demand.
@@ -356,6 +407,120 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::{Notify, Semaphore};
+
+    #[tokio::test]
+    async fn sparse_shards_require_a_fresh_full_sweep_before_completion() {
+        for pipelined in [false, true] {
+            for late_write in [false, true] {
+                let activity = ShardActivity::new(20);
+                let pending: Vec<_> = (0..20)
+                    .map(|index| AtomicUsize::new(if index == 0 { 24 } else { 0 }))
+                    .collect();
+                let empty_reads = AtomicUsize::new(0);
+                let mut reclaimed = 0;
+                let mut completed = false;
+                let mut saw_partial_empty = false;
+                for pass in 0..16 {
+                    let selected = activity.select(pass);
+                    let count = run_pipeline(selected.iter().copied(), pipelined, |index| {
+                        let activity = &activity;
+                        let pending = &pending;
+                        let empty_reads = &empty_reads;
+                        async move {
+                            // Model a byte-bounded read followed by its joined
+                            // commit. Each successful pass reclaims at most six.
+                            let count = pending[index]
+                                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+                                    Some(value.saturating_sub(6))
+                                })
+                                .unwrap()
+                                .min(6);
+                            if count == 0 {
+                                empty_reads.fetch_add(1, Ordering::SeqCst);
+                            }
+                            Ok(async move {
+                                tokio::task::yield_now().await;
+                                activity.record(index, count);
+                                Ok(count)
+                            })
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    reclaimed += count;
+                    if pass == 1 && late_write {
+                        // This writer was empty at discovery, then received new
+                        // data while the hot writer was still catching up.
+                        pending[19].store(2, Ordering::SeqCst);
+                    }
+                    if count == 0 && selected.len() < 20 {
+                        saw_partial_empty = true;
+                        assert!(!activity.caught_up(&selected, count));
+                    }
+                    if activity.caught_up(&selected, count) {
+                        assert!(pending.iter().all(|x| x.load(Ordering::SeqCst) == 0));
+                        completed = true;
+                        break;
+                    }
+                }
+                assert!(completed);
+                assert_eq!(reclaimed, if late_write { 26 } else { 24 });
+                if late_write {
+                    assert!(
+                        saw_partial_empty,
+                        "completion must wait for the full resweep"
+                    );
+                } else {
+                    // Initial and final discovery remain; the three middle
+                    // rounds avoid 19 known-empty shards each (96 -> 39).
+                    assert_eq!(empty_reads.load(Ordering::SeqCst), 39);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn continuously_hot_shard_cannot_starve_a_newly_active_writer() {
+        for pipelined in [false, true] {
+            let activity = ShardActivity::new(20);
+            let cold_pending = AtomicUsize::new(0);
+            let mut cold_reclaimed_at = Vec::new();
+            for pass in 0..12 {
+                let selected = activity.select(pass);
+                let count = run_pipeline(selected.iter().copied(), pipelined, |index| {
+                    let activity = &activity;
+                    let cold_pending = &cold_pending;
+                    async move {
+                        let count = match index {
+                            0 => 6, // Continuous ingestion never lets this go idle.
+                            19 => cold_pending.swap(0, Ordering::SeqCst),
+                            _ => 0,
+                        };
+                        Ok(async move {
+                            activity.record(index, count);
+                            Ok(count)
+                        })
+                    }
+                })
+                .await
+                .unwrap();
+                assert!(!activity.caught_up(&selected, count));
+                if count > 6 {
+                    cold_reclaimed_at.push(pass);
+                }
+                if pass == 1 || pass == 6 {
+                    cold_pending.store(2, Ordering::SeqCst);
+                }
+            }
+            assert_eq!(cold_reclaimed_at, [4, 8]);
+            assert_eq!(cold_pending.load(Ordering::SeqCst), 0);
+            // A new claim cannot inherit an old empty observation.
+            assert_eq!(
+                ShardActivity::new(20).select(0),
+                (0..20).collect::<Vec<_>>()
+            );
+        }
+    }
 
     #[tokio::test]
     async fn admission_delivers_claim_accepted_across_retry_deadline() {
