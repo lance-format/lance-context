@@ -2377,7 +2377,8 @@ impl StorageBase {
 
     /// Read a fresh base/WAL view and retry if a merge invalidates it. A merge
     /// commits base before draining/deleting its generations, so an unchanged
-    /// base version must bracket the WAL manifest capture. Validate that pair
+    /// base data view must bracket the WAL manifest capture. Metadata/index-only
+    /// publication does not change that view. Validate that pair
     /// before reading payloads. A later commit does not invalidate a completed
     /// read of that snapshot. Retry missing generations even when the base
     /// version is unchanged; never return a partial result after one disappears.
@@ -2419,8 +2420,12 @@ impl StorageBase {
         let mut payload_retry_started = None;
         let mut next_dataset = None;
         let mut captures = 0;
-        let mut last_missing_version = None;
+        let mut last_missing_view: Option<Arc<lance_table::format::Manifest>> = None;
         let mut missing_at_version = 0;
+        let mut base_open_secs = 0.0;
+        let mut wal_capture_secs = 0.0;
+        let mut base_validate_secs = 0.0;
+        let mut last_versions = None;
         for attempt in 0..MAX_SNAPSHOT_ATTEMPTS {
             // Once payload recovery begins, metadata churn and newer base
             // versions cannot reset or extend that recovery window.
@@ -2431,7 +2436,8 @@ impl StorageBase {
                 break;
             }
             captures += 1;
-            let dataset = match next_dataset.take() {
+            let phase_started = std::time::Instant::now();
+            let mut dataset = match next_dataset.take() {
                 Some(dataset) => dataset,
                 None => {
                     let mut dataset = self.dataset.clone();
@@ -2441,16 +2447,24 @@ impl StorageBase {
                     dataset
                 }
             };
+            base_open_secs += phase_started.elapsed().as_secs_f64();
             let version = dataset.manifest.version;
+            let phase_started = std::time::Instant::now();
             let snapshots = if source == ListSource::Fragments {
                 Vec::new()
             } else {
                 capture().await?
             };
+            wal_capture_secs += phase_started.elapsed().as_secs_f64();
             if !self.is_version_pinned() {
+                let phase_started = std::time::Instant::now();
                 let mut latest = dataset.clone();
                 latest.checkout_latest().await?;
-                if latest.manifest.version != version {
+                base_validate_secs += phase_started.elapsed().as_secs_f64();
+                last_versions = Some((version, latest.manifest.version));
+                if latest.manifest.version != version
+                    && !same_base_read_data(&dataset.manifest, &latest.manifest)
+                {
                     // A merge could have drained WAL after we opened base.
                     // Retry this metadata pair before scanning any payloads,
                     // otherwise the view could omit its newly merged rows.
@@ -2461,6 +2475,9 @@ impl StorageBase {
                     next_dataset = Some(latest);
                     continue;
                 }
+                // Prefer the validated newer index metadata / WAL watermarks.
+                // Its data view is identical to the capture's lower bound.
+                dataset = latest;
             }
             // A successful metadata capture ends that metadata-only window.
             // The payload window, once started, remains fixed across captures.
@@ -2475,14 +2492,17 @@ impl StorageBase {
                 }
                 let payload_started =
                     payload_retry_started.get_or_insert_with(std::time::Instant::now);
-                if last_missing_version == Some(version) {
+                if last_missing_view.as_ref().is_some_and(|previous| {
+                    previous.version == dataset.manifest.version
+                        || same_base_read_data(previous, &dataset.manifest)
+                }) {
                     missing_at_version += 1;
                 } else {
-                    last_missing_version = Some(version);
                     missing_at_version = 1;
                 }
-                // Actual base commits justify refreshing again, but repeated
-                // failures without base progress retain the old three-attempt
+                last_missing_view = Some(dataset.manifest.clone());
+                // Actual data changes justify refreshing again, but repeated
+                // failures with unchanged data retain the old three-attempt
                 // bound. Neither continuous commits nor missing data permit
                 // unlimited repeated payload decoding.
                 if missing_at_version >= MAX_MISSING_AT_VERSION
@@ -2503,7 +2523,8 @@ impl StorageBase {
             // continuous merging and repeats all their decoding work.
             return result;
         }
-        warn!(uri = %self.dataset.uri(), captures,
+        warn!(uri = %self.dataset.uri(), captures, ?source, ?last_versions,
+            base_open_secs, wal_capture_secs, base_validate_secs,
             elapsed_secs = started.elapsed().as_secs_f64(),
             "read could not capture stable base/WAL metadata within retry limits");
         Err(LanceError::io(
@@ -2856,6 +2877,27 @@ fn note_read_refused(_uri: &str) {
             .unwrap_or("unknown")
             .to_string(),
     );
+}
+
+/// Compare the immutable read view while excluding publication bookkeeping.
+/// Fragment data/deletion/row-id files, schema, configuration, external paths,
+/// feature flags and every other manifest field must still match. Normalizing
+/// a clone retains comparison of future manifest fields too; the potentially
+/// large fragment vector remains shared through its Arc.
+fn same_base_read_data(
+    before: &lance_table::format::Manifest,
+    after: &lance_table::format::Manifest,
+) -> bool {
+    let mut comparable = after.clone();
+    comparable.version = before.version;
+    comparable.version_aux_data = before.version_aux_data;
+    comparable.index_section = before.index_section;
+    comparable.timestamp_nanos = before.timestamp_nanos;
+    comparable.tag = before.tag.clone();
+    comparable.transaction_file = before.transaction_file.clone();
+    comparable.transaction_section = before.transaction_section;
+    comparable.table_metadata = before.table_metadata.clone();
+    *before == comparable
 }
 
 /// Derive the MemWAL shard UUID a server instance writes to from its stable

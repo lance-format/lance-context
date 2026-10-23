@@ -2567,6 +2567,161 @@ mod tests {
     use tempfile::TempDir;
 
     #[tokio::test]
+    async fn metadata_only_publications_do_not_starve_wal_snapshot_reads() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for index_kind in [
+            None,
+            Some(crate::KeyIndexType::Btree),
+            Some(crate::KeyIndexType::Zonemap),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let mut writer = RolloutStore::open_with_options(
+                uri,
+                RolloutStoreOptions {
+                    key_index_type: index_kind.unwrap_or_default(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            writer.add(&[assistant_record("base-row")]).await.unwrap();
+            writer.flush().await.unwrap();
+            writer.cleanup_own_shard().await.unwrap();
+            writer.add(&[assistant_record("wal-row")]).await.unwrap();
+            writer.flush().await.unwrap();
+            let reader = RolloutStore::open(uri).await.unwrap();
+            let writer = tokio::sync::Mutex::new(writer);
+            let captures = AtomicUsize::new(0);
+            let decodes = AtomicUsize::new(0);
+            let rows = reader
+                .base
+                .read_consistent_with_snapshots(
+                    ListSource::All,
+                    || async {
+                        let snapshots = reader.base.wal_shard_snapshots().await?;
+                        let epoch = captures.fetch_add(1, Ordering::SeqCst);
+                        let mut writer = writer.lock().await;
+                        if index_kind.is_some() {
+                            writer.base.create_configured_key_index().await?;
+                        } else {
+                            writer
+                                .base
+                                .dataset
+                                .update_metadata([("capture-epoch".to_owned(), epoch.to_string())])
+                                .await?;
+                        }
+                        Ok(snapshots)
+                    },
+                    |dataset, snapshots| {
+                        decodes.fetch_add(1, Ordering::SeqCst);
+                        reader.list_non_blob_snapshot(dataset, snapshots)
+                    },
+                )
+                .await
+                .expect("metadata/index publication must not invalidate unchanged base data");
+            assert_eq!(captures.load(Ordering::SeqCst), 1);
+            assert_eq!(decodes.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row.id.as_str())
+                    .collect::<HashSet<_>>(),
+                HashSet::from(["base-row", "wal-row"])
+            );
+            writer.lock().await.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_read_retries_a_concurrent_base_deletion() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut writer = RolloutStore::open(uri).await.unwrap();
+        writer
+            .add(&[assistant_record("deleted"), assistant_record("kept")])
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        writer.cleanup_own_shard().await.unwrap();
+        writer.add(&[assistant_record("wal-row")]).await.unwrap();
+        writer.flush().await.unwrap();
+        let reader = RolloutStore::open(uri).await.unwrap();
+        let writer = tokio::sync::Mutex::new(writer);
+        let captures = AtomicUsize::new(0);
+        let decodes = AtomicUsize::new(0);
+        let rows = reader
+            .base
+            .read_consistent_with_snapshots(
+                ListSource::All,
+                || async {
+                    let snapshots = reader.base.wal_shard_snapshots().await?;
+                    if captures.fetch_add(1, Ordering::SeqCst) == 0 {
+                        writer
+                            .lock()
+                            .await
+                            .base
+                            .dataset
+                            .delete("id = 'deleted'")
+                            .await?;
+                    }
+                    Ok(snapshots)
+                },
+                |dataset, snapshots| {
+                    decodes.fetch_add(1, Ordering::SeqCst);
+                    reader.list_non_blob_snapshot(dataset, snapshots)
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(captures.load(Ordering::SeqCst), 2);
+        assert_eq!(decodes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.id.as_str())
+                .collect::<HashSet<_>>(),
+            HashSet::from(["kept", "wal-row"])
+        );
+        writer.lock().await.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn metadata_publication_does_not_reset_missing_payload_retry_limit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let writer = tokio::sync::Mutex::new(RolloutStore::open(uri).await.unwrap());
+        let reader = RolloutStore::open(uri).await.unwrap();
+        let decodes = AtomicUsize::new(0);
+        let result = reader
+            .base
+            .read_consistent(ListSource::All, |_, _| async {
+                let epoch = decodes.fetch_add(1, Ordering::SeqCst);
+                writer
+                    .lock()
+                    .await
+                    .base
+                    .dataset
+                    .update_metadata([("capture-epoch".to_owned(), epoch.to_string())])
+                    .await?;
+                Err::<(), _>(LanceError::io(
+                    "Not found: _mem_wal/missing/data/file.lance",
+                ))
+            })
+            .await;
+        assert!(result.is_err());
+        assert_eq!(
+            decodes.load(Ordering::SeqCst),
+            3,
+            "metadata churn is not data progress"
+        );
+        writer.lock().await.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn slow_payload_read_retries_a_generation_reclaimed_by_peer_merge() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let dir = tempfile::tempdir().unwrap();
@@ -2720,7 +2875,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn changing_metadata_captures_remain_bounded_without_payload_decoding() {
+    async fn changing_data_captures_remain_bounded_without_payload_decoding() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         // Exercise both the attempt cap and expiry of the metadata retry
@@ -2742,13 +2897,12 @@ mod tests {
                         if slow {
                             tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
                         }
+                        let mut writer = writer.lock().await;
                         writer
-                            .lock()
-                            .await
-                            .base
-                            .dataset
-                            .update_metadata([("capture-epoch".to_owned(), epoch.to_string())])
+                            .add(&[assistant_record(&format!("new-row-{epoch}"))])
                             .await?;
+                        writer.flush().await?;
+                        writer.cleanup_own_shard().await?;
                         Ok(snapshots)
                     },
                     |_, _| {
