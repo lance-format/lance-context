@@ -176,6 +176,17 @@ impl MergeWriteScope {
         })
     }
 
+    /// Observe file IO on ephemeral legacy maintenance handles without changing
+    /// their commit authority or detaching writes. This is diagnostics only:
+    /// absence of progress does not authorize cancelling an unfenced writer.
+    pub fn for_legacy_file_observation() -> Arc<Self> {
+        Arc::new(Self {
+            observation_only: true,
+            observe_file_io: true,
+            ..Self::default()
+        })
+    }
+
     pub fn with_authorizer(authorizer: Arc<dyn CommitAuthorizer>) -> Arc<Self> {
         Arc::new(Self {
             authorizer: Some(authorizer),
@@ -1016,35 +1027,39 @@ mod tests {
                 self.0.store(false, Ordering::SeqCst);
             }
         }
-        let scope = MergeWriteScope::for_legacy_observation();
-        let writing = Arc::new(AtomicBool::new(false));
-        let flag = writing.clone();
-        let (entered, began) = oneshot::channel();
-        let run_scope = scope.clone();
-        let caller = tokio::spawn(async move {
-            run_scope
-                .run(shield(async move {
-                    flag.store(true, Ordering::SeqCst);
-                    let _local_write = LocalWrite(flag);
-                    entered.send(()).unwrap();
-                    std::future::pending::<Result<()>>().await
-                }))
-                .await
-        });
-        began.await.unwrap();
-        assert_eq!(scope.write_status().active_commits, 1);
-        caller.abort();
-        caller.await.unwrap_err();
-        assert!(
-            !writing.load(Ordering::SeqCst),
-            "diagnostics must not detach storage work"
-        );
-        assert_eq!(scope.write_status().active_commits, 0);
-        assert!(
-            scope.write_status().uncertain_commit,
-            "remote completion is still unknown"
-        );
-        assert_eq!(scope.completed_steps(), 0);
+        for scope in [
+            MergeWriteScope::for_legacy_observation(),
+            MergeWriteScope::for_legacy_file_observation(),
+        ] {
+            let writing = Arc::new(AtomicBool::new(false));
+            let flag = writing.clone();
+            let (entered, began) = oneshot::channel();
+            let run_scope = scope.clone();
+            let caller = tokio::spawn(async move {
+                run_scope
+                    .run(shield(async move {
+                        flag.store(true, Ordering::SeqCst);
+                        let _local_write = LocalWrite(flag);
+                        entered.send(()).unwrap();
+                        std::future::pending::<Result<()>>().await
+                    }))
+                    .await
+            });
+            began.await.unwrap();
+            assert_eq!(scope.write_status().active_commits, 1);
+            caller.abort();
+            caller.await.unwrap_err();
+            assert!(
+                !writing.load(Ordering::SeqCst),
+                "diagnostics must not detach storage work"
+            );
+            assert_eq!(scope.write_status().active_commits, 0);
+            assert!(
+                scope.write_status().uncertain_commit,
+                "remote completion is still unknown"
+            );
+            assert_eq!(scope.completed_steps(), 0);
+        }
     }
 
     #[tokio::test]

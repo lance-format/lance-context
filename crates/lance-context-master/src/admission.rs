@@ -146,6 +146,20 @@ impl Operation {
         });
     }
 
+    /// One sample in which this operation completed additional IO or logical
+    /// work. The unit is samples, not bytes, polls, or another task's progress.
+    pub(crate) fn observed_work(&self) {
+        self.update(|operation| {
+            let progress = operation.progress.get_or_insert(Progress {
+                unit: "work_progress_samples",
+                completed: 0,
+                last_completed_at_ms: 0,
+            });
+            progress.completed = progress.completed.saturating_add(1);
+            progress.last_completed_at_ms = chrono::Utc::now().timestamp_millis();
+        });
+    }
+
     fn update(&self, update: impl FnOnce(&mut OperationStatus)) {
         self.admission.state.send_modify(|state| {
             // The operation guard owns this entry until Drop. No separate
