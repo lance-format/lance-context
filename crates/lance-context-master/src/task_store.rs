@@ -7,7 +7,7 @@
 //! after the lease expires — execution is at-least-once, so task
 //! implementations must be idempotent.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -29,6 +29,10 @@ pub(crate) use diagnostic::AdmissionExplanation;
 const TASK_POLL_BATCH: usize = 256;
 const SCHEDULER_CLAIM_MAX_CANDIDATES: usize = 64;
 const SCHEDULER_CLAIM_MAX_PAGES: usize = 4;
+// Bound advisory lookahead independently of queue pages and eligible-candidate
+// budgets. Claims are still serial CAS operations; this batches reads only.
+const CLAIM_READ_BATCH_TASKS: usize = 4;
+const CLAIM_READ_BATCH_KEYS: usize = 64;
 
 /// Owned by one scheduler pool, never shared between kind/target filters.
 /// A fixed etcd revision closes each sweep even while new tasks keep arriving.
@@ -1113,6 +1117,120 @@ impl EtcdTaskStore {
         }
     }
 
+    fn locally_eligible(
+        &self,
+        task: &TaskRecord,
+        kinds: TaskKinds,
+        resident_targets: Option<&[String]>,
+    ) -> bool {
+        !(task.kind == TaskKind::MergeWal
+            && !self.wal_claim_targets.is_empty()
+            && !self.wal_claim_targets.contains(&task.target))
+            && eligibility::pre_dependency_filter(
+                task.kind,
+                &task.target,
+                |kind| kinds.contains(kind),
+                resident_targets,
+                &self.eligibility_policy(),
+            )
+            .is_ok()
+    }
+
+    fn admission_keys(&self, task: &TaskRecord) -> [String; 8] {
+        let execution = lance_context_merge::execution_key(&self.prefix, &task.target);
+        [
+            execution.clone(),
+            self.target_lock_key(&task.target),
+            crate::catchup::store::active_key(&self.prefix, &task.target),
+            execution.replace("/merge-executions/", "/merge-claims/"),
+            self.claim_key(&task.id),
+            format!(
+                "{}/compact-preparations/{}",
+                self.prefix,
+                encode_segment(&task.target)
+            ),
+            self.compaction_commit_key(&task.target),
+            self.queue_key(&task.id),
+        ]
+    }
+
+    async fn read_claim_candidates(
+        &self,
+        candidates: &[&TaskRecord],
+        operation: Option<&crate::admission::Operation>,
+    ) -> lance::Result<HashMap<String, ClaimCandidateRead>> {
+        let mut dependency_keys = Vec::new();
+        let mut selected = Vec::new();
+        let mut total_keys = 0;
+        for task in candidates.iter().take(CLAIM_READ_BATCH_TASKS) {
+            let needed = 8usize.saturating_add(task.depends_on.len());
+            if needed > CLAIM_READ_BATCH_KEYS.saturating_sub(total_keys) {
+                break;
+            }
+            total_keys += needed;
+            selected.push(*task);
+            dependency_keys.extend(task.depends_on.iter().map(|id| self.task_key(id)));
+        }
+        if selected.is_empty() {
+            // Very long dependency chains retain the existing bounded-per-key
+            // path instead of creating an oversized transaction.
+            return Ok(HashMap::new());
+        }
+        let dependencies = if dependency_keys.is_empty() {
+            Vec::new()
+        } else {
+            if let Some(operation) = operation {
+                operation.claim_phase("dependencies_batch");
+            }
+            let values = self.read_values(&dependency_keys).await?;
+            if let Some(operation) = operation {
+                operation.claim_completed(1, 0, 0);
+            }
+            values
+        };
+        let mut dependencies = dependencies.into_iter();
+        let mut out = HashMap::new();
+        let mut admission_keys = Vec::new();
+        let mut ready = Vec::new();
+        for task in selected {
+            let dependencies: Vec<Option<Vec<u8>>> =
+                dependencies.by_ref().take(task.depends_on.len()).collect();
+            // Avoid multiplying key reads for dependency-blocked queues. A
+            // malformed later dependency is reported only when that candidate
+            // is reached, so lookahead cannot poison an earlier runnable task.
+            if matches!(
+                dependency_status_from_values(task, &dependencies),
+                Ok(DependencyStatus::Ready)
+            ) {
+                admission_keys.extend(self.admission_keys(task));
+                ready.push(task.id.clone());
+            }
+            out.insert(
+                task.id.clone(),
+                ClaimCandidateRead {
+                    admission: Vec::new(),
+                    dependencies,
+                },
+            );
+        }
+        if !admission_keys.is_empty() {
+            if let Some(operation) = operation {
+                operation.claim_phase("admission_batch");
+            }
+            let values = self.read_values(&admission_keys).await?;
+            if let Some(operation) = operation {
+                operation.claim_completed(1, 0, 0);
+            }
+            let mut values = values.into_iter();
+            for id in ready {
+                out.get_mut(&id)
+                    .expect("batched candidate was inserted")
+                    .admission = values.by_ref().take(8).collect();
+            }
+        }
+        Ok(out)
+    }
+
     async fn claim_next(
         &self,
         kinds: TaskKinds,
@@ -1171,13 +1289,14 @@ impl EtcdTaskStore {
                 key.push(0);
                 key
             });
-            let queued = response
+            let mut queued = response
                 .kvs()
                 .iter()
                 .map(|kv| decode_task(kv.value(), &String::from_utf8_lossy(kv.key())))
-                .collect::<lance::Result<Vec<_>>>()?;
+                .collect::<lance::Result<VecDeque<_>>>()?;
+            let mut candidate_reads = HashMap::new();
 
-            for mut task in queued {
+            while let Some(mut task) = queued.pop_front() {
                 let candidate_key = self.queue_key(&task.id);
                 let mut candidate_next = candidate_key.as_bytes().to_vec();
                 candidate_next.push(0);
@@ -1222,13 +1341,30 @@ impl EtcdTaskStore {
                     scan.operation.claim_phase("dependencies");
                 }
                 let operation = scan.as_ref().map(|scan| scan.operation);
-                match self.dependency_status(&task, operation).await? {
+                if !candidate_reads.contains_key(&task.id) {
+                    let remaining = scan.as_ref().map_or(CLAIM_READ_BATCH_TASKS, |scan| {
+                        SCHEDULER_CLAIM_MAX_CANDIDATES - scan.candidates + 1
+                    });
+                    let candidates: Vec<_> = std::iter::once(&task)
+                        .chain(queued.iter())
+                        .filter(|task| self.locally_eligible(task, kinds, resident_targets))
+                        .take(remaining.min(CLAIM_READ_BATCH_TASKS))
+                        .collect();
+                    candidate_reads = self.read_claim_candidates(&candidates, operation).await?;
+                }
+                let read = candidate_reads.remove(&task.id);
+                let dependency = match &read {
+                    Some(read) => dependency_status_from_values(&task, &read.dependencies)?,
+                    None => self.dependency_status(&task, operation).await?,
+                };
+                match dependency {
                     DependencyStatus::Ready => {}
                     DependencyStatus::Waiting => {
                         advance(&mut scan);
                         continue;
                     }
                     DependencyStatus::Failed(dependency) => {
+                        candidate_reads.clear();
                         if self.fail_dependency(&task, &dependency).await? {
                             dependency_failed = true;
                         }
@@ -1245,25 +1381,19 @@ impl EtcdTaskStore {
                     self.prefix,
                     encode_segment(&task.target)
                 );
-                let execution_key = lance_context_merge::execution_key(&self.prefix, &task.target);
                 if let Some(operation) = operation {
                     operation.claim_phase("admission_snapshot");
                 }
-                let snapshot = self
-                    .read_values(&[
-                        execution_key.clone(),
-                        self.target_lock_key(&task.target),
-                        crate::catchup::store::active_key(&self.prefix, &task.target),
-                        execution_key.replace("/merge-executions/", "/merge-claims/"),
-                        self.claim_key(&task.id),
-                        preparation_key.clone(),
-                        self.compaction_commit_key(&task.target),
-                        candidate_key.clone(),
-                    ])
-                    .await?;
-                if let Some(operation) = operation {
-                    operation.claim_completed(1, 0, 0);
-                }
+                let snapshot = match read {
+                    Some(read) => read.admission,
+                    None => {
+                        let snapshot = self.read_values(&self.admission_keys(&task)).await?;
+                        if let Some(operation) = operation {
+                            operation.claim_completed(1, 0, 0);
+                        }
+                        snapshot
+                    }
+                };
                 // A task from the paged snapshot may already have left the
                 // live queue. Check that in the same fresh admission transaction
                 // before granting any lease; never replay a historical owner.
@@ -1338,6 +1468,9 @@ impl EtcdTaskStore {
                 if let Some(operation) = operation {
                     operation.claim_phase("lease_grant");
                 }
+                // Do not reuse advisory reads after any ownership mutation.
+                // Every candidate still passes the original claim/fence CAS.
+                candidate_reads.clear();
                 metrics::counter!("master_scheduler_claim_lease_attempts_total").increment(1);
                 let lease_id = self.grant_lease().await?;
                 if let Some(operation) = operation {
@@ -2374,6 +2507,37 @@ fn requeue(task: &mut TaskRecord) {
     task.detail = None;
 }
 
+struct ClaimCandidateRead {
+    admission: Vec<Option<Vec<u8>>>,
+    dependencies: Vec<Option<Vec<u8>>>,
+}
+
+fn dependency_status_from_values(
+    task: &TaskRecord,
+    values: &[Option<Vec<u8>>],
+) -> lance::Result<DependencyStatus> {
+    if task.depends_on.len() != values.len() {
+        return Err(lance::Error::io("incomplete dependency snapshot"));
+    }
+    let mut waiting = false;
+    for (id, value) in task.depends_on.iter().zip(values) {
+        let record = value.as_deref().map(|v| decode_task(v, id)).transpose()?;
+        match record {
+            Some(record) if record.state == TaskState::Done => {}
+            Some(record) if record.state == TaskState::Failed => {
+                return Ok(DependencyStatus::Failed(id.clone()));
+            }
+            Some(_) => waiting = true,
+            None => return Ok(DependencyStatus::Failed(id.clone())),
+        }
+    }
+    Ok(if waiting {
+        DependencyStatus::Waiting
+    } else {
+        DependencyStatus::Ready
+    })
+}
+
 enum DependencyStatus {
     Ready,
     Waiting,
@@ -2939,7 +3103,9 @@ mod tests {
             .as_ref()
             .unwrap();
         assert_eq!(p.queue_candidates, 64);
-        assert!(p.completed_etcd_responses >= 64);
+        // A blocked candidate must not require its own network round trip.
+        // Includes the recovery page and queue page, not just preflight reads.
+        assert!((2..=20).contains(&p.completed_etcd_responses), "{p:?}");
         assert!(snapshot
             .operations
             .values()
@@ -3013,6 +3179,174 @@ mod tests {
             .finish(claim, Ok("test completion".into()))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn batched_admission_reads_waiting_dependencies_then_wakes_after_completion() {
+        let (_dir, store) = bounded_scheduler_store(vec![]).await;
+        let dependency = store
+            .enqueue(TaskKind::IndexId, "dependency", vec![])
+            .await
+            .unwrap();
+        for i in 0..64 {
+            store
+                .enqueue(
+                    TaskKind::MergeWal,
+                    &format!("dependent-{i}"),
+                    vec![dependency.id.clone()],
+                )
+                .await
+                .unwrap();
+        }
+        let admission = Arc::new(crate::admission::Admission::default());
+        let mut cursor = SchedulerClaimCursor::default();
+        let op = admission.try_admit_named("merge").unwrap();
+        assert!(store
+            .claim_scheduler_slice(TaskKinds::MERGE_WAL, None, &mut cursor, &op)
+            .await
+            .unwrap()
+            .is_none());
+        let status = admission.status();
+        let progress = status
+            .operations
+            .values()
+            .next()
+            .unwrap()
+            .claim_progress
+            .as_ref()
+            .unwrap();
+        assert!(
+            (2..=20).contains(&progress.completed_etcd_responses),
+            "{progress:?}"
+        );
+        drop(op);
+        let dependency_claim = store
+            .claim_next_of_kinds(TaskKinds::GENERAL)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(dependency_claim.task.id, dependency.id);
+        store
+            .finish(dependency_claim, Ok("dependency completed".into()))
+            .await
+            .unwrap();
+        // No advisory read survives the previous slice or hides the new state.
+        let op = admission.try_admit_named("merge").unwrap();
+        let mut cursor = SchedulerClaimCursor::default();
+        let claim = store
+            .claim_scheduler_slice(TaskKinds::MERGE_WAL, None, &mut cursor, &op)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.task.depends_on, [dependency.id]);
+        store.finish(claim, Ok("done".into())).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn batched_admission_reads_preserve_exclusive_claims_under_competition() {
+        let (_dir, store) = bounded_scheduler_store(vec![]).await;
+        let dependency = store
+            .enqueue(TaskKind::IndexId, "dependency", vec![])
+            .await
+            .unwrap();
+        let dependency_claim = store
+            .claim_next_of_kinds(TaskKinds::GENERAL)
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .finish(dependency_claim, Ok("done".into()))
+            .await
+            .unwrap();
+        // Dependency-chain tasks intentionally bypass ordinary target dedupe.
+        for _ in 0..4 {
+            store
+                .enqueue(TaskKind::MergeWal, "contended", vec![dependency.id.clone()])
+                .await
+                .unwrap();
+        }
+        let results = futures::future::join_all(
+            (0..4).map(|_| store.claim_next_of_kinds(TaskKinds::MERGE_WAL)),
+        )
+        .await;
+        let mut claims: Vec<_> = results.into_iter().filter_map(Result::unwrap).collect();
+        assert_eq!(
+            claims.len(),
+            1,
+            "advisory batching must not grant concurrent table writers"
+        );
+        let first = claims.pop().unwrap();
+        let first_id = first.task.id.clone();
+        assert_eq!(store.queue_depth().await.unwrap(), 3);
+        store.finish(first, Ok("done".into())).await.unwrap();
+        let next = store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(next.task.id, first_id);
+        store.finish(next, Ok("done".into())).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn batched_admission_reads_do_not_poison_earlier_work_with_later_corruption() {
+        let (_dir, store) = bounded_scheduler_store(vec![]).await;
+        let first = store
+            .enqueue(TaskKind::MergeWal, "first", vec![])
+            .await
+            .unwrap();
+        store
+            .enqueue(TaskKind::MergeWal, "later", vec!["malformed".into()])
+            .await
+            .unwrap();
+        store
+            .inner
+            .client
+            .clone()
+            .put(store.inner.task_key("malformed"), "not-json", None)
+            .await
+            .unwrap();
+        let claim = store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.task.id, first.id);
+        store.finish(claim, Ok("done".into())).await.unwrap();
+        assert!(store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn batched_admission_reads_fall_back_for_long_dependency_chains() {
+        let (_dir, store) = bounded_scheduler_store(vec![]).await;
+        let dependency = store
+            .enqueue(TaskKind::IndexId, "dependency", vec![])
+            .await
+            .unwrap();
+        let claim = store
+            .claim_next_of_kinds(TaskKinds::GENERAL)
+            .await
+            .unwrap()
+            .unwrap();
+        store.finish(claim, Ok("done".into())).await.unwrap();
+        let task = store
+            .enqueue(TaskKind::MergeWal, "long-chain", vec![dependency.id; 64])
+            .await
+            .unwrap();
+        let claim = store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.task.id, task.id);
+        store.finish(claim, Ok("done".into())).await.unwrap();
     }
 
     #[tokio::test]
@@ -3168,8 +3502,8 @@ mod tests {
             .unwrap();
         assert_eq!(progress.queue_candidates, 2);
         assert_eq!(
-            progress.completed_etcd_responses, 4,
-            "two pages + two fresh snapshots, without a lease for the historical task"
+            progress.completed_etcd_responses, 3,
+            "two pages + one batched snapshot, without a lease for the historical task"
         );
         assert_eq!(
             store.get(&tail.id).await.unwrap().unwrap().state,

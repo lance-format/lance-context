@@ -13,11 +13,28 @@ batched claim read per page; only tasks without observed claims reach the existi
 recovery CAS. The CAS still checks the canonical task, absent claim and exact
 running record. A stale observation cannot requeue a newly claimed task.
 
-Candidate admission reads the execution, target owner, native guard, merge claim
-and task claim together before allocating a lease. Clearly blocked candidates
-are skipped without a lease grant/revoke pair. This preflight is an optimization:
-all final atomic ownership comparisons remain. Dependency handling, queue
-pagination and kind filtering remain in their original order.
+Candidate admission groups at most four locally eligible queued tasks, capped at
+64 exact keys across the batch. It reads dependencies together, then reads
+ownership metadata together only for dependency-ready candidates. This takes at
+most two read-only transactions; dependency-blocked queues do not incur extra
+ownership-key reads. Kind and routing filters run before these reads. Very long
+dependency chains retain the existing per-key path rather than producing oversized requests.
+No WAL payload, base-table data, or global history is read by this preflight.
+
+The execution, target owner, native guard, merge claim, preparation/commit-turn
+markers, task claim and live queue key are inspected before allocating a lease.
+Dependencies still determine whether a candidate waits, fails, or proceeds to
+admission. Clearly blocked candidates are skipped without a lease grant/revoke
+pair. Advisory results stay within one page/slice. Lookahead for other candidates
+is discarded before any ownership mutation or dependency-failure publication.
+Task claims remain serial,
+and every claim still passes the original current-state atomic comparisons and
+fences; batching does not authorize ownership or cache it across claim calls.
+
+`dependencies_batch` and `admission_batch` are admission diagnostic phases.
+Completed etcd responses count actual requests, while queue candidates count inspected task rows; the two
+counts are intentionally different. A smaller response count is not itself
+proof of shorter production latency or improved WAL throughput.
 
 Lease renewal starts before the claim transaction. A transport error after that
 transaction triggers a read of the unique claim token; an accepted claim is
