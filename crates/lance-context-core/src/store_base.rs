@@ -2387,6 +2387,8 @@ impl StorageBase {
     /// missing-file failures at the same base version. Metadata retries get a
     /// bounded window starting at the first invalidated capture, so slow initial
     /// metadata IO cannot suppress the first retry before any payload is read.
+    /// Payload retries similarly start at the first missing-file failure: a
+    /// slow initial read must still be able to recover WAL reclaimed by a merge.
     /// The retry budget limits starting another attempt, not a valid scan.
     pub async fn read_consistent<T, F, Fut>(&self, source: ListSource, read: F) -> LanceResult<T>
     where
@@ -2414,12 +2416,17 @@ impl StorageBase {
         let started = std::time::Instant::now();
         let retry_budget = std::time::Duration::from_secs(2);
         let mut metadata_retry_started = None;
+        let mut payload_retry_started = None;
         let mut next_dataset = None;
         let mut captures = 0;
         let mut last_missing_version = None;
         let mut missing_at_version = 0;
         for attempt in 0..MAX_SNAPSHOT_ATTEMPTS {
-            let retry_started = metadata_retry_started.unwrap_or(started);
+            // Once payload recovery begins, metadata churn and newer base
+            // versions cannot reset or extend that recovery window.
+            let retry_started = payload_retry_started
+                .or(metadata_retry_started)
+                .unwrap_or(started);
             if attempt != 0 && retry_started.elapsed() >= retry_budget {
                 break;
             }
@@ -2455,8 +2462,8 @@ impl StorageBase {
                     continue;
                 }
             }
-            // Payload retries retain the original elapsed-time and missing-file
-            // limits; metadata churn must not grant extra repeated decoding.
+            // A successful metadata capture ends that metadata-only window.
+            // The payload window, once started, remains fixed across captures.
             metadata_retry_started = None;
             let result = read(dataset.clone(), snapshots).await;
             if self.is_version_pinned() {
@@ -2466,6 +2473,8 @@ impl StorageBase {
                 if !is_not_found_error(err) {
                     return result;
                 }
+                let payload_started =
+                    payload_retry_started.get_or_insert_with(std::time::Instant::now);
                 if last_missing_version == Some(version) {
                     missing_at_version += 1;
                 } else {
@@ -2478,7 +2487,7 @@ impl StorageBase {
                 // unlimited repeated payload decoding.
                 if missing_at_version >= MAX_MISSING_AT_VERSION
                     || attempt + 1 == MAX_SNAPSHOT_ATTEMPTS
-                    || started.elapsed() >= retry_budget
+                    || payload_started.elapsed() >= retry_budget
                 {
                     return result;
                 }
