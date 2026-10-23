@@ -65,6 +65,10 @@ pub struct CatchupConfig {
     /// Prepare the next shard while the current shard commits. Commits stay ordered.
     #[arg(long, env = "CATCHUP_PIPELINE_ENABLED", default_value_t = true, action = clap::ArgAction::Set)]
     pub pipeline_enabled: bool,
+    /// Opt-in rollout targets for key-only bulk deletion before upsert append.
+    /// Qualify against actual index coverage; fully indexed tables may regress.
+    #[arg(long, env = "CATCHUP_BULK_KEY_DELETE_TARGETS", value_delimiter = ',')]
+    pub bulk_key_delete_targets: Vec<String>,
     /// Native one-table executor mode; does not start the admin server or scanner.
     #[arg(long, env = "CATCHUP_TARGET", hide = true)]
     pub target: Option<String>,
@@ -96,6 +100,7 @@ impl Default for CatchupConfig {
             merge_max_bytes: 67_108_864,
             merge_memory_bytes: 1_073_741_824,
             pipeline_enabled: true,
+            bulk_key_delete_targets: Vec::new(),
             target: None,
             job_name: None,
             outcome_path: None,

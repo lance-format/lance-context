@@ -396,6 +396,95 @@ async fn native_executor_preserves_live_ingestion_and_drains_sealed_shards() {
 
 #[tokio::test]
 #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+async fn bulk_key_delete_native_executor_preserves_fenced_upserts_and_live_writers() {
+    use lance_context_core::{RolloutStore, RolloutStoreOptions};
+    for pipelined in [false, true] {
+        let (_dir, state) = fixture().await.unwrap();
+        let target = "hot";
+        let uri = state.rollout_uri(target);
+        let mut writers = Vec::new();
+        for shard in ["worker-0", "worker-1"] {
+            let writer = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    shard_id: Some(shard.into()),
+                    merge_after_generations: Some(0),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            for generation in 0..3 {
+                let dto = serde_json::from_value(json!({
+                    "id": "shared", "rollout_id":"r", "content": format!("{shard}-{generation}")
+                }))
+                .unwrap();
+                let mut shared = lance_context_core::rollout_record_from_add_request(&dto);
+                shared.binary_payload = Some(vec![generation as u8; 64 * 1024]);
+                let mut unique = shared.clone();
+                unique.id = format!("{shard}-{generation}");
+                writer.add(&[shared, unique]).await.unwrap();
+                writer.flush().await.unwrap();
+            }
+            writers.push(writer);
+        }
+        let mut cfg = state.config.clone();
+        cfg.catchup.enabled = false;
+        cfg.catchup.pipeline_enabled = pipelined;
+        cfg.catchup.bulk_key_delete_targets = vec![target.into()];
+        cfg.catchup.merge_max_generations = 1;
+        cfg.catchup.merge_max_bytes = 1024 * 1024;
+        cfg.catchup.merge_memory_bytes = 2 * 1024 * 1024;
+        let decision = Inventory::new(&state)
+            .reserve(target, "bulk-delete-test", 6, 100)
+            .await
+            .unwrap();
+        cfg.catchup.target = Some(target.into());
+        cfg.catchup.job_name = decision.job;
+        execute(cfg, target).await.unwrap();
+        let reader = RolloutStore::open_existing_with_options(&uri, RolloutStoreOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(reader.pending_wal_generations().await.unwrap(), 0);
+        let rows = reader.list(None, None).await.unwrap();
+        assert_eq!(rows.len(), 7);
+        assert_eq!(
+            rows.iter()
+                .find(|r| r.id == "shared")
+                .unwrap()
+                .content
+                .as_deref(),
+            Some("worker-1-2")
+        );
+        assert_eq!(
+            reader.get_blob("shared").await.unwrap(),
+            Some(vec![2; 64 * 1024])
+        );
+        assert!(state
+            .task_store
+            .merge_coordinator()
+            .get(target)
+            .await
+            .unwrap()
+            .is_none());
+        for (index, writer) in writers.iter_mut().enumerate() {
+            let dto = serde_json::from_value(
+                json!({"id":format!("after-{index}"),"rollout_id":"r","content":"live"}),
+            )
+            .unwrap();
+            writer
+                .add(&[lance_context_core::rollout_record_from_add_request(&dto)])
+                .await
+                .unwrap();
+            writer.flush().await.unwrap();
+            writer.close().await.unwrap();
+        }
+        assert_eq!(reader.list(None, None).await.unwrap().len(), 9);
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires ETCD_TEST_ENDPOINTS"]
 async fn sparse_native_executor_preserves_upserts_and_rediscovers_cold_writes() {
     use lance_context_core::{
         ColumnSpec, ColumnType, GenericStore, GenericStoreOptions, SchemaSpec,

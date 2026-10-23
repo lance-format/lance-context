@@ -4247,6 +4247,7 @@ dependencies = [
  "lance-context-core",
  "lance-context-merge",
  "lance-context-metrics",
+ "lance-table",
  "lru 0.12.5",
  "metrics",
  "reqwest 0.12.28",

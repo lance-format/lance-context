@@ -11,6 +11,7 @@ pub mod discovery;
 pub mod eligibility;
 pub mod error;
 pub mod executors;
+mod index_coverage;
 pub mod legacy_retirement;
 pub mod local_merge;
 mod maintenance_execution;

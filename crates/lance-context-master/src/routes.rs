@@ -965,6 +965,10 @@ pub fn api_router() -> Router<Arc<MasterState>> {
         .route("/executor/drain", post(drain_executor))
         .route("/experiments", get(list_experiments))
         .route("/experiments/{name}", get(get_experiment))
+        .route(
+            "/experiments/{name}/key-index-coverage",
+            get(crate::index_coverage::handler),
+        )
         .route("/experiments/{name}/records", get(list_experiment_records))
         .route("/experiments/{name}/query", post(query_experiment_sql))
         .route(

@@ -369,12 +369,23 @@ async fn prepare_shard(
             .await
             .map_err(|e| e.to_string())?
         {
-            Some((manifest_store, manifest, prepared)) => Ok(Box::pin(async move {
-                store
-                    .commit_prepared_merge(&manifest_store, &manifest, prepared)
-                    .await
-                    .map_err(|e| e.to_string())
-            })),
+            Some((manifest_store, manifest, mut prepared)) => {
+                if state
+                    .config
+                    .catchup
+                    .bulk_key_delete_targets
+                    .iter()
+                    .any(|t| t == target)
+                {
+                    prepared.use_bulk_key_delete();
+                }
+                Ok(Box::pin(async move {
+                    store
+                        .commit_prepared_merge(&manifest_store, &manifest, prepared)
+                        .await
+                        .map_err(|e| e.to_string())
+                }))
+            }
             None => Ok(Box::pin(async { Ok(0usize) })),
         }
     }

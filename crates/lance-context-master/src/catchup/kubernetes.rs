@@ -332,6 +332,10 @@ pub(super) fn render_job(config: &MasterConfig, record: &Record, mut spec: Value
             "CATCHUP_PIPELINE_ENABLED",
             config.catchup.pipeline_enabled.to_string(),
         ),
+        (
+            "CATCHUP_BULK_KEY_DELETE_TARGETS",
+            config.catchup.bulk_key_delete_targets.join(","),
+        ),
         ("CATCHUP_TARGET", record.target.clone()),
         ("CATCHUP_JOB_NAME", record.job.clone()),
         ("CATCHUP_ATTEMPT_ID", record.attempt.to_string()),

@@ -5120,6 +5120,219 @@ mod tests {
         });
     }
 
+    #[tokio::test]
+    async fn bulk_key_delete_merge_preserves_upserts_blobs_and_later_wal() {
+        for index in [
+            None,
+            Some(crate::KeyIndexType::Btree),
+            Some(crate::KeyIndexType::Zonemap),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let uri = dir.path().to_string_lossy().to_string();
+            let budget = crate::MergeMemoryBudget::new(32 * 1024 * 1024);
+            let options = RolloutStoreOptions {
+                shard_id: Some("bulk-writer".into()),
+                merge_after_generations: Some(0),
+                merge_max_generations: Some(64),
+                merge_max_bytes: Some(1024 * 1024),
+                merge_budget: Some(budget.clone()),
+                key_index_type: index.unwrap_or(crate::KeyIndexType::Zonemap),
+                ..Default::default()
+            };
+            let mut store = RolloutStore::open_with_options(&uri, options)
+                .await
+                .unwrap();
+            let old_blob = vec![19; 64 * 1024];
+            let new_blob = vec![41; 64 * 1024];
+            for group in 0..2 {
+                let rows: Vec<_> = (group * 8..(group + 1) * 8)
+                    .map(|i| artifact_record(&format!("row-{i}"), &old_blob))
+                    .collect();
+                store.add(&rows).await.unwrap();
+                store.cleanup_own_shard().await.unwrap();
+                if group == 0 && index.is_some() {
+                    store.base.create_configured_key_index().await.unwrap();
+                }
+            }
+            // Existing keys in both indexed and uncovered fragments, plus an
+            // absent key. Two source generations update the same key as well.
+            store
+                .add(&[
+                    artifact_record("row-0", &old_blob),
+                    artifact_record("row-9", &new_blob),
+                    artifact_record("new-key", &new_blob),
+                ])
+                .await
+                .unwrap();
+            store.flush().await.unwrap();
+            store
+                .add(&[artifact_record("row-0", &new_blob)])
+                .await
+                .unwrap();
+            store.flush().await.unwrap();
+            let (manifests, manifest, mut prepared) =
+                store.prepare_merge_if_ready(1).await.unwrap().unwrap();
+            let (_, _, mut stale) = store.prepare_merge_if_ready(1).await.unwrap().unwrap();
+            prepared.use_bulk_key_delete();
+            stale.use_bulk_key_delete();
+            assert!(budget.reserved() > 0);
+            let before = store.base.dataset.version().version;
+            store
+                .add(&[artifact_record("later-wal", &new_blob)])
+                .await
+                .unwrap();
+            store.flush().await.unwrap();
+            assert_eq!(
+                store
+                    .commit_prepared_merge(&manifests, &manifest, prepared)
+                    .await
+                    .unwrap(),
+                2
+            );
+            assert!(store.base.dataset.version().version > before);
+            assert_eq!(store.base.dataset.count_rows(None).await.unwrap(), 17);
+            assert_eq!(
+                flushed_generation_count(&store).await,
+                1,
+                "later flush must survive the older prepared merge"
+            );
+            assert_eq!(
+                store
+                    .commit_prepared_merge(&manifests, &manifest, stale)
+                    .await
+                    .unwrap(),
+                0
+            );
+            assert_eq!(budget.reserved(), 0);
+            for id in ["row-0", "row-9", "new-key", "later-wal"] {
+                assert_eq!(
+                    store.get_blob(id).await.unwrap().as_deref(),
+                    Some(new_blob.as_slice()),
+                    "{id}"
+                );
+            }
+            assert_eq!(
+                store.get_blob("row-15").await.unwrap().as_deref(),
+                Some(old_blob.as_slice())
+            );
+            let (manifests, manifest, mut next) =
+                store.prepare_merge_if_ready(1).await.unwrap().unwrap();
+            next.use_bulk_key_delete();
+            assert_eq!(
+                store
+                    .commit_prepared_merge(&manifests, &manifest, next)
+                    .await
+                    .unwrap(),
+                1
+            );
+            assert_eq!(store.base.dataset.count_rows(None).await.unwrap(), 18);
+            assert_eq!(flushed_generation_count(&store).await, 0);
+            assert_eq!(budget.reserved(), 0);
+            store.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn bulk_key_delete_replays_after_append_is_fenced() {
+        use crate::merge_write_scope::{CommitAuthorizer, MergeWriteScope};
+        #[derive(Debug)]
+        struct DeleteOnly(u64);
+        impl CommitAuthorizer for DeleteOnly {
+            fn authorize<'a>(
+                &'a self,
+                resource: &'a str,
+                version: u64,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = lance::Result<()>> + Send + 'a>>
+            {
+                Box::pin(async move {
+                    if resource == "base" && version > self.0 {
+                        return Err(lance::Error::io("append fenced after bulk delete"));
+                    }
+                    Ok(())
+                })
+            }
+        }
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let budget = crate::MergeMemoryBudget::new(32 * 1024 * 1024);
+        let options = RolloutStoreOptions {
+            shard_id: Some("bulk-replay".into()),
+            merge_after_generations: Some(0),
+            merge_budget: Some(budget.clone()),
+            ..Default::default()
+        };
+        let mut store = RolloutStore::open_with_options(uri, options.clone())
+            .await
+            .unwrap();
+        let old = vec![19; 64 * 1024];
+        let new = vec![41; 64 * 1024];
+        store
+            .add(&[
+                artifact_record("replace", &old),
+                artifact_record("untouched", &old),
+            ])
+            .await
+            .unwrap();
+        store.cleanup_own_shard().await.unwrap();
+        store
+            .add(&[
+                artifact_record("replace", &new),
+                artifact_record("new", &new),
+            ])
+            .await
+            .unwrap();
+        store.flush().await.unwrap();
+        let (manifests, manifest, mut prepared) =
+            store.prepare_merge_if_ready(1).await.unwrap().unwrap();
+        prepared.use_bulk_key_delete();
+        let before = store.base.dataset.version().version;
+        let scope = MergeWriteScope::with_authorizer(Arc::new(DeleteOnly(before + 1)));
+        let error = scope
+            .run(store.commit_prepared_merge(&manifests, &manifest, prepared))
+            .await
+            .unwrap_err();
+        scope.drain().await;
+        assert!(
+            error
+                .to_string()
+                .contains("append fenced after bulk delete"),
+            "{error}"
+        );
+        let base = lance::Dataset::open(uri).await.unwrap();
+        assert_eq!(base.version().version, before + 1);
+        assert_eq!(
+            base.count_rows(None).await.unwrap(),
+            1,
+            "only deletion committed"
+        );
+        assert_eq!(flushed_generation_count(&store).await, 1);
+        assert_eq!(budget.reserved(), 0);
+        // WAL still serves the replacement during the failed append window.
+        assert_eq!(store.get_blob("replace").await.unwrap(), Some(new.clone()));
+        store.close().await.unwrap();
+        drop(store);
+
+        let mut successor = RolloutStore::open_with_options(uri, options).await.unwrap();
+        let (manifests, manifest, mut prepared) =
+            successor.prepare_merge_if_ready(1).await.unwrap().unwrap();
+        prepared.use_bulk_key_delete();
+        assert_eq!(
+            successor
+                .commit_prepared_merge(&manifests, &manifest, prepared)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(successor.base.dataset.count_rows(None).await.unwrap(), 3);
+        assert_eq!(flushed_generation_count(&successor).await, 0);
+        for id in ["replace", "new"] {
+            assert_eq!(successor.get_blob(id).await.unwrap(), Some(new.clone()));
+        }
+        assert_eq!(successor.get_blob("untouched").await.unwrap(), Some(old));
+        assert_eq!(budget.reserved(), 0);
+        successor.close().await.unwrap();
+    }
+
     #[test]
     fn cleanup_recovers_own_wal_without_new_ingest_after_runtime_exit() {
         let dir = TempDir::new().unwrap();

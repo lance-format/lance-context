@@ -287,9 +287,18 @@ pub struct PreparedMerge {
     /// Released when this is dropped, i.e. right after the commit consumes
     /// the batches. `None` when no budget is configured.
     reservation: Option<MergeReservation>,
+    bulk_key_delete: bool,
 }
 
 impl PreparedMerge {
+    /// Opt in to a key-only hash-join deletion before the normal append.
+    /// Publication, WAL draining, and replay semantics remain unchanged.
+    /// Full BTree coverage can be faster with predicate deletion; callers must
+    /// qualify this mode for their workload rather than enabling it globally.
+    pub fn use_bulk_key_delete(&mut self) {
+        self.bulk_key_delete = true;
+    }
+
     /// Number of generations this merge will reclaim.
     #[must_use]
     pub fn generation_count(&self) -> usize {
@@ -1157,6 +1166,7 @@ impl StorageBase {
             batches,
             merge_schema,
             reservation,
+            bulk_key_delete: false,
         }))
     }
 
@@ -1198,6 +1208,7 @@ impl StorageBase {
             batches,
             merge_schema,
             reservation,
+            bulk_key_delete,
         } = prepared;
 
         // Several sweepers can prepare the same immutable generations under a
@@ -1240,7 +1251,13 @@ impl StorageBase {
         if !batches.is_empty() {
             observe_phase!(
                 "append",
-                Box::pin(self.merge_prepared_batches(batches, merge_schema, watermark)).await
+                Box::pin(self.merge_prepared_batches(
+                    batches,
+                    merge_schema,
+                    watermark,
+                    bulk_key_delete
+                ))
+                .await
             )?;
             self.pinned_version = None;
         }
@@ -1477,6 +1494,7 @@ impl StorageBase {
         batches: Vec<RecordBatch>,
         merge_schema: Arc<Schema>,
         watermark: Option<lance_index::mem_wal::CompactedSsTable>,
+        bulk_key_delete: bool,
     ) -> LanceResult<()> {
         // Predicate deletion projects only the key and row IDs, including for
         // unindexed fragments. It can use existing BTree/ZoneMap coverage but
@@ -1484,22 +1502,45 @@ impl StorageBase {
         // that here made parallel shards compete on CreateIndex transactions
         // and repeatedly rebuild the same table-wide index.
         let key_index = merge_schema.index_of(&self.key_column)?;
-        use datafusion::logical_expr::Expr;
-        let mut values = Vec::with_capacity(1024);
-        for batch in &batches {
-            for row in 0..batch.num_rows() {
-                values.push(Expr::Literal(
-                    ScalarValue::try_from_array(batch.column(key_index), row)
-                        .map_err(|e| LanceError::invalid_input(e.to_string()))?,
-                    None,
-                ));
-                if values.len() == 1024 {
-                    self.delete_key_values(std::mem::take(&mut values)).await?;
+        if bulk_key_delete {
+            // Source rows were already deduplicated by read_flushed_generations.
+            // Project keys before the join so neither side carries blob columns.
+            // Delete-only must explicitly disable insertion of absent keys.
+            let keys = batches
+                .iter()
+                .map(|batch| batch.project(&[key_index]))
+                .collect::<Result<Vec<_>, _>>()?;
+            let job = lance::dataset::MergeInsertBuilder::try_new(
+                Arc::new(self.dataset.clone()),
+                vec![self.key_column.clone()],
+            )?
+            .when_matched(lance::dataset::WhenMatched::Delete)
+            .when_not_matched(lance::dataset::WhenNotMatched::DoNothing)
+            .use_index(false)
+            .conflict_retries(0)
+            .commit_retries(0)
+            .try_build()?;
+            let (dataset, _) = observe_phase!("delete_keys", job.execute_batches(keys).await)?;
+            self.dataset = Arc::unwrap_or_clone(dataset);
+            crate::merge_write_scope::checkpoint();
+        } else {
+            use datafusion::logical_expr::Expr;
+            let mut values = Vec::with_capacity(1024);
+            for batch in &batches {
+                for row in 0..batch.num_rows() {
+                    values.push(Expr::Literal(
+                        ScalarValue::try_from_array(batch.column(key_index), row)
+                            .map_err(|e| LanceError::invalid_input(e.to_string()))?,
+                        None,
+                    ));
+                    if values.len() == 1024 {
+                        self.delete_key_values(std::mem::take(&mut values)).await?;
+                    }
                 }
             }
-        }
-        if !values.is_empty() {
-            self.delete_key_values(values).await?;
+            if !values.is_empty() {
+                self.delete_key_values(values).await?;
+            }
         }
 
         if let Some(watermark) = watermark {
