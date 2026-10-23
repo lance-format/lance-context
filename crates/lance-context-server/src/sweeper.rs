@@ -430,6 +430,15 @@ fn spawn_publish_demand<S: Sweepable>(
                 Some(watermark) => watermark,
                 None => return Ok(None),
             };
+            // Disabling local self-merge must not hide fresh backlog from the
+            // master until its next whole-fleet scan. Reuse this manifest read;
+            // queue publication has independent slots/coalescing and never
+            // waits for telemetry or admits a local merge. The master retains
+            // its normal ownership, dedupe, and retry checks.
+            let threshold = state.rollout_master_merge_after_generations;
+            if threshold > 0 && watermark.pending_generations >= threshold {
+                crate::merge_execution::publish_background_request(state.clone(), target.clone());
+            }
             let event = lance_context_merge::demand::DemandEvent {
                 v: lance_context_merge::demand::SCHEMA_VERSION,
                 shard: watermark.shard_id.to_string(),
@@ -819,6 +828,88 @@ mod tests {
         .await;
         let second = await_event(&client, &key, |e| e.sealed_through > first.sealed_through).await;
         assert_eq!(second.writer_epoch, first.writer_epoch);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn master_demand_survives_disabled_self_merge_without_starting_execution() {
+        let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+        let client = etcd_client::Client::connect([endpoint], None)
+            .await
+            .unwrap();
+        for (threshold, owned, drained, expected) in [
+            (2, true, false, true),
+            (2, false, false, true),
+            (3, true, false, false),
+            (0, true, false, false),
+            (2, true, true, false),
+        ] {
+            let prefix = format!("/independent-master-demand/{}", uuid::Uuid::new_v4());
+            let coordinator = lance_context_merge::Coordinator::new(client.clone(), prefix.clone());
+            let state_dir = TempDir::new().unwrap();
+            let mut state =
+                crate::state::AppState::new_for_test(state_dir.path().to_path_buf()).await;
+            state.rollout_master_merge_after_generations = threshold;
+            state.merge_executions =
+                crate::merge_execution::Executions::new(Some(coordinator.clone()), 3600);
+            if owned {
+                state
+                    .merge_executions
+                    .rollout
+                    .owned_targets
+                    .push("generic:s".into());
+            }
+            if drained {
+                state
+                    .merge_executions
+                    .rollout
+                    .drain_targets
+                    .push("generic:s".into());
+            }
+            let state = Arc::new(state);
+            let dir = TempDir::new().unwrap();
+            let store = generic_with_pending(&dir, 0, 2).await;
+            assert!(!store.count_merge_due().await.unwrap());
+            flush_pass_coordinated(
+                vec![("s".into(), store.clone())],
+                Duration::from_secs(5),
+                None,
+                Some(state),
+            )
+            .await;
+            if !drained {
+                let shard = store.own_shard_watermark().await.unwrap().unwrap().shard_id;
+                let encoded: String = "generic:s".bytes().map(|b| format!("{b:02x}")).collect();
+                await_event(
+                    &client,
+                    &format!("{prefix}/demand-events/{encoded}/{shard}"),
+                    |_| true,
+                )
+                .await;
+            }
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let requests = coordinator.request_page(None).await.unwrap().0;
+                if !expected || !requests.is_empty() {
+                    assert_eq!(requests.len(), usize::from(expected));
+                    if expected {
+                        assert_eq!(requests[0].target, "generic:s");
+                    }
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "master request was suppressed with self-merge disabled"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(coordinator.get("generic:s").await.unwrap().is_none());
+            assert_eq!(
+                store.read().await.pending_wal_generations().await.unwrap(),
+                2
+            );
+            assert_eq!(store.read().await.count_base_rows().await.unwrap(), 0);
+        }
     }
 
     fn spec() -> SchemaSpec {

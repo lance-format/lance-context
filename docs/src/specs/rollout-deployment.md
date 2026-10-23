@@ -160,6 +160,24 @@ Every append is flushed before `add` returns and every flushed generation is rec
 
 ### 6.1 Bounding read amplification: count-triggered self-merge
 
+**Master notification is independent of self-merge.** The server's flush sweeper
+reuses its writer-manifest observation to request a normal master merge when
+pending generations reach `ROLLOUT_MASTER_MERGE_AFTER_GENERATIONS` (default `8`,
+`0` disables notifications). It works with `ROLLOUT_MERGE_AFTER_GENERATIONS=0`
+and does not execute a local merge. Notifications are detached, bounded and
+coalesced; master ownership, deduplication and retry rules still apply. Draining
+targets are excluded. This requires the flush sweeper and a reachable merge
+coordinator; failed or dropped notifications retry on a later flush, with the
+ordinary master scan retained as a fallback. No WAL payload or base-table scan
+is added to writes or reads.
+
+Masters with automatic WAL merging enabled accept these hints through the
+ordinary queue even before the table appears in stats. This does not enroll a
+table in owned or native merging. Disabled automatic merging, missing execution
+capacity configuration and draining targets do not gain a new automatic path.
+Deploy the corresponding master change before relying on writer notifications;
+older masters may ignore hints for targets outside their owned-target list.
+
 By default (`--rollout-merge-after-generations 0`) there is no compaction step: rollout rows are append-only (§7), so each `add` leaves a new flushed generation in `_mem_wal/{shard}/` and every read unions all of them. That is correct, but read cost grows linearly with the number of un-merged generations — a shard that has absorbed thousands of appends makes every `list`/`get` open thousands of generation datasets.
 
 To bound this, an instance can **merge its own shard back into the base table** on a size trigger. Set `--rollout-merge-after-generations N` (env `ROLLOUT_MERGE_AFTER_GENERATIONS`, or `RolloutStoreOptions::merge_after_generations`). After an append flushes a generation, if this instance's shard has accumulated ≥ N un-merged generations, the same `add` call synchronously:

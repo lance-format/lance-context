@@ -83,6 +83,18 @@ pub struct ServerConfig {
     #[arg(long, env = "ROLLOUT_MERGE_AFTER_GENERATIONS", default_value = "0")]
     pub rollout_merge_after_generations: usize,
 
+    /// Notify the master when this writer has at least this many pending WAL
+    /// generations, independently of worker self-merge. Uses the flush sweeper's
+    /// existing metadata observation and bounded, detached queue publication.
+    /// This never starts a local merge or changes execution ownership. `0`
+    /// disables the notification; ordinary master scans remain enabled.
+    #[arg(
+        long,
+        env = "ROLLOUT_MASTER_MERGE_AFTER_GENERATIONS",
+        default_value = "8"
+    )]
+    pub rollout_master_merge_after_generations: usize,
+
     /// Maximum flushed MemWAL generations folded into the base table by one
     /// merge pass. `0` disables this cap; the byte budget still applies.
     /// Leftovers stay pending for the next pass. Both caps apply to count- and

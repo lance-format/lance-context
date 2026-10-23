@@ -990,7 +990,15 @@ pub(crate) async fn enqueue_merge_request(
     coordinator: &lance_context_merge::Coordinator,
     request: &lance_context_merge::rollout::MergeRequest,
 ) -> Result<(), String> {
-    if !state.config.merge_rollout.owned(&request.target)
+    // A fresh writer hint may arrive before the fleet scan has observed this
+    // table. If ordinary automatic WAL merges are configured, admit it through
+    // that same queue without enrolling the table in owned/native execution.
+    let ordinary_automatic = state.config.merge_wal_interval_secs > 0
+        && !state.config.merge_rollout.draining(&request.target)
+        && (!state.config.worker_endpoints.is_empty()
+            || crate::local_merge::selected(&state.config, &request.target));
+    if !ordinary_automatic
+        && !state.config.merge_rollout.owned(&request.target)
         && !state.config.merge_rollout.fence_legacy
         && coordinator
             .get(&request.target)
@@ -2221,6 +2229,97 @@ mod tests {
             !crate::local_merge::selected(&state.config, "new-hot-table"),
             "worker recording does not certify native ownership"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn ordinary_writer_demand_enqueues_before_stats_without_changing_ownership() {
+        for (automatic, workers, draining, expected) in [
+            (true, true, false, true),
+            (false, true, false, false),
+            (true, false, false, false),
+            (true, true, true, false),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let mut cfg = config(&dir);
+            cfg.merge_rollout.owned_targets.clear();
+            cfg.merge_wal_interval_secs = if automatic { 600 } else { 0 };
+            if workers {
+                cfg.worker_endpoints = vec!["http://127.0.0.1:1".into()];
+            }
+            if draining {
+                cfg.merge_rollout.drain_targets.push("new-hot-table".into());
+            }
+            let state = MasterState::new(cfg).await.unwrap();
+            assert!(state.stats_cache.read().await.is_empty());
+            let c = state.task_store.merge_coordinator();
+            c.request_merge("new-hot-table").await.unwrap();
+            let request = c.get_merge_request("new-hot-table").await.unwrap().unwrap();
+            enqueue_merge_request(&state, &c, &request).await.unwrap();
+            let active = state
+                .task_store
+                .get_active_id(TaskKind::MergeWal, "new-hot-table")
+                .await
+                .unwrap();
+            assert_eq!(active.is_some(), expected);
+            assert!(c.get("new-hot-table").await.unwrap().is_none());
+            assert!(!crate::local_merge::selected(
+                &state.config,
+                "new-hot-table"
+            ));
+            if !expected {
+                assert!(c
+                    .get_merge_request("new-hot-table")
+                    .await
+                    .unwrap()
+                    .is_some());
+                continue;
+            }
+            let first = active.unwrap();
+            // Repeated hints dedupe to the queued task. A hint received while
+            // it runs survives acknowledgement until a follow-up is queued.
+            c.request_merge("new-hot-table").await.unwrap();
+            let request = c.get_merge_request("new-hot-table").await.unwrap().unwrap();
+            enqueue_merge_request(&state, &c, &request).await.unwrap();
+            assert_eq!(
+                state
+                    .task_store
+                    .get_active_id(TaskKind::MergeWal, "new-hot-table")
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                first
+            );
+            let claim = state.task_store.claim_next().await.unwrap().unwrap();
+            c.request_merge("new-hot-table").await.unwrap();
+            let request = c.get_merge_request("new-hot-table").await.unwrap().unwrap();
+            enqueue_merge_request(&state, &c, &request).await.unwrap();
+            assert!(c
+                .get_merge_request("new-hot-table")
+                .await
+                .unwrap()
+                .is_some());
+            state
+                .task_store
+                .finish(claim, Ok("bounded pass complete".into()))
+                .await
+                .unwrap();
+            enqueue_merge_request(&state, &c, &request).await.unwrap();
+            assert_ne!(
+                state
+                    .task_store
+                    .get_active_id(TaskKind::MergeWal, "new-hot-table")
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                first
+            );
+            assert!(c
+                .get_merge_request("new-hot-table")
+                .await
+                .unwrap()
+                .is_none());
+        }
     }
 
     /// Wait until the task reaches a terminal state, returning its final record.
