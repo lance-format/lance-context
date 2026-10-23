@@ -22,6 +22,7 @@
 //! Each task runs in its own `tokio::spawn`, so one task's failure never affects
 //! another. A global [`Semaphore`] bounds how many run at once.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1109,6 +1110,51 @@ async fn enqueue_execution_recovery(
     Ok(())
 }
 
+/// Stop this page at the first failed enqueue/acknowledgement instead of
+/// sending its remaining mutations into the same overloaded backend. Retain
+/// the unattempted entries for the next scheduled tick. The failed entry is
+/// still durable (unless its acknowledgement actually committed), and the
+/// normal paged scan revisits it without starving later targets on the page.
+async fn enqueue_request_page<A, F, Fut>(
+    pending: &mut VecDeque<lance_context_merge::rollout::MergeRequest>,
+    mut accepting: A,
+    mut enqueue: F,
+) -> Result<(), (String, String)>
+where
+    A: FnMut() -> bool,
+    F: FnMut(lance_context_merge::rollout::MergeRequest) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    while accepting() {
+        let Some(request) = pending.pop_front() else {
+            break;
+        };
+        let target = request.target.clone();
+        enqueue(request).await.map_err(|error| (target, error))?;
+    }
+    Ok(())
+}
+
+async fn enqueue_buffered_merge_request(
+    state: &Arc<MasterState>,
+    coordinator: &lance_context_merge::Coordinator,
+    request: lance_context_merge::rollout::MergeRequest,
+    resumed_page: bool,
+) -> Result<(), String> {
+    // Another replica may have served/acknowledged this hint during the pause.
+    // Do not create empty follow-up tasks from stale buffered requests; keep
+    // newer flush revisions. Freshly fetched pages need no extra lookup.
+    let request = if resumed_page {
+        let Some(current) = coordinator.get_merge_request(&request.target).await? else {
+            return Ok(());
+        };
+        current
+    } else {
+        request
+    };
+    enqueue_merge_request(state, coordinator, &request).await
+}
+
 /// Spawn the scheduler pollers plus the optional periodic auto-sweep.
 ///
 /// Returns the handle of the *general* poller only. When a separate WAL-merge
@@ -1129,22 +1175,56 @@ pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
         let coordinator = retry_state.task_store.merge_coordinator();
         let mut cursor = None;
         let mut request_cursor = None;
+        let mut pending_requests = VecDeque::new();
         let mut execution_cursor = None;
         let mut ticker = tokio::time::interval(Duration::from_secs(15));
+        // Slow or failed metadata calls must not accumulate immediate retries
+        // when the backend recovers. Durable demand survives a missed tick.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
-            match coordinator.request_page(request_cursor.as_deref()).await {
-                Ok((targets, next)) => {
-                    request_cursor = next;
-                    for request in targets {
-                        if let Err(error) =
-                            enqueue_merge_request(&retry_state, &coordinator, &request).await
-                        {
-                            tracing::warn!(target = %request.target, %error, "worker merge demand enqueue failed");
+            if let Some(operation) = retry_state.admission.try_admit_named("worker_merge_demand") {
+                operation.phase("enqueue_worker_demand");
+                let resumed_page = !pending_requests.is_empty();
+                if pending_requests.is_empty() {
+                    match coordinator.request_page(request_cursor.as_deref()).await {
+                        Ok((targets, next)) => {
+                            request_cursor = next;
+                            pending_requests.extend(targets);
                         }
+                        Err(error) => tracing::warn!(%error, "worker merge demand scan failed"),
                     }
                 }
-                Err(error) => tracing::warn!(%error, "worker merge demand scan failed"),
+                if let Err((target, error)) = enqueue_request_page(
+                    &mut pending_requests,
+                    || retry_state.admission.status().accepting,
+                    |request| {
+                        let state = &retry_state;
+                        let coordinator = &coordinator;
+                        let operation = &operation;
+                        async move {
+                            operation.target(&request.target);
+                            let result = enqueue_buffered_merge_request(
+                                state,
+                                coordinator,
+                                request,
+                                resumed_page,
+                            )
+                            .await;
+                            if result.is_ok() {
+                                operation.observed_work();
+                            }
+                            result
+                        }
+                    },
+                )
+                .await
+                {
+                    metrics::counter!("master_worker_demand_enqueue_page_errors_total")
+                        .increment(1);
+                    tracing::warn!(%target, %error, remaining = pending_requests.len(),
+                    "worker merge demand enqueue failed; remaining page deferred to next tick");
+                }
             }
             match coordinator
                 .execution_page(execution_cursor.as_deref())
@@ -2495,6 +2575,199 @@ mod tests {
             !crate::local_merge::selected(&state.config, "new-hot-table"),
             "worker recording does not certify native ownership"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn worker_demand_drain_joins_admitted_enqueue_and_leaves_rest_for_successor() {
+        let dir = TempDir::new().unwrap();
+        let state = MasterState::new(config(&dir)).await.unwrap();
+        let coordinator = state.task_store.merge_coordinator();
+        for target in ["exp-0", "exp-1"] {
+            coordinator.request_merge(target).await.unwrap();
+        }
+        let mut pending: VecDeque<_> = coordinator.request_page(None).await.unwrap().0.into();
+        let operation = state
+            .admission
+            .try_admit_named("worker_merge_demand")
+            .unwrap();
+        enqueue_request_page(
+            &mut pending,
+            || state.admission.status().accepting,
+            |request| {
+                let state = &state;
+                let coordinator = &coordinator;
+                async move {
+                    // Drain races with an already admitted enqueue. It must
+                    // finish, while the next request remains untouched.
+                    let status = state.admission.begin_drain();
+                    assert_eq!(status.active_operations, 1);
+                    enqueue_buffered_merge_request(state, coordinator, request, false).await
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].target, "exp-1");
+        assert!(coordinator
+            .get_merge_request("exp-0")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(coordinator
+            .get_merge_request("exp-1")
+            .await
+            .unwrap()
+            .is_some());
+        drop(operation);
+        assert_eq!(state.admission.status().active_operations, 0);
+        assert!(state
+            .admission
+            .try_admit_named("worker_merge_demand")
+            .is_none());
+
+        // Losing the old process and its in-memory page loses no demand.
+        drop(pending);
+        let successor = MasterState::new(state.config.clone()).await.unwrap();
+        let coordinator = successor.task_store.merge_coordinator();
+        let mut pending: VecDeque<_> = coordinator.request_page(None).await.unwrap().0.into();
+        enqueue_request_page(
+            &mut pending,
+            || successor.admission.status().accepting,
+            |request| enqueue_buffered_merge_request(&successor, &coordinator, request, false),
+        )
+        .await
+        .unwrap();
+        assert!(coordinator.request_page(None).await.unwrap().0.is_empty());
+        assert!(successor
+            .task_store
+            .get_active_id(TaskKind::MergeWal, "exp-1")
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn worker_demand_failure_bounds_page_and_preserves_replay_after_uncertain_enqueue() {
+        for accepted_before_error in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let state = MasterState::new(config(&dir)).await.unwrap();
+            let coordinator = state.task_store.merge_coordinator();
+            for target in ["exp-0", "exp-1", "exp-2"] {
+                coordinator.request_merge(target).await.unwrap();
+            }
+            let mut pending: VecDeque<_> = coordinator.request_page(None).await.unwrap().0.into();
+            let attempted = std::sync::atomic::AtomicUsize::new(0);
+            let result = enqueue_request_page(
+                &mut pending,
+                || true,
+                |request| {
+                    let state = &state;
+                    let coordinator = &coordinator;
+                    let attempted = &attempted;
+                    async move {
+                        attempted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if request.target == "exp-1" {
+                            if accepted_before_error {
+                                state
+                                    .task_store
+                                    .enqueue(TaskKind::MergeWal, "exp-1", vec![])
+                                    .await
+                                    .map_err(|e| e.to_string())?;
+                            }
+                            return Err("injected etcd overload / lost enqueue response".into());
+                        }
+                        enqueue_buffered_merge_request(state, coordinator, request, false).await
+                    }
+                },
+            )
+            .await;
+            assert_eq!(result.unwrap_err().0, "exp-1");
+            assert_eq!(attempted.load(std::sync::atomic::Ordering::Relaxed), 2);
+            assert_eq!(
+                pending
+                    .iter()
+                    .map(|r| r.target.as_str())
+                    .collect::<Vec<_>>(),
+                ["exp-2"]
+            );
+            assert!(coordinator
+                .get_merge_request("exp-1")
+                .await
+                .unwrap()
+                .is_some());
+            let uncertain_id = state
+                .task_store
+                .get_active_id(TaskKind::MergeWal, "exp-1")
+                .await
+                .unwrap();
+            assert_eq!(uncertain_id.is_some(), accepted_before_error);
+
+            // A peer serves the buffered request while this scanner pauses.
+            // The resumed page must not enqueue a second, empty merge.
+            let peer_request = coordinator
+                .get_merge_request("exp-2")
+                .await
+                .unwrap()
+                .unwrap();
+            enqueue_merge_request(&state, &coordinator, &peer_request)
+                .await
+                .unwrap();
+            let claimed = state
+                .task_store
+                .claim_resident_merge(&["exp-2".into()])
+                .await
+                .unwrap()
+                .unwrap();
+            state
+                .task_store
+                .finish(claimed, Ok("peer completed".into()))
+                .await
+                .unwrap();
+            enqueue_request_page(
+                &mut pending,
+                || true,
+                |request| enqueue_buffered_merge_request(&state, &coordinator, request, true),
+            )
+            .await
+            .unwrap();
+            assert!(pending.is_empty());
+            assert!(state
+                .task_store
+                .get_active_id(TaskKind::MergeWal, "exp-2")
+                .await
+                .unwrap()
+                .is_none());
+
+            // A later scan rediscovers the failed durable hint, including any
+            // flush that arrived after the uncertain enqueue response.
+            coordinator.request_merge("exp-1").await.unwrap();
+            let mut retry: VecDeque<_> = coordinator.request_page(None).await.unwrap().0.into();
+            assert_eq!(retry.len(), 1);
+            enqueue_request_page(
+                &mut retry,
+                || true,
+                |request| enqueue_buffered_merge_request(&state, &coordinator, request, false),
+            )
+            .await
+            .unwrap();
+            let id = state
+                .task_store
+                .get_active_id(TaskKind::MergeWal, "exp-1")
+                .await
+                .unwrap()
+                .unwrap();
+            if let Some(accepted) = uncertain_id {
+                assert_eq!(id, accepted, "retry must dedupe the accepted enqueue");
+            }
+            assert!(coordinator
+                .get_merge_request("exp-1")
+                .await
+                .unwrap()
+                .is_none());
+        }
     }
 
     #[tokio::test]
