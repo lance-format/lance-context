@@ -429,12 +429,19 @@ mod tests {
                         async move {
                             // Model a byte-bounded read followed by its joined
                             // commit. Each successful pass reclaims at most six.
-                            let count = pending[index]
-                                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
-                                    Some(value.saturating_sub(6))
-                                })
-                                .unwrap()
-                                .min(6);
+                            let mut remaining = pending[index].load(Ordering::SeqCst);
+                            let count = loop {
+                                let count = remaining.min(6);
+                                match pending[index].compare_exchange(
+                                    remaining,
+                                    remaining - count,
+                                    Ordering::SeqCst,
+                                    Ordering::SeqCst,
+                                ) {
+                                    Ok(_) => break count,
+                                    Err(current) => remaining = current,
+                                }
+                            };
                             if count == 0 {
                                 empty_reads.fetch_add(1, Ordering::SeqCst);
                             }
