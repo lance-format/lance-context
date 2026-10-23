@@ -5122,113 +5122,124 @@ mod tests {
 
     #[tokio::test]
     async fn bulk_key_delete_merge_preserves_upserts_blobs_and_later_wal() {
-        for index in [
-            None,
-            Some(crate::KeyIndexType::Btree),
-            Some(crate::KeyIndexType::Zonemap),
-        ] {
-            let dir = TempDir::new().unwrap();
-            let uri = dir.path().to_string_lossy().to_string();
-            let budget = crate::MergeMemoryBudget::new(32 * 1024 * 1024);
-            let options = RolloutStoreOptions {
-                shard_id: Some("bulk-writer".into()),
-                merge_after_generations: Some(0),
-                merge_max_generations: Some(64),
-                merge_max_bytes: Some(1024 * 1024),
-                merge_budget: Some(budget.clone()),
-                key_index_type: index.unwrap_or(crate::KeyIndexType::Zonemap),
-                ..Default::default()
-            };
-            let mut store = RolloutStore::open_with_options(&uri, options)
-                .await
-                .unwrap();
-            let old_blob = vec![19; 64 * 1024];
-            let new_blob = vec![41; 64 * 1024];
-            for group in 0..2 {
-                let rows: Vec<_> = (group * 8..(group + 1) * 8)
-                    .map(|i| artifact_record(&format!("row-{i}"), &old_blob))
-                    .collect();
-                store.add(&rows).await.unwrap();
-                store.cleanup_own_shard().await.unwrap();
-                if group == 0 && index.is_some() {
-                    store.base.create_configured_key_index().await.unwrap();
+        for parallel in [false, true] {
+            for index in [
+                None,
+                Some(crate::KeyIndexType::Btree),
+                Some(crate::KeyIndexType::Zonemap),
+            ] {
+                let dir = TempDir::new().unwrap();
+                let uri = dir.path().to_string_lossy().to_string();
+                let budget = crate::MergeMemoryBudget::new(32 * 1024 * 1024);
+                let options = RolloutStoreOptions {
+                    shard_id: Some("bulk-writer".into()),
+                    merge_after_generations: Some(0),
+                    merge_max_generations: Some(64),
+                    merge_max_bytes: Some(1024 * 1024),
+                    merge_budget: Some(budget.clone()),
+                    key_index_type: index.unwrap_or(crate::KeyIndexType::Zonemap),
+                    ..Default::default()
+                };
+                let mut store = RolloutStore::open_with_options(&uri, options)
+                    .await
+                    .unwrap();
+                let old_blob = vec![19; 64 * 1024];
+                let new_blob = vec![41; 64 * 1024];
+                for group in 0..2 {
+                    let rows: Vec<_> = (group * 8..(group + 1) * 8)
+                        .map(|i| artifact_record(&format!("row-{i}"), &old_blob))
+                        .collect();
+                    store.add(&rows).await.unwrap();
+                    store.cleanup_own_shard().await.unwrap();
+                    if group == 0 && index.is_some() {
+                        store.base.create_configured_key_index().await.unwrap();
+                    }
                 }
-            }
-            // Existing keys in both indexed and uncovered fragments, plus an
-            // absent key. Two source generations update the same key as well.
-            store
-                .add(&[
-                    artifact_record("row-0", &old_blob),
-                    artifact_record("row-9", &new_blob),
-                    artifact_record("new-key", &new_blob),
-                ])
-                .await
-                .unwrap();
-            store.flush().await.unwrap();
-            store
-                .add(&[artifact_record("row-0", &new_blob)])
-                .await
-                .unwrap();
-            store.flush().await.unwrap();
-            let (manifests, manifest, mut prepared) =
-                store.prepare_merge_if_ready(1).await.unwrap().unwrap();
-            let (_, _, mut stale) = store.prepare_merge_if_ready(1).await.unwrap().unwrap();
-            prepared.use_bulk_key_delete();
-            stale.use_bulk_key_delete();
-            assert!(budget.reserved() > 0);
-            let before = store.base.dataset.version().version;
-            store
-                .add(&[artifact_record("later-wal", &new_blob)])
-                .await
-                .unwrap();
-            store.flush().await.unwrap();
-            assert_eq!(
+                // Existing keys in both indexed and uncovered fragments, plus an
+                // absent key. Two source generations update the same key as well.
                 store
-                    .commit_prepared_merge(&manifests, &manifest, prepared)
+                    .add(&[
+                        artifact_record("row-0", &old_blob),
+                        artifact_record("row-9", &new_blob),
+                        artifact_record("new-key", &new_blob),
+                    ])
                     .await
-                    .unwrap(),
-                2
-            );
-            assert!(store.base.dataset.version().version > before);
-            assert_eq!(store.base.dataset.count_rows(None).await.unwrap(), 17);
-            assert_eq!(
-                flushed_generation_count(&store).await,
-                1,
-                "later flush must survive the older prepared merge"
-            );
-            assert_eq!(
+                    .unwrap();
+                store.flush().await.unwrap();
                 store
-                    .commit_prepared_merge(&manifests, &manifest, stale)
+                    .add(&[artifact_record("row-0", &new_blob)])
                     .await
-                    .unwrap(),
-                0
-            );
-            assert_eq!(budget.reserved(), 0);
-            for id in ["row-0", "row-9", "new-key", "later-wal"] {
+                    .unwrap();
+                store.flush().await.unwrap();
+                let (manifests, manifest, mut prepared) =
+                    store.prepare_merge_if_ready(1).await.unwrap().unwrap();
+                let (_, _, mut stale) = store.prepare_merge_if_ready(1).await.unwrap().unwrap();
+                prepared.use_bulk_key_delete();
+                if parallel {
+                    prepared.use_parallel_upsert_io();
+                }
+                stale.use_bulk_key_delete();
+                if parallel {
+                    stale.use_parallel_upsert_io();
+                }
+                assert!(budget.reserved() > 0);
+                let before = store.base.dataset.version().version;
+                store
+                    .add(&[artifact_record("later-wal", &new_blob)])
+                    .await
+                    .unwrap();
+                store.flush().await.unwrap();
                 assert_eq!(
-                    store.get_blob(id).await.unwrap().as_deref(),
-                    Some(new_blob.as_slice()),
-                    "{id}"
+                    store
+                        .commit_prepared_merge(&manifests, &manifest, prepared)
+                        .await
+                        .unwrap(),
+                    2
                 );
+                assert!(store.base.dataset.version().version > before);
+                assert_eq!(store.base.dataset.count_rows(None).await.unwrap(), 17);
+                assert_eq!(
+                    flushed_generation_count(&store).await,
+                    1,
+                    "later flush must survive the older prepared merge"
+                );
+                assert_eq!(
+                    store
+                        .commit_prepared_merge(&manifests, &manifest, stale)
+                        .await
+                        .unwrap(),
+                    0
+                );
+                assert_eq!(budget.reserved(), 0);
+                for id in ["row-0", "row-9", "new-key", "later-wal"] {
+                    assert_eq!(
+                        store.get_blob(id).await.unwrap().as_deref(),
+                        Some(new_blob.as_slice()),
+                        "{id}"
+                    );
+                }
+                assert_eq!(
+                    store.get_blob("row-15").await.unwrap().as_deref(),
+                    Some(old_blob.as_slice())
+                );
+                let (manifests, manifest, mut next) =
+                    store.prepare_merge_if_ready(1).await.unwrap().unwrap();
+                next.use_bulk_key_delete();
+                if parallel {
+                    next.use_parallel_upsert_io();
+                }
+                assert_eq!(
+                    store
+                        .commit_prepared_merge(&manifests, &manifest, next)
+                        .await
+                        .unwrap(),
+                    1
+                );
+                assert_eq!(store.base.dataset.count_rows(None).await.unwrap(), 18);
+                assert_eq!(flushed_generation_count(&store).await, 0);
+                assert_eq!(budget.reserved(), 0);
+                store.close().await.unwrap();
             }
-            assert_eq!(
-                store.get_blob("row-15").await.unwrap().as_deref(),
-                Some(old_blob.as_slice())
-            );
-            let (manifests, manifest, mut next) =
-                store.prepare_merge_if_ready(1).await.unwrap().unwrap();
-            next.use_bulk_key_delete();
-            assert_eq!(
-                store
-                    .commit_prepared_merge(&manifests, &manifest, next)
-                    .await
-                    .unwrap(),
-                1
-            );
-            assert_eq!(store.base.dataset.count_rows(None).await.unwrap(), 18);
-            assert_eq!(flushed_generation_count(&store).await, 0);
-            assert_eq!(budget.reserved(), 0);
-            store.close().await.unwrap();
         }
     }
 
@@ -5285,6 +5296,7 @@ mod tests {
         let (manifests, manifest, mut prepared) =
             store.prepare_merge_if_ready(1).await.unwrap().unwrap();
         prepared.use_bulk_key_delete();
+        prepared.use_parallel_upsert_io();
         let before = store.base.dataset.version().version;
         let scope = MergeWriteScope::with_authorizer(Arc::new(DeleteOnly(before + 1)));
         let error = scope
@@ -5316,6 +5328,7 @@ mod tests {
         let (manifests, manifest, mut prepared) =
             successor.prepare_merge_if_ready(1).await.unwrap().unwrap();
         prepared.use_bulk_key_delete();
+        prepared.use_parallel_upsert_io();
         assert_eq!(
             successor
                 .commit_prepared_merge(&manifests, &manifest, prepared)
@@ -5331,6 +5344,150 @@ mod tests {
         assert_eq!(successor.get_blob("untouched").await.unwrap(), Some(old));
         assert_eq!(budget.reserved(), 0);
         successor.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn parallel_upsert_encodes_while_delete_waits_and_joins_on_error() {
+        use crate::merge_write_scope::{CommitAuthorizer, MergeWriteScope};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        #[derive(Debug)]
+        struct Gate {
+            first: AtomicBool,
+            entered: tokio::sync::Notify,
+            release: tokio::sync::Semaphore,
+            reject: bool,
+        }
+        impl CommitAuthorizer for Gate {
+            fn authorize<'a>(
+                &'a self,
+                resource: &'a str,
+                _: u64,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = lance::Result<()>> + Send + 'a>>
+            {
+                Box::pin(async move {
+                    if resource == "base" && !self.first.swap(true, Ordering::SeqCst) {
+                        self.entered.notify_one();
+                        let permit = self.release.acquire().await.unwrap();
+                        drop(permit);
+                        if self.reject {
+                            return Err(lance::Error::io("delete denied by test fence"));
+                        }
+                    }
+                    Ok(())
+                })
+            }
+        }
+        for bulk in [false, true] {
+            for reject in [false, true] {
+                let dir = TempDir::new().unwrap();
+                let uri = dir.path().to_str().unwrap();
+                let budget = crate::MergeMemoryBudget::new(32 * 1024 * 1024);
+                let mut store = RolloutStore::open_with_options(
+                    uri,
+                    RolloutStoreOptions {
+                        merge_after_generations: Some(0),
+                        merge_budget: Some(budget.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+                store
+                    .add(&[artifact_record("replace", &[19; 4096])])
+                    .await
+                    .unwrap();
+                store.cleanup_own_shard().await.unwrap();
+                let payload = vec![41; 2 * 1024 * 1024];
+                store
+                    .add(&[artifact_record("replace", &payload)])
+                    .await
+                    .unwrap();
+                store.flush().await.unwrap();
+                let (manifests, manifest, mut prepared) =
+                    store.prepare_merge_if_ready(1).await.unwrap().unwrap();
+                prepared.use_parallel_upsert_io();
+                if bulk {
+                    prepared.use_bulk_key_delete();
+                }
+                let before = store.base.dataset.version().version;
+                let gate = Arc::new(Gate {
+                    first: AtomicBool::new(false),
+                    entered: tokio::sync::Notify::new(),
+                    // Error case rejects immediately, proving join does not
+                    // abandon the concurrently admitted encoding operation.
+                    release: tokio::sync::Semaphore::new(usize::from(reject)),
+                    reject,
+                });
+                let scope = MergeWriteScope::with_authorizer(gate.clone());
+                let runner_scope = scope.clone();
+                let runner = tokio::spawn(async move {
+                    runner_scope
+                        .run(async move {
+                            let result = store
+                                .commit_prepared_merge(&manifests, &manifest, prepared)
+                                .await;
+                            (store, result)
+                        })
+                        .await
+                });
+                if !reject {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(20),
+                        gate.entered.notified(),
+                    )
+                    .await
+                    .unwrap();
+                    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                        while scope.work().encoded_files == 0 {
+                            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                        }
+                    })
+                    .await
+                    .expect("encoding must finish while deletion is blocked");
+                    assert!(!runner.is_finished());
+                    assert!(budget.reserved() > 0);
+                    assert_eq!(
+                        lance::Dataset::open(uri).await.unwrap().version().version,
+                        before
+                    );
+                    gate.release.add_permits(1);
+                }
+                let (mut store, result) = runner.await.unwrap();
+                scope.drain().await;
+                assert!(scope.work().encoded_files > 0);
+                assert_eq!(budget.reserved(), 0);
+                if reject {
+                    assert!(result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("delete denied by test fence"));
+                    assert_eq!(
+                        lance::Dataset::open(uri).await.unwrap().version().version,
+                        before
+                    );
+                    assert_eq!(flushed_generation_count(&store).await, 1);
+                    let (manifests, manifest, mut prepared) =
+                        store.prepare_merge_if_ready(1).await.unwrap().unwrap();
+                    prepared.use_parallel_upsert_io();
+                    if bulk {
+                        prepared.use_bulk_key_delete();
+                    }
+                    assert_eq!(
+                        store
+                            .commit_prepared_merge(&manifests, &manifest, prepared)
+                            .await
+                            .unwrap(),
+                        1
+                    );
+                } else {
+                    assert_eq!(result.unwrap(), 1);
+                }
+                assert_eq!(store.base.dataset.count_rows(None).await.unwrap(), 1);
+                assert_eq!(store.get_blob("replace").await.unwrap(), Some(payload));
+                assert_eq!(flushed_generation_count(&store).await, 0);
+                store.close().await.unwrap();
+            }
+        }
     }
 
     #[test]

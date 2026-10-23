@@ -288,6 +288,7 @@ pub struct PreparedMerge {
     /// the batches. `None` when no budget is configured.
     reservation: Option<MergeReservation>,
     bulk_key_delete: bool,
+    parallel_upsert_io: bool,
 }
 
 impl PreparedMerge {
@@ -297,6 +298,12 @@ impl PreparedMerge {
     /// qualify this mode for their workload rather than enabling it globally.
     pub fn use_bulk_key_delete(&mut self) {
         self.bulk_key_delete = true;
+    }
+
+    /// Encode immutable replacement files while deleting the same batch's old
+    /// keys. Both operations finish before the serial append publication.
+    pub fn use_parallel_upsert_io(&mut self) {
+        self.parallel_upsert_io = true;
     }
 
     /// Number of generations this merge will reclaim.
@@ -1167,6 +1174,7 @@ impl StorageBase {
             merge_schema,
             reservation,
             bulk_key_delete: false,
+            parallel_upsert_io: false,
         }))
     }
 
@@ -1209,6 +1217,7 @@ impl StorageBase {
             merge_schema,
             reservation,
             bulk_key_delete,
+            parallel_upsert_io,
         } = prepared;
 
         // Several sweepers can prepare the same immutable generations under a
@@ -1255,7 +1264,8 @@ impl StorageBase {
                     batches,
                     merge_schema,
                     watermark,
-                    bulk_key_delete
+                    bulk_key_delete,
+                    parallel_upsert_io
                 ))
                 .await
             )?;
@@ -1495,6 +1505,7 @@ impl StorageBase {
         merge_schema: Arc<Schema>,
         watermark: Option<lance_index::mem_wal::CompactedSsTable>,
         bulk_key_delete: bool,
+        parallel_upsert_io: bool,
     ) -> LanceResult<()> {
         // Predicate deletion projects only the key and row IDs, including for
         // unindexed fragments. It can use existing BTree/ZoneMap coverage but
@@ -1502,46 +1513,67 @@ impl StorageBase {
         // that here made parallel shards compete on CreateIndex transactions
         // and repeatedly rebuild the same table-wide index.
         let key_index = merge_schema.index_of(&self.key_column)?;
-        if bulk_key_delete {
-            // Source rows were already deduplicated by read_flushed_generations.
-            // Project keys before the join so neither side carries blob columns.
-            // Delete-only must explicitly disable insertion of absent keys.
-            let keys = batches
-                .iter()
-                .map(|batch| batch.project(&[key_index]))
-                .collect::<Result<Vec<_>, _>>()?;
-            let job = lance::dataset::MergeInsertBuilder::try_new(
-                Arc::new(self.dataset.clone()),
-                vec![self.key_column.clone()],
-            )?
-            .when_matched(lance::dataset::WhenMatched::Delete)
-            .when_not_matched(lance::dataset::WhenNotMatched::DoNothing)
-            .use_index(false)
-            .conflict_retries(0)
-            .commit_retries(0)
-            .try_build()?;
-            let (dataset, _) = observe_phase!("delete_keys", job.execute_batches(keys).await)?;
-            self.dataset = Arc::unwrap_or_clone(dataset);
-            crate::merge_write_scope::checkpoint();
-        } else {
-            use datafusion::logical_expr::Expr;
-            let mut values = Vec::with_capacity(1024);
-            for batch in &batches {
-                for row in 0..batch.num_rows() {
-                    values.push(Expr::Literal(
-                        ScalarValue::try_from_array(batch.column(key_index), row)
-                            .map_err(|e| LanceError::invalid_input(e.to_string()))?,
-                        None,
-                    ));
-                    if values.len() == 1024 {
-                        self.delete_key_values(std::mem::take(&mut values)).await?;
-                    }
+        // These projections retain only key arrays, never the old/base blobs.
+        let keys = batches
+            .iter()
+            .map(|batch| batch.project(&[key_index]))
+            .collect::<Result<Vec<_>, _>>()?;
+        if parallel_upsert_io {
+            if self.dataset.manifest().data_storage_format.version
+                == lance_file::version::ConcreteFileVersion::V1
+            {
+                return Err(LanceError::invalid_input(
+                    "parallel upsert IO requires Lance V2 files",
+                ));
+            }
+            let snapshot = self.dataset.clone();
+            let schema = snapshot.schema().clone();
+            let stage = async move {
+                let _phase = crate::merge_write_scope::work_stage("file_encoding");
+                let params = WriteParams {
+                    mode: WriteMode::Append,
+                    write_progress: Some(crate::merge_write_scope::write_progress()),
+                    ..Default::default()
+                };
+                let tx = lance::dataset::InsertBuilder::new(Arc::new(snapshot))
+                    .with_params(&params)
+                    .execute_uncommitted(batches)
+                    .await?;
+                match tx.operation {
+                    lance::dataset::transaction::Operation::Append { fragments } => Ok(fragments),
+                    _ => Err(LanceError::io(
+                        "upsert staging produced a non-append transaction",
+                    )),
                 }
+            };
+            // Do not try_join: an error must not abandon the other admitted
+            // operation. Keep the existing full decoded-byte reservation until
+            // both finish; there is no extra prefetch batch or early release.
+            let (staged, deleted) = tokio::join!(
+                async { observe_phase!("encode_upload", stage.await) },
+                self.delete_prepared_keys(keys, bulk_key_delete),
+            );
+            deleted?;
+            let fragments = staged?;
+            // Delete transactions may rebase. Never attach files with stale
+            // field IDs or schema metadata to a differently shaped base.
+            if self.dataset.schema().fields != schema.fields
+                || self.dataset.schema().metadata != schema.metadata
+            {
+                return Err(LanceError::io(
+                    MaintenanceErrorCode::StalePreparation
+                        .tag("base schema changed during upsert encoding; reprepare"),
+                ));
             }
-            if !values.is_empty() {
-                self.delete_key_values(values).await?;
-            }
+            crate::rollout_append::commit_files(
+                &mut self.dataset,
+                fragments,
+                watermark.into_iter().collect(),
+            )
+            .await?;
+            return Ok(());
         }
+        self.delete_prepared_keys(keys, bulk_key_delete).await?;
 
         if let Some(watermark) = watermark {
             let params = WriteParams {
@@ -1576,6 +1608,51 @@ impl StorageBase {
             ))
             .await?;
         }
+        Ok(())
+    }
+
+    async fn delete_prepared_keys(
+        &mut self,
+        keys: Vec<RecordBatch>,
+        bulk_key_delete: bool,
+    ) -> LanceResult<()> {
+        if bulk_key_delete {
+            // Source rows were already deduplicated by read_flushed_generations.
+            // Project keys before the join so neither side carries blob columns.
+            // Delete-only must explicitly disable insertion of absent keys.
+            let job = lance::dataset::MergeInsertBuilder::try_new(
+                Arc::new(self.dataset.clone()),
+                vec![self.key_column.clone()],
+            )?
+            .when_matched(lance::dataset::WhenMatched::Delete)
+            .when_not_matched(lance::dataset::WhenNotMatched::DoNothing)
+            .use_index(false)
+            .conflict_retries(0)
+            .commit_retries(0)
+            .try_build()?;
+            let (dataset, _) = observe_phase!("delete_keys", job.execute_batches(keys).await)?;
+            self.dataset = Arc::unwrap_or_clone(dataset);
+            crate::merge_write_scope::checkpoint();
+        } else {
+            use datafusion::logical_expr::Expr;
+            let mut values = Vec::with_capacity(1024);
+            for batch in &keys {
+                for row in 0..batch.num_rows() {
+                    values.push(Expr::Literal(
+                        ScalarValue::try_from_array(batch.column(0), row)
+                            .map_err(|e| LanceError::invalid_input(e.to_string()))?,
+                        None,
+                    ));
+                    if values.len() == 1024 {
+                        self.delete_key_values(std::mem::take(&mut values)).await?;
+                    }
+                }
+            }
+            if !values.is_empty() {
+                self.delete_key_values(values).await?;
+            }
+        }
+
         Ok(())
     }
 

@@ -379,6 +379,15 @@ async fn prepare_shard(
                 {
                     prepared.use_bulk_key_delete();
                 }
+                if state
+                    .config
+                    .catchup
+                    .parallel_upsert_io_targets
+                    .iter()
+                    .any(|t| t == target)
+                {
+                    prepared.use_parallel_upsert_io();
+                }
                 Ok(Box::pin(async move {
                     store
                         .commit_prepared_merge(&manifest_store, &manifest, prepared)

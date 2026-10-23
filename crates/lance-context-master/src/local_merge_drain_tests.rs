@@ -38,6 +38,16 @@ async fn merge(state: &Arc<MasterState>, append: bool) -> Result<String, String>
 }
 
 async fn drain_case(append: bool, before_first_batch: bool, pipelined: bool) {
+    drain_case_with_upsert_io(append, before_first_batch, pipelined, false, false).await;
+}
+
+async fn drain_case_with_upsert_io(
+    append: bool,
+    before_first_batch: bool,
+    pipelined: bool,
+    parallel_upsert_io: bool,
+    bulk_key_delete: bool,
+) {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = MasterConfig::parse_from(["test"]);
     cfg.data_dir = dir.path().to_string_lossy().into();
@@ -54,6 +64,12 @@ async fn drain_case(append: bool, before_first_batch: bool, pipelined: bool) {
     cfg.catchup.slice_secs = 1800;
     cfg.catchup.merge_max_generations = 1;
     cfg.catchup.pipeline_enabled = pipelined;
+    if parallel_upsert_io {
+        cfg.catchup.parallel_upsert_io_targets = vec!["hot".into()];
+    }
+    if bulk_key_delete {
+        cfg.catchup.bulk_key_delete_targets = vec!["hot".into()];
+    }
     if append {
         cfg.append.rollout_append_targets = vec!["hot".into()];
         cfg.append.rollout_append_local = true;
@@ -274,5 +290,15 @@ async fn native_drain_append_joins_commit_and_persists_continuation() {
 async fn native_drain_before_first_batch_keeps_durable_demand() {
     for (append, pipelined) in [(false, false), (false, true), (true, true)] {
         drain_case(append, true, pipelined).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires ETCD_TEST_ENDPOINTS"]
+async fn native_drain_parallel_upsert_joins_commit_and_persists_continuation() {
+    for pipelined in [false, true] {
+        for bulk in [false, true] {
+            drain_case_with_upsert_io(false, false, pipelined, true, bulk).await;
+        }
     }
 }

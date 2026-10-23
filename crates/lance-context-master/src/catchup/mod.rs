@@ -69,6 +69,13 @@ pub struct CatchupConfig {
     /// Qualify against actual index coverage; fully indexed tables may regress.
     #[arg(long, env = "CATCHUP_BULK_KEY_DELETE_TARGETS", value_delimiter = ',')]
     pub bulk_key_delete_targets: Vec<String>,
+    /// Overlap immutable file encoding/upload with old-key deletion for exact rollout targets.
+    #[arg(
+        long,
+        env = "CATCHUP_PARALLEL_UPSERT_IO_TARGETS",
+        value_delimiter = ','
+    )]
+    pub parallel_upsert_io_targets: Vec<String>,
     /// Native one-table executor mode; does not start the admin server or scanner.
     #[arg(long, env = "CATCHUP_TARGET", hide = true)]
     pub target: Option<String>,
@@ -101,6 +108,7 @@ impl Default for CatchupConfig {
             merge_memory_bytes: 1_073_741_824,
             pipeline_enabled: true,
             bulk_key_delete_targets: Vec::new(),
+            parallel_upsert_io_targets: Vec::new(),
             target: None,
             job_name: None,
             outcome_path: None,
