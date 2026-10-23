@@ -32,6 +32,42 @@ pub struct WorkerRetirementIntent {
     pub process: ProcessIdentity,
 }
 
+/// Immutable evidence captured while Kubernetes still exposes the exact old
+/// container's graceful termination. This proves process death only: every
+/// target still requires its own storage barriers and fenced successor probe.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerTermination {
+    pub intent: WorkerRetirementIntent,
+    pub successor: ProcessIdentity,
+    pub finished_at: String,
+}
+
+impl WorkerTermination {
+    pub fn validate(&self) -> Result<()> {
+        uuid::Uuid::parse_str(&self.intent.id)
+            .map_err(|_| "invalid worker retirement ID".to_string())?;
+        let old = &self.intent.process;
+        let new = &self.successor;
+        if self.intent.endpoint.is_empty()
+            || self.intent.base_uri.is_empty()
+            || !valid_process(old)
+            || !valid_process(new)
+            || old.namespace != new.namespace
+            || old.pod != new.pod
+            || old.pod_uid != new.pod_uid
+            || old.container != new.container
+            || old.writer_id != new.writer_id
+            || old.container_id == new.container_id
+            || old.instance == new.instance
+            || self.finished_at.is_empty()
+            || self.finished_at.len() > 128
+        {
+            return Err("invalid worker termination receipt".into());
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -81,6 +117,130 @@ mod tests {
             ("base".into(), 12),
             (format!("shard:{}", uuid::Uuid::nil()), 15),
         ])
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn worker_death_receipt_survives_reconnect_without_releasing_a_target() {
+        let (coordinator, _, execution, process) = fixture().await;
+        let intent = WorkerRetirementIntent {
+            id: uuid::Uuid::new_v4().to_string(),
+            endpoint: execution.endpoint.clone(),
+            base_uri: "az://data/root".into(),
+            process: process.clone(),
+        };
+        let receipt = WorkerTermination {
+            intent: intent.clone(),
+            successor: ProcessIdentity {
+                container_id: "containerd://second".into(),
+                instance: "second-instance".into(),
+                ..process
+            },
+            finished_at: "2026-10-23T00:00:00Z".into(),
+        };
+        // A termination record cannot be installed without the captured intent.
+        assert!(coordinator
+            .record_worker_termination(receipt.clone())
+            .await
+            .is_err());
+        coordinator
+            .prepare_worker_retirement(intent.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            coordinator
+                .record_worker_termination(receipt.clone())
+                .await
+                .unwrap(),
+            receipt
+        );
+        assert_eq!(
+            coordinator
+                .record_worker_termination(receipt.clone())
+                .await
+                .unwrap(),
+            receipt
+        );
+        let mut conflicting = receipt.clone();
+        conflicting.successor.container_id = "containerd://third".into();
+        assert!(coordinator
+            .record_worker_termination(conflicting)
+            .await
+            .is_err());
+        let fresh_client =
+            etcd_client::Client::connect([std::env::var("ETCD_TEST_ENDPOINTS").unwrap()], None)
+                .await
+                .unwrap();
+        let reconnected = Coordinator::new(fresh_client, coordinator.prefix.clone());
+        assert_eq!(
+            reconnected.worker_termination(&intent).await.unwrap(),
+            Some(receipt)
+        );
+        assert_eq!(
+            reconnected.get(&execution.target).await.unwrap(),
+            Some(execution.clone())
+        );
+        let lock = reconnected
+            .client
+            .clone()
+            .get(
+                target_lock_key(&reconnected.prefix, &execution.target),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            lock.kvs()[0].value(),
+            execution_owner(&execution).as_bytes()
+        );
+        let mut wrong = intent.clone();
+        wrong.base_uri = "az://other/root".into();
+        assert!(reconnected.worker_termination(&wrong).await.is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn worker_death_receipt_rejects_changed_endpoint_index() {
+        let (coordinator, _, execution, process) = fixture().await;
+        let intent = WorkerRetirementIntent {
+            id: uuid::Uuid::new_v4().to_string(),
+            endpoint: execution.endpoint,
+            base_uri: "az://data/root".into(),
+            process: process.clone(),
+        };
+        coordinator
+            .prepare_worker_retirement(intent.clone())
+            .await
+            .unwrap();
+        // Simulate an inconsistent concurrent registry mutation in this isolated prefix.
+        coordinator
+            .client
+            .clone()
+            .put(
+                coordinator.worker_retirement_endpoint_key(&intent.endpoint),
+                "changed",
+                None,
+            )
+            .await
+            .unwrap();
+        let receipt = WorkerTermination {
+            intent: intent.clone(),
+            successor: ProcessIdentity {
+                container_id: "containerd://second".into(),
+                instance: "second-instance".into(),
+                ..process
+            },
+            finished_at: "2026-10-23T00:00:00Z".into(),
+        };
+        assert!(coordinator
+            .record_worker_termination(receipt)
+            .await
+            .is_err());
+        assert!(coordinator
+            .worker_termination(&intent)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -469,6 +629,76 @@ fn valid_process(process: &ProcessIdentity) -> bool {
 }
 
 impl Coordinator {
+    fn worker_termination_key(&self, id: &str) -> Result<String> {
+        Ok(self.worker_retirement_key(id)?.replace(
+            "/legacy-worker-retirements/",
+            "/legacy-worker-terminations/",
+        ))
+    }
+
+    pub async fn worker_termination(
+        &self,
+        intent: &WorkerRetirementIntent,
+    ) -> Result<Option<WorkerTermination>> {
+        let reply = self
+            .client
+            .clone()
+            .get(self.worker_termination_key(&intent.id)?, None)
+            .await
+            .map_err(|e| e.to_string())?;
+        let record: Option<WorkerTermination> = reply
+            .kvs()
+            .first()
+            .map(|kv| serde_json::from_slice(kv.value()).map_err(|e| e.to_string()))
+            .transpose()?;
+        if let Some(receipt) = &record {
+            receipt.validate()?;
+        }
+        if record.as_ref().is_some_and(|r| &r.intent != intent) {
+            return Err("worker termination receipt does not match immutable intent".into());
+        }
+        Ok(record)
+    }
+
+    /// Caller must verify exact graceful death and bracket the successor probe
+    /// with stable Kubernetes identity reads. No target ownership is changed.
+    pub async fn record_worker_termination(
+        &self,
+        record: WorkerTermination,
+    ) -> Result<WorkerTermination> {
+        record.validate()?;
+        let key = self.worker_termination_key(&record.intent.id)?;
+        if self
+            .transact(
+                vec![
+                    Compare::value(
+                        self.worker_retirement_key(&record.intent.id)?,
+                        CompareOp::Equal,
+                        encode_intent(&record.intent),
+                    ),
+                    Compare::value(
+                        self.worker_retirement_endpoint_key(&record.intent.endpoint),
+                        CompareOp::Equal,
+                        encode_intent(&record.intent),
+                    ),
+                    Compare::version(key.as_str(), CompareOp::Equal, 0),
+                ],
+                vec![TxnOp::put(
+                    key,
+                    serde_json::to_vec(&record).map_err(|e| e.to_string())?,
+                    None,
+                )],
+            )
+            .await?
+        {
+            return Ok(record);
+        }
+        match self.worker_termination(&record.intent).await? {
+            Some(prior) if prior == record => Ok(prior),
+            _ => Err("worker termination intent changed or receipt already differs".into()),
+        }
+    }
+
     fn worker_retirement_endpoint_key(&self, endpoint: &str) -> String {
         let encoded: String = endpoint
             .as_bytes()
