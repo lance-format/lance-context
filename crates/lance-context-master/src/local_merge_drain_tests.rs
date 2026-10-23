@@ -95,6 +95,28 @@ async fn drain_case(append: bool, before_first_batch: bool, pipelined: bool) {
         }
         writers.push(writer);
     }
+    if append {
+        // Establish the migration metadata before the test gate. Its metadata
+        // commit precedes any staging and is not an admitted payload batch.
+        let mut coordinator = lance_context_core::rollout_append::AppendCoordinator::open(
+            &first.rollout_uri("hot"),
+            None,
+        )
+        .await
+        .unwrap();
+        let (plans, reclaimed) = coordinator
+            .plan(&cfg.catchup.shards, 1, cfg.append.rollout_append_max_bytes)
+            .await
+            .unwrap();
+        assert_eq!(plans.len(), 4);
+        assert_eq!(reclaimed, 0);
+    }
+    let initial_version = lance::Dataset::open(&first.rollout_uri("hot"))
+        .await
+        .unwrap()
+        .version()
+        .version;
+    assert_eq!(writers[0].pending_wal_generations().await.unwrap(), 24);
     first
         .task_store
         .enqueue(TaskKind::MergeWal, "hot", Vec::new())
@@ -137,11 +159,17 @@ async fn drain_case(append: bool, before_first_batch: bool, pipelined: bool) {
         .unwrap()
         .unwrap();
     assert!(result.is_ok(), "{result:?}");
-    let reclaimed = scope.work().generations_reclaimed;
+    // Use fresh durable manifests: legacy upsert does not populate every
+    // logical counter exposed by the append progress scope.
+    let remaining = writers[0].pending_wal_generations().await.unwrap();
+    let reclaimed = 24 - remaining;
+    let base = lance::Dataset::open(&first.rollout_uri("hot"))
+        .await
+        .unwrap();
     eprintln!("native drain append={append} pipeline={pipelined} before_first={before_first_batch} reclaimed={reclaimed}");
     if before_first_batch {
         assert_eq!(reclaimed, 0);
-        assert_eq!(scope.work().base_commits, 0);
+        assert_eq!(base.version().version, initial_version);
     } else {
         // One active commit, one queued batch, one preparing batch at most.
         // The append buffer may have two staged parts per admitted group.
@@ -149,7 +177,8 @@ async fn drain_case(append: bool, before_first_batch: bool, pipelined: bool) {
             (1..=4).contains(&reclaimed),
             "continued new batches after drain: {reclaimed}"
         );
-        assert!(scope.work().base_commits > 0);
+        assert!(base.version().version > initial_version);
+        assert!(base.count_rows(None).await.unwrap() > 0);
     }
     assert_eq!(first.local_append.as_ref().unwrap().budget.reserved(), 0);
     assert_eq!(scope.write_status().active_commits, 0);
