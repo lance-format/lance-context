@@ -31,6 +31,10 @@ pub struct Request {
     pub namespace: String,
     pub pod: String,
     pub container: String,
+    /// For a late-discovered target, reuse only the process identity from this
+    /// completed retirement, after revalidating its exact death and successor.
+    #[serde(default)]
+    pub witness_execution_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -88,6 +92,7 @@ fn completion_request(
         namespace: record.process.namespace.clone(),
         pod: record.process.pod.clone(),
         container: record.process.container.clone(),
+        witness_execution_id: None,
     })
 }
 
@@ -199,6 +204,40 @@ async fn execute_inner(
                     "retirement already prepared; use complete after verified termination".into(),
                 );
             }
+            if let Some(witness_id) = &request.witness_execution_id {
+                let witness = coordinator
+                    .legacy_retirement(witness_id)
+                    .await?
+                    .ok_or("retirement witness not found")?;
+                validate_witness(&request, &execution, &witness)?;
+                verify_terminated(&after, &request, &witness.process, &capability)?;
+                let replacement = bounded_json(
+                    client
+                        .get(format!(
+                            "{address}/api/v1/internal/merge-executor/retirement"
+                        ))
+                        .query(&[("target", &request.target)]),
+                )
+                .await?;
+                let prospective = Retirement {
+                    execution: execution.clone(),
+                    process: witness.process.clone(),
+                    versions: None,
+                    completed: false,
+                };
+                verify_replacement(&replacement, &prospective, &capability, &config.data_dir)?;
+                let latest = pod(&client, &request).await?;
+                if running_identity(&latest, &request)? != identity {
+                    return Err("replacement changed during witness validation".into());
+                }
+                let record = coordinator
+                    .prepare_legacy_retirement_from_witness(&execution, &witness)
+                    .await?;
+                return Ok(Response {
+                    retirement: record,
+                    target_lock_released: false,
+                });
+            }
             let instance = capability["instance"]
                 .as_str()
                 .filter(|s| !s.is_empty())
@@ -224,6 +263,9 @@ async fn execute_inner(
             })
         }
         Action::Complete => {
+            if request.witness_execution_id.is_some() {
+                return Err("retirement witness is only accepted during preparation".into());
+            }
             let mut record =
                 prior.ok_or("prepare must capture the live process before retirement")?;
             if execution != record.execution {
@@ -290,6 +332,24 @@ async fn execute_inner(
             })
         }
     }
+}
+
+fn validate_witness(
+    request: &Request,
+    execution: &lance_context_merge::Execution,
+    witness: &Retirement,
+) -> Result<()> {
+    if !witness.completed
+        || witness.versions.is_none()
+        || witness.execution.id == execution.id
+        || witness.execution.endpoint != execution.endpoint
+        || witness.process.namespace != request.namespace
+        || witness.process.pod != request.pod
+        || witness.process.container != request.container
+    {
+        return Err("completed retirement witness must identify this exact worker".into());
+    }
+    Ok(())
 }
 
 async fn bounded_json(request: reqwest::RequestBuilder) -> Result<Value> {
@@ -472,6 +532,7 @@ mod tests {
             namespace: "test".into(),
             pod: "worker-9".into(),
             container: "server".into(),
+            witness_execution_id: None,
         };
         let pod = json!({
             "metadata":{"name":"worker-9","namespace":"test","uid":"same-pod"},
@@ -522,6 +583,52 @@ mod tests {
             ..record
         };
         assert!(completion_request(&execution, &completed).is_err());
+    }
+
+    #[test]
+    fn retirement_witness_must_be_complete_and_match_the_worker() {
+        let (request, pod, process, capability) = fixture();
+        let execution =
+            lance_context_merge::Execution::new("late", "http://worker-9:3000", "legacy-http", 1);
+        let mut previous = execution.clone();
+        previous.id = "earlier".into();
+        previous.target = "previous-table".into();
+        let witness = Retirement {
+            execution: previous,
+            process,
+            versions: Some(std::collections::BTreeMap::from([("base".into(), 12)])),
+            completed: true,
+        };
+        validate_witness(&request, &execution, &witness).unwrap();
+        verify_terminated(&pod, &request, &witness.process, &capability).unwrap();
+        for field in [
+            "completed",
+            "versions",
+            "namespace",
+            "pod",
+            "container",
+            "endpoint",
+            "id",
+        ] {
+            let mut wrong = witness.clone();
+            match field {
+                "completed" => wrong.completed = false,
+                "versions" => wrong.versions = None,
+                "namespace" => wrong.process.namespace = "other".into(),
+                "pod" => wrong.process.pod = "other".into(),
+                "container" => wrong.process.container = "other".into(),
+                "endpoint" => wrong.execution.endpoint = "http://other:3000".into(),
+                "id" => wrong.execution.id = execution.id.clone(),
+                _ => unreachable!(),
+            }
+            assert!(
+                validate_witness(&request, &execution, &wrong).is_err(),
+                "{field}"
+            );
+        }
+        let mut living = pod;
+        living["status"]["containerStatuses"][0]["containerID"] = json!("containerd://old");
+        assert!(verify_terminated(&living, &request, &witness.process, &capability).is_err());
     }
 
     #[test]

@@ -75,12 +75,33 @@ any RBAC or ConfigMaps.
 
 `master_legacy_retirement_attempts_total{result="completed"|"unresolved"}`
 reports canonical completion attempts. An unresolved proof keeps the execution
-and lock intact. No per-target preparation is inferred from another table's
-journal: old protocol-0 records do not persist their process instance, so an
-endpoint alone is insufficient evidence to adopt an unprepared execution.
+and lock intact.
+
+## Requests admitted during the handoff window
+
+A master can record another legacy request after the preparation inventory,
+while the old worker is shutting down. An HTTP 503 with the exact body
+`worker is draining` is the worker's pre-handler rejection: the master records
+that failure and releases this unadmitted request through its normal claim.
+Other 503 bodies, truncated responses and response timeouts remain protected.
+
+For an already retained record discovered after replacement, explicitly add
+`"witness_execution_id":"a-completed-retirement-uuid"` to a `prepare` request.
+The witness must be a completed retirement for the same endpoint, namespace,
+Pod and container. The master rechecks its exact old container's death, the
+same Pod UID, and the fenced successor's storage and coordinator identity.
+An etcd transaction compares the witness, current execution and its target
+lock before saving the new journal. Only the verified process identity is
+inherited: this target must obtain its own storage snapshot and barriers.
+Normal canonical completion and lock release then apply. Remove the optional
+witness field when sending an explicit `complete` request.
+
+No witness is selected automatically from an endpoint or empty progress
+telemetry. A changed Pod UID, another restart that loses the exact termination
+receipt, an incomplete witness, or changed ownership keeps recovery protected.
 
 This is a migration tool, not an automatic process killer. It deliberately
-requires preparation before termination and a same-Pod container replacement.
+requires verified process evidence and a same-Pod container replacement.
 Other retirement mechanisms need their own identity and termination proof.
 Before production use, validate the exact old and replacement images with a
 stalled legacy merge, delayed base/shard publication, concurrent ingestion,

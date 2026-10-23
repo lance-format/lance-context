@@ -163,6 +163,132 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod witness_tests {
+    use super::*;
+    use crate::ClaimProof;
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn late_admission_inherits_verified_process_but_not_other_target_barriers() {
+        let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+        let mut client = etcd_client::Client::connect([endpoint], None)
+            .await
+            .unwrap();
+        let prefix = format!("/retirement-witness-tests/{}", uuid::Uuid::new_v4());
+        let proof = ClaimProof {
+            key: format!("{prefix}/claims/test"),
+            token: "owner".into(),
+            lease_id: 0,
+        };
+        client
+            .put(proof.key.as_str(), proof.token.as_str(), None)
+            .await
+            .unwrap();
+        for target in ["first", "late"] {
+            client
+                .put(target_lock_key(&prefix, target), proof.token.as_str(), None)
+                .await
+                .unwrap();
+        }
+        let coordinator = Coordinator::new(client, prefix);
+        let execution = coordinator
+            .admit_legacy(&proof, "first", "http://worker:3000")
+            .await
+            .unwrap();
+        let process = ProcessIdentity {
+            namespace: "test".into(),
+            pod: "worker".into(),
+            pod_uid: "uid".into(),
+            container: "server".into(),
+            container_id: "containerd://old".into(),
+            instance: "old".into(),
+            writer_id: "worker".into(),
+        };
+        let prepared = coordinator
+            .prepare_legacy_retirement(&execution, process.clone())
+            .await
+            .unwrap();
+        let late = coordinator
+            .admit_legacy(&proof, "late", &execution.endpoint)
+            .await
+            .unwrap();
+        assert!(coordinator
+            .prepare_legacy_retirement_from_witness(&late, &prepared)
+            .await
+            .is_err());
+        let plan = BTreeMap::from([
+            ("base".into(), 12),
+            (format!("shard:{}", uuid::Uuid::nil()), 15),
+        ]);
+        let planned = coordinator
+            .plan_legacy_retirement(&prepared, plan)
+            .await
+            .unwrap();
+        assert!(coordinator
+            .finish_legacy_retirement(&planned)
+            .await
+            .unwrap());
+        let witness = coordinator
+            .legacy_retirement(&execution.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut invented = witness.clone();
+        invented.process.container_id = "containerd://unverified".into();
+        assert!(coordinator
+            .prepare_legacy_retirement_from_witness(&late, &invented)
+            .await
+            .is_err());
+        let mut other_endpoint = late.clone();
+        other_endpoint.endpoint = "http://different-worker:3000".into();
+        assert!(coordinator
+            .prepare_legacy_retirement_from_witness(&other_endpoint, &witness)
+            .await
+            .is_err());
+        let journal = coordinator
+            .prepare_legacy_retirement_from_witness(&late, &witness)
+            .await
+            .unwrap();
+        assert_eq!(journal.process, process);
+        assert_eq!(journal.execution, late);
+        assert!(journal.versions.is_none());
+        assert!(!journal.completed);
+        assert_eq!(coordinator.get("late").await.unwrap(), Some(late.clone()));
+        assert!(coordinator
+            .finish_legacy_retirement(&journal)
+            .await
+            .is_err());
+        let new_plan = BTreeMap::from([
+            ("base".into(), 90),
+            (format!("shard:{}", uuid::Uuid::nil()), 91),
+        ]);
+        let planned_late = coordinator
+            .plan_legacy_retirement(&journal, new_plan)
+            .await
+            .unwrap();
+        assert!(coordinator
+            .finish_legacy_retirement(&planned_late)
+            .await
+            .unwrap());
+        assert_eq!(
+            coordinator.get("late").await.unwrap().unwrap().phase,
+            Phase::Finished
+        );
+        let lock = coordinator
+            .client
+            .clone()
+            .get(target_lock_key(&coordinator.prefix, "late"), None)
+            .await
+            .unwrap();
+        assert_eq!(lock.kvs()[0].value(), execution_owner(&late).as_bytes());
+        assert_eq!(
+            coordinator.legacy_retirement(&execution.id).await.unwrap(),
+            Some(witness)
+        );
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Retirement {
     pub execution: Execution,
@@ -205,6 +331,34 @@ impl Coordinator {
         old: &Execution,
         process: ProcessIdentity,
     ) -> Result<Retirement> {
+        self.prepare_retirement(old, process, None).await
+    }
+
+    /// A target discovered during shutdown can use the already verified death
+    /// of the same worker. The caller must recheck Kubernetes and the fenced
+    /// successor. Only process identity is inherited, never storage versions.
+    pub async fn prepare_legacy_retirement_from_witness(
+        &self,
+        old: &Execution,
+        witness: &Retirement,
+    ) -> Result<Retirement> {
+        if !witness.completed
+            || witness.versions.is_none()
+            || witness.execution.id == old.id
+            || witness.execution.endpoint != old.endpoint
+        {
+            return Err("completed retirement of the same worker is required".into());
+        }
+        self.prepare_retirement(old, witness.process.clone(), Some(witness))
+            .await
+    }
+
+    async fn prepare_retirement(
+        &self,
+        old: &Execution,
+        process: ProcessIdentity,
+        witness: Option<&Retirement>,
+    ) -> Result<Retirement> {
         if old.protocol != 0
             || old.background
             || old.maintenance.is_some()
@@ -230,23 +384,28 @@ impl Coordinator {
             completed: false,
         };
         let key = self.retirement_key(&old.id)?;
+        let mut comparisons = vec![
+            Compare::value(
+                execution_key(&self.prefix, &old.target),
+                CompareOp::Equal,
+                encode(old),
+            ),
+            Compare::value(
+                target_lock_key(&self.prefix, &old.target),
+                CompareOp::Equal,
+                execution_owner(old),
+            ),
+            Compare::version(key.as_str(), CompareOp::Equal, 0),
+        ];
+        if let Some(witness) = witness {
+            comparisons.push(Compare::value(
+                self.retirement_key(&witness.execution.id)?,
+                CompareOp::Equal,
+                bytes(witness),
+            ));
+        }
         if self
-            .transact(
-                vec![
-                    Compare::value(
-                        execution_key(&self.prefix, &old.target),
-                        CompareOp::Equal,
-                        encode(old),
-                    ),
-                    Compare::value(
-                        target_lock_key(&self.prefix, &old.target),
-                        CompareOp::Equal,
-                        execution_owner(old),
-                    ),
-                    Compare::version(key.as_str(), CompareOp::Equal, 0),
-                ],
-                vec![TxnOp::put(key, bytes(&next), None)],
-            )
+            .transact(comparisons, vec![TxnOp::put(key, bytes(&next), None)])
             .await?
         {
             return Ok(next);

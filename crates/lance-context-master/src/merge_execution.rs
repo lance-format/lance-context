@@ -380,7 +380,7 @@ async fn run_legacy_workers_inner(
         let execution = ownership.admit(target, endpoint).await?;
         let started = std::time::Instant::now();
         let result = crate::merge_capacity::observe(async {
-            let response = http.post(url).send().await.map_err(|error| {
+            let mut response = http.post(url).send().await.map_err(|error| {
                 // The shared worker client must disable redirects: a failed
                 // connection AFTER a redirected POST could hide an execution.
                 // Keep a table name such as "schema" or "invalid" out of
@@ -394,6 +394,26 @@ async fn run_legacy_workers_inner(
                 return Err((
                     false,
                     format!("legacy merge redirect refused: HTTP {}", response.status()),
+                ));
+            }
+            if response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+                // This exact response is emitted by the worker's outer drain
+                // gate before the merge handler is admitted. Other 503s may
+                // follow storage work and must retain their durable ownership.
+                let refused = tokio::time::timeout(RPC_TIMEOUT, async {
+                    let mut body = Vec::new();
+                    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+                        if body.len().saturating_add(chunk.len()) > 64 {
+                            return Ok::<_, String>(false);
+                        }
+                        body.extend_from_slice(&chunk);
+                    }
+                    Ok(body == b"worker is draining")
+                })
+                .await;
+                return Err((
+                    matches!(refused, Ok(Ok(true))),
+                    "legacy merge returned HTTP 503; only an exact worker drain refusal proves no admission".into(),
                 ));
             }
             let reply: serde_json::Value = response
@@ -426,7 +446,7 @@ async fn run_legacy_workers_inner(
                 ownership
                     .known_outcome(execution, Err(error.clone()))
                     .await?;
-                tracing::warn!(%endpoint, %target, %error, "worker connection failed before merge admission; continuing healthy workers");
+                tracing::warn!(%endpoint, %target, %error, "worker merge was not admitted; continuing healthy workers");
                 unavailable.push(format!("{endpoint}: {error}"));
             }
             Err((false, error)) => {
@@ -2070,6 +2090,63 @@ mod legacy_connection_tests {
         assert!(error.contains("unavailable workers"));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         server.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn only_exact_drain_refusal_releases_legacy_record_and_continues_fanout() {
+        use super::{run_legacy_workers_inner, LegacyOwnership};
+        use crate::task_store::TaskKinds;
+        use lance_context_api::TaskKind;
+        for (body, unadmitted) in [
+            ("worker is draining".to_string(), true),
+            ("storage failed after publication".to_string(), false),
+            ("worker is draining\n".to_string(), false),
+            ("worker is draining".repeat(8), false),
+        ] {
+            let (_dir, store, _) = durable_store().await;
+            let (bad, rejected) = serve(Router::new().fallback(post(move || {
+                let body = body.clone();
+                async move { (StatusCode::SERVICE_UNAVAILABLE, body) }
+            })))
+            .await;
+            let calls = Arc::new(AtomicUsize::new(0));
+            let (good, healthy_server) = healthy(calls.clone()).await;
+            store
+                .enqueue(TaskKind::MergeWal, "table", vec![])
+                .await
+                .unwrap();
+            let claim = store
+                .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+                .await
+                .unwrap()
+                .unwrap();
+            let coordinator = store.merge_coordinator();
+            let proof = store.merge_claim(&claim);
+            let result = run_legacy_workers_inner(
+                &crate::state::worker_http_client().unwrap(),
+                &[bad, good],
+                "table",
+                LegacyOwnership::Durable {
+                    coordinator: &coordinator,
+                    proof: &proof,
+                },
+            )
+            .await;
+            assert!(result.is_err());
+            assert_eq!(calls.load(Ordering::SeqCst), usize::from(unadmitted));
+            assert_eq!(
+                coordinator.get("table").await.unwrap().is_none(),
+                unadmitted
+            );
+            store.finish(claim, result).await.unwrap();
+            assert_eq!(
+                coordinator.get("table").await.unwrap().is_none(),
+                unadmitted
+            );
+            rejected.abort();
+            healthy_server.abort();
+        }
     }
 
     #[tokio::test]
