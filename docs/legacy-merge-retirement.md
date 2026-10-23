@@ -97,8 +97,10 @@ Normal canonical completion and lock release then apply. Remove the optional
 witness field when sending an explicit `complete` request.
 
 Completed target witnesses are not selected automatically from an endpoint or
-empty progress telemetry. A changed Pod UID, another restart that loses the exact termination
-receipt, an incomplete witness, or changed ownership keeps recovery protected.
+empty progress telemetry. A changed Pod UID, an incomplete witness, or changed
+ownership keeps recovery protected. Another restart requires the persisted
+worker termination receipt described below; without it the exact original
+Kubernetes termination record is still required.
 
 ## Workers with no current execution
 
@@ -141,9 +143,39 @@ No agent needs to bind each late target. For a manual `prepare` request,
 `witness_execution_id`; supplying both is rejected. Explicit `complete`
 requests omit both witness fields.
 
-The intent is retained for late admissions and cannot authorize recovery after
-a second restart loses the original termination receipt. It is a one-time
-legacy transition record, not a replacement for native fenced-worker recovery.
+### Preserve termination evidence before another restart
+
+Kubernetes keeps only the immediately preceding container termination. Before
+a second same-Pod replacement, send the original worker request with
+`"action":"confirm_worker_termination"`, retaining the original `intent_id`,
+endpoint, namespace, Pod and container. This action requires a master binary
+that implements it; it does not restart or drain the worker.
+
+The master rechecks the captured old container's graceful termination and
+brackets the live fenced successor's capability probe with Kubernetes identity
+reads. It persists an immutable `worker_termination` receipt in application
+etcd, comparing both the original intent and its endpoint index. The receipt
+contains the original process, the observed successor and the termination time.
+It creates no execution, task, storage version or target lock. Confirm it while
+the original `lastState.terminated` evidence still exists; a missing receipt
+cannot be reconstructed from elapsed time, readiness or an empty queue.
+
+Canonical preparation of a late target also saves this receipt automatically.
+An idle worker may have no such task, so explicitly confirm before its next
+replacement. Retrying confirmation returns the original receipt while still
+checking a current fenced successor. It cannot replace the original intent or
+termination evidence.
+
+After another restart, recovery may use the persisted proof of the old
+process's death. It still probes the current ready process in the same Pod UID,
+with the same writer/shard identity and fenced admission. Each late target must
+still validate its own storage/coordinator namespace, prepare its own storage
+barriers and complete through the normal ownership comparisons. A receipt
+never authorizes deleting a lock, recovering an unknown process, accepting a
+changed Pod UID, or rolling back to an unfenced binary.
+
+The intent and receipt are retained for late admissions. They support a legacy
+transition, not a replacement for native fenced-worker recovery.
 
 This is a migration tool, not an automatic process killer. It deliberately
 requires verified process evidence and a same-Pod container replacement.
