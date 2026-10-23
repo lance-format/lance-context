@@ -10,7 +10,7 @@
 //! Master replicas coordinate a single writer through the configured task-store
 //! backend; the data-plane never touches this table.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use std::time::Duration;
@@ -75,6 +75,40 @@ impl StatRow {
             scanned_at: self.scanned_at,
         }
     }
+}
+
+/// Legacy registry snapshots can contain the same name more than once. Keep
+/// the newest observation, not whichever fragment or concurrent scan finishes
+/// last. Equal-time observations prefer the larger backlog conservatively.
+pub(crate) fn unique_stats_rows(mut rows: Vec<StatRow>) -> Vec<StatRow> {
+    rows.sort_by(|a, b| {
+        a.name.cmp(&b.name).then_with(|| {
+            (
+                b.scanned_at,
+                b.version,
+                b.last_updated,
+                b.pending_wal_generations,
+                b.fragment_count,
+                b.row_count,
+                b.last_compaction,
+                b.total_compactions,
+                &b.uri,
+            )
+                .cmp(&(
+                    a.scanned_at,
+                    a.version,
+                    a.last_updated,
+                    a.pending_wal_generations,
+                    a.fragment_count,
+                    a.row_count,
+                    a.last_compaction,
+                    a.total_compactions,
+                    &a.uri,
+                ))
+        })
+    });
+    rows.dedup_by(|a, b| a.name == b.name);
+    rows
 }
 
 /// Durable directory of per-experiment stats, backed by a single Lance dataset.
@@ -278,7 +312,8 @@ impl StatsStore {
     /// rows for experiments that no longer exist (which the compaction and
     /// WAL-merge sweeps would keep acting on).
     pub async fn replace_snapshot(&mut self, rows: &[StatRow]) -> LanceResult<()> {
-        let batch = Self::rows_to_batch(rows)?;
+        let rows = unique_stats_rows(rows.to_vec());
+        let batch = Self::rows_to_batch(&rows)?;
         let schema = Arc::new(stats_schema());
         let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema);
         let params = Self::write_params(WriteMode::Overwrite, self.storage_options.clone());
@@ -325,19 +360,16 @@ impl StatsStore {
         let escaped = name.replace('\'', "''");
         let mut scanner = self.dataset.scan();
         scanner.filter(&format!("name = '{}'", escaped))?;
-        scanner.limit(Some(1), None)?;
         let mut stream = scanner.try_into_stream().await?;
+        let mut rows = Vec::new();
         while let Some(batch) = stream.try_next().await? {
-            let rows = Self::batch_to_rows(&batch)?;
-            if let Some(first) = rows.into_iter().next() {
-                return Ok(Some(first));
-            }
+            rows.extend(Self::batch_to_rows(&batch)?);
         }
-        Ok(None)
+        Ok(unique_stats_rows(rows).into_iter().next())
     }
 
-    /// Total number of rows matching an optional case-sensitive substring on
-    /// `name`, ignoring pagination.
+    /// Total number of distinct names matching an optional case-sensitive
+    /// substring, ignoring pagination and legacy duplicate physical rows.
     pub async fn count(&mut self, search: Option<&str>) -> LanceResult<i64> {
         self.dataset.checkout_latest().await?;
         let mut scanner = self.dataset.scan();
@@ -346,11 +378,12 @@ impl StatsStore {
             scanner.filter(&Self::like_filter(q))?;
         }
         let mut stream = scanner.try_into_stream().await?;
-        let mut total = 0i64;
+        let mut names = HashSet::new();
         while let Some(batch) = stream.try_next().await? {
-            total += batch.num_rows() as i64;
+            let column = Self::str_col(&batch, "name")?;
+            names.extend((0..batch.num_rows()).map(|i| column.value(i).to_owned()));
         }
-        Ok(total)
+        Ok(names.len() as i64)
     }
 
     /// List stats rows, optionally filtered by a `name` substring, ordered by
@@ -377,8 +410,11 @@ impl StatsStore {
         while let Some(batch) = stream.try_next().await? {
             rows.extend(Self::batch_to_rows(&batch)?);
         }
-        rows.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(rows.into_iter().skip(offset).take(limit).collect())
+        Ok(unique_stats_rows(rows)
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .collect())
     }
 
     /// Rows whose `fragment_count` is at least `threshold`, capped at `limit`.
@@ -442,6 +478,11 @@ impl StatsStore {
         while let Some(batch) = stream.try_next().await? {
             rows.extend(Self::batch_to_rows(&batch)?);
         }
+        // Keep threshold pushdown: these are conservative scheduling hints,
+        // not a fresh per-table count. An older above-threshold observation can
+        // still cause a no-op until the next snapshot repairs physical rows,
+        // but duplicate names must not consume multiple places in the sweep.
+        let mut rows = unique_stats_rows(rows);
         // Worst backlog first; `name` only breaks ties, so pagination-style
         // stability is preserved among equal counts.
         let key = |row: &StatRow| match column {
@@ -651,6 +692,94 @@ mod tests {
         let rows = s.list(None, 100, 0).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].row_count, 20);
+    }
+
+    #[tokio::test]
+    async fn duplicate_stats_use_latest_observation_before_pagination() {
+        let dir = TempDir::new().unwrap();
+        let mut s = new_store(&dir).await;
+        let mut stale = sample("a", 10);
+        stale.pending_wal_generations = 500;
+        let mut fresh = sample("a", 20);
+        fresh.scanned_at += 1;
+        fresh.pending_wal_generations = 0;
+        // Seed a physical legacy snapshot, bypassing write-time normalization.
+        let rows = vec![stale.clone(), sample("b", 30), fresh.clone(), stale];
+        let batch = StatsStore::rows_to_batch(&rows).unwrap();
+        let reader =
+            RecordBatchIterator::new(vec![Ok(batch)].into_iter(), Arc::new(stats_schema()));
+        s.dataset = Dataset::write(
+            reader,
+            &s.uri,
+            Some(StatsStore::write_params(WriteMode::Overwrite, None)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(s.count(None).await.unwrap(), 2);
+        assert_eq!(s.count(Some("a")).await.unwrap(), 1);
+        assert_eq!(s.get("a").await.unwrap(), Some(fresh.clone()));
+        assert_eq!(s.list(None, 1, 0).await.unwrap(), vec![fresh]);
+        assert_eq!(s.list(None, 1, 1).await.unwrap()[0].name, "b");
+        assert!(s.list(None, 1, 2).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn duplicate_snapshot_writes_one_physical_row_per_name() {
+        let dir = TempDir::new().unwrap();
+        let mut s = new_store(&dir).await;
+        let stale = sample("a", 10);
+        let mut fresh = sample("a", 20);
+        fresh.scanned_at += 1;
+        s.write_snapshot(&[fresh.clone(), stale, sample("b", 30)])
+            .await
+            .unwrap();
+        assert_eq!(s.dataset.count_rows(None).await.unwrap(), 2);
+        assert_eq!(s.get("a").await.unwrap(), Some(fresh));
+    }
+
+    #[tokio::test]
+    async fn duplicate_legacy_candidates_do_not_exhaust_sweep_limit() {
+        let dir = TempDir::new().unwrap();
+        let mut s = new_store(&dir).await;
+        let mut hot = sample("hot", 10);
+        hot.pending_wal_generations = 100;
+        let mut next = sample("next", 20);
+        next.pending_wal_generations = 50;
+        let mut rows = vec![hot; 14];
+        rows.push(next);
+        let batch = StatsStore::rows_to_batch(&rows).unwrap();
+        let reader =
+            RecordBatchIterator::new(vec![Ok(batch)].into_iter(), Arc::new(stats_schema()));
+        s.dataset = Dataset::write(
+            reader,
+            &s.uri,
+            Some(StatsStore::write_params(WriteMode::Overwrite, None)),
+        )
+        .await
+        .unwrap();
+        let selected = s.list_above_pending_wal(10, 2).await.unwrap();
+        assert_eq!(
+            selected.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            vec!["hot", "next"]
+        );
+    }
+
+    #[test]
+    fn duplicate_stats_order_does_not_change_selected_observation() {
+        let mut older = sample("hot", 100);
+        older.pending_wal_generations = 1000;
+        let mut newest = sample("hot", 200);
+        newest.scanned_at += 1;
+        newest.pending_wal_generations = 2;
+        let mut tied = newest.clone();
+        tied.pending_wal_generations = 3;
+        let rows = vec![older, newest, tied.clone(), sample("other", 4)];
+        let expected = vec![tied, sample("other", 4)];
+        assert_eq!(unique_stats_rows(rows.clone()), expected);
+        assert_eq!(
+            unique_stats_rows(rows.into_iter().rev().collect()),
+            expected
+        );
     }
 
     #[tokio::test]

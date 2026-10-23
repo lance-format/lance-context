@@ -22,7 +22,7 @@ use tokio::task::JoinHandle;
 
 use crate::scheduler::generic_target;
 use crate::state::MasterState;
-use crate::stats_store::StatRow;
+use crate::stats_store::{unique_stats_rows, StatRow};
 use lance_context_api::{ExperimentSummary, TaskKind};
 
 /// Per-experiment open+observe timeout so one wedged dataset cannot stall a
@@ -401,6 +401,7 @@ async fn scan_once_inner(
             }),
     );
     let live: HashSet<String> = entries.iter().map(|e| e.name.clone()).collect();
+    let (entries, ambiguous) = unique_scan_entries(entries);
     let concurrency = state.config.scan_concurrency.max(1);
 
     // Read the previous snapshot once, up front. Each experiment's row supplies
@@ -470,7 +471,10 @@ async fn scan_once_inner(
             }
         })
         .buffer_unordered(concurrency);
-    let observed = collect_observations(state, observations).await;
+    let mut observed = collect_observations(state, observations).await;
+    // Preserve the previous observation for an ambiguous registry identity,
+    // just as for a failed store read; unrelated tables continue to scan.
+    observed.extend(ambiguous.iter().cloned().map(|name| (name, None)));
 
     let count = observed.iter().filter(|(_, row)| row.is_some()).count();
     let failed = observed.len() - count;
@@ -500,7 +504,7 @@ async fn scan_once_inner(
             }
         }
     }
-    snapshot.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut snapshot = unique_stats_rows(snapshot);
 
     // Retire experiments with no writes for the configured window. Each is
     // merged, compacted and verified quiescent first; only then is its row
@@ -528,6 +532,7 @@ async fn scan_once_inner(
     // observed only, never retired by the master.
     let rollout_rows: Vec<StatRow> = snapshot
         .iter()
+        .filter(|row| !ambiguous.contains(&row.name))
         .filter(|row| !row.name.starts_with("generic:"))
         .cloned()
         .collect();
@@ -640,7 +645,7 @@ async fn publish_snapshot(
 /// experiments, almost all of them cold, that is the difference between a scan
 /// that finishes inside its interval and one that never does.
 /// Which registry a scan entry came from, which decides how it is opened.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ScanKind {
     Rollout,
     Generic,
@@ -652,6 +657,37 @@ struct ScanEntry {
     name: String,
     uri: String,
     kind: ScanKind,
+}
+
+/// Deduplicate before opening any datasets: a legacy registry with fourteen
+/// copies of a name must not generate fourteen concurrent observations and
+/// fourteen stats rows. Conflicting identities cannot safely be guessed.
+fn unique_scan_entries(mut entries: Vec<ScanEntry>) -> (Vec<ScanEntry>, HashSet<String>) {
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut ambiguous = HashSet::new();
+    for pair in entries.windows(2) {
+        if pair[0].name == pair[1].name
+            && (pair[0].uri != pair[1].uri || pair[0].kind != pair[1].kind)
+        {
+            ambiguous.insert(pair[0].name.clone());
+        }
+    }
+    let physical = entries.len();
+    entries.dedup_by(|a, b| a.name == b.name);
+    if physical != entries.len() {
+        tracing::warn!(
+            duplicate_entries = physical - entries.len(),
+            "stats scan ignored duplicate registry entries"
+        );
+    }
+    for name in &ambiguous {
+        tracing::warn!(
+            name,
+            "registry identity is ambiguous; retaining previous stats"
+        );
+    }
+    entries.retain(|entry| !ambiguous.contains(&entry.name));
+    (entries, ambiguous)
 }
 
 /// Count pending generations under the observe timeout; shard manifests are
@@ -1430,6 +1466,29 @@ mod incremental_scan_tests {
     use super::*;
     use lance_context_core::{RolloutRecord, RolloutStore, RolloutStoreOptions, ROLE_ASSISTANT};
     use tempfile::TempDir;
+
+    #[test]
+    fn duplicate_registry_entries_are_observed_once_and_conflicts_are_isolated() {
+        let entry = |name: &str, uri: &str, kind| ScanEntry {
+            name: name.into(),
+            uri: uri.into(),
+            kind,
+        };
+        let mut entries: Vec<_> = (0..14)
+            .map(|_| entry("hot", "/hot", ScanKind::Rollout))
+            .collect();
+        entries.extend([
+            entry("generic:hot", "/generic/hot", ScanKind::Generic),
+            entry("conflict", "/one", ScanKind::Rollout),
+            entry("conflict", "/two", ScanKind::Rollout),
+        ]);
+        let (unique, ambiguous) = unique_scan_entries(entries);
+        assert_eq!(
+            unique.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            vec!["generic:hot", "hot"]
+        );
+        assert_eq!(ambiguous, HashSet::from(["conflict".to_string()]));
+    }
 
     fn rec(id: &str) -> RolloutRecord {
         RolloutRecord {
