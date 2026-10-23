@@ -2384,36 +2384,61 @@ impl StorageBase {
     /// Ordinary WAL appends do not force retries. Pinned reads use only their
     /// selected base version. A progressing merge may invalidate several fresh
     /// views in a few milliseconds: bound refreshes separately from repeated
-    /// missing-file failures at the same base version. The retry budget limits
-    /// starting another attempt, not the duration of an otherwise valid scan.
-    pub async fn read_consistent<T, F, Fut>(
+    /// missing-file failures at the same base version. Metadata retries get a
+    /// bounded window starting at the first invalidated capture, so slow initial
+    /// metadata IO cannot suppress the first retry before any payload is read.
+    /// The retry budget limits starting another attempt, not a valid scan.
+    pub async fn read_consistent<T, F, Fut>(&self, source: ListSource, read: F) -> LanceResult<T>
+    where
+        F: FnMut(Dataset, Vec<ShardSnapshot>) -> Fut,
+        Fut: std::future::Future<Output = LanceResult<T>>,
+    {
+        self.read_consistent_with_snapshots(source, || self.wal_shard_snapshots(), read)
+            .await
+    }
+
+    pub(crate) async fn read_consistent_with_snapshots<T, F, Fut, S, Snapshot>(
         &self,
         source: ListSource,
+        mut capture: S,
         mut read: F,
     ) -> LanceResult<T>
     where
         F: FnMut(Dataset, Vec<ShardSnapshot>) -> Fut,
         Fut: std::future::Future<Output = LanceResult<T>>,
+        S: FnMut() -> Snapshot,
+        Snapshot: std::future::Future<Output = LanceResult<Vec<ShardSnapshot>>>,
     {
         const MAX_SNAPSHOT_ATTEMPTS: usize = 16;
         const MAX_MISSING_AT_VERSION: usize = 3;
         let started = std::time::Instant::now();
         let retry_budget = std::time::Duration::from_secs(2);
+        let mut metadata_retry_started = None;
+        let mut next_dataset = None;
+        let mut captures = 0;
         let mut last_missing_version = None;
         let mut missing_at_version = 0;
         for attempt in 0..MAX_SNAPSHOT_ATTEMPTS {
-            if attempt != 0 && started.elapsed() >= retry_budget {
+            let retry_started = metadata_retry_started.unwrap_or(started);
+            if attempt != 0 && retry_started.elapsed() >= retry_budget {
                 break;
             }
-            let mut dataset = self.dataset.clone();
-            if !self.is_version_pinned() {
-                dataset.checkout_latest().await?;
-            }
+            captures += 1;
+            let dataset = match next_dataset.take() {
+                Some(dataset) => dataset,
+                None => {
+                    let mut dataset = self.dataset.clone();
+                    if !self.is_version_pinned() {
+                        dataset.checkout_latest().await?;
+                    }
+                    dataset
+                }
+            };
             let version = dataset.manifest.version;
             let snapshots = if source == ListSource::Fragments {
                 Vec::new()
             } else {
-                self.wal_shard_snapshots().await?
+                capture().await?
             };
             if !self.is_version_pinned() {
                 let mut latest = dataset.clone();
@@ -2422,9 +2447,17 @@ impl StorageBase {
                     // A merge could have drained WAL after we opened base.
                     // Retry this metadata pair before scanning any payloads,
                     // otherwise the view could omit its newly merged rows.
+                    metadata_retry_started.get_or_insert_with(std::time::Instant::now);
+                    // This version was observed before the next WAL capture.
+                    // Keep it as that capture's lower bound rather than opening
+                    // latest once more and discarding the work just completed.
+                    next_dataset = Some(latest);
                     continue;
                 }
             }
+            // Payload retries retain the original elapsed-time and missing-file
+            // limits; metadata churn must not grant extra repeated decoding.
+            metadata_retry_started = None;
             let result = read(dataset.clone(), snapshots).await;
             if self.is_version_pinned() {
                 return result;
@@ -2461,6 +2494,9 @@ impl StorageBase {
             // continuous merging and repeats all their decoding work.
             return result;
         }
+        warn!(uri = %self.dataset.uri(), captures,
+            elapsed_secs = started.elapsed().as_secs_f64(),
+            "read could not capture stable base/WAL metadata within retry limits");
         Err(LanceError::io(
             "dataset changed during read; retry the request",
         ))
