@@ -25,6 +25,17 @@ pub struct OperationStatus {
     /// None means this operation has no instrumented progress counter. It
     /// must not be interpreted as zero progress or permission to kill it.
     pub progress: Option<Progress>,
+    /// Claim diagnostics are distinct from execution progress and never authorize fencing.
+    pub claim_progress: Option<ClaimProgress>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct ClaimProgress {
+    pub stage: &'static str,
+    pub completed_etcd_responses: u64,
+    pub queue_candidates: u64,
+    pub recovery_candidates: u64,
+    pub last_completed_at_ms: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -83,6 +94,7 @@ impl Admission {
                         target: None,
                         started_at_ms: chrono::Utc::now().timestamp_millis(),
                         progress: None,
+                        claim_progress: None,
                     },
                 );
                 admitted = true;
@@ -160,6 +172,31 @@ impl Operation {
         });
     }
 
+    pub(crate) fn claim_phase(&self, stage: &'static str) {
+        self.update(|operation| {
+            operation
+                .claim_progress
+                .get_or_insert_with(ClaimProgress::default)
+                .stage = stage;
+        });
+    }
+
+    /// Completed IO responses / inspected candidates, never a poll heartbeat.
+    /// This does not increment the running merge's independent work counter.
+    pub(crate) fn claim_completed(&self, responses: u64, queued: u64, recovery: u64) {
+        self.update(|operation| {
+            let p = operation
+                .claim_progress
+                .get_or_insert_with(ClaimProgress::default);
+            p.completed_etcd_responses += responses;
+            p.queue_candidates += queued;
+            p.recovery_candidates += recovery;
+            if responses + queued + recovery > 0 {
+                p.last_completed_at_ms = Some(chrono::Utc::now().timestamp_millis());
+            }
+        });
+    }
+
     fn update(&self, update: impl FnOnce(&mut OperationStatus)) {
         self.admission.state.send_modify(|state| {
             // The operation guard owns this entry until Drop. No separate
@@ -186,6 +223,70 @@ impl Drop for Operation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn claim_progress_is_local_and_does_not_become_merge_work() {
+        let admission = Arc::new(Admission::default());
+        let first = admission.try_admit_named("merge").unwrap();
+        let second = admission.try_admit_named("merge").unwrap();
+        first.claim_phase("admission_snapshot");
+        second.claim_phase("queue_page");
+        let second_id = second.id.clone();
+        let advancing = tokio::spawn(async move {
+            for _ in 0..100 {
+                second.claim_completed(1, 64, 0);
+                tokio::task::yield_now().await;
+            }
+            second
+        });
+        for _ in 0..100 {
+            let status = admission.status();
+            let stalled = status.operations[&first.id]
+                .claim_progress
+                .as_ref()
+                .unwrap();
+            assert_eq!(stalled.completed_etcd_responses, 0);
+            assert!(stalled.last_completed_at_ms.is_none());
+            assert!(status.operations[&second_id].progress.is_none());
+            tokio::task::yield_now().await;
+        }
+        let second = advancing.await.unwrap();
+        let status = admission.status();
+        let stalled = &status.operations[&first.id];
+        assert_eq!(
+            stalled
+                .claim_progress
+                .as_ref()
+                .unwrap()
+                .completed_etcd_responses,
+            0
+        );
+        assert!(stalled
+            .claim_progress
+            .as_ref()
+            .unwrap()
+            .last_completed_at_ms
+            .is_none());
+        assert_eq!(
+            status.operations[&second.id]
+                .claim_progress
+                .as_ref()
+                .unwrap()
+                .queue_candidates,
+            6400
+        );
+        second.task("owned-task", "hot");
+        assert!(admission.status().operations[&second.id].progress.is_none());
+        second.observed_work();
+        assert_eq!(
+            admission.status().operations[&second.id]
+                .progress
+                .as_ref()
+                .unwrap()
+                .completed,
+            1
+        );
+    }
 
     #[tokio::test]
     async fn drain_waits_for_admitted_claim_and_rejects_new_work() {

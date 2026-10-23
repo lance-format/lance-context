@@ -1168,6 +1168,26 @@ pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
     crate::resident_recovery::spawn(state);
     crate::planner::spawn(state);
     crate::executors::spawn(state);
+    // Dependency failure bookkeeping must never delay an accepted claim.
+    // Coalesce cleanup into one admitted, joined operation per master.
+    let history_state = state.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(5));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            if !history_state.task_store.history_prune_pending() {
+                continue;
+            }
+            let Some(operation) = history_state.admission.try_admit_named("task_history") else {
+                break;
+            };
+            operation.phase("prune_terminal_history");
+            if let Err(error) = history_state.task_store.prune_pending_history().await {
+                tracing::warn!(%error, "deferred task history pruning failed");
+            }
+        }
+    });
     // Retry metadata independently of coarse stats sweeps. Every replica may
     // enqueue; the existing task dedupe/claim transaction elects one executor.
     let retry_state = state.clone();
@@ -1340,7 +1360,8 @@ pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
     //
     // Splitting the pollers makes each one claim only what it can run, so a
     // free compaction slot reaches past any number of queued MergeWal tasks.
-    // FIFO order within a kind is unchanged.
+    // Each pool scans keys in order within a finite sweep. Blocked candidates
+    // are revisited next sweep; new arrivals cannot extend a sweep forever.
     let general = spawn_pool_poller(
         state.clone(),
         sem.clone(),
@@ -1425,6 +1446,7 @@ fn spawn_filtered_pool_poller(
     claiming.set(0.0);
     running.set(0.0);
     tokio::spawn(async move {
+        let mut claim_cursor = crate::task_store::SchedulerClaimCursor::default();
         loop {
             if report_depth {
                 if let Ok(queued) = state.task_store.queue_depth().await {
@@ -1453,14 +1475,11 @@ fn spawn_filtered_pool_poller(
                 let claiming_hold = GaugeHold(claiming.clone());
                 operation.phase("claiming");
                 let claim_start = std::time::Instant::now();
-                let claim = if resident_only {
-                    state
-                        .task_store
-                        .claim_resident_merge(&crate::local_merge::targets(&state.config))
-                        .await
-                } else {
-                    state.task_store.claim_next_of_kinds(kinds).await
-                };
+                let targets = resident_only.then(|| crate::local_merge::targets(&state.config));
+                let claim = state
+                    .task_store
+                    .claim_scheduler_slice(kinds, targets.as_deref(), &mut claim_cursor, &operation)
+                    .await;
                 drop(claiming_hold);
                 match claim {
                     Ok(Some(claim)) => {

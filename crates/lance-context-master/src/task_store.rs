@@ -8,6 +8,7 @@
 //! implementations must be idempotent.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,6 +23,48 @@ use crate::config::MasterConfig;
 use crate::eligibility;
 
 const TASK_POLL_BATCH: usize = 256;
+const SCHEDULER_CLAIM_MAX_CANDIDATES: usize = 64;
+const SCHEDULER_CLAIM_MAX_PAGES: usize = 4;
+
+/// Owned by one scheduler pool, never shared between kind/target filters.
+/// A fixed etcd revision closes each sweep even while new tasks keep arriving.
+#[derive(Default)]
+pub(crate) struct SchedulerClaimCursor {
+    queue: ScanCursor,
+    recovery: ScanCursor,
+}
+
+#[derive(Default)]
+struct ScanCursor {
+    next: Option<Vec<u8>>,
+    revision: Option<i64>,
+}
+
+impl ScanCursor {
+    fn advance(&mut self, key: &[u8], last_in_round: bool) {
+        if last_in_round {
+            *self = Self::default();
+        } else {
+            let mut next = key.to_vec();
+            next.push(0);
+            self.next = Some(next);
+        }
+    }
+}
+
+struct SchedulerClaimScan<'a> {
+    cursor: &'a mut ScanCursor,
+    operation: &'a crate::admission::Operation,
+    candidates: usize,
+    pages: usize,
+}
+
+impl SchedulerClaimScan<'_> {
+    fn advance(&mut self, key: &[u8], last_in_round: bool) {
+        self.cursor.advance(key, last_in_round);
+        self.operation.claim_completed(0, 1, 0);
+    }
+}
 
 /// A set of [`TaskKind`]s a claim is allowed to return.
 ///
@@ -84,6 +127,7 @@ pub struct TaskStore {
     history_ttl_secs: u64,
     cooldown: CooldownPolicy,
     global_maintenance: bool,
+    pending_history_prune: Arc<AtomicBool>,
 }
 
 /// When to stop re-enqueueing a target that keeps failing, and for how long.
@@ -406,6 +450,7 @@ impl TaskStore {
                 max: Duration::from_secs(config.task_cooldown_max_secs),
             },
             global_maintenance: config.catchup.target.is_none(),
+            pending_history_prune: Arc::new(AtomicBool::new(false)),
         };
         // Short-lived exact-target executors must not sweep the fleet's running
         // tasks or terminal history on every invocation. Ordinary masters own
@@ -463,7 +508,7 @@ impl TaskStore {
     /// saturated one.
     pub async fn claim_next_of_kinds(&self, kinds: TaskKinds) -> lance::Result<Option<TaskClaim>> {
         self.inner.recover_orphaned().await?;
-        let (claim, dependency_failed) = self.inner.claim_next(kinds, None, None).await?;
+        let (claim, dependency_failed) = self.inner.claim_next(kinds, None, None, None).await?;
         if dependency_failed {
             if let Err(error) = self.prune_terminal_history().await {
                 tracing::warn!(error = %error, "failed to prune task history");
@@ -474,6 +519,7 @@ impl TaskStore {
 
     /// Reserved resident capacity filters before any dependency/ownership RPC.
     /// Keep canonical claims and all external-owner/fencing checks unchanged.
+    #[cfg(test)]
     pub(crate) async fn claim_resident_merge(
         &self,
         targets: &[String],
@@ -481,13 +527,52 @@ impl TaskStore {
         self.inner.recover_orphaned().await?;
         let (claim, dependency_failed) = self
             .inner
-            .claim_next(TaskKinds::MERGE_WAL, None, Some(targets))
+            .claim_next(TaskKinds::MERGE_WAL, None, Some(targets), None)
             .await?;
         if dependency_failed {
             if let Err(error) = self.prune_terminal_history().await {
                 tracing::warn!(error = %error, "failed to prune task history");
             }
         }
+        Ok(claim)
+    }
+
+    /// Yield between bounded queue/recovery slices without cancelling any
+    /// ownership RPC. The caller keeps this cursor for its own execution pool.
+    pub(crate) async fn claim_scheduler_slice(
+        &self,
+        kinds: TaskKinds,
+        resident_targets: Option<&[String]>,
+        cursor: &mut SchedulerClaimCursor,
+        operation: &crate::admission::Operation,
+    ) -> lance::Result<Option<TaskClaim>> {
+        self.inner
+            .recover_scheduler_slice(&mut cursor.recovery, operation)
+            .await?;
+        let mut scan = SchedulerClaimScan {
+            cursor: &mut cursor.queue,
+            operation,
+            candidates: 0,
+            pages: 0,
+        };
+        let (claim, dependency_failed) = self
+            .inner
+            .claim_next(kinds, None, resident_targets, Some(&mut scan))
+            .await?;
+        if let Some(claim) = &claim {
+            // Publish accepted ownership before any terminal-history work.
+            operation.task(&claim.task.id, &claim.task.target);
+        }
+        if dependency_failed && self.global_maintenance {
+            // Do not keep an accepted claim / local slot idle behind a fleet
+            // history scan. An independently admitted master loop performs it.
+            self.pending_history_prune.store(true, Ordering::Release);
+        }
+        operation.claim_phase(if claim.is_some() {
+            "claimed"
+        } else {
+            "scan_complete"
+        });
         Ok(claim)
     }
 
@@ -502,12 +587,12 @@ impl TaskStore {
         };
         if let Some(task) = self.inner.get(&id).await? {
             if task.state == TaskState::Running {
-                self.inner.recover_tasks(&[task]).await?;
+                self.inner.recover_tasks(&[task], None).await?;
             }
         }
         Ok(self
             .inner
-            .claim_next(TaskKinds::MERGE_WAL, Some((&id, job)), None)
+            .claim_next(TaskKinds::MERGE_WAL, Some((&id, job)), None, None)
             .await?
             .0)
     }
@@ -669,6 +754,23 @@ impl TaskStore {
         let lease_id = claim.backend.lease_id;
         drop(claim);
         self.inner.revoke_lease(lease_id).await
+    }
+
+    pub(crate) fn history_prune_pending(&self) -> bool {
+        self.pending_history_prune.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn prune_pending_history(&self) -> lance::Result<usize> {
+        if !self.pending_history_prune.swap(false, Ordering::AcqRel) {
+            return Ok(0);
+        }
+        match self.prune_terminal_history().await {
+            Ok(n) => Ok(n),
+            Err(error) => {
+                self.pending_history_prune.store(true, Ordering::Release);
+                Err(error)
+            }
+        }
     }
 
     async fn prune_terminal_history(&self) -> lance::Result<usize> {
@@ -855,6 +957,7 @@ impl EtcdTaskStore {
         kinds: TaskKinds,
         only_id: Option<(&str, &str)>,
         resident_targets: Option<&[String]>,
+        mut scan: Option<&mut SchedulerClaimScan<'_>>,
     ) -> lance::Result<(Option<TaskClaim>, bool)> {
         let prefix = only_id.map_or_else(|| self.queue_prefix(), |(id, _)| self.queue_key(id));
         let range_end = if only_id.is_some() {
@@ -868,18 +971,39 @@ impl EtcdTaskStore {
         let mut dependency_failed = false;
 
         loop {
-            let mut client = self.client.clone();
-            let response = client
-                .get(
-                    start_key,
-                    Some(
-                        GetOptions::new()
-                            .with_range(range_end.clone())
-                            .with_limit(TASK_POLL_BATCH as i64),
-                    ),
-                )
-                .await
-                .map_err(etcd_error("list queued tasks"))?;
+            if let Some(scan) = scan.as_mut() {
+                if scan.pages == SCHEDULER_CLAIM_MAX_PAGES {
+                    metrics::counter!("master_task_claim_scan_yields_total", "budget" => "pages")
+                        .increment(1);
+                    return Ok((None, dependency_failed));
+                }
+                scan.operation.claim_phase("queue_page");
+            }
+            let response = if let Some(scan) = scan.as_mut() {
+                let response = self
+                    .scan_page(
+                        &self.queue_prefix(),
+                        scan.cursor,
+                        TASK_POLL_BATCH,
+                        scan.operation,
+                    )
+                    .await?;
+                scan.pages += 1;
+                response
+            } else {
+                self.client
+                    .clone()
+                    .get(
+                        start_key,
+                        Some(
+                            GetOptions::new()
+                                .with_range(range_end.clone())
+                                .with_limit(TASK_POLL_BATCH as i64),
+                        ),
+                    )
+                    .await
+                    .map_err(etcd_error("list queued tasks"))?
+            };
             let more = response.more();
             let next_key = response.kvs().last().map(|kv| {
                 let mut key = kv.key().to_vec();
@@ -893,6 +1017,15 @@ impl EtcdTaskStore {
                 .collect::<lance::Result<Vec<_>>>()?;
 
             for mut task in queued {
+                let candidate_key = self.queue_key(&task.id);
+                let mut candidate_next = candidate_key.as_bytes().to_vec();
+                candidate_next.push(0);
+                let last_in_round = !more && next_key.as_ref() == Some(&candidate_next);
+                let advance = |scan: &mut Option<&mut SchedulerClaimScan<'_>>| {
+                    if let Some(scan) = scan.as_mut() {
+                        scan.advance(candidate_key.as_bytes(), last_in_round);
+                    }
+                };
                 // Local routing policy only. Apply before dependency probes or
                 // ownership RPCs, including shared and reserved resident pools.
                 // Unselected tasks stay available to other masters. The normal
@@ -901,6 +1034,7 @@ impl EtcdTaskStore {
                     && !self.wal_claim_targets.is_empty()
                     && !self.wal_claim_targets.contains(&task.target)
                 {
+                    advance(&mut scan);
                     continue;
                 }
                 // Cheap kind/resident filtering happens before the dependency
@@ -915,15 +1049,29 @@ impl EtcdTaskStore {
                     &policy,
                 ) {
                     tracing::trace!(task = %task.id, target = %task.target, ?skip, "task skipped");
+                    advance(&mut scan);
                     continue;
                 }
-                match self.dependency_status(&task).await? {
+                if let Some(scan) = scan.as_mut() {
+                    if scan.candidates == SCHEDULER_CLAIM_MAX_CANDIDATES {
+                        metrics::counter!("master_task_claim_scan_yields_total", "budget" => "candidates").increment(1);
+                        return Ok((None, dependency_failed));
+                    }
+                    scan.candidates += 1;
+                    scan.operation.claim_phase("dependencies");
+                }
+                let operation = scan.as_ref().map(|scan| scan.operation);
+                match self.dependency_status(&task, operation).await? {
                     DependencyStatus::Ready => {}
-                    DependencyStatus::Waiting => continue,
+                    DependencyStatus::Waiting => {
+                        advance(&mut scan);
+                        continue;
+                    }
                     DependencyStatus::Failed(dependency) => {
                         if self.fail_dependency(&task, &dependency).await? {
                             dependency_failed = true;
                         }
+                        advance(&mut scan);
                         continue;
                     }
                 }
@@ -937,6 +1085,9 @@ impl EtcdTaskStore {
                     encode_segment(&task.target)
                 );
                 let execution_key = lance_context_merge::execution_key(&self.prefix, &task.target);
+                if let Some(operation) = operation {
+                    operation.claim_phase("admission_snapshot");
+                }
                 let snapshot = self
                     .read_values(&[
                         execution_key.clone(),
@@ -946,8 +1097,19 @@ impl EtcdTaskStore {
                         self.claim_key(&task.id),
                         preparation_key.clone(),
                         self.compaction_commit_key(&task.target),
+                        candidate_key.clone(),
                     ])
                     .await?;
+                if let Some(operation) = operation {
+                    operation.claim_completed(1, 0, 0);
+                }
+                // A task from the paged snapshot may already have left the
+                // live queue. Check that in the same fresh admission transaction
+                // before granting any lease; never replay a historical owner.
+                if snapshot[7].is_none() {
+                    advance(&mut scan);
+                    continue;
+                }
                 let merge_execution: Option<lance_context_merge::Execution> = snapshot[0]
                     .as_deref()
                     .map(serde_json::from_slice)
@@ -997,19 +1159,29 @@ impl EtcdTaskStore {
                     Ok(()) => {}
                     Err(eligibility::Skip::YieldToPreparedCommit) => {
                         metrics::counter!("master_merge_yield_to_compaction_total").increment(1);
+                        advance(&mut scan);
                         continue;
                     }
                     Err(eligibility::Skip::OwnershipBlocked) => {
                         metrics::counter!("master_task_admission_blocked_total").increment(1);
+                        advance(&mut scan);
                         continue;
                     }
                     Err(skip) => {
                         tracing::trace!(task = %task.id, target = %task.target, ?skip, "task skipped");
+                        advance(&mut scan);
                         continue;
                     }
                 }
                 let token = generate_id();
+                if let Some(operation) = operation {
+                    operation.claim_phase("lease_grant");
+                }
                 let lease_id = self.grant_lease().await?;
+                if let Some(operation) = operation {
+                    operation.claim_completed(1, 0, 0);
+                    operation.claim_phase("lease_keepalive");
+                }
                 // Establish renewal before publishing ownership, so a slow
                 // keepalive handshake cannot strand an already accepted claim.
                 let keepalive = match self.start_keepalive(lease_id).await {
@@ -1019,6 +1191,9 @@ impl EtcdTaskStore {
                         return Err(error);
                     }
                 };
+                if let Some(operation) = operation {
+                    operation.claim_phase("claim_transaction");
+                }
                 let claim_key = self.claim_key(&task.id);
                 let target_key = write_claim.then(|| self.target_lock_key(&task.target));
                 let queue_key = self.queue_key(&task.id);
@@ -1121,6 +1296,9 @@ impl EtcdTaskStore {
                 let response = client
                     .txn(Txn::new().when(compares).and_then(operations))
                     .await;
+                if let Some(operation) = operation {
+                    operation.claim_phase("claim_reconciliation");
+                }
                 let claimed = match self
                     .resolve_claim_response(response, &claim_key, &token)
                     .await
@@ -1132,7 +1310,11 @@ impl EtcdTaskStore {
                         return Err(error);
                     }
                 };
+                if let Some(operation) = operation {
+                    operation.claim_completed(1, 0, 0);
+                }
                 if claimed {
+                    advance(&mut scan);
                     return Ok((
                         Some(TaskClaim {
                             task,
@@ -1151,9 +1333,13 @@ impl EtcdTaskStore {
                 }
                 drop(keepalive);
                 self.revoke_lease(lease_id).await?;
+                advance(&mut scan);
             }
 
             if !more {
+                if let Some(scan) = scan.as_mut() {
+                    *scan.cursor = ScanCursor::default();
+                }
                 return Ok((None, dependency_failed));
             }
             let Some(next_key) = next_key else {
@@ -1261,6 +1447,76 @@ impl EtcdTaskStore {
         }
     }
 
+    /// Bounded server-side pages without sorting/materializing the whole prefix.
+    /// Only queue membership uses this snapshot: dependency, lease and ownership
+    /// reads plus every claim/recovery CAS always use the live revision.
+    async fn scan_page(
+        &self,
+        prefix: &str,
+        cursor: &mut ScanCursor,
+        limit: usize,
+        operation: &crate::admission::Operation,
+    ) -> lance::Result<etcd_client::GetResponse> {
+        let start = cursor
+            .next
+            .clone()
+            .unwrap_or_else(|| prefix.as_bytes().to_vec());
+        let mut options = GetOptions::new()
+            .with_range(prefix_range_end(prefix.as_bytes()))
+            .with_limit(limit as i64);
+        if let Some(revision) = cursor.revision {
+            options = options.with_revision(revision);
+        }
+        let response = self.client.clone().get(start, Some(options)).await;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                if matches!(&error, etcd_client::Error::GRpcStatus(status) if status.message().contains("required revision has been compacted"))
+                {
+                    // No ownership RPC has started for this page. Restart a
+                    // fresh bounded sweep on the next poll, never a hot retry.
+                    *cursor = ScanCursor::default();
+                    metrics::counter!("master_task_claim_scan_resets_total", "reason" => "compacted").increment(1);
+                }
+                return Err(etcd_error("read scheduler scan page")(error));
+            }
+        };
+        operation.claim_completed(1, 0, 0);
+        if cursor.revision.is_none() {
+            cursor.revision = Some(
+                response
+                    .header()
+                    .ok_or_else(|| lance::Error::io("missing scan revision"))?
+                    .revision(),
+            );
+        }
+        Ok(response)
+    }
+
+    async fn recover_scheduler_slice(
+        &self,
+        cursor: &mut ScanCursor,
+        operation: &crate::admission::Operation,
+    ) -> lance::Result<()> {
+        operation.claim_phase("recovery_page");
+        let page = self
+            .scan_page(&self.running_prefix(), cursor, 64, operation)
+            .await?;
+        let tasks = page
+            .kvs()
+            .iter()
+            .map(|kv| decode_task(kv.value(), &String::from_utf8_lossy(kv.key())))
+            .collect::<lance::Result<Vec<_>>>()?;
+        operation.claim_phase("recovery_ownership");
+        self.recover_tasks(&tasks, Some(operation)).await?;
+        if let Some(last) = page.kvs().last() {
+            cursor.advance(last.key(), !page.more());
+        } else {
+            *cursor = ScanCursor::default();
+        }
+        Ok(())
+    }
+
     async fn recover_orphaned(&self) -> lance::Result<usize> {
         // Bound each read and batch live-claim checks: a healthy running task
         // needs no conditional recovery transaction. Keep the original CAS
@@ -1283,7 +1539,7 @@ impl EtcdTaskStore {
                 .iter()
                 .map(|kv| decode_task(kv.value(), &String::from_utf8_lossy(kv.key())))
                 .collect::<lance::Result<Vec<_>>>()?;
-            recovered += self.recover_tasks(&tasks).await?;
+            recovered += self.recover_tasks(&tasks, None).await?;
             if !page.more() {
                 return Ok(recovered);
             }
@@ -1324,7 +1580,11 @@ impl EtcdTaskStore {
             .collect()
     }
 
-    async fn recover_tasks(&self, tasks: &[TaskRecord]) -> lance::Result<usize> {
+    async fn recover_tasks(
+        &self,
+        tasks: &[TaskRecord],
+        operation: Option<&crate::admission::Operation>,
+    ) -> lance::Result<usize> {
         if tasks.is_empty() {
             return Ok(0);
         }
@@ -1336,13 +1596,22 @@ impl EtcdTaskStore {
                     .collect::<Vec<_>>(),
             )
             .await?;
+        if let Some(operation) = operation {
+            operation.claim_completed(1, 0, 0);
+        }
         let mut recovered = 0;
         for (task, claim) in tasks.iter().zip(claims) {
             if claim.is_some() {
+                if let Some(operation) = operation {
+                    operation.claim_completed(0, 0, 1);
+                }
                 continue;
             }
             if self.recover_task(task).await? {
                 recovered += 1;
+            }
+            if let Some(operation) = operation {
+                operation.claim_completed(1, 0, 1);
             }
         }
         metrics::counter!("master_task_recovery_inspected_total").increment(tasks.len() as u64);
@@ -1554,10 +1823,18 @@ impl EtcdTaskStore {
             .transpose()
     }
 
-    async fn dependency_status(&self, task: &TaskRecord) -> lance::Result<DependencyStatus> {
+    async fn dependency_status(
+        &self,
+        task: &TaskRecord,
+        operation: Option<&crate::admission::Operation>,
+    ) -> lance::Result<DependencyStatus> {
         let mut waiting = false;
         for dependency in &task.depends_on {
-            match self.get(dependency).await? {
+            let record = self.get(dependency).await?;
+            if let Some(operation) = operation {
+                operation.claim_completed(1, 0, 0);
+            }
+            match record {
                 Some(record) if record.state == TaskState::Done => {}
                 Some(record) if record.state == TaskState::Failed => {
                     return Ok(DependencyStatus::Failed(dependency.clone()));
@@ -2133,6 +2410,532 @@ mod tests {
         cfg.etcd_lease_ttl_secs = 6;
         let store = TaskStore::open(&cfg).await.unwrap();
         (dir, proxy, store, observer)
+    }
+
+    async fn bounded_scheduler_store(targets: Vec<String>) -> (TempDir, TaskStore) {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.etcd.etcd_endpoints = std::env::var("ETCD_TEST_ENDPOINTS")
+            .unwrap()
+            .split(',')
+            .map(str::to_owned)
+            .collect();
+        cfg.etcd.etcd_prefix = format!("/bounded-claim-test/{}", generate_id());
+        cfg.maintenance.wal_claim_targets = targets;
+        let store = TaskStore::open(&cfg).await.unwrap();
+        (dir, store)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn bounded_scheduler_claim_resumes_and_wraps_before_new_arrivals() {
+        let (_dir, store) = bounded_scheduler_store(vec![]).await;
+        let mut client = store.inner.client.clone();
+        let mut blocked = Vec::new();
+        for i in 0..130 {
+            let task = store
+                .enqueue(TaskKind::MergeWal, &format!("blocked-{i}"), vec![])
+                .await
+                .unwrap();
+            client
+                .put(
+                    store.inner.target_lock_key(&task.target),
+                    "external-owner",
+                    None,
+                )
+                .await
+                .unwrap();
+            blocked.push(task);
+        }
+        let tail = store
+            .enqueue(TaskKind::MergeWal, "tail", vec![])
+            .await
+            .unwrap();
+        let admission = Arc::new(crate::admission::Admission::default());
+        let mut cursor = SchedulerClaimCursor::default();
+        let first = admission.try_admit_named("merge").unwrap();
+        assert!(store
+            .claim_scheduler_slice(TaskKinds::MERGE_WAL, None, &mut cursor, &first)
+            .await
+            .unwrap()
+            .is_none());
+        let snapshot = admission.status();
+        let p = snapshot
+            .operations
+            .values()
+            .next()
+            .unwrap()
+            .claim_progress
+            .as_ref()
+            .unwrap();
+        assert_eq!(p.queue_candidates, 64);
+        assert!(p.completed_etcd_responses >= 64);
+        assert!(snapshot
+            .operations
+            .values()
+            .next()
+            .unwrap()
+            .progress
+            .is_none());
+        drop(first);
+        // A formerly blocked old task becomes runnable while new tasks arrive.
+        // The retained revision guarantees this round ends, so the old task
+        // is reconsidered before the new tail can extend the scan forever.
+        client
+            .delete(store.inner.target_lock_key(&blocked[0].target), None)
+            .await
+            .unwrap();
+        let newer = store
+            .enqueue(TaskKind::MergeWal, "newer", vec![])
+            .await
+            .unwrap();
+        let second = admission.try_admit_named("merge").unwrap();
+        assert!(store
+            .claim_scheduler_slice(TaskKinds::MERGE_WAL, None, &mut cursor, &second)
+            .await
+            .unwrap()
+            .is_none());
+        drop(second);
+        let third = admission.try_admit_named("merge").unwrap();
+        let claim = store
+            .claim_scheduler_slice(TaskKinds::MERGE_WAL, None, &mut cursor, &third)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.task.id, tail.id);
+        assert_eq!(
+            admission
+                .status()
+                .operations
+                .values()
+                .next()
+                .unwrap()
+                .task_id
+                .as_deref(),
+            Some(tail.id.as_str())
+        );
+        store
+            .finish(claim, Ok("test completion".into()))
+            .await
+            .unwrap();
+        drop(third);
+        let fourth = admission.try_admit_named("merge").unwrap();
+        let claim = store
+            .claim_scheduler_slice(TaskKinds::MERGE_WAL, None, &mut cursor, &fourth)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.task.id, blocked[0].id);
+        assert_eq!(
+            store.get(&newer.id).await.unwrap().unwrap().state,
+            TaskState::Queued
+        );
+        assert_eq!(
+            client
+                .get(store.inner.target_lock_key(&blocked[1].target), None)
+                .await
+                .unwrap()
+                .kvs()[0]
+                .value(),
+            b"external-owner"
+        );
+        store
+            .finish(claim, Ok("test completion".into()))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn bounded_scheduler_filtered_pages_preserve_other_pool_work() {
+        let (_dir, store) = bounded_scheduler_store(vec!["chosen".into()]).await;
+        let mut client = store.inner.client.clone();
+        // Real canonical task/queue keys; batch fixture creation to avoid
+        // making setup latency dominate the bounded-scan assertion.
+        let mut tasks = Vec::new();
+        for i in 0..1025 {
+            let mut task = new_task(TaskKind::MergeWal, &format!("excluded-{i}"), vec![]);
+            task.id = format!("00000000-0000-7000-8000-{i:012x}");
+            tasks.push(task);
+        }
+        for chunk in tasks.chunks(32) {
+            let ops = chunk
+                .iter()
+                .flat_map(|task| {
+                    [
+                        TxnOp::put(
+                            store.inner.task_key(&task.id),
+                            encode_task(task).unwrap(),
+                            None,
+                        ),
+                        TxnOp::put(
+                            store.inner.queue_key(&task.id),
+                            encode_task(task).unwrap(),
+                            None,
+                        ),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            client.txn(Txn::new().and_then(ops)).await.unwrap();
+        }
+        let chosen = store
+            .enqueue(TaskKind::MergeWal, "chosen", vec![])
+            .await
+            .unwrap();
+        let compact = store
+            .enqueue(TaskKind::Compact, "maintenance", vec![])
+            .await
+            .unwrap();
+        let admission = Arc::new(crate::admission::Admission::default());
+        let mut merge_cursor = SchedulerClaimCursor::default();
+        let first = admission.try_admit_named("merge").unwrap();
+        assert!(store
+            .claim_scheduler_slice(TaskKinds::MERGE_WAL, None, &mut merge_cursor, &first)
+            .await
+            .unwrap()
+            .is_none());
+        let snapshot = admission.status();
+        let p = snapshot
+            .operations
+            .values()
+            .next()
+            .unwrap()
+            .claim_progress
+            .as_ref()
+            .unwrap();
+        assert_eq!(p.queue_candidates, 1024);
+        // 1 empty recovery page + 4 queue pages: excluded merge targets
+        // trigger no dependency/eligibility RPCs or whole-prefix sort.
+        assert_eq!(p.completed_etcd_responses, 5);
+        drop(first);
+        let merge = admission.try_admit_named("merge").unwrap();
+        let claim = store
+            .claim_scheduler_slice(TaskKinds::MERGE_WAL, None, &mut merge_cursor, &merge)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.task.id, chosen.id);
+        let mut general_cursor = SchedulerClaimCursor::default();
+        let general = admission.try_admit_named("general").unwrap();
+        assert!(store
+            .claim_scheduler_slice(TaskKinds::GENERAL, None, &mut general_cursor, &general)
+            .await
+            .unwrap()
+            .is_none());
+        let maintenance = store
+            .claim_scheduler_slice(TaskKinds::GENERAL, None, &mut general_cursor, &general)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(maintenance.task.id, compact.id);
+        assert_eq!(
+            store.get(&tasks[0].id).await.unwrap().unwrap().state,
+            TaskState::Queued
+        );
+        store
+            .finish(maintenance, Ok("test completion".into()))
+            .await
+            .unwrap();
+        store
+            .finish(claim, Ok("test completion".into()))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn bounded_scheduler_snapshot_uses_fresh_queue_and_ownership() {
+        let (_dir, store) = bounded_scheduler_store(vec![]).await;
+        let mut client = store.inner.client.clone();
+        for i in 0..65 {
+            let t = store
+                .enqueue(TaskKind::MergeWal, &format!("blocked-{i}"), vec![])
+                .await
+                .unwrap();
+            client
+                .put(store.inner.target_lock_key(&t.target), "live-owner", None)
+                .await
+                .unwrap();
+        }
+        let tail = store
+            .enqueue(TaskKind::MergeWal, "completed-by-peer", vec![])
+            .await
+            .unwrap();
+        let admission = Arc::new(crate::admission::Admission::default());
+        let mut cursor = SchedulerClaimCursor::default();
+        let first = admission.try_admit_named("merge").unwrap();
+        assert!(store
+            .claim_scheduler_slice(TaskKinds::MERGE_WAL, None, &mut cursor, &first)
+            .await
+            .unwrap()
+            .is_none());
+        drop(first);
+        // Another executor finishes a task still visible in our old queue snapshot.
+        let peer = store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(peer.task.id, tail.id);
+        store
+            .finish(peer, Ok("peer completed".into()))
+            .await
+            .unwrap();
+        let second = admission.try_admit_named("merge").unwrap();
+        assert!(store
+            .claim_scheduler_slice(TaskKinds::MERGE_WAL, None, &mut cursor, &second)
+            .await
+            .unwrap()
+            .is_none());
+        let status = admission.status();
+        let progress = status
+            .operations
+            .values()
+            .next()
+            .unwrap()
+            .claim_progress
+            .as_ref()
+            .unwrap();
+        assert_eq!(progress.queue_candidates, 2);
+        assert_eq!(
+            progress.completed_etcd_responses, 4,
+            "two pages + two fresh snapshots, without a lease for the historical task"
+        );
+        assert_eq!(
+            store.get(&tail.id).await.unwrap().unwrap().state,
+            TaskState::Done
+        );
+        assert_eq!(
+            client
+                .get(store.inner.target_lock_key("blocked-64"), None)
+                .await
+                .unwrap()
+                .kvs()[0]
+                .value(),
+            b"live-owner"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires dedicated loopback etcd and ETCD_TEST_ALLOW_COMPACTION=1"]
+    async fn bounded_scheduler_compacted_snapshot_restarts_without_stealing_locks() {
+        // Compaction is cluster-wide, not isolated by our test key prefix.
+        // Require explicit opt-in against a disposable local instance.
+        assert_eq!(
+            std::env::var("ETCD_TEST_ALLOW_COMPACTION").as_deref(),
+            Ok("1"),
+            "this test requires a dedicated disposable etcd instance"
+        );
+        let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+        assert!(
+            !endpoint.contains(',')
+                && (endpoint.starts_with("http://127.0.0.1:")
+                    || endpoint.starts_with("http://localhost:")),
+            "cluster-wide compaction is restricted to a disposable loopback etcd"
+        );
+        let (_dir, store) = bounded_scheduler_store(vec![]).await;
+        let mut client = store.inner.client.clone();
+        for i in 0..65 {
+            let t = store
+                .enqueue(TaskKind::MergeWal, &format!("blocked-{i}"), vec![])
+                .await
+                .unwrap();
+            client
+                .put(store.inner.target_lock_key(&t.target), "live-owner", None)
+                .await
+                .unwrap();
+        }
+        let tail = store
+            .enqueue(TaskKind::MergeWal, "tail", vec![])
+            .await
+            .unwrap();
+        let admission = Arc::new(crate::admission::Admission::default());
+        let mut cursor = SchedulerClaimCursor::default();
+        let first = admission.try_admit_named("merge").unwrap();
+        assert!(store
+            .claim_scheduler_slice(TaskKinds::MERGE_WAL, None, &mut cursor, &first)
+            .await
+            .unwrap()
+            .is_none());
+        let revision = cursor.queue.revision.unwrap();
+        drop(first);
+        let advanced = client
+            .put(
+                format!("{}/advance-revision", store.inner.prefix),
+                "1",
+                None,
+            )
+            .await
+            .unwrap()
+            .header()
+            .unwrap()
+            .revision();
+        assert!(advanced > revision);
+        client.compact(advanced, None).await.unwrap();
+        let compacted = admission.try_admit_named("merge").unwrap();
+        assert!(store
+            .claim_scheduler_slice(TaskKinds::MERGE_WAL, None, &mut cursor, &compacted)
+            .await
+            .is_err());
+        assert!(cursor.queue.revision.is_none() && cursor.queue.next.is_none());
+        assert_eq!(
+            store.get(&tail.id).await.unwrap().unwrap().state,
+            TaskState::Queued
+        );
+        drop(compacted);
+        let mut claimed = None;
+        for _ in 0..3 {
+            let operation = admission.try_admit_named("merge").unwrap();
+            claimed = store
+                .claim_scheduler_slice(TaskKinds::MERGE_WAL, None, &mut cursor, &operation)
+                .await
+                .unwrap();
+            if claimed.is_some() {
+                break;
+            }
+        }
+        let claim = claimed.expect("a fresh sweep must reach the tail");
+        assert_eq!(claim.task.id, tail.id);
+        assert_eq!(
+            client
+                .get(store.inner.target_lock_key("blocked-0"), None)
+                .await
+                .unwrap()
+                .kvs()[0]
+                .value(),
+            b"live-owner"
+        );
+        store
+            .finish(claim, Ok("test completion".into()))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn bounded_scheduler_dependency_cleanup_does_not_hold_accepted_claim() {
+        let (_dir, mut store) = bounded_scheduler_store(vec![]).await;
+        store.history_limit = 1;
+        let failed = store
+            .enqueue(TaskKind::MergeWal, "bad-1", vec!["missing".into()])
+            .await
+            .unwrap();
+        store
+            .enqueue(TaskKind::MergeWal, "bad-2", vec!["missing".into()])
+            .await
+            .unwrap();
+        let wanted = store
+            .enqueue(TaskKind::MergeWal, "runnable", vec![])
+            .await
+            .unwrap();
+        let admission = Arc::new(crate::admission::Admission::default());
+        let operation = admission.try_admit_named("merge").unwrap();
+        let mut cursor = SchedulerClaimCursor::default();
+        let claim = store
+            .claim_scheduler_slice(TaskKinds::MERGE_WAL, None, &mut cursor, &operation)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.task.id, wanted.id);
+        assert!(store.history_prune_pending());
+        assert!(
+            store.get(&failed.id).await.unwrap().is_some(),
+            "claim path must not run the history scan"
+        );
+        assert_eq!(
+            admission
+                .status()
+                .operations
+                .values()
+                .next()
+                .unwrap()
+                .task_id
+                .as_deref(),
+            Some(wanted.id.as_str())
+        );
+        assert_eq!(store.prune_pending_history().await.unwrap(), 1);
+        assert!(!store.history_prune_pending());
+        assert_eq!(
+            store.get(&wanted.id).await.unwrap().unwrap().state,
+            TaskState::Running
+        );
+        store
+            .finish(claim, Ok("test completion".into()))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn bounded_scheduler_recovery_visits_all_pages_without_stealing_live_claims() {
+        let (_dir, store) = bounded_scheduler_store(vec![]).await;
+        store
+            .enqueue(TaskKind::MergeWal, "live", vec![])
+            .await
+            .unwrap();
+        let live = store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut client = store.inner.client.clone();
+        for i in 0..70 {
+            let mut task = new_task(TaskKind::MergeWal, &format!("orphan-{i}"), vec![]);
+            task.state = TaskState::Running;
+            let value = encode_task(&task).unwrap();
+            client
+                .txn(Txn::new().and_then([
+                    TxnOp::put(store.inner.task_key(&task.id), value.clone(), None),
+                    TxnOp::put(store.inner.running_key(&task.id), value, None),
+                ]))
+                .await
+                .unwrap();
+        }
+        let admission = Arc::new(crate::admission::Admission::default());
+        let mut cursor = SchedulerClaimCursor::default();
+        let first = admission.try_admit_named("general").unwrap();
+        assert!(store
+            .claim_scheduler_slice(TaskKinds::GENERAL, None, &mut cursor, &first)
+            .await
+            .unwrap()
+            .is_none());
+        let depth = store.queue_depth().await.unwrap();
+        assert!(depth > 0 && depth <= 64 && depth < 70);
+        assert_eq!(
+            admission
+                .status()
+                .operations
+                .values()
+                .next()
+                .unwrap()
+                .claim_progress
+                .as_ref()
+                .unwrap()
+                .recovery_candidates,
+            64
+        );
+        drop(first);
+        let second = admission.try_admit_named("general").unwrap();
+        assert!(store
+            .claim_scheduler_slice(TaskKinds::GENERAL, None, &mut cursor, &second)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(store.queue_depth().await.unwrap(), 70);
+        assert_eq!(
+            store.get(&live.task.id).await.unwrap().unwrap().state,
+            TaskState::Running
+        );
+        assert!(!client
+            .get(live.backend.claim_key.clone(), None)
+            .await
+            .unwrap()
+            .kvs()
+            .is_empty());
+        store
+            .finish(live, Ok("test completion".into()))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
