@@ -349,6 +349,25 @@ async fn saturated_http_data_lane_keeps_control_available_and_drain_joins_discon
         overloaded.status(),
         reqwest::StatusCode::SERVICE_UNAVAILABLE
     );
+    assert_eq!(overloaded.headers()[reqwest::header::CONNECTION], "close");
+    assert_eq!(overloaded.headers()[reqwest::header::RETRY_AFTER], "1");
+    let rejected: serde_json::Value = overloaded.json().await?;
+    assert_eq!(rejected["operation_outcome"], "not_submitted");
+    // Reject a second incomplete upload without waiting for its declared body.
+    // The response must close HTTP/1 explicitly, while the admitted slow reader
+    // retains its slot until the normal drain below joins it.
+    let mut rejected_stream = TcpStream::connect(server.address).await?;
+    rejected_stream.write_all(b"POST /api/v1/ingest/rollouts/append HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1048576\r\n\r\nx").await?;
+    let mut response = Vec::new();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        rejected_stream.read_to_end(&mut response),
+    )
+    .await??;
+    let response = String::from_utf8(response)?.to_ascii_lowercase();
+    assert!(response.starts_with("http/1.1 503"), "{response}");
+    assert!(response.contains("connection: close"), "{response}");
+    assert_eq!(server.gateway.observation().data_inflight, 1);
     let opened_again: Opened = client
         .post(server.endpoint("producer"))
         .json(&opens()[0])

@@ -173,12 +173,17 @@ impl Handle for FaultHandle {
                 if after_sync {
                     self.inner.sync()?;
                 }
+                // The parent treats existence as the completed pause receipt.
+                // Publish atomically so it cannot observe an empty/partial JSON
+                // file between create/truncate and write under coverage load.
+                let pending_marker = marker.with_extension("pending");
                 std::fs::write(
-                    marker,
+                    &pending_marker,
                     serde_json::to_vec(
                         &serde_json::json!({"rewrite_sync":call,"file_bytes":self.inner.file_size()?}),
                     )?,
                 )?;
+                std::fs::rename(pending_marker, marker)?;
                 loop {
                     std::thread::park();
                 }

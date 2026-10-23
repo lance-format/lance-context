@@ -278,7 +278,22 @@ async fn close(State(g): State<Gateway>, Path(table): Path<String>, request: Req
 async fn dispatch(gateway: Gateway, table: String, request: Request, action: Action) -> Response {
     let guard = match gateway.enter(matches!(action, Action::Append)) {
         Ok(guard) => guard,
-        Err(error) => return error.into_response(),
+        Err(error) => {
+            let mut response = error.into_response();
+            // Admission rejected this request without consuming its body.
+            // Hyper may close HTTP/1 after dropping that unread body. Tell the
+            // client before it pools the socket and races a following POST
+            // against the close; never drain an unbounded rejected upload.
+            if matches!(
+                request.version(),
+                axum::http::Version::HTTP_10 | axum::http::Version::HTTP_11
+            ) {
+                response
+                    .headers_mut()
+                    .insert(header::CONNECTION, "close".parse().unwrap());
+            }
+            return response;
+        }
     };
     // The admitted task owns its guard and body independently of the socket.
     match tokio::spawn(async move {
