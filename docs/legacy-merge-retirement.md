@@ -174,6 +174,40 @@ barriers and complete through the normal ownership comparisons. A receipt
 never authorizes deleting a lock, recovering an unknown process, accepting a
 changed Pod UID, or rolling back to an unfenced binary.
 
+### Preserve an earlier target retirement without a worker intent
+
+Some earlier migrations registered only a target, not a worker-wide intent.
+Before another same-Pod restart, use the same API or CLI with:
+
+```json
+{
+  "action": "preserve_worker_retirement_witness",
+  "intent_id": "a-new-registration-uuid",
+  "witness_execution_id": "the-completed-target-execution-uuid",
+  "endpoint": "http://worker-9.workers:3000",
+  "namespace": "rollout-db",
+  "pod": "worker-9",
+  "container": "server"
+}
+```
+
+The master derives the **original** process from the completed target journal.
+It requires Kubernetes to still expose that exact container's termination and
+checks a stable, ready, fenced successor in the same Pod. This route accepts a
+nonzero original exit because the target retirement already verified death and
+completed its storage barriers; it does not certify data durability across an
+ungraceful shutdown. An incomplete journal, missing original termination,
+conflicting endpoint registration, or changed Pod UID is rejected.
+
+One transaction compares the completed journal and atomically installs the
+worker registration, endpoint index, and immutable death receipt. A compatible
+existing registration is reused and its real ID is returned. The new ID labels
+this registration; it does not pretend a worker intent existed before death.
+No execution or target lock changes. After a subsequent restart, canonical
+late-target recovery can use the receipt, but must still build and complete
+**each target's own** storage barriers. The witness's barriers are never copied.
+Other worker actions reject `witness_execution_id`.
+
 The intent and receipt are retained for late admissions. They support a legacy
 transition, not a replacement for native fenced-worker recovery.
 
