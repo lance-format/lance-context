@@ -223,9 +223,21 @@ jobs:
         env:
           ETCD_TEST_ENDPOINTS: http://127.0.0.1:2379
         run: |
-          cargo test -p lance-context-master -p lance-context-server -p lance-context-merge -- --ignored
+          cargo test -p lance-context-master -p lance-context-server -p lance-context-merge -- --ignored \
+            --skip task_store::tests::bounded_scheduler_compacted_snapshot_restarts_without_stealing_locks
           cargo test -p lance-context-core registry --lib -- --ignored
           cargo test -p lance-context-ingest --features worker --lib tests::worker -- --ignored
+
+      # Compaction changes the entire etcd revision history. Run its explicit
+      # opt-in only after the parallel suites have finished using this instance.
+      - name: Check scheduler recovery after etcd compaction
+        env:
+          ETCD_TEST_ENDPOINTS: http://127.0.0.1:2379
+          ETCD_TEST_ALLOW_COMPACTION: "1"
+        run: |
+          cargo test -p lance-context-master --lib \
+            task_store::tests::bounded_scheduler_compacted_snapshot_restarts_without_stealing_locks \
+            -- --exact --ignored --test-threads=1
 
       - name: Ingestion application process recovery
         env:
@@ -315,11 +327,20 @@ jobs:
           ETCD_TEST_ENDPOINTS: http://127.0.0.1:2379
         run: |
           cargo llvm-cov --no-report --all-features \
-            -p lance-context-master -p lance-context-server -p lance-context-merge -- --ignored
+            -p lance-context-master -p lance-context-server -p lance-context-merge -- --ignored \
+            --skip task_store::tests::bounded_scheduler_compacted_snapshot_restarts_without_stealing_locks
           cargo llvm-cov --no-report --all-features \
             -p lance-context-core --lib -- registry --ignored
           cargo llvm-cov --no-report --all-features \
             -p lance-context-ingest --lib -- tests::worker --ignored
+      - name: Collect coverage (isolated etcd compaction)
+        env:
+          ETCD_TEST_ENDPOINTS: http://127.0.0.1:2379
+          ETCD_TEST_ALLOW_COMPACTION: "1"
+        run: |
+          cargo llvm-cov --no-report --all-features -p lance-context-master --lib -- \
+            task_store::tests::bounded_scheduler_compacted_snapshot_restarts_without_stealing_locks \
+            --exact --ignored --test-threads=1
       - name: Merge coverage reports
         run: cargo llvm-cov report --lcov --output-path lcov.info
       - name: Save coverage report
