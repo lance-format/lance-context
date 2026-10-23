@@ -163,11 +163,17 @@ async fn watch(
     task_id: &str,
 ) -> String {
     let mut sequence = scope.completed_steps();
+    if sequence > 0 {
+        crate::merge_capacity::observed_work();
+    }
     let mut changed = tokio::time::Instant::now();
     let mut last_progress_at_ms = (sequence > 0).then(lance_context_merge::failure::now_ms);
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
         let current = scope.completed_steps();
+        if current > sequence {
+            crate::merge_capacity::observed_work();
+        }
         if current != sequence {
             changed = tokio::time::Instant::now();
             sequence = current;
@@ -211,10 +217,37 @@ where
     F: Future<Output = Result<String, String>>,
 {
     if !fenced(&state.config, &claim.task.target) {
-        return work.await;
+        return observe_legacy(work).await;
     }
     let maintenance = kind(claim.task.kind).ok_or("invalid local maintenance kind")?;
     run_as(state, claim, maintenance, work).await
+}
+
+/// Report actual local work for legacy maintenance too, but retain its original
+/// cancellation and commit behavior. A quiet observation never stops this work.
+async fn observe_legacy<F>(work: F) -> F::Output
+where
+    F: Future,
+{
+    crate::merge_capacity::phase("legacy_maintenance");
+    let scope = MergeWriteScope::for_legacy_file_observation();
+    let work = scope.run(work);
+    tokio::pin!(work);
+    let mut observed = 0;
+    loop {
+        let outcome = tokio::select! {
+            result = &mut work => Some(result),
+            _ = tokio::time::sleep(Duration::from_secs(1)) => None,
+        };
+        let current = scope.completed_steps();
+        if current > observed {
+            observed = current;
+            crate::merge_capacity::observed_work();
+        }
+        if let Some(result) = outcome {
+            return result;
+        }
+    }
 }
 
 fn fenced(config: &crate::config::MasterConfig, target: &str) -> bool {
@@ -231,6 +264,7 @@ pub(crate) async fn run_as<F>(
 where
     F: Future<Output = Result<String, String>>,
 {
+    crate::merge_capacity::phase("fenced_maintenance");
     let uri = match claim.task.target.strip_prefix("generic:") {
         Some(name) => state.generic_uri(name),
         None => state.rollout_uri(&claim.task.target),
@@ -390,6 +424,147 @@ mod tests {
     use crate::{config::MasterConfig, task_store::TaskKinds};
     use clap::Parser;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[tokio::test]
+    async fn legacy_file_progress_is_visible_without_masking_an_idle_operation() {
+        use crate::{admission::Admission, merge_capacity::Capacity};
+        use lance_context_core::{
+            ColumnSpec, ColumnType, GenericStore, GenericStoreOptions, ListSource, SchemaSpec,
+        };
+        use tokio::sync::{Notify, Semaphore};
+
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let schema = SchemaSpec::new(vec![(
+            "id".into(),
+            ColumnSpec::required(ColumnType::String { large: false }),
+        )]);
+        let mut store = GenericStore::open(uri, schema, GenericStoreOptions::default())
+            .await
+            .unwrap();
+        store
+            .add(&[serde_json::json!({"id": "preserved"})
+                .as_object()
+                .unwrap()
+                .clone()])
+            .await
+            .unwrap();
+        store.flush().await.unwrap();
+        store.cleanup_wal().await.unwrap();
+        store.close().await.unwrap();
+
+        let admission = Arc::new(Admission::default());
+        let pool = Arc::new(Semaphore::new(2));
+        let mut capacities = Vec::new();
+        for name in ["reading", "idle"] {
+            let operation = Arc::new(admission.try_admit_named("compact").unwrap());
+            operation.task(name, name);
+            capacities.push(Capacity::new(
+                pool.clone().acquire_owned().await.unwrap(),
+                pool.clone(),
+                Arc::new(Semaphore::new(1)),
+                Duration::from_secs(1),
+                metrics::gauge!("test_maintenance_progress_running"),
+                operation,
+            ));
+        }
+        let read_done = Notify::new();
+        let last_work_completed_at = std::sync::atomic::AtomicI64::new(0);
+        let release = Semaphore::new(0);
+        let busy = crate::merge_capacity::scope(
+            capacities[0].clone(),
+            observe_legacy(async {
+                for step in 0..5 {
+                    let mut store =
+                        GenericStore::open_existing(uri, GenericStoreOptions::default())
+                            .await
+                            .unwrap();
+                    // The observation scope must preserve real legacy commits,
+                    // not just allow reads or record synthetic checkpoints.
+                    store
+                        .add(&[serde_json::json!({"id": format!("new-{step}")})
+                            .as_object()
+                            .unwrap()
+                            .clone()])
+                        .await
+                        .unwrap();
+                    store.flush().await.unwrap();
+                    store.cleanup_wal().await.unwrap();
+                    let rows = store.list_from(ListSource::Fragments).await.unwrap();
+                    assert_eq!(rows.len(), step + 2);
+                    assert!(rows.iter().any(|row| row["id"] == "preserved"));
+                    store.close().await.unwrap();
+                    last_work_completed_at
+                        .store(chrono::Utc::now().timestamp_millis(), Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(350)).await;
+                }
+                read_done.notify_one();
+                release.acquire().await.unwrap().forget();
+            }),
+        );
+        let idle = crate::merge_capacity::scope(
+            capacities[1].clone(),
+            observe_legacy(async { release.acquire().await.unwrap().forget() }),
+        );
+        let inspect = async {
+            read_done.notified().await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let before = loop {
+                let status = admission.status();
+                let reading = status
+                    .operations
+                    .values()
+                    .find(|op| op.task_id.as_deref() == Some("reading"))
+                    .unwrap();
+                let idle = status
+                    .operations
+                    .values()
+                    .find(|op| op.task_id.as_deref() == Some("idle"))
+                    .unwrap();
+                assert!(
+                    idle.progress.is_none(),
+                    "another operation's IO cannot count here"
+                );
+                assert_eq!(idle.phase, "legacy_maintenance");
+                if let Some(progress) = &reading.progress {
+                    if progress.completed >= 2
+                        && progress.last_completed_at_ms
+                            >= last_work_completed_at.load(Ordering::SeqCst)
+                    {
+                        assert_eq!(progress.unit, "work_progress_samples");
+                        break serde_json::to_value(progress).unwrap();
+                    }
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "real file reads were not reported"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            };
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+            let status = admission.status();
+            let reading = status
+                .operations
+                .values()
+                .find(|op| op.task_id.as_deref() == Some("reading"))
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(reading.progress.as_ref().unwrap()).unwrap(),
+                before,
+                "polling without completed IO must not refresh progress"
+            );
+            assert_eq!(
+                status.active_operations, 2,
+                "quiet legacy work must not be cancelled"
+            );
+            release.add_permits(2);
+        };
+        tokio::time::timeout(Duration::from_secs(15), async {
+            tokio::join!(busy, idle, inspect);
+        })
+        .await
+        .unwrap();
+    }
 
     #[test]
     fn legacy_maintenance_fencing_does_not_enroll_worker_merges() {

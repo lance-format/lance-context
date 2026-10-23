@@ -408,6 +408,9 @@ async fn watch_maintenance_preparation(
     scope: &lance_context_core::merge_write_scope::MergeWriteScope,
 ) -> String {
     let mut sequence = scope.completed_steps();
+    if sequence > 0 {
+        crate::merge_capacity::observed_work();
+    }
     let mut changed = std::time::Instant::now();
     loop {
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -417,6 +420,9 @@ async fn watch_maintenance_preparation(
             Err(error) => return error.to_string(),
         }
         let current = scope.completed_steps();
+        if current > sequence {
+            crate::merge_capacity::observed_work();
+        }
         if current != sequence {
             changed = std::time::Instant::now();
             sequence = current;
@@ -555,6 +561,7 @@ async fn run_prepared_compaction(
     state: &Arc<MasterState>,
     claim: &mut TaskClaim,
 ) -> Result<(String, bool), String> {
+    crate::merge_capacity::phase("preparing_compaction");
     let target = claim.task.target.clone();
     let (_, name) = parse_target(&target);
     let uri = state.rollout_uri(name);
@@ -595,6 +602,7 @@ async fn run_prepared_compaction(
         return Ok(("compaction snapshot needs no rewrite".into(), false));
     }
     let waiting = std::time::Instant::now();
+    crate::merge_capacity::phase("waiting_maintenance_commit");
     tracing::info!(task = %claim.task.id, target = %claim.task.target, seconds = began.elapsed().as_secs_f64(), "compaction files ready; waiting for commit ownership");
     wait_for_maintenance_commit(state, claim).await?;
     metrics::histogram!("master_compaction_phase_duration_seconds", "phase" => "commit_wait")
@@ -696,6 +704,7 @@ async fn run_prepared_index(
     state: &Arc<MasterState>,
     claim: &mut TaskClaim,
 ) -> Result<String, String> {
+    crate::merge_capacity::phase("preparing_index");
     let uri = state.rollout_uri(&claim.task.target);
     let scope = lance_context_core::merge_write_scope::MergeWriteScope::with_preparation_authorizer(
         Arc::new(PreparationOnly),
@@ -724,6 +733,7 @@ async fn run_prepared_index(
     tracing::info!(task = %claim.task.id, target = %claim.task.target,
         seconds = began.elapsed().as_secs_f64(), "index files ready; waiting for commit ownership");
     let waiting = std::time::Instant::now();
+    crate::merge_capacity::phase("waiting_maintenance_commit");
     wait_for_maintenance_commit(state, claim).await?;
     metrics::histogram!("master_index_phase_duration_seconds", "phase" => "commit_wait")
         .record(waiting.elapsed().as_secs_f64());

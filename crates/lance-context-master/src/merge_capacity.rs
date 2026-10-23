@@ -116,6 +116,17 @@ pub(crate) async fn scope<F: Future>(capacity: Arc<Capacity>, work: F) -> F::Out
     CAPACITY.scope(capacity, work).await
 }
 
+/// Attribute local maintenance observations to the scheduler's exact operation
+/// guard. Task-local isolation prevents other tables or detached IO from
+/// updating this operation. Direct callers without a scheduler are unchanged.
+pub(crate) fn observed_work() {
+    let _ = CAPACITY.try_with(|capacity| capacity.operation.observed_work());
+}
+
+pub(crate) fn phase(phase: &'static str) {
+    let _ = CAPACITY.try_with(|capacity| capacity.operation.phase(phase));
+}
+
 /// Only the legacy HTTP response path calls this. Fenced executions, local
 /// merges, compaction and claim RPCs retain their existing execution budgets.
 pub(crate) async fn observe<F: Future>(request: F) -> F::Output {
