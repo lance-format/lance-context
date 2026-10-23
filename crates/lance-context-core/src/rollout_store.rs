@@ -2567,6 +2567,98 @@ mod tests {
     use tempfile::TempDir;
 
     #[tokio::test]
+    async fn slow_metadata_capture_still_gets_a_fresh_snapshot_after_merge() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let writer = RolloutStore::open(uri).await.unwrap();
+        writer
+            .add(&[assistant_record("survives-merge")])
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        let reader = RolloutStore::open(uri).await.unwrap();
+        let writer = tokio::sync::Mutex::new(writer);
+        let captures = AtomicUsize::new(0);
+        let decodes = AtomicUsize::new(0);
+        let rows = reader
+            .base
+            .read_consistent_with_snapshots(
+                ListSource::All,
+                || async {
+                    let snapshots = reader.base.wal_shard_snapshots().await?;
+                    if captures.fetch_add(1, Ordering::SeqCst) == 0 {
+                        // Azure metadata IO can consume the entire retry budget
+                        // before any payload is decoded. An actual peer merge
+                        // then invalidates this first base/WAL pair.
+                        tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+                        writer.lock().await.cleanup_own_shard().await.unwrap();
+                    }
+                    Ok(snapshots)
+                },
+                |dataset, snapshots| {
+                    decodes.fetch_add(1, Ordering::SeqCst);
+                    reader.list_non_blob_snapshot(dataset, snapshots)
+                },
+            )
+            .await
+            .expect("slow initial metadata must not suppress the first fresh snapshot attempt");
+        assert_eq!(captures.load(Ordering::SeqCst), 2);
+        assert_eq!(decodes.load(Ordering::SeqCst), 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "survives-merge");
+    }
+
+    #[tokio::test]
+    async fn changing_metadata_captures_remain_bounded_without_payload_decoding() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Exercise both the attempt cap and expiry of the metadata retry
+        // window. Every capture observes another real committed version.
+        for slow in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let writer = tokio::sync::Mutex::new(RolloutStore::open(uri).await.unwrap());
+            let reader = RolloutStore::open(uri).await.unwrap();
+            let captures = AtomicUsize::new(0);
+            let decodes = AtomicUsize::new(0);
+            let result = reader
+                .base
+                .read_consistent_with_snapshots(
+                    ListSource::All,
+                    || async {
+                        let snapshots = reader.base.wal_shard_snapshots().await?;
+                        let epoch = captures.fetch_add(1, Ordering::SeqCst);
+                        if slow {
+                            tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+                        }
+                        writer
+                            .lock()
+                            .await
+                            .base
+                            .dataset
+                            .update_metadata([("capture-epoch".to_owned(), epoch.to_string())])
+                            .await?;
+                        Ok(snapshots)
+                    },
+                    |_, _| {
+                        decodes.fetch_add(1, Ordering::SeqCst);
+                        async { Ok(()) }
+                    },
+                )
+                .await;
+            assert!(result.unwrap_err().to_string().contains("dataset changed"));
+            assert_eq!(decodes.load(Ordering::SeqCst), 0);
+            let observed = captures.load(Ordering::SeqCst);
+            assert!((2..=16).contains(&observed), "captures={observed}");
+            if slow {
+                assert_eq!(observed, 2, "a new version must not reset the retry window");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn list_retries_wrapped_missing_generation_errors() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
