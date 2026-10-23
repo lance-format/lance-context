@@ -46,6 +46,7 @@ pub struct Request {
 pub enum WorkerAction {
     PrepareWorker,
     ConfirmWorkerTermination,
+    PreserveWorkerRetirementWitness,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -57,6 +58,8 @@ pub struct WorkerRequest {
     pub namespace: String,
     pub pod: String,
     pub container: String,
+    #[serde(default)]
+    pub witness_execution_id: Option<String>,
 }
 
 /// Preserve the target request wire format and the existing bounded CLI flag.
@@ -190,12 +193,22 @@ pub async fn execute_command(
                 .map_err(|e| e.to_string())
         }
         Command::Worker(request) => tokio::time::timeout(Duration::from_secs(120), async {
+            if !matches!(
+                request.action,
+                WorkerAction::PreserveWorkerRetirementWitness
+            ) && request.witness_execution_id.is_some()
+            {
+                return Err(
+                    "worker witness is only accepted by preserve_worker_retirement_witness".into(),
+                );
+            }
             match request.action {
                 WorkerAction::PrepareWorker => {
                     let intent = prepare_worker(config, coordinator, request).await?;
                     Ok(serde_json::json!({"worker_intent":intent}))
                 }
-                WorkerAction::ConfirmWorkerTermination => {
+                WorkerAction::ConfirmWorkerTermination
+                | WorkerAction::PreserveWorkerRetirementWitness => {
                     let receipt = confirm_worker_termination(config, coordinator, request).await?;
                     Ok(serde_json::json!({"worker_termination":receipt}))
                 }
@@ -216,6 +229,31 @@ async fn confirm_worker_termination(
         .iter()
         .find(|e| e.trim_end_matches('/') == request.endpoint.trim_end_matches('/'))
         .ok_or("worker endpoint is not configured")?;
+    let witness = if matches!(
+        request.action,
+        WorkerAction::PreserveWorkerRetirementWitness
+    ) {
+        let id = request
+            .witness_execution_id
+            .as_deref()
+            .ok_or("completed target witness is required")?;
+        let witness = coordinator
+            .legacy_retirement(id)
+            .await?
+            .ok_or("retirement witness not found")?;
+        if !witness.completed
+            || witness.versions.is_none()
+            || witness.execution.protocol != 0
+            || witness.execution.maintenance.is_some()
+            || witness.execution.background
+            || witness.execution.endpoint != *endpoint
+        {
+            return Err("completed legacy worker retirement is required".into());
+        }
+        Some(witness)
+    } else {
+        None
+    };
     let identity_request = Request {
         action: Action::Prepare,
         target: String::new(),
@@ -227,10 +265,23 @@ async fn confirm_worker_termination(
         worker_witness_id: None,
     };
     validate_kube_identity(&identity_request)?;
-    let intent = coordinator
-        .worker_retirement_intent(&request.intent_id)
-        .await?
-        .ok_or("worker retirement intent not found")?;
+    let intent = if let Some(witness) = &witness {
+        match coordinator.worker_retirement_for_endpoint(endpoint).await? {
+            Some(intent) if intent.process == witness.process => intent,
+            Some(_) => return Err("endpoint identifies a different retired process".into()),
+            None => WorkerRetirementIntent {
+                id: request.intent_id,
+                endpoint: endpoint.clone(),
+                base_uri: config.data_dir.clone(),
+                process: witness.process.clone(),
+            },
+        }
+    } else {
+        coordinator
+            .worker_retirement_intent(&request.intent_id)
+            .await?
+            .ok_or("worker retirement intent not found")?
+    };
     validate_worker_intent(&identity_request, endpoint, &config.data_dir, &intent)?;
     let client = retirement_client()?;
     let before = pod(&client, &identity_request).await?;
@@ -238,6 +289,18 @@ async fn confirm_worker_termination(
     let capability =
         bounded_json(client.get(format!("{address}/api/v1/internal/merge-executor"))).await?;
     let after = pod(&client, &identity_request).await?;
+    if let Some(witness) = &witness {
+        return preserve_worker_witness(
+            coordinator,
+            &intent,
+            witness,
+            &before,
+            &after,
+            &identity_request,
+            &capability,
+        )
+        .await;
+    }
     preserve_worker_termination(
         coordinator,
         &intent,
@@ -247,6 +310,41 @@ async fn confirm_worker_termination(
         &capability,
     )
     .await
+}
+
+async fn preserve_worker_witness(
+    coordinator: &Coordinator,
+    intent: &WorkerRetirementIntent,
+    witness: &Retirement,
+    before: &Value,
+    after: &Value,
+    request: &Request,
+    capability: &Value,
+) -> Result<WorkerTermination> {
+    let successor = capture_process(before, after, request, capability)?;
+    if let Some(receipt) = coordinator.worker_termination(intent).await? {
+        verify_receipt_successor(after, request, &receipt, capability)?;
+        return Ok(receipt);
+    }
+    // Completed target retirement already required exact old-process death and
+    // that target's storage barriers. Preserve its original process, including
+    // a nonzero exit, never the currently running successor. Require Kubernetes
+    // to still show that exact termination before first persistence.
+    verify_terminated(after, request, &intent.process, capability)?;
+    coordinator
+        .record_worker_termination_from_witness(
+            WorkerTermination {
+                intent: intent.clone(),
+                successor,
+                finished_at: status(after, request)?["lastState"]["terminated"]["finishedAt"]
+                    .as_str()
+                    .ok_or("old process termination time absent")?
+                    .into(),
+                witness_execution_id: Some(witness.execution.id.clone()),
+            },
+            witness,
+        )
+        .await
 }
 
 async fn preserve_worker_termination(
@@ -271,6 +369,7 @@ async fn preserve_worker_termination(
                 .as_str()
                 .ok_or("old process termination time absent")?
                 .into(),
+            witness_execution_id: None,
         })
         .await
 }
@@ -1034,6 +1133,7 @@ mod tests {
             },
             successor: capture_process(&pod, &pod, &request, &capability).unwrap(),
             finished_at: "2026-10-22T00:00:00Z".into(),
+            witness_execution_id: None,
         };
         pod["status"]["containerStatuses"][0]["containerID"] = json!("containerd://third");
         pod["status"]["containerStatuses"][0]["lastState"]["terminated"]["containerID"] =
@@ -1169,6 +1269,210 @@ mod tests {
         assert!(coordinator.get(&request.target).await.unwrap().is_none());
     }
 
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn completed_target_witness_survives_nonzero_exit_and_second_restart() {
+        use lance_context_merge::ClaimProof;
+        let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+        let mut client = etcd_client::Client::connect([endpoint], None)
+            .await
+            .unwrap();
+        let prefix = format!(
+            "/master-target-witness/{}",
+            lance_context_core::generate_id()
+        );
+        let lease = client.lease_grant(60, None).await.unwrap().id();
+        let proof = ClaimProof {
+            key: format!("{prefix}/claims/test"),
+            token: "claim".into(),
+            lease_id: lease,
+        };
+        client
+            .put(
+                proof.key.as_str(),
+                proof.token.as_str(),
+                Some(etcd_client::PutOptions::new().with_lease(lease)),
+            )
+            .await
+            .unwrap();
+        client
+            .put(
+                lance_context_merge::target_lock_key(&prefix, "table"),
+                proof.token.as_str(),
+                Some(etcd_client::PutOptions::new().with_lease(lease)),
+            )
+            .await
+            .unwrap();
+        let coordinator = Coordinator::new(client, prefix);
+        let (request, mut pod, old, mut capability) = fixture();
+        capability["shard_name"] = json!(old.writer_id);
+        let worker_endpoint = "http://worker:3000";
+        use clap::Parser;
+        let config =
+            MasterConfig::try_parse_from(["master", "--data-dir", "az://data/root"]).unwrap();
+        // Reject witness payloads on ordinary worker actions before any capture.
+        for action in ["prepare_worker", "confirm_worker_termination"] {
+            let command: Command = serde_json::from_value(json!({
+                "action": action, "intent_id": lance_context_core::generate_id(),
+                "endpoint": worker_endpoint, "namespace": "test", "pod": "worker-9",
+                "container": "server", "witness_execution_id": lance_context_core::generate_id()
+            }))
+            .unwrap();
+            let error = execute_command(&config, &coordinator, command)
+                .await
+                .unwrap_err();
+            assert!(error.contains("worker witness is only accepted"), "{error}");
+        }
+        let execution = coordinator
+            .admit_legacy(&proof, &request.target, worker_endpoint)
+            .await
+            .unwrap();
+        let prepared = coordinator
+            .prepare_legacy_retirement(&execution, old.clone())
+            .await
+            .unwrap();
+        let planned = coordinator
+            .plan_legacy_retirement(
+                &prepared,
+                std::collections::BTreeMap::from([
+                    ("base".into(), 12),
+                    ("shard:00000000-0000-0000-0000-000000000000".into(), 15),
+                ]),
+            )
+            .await
+            .unwrap();
+        assert!(coordinator
+            .finish_legacy_retirement(&planned)
+            .await
+            .unwrap());
+        let witness = coordinator
+            .legacy_retirement(&execution.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let intent = WorkerRetirementIntent {
+            id: lance_context_core::generate_id(),
+            endpoint: worker_endpoint.into(),
+            base_uri: "az://data/root".into(),
+            process: old.clone(),
+        };
+        assert!(coordinator
+            .worker_retirement_for_endpoint(worker_endpoint)
+            .await
+            .unwrap()
+            .is_none());
+        pod["status"]["containerStatuses"][0]["lastState"]["terminated"]["exitCode"] = json!(247);
+        pod["status"]["containerStatuses"][0]["lastState"]["terminated"]["reason"] = json!("Error");
+        // Reject missing original termination, live old process, and unfenced successors.
+        for (pointer, value) in [
+            ("/status/containerStatuses/0/lastState", json!({})),
+            (
+                "/status/containerStatuses/0/containerID",
+                json!("containerd://old"),
+            ),
+            ("/metadata/uid", json!("another-pod")),
+        ] {
+            let mut bad = pod.clone();
+            *bad.pointer_mut(pointer).unwrap() = value;
+            assert!(preserve_worker_witness(
+                &coordinator,
+                &intent,
+                &witness,
+                &bad,
+                &bad,
+                &request,
+                &capability
+            )
+            .await
+            .is_err());
+            assert!(coordinator
+                .worker_termination(&intent)
+                .await
+                .unwrap()
+                .is_none());
+        }
+        let mut bad_capability = capability.clone();
+        bad_capability["fenced_legacy_merges"] = json!(false);
+        assert!(preserve_worker_witness(
+            &coordinator,
+            &intent,
+            &witness,
+            &pod,
+            &pod,
+            &request,
+            &bad_capability
+        )
+        .await
+        .is_err());
+        assert!(preserve_worker_termination(
+            &coordinator,
+            &intent,
+            &pod,
+            &pod,
+            &request,
+            &capability
+        )
+        .await
+        .is_err());
+        let receipt = preserve_worker_witness(
+            &coordinator,
+            &intent,
+            &witness,
+            &pod,
+            &pod,
+            &request,
+            &capability,
+        )
+        .await
+        .unwrap();
+        assert_eq!(receipt.intent.process, old);
+        assert_eq!(
+            receipt.witness_execution_id.as_deref(),
+            Some(execution.id.as_str())
+        );
+        pod["status"]["containerStatuses"][0]["containerID"] = json!("containerd://third");
+        pod["status"]["containerStatuses"][0]["lastState"]["terminated"]["containerID"] =
+            json!("containerd://new");
+        capability["instance"] = json!("third-instance");
+        assert!(verify_terminated(&pod, &request, &old, &capability).is_err());
+        assert_eq!(
+            preserve_worker_witness(
+                &coordinator,
+                &intent,
+                &witness,
+                &pod,
+                &pod,
+                &request,
+                &capability
+            )
+            .await
+            .unwrap(),
+            receipt
+        );
+        verify_retired_process(
+            &config,
+            &coordinator,
+            worker_endpoint,
+            &pod,
+            &request,
+            &old,
+            &capability,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            coordinator
+                .worker_retirement_for_endpoint(worker_endpoint)
+                .await
+                .unwrap(),
+            Some(intent)
+        );
+        assert_eq!(
+            coordinator.legacy_retirement(&execution.id).await.unwrap(),
+            Some(witness)
+        );
+    }
+
     #[test]
     fn worker_capture_rejects_changed_or_unready_process() {
         let (request, pod, _, mut capability) = fixture();
@@ -1190,6 +1494,13 @@ mod tests {
         let request = json!({"action":"prepare_worker","intent_id":"id","endpoint":"http://worker:3000","namespace":"test","pod":"worker","container":"server"});
         assert!(matches!(
             serde_json::from_value::<Command>(request.clone()).unwrap(),
+            Command::Worker(_)
+        ));
+        let mut witness = request.clone();
+        witness["action"] = json!("preserve_worker_retirement_witness");
+        witness["witness_execution_id"] = json!(lance_context_core::generate_id());
+        assert!(matches!(
+            serde_json::from_value::<Command>(witness).unwrap(),
             Command::Worker(_)
         ));
         let mut invented = request.clone();

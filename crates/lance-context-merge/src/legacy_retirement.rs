@@ -21,8 +21,8 @@ pub struct ProcessIdentity {
     pub writer_id: String,
 }
 
-/// A live process captured before a planned replacement, independently of
-/// whether it currently has a merge execution. This is intent, not proof of
+/// A process registered before replacement, or recovered from an explicitly
+/// completed target retirement. The registration alone is not proof of
 /// death, storage fencing, or permission to remove any target lock.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerRetirementIntent {
@@ -33,19 +33,28 @@ pub struct WorkerRetirementIntent {
 }
 
 /// Immutable evidence captured while Kubernetes still exposes the exact old
-/// container's graceful termination. This proves process death only: every
+/// container's termination (graceful unless a completed target witness is used).
+/// This proves process death only: every
 /// target still requires its own storage barriers and fenced successor probe.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerTermination {
     pub intent: WorkerRetirementIntent,
     pub successor: ProcessIdentity,
     pub finished_at: String,
+    /// A completed target retirement used to register an already retired
+    /// worker. Unlike a live-process intent, this also supports a verified
+    /// nonzero exit; it never inherits the witness's storage barriers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub witness_execution_id: Option<String>,
 }
 
 impl WorkerTermination {
     pub fn validate(&self) -> Result<()> {
         uuid::Uuid::parse_str(&self.intent.id)
             .map_err(|_| "invalid worker retirement ID".to_string())?;
+        if let Some(id) = &self.witness_execution_id {
+            uuid::Uuid::parse_str(id).map_err(|_| "invalid retirement witness ID".to_string())?;
+        }
         let old = &self.intent.process;
         let new = &self.successor;
         if self.intent.endpoint.is_empty()
@@ -119,6 +128,187 @@ mod tests {
         ])
     }
 
+    async fn completed_witness() -> (Coordinator, Retirement, WorkerTermination) {
+        let (coordinator, _, execution, process) = fixture().await;
+        let prepared = coordinator
+            .prepare_legacy_retirement(&execution, process.clone())
+            .await
+            .unwrap();
+        let planned = coordinator
+            .plan_legacy_retirement(&prepared, plan())
+            .await
+            .unwrap();
+        assert!(coordinator
+            .finish_legacy_retirement(&planned)
+            .await
+            .unwrap());
+        let witness = coordinator
+            .legacy_retirement(&execution.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let receipt = WorkerTermination {
+            intent: WorkerRetirementIntent {
+                id: uuid::Uuid::new_v4().to_string(),
+                endpoint: execution.endpoint.clone(),
+                base_uri: "az://data/root".into(),
+                process: process.clone(),
+            },
+            successor: ProcessIdentity {
+                container_id: "containerd://second".into(),
+                instance: "second-instance".into(),
+                ..process
+            },
+            finished_at: "2026-10-23T00:00:00Z".into(),
+            witness_execution_id: Some(execution.id),
+        };
+        (coordinator, witness, receipt)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn completed_target_witness_registers_worker_without_releasing_ownership() {
+        let (coordinator, witness, receipt) = completed_witness().await;
+        assert!(coordinator
+            .worker_retirement_for_endpoint(&receipt.intent.endpoint)
+            .await
+            .unwrap()
+            .is_none());
+        let execution_before = coordinator.get("table").await.unwrap();
+        assert!(coordinator
+            .record_worker_termination(receipt.clone())
+            .await
+            .is_err());
+        for _ in 0..2 {
+            assert_eq!(
+                coordinator
+                    .record_worker_termination_from_witness(receipt.clone(), &witness)
+                    .await
+                    .unwrap(),
+                receipt
+            );
+        }
+        assert_eq!(
+            coordinator
+                .worker_retirement_for_endpoint(&receipt.intent.endpoint)
+                .await
+                .unwrap(),
+            Some(receipt.intent.clone())
+        );
+        assert_eq!(
+            coordinator
+                .worker_termination(&receipt.intent)
+                .await
+                .unwrap(),
+            Some(receipt.clone())
+        );
+        assert_eq!(coordinator.get("table").await.unwrap(), execution_before);
+        assert_eq!(
+            coordinator
+                .legacy_retirement(&witness.execution.id)
+                .await
+                .unwrap(),
+            Some(witness.clone())
+        );
+        let lock = coordinator
+            .client
+            .clone()
+            .get(target_lock_key(&coordinator.prefix, "table"), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            lock.kvs()[0].value(),
+            execution_owner(&witness.execution).as_bytes()
+        );
+        let mut changed = receipt.clone();
+        changed.successor.container_id = "containerd://third".into();
+        assert!(coordinator
+            .record_worker_termination_from_witness(changed, &witness)
+            .await
+            .is_err());
+        // Existing receipts remain readable without the new optional field.
+        let mut old_json = serde_json::to_value(&receipt).unwrap();
+        old_json
+            .as_object_mut()
+            .unwrap()
+            .remove("witness_execution_id");
+        let old: WorkerTermination = serde_json::from_value(old_json).unwrap();
+        assert!(old.witness_execution_id.is_none());
+        old.validate().unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn completed_target_witness_rejects_missing_changed_or_conflicting_evidence() {
+        let (coordinator, witness, receipt) = completed_witness().await;
+        for kind in [
+            "incomplete",
+            "versions",
+            "process",
+            "endpoint",
+            "id",
+            "protocol",
+            "background",
+            "cas",
+        ] {
+            let mut bad = witness.clone();
+            match kind {
+                "incomplete" => bad.completed = false,
+                "versions" => bad.versions = None,
+                "process" => bad.process.container_id = "other".into(),
+                "endpoint" => bad.execution.endpoint = "http://other:3000".into(),
+                "id" => bad.execution.id = uuid::Uuid::new_v4().to_string(),
+                "protocol" => bad.execution.protocol = 2,
+                "background" => bad.execution.background = true,
+                // Passes identity checks but does not match the stored journal.
+                "cas" => {
+                    bad.versions.as_mut().unwrap().insert("base".into(), 99);
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                coordinator
+                    .record_worker_termination_from_witness(receipt.clone(), &bad)
+                    .await
+                    .is_err(),
+                "{kind}"
+            );
+            assert!(coordinator
+                .worker_retirement_intent(&receipt.intent.id)
+                .await
+                .unwrap()
+                .is_none());
+            assert!(coordinator
+                .worker_termination(&receipt.intent)
+                .await
+                .unwrap()
+                .is_none());
+        }
+        let mut conflict = receipt.intent.clone();
+        conflict.id = uuid::Uuid::new_v4().to_string();
+        conflict.process.container_id = "containerd://unrelated".into();
+        coordinator
+            .prepare_worker_retirement(conflict.clone())
+            .await
+            .unwrap();
+        assert!(coordinator
+            .record_worker_termination_from_witness(receipt.clone(), &witness)
+            .await
+            .is_err());
+        assert_eq!(
+            coordinator
+                .worker_retirement_for_endpoint(&receipt.intent.endpoint)
+                .await
+                .unwrap(),
+            Some(conflict)
+        );
+        assert!(coordinator
+            .worker_termination(&receipt.intent)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
     #[tokio::test]
     #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
     async fn worker_death_receipt_survives_reconnect_without_releasing_a_target() {
@@ -137,6 +327,7 @@ mod tests {
                 ..process
             },
             finished_at: "2026-10-23T00:00:00Z".into(),
+            witness_execution_id: None,
         };
         // A termination record cannot be installed without the captured intent.
         assert!(coordinator
@@ -231,6 +422,7 @@ mod tests {
                 ..process
             },
             finished_at: "2026-10-23T00:00:00Z".into(),
+            witness_execution_id: None,
         };
         assert!(coordinator
             .record_worker_termination(receipt)
@@ -667,6 +859,9 @@ impl Coordinator {
         record: WorkerTermination,
     ) -> Result<WorkerTermination> {
         record.validate()?;
+        if record.witness_execution_id.is_some() {
+            return Err("completed retirement witness requires atomic registration".into());
+        }
         let key = self.worker_termination_key(&record.intent.id)?;
         if self
             .transact(
@@ -696,6 +891,79 @@ impl Coordinator {
         match self.worker_termination(&record.intent).await? {
             Some(prior) if prior == record => Ok(prior),
             _ => Err("worker termination intent changed or receipt already differs".into()),
+        }
+    }
+
+    /// Register a process captured in a completed target retirement, together
+    /// with freshly verified termination evidence. The witness, endpoint index,
+    /// intent and receipt are compared/published in one transaction. No task,
+    /// execution, target lock or storage version is changed.
+    pub async fn record_worker_termination_from_witness(
+        &self,
+        record: WorkerTermination,
+        witness: &Retirement,
+    ) -> Result<WorkerTermination> {
+        record.validate()?;
+        if !witness.completed
+            || witness.versions.as_ref().is_none_or(|v| {
+                v.len() != 2 || !v.contains_key("base") || v.values().any(|version| *version == 0)
+            })
+            || witness.execution.protocol != 0
+            || witness.execution.background
+            || witness.execution.maintenance.is_some()
+            || witness.execution.endpoint != record.intent.endpoint
+            || witness.process != record.intent.process
+            || record.witness_execution_id.as_deref() != Some(witness.execution.id.as_str())
+        {
+            return Err("completed retirement must identify this exact retired worker".into());
+        }
+        let intent_key = self.worker_retirement_key(&record.intent.id)?;
+        let endpoint_key = self.worker_retirement_endpoint_key(&record.intent.endpoint);
+        let key = self.worker_termination_key(&record.intent.id)?;
+        let existing_intent = self.worker_retirement_intent(&record.intent.id).await?;
+        let existing_endpoint = self
+            .worker_retirement_for_endpoint(&record.intent.endpoint)
+            .await?;
+        let mut comparisons = vec![
+            Compare::value(
+                self.retirement_key(&witness.execution.id)?,
+                CompareOp::Equal,
+                bytes(witness),
+            ),
+            Compare::version(key.as_str(), CompareOp::Equal, 0),
+        ];
+        for (key, existing) in [
+            (&intent_key, existing_intent.as_ref()),
+            (&endpoint_key, existing_endpoint.as_ref()),
+        ] {
+            comparisons.push(match existing {
+                None => Compare::version(key.as_str(), CompareOp::Equal, 0),
+                Some(intent) if intent == &record.intent => {
+                    Compare::value(key.as_str(), CompareOp::Equal, encode_intent(intent))
+                }
+                Some(_) => return Err("worker retirement identity already differs".into()),
+            });
+        }
+        if self
+            .transact(
+                comparisons,
+                vec![
+                    TxnOp::put(intent_key, encode_intent(&record.intent), None),
+                    TxnOp::put(endpoint_key, encode_intent(&record.intent), None),
+                    TxnOp::put(
+                        key,
+                        serde_json::to_vec(&record).map_err(|e| e.to_string())?,
+                        None,
+                    ),
+                ],
+            )
+            .await?
+        {
+            return Ok(record);
+        }
+        match self.worker_termination(&record.intent).await? {
+            Some(prior) if prior == record => Ok(prior),
+            _ => Err("retirement witness or worker registration changed".into()),
         }
     }
 
