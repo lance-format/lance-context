@@ -1447,8 +1447,15 @@ fn spawn_filtered_pool_poller(
     running.set(0.0);
     tokio::spawn(async move {
         let mut claim_cursor = crate::task_store::SchedulerClaimCursor::default();
+        let mut notifications = state.task_store.scheduler_notifications();
+        let mut next_depth = tokio::time::Instant::now();
         loop {
-            if report_depth {
+            // Consume prior changes before reading. A change during the scan
+            // remains unseen and wakes the next pass, avoiding lost wakeups.
+            notifications.borrow_and_update();
+            if report_depth && tokio::time::Instant::now() >= next_depth {
+                next_depth =
+                    tokio::time::Instant::now() + crate::scheduler_wakeup::RECONCILE_INTERVAL;
                 if let Ok(queued) = state.task_store.queue_depth().await {
                     metrics::gauge!("master_task_queue_depth").set(queued as f64);
                 }
@@ -1515,7 +1522,8 @@ fn spawn_filtered_pool_poller(
                     }
                 }
             }
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            crate::scheduler_wakeup::wait(&mut notifications, &pool, claim_cursor.has_more_pages())
+                .await;
         }
     })
 }

@@ -21,6 +21,7 @@ pub mod rollout_append;
 pub mod routes;
 pub mod scanner;
 pub mod scheduler;
+mod scheduler_wakeup;
 pub mod scoring;
 pub mod state;
 pub mod stats_store;

@@ -9,7 +9,7 @@
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -32,6 +32,12 @@ const SCHEDULER_CLAIM_MAX_PAGES: usize = 4;
 pub(crate) struct SchedulerClaimCursor {
     queue: ScanCursor,
     recovery: ScanCursor,
+}
+
+impl SchedulerClaimCursor {
+    pub(crate) fn has_more_pages(&self) -> bool {
+        self.queue.next.is_some() || self.recovery.next.is_some()
+    }
 }
 
 #[derive(Default)]
@@ -128,6 +134,7 @@ pub struct TaskStore {
     cooldown: CooldownPolicy,
     global_maintenance: bool,
     pending_history_prune: Arc<AtomicBool>,
+    scheduler_notifications: Arc<OnceLock<tokio::sync::watch::Receiver<u64>>>,
 }
 
 /// When to stop re-enqueueing a target that keeps failing, and for how long.
@@ -443,6 +450,18 @@ impl TaskStore {
         )
     }
 
+    /// Share admission-change notifications across this master's scheduler pools.
+    pub(crate) fn scheduler_notifications(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.scheduler_notifications
+            .get_or_init(|| {
+                crate::scheduler_wakeup::subscribe(
+                    self.inner.client.clone(),
+                    self.inner.prefix.clone(),
+                )
+            })
+            .clone()
+    }
+
     /// The underlying etcd client, for other etcd-backed components (the
     /// store registries) that should share one connection.
     pub fn etcd_client(&self) -> &Client {
@@ -461,6 +480,7 @@ impl TaskStore {
             },
             global_maintenance: config.catchup.target.is_none(),
             pending_history_prune: Arc::new(AtomicBool::new(false)),
+            scheduler_notifications: Arc::new(OnceLock::new()),
         };
         // Short-lived exact-target executors must not sweep the fleet's running
         // tasks or terminal history on every invocation. Ordinary masters own
@@ -1187,6 +1207,7 @@ impl EtcdTaskStore {
                 if let Some(operation) = operation {
                     operation.claim_phase("lease_grant");
                 }
+                metrics::counter!("master_scheduler_claim_lease_attempts_total").increment(1);
                 let lease_id = self.grant_lease().await?;
                 if let Some(operation) = operation {
                     operation.claim_completed(1, 0, 0);
@@ -1323,6 +1344,7 @@ impl EtcdTaskStore {
                 if let Some(operation) = operation {
                     operation.claim_completed(1, 0, 0);
                 }
+                metrics::counter!("master_scheduler_claim_results_total", "outcome" => if claimed { "accepted" } else { "contended" }).increment(1);
                 if claimed {
                     advance(&mut scan);
                     return Ok((
@@ -2434,6 +2456,148 @@ mod tests {
         cfg.maintenance.wal_claim_targets = targets;
         let store = TaskStore::open(&cfg).await.unwrap();
         (dir, store)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn scheduler_notifications_reconnect_after_transport_loss() {
+        let (_dir, proxy, store, mut observer) = lease_proxy_store().await;
+        let mut rx = store.scheduler_notifications();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while *rx.borrow_and_update() < 10 {
+                rx.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        proxy.online.send(false).unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // The write occurs during the disconnected window. Re-subscription
+        // must wake a fresh scan even though this event itself was missed.
+        observer
+            .put(
+                format!("{}/queue/disconnected", store.inner.prefix),
+                "fixture",
+                None,
+            )
+            .await
+            .unwrap();
+        proxy.online.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), rx.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        rx.borrow_and_update();
+        assert_eq!(
+            observer
+                .get(format!("{}/queue/disconnected", store.inner.prefix), None)
+                .await
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn idle_scheduler_avoids_repeated_claims_and_wakes_for_a_new_task() {
+        let (_dir, store) = bounded_scheduler_store(vec![]).await;
+        let runner_store = store.clone();
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = attempts.clone();
+        let (quiet, quiet_rx) = tokio::sync::oneshot::channel();
+        let runner = tokio::spawn(async move {
+            let mut rx = runner_store.scheduler_notifications();
+            // Let subscription acknowledgements settle before measuring quiet
+            // queue behavior; these acknowledgements intentionally trigger scans.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            rx.borrow_and_update();
+            let admission = Arc::new(crate::admission::Admission::default());
+            let mut cursor = SchedulerClaimCursor::default();
+            let pool = Arc::new(tokio::sync::Semaphore::new(1));
+            let operation = admission.try_admit_named("fixture").unwrap();
+            counter.fetch_add(1, Ordering::SeqCst);
+            assert!(runner_store
+                .claim_scheduler_slice(TaskKinds::MERGE_WAL, None, &mut cursor, &operation)
+                .await
+                .unwrap()
+                .is_none());
+            quiet.send(()).unwrap();
+            loop {
+                crate::scheduler_wakeup::wait(&mut rx, &pool, cursor.has_more_pages()).await;
+                rx.borrow_and_update();
+                counter.fetch_add(1, Ordering::SeqCst);
+                if let Some(claim) = runner_store
+                    .claim_scheduler_slice(TaskKinds::MERGE_WAL, None, &mut cursor, &operation)
+                    .await
+                    .unwrap()
+                {
+                    return claim;
+                }
+            }
+        });
+        quiet_rx.await.unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "unchanged queue should not be scanned every 500ms"
+        );
+        let queued = store
+            .enqueue(TaskKind::MergeWal, "new-demand", vec![])
+            .await
+            .unwrap();
+        let claim = tokio::time::timeout(Duration::from_secs(2), runner)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.task.id, queued.id);
+        store
+            .finish(claim, Ok("fixture completed".into()))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn shared_scheduler_notifications_never_replace_authoritative_claims() {
+        let (_dir, store) = bounded_scheduler_store(vec![]).await;
+        let mut first = store.scheduler_notifications();
+        let second = store.clone().scheduler_notifications();
+        assert!(
+            first.same_channel(&second),
+            "one stream shared by all pools/clones"
+        );
+        // Initial subscription also wakes a scan, covering changes made while
+        // the watch was being installed.
+        tokio::time::timeout(Duration::from_secs(5), first.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        let task = store
+            .enqueue(TaskKind::MergeWal, "notification", vec![])
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), first.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        let claimed = store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.task.id, task.id);
+        // A stale notification cannot grant the same durable task twice.
+        assert!(store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .is_none());
+        store
+            .finish(claimed, Ok("fixture completed".into()))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
