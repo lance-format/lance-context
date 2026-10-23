@@ -13,7 +13,7 @@ members = [
     "python",
 ]
 resolver = "2"
-exclude = ["vendor/raft-engine"]
+exclude = ["vendor/raft-engine", "vendor/lance-io"]
 
 [workspace.package]
 edition = "2021"
@@ -21,3 +21,7 @@ license = "Apache-2.0"
 
 [workspace.metadata]
 # reserved for future use
+
+# Temporary Lance 13 backport of lance-format/lance#9913; see vendor/lance-io/BACKPORT.md.
+[patch.crates-io]
+lance-io = { path = "vendor/lance-io" }

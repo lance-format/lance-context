@@ -4641,8 +4641,6 @@ dependencies = [
 [[package]]
 name = "lance-io"
 version = "13.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "224730479e781d24b81a0afecfe230b5b21a86a4f767ba7655b974402d0c67c5"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4669,6 +4667,7 @@ dependencies = [
  "path_abs",
  "pin-project",
  "prost",
+ "quick-xml 0.41.0",
  "rand 0.9.4",
  "reqsign-core",
  "reqsign-file-read-tokio",

@@ -7,6 +7,7 @@ on:
     paths:
       - crates/**
       - vendor/raft-engine/**
+      - vendor/lance-io/**
       - .github/workflows/rust-test.yml
       - Cargo.toml
       - Cargo.lock
@@ -56,6 +57,10 @@ jobs:
           apt_options=(-o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
           sudo apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update
           sudo apt-get "${apt_options[@]}" install -y clang libclang-dev protobuf-compiler
+      - name: Vendored multipart upload regressions
+        run: |
+          cargo test --locked --manifest-path vendor/lance-io/Cargo.toml --lib object_store::throttle::tests
+          cargo clippy --locked --manifest-path vendor/lance-io/Cargo.toml --all-targets -- -D warnings
       - name: Build tests
         run: cargo test --workspace --all-targets --no-run
       - name: Run unit and integration tests
