@@ -5129,6 +5129,94 @@ mod tests {
             .unwrap();
     }
 
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn reserved_recovery_admits_retry_without_resetting_failure_history() {
+        use lance_context_merge::{failure::FailureClass, Execution, MaintenanceKind};
+        for canonical_preflight in [false, true] {
+            let (_dir, mut cfg, store) = preparation_test_store().await;
+            cfg.merge_rollout.owned_targets = vec!["hot".into()];
+            let state = crate::state::MasterState::new(cfg).await.unwrap();
+            store
+                .enqueue(TaskKind::MergeWal, "hot", vec![])
+                .await
+                .unwrap();
+            let claim = store
+                .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+                .await
+                .unwrap()
+                .unwrap();
+            let proof = store.merge_claim(&claim);
+            let coordinator = store.merge_coordinator();
+            let mut reserved = Execution::new("hot", "master:catchup", "old", 600);
+            reserved.maintenance = Some(MaintenanceKind::Catchup);
+            assert!(coordinator.reserve(&proof, &reserved).await.unwrap());
+            let error = "merge ownership unresolved: recovery barrier failed: execution lacks recoverable storage fencing protocol";
+            for _ in 0..15 {
+                coordinator
+                    .record_failure(&proof, "hot", "master:catchup", error)
+                    .await
+                    .unwrap();
+            }
+            let before = coordinator
+                .failure("hot", "master:catchup")
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(before.next_retry_ms > lance_context_merge::failure::now_ms());
+            if canonical_preflight {
+                crate::maintenance_execution::reconcile_previous(&state, &claim)
+                    .await
+                    .unwrap();
+            } else {
+                crate::merge_execution::recover_execution(&state, &coordinator, &proof, reserved)
+                    .await
+                    .unwrap();
+            }
+            let after = coordinator
+                .failure("hot", "master:catchup")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                after.consecutive_attempts, before.consecutive_attempts,
+                "recovering an unstarted reservation is not another failed merge"
+            );
+            assert_eq!(after.last_error, before.last_error);
+            assert_eq!(after.last_failure_ms, before.last_failure_ms);
+            assert!(after.next_retry_ms <= lance_context_merge::failure::now_ms());
+            // The resolved protocol problem permits one real attempt. If that
+            // attempt fails for a different reason, its original budget survives.
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                crate::maintenance_execution::run_as(
+                    &state,
+                    &claim,
+                    MaintenanceKind::Catchup,
+                    async { Err("invalid schema from actual payload work".into()) },
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                outcome.unwrap_err(),
+                "invalid schema from actual payload work"
+            );
+            let failed = coordinator
+                .failure("hot", "master:catchup")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(failed.consecutive_attempts, 16);
+            assert_eq!(failed.class, FailureClass::DataOrConfiguration);
+            assert!(failed.next_retry_ms > lance_context_merge::failure::now_ms());
+            store
+                .finish(claim, Err("fixture payload failed".into()))
+                .await
+                .unwrap();
+        }
+    }
+
     async fn preparation_test_store() -> (TempDir, MasterConfig, TaskStore) {
         let dir = TempDir::new().unwrap();
         let mut cfg = config(&dir);

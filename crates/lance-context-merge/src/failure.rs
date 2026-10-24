@@ -1,5 +1,5 @@
 //! Durable shard failures: task recreation must not reset a retry budget.
-use crate::{ClaimProof, Coordinator, Execution, Result};
+use crate::{ClaimProof, Coordinator, Execution, Phase, Result, RESERVED_RECOVERY_REASON};
 use etcd_client::{Compare, CompareOp, GetOptions, TxnOp};
 use lance_context_api::MaintenanceErrorCode;
 use serde::{Deserialize, Serialize};
@@ -265,6 +265,13 @@ impl Coordinator {
         &self,
         execution: &Execution,
     ) -> Result<(Vec<Compare>, Vec<TxnOp>)> {
+        if execution.protocol == 2
+            && execution.phase == Phase::Recovered
+            && execution.reclaimed == 0
+            && execution.error.as_deref() == Some(RESERVED_RECOVERY_REASON)
+        {
+            return self.reservation_recovery_changes(execution).await;
+        }
         let key = self.failure_key(&execution.target, &execution.endpoint);
         let Some(error) = &execution.error else {
             return Ok((Vec::new(), vec![TxnOp::delete(key, None)]));
@@ -286,6 +293,46 @@ impl Coordinator {
                 key.clone(),
                 CompareOp::Equal,
                 previous.map_or(0, |kv| kv.mod_revision()),
+            )],
+            vec![TxnOp::put(key, serde_json::to_vec(&failure).unwrap(), None)],
+        ))
+    }
+
+    /// Successfully recovering an unstarted reservation is not another failed
+    /// payload attempt. Preserve its history, and permit one probe only when
+    /// that recovery has resolved the exact old Reserved/protocol rejection.
+    /// Other data, permission, timeout and ownership failures retain deadlines.
+    async fn reservation_recovery_changes(
+        &self,
+        execution: &Execution,
+    ) -> Result<(Vec<Compare>, Vec<TxnOp>)> {
+        let key = self.failure_key(&execution.target, &execution.endpoint);
+        let response = self
+            .client
+            .clone()
+            .get(key.clone(), None)
+            .await
+            .map_err(|e| e.to_string())?;
+        let Some(kv) = response.kvs().first() else {
+            return Ok((Vec::new(), Vec::new()));
+        };
+        let mut failure: ShardFailure =
+            serde_json::from_slice(kv.value()).map_err(|e| e.to_string())?;
+        if failure.class != FailureClass::OwnershipUnresolved
+            || failure.last_error != "merge ownership unresolved: recovery barrier failed: execution lacks recoverable storage fencing protocol"
+        {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let now = now_ms();
+        if failure.next_retry_ms <= now {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        failure.next_retry_ms = now;
+        Ok((
+            vec![Compare::mod_revision(
+                key.clone(),
+                CompareOp::Equal,
+                kv.mod_revision(),
             )],
             vec![TxnOp::put(key, serde_json::to_vec(&failure).unwrap(), None)],
         ))

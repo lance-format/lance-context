@@ -70,6 +70,9 @@ pub(crate) async fn reconcile_previous(
     let proof = state.task_store.merge_claim(claim);
     crate::merge_execution::ensure_recovery_due(&coordinator, &old).await?;
     match old.phase {
+        Phase::Reserved if old.protocol == 2 => {
+            crate::merge_execution::recover_execution(state, &coordinator, &proof, old).await?;
+        }
         Phase::Reserved => {
             if !coordinator.cancel_reserved(&old).await? {
                 return Err("maintenance reservation changed".into());

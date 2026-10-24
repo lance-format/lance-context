@@ -18,6 +18,10 @@ use serde::{Deserialize, Serialize};
 
 pub type Result<T> = std::result::Result<T, String>;
 
+// Existing protocol-2 Recovered records can carry this durable reason across
+// a crash between cancellation and release; no new wire fields or phases.
+pub(crate) const RESERVED_RECOVERY_REASON: &str = "merge reservation recovered before admission";
+
 #[derive(Clone, Debug)]
 pub struct ClaimProof {
     pub key: String,
@@ -337,7 +341,8 @@ impl Coordinator {
         if execution.protocol != 2 || execution.phase != Phase::Reserved {
             return Err("recovery cancellation requires a protocol-2 reservation".into());
         }
-        let terminal = execution.finished(Err("cancelled before admission".into()));
+        let mut terminal = execution.finished(Err(RESERVED_RECOVERY_REASON.into()));
+        terminal.phase = Phase::Recovered;
         Ok(self
             .transact(
                 vec![
@@ -721,6 +726,129 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn reserved_recovery_preserves_unrelated_failure_budgets() {
+        for error in [
+            None,
+            Some("storage status=403 forbidden"),
+            Some("invalid schema"),
+            Some("storage timeout"),
+            Some("merge ownership unresolved: storage status=403"),
+        ] {
+            let (coordinator, _, proof, _) = fixture().await;
+            let reserved = Execution::new("table", "master:catchup", "old", 600);
+            assert!(coordinator.reserve(&proof, &reserved).await.unwrap());
+            if let Some(error) = error {
+                for _ in 0..15 {
+                    coordinator
+                        .record_failure(&proof, "table", "master:catchup", error)
+                        .await
+                        .unwrap();
+                }
+            }
+            let before = coordinator
+                .failure("table", "master:catchup")
+                .await
+                .unwrap();
+            let terminal = coordinator
+                .cancel_reserved_for_recovery(&proof, &reserved)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(coordinator.release(&proof, &terminal).await.unwrap());
+            let after = coordinator
+                .failure("table", "master:catchup")
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(before).unwrap(),
+                serde_json::to_value(after).unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn reserved_recovery_retry_probe_rejects_stale_claim_and_failure_revision() {
+        let (coordinator, mut client, proof, lease) = fixture().await;
+        let reserved = Execution::new("table", "master:catchup", "old", 600);
+        assert!(coordinator.reserve(&proof, &reserved).await.unwrap());
+        let protocol_error = "merge ownership unresolved: recovery barrier failed: execution lacks recoverable storage fencing protocol";
+        coordinator
+            .record_failure(&proof, "table", "master:catchup", protocol_error)
+            .await
+            .unwrap();
+        let terminal = coordinator
+            .cancel_reserved_for_recovery(&proof, &reserved)
+            .await
+            .unwrap()
+            .unwrap();
+        let before = coordinator
+            .failure("table", "master:catchup")
+            .await
+            .unwrap();
+        client.lease_revoke(lease).await.unwrap();
+        assert!(!coordinator.release(&proof, &terminal).await.unwrap());
+        assert_eq!(
+            serde_json::to_value(&before).unwrap(),
+            serde_json::to_value(
+                coordinator
+                    .failure("table", "master:catchup")
+                    .await
+                    .unwrap()
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            coordinator.get("table").await.unwrap(),
+            Some(terminal.clone())
+        );
+        let replacement = ClaimProof {
+            key: proof.key.clone(),
+            token: "replacement".into(),
+            lease_id: client.lease_grant(30, None).await.unwrap().id(),
+        };
+        client
+            .put(
+                replacement.key.clone(),
+                replacement.token.clone(),
+                Some(etcd_client::PutOptions::new().with_lease(replacement.lease_id)),
+            )
+            .await
+            .unwrap();
+        // A concurrent newer failure must not be overwritten by a stale decision
+        // to make the recovered protocol failure eligible for one probe.
+        let (compares, operations) = coordinator.completion_changes(&terminal).await.unwrap();
+        assert!(!operations.is_empty());
+        coordinator
+            .record_failure(
+                &replacement,
+                "table",
+                "master:catchup",
+                "status=403 forbidden",
+            )
+            .await
+            .unwrap();
+        assert!(!coordinator.transact(compares, operations).await.unwrap());
+        let newer = coordinator
+            .failure("table", "master:catchup")
+            .await
+            .unwrap();
+        assert!(coordinator.release(&replacement, &terminal).await.unwrap());
+        assert_eq!(
+            serde_json::to_value(newer).unwrap(),
+            serde_json::to_value(
+                coordinator
+                    .failure("table", "master:catchup")
+                    .await
+                    .unwrap()
+            )
+            .unwrap()
+        );
+        assert!(coordinator.get("table").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
     async fn reserved_recovery_excludes_a_racing_start_and_preserves_running_permits() {
         let (coordinator, _, proof, _) = fixture().await;
         for mode in 0..24 {
@@ -752,7 +880,7 @@ mod tests {
             let cancelled = cancelled.unwrap();
             assert_ne!(started.is_some(), cancelled.is_some());
             if let Some(terminal) = cancelled {
-                assert_eq!(terminal.phase, Phase::Finished);
+                assert_eq!(terminal.phase, Phase::Recovered);
                 assert!(coordinator.start(&reserved).await.unwrap().is_none());
                 let mut late = reserved.clone();
                 late.phase = Phase::Running;
