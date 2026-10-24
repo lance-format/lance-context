@@ -31,6 +31,67 @@ struct Capabilities {
     merge_admission_ready: bool,
 }
 
+const WORKER_ADMISSION_PENDING: &str = "worker admission discovery is still pending; no merge sent";
+const WORKER_PROTOCOL_UNSUPPORTED: &str = "worker lacks bounded owned-merge protocol";
+
+enum WorkerRetry {
+    Deferred(String),
+    Eligible(Option<Capabilities>),
+}
+
+fn validate_capabilities(capabilities: &Capabilities, target: &str) -> Result<(), String> {
+    if !capabilities.merge_admission_ready {
+        return Err(WORKER_ADMISSION_PENDING.into());
+    }
+    if capabilities.protocol != 2
+        || capabilities.progress_protocol != 1
+        || (!capabilities.owned_targets.iter().any(|t| t == target)
+            && !capabilities.fenced_legacy_merges)
+        || capabilities.timeout_secs == 0
+        || capabilities.queue_timeout_secs == 0
+        || capabilities.idle_timeout_secs == 0
+    {
+        return Err(WORKER_PROTOCOL_UNSUPPORTED.into());
+    }
+    Ok(())
+}
+
+async fn worker_retry(
+    http: &reqwest::Client,
+    coordinator: &Coordinator,
+    target: &str,
+    endpoint: &str,
+) -> Result<WorkerRetry, String> {
+    use lance_context_merge::failure::FailureClass;
+    let Some(failure) = coordinator.failure(target, endpoint).await? else {
+        return Ok(WorkerRetry::Eligible(None));
+    };
+    if failure.next_retry_ms <= lance_context_merge::failure::now_ms() {
+        return Ok(WorkerRetry::Eligible(None));
+    }
+    let admission_failure = (failure.class == FailureClass::DataOrConfiguration
+        && failure.last_error == WORKER_PROTOCOL_UNSUPPORTED)
+        || (failure.class == FailureClass::Retryable
+            && failure.last_error == WORKER_ADMISSION_PENDING);
+    // Old masters also wrote the protocol error for temporary closed admission.
+    // Only these exact pre-admission errors may be reconsidered on a fresh GET.
+    // No timer/poll loop, failure reset, or extra etcd write is introduced.
+    // Reuse the verified capabilities for the normal fenced reservation/start.
+    if admission_failure {
+        if let Ok(Ok(caps)) =
+            tokio::time::timeout(OWNER_PROBE_TIMEOUT, capabilities(http, endpoint)).await
+        {
+            if validate_capabilities(&caps, target).is_ok() {
+                return Ok(WorkerRetry::Eligible(Some(caps)));
+            }
+        }
+    }
+    Ok(WorkerRetry::Deferred(format!(
+        "{endpoint}: retry at {}; {:?}: {}",
+        failure.next_retry_ms, failure.class, failure.last_error
+    )))
+}
+
 fn admission_ready_by_default() -> bool {
     true
 }
@@ -217,10 +278,15 @@ impl LegacyOwnership<'_> {
         http: &reqwest::Client,
         target: &str,
         endpoint: &str,
+        reprobed: Option<Capabilities>,
     ) -> Result<Option<usize>, String> {
         match self {
             Self::Durable { coordinator, proof } => {
-                let caps = match capabilities(http, endpoint).await {
+                let owned_probe = reprobed.is_some();
+                let caps = match match reprobed {
+                    Some(caps) => Ok(caps),
+                    None => capabilities(http, endpoint).await,
+                } {
                     Ok(caps) => caps,
                     Err(error) => {
                         coordinator
@@ -230,13 +296,13 @@ impl LegacyOwnership<'_> {
                     }
                 };
                 if !caps.merge_admission_ready {
-                    let error = "worker admission discovery is still pending; no merge sent";
+                    let error = WORKER_ADMISSION_PENDING;
                     coordinator
                         .record_failure(proof, target, endpoint, error)
                         .await?;
                     return Err(error.into());
                 }
-                if caps.fenced_legacy_merges {
+                if caps.fenced_legacy_merges || owned_probe {
                     let before = coordinator
                         .failure(target, endpoint)
                         .await?
@@ -276,22 +342,18 @@ impl LegacyOwnership<'_> {
         }
     }
 
-    async fn deferred(&self, target: &str, endpoint: &str) -> Result<Option<String>, String> {
+    async fn retry(
+        &self,
+        http: &reqwest::Client,
+        target: &str,
+        endpoint: &str,
+    ) -> Result<WorkerRetry, String> {
         match self {
-            Self::Durable { coordinator, .. } => Ok(coordinator
-                .failure(target, endpoint)
-                .await?
-                .filter(|failure| failure.next_retry_ms > lance_context_merge::failure::now_ms())
-                .map(|failure| {
-                    format!(
-                        "{endpoint}: retry at {} after {} failed attempts (attention={})",
-                        failure.next_retry_ms,
-                        failure.consecutive_attempts,
-                        failure.needs_attention
-                    )
-                })),
+            Self::Durable { coordinator, .. } => {
+                worker_retry(http, coordinator, target, endpoint).await
+            }
             #[cfg(test)]
-            Self::HttpTest => Ok(None),
+            Self::HttpTest => Ok(WorkerRetry::Eligible(None)),
         }
     }
 
@@ -342,13 +404,19 @@ async fn run_legacy_workers_inner(
     let mut unavailable = Vec::new();
     for endpoint in endpoints {
         let endpoint = endpoint.trim_end_matches('/');
-        if let Some(deferred) = ownership.deferred(target, endpoint).await? {
-            metrics::counter!("master_merge_wal_legacy_deferred_total").increment(1);
-            unavailable.push(deferred);
-            continue;
-        }
+        let reprobed = match ownership.retry(http, target, endpoint).await? {
+            WorkerRetry::Deferred(deferred) => {
+                metrics::counter!("master_merge_wal_legacy_deferred_total").increment(1);
+                unavailable.push(deferred);
+                continue;
+            }
+            WorkerRetry::Eligible(caps) => caps,
+        };
         let started = std::time::Instant::now();
-        match ownership.upgraded_worker(http, target, endpoint).await {
+        match ownership
+            .upgraded_worker(http, target, endpoint, reprobed)
+            .await
+        {
             Ok(Some(n)) => {
                 metrics::histogram!("master_merge_wal_worker_duration_seconds")
                     .record(started.elapsed().as_secs_f64());
@@ -658,19 +726,8 @@ async fn run_workers(
     if endpoints.is_empty() {
         return Err("no worker endpoints configured after reconciling recorded execution".into());
     }
-    let mut pending = Vec::new();
+    let mut pending = endpoints.to_vec();
     let mut deferred = Vec::new();
-    for endpoint in endpoints {
-        match coordinator.failure(target, endpoint).await? {
-            Some(failure) if failure.next_retry_ms > lance_context_merge::failure::now_ms() => {
-                deferred.push(format!(
-                    "{endpoint}: retry at {}; {:?}: {}",
-                    failure.next_retry_ms, failure.class, failure.last_error
-                ))
-            }
-            _ => pending.push(endpoint.clone()),
-        }
-    }
 
     let mut reclaimed = 0;
     let mut errors = Vec::new();
@@ -681,12 +738,30 @@ async fn run_workers(
         let mut retry = Vec::new();
         errors.clear();
         for endpoint in pending {
+            // Probe at this worker's turn, not before earlier workers run:
+            // their merges may take long enough for its identity to change.
+            let reprobed = if attempt == 0 {
+                match worker_retry(http, coordinator, target, &endpoint).await? {
+                    WorkerRetry::Deferred(message) => {
+                        deferred.push(message);
+                        continue;
+                    }
+                    WorkerRetry::Eligible(caps) => caps,
+                }
+            } else {
+                None
+            };
             let failures_before = coordinator
                 .failure(target, &endpoint)
                 .await?
                 .map_or(0, |failure| failure.consecutive_attempts);
             let started = std::time::Instant::now();
-            let outcome = one(http, coordinator, proof, target, &endpoint).await;
+            let outcome = match reprobed {
+                Some(caps) => {
+                    one_with_capabilities(http, coordinator, proof, target, &endpoint, caps).await
+                }
+                None => one(http, coordinator, proof, target, &endpoint).await,
+            };
             metrics::histogram!("master_merge_wal_worker_duration_seconds")
                 .record(started.elapsed().as_secs_f64());
             metrics::counter!("master_merge_wal_workers_total", "result" => if outcome.is_ok() { "ok" } else { "failed" }).increment(1);
@@ -782,17 +857,7 @@ async fn one_with_capabilities(
         "{}/api/v1/internal/merge-executor",
         endpoint.trim_end_matches('/')
     );
-    if !capabilities.merge_admission_ready
-        || capabilities.protocol != 2
-        || capabilities.progress_protocol != 1
-        || (!capabilities.owned_targets.iter().any(|t| t == target)
-            && !capabilities.fenced_legacy_merges)
-        || capabilities.timeout_secs == 0
-        || capabilities.queue_timeout_secs == 0
-        || capabilities.idle_timeout_secs == 0
-    {
-        return Err("worker lacks bounded owned-merge protocol".into());
-    }
+    validate_capabilities(&capabilities, target)?;
     let mut execution = Execution::new(
         target,
         endpoint,
@@ -1525,6 +1590,287 @@ mod tests {
             .unwrap());
         let terminal = coordinator.get("table").await.unwrap().unwrap();
         assert!(coordinator.release(&proof, &terminal).await.unwrap());
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn worker_capability_backoff_reprobes_a_ready_executor() {
+        let (coordinator, proof) = fixture().await;
+        let good = Worker {
+            coordinator: coordinator.clone(),
+            calls: Arc::new(AtomicUsize::new(0)),
+            fail: false,
+            stall_first: false,
+            name: "ready-after-restart",
+            events: Arc::new(Mutex::new(Vec::new())),
+        };
+        let (endpoint, server) = worker(good.clone()).await;
+        for _ in 0..15 {
+            coordinator
+                .record_failure(
+                    &proof,
+                    "table",
+                    &endpoint,
+                    "worker lacks bounded owned-merge protocol",
+                )
+                .await
+                .unwrap();
+        }
+        let before = coordinator
+            .failure("table", &endpoint)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(before.next_retry_ms > lance_context_merge::failure::now_ms());
+        let outcome = run_workers(
+            &reqwest::Client::new(),
+            &coordinator,
+            &proof,
+            "table",
+            std::slice::from_ref(&endpoint),
+        )
+        .await;
+        server.abort();
+        assert!(outcome.as_ref().is_ok_and(|s| s.contains("merged 7 generations")),
+            "a fresh supported worker must not stay blocked by its pre-admission failure: {outcome:?}");
+        assert_eq!(good.calls.load(Ordering::SeqCst), 1);
+        assert!(coordinator
+            .failure("table", &endpoint)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn worker_admission_pending_is_transient_but_never_authorizes_merge() {
+        let mut value = serde_json::json!({"protocol":2,"instance":"new","timeout_secs":600,
+            "queue_timeout_secs":600,"idle_timeout_secs":600,"progress_protocol":1,
+            "owned_targets":["table"],"merge_admission_ready":false});
+        let caps: Capabilities = serde_json::from_value(value.clone()).unwrap();
+        let error = validate_capabilities(&caps, "table").unwrap_err();
+        assert_eq!(error, WORKER_ADMISSION_PENDING);
+        assert_eq!(
+            lance_context_merge::failure::classify(&error),
+            lance_context_merge::failure::FailureClass::Retryable
+        );
+        value["merge_admission_ready"] = true.into();
+        let caps: Capabilities = serde_json::from_value(value.clone()).unwrap();
+        assert!(validate_capabilities(&caps, "table").is_ok());
+        for (key, invalid) in [
+            ("protocol", 1),
+            ("progress_protocol", 0),
+            ("timeout_secs", 0),
+            ("queue_timeout_secs", 0),
+            ("idle_timeout_secs", 0),
+        ] {
+            let mut bad = value.clone();
+            bad[key] = invalid.into();
+            let caps: Capabilities = serde_json::from_value(bad).unwrap();
+            assert_eq!(
+                validate_capabilities(&caps, "table").unwrap_err(),
+                WORKER_PROTOCOL_UNSUPPORTED
+            );
+        }
+        assert!(validate_capabilities(&caps, "different-table").is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn worker_capability_backoff_preserves_unresolved_and_unrelated_failures() {
+        use axum::response::IntoResponse;
+        let valid = serde_json::json!({"protocol":2,"instance":"new","timeout_secs":600,
+            "queue_timeout_secs":600,"idle_timeout_secs":600,"progress_protocol":1,
+            "owned_targets":["table"],"merge_admission_ready":true});
+        let mut cases = Vec::new();
+        for (key, value) in [
+            ("merge_admission_ready", serde_json::json!(false)),
+            ("protocol", serde_json::json!(1)),
+            ("progress_protocol", serde_json::json!(0)),
+            ("timeout_secs", serde_json::json!(0)),
+            ("queue_timeout_secs", serde_json::json!(0)),
+            ("idle_timeout_secs", serde_json::json!(0)),
+            ("owned_targets", serde_json::json!([])),
+        ] {
+            let mut caps = valid.clone();
+            caps[key] = value;
+            cases.push((WORKER_PROTOCOL_UNSUPPORTED, caps, false, 1));
+        }
+        cases.push((WORKER_PROTOCOL_UNSUPPORTED, valid.clone(), true, 1));
+        let mut unready = valid.clone();
+        unready["merge_admission_ready"] = false.into();
+        cases.push((WORKER_ADMISSION_PENDING, unready, false, 1));
+        for error in [
+            "status=403 forbidden",
+            "invalid schema",
+            "storage timeout",
+            "merge ownership unresolved: worker lacks bounded owned-merge protocol",
+        ] {
+            cases.push((error, valid.clone(), false, 0));
+        }
+        for (error, caps, forbidden, expected_gets) in cases {
+            let (coordinator, proof) = fixture().await;
+            let gets = Arc::new(AtomicUsize::new(0));
+            let counted = gets.clone();
+            let app = Router::new()
+                .route(
+                    "/api/v1/internal/merge-executor",
+                    get(move || {
+                        let counted = counted.clone();
+                        let caps = caps.clone();
+                        async move {
+                            counted.fetch_add(1, Ordering::SeqCst);
+                            if forbidden {
+                                axum::http::StatusCode::FORBIDDEN.into_response()
+                            } else {
+                                Json(caps).into_response()
+                            }
+                        }
+                    }),
+                )
+                .fallback(post(|| async {
+                    panic!("failed capability probe must never write");
+                    #[allow(unreachable_code)]
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            for _ in 0..15 {
+                coordinator
+                    .record_failure(&proof, "table", &endpoint, error)
+                    .await
+                    .unwrap();
+            }
+            let before =
+                serde_json::to_value(coordinator.failure("table", &endpoint).await.unwrap())
+                    .unwrap();
+            assert!(matches!(
+                worker_retry(&reqwest::Client::new(), &coordinator, "table", &endpoint)
+                    .await
+                    .unwrap(),
+                WorkerRetry::Deferred(_)
+            ));
+            assert_eq!(gets.load(Ordering::SeqCst), expected_gets);
+            assert_eq!(
+                serde_json::to_value(coordinator.failure("table", &endpoint).await.unwrap())
+                    .unwrap(),
+                before
+            );
+            assert!(coordinator.get("table").await.unwrap().is_none());
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn worker_capability_backoff_recovery_keeps_real_attempt_budget_and_ownership() {
+        for legacy in [false, true] {
+            for payload_fails in [false, true] {
+                let (coordinator, proof) = fixture().await;
+                let executor = Worker {
+                    coordinator: coordinator.clone(),
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    fail: payload_fails,
+                    stall_first: false,
+                    name: "recovered",
+                    events: Arc::new(Mutex::new(Vec::new())),
+                };
+                let (endpoint, server) = worker(executor.clone()).await;
+                for _ in 0..15 {
+                    coordinator
+                        .record_failure(&proof, "table", &endpoint, WORKER_ADMISSION_PENDING)
+                        .await
+                        .unwrap();
+                }
+                let before = coordinator
+                    .failure("table", &endpoint)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(before.next_retry_ms > lance_context_merge::failure::now_ms());
+                let result = if legacy {
+                    run_legacy_workers_inner(
+                        &reqwest::Client::new(),
+                        std::slice::from_ref(&endpoint),
+                        "table",
+                        LegacyOwnership::Durable {
+                            coordinator: &coordinator,
+                            proof: &proof,
+                        },
+                    )
+                    .await
+                } else {
+                    run_workers(
+                        &reqwest::Client::new(),
+                        &coordinator,
+                        &proof,
+                        "table",
+                        std::slice::from_ref(&endpoint),
+                    )
+                    .await
+                };
+                assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(result.is_err(), payload_fails, "{result:?}");
+                if payload_fails {
+                    let after = coordinator
+                        .failure("table", &endpoint)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(after.consecutive_attempts, 16);
+                    assert_eq!(after.last_error, "injected shard failure");
+                    assert!(after.needs_attention);
+                } else {
+                    assert!(coordinator
+                        .failure("table", &endpoint)
+                        .await
+                        .unwrap()
+                        .is_none());
+                }
+                assert!(coordinator.get("table").await.unwrap().is_none());
+                server.abort();
+            }
+        }
+        // A positive GET grants no ownership: losing the claim still prohibits start.
+        let (coordinator, proof) = fixture().await;
+        let executor = Worker {
+            coordinator: coordinator.clone(),
+            calls: Arc::new(AtomicUsize::new(0)),
+            fail: false,
+            stall_first: false,
+            name: "unclaimed",
+            events: Arc::new(Mutex::new(Vec::new())),
+        };
+        let (endpoint, server) = worker(executor.clone()).await;
+        coordinator
+            .record_failure(&proof, "table", &endpoint, WORKER_PROTOCOL_UNSUPPORTED)
+            .await
+            .unwrap();
+        let before =
+            serde_json::to_value(coordinator.failure("table", &endpoint).await.unwrap()).unwrap();
+        let mut client =
+            etcd_client::Client::connect([std::env::var("ETCD_TEST_ENDPOINTS").unwrap()], None)
+                .await
+                .unwrap();
+        client.lease_revoke(proof.lease_id).await.unwrap();
+        assert!(run_workers(
+            &reqwest::Client::new(),
+            &coordinator,
+            &proof,
+            "table",
+            std::slice::from_ref(&endpoint)
+        )
+        .await
+        .is_err());
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
+        assert!(coordinator.get("table").await.unwrap().is_none());
+        assert_eq!(
+            serde_json::to_value(coordinator.failure("table", &endpoint).await.unwrap()).unwrap(),
+            before
+        );
         server.abort();
     }
 
