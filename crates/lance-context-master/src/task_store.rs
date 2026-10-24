@@ -181,9 +181,12 @@ struct EtcdTaskStore {
     prepare_targets: Vec<String>,
     index_prepare_targets: Vec<String>,
     maintenance_catchup_targets: Vec<String>,
+    repair_validate_only_targets: Vec<String>,
     wal_claim_targets: Vec<String>,
     rollout: lance_context_merge::rollout::MergeRollout,
     auto_local_merge: bool,
+    #[cfg(test)]
+    claim_owner_swap: std::sync::Mutex<Option<(String, String)>>,
 }
 
 /// Ownership of one running task. Dropping the claim stops lease renewal; etcd
@@ -977,11 +980,14 @@ impl EtcdTaskStore {
         let client = config.etcd.connect().await?;
         Ok(Self {
             client,
+            #[cfg(test)]
+            claim_owner_swap: Default::default(),
             prefix: config.etcd.prefix().to_string(),
             lease_ttl: config.etcd_lease_ttl_secs,
             prepare_targets: config.maintenance.compaction_prepare_targets.clone(),
             index_prepare_targets: config.maintenance.index_prepare_targets.clone(),
             maintenance_catchup_targets: config.maintenance.maintenance_catchup_targets.clone(),
+            repair_validate_only_targets: config.maintenance.repair_validate_only_targets.clone(),
             wal_claim_targets: config.maintenance.wal_claim_targets.clone(),
             rollout: config.merge_rollout.clone(),
             auto_local_merge: config.local_merge.master_local_merge_auto,
@@ -1196,6 +1202,7 @@ impl EtcdTaskStore {
             compaction_prepare_targets: &self.prepare_targets,
             index_prepare_targets: &self.index_prepare_targets,
             maintenance_catchup_targets: &self.maintenance_catchup_targets,
+            repair_validate_only_targets: &self.repair_validate_only_targets,
         }
     }
 
@@ -1701,6 +1708,18 @@ impl EtcdTaskStore {
                             token.as_bytes(),
                             lease_options.clone(),
                         ));
+                    }
+                }
+                #[cfg(test)]
+                {
+                    // Deterministic race after snapshot/compare construction.
+                    let swap = self.claim_owner_swap.lock().unwrap().take();
+                    if let Some((key, replacement)) = swap {
+                        self.client
+                            .clone()
+                            .put(key, replacement, None)
+                            .await
+                            .map_err(etcd_error("test owner replacement"))?;
                     }
                 }
                 let mut client = self.client.clone();
@@ -5496,6 +5515,139 @@ mod tests {
             store.inner.get_text(&active).await.unwrap().as_deref(),
             Some("native")
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn repair_validation_owner_swap_rejects_stale_claim_and_preserves_marker() {
+        let (_dir, mut cfg, _) = preparation_test_store().await;
+        cfg.merge_rollout.owned_targets = vec!["hot".into()];
+        cfg.maintenance.repair_validate_only_targets = vec!["hot".into()];
+        cfg.maintenance.maintenance_catchup_targets = vec!["hot".into()];
+        let store = TaskStore::open(&cfg).await.unwrap();
+        let active = crate::catchup::store::active_key(&cfg.etcd.etcd_prefix, "hot");
+        store
+            .inner
+            .client
+            .clone()
+            .put(active.clone(), "old", None)
+            .await
+            .unwrap();
+        let task = store
+            .enqueue(TaskKind::Repair, "hot", vec![])
+            .await
+            .unwrap();
+        *store.inner.claim_owner_swap.lock().unwrap() = Some((active.clone(), "new".into()));
+        assert!(
+            store.claim_next().await.unwrap().is_none(),
+            "owner changed after read must reject final CAS"
+        );
+        assert!(store
+            .inner
+            .get_text(&store.inner.target_lock_key("hot"))
+            .await
+            .unwrap()
+            .is_none());
+        let claim = store.claim_next().await.unwrap().unwrap();
+        assert_eq!(claim.task.id, task.id);
+        assert_eq!(
+            claim.backend.preparation_owner.as_deref(),
+            Some(b"new".as_slice())
+        );
+        assert!(!claim.preparing_maintenance());
+        let peer = TaskStore::open(&cfg).await.unwrap();
+        peer.enqueue(TaskKind::MergeWal, "hot", vec![])
+            .await
+            .unwrap();
+        assert!(peer
+            .claim_merge_target("hot", "new")
+            .await
+            .unwrap()
+            .is_none());
+        peer.enqueue(TaskKind::IndexId, "hot", vec![])
+            .await
+            .unwrap();
+        assert!(peer.claim_next().await.unwrap().is_none());
+        store.finish(claim, Ok("validated".into())).await.unwrap();
+        assert_eq!(
+            store.inner.get_text(&active).await.unwrap().as_deref(),
+            Some("new")
+        );
+        let merge = peer
+            .claim_merge_target("hot", "new")
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .enqueue(TaskKind::Repair, "hot", vec![])
+            .await
+            .unwrap();
+        assert!(
+            store.claim_next().await.unwrap().is_none(),
+            "repair cannot overlap active merge"
+        );
+        peer.finish(merge, Ok("pass finished".into()))
+            .await
+            .unwrap();
+        let index = peer.claim_next().await.unwrap().unwrap();
+        assert_eq!(index.task.kind, TaskKind::IndexId);
+        assert!(
+            store.claim_next().await.unwrap().is_none(),
+            "repair cannot overlap maintenance"
+        );
+        peer.finish(index, Ok("index finished".into()))
+            .await
+            .unwrap();
+        let next = store.claim_next().await.unwrap().unwrap();
+        assert_eq!(next.task.kind, TaskKind::Repair);
+        store.finish(next, Ok("validated".into())).await.unwrap();
+        assert_eq!(
+            store.inner.get_text(&active).await.unwrap().as_deref(),
+            Some("new")
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn repair_validation_exact_opt_in_cannot_bypass_scope_guards() {
+        for (target, owned, draining, opt_in) in [
+            ("hot", true, false, ""),
+            ("hot", true, false, "*"),
+            ("hot", false, false, "hot"),
+            ("hot", true, true, "hot"),
+            ("generic:hot", true, false, "generic:hot"),
+        ] {
+            let (_dir, mut cfg, _) = preparation_test_store().await;
+            cfg.maintenance.maintenance_catchup_targets = vec![target.into()];
+            cfg.maintenance.repair_validate_only_targets = vec![opt_in.into()];
+            if owned {
+                cfg.merge_rollout.owned_targets = vec![target.into()];
+            }
+            if draining {
+                cfg.merge_rollout.drain_targets = vec![target.into()];
+            }
+            let store = TaskStore::open(&cfg).await.unwrap();
+            let active = crate::catchup::store::active_key(&cfg.etcd.etcd_prefix, target);
+            store
+                .inner
+                .client
+                .clone()
+                .put(active.clone(), "native", None)
+                .await
+                .unwrap();
+            store
+                .enqueue(TaskKind::Repair, target, vec![])
+                .await
+                .unwrap();
+            assert!(
+                store.claim_next().await.unwrap().is_none(),
+                "{target}/{opt_in}/{owned}/{draining}"
+            );
+            assert_eq!(
+                store.inner.get_text(&active).await.unwrap().as_deref(),
+                Some("native")
+            );
+        }
     }
 
     #[tokio::test]

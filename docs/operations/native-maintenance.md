@@ -47,3 +47,37 @@ race. A continuously reclaiming publisher may still exhaust a compact's bounded
 publication wait. Measure that contention and keep the existing merge/drain
 recovery running; do not reset claims or stop progressing writers to force a
 maintenance slot.
+
+## Validation-only Repair
+
+`REPAIR_VALIDATE_ONLY_TARGETS` is a separate comma-separated list of exact
+rollout table names, empty by default. It does not accept `*`, generic or
+datagen targets. An enrolled target must be owned and non-draining. Verify
+that every publisher uses the fenced claim/target-lock protocol described
+above before enabling this option; an old Pod being absent or a catch-up
+record being missing is not that proof.
+
+For these targets, Repair checks current data and deletion file references
+with sequential metadata HEAD requests. Each successful reference advances
+`work.references_validated` and the existing progress sequence; waiting or
+transport errors do not. It succeeds without changing the base manifest only
+when all references exist and the base version remains unchanged. This checks
+reference existence, not payload integrity or every index file. Missing files,
+transport errors or a concurrent version change fail the task explicitly;
+restore missing objects or resolve the reported storage error before retrying.
+The normal failure budgets remain in effect. No fragments, WAL objects or
+catch-up identities are deleted, and unrelated failure budgets are not reset.
+
+The setting also permits this Repair to claim beside a retained catch-up
+identity. It still takes exclusive task/merge/target ownership, compares the
+exact observed catch-up value in the final etcd transaction, and cannot
+prepare concurrently with a writer. A lost process lease preserves persistent
+execution ownership; the replacement reconciles and fences it before work.
+The original Repair reaches Done through normal task completion, after which
+its dependent tasks may run. Nothing manufactures successful task records.
+
+Validation-only behavior remains selected if the catch-up marker later
+disappears. Disabling the option restores the pre-existing Repair behavior,
+which can delete fragments naming missing files, so do not disable it merely
+to retry a failed validation. This option does not retire the historical
+catch-up owner or prove all of its successors have stopped writing.

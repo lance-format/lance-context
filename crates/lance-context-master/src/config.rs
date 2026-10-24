@@ -410,6 +410,13 @@ pub struct MaintenanceConfig {
     /// Enable only after verifying publisher compatibility. No wildcard.
     #[arg(long, env = "MAINTENANCE_CATCHUP_TARGETS", value_delimiter = ',')]
     pub maintenance_catchup_targets: Vec<String>,
+    /// Validate current rollout data/deletion references without deleting any
+    /// fragments. Exact owned, non-draining rollout targets only. Also permits
+    /// Repair beside a persistent catch-up identity when all its publishers
+    /// obey the common fenced task/target/merge-claim protocol. Verify that
+    /// compatibility before enabling; empty retains existing repair behavior.
+    #[arg(long, env = "REPAIR_VALIDATE_ONLY_TARGETS", value_delimiter = ',', value_parser = parse_repair_validation_target)]
+    pub repair_validate_only_targets: Vec<String>,
     /// Yield prepared output after this long without observed writer progress.
     /// Completed work extends the wait; heartbeats do not. Expiry releases
     /// preparation capacity and never cancels the current table writer.
@@ -439,6 +446,7 @@ impl Default for MaintenanceConfig {
             compaction_prepare_targets: Vec::new(),
             index_prepare_targets: Vec::new(),
             maintenance_catchup_targets: Vec::new(),
+            repair_validate_only_targets: Vec::new(),
             compaction_commit_wait_secs: 120,
             index_commit_wait_secs: 120,
             maintenance_timeout_secs: 3600,
@@ -452,5 +460,38 @@ fn parse_wal_claim_target(value: &str) -> Result<String, String> {
     if value.trim().is_empty() || value == "*" {
         return Err("WAL claim targets must be nonempty exact table names; omit the option to accept all tables".into());
     }
+    Ok(value.to_owned())
+}
+
+#[cfg(test)]
+mod repair_validation_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn repair_validation_default_and_exact_target_parser() {
+        let cfg = MasterConfig::try_parse_from(["master"]).unwrap();
+        assert!(cfg.maintenance.repair_validate_only_targets.is_empty());
+        let cfg =
+            MasterConfig::try_parse_from(["master", "--repair-validate-only-targets=aops,t1"])
+                .unwrap();
+        assert_eq!(cfg.maintenance.repair_validate_only_targets, ["aops", "t1"]);
+        for value in ["", "*", "generic:hot", "datagen:hot", "../hot", "_stats"] {
+            assert!(
+                MasterConfig::try_parse_from([
+                    "master",
+                    &format!("--repair-validate-only-targets={value}")
+                ])
+                .is_err(),
+                "{value}"
+            );
+        }
+    }
+}
+
+fn parse_repair_validation_target(value: &str) -> Result<String, String> {
+    lance_context_core::validate_store_name(value).map_err(|error| {
+        format!("repair validation requires an exact rollout table name: {error}")
+    })?;
     Ok(value.to_owned())
 }

@@ -2026,6 +2026,62 @@ impl StorageBase {
             .collect()
     }
 
+    /// Check current data and deletion file references with one metadata
+    /// request at a time. Never reads row payloads or commits a repair. The
+    /// caller must hold exclusive write authority for the complete operation;
+    /// a changed version fails instead of declaring an unchecked version healthy.
+    pub async fn validate_fragment_references(
+        &mut self,
+    ) -> LanceResult<crate::ReferenceValidation> {
+        self.reload().await?;
+        let read_version = self.dataset.version().version;
+        let object_store = self.dataset.object_store(None).await?;
+        let data_dir = self.dataset.data_dir();
+        let deletions_dir = self.dataset.deletions_dir();
+        let mut references_checked = 0;
+        for fragment in self.dataset.fragments().iter() {
+            for file in &fragment.files {
+                let path = data_dir.clone().join(file.path.as_str());
+                if !object_store.exists(&path).await? {
+                    return Err(lance::Error::io(format!(
+                        "repair validation: missing data reference {} at version {read_version}; no data changed",
+                        file.path
+                    )));
+                }
+                references_checked += 1;
+                crate::merge_write_scope::reference_validated();
+            }
+            if let Some(deletion) = &fragment.deletion_file {
+                let name = format!(
+                    "{}-{}-{}.{}",
+                    fragment.id,
+                    deletion.read_version,
+                    deletion.id,
+                    deletion.file_type.suffix()
+                );
+                let path = deletions_dir.clone().join(name.as_str());
+                if !object_store.exists(&path).await? {
+                    return Err(lance::Error::io(format!(
+                        "repair validation: missing deletion reference {name} at version {read_version}; no data changed"
+                    )));
+                }
+                references_checked += 1;
+                crate::merge_write_scope::reference_validated();
+            }
+        }
+        self.reload().await?;
+        let latest = self.dataset.version().version;
+        if latest != read_version {
+            return Err(lance::Error::io(format!(
+                "repair validation: base version changed {read_version} -> {latest}; retry validation; no data changed"
+            )));
+        }
+        Ok(crate::ReferenceValidation {
+            read_version,
+            references_checked,
+        })
+    }
+
     /// Drop every base-table fragment whose data or deletion file is missing
     /// from storage, so the manifest stops naming files that do not exist.
     ///

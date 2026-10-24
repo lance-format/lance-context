@@ -317,6 +317,29 @@ async fn run_repair(state: &Arc<MasterState>, claim: &TaskClaim) -> Result<Strin
     let mut store = RolloutStore::open_existing_with_options(&uri, state.rollout_store_options())
         .await
         .map_err(|e| e.to_string())?;
+    // The explicit target setting controls semantics even if its catch-up
+    // marker disappears. Never fall back from validation to fragment deletion.
+    if state
+        .config
+        .maintenance
+        .repair_validate_only_targets
+        .iter()
+        .any(|t| t == &task.target)
+    {
+        if !state.config.merge_rollout.owned(&task.target)
+            || state.config.merge_rollout.draining(&task.target)
+        {
+            return Err("repair validation requires an owned, non-draining rollout target".into());
+        }
+        let report = store
+            .validate_fragment_references()
+            .await
+            .map_err(|e| e.to_string())?;
+        return Ok(format!(
+            "validated {} current file references at version {}; no data changed",
+            report.references_checked, report.read_version
+        ));
+    }
     let report = store
         .repair_missing_fragments()
         .await
@@ -3185,6 +3208,178 @@ mod tests {
         assert_eq!(store.version(), version_after_first);
 
         worker.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn repair_validation_completes_original_dependency_without_deleting_data() {
+        for marker_present in [true, false] {
+            let dir = TempDir::new().unwrap();
+            let mut cfg = config(&dir);
+            cfg.maintenance.repair_validate_only_targets = vec!["exp".into()];
+            cfg.maintenance.maintenance_catchup_targets = vec!["exp".into()];
+            let mut client = cfg.etcd.connect().await.unwrap();
+            let active = crate::catchup::store::active_key(&cfg.etcd.etcd_prefix, "exp");
+            if marker_present {
+                client.put(active.clone(), "native", None).await.unwrap();
+            }
+            let state = MasterState::new(cfg).await.unwrap();
+            let uri = state.rollout_uri("exp");
+            let mut writer = RolloutStore::open(&uri).await.unwrap();
+            writer
+                .add(&[rollout_record("a"), rollout_record("b")])
+                .await
+                .unwrap();
+            writer.cleanup_own_shard().await.unwrap();
+            let version = writer.version();
+            let files = writer.base_data_files();
+            let repair = enqueue(&state, TaskKind::Repair, "exp").await.unwrap();
+            let dependency =
+                enqueue_with_deps(&state, TaskKind::IndexId, "exp", vec![repair.id.clone()])
+                    .await
+                    .unwrap();
+            let claim = state.task_store.claim_next().await.unwrap().unwrap();
+            assert_eq!(claim.task.id, repair.id);
+            run_task(&state, claim, TaskClaimTiming::default()).await;
+            let done = state.task_store.get(&repair.id).await.unwrap().unwrap();
+            assert_eq!(done.state, TaskState::Done, "{done:?}");
+            assert!(done
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("validated"));
+            let next = state.task_store.claim_next().await.unwrap().unwrap();
+            assert_eq!(next.task.id, dependency.id);
+            state
+                .task_store
+                .finish(next, Ok("dependency admitted".into()))
+                .await
+                .unwrap();
+            let current = RolloutStore::open_existing_with_options(&uri, Default::default())
+                .await
+                .unwrap();
+            assert_eq!(current.version(), version);
+            assert_eq!(current.base_data_files(), files);
+            assert_eq!(current.list(None, None).await.unwrap().len(), 2);
+            assert!(
+                state.task_store.list_repairs().await.unwrap().is_empty(),
+                "no fragment deletion report"
+            );
+            let marker = client.get(active, None).await.unwrap();
+            assert_eq!(marker.kvs().len(), usize::from(marker_present));
+            if marker_present {
+                assert_eq!(marker.kvs()[0].value(), b"native");
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn repair_validation_recovers_lost_lease_with_storage_fence() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.maintenance.repair_validate_only_targets = vec!["exp".into()];
+        let mut client = cfg.etcd.connect().await.unwrap();
+        let active = crate::catchup::store::active_key(&cfg.etcd.etcd_prefix, "exp");
+        client.put(active.clone(), "native", None).await.unwrap();
+        let state = MasterState::new(cfg).await.unwrap();
+        let uri = state.rollout_uri("exp");
+        let mut writer = RolloutStore::open(&uri).await.unwrap();
+        writer.add(&[rollout_record("a")]).await.unwrap();
+        writer.cleanup_own_shard().await.unwrap();
+        let files = writer.base_data_files();
+        let repair = enqueue(&state, TaskKind::Repair, "exp").await.unwrap();
+        let old_claim = state.task_store.claim_next().await.unwrap().unwrap();
+        let coordinator = state.task_store.merge_coordinator();
+        let mut old =
+            lance_context_merge::Execution::new("exp", "master:repair", "old-master", 600);
+        old.maintenance = Some(lance_context_merge::MaintenanceKind::Repair);
+        assert!(coordinator
+            .reserve(&state.task_store.merge_claim(&old_claim), &old)
+            .await
+            .unwrap());
+        let old = coordinator.start(&old).await.unwrap().unwrap();
+        coordinator
+            .authorize_commit(&old, &uri, "base", writer.version() + 1)
+            .await
+            .unwrap();
+        assert!(coordinator
+            .publish_work_progress(&old, 1, serde_json::json!({"references_validated":1}))
+            .await
+            .unwrap());
+        assert!(
+            state.task_store.claim_next().await.unwrap().is_none(),
+            "live executor retains its claim"
+        );
+        assert_eq!(coordinator.get("exp").await.unwrap(), Some(old.clone()));
+        state
+            .task_store
+            .abandon_claim_for_test(old_claim)
+            .await
+            .unwrap();
+        assert_eq!(
+            coordinator.get("exp").await.unwrap(),
+            Some(old.clone()),
+            "losing lease must not drop persistent write ownership"
+        );
+        let next = state.task_store.claim_next().await.unwrap().unwrap();
+        assert_eq!(next.task.id, repair.id);
+        run_task(&state, next, TaskClaimTiming::default()).await;
+        let done = state.task_store.get(&repair.id).await.unwrap().unwrap();
+        assert_eq!(done.state, TaskState::Done, "{done:?}");
+        assert!(coordinator
+            .authorize_commit(&old, &uri, "base", writer.version() + 2)
+            .await
+            .is_err());
+        assert!(coordinator.get("exp").await.unwrap().is_none());
+        let reader = RolloutStore::open_existing_with_options(&uri, Default::default())
+            .await
+            .unwrap();
+        assert_eq!(reader.base_data_files(), files);
+        assert_eq!(reader.list(None, None).await.unwrap().len(), 1);
+        assert_eq!(
+            client.get(active, None).await.unwrap().kvs()[0].value(),
+            b"native"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn repair_validation_missing_file_fails_and_blocks_dependency_even_without_marker() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.maintenance.repair_validate_only_targets = vec!["exp".into()];
+        let state = MasterState::new(cfg).await.unwrap();
+        let uri = state.rollout_uri("exp");
+        let mut writer = RolloutStore::open(&uri).await.unwrap();
+        writer.add(&[rollout_record("a")]).await.unwrap();
+        writer.cleanup_own_shard().await.unwrap();
+        let version = writer.version();
+        let files = writer.base_data_files();
+        std::fs::remove_file(dir.path().join("exp.rollout.lance/data").join(&files[0])).unwrap();
+        let repair = enqueue(&state, TaskKind::Repair, "exp").await.unwrap();
+        let dependency =
+            enqueue_with_deps(&state, TaskKind::IndexId, "exp", vec![repair.id.clone()])
+                .await
+                .unwrap();
+        let claim = state.task_store.claim_next().await.unwrap().unwrap();
+        run_task(&state, claim, TaskClaimTiming::default()).await;
+        let failed = state.task_store.get(&repair.id).await.unwrap().unwrap();
+        assert_eq!(failed.state, TaskState::Failed, "{failed:?}");
+        assert!(failed
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("missing data reference"));
+        assert!(state.task_store.claim_next().await.unwrap().is_none());
+        let dependent = state.task_store.get(&dependency.id).await.unwrap().unwrap();
+        assert_ne!(dependent.state, TaskState::Done);
+        let current = RolloutStore::open_existing_with_options(&uri, Default::default())
+            .await
+            .unwrap();
+        assert_eq!(current.version(), version);
+        assert_eq!(current.base_data_files(), files);
+        assert!(state.task_store.list_repairs().await.unwrap().is_empty());
     }
 
     /// A base table whose manifest names a missing data file fails every
