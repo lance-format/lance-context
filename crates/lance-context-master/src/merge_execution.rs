@@ -5,6 +5,7 @@ use std::{sync::Arc, time::Duration};
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_DELAY: Duration = Duration::from_millis(250);
+const WATCH_REFRESH: Duration = Duration::from_secs(10);
 const RETRY_DELAY: Duration = Duration::from_secs(2);
 const ATTEMPTS: usize = 3;
 const OWNER_PROBE_INTERVAL: Duration = Duration::from_secs(10);
@@ -674,6 +675,13 @@ impl Deadlines {
             Some(_) => now.duration_since(self.last_progress) >= self.idle_timeout,
         }
     }
+
+    fn next_check(&self) -> tokio::time::Instant {
+        match self.running {
+            None => self.queue,
+            Some(_) => self.last_progress + self.idle_timeout,
+        }
+    }
 }
 
 pub(crate) async fn ensure_recovery_due(
@@ -1014,6 +1022,7 @@ async fn reconcile_with_grace(
     let mut next_cancel = tokio::time::Instant::now();
     let mut next_probe = tokio::time::Instant::now() + OWNER_PROBE_INTERVAL;
     let mut failed_probes = 0;
+    let mut changes = None;
     loop {
         // Losing etcd responses must not turn this into an unbounded scheduler
         // wait. Ownership remains durable when the reconciliation slot exits.
@@ -1024,8 +1033,8 @@ async fn reconcile_with_grace(
                 .await?;
             return Err(error.into());
         }
-        let current = match coordinator.get(&initial.target).await {
-            Ok(Some(current)) if current.id == initial.id => current,
+        let (current, revision) = match coordinator.get_with_revision(&initial.target).await {
+            Ok((Some(current), revision)) if current.id == initial.id => (current, revision),
             Ok(_) => return Err("merge execution ownership changed during reconciliation".into()),
             Err(error) => {
                 // Bound an unavailable coordinator independently. On successful
@@ -1038,6 +1047,7 @@ async fn reconcile_with_grace(
                 continue;
             }
         };
+        metrics::counter!("master_merge_execution_observations_total").increment(1);
         if matches!(current.phase, Phase::Uncertain | Phase::Recovering) {
             let error = current
                 .error
@@ -1130,7 +1140,44 @@ async fn reconcile_with_grace(
                 .send()
                 .await;
         }
-        tokio::time::sleep(POLL_DELAY).await;
+        // Only long-lived executions need a stream. A fast/empty merge above
+        // releases immediately without paying for a watch. Starting at the
+        // read revision covers completion/progress during subscription setup.
+        if changes.is_none() {
+            match tokio::time::timeout(
+                OWNER_PROBE_TIMEOUT,
+                coordinator.watch_execution(&current, revision),
+            )
+            .await
+            {
+                Ok(Ok(watch)) => changes = Some(watch),
+                _ => {
+                    metrics::counter!("master_merge_execution_watch_errors_total").increment(1);
+                    tokio::time::sleep(RETRY_DELAY).await;
+                    continue;
+                }
+            }
+        }
+        let now = tokio::time::Instant::now();
+        let mut wake = (now + WATCH_REFRESH).min(next_probe);
+        if let Some(started) = cancel_started {
+            wake = wake.min(started + grace).min(next_cancel);
+        } else {
+            wake = wake.min(deadlines.next_check());
+        }
+        match tokio::time::timeout_at(wake, changes.as_mut().unwrap().changed()).await {
+            Ok(Ok(())) => {
+                metrics::counter!("master_merge_execution_watch_notifications_total").increment(1);
+                // Coalesce bursts without exceeding the old observation rate.
+                tokio::time::sleep(POLL_DELAY).await;
+            }
+            Ok(Err(_)) => {
+                metrics::counter!("master_merge_execution_watch_errors_total").increment(1);
+                changes = None;
+                tokio::time::sleep(RETRY_DELAY).await;
+            }
+            Err(_) => {} // bounded freshness/owner/deadline check, not progress
+        }
     }
 }
 
@@ -1374,6 +1421,119 @@ mod tests {
             1
         );
         assert!(admission.status().drained());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires exclusive isolated ETCD_TEST_ENDPOINTS and ETCD_TEST_EXCLUSIVE=1"]
+    async fn quiet_execution_bounds_etcd_reads_without_delaying_completion() {
+        assert_eq!(std::env::var("ETCD_TEST_EXCLUSIVE").as_deref(), Ok("1"));
+        let (coordinator, proof) = fixture().await;
+        let execution = Execution::new("table", "http://127.0.0.1:1", "test", 600);
+        assert!(coordinator.reserve(&proof, &execution).await.unwrap());
+        let running = coordinator.start(&execution).await.unwrap().unwrap();
+        assert!(coordinator.publish_progress(&running, 0).await.unwrap());
+        async fn range_count(http: &reqwest::Client) -> f64 {
+            let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+            let body = http
+                .get(format!("{endpoint}/metrics"))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            let samples: Vec<f64> = body
+                .lines()
+                .filter(|l| {
+                    l.starts_with("grpc_server_started_total{")
+                        && l.contains("grpc_method=\"Range\"")
+                })
+                .map(|l| l.split_whitespace().last().unwrap().parse().unwrap())
+                .collect();
+            assert!(!samples.is_empty(), "etcd Range counter required");
+            samples.iter().sum()
+        }
+        let http = reqwest::Client::new();
+        let before = range_count(&http).await;
+        let c = coordinator.clone();
+        let e = execution.clone();
+        let h = http.clone();
+        let waiter = tokio::spawn(async move { reconcile(&h, &c, &proof, e, false).await });
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert!(!waiter.is_finished());
+        let reads = range_count(&http).await - before;
+        eprintln!("quiet merge 6s Range RPCs: {reads}");
+        // The previous two reads/250ms loop uses about 48 reads here. This
+        // exclusive real-etcd bound includes setup and allows scheduling jitter.
+        assert!(reads <= 8.0, "quiet merge issued {reads} Range RPCs");
+        // Cross the periodic owner/freshness check: canceling a pending watch
+        // receive for that check must not break subsequent notifications.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let reads = range_count(&http).await - before;
+        eprintln!("quiet merge 11s Range RPCs: {reads}");
+        assert!(reads <= 8.0, "quiet merge issued {reads} Range RPCs");
+        assert!(coordinator.finish(&running, Ok(11)).await.unwrap());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(1500), waiter)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            11
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn execution_watch_reconnect_observes_completion_after_transport_loss() {
+        let (coordinator, proof) = fixture().await;
+        let execution = Execution::new("table", "http://127.0.0.1:1", "test", 600);
+        assert!(coordinator.reserve(&proof, &execution).await.unwrap());
+        let running = coordinator.start(&execution).await.unwrap().unwrap();
+        assert!(coordinator.publish_progress(&running, 0).await.unwrap());
+        // Break only this test's TCP connections. Other fixtures and the
+        // durable etcd state remain untouched; the writer uses a direct client.
+        let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+        let upstream = endpoint.strip_prefix("http://").unwrap().to_owned();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = format!("http://{}", listener.local_addr().unwrap());
+        let (cut, signal) = watch::channel(0_u64);
+        let connected = Arc::new(AtomicUsize::new(0));
+        let counter = connected.clone();
+        let server = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                let (mut incoming, _) = listener.accept().await.unwrap();
+                let mut outgoing = tokio::net::TcpStream::connect(&upstream).await.unwrap();
+                let mut signal = signal.clone();
+                signal.borrow_and_update();
+                counter.fetch_add(1, Ordering::SeqCst);
+                connections.spawn(async move {
+                    tokio::select! {
+                        _ = tokio::io::copy_bidirectional(&mut incoming, &mut outgoing) => {},
+                        _ = signal.changed() => {},
+                    }
+                });
+                while connections.try_join_next().is_some() {}
+            }
+        });
+        let client = etcd_client::Client::connect([proxy], None).await.unwrap();
+        let observer = Coordinator::new(client, proof.key.strip_suffix("/claim").unwrap());
+        let waiter = tokio::spawn(async move {
+            reconcile(&reqwest::Client::new(), &observer, &proof, execution, false).await
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!waiter.is_finished());
+        let before = connected.load(Ordering::SeqCst);
+        assert!(before > 0);
+        cut.send_modify(|n| *n += 1);
+        assert!(coordinator.finish(&running, Ok(13)).await.unwrap());
+        let result = tokio::time::timeout(Duration::from_secs(8), waiter).await;
+        server.abort();
+        let _ = server.await;
+        assert_eq!(result.unwrap().unwrap().unwrap(), 13);
+        assert!(connected.load(Ordering::SeqCst) > before, "must reconnect");
+        assert!(coordinator.get("table").await.unwrap().is_none());
     }
 
     async fn fixture() -> (Coordinator, ClaimProof) {

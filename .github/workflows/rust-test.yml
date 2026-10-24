@@ -232,6 +232,8 @@ jobs:
           ETCD_TEST_ENDPOINTS: http://127.0.0.1:2379
         run: |
           cargo test -p lance-context-master -p lance-context-server -p lance-context-merge -- --ignored \
+            --skip quiet_execution_bounds_etcd_reads_without_delaying_completion \
+            --skip execution_watch_compaction_requires_fresh_snapshot_then_resumes \
             --skip task_store::tests::bounded_scheduler_compacted_snapshot_restarts_without_stealing_locks
           cargo test -p lance-context-core registry --lib -- --ignored
           cargo test -p lance-context-ingest --features worker --lib tests::worker -- --ignored
@@ -242,9 +244,16 @@ jobs:
         env:
           ETCD_TEST_ENDPOINTS: http://127.0.0.1:2379
           ETCD_TEST_ALLOW_COMPACTION: "1"
+          ETCD_TEST_EXCLUSIVE: "1"
         run: |
           cargo test -p lance-context-master --lib \
             task_store::tests::bounded_scheduler_compacted_snapshot_restarts_without_stealing_locks \
+            -- --exact --ignored --test-threads=1
+          cargo test -p lance-context-merge --lib \
+            tests::execution_watch_compaction_requires_fresh_snapshot_then_resumes \
+            -- --exact --ignored --test-threads=1
+          cargo test -p lance-context-master --lib \
+            merge_execution::tests::quiet_execution_bounds_etcd_reads_without_delaying_completion \
             -- --exact --ignored --test-threads=1
 
       - name: Ingestion application process recovery
@@ -336,6 +345,8 @@ jobs:
         run: |
           cargo llvm-cov --no-report --all-features \
             -p lance-context-master -p lance-context-server -p lance-context-merge -- --ignored \
+            --skip quiet_execution_bounds_etcd_reads_without_delaying_completion \
+            --skip execution_watch_compaction_requires_fresh_snapshot_then_resumes \
             --skip task_store::tests::bounded_scheduler_compacted_snapshot_restarts_without_stealing_locks
           cargo llvm-cov --no-report --all-features \
             -p lance-context-core --lib -- registry --ignored
@@ -345,9 +356,16 @@ jobs:
         env:
           ETCD_TEST_ENDPOINTS: http://127.0.0.1:2379
           ETCD_TEST_ALLOW_COMPACTION: "1"
+          ETCD_TEST_EXCLUSIVE: "1"
         run: |
           cargo llvm-cov --no-report --all-features -p lance-context-master --lib -- \
             task_store::tests::bounded_scheduler_compacted_snapshot_restarts_without_stealing_locks \
+            --exact --ignored --test-threads=1
+          cargo llvm-cov --no-report --all-features -p lance-context-merge --lib -- \
+            tests::execution_watch_compaction_requires_fresh_snapshot_then_resumes \
+            --exact --ignored --test-threads=1
+          cargo llvm-cov --no-report --all-features -p lance-context-master --lib -- \
+            merge_execution::tests::quiet_execution_bounds_etcd_reads_without_delaying_completion \
             --exact --ignored --test-threads=1
       - name: Merge coverage reports
         run: cargo llvm-cov report --lcov --output-path lcov.info

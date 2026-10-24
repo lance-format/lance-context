@@ -1,7 +1,28 @@
 //! Execution progress is separate from commit ownership. A heartbeat with an
 //! unchanged sequence must never extend a no-progress deadline.
 use crate::{encode, execution_key, Coordinator, Execution, Phase, Result};
-use etcd_client::{Compare, CompareOp, Txn, TxnOp, TxnOpResponse};
+use etcd_client::{Compare, CompareOp, Txn, TxnOp, TxnOpResponse, WatchOptions, WatchStream};
+
+/// Two exact keys on one stream, owned by the waiting execution. Dropping this
+/// value closes the stream; there is no detached task or fleet-wide progress
+/// subscription. Events are hints to reread, never authorization to commit.
+pub struct ExecutionWatch(WatchStream);
+
+impl ExecutionWatch {
+    pub async fn changed(&mut self) -> Result<()> {
+        while let Some(response) = self.0.message().await.map_err(|e| e.to_string())? {
+            if response.canceled() {
+                return Err(
+                    "execution watch canceled; refresh snapshot before resubscribing".into(),
+                );
+            }
+            if !response.events().is_empty() {
+                return Ok(());
+            }
+        }
+        Err("execution watch ended".into())
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExecutionProgress {
@@ -113,6 +134,34 @@ impl WorkProgressPublisher {
 }
 
 impl Coordinator {
+    /// Replay changes after the authoritative execution read, including changes
+    /// that occur before either watch is registered. After disconnect or
+    /// compaction, callers must take a new snapshot before calling this again.
+    pub async fn watch_execution(
+        &self,
+        execution: &Execution,
+        revision: i64,
+    ) -> Result<ExecutionWatch> {
+        if revision <= 0 || revision == i64::MAX {
+            return Err("invalid execution watch revision".into());
+        }
+        let options = WatchOptions::new().with_start_revision(revision + 1);
+        let mut stream = self
+            .client
+            .clone()
+            .watch(
+                execution_key(&self.prefix, &execution.target),
+                Some(options.clone()),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        stream
+            .watch(self.progress_key(execution), Some(options))
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(ExecutionWatch(stream))
+    }
+
     pub fn work_progress_publisher(&self, execution: &Execution) -> WorkProgressPublisher {
         WorkProgressPublisher {
             coordinator: self.clone(),
