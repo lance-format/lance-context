@@ -883,11 +883,21 @@ fn compact_options_key(config: &CompactionConfig) -> String {
 async fn update_stats_after_compaction(state: &Arc<MasterState>, name: &str, store: &RolloutStore) {
     let guard = match tokio::time::timeout(
         STATS_REFRESH_LOCK_WAIT,
-        state.task_store.coordination_lock("stats-writer"),
+        // This refresh is optional: leave a busy writer to the next scan.
+        // Do not retain compact capacity or churn leases retrying the lock
+        // after the compaction has durably completed.
+        state.task_store.try_coordination_lock("stats-writer"),
     )
     .await
     {
-        Ok(Ok(guard)) => guard,
+        Ok(Ok(Some(guard))) => guard,
+        Ok(Ok(None)) => {
+            tracing::info!(
+                store = %name,
+                "stats writer busy; leaving the post-compaction refresh to the next scan"
+            );
+            return;
+        }
         Ok(Err(e)) => {
             tracing::warn!(store = %name, error = %e, "stats writer lock failed");
             return;
@@ -2012,7 +2022,69 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires ETCD_TEST_ENDPOINTS"]
-    async fn prepared_compact_releases_writer_before_waiting_for_stats() {
+    async fn busy_stats_refresh_does_not_retry_coordination_leases() {
+        let dir = TempDir::new().unwrap();
+        let state = MasterState::new(config(&dir)).await.unwrap();
+        let store = RolloutStore::open(&state.rollout_uri("exp")).await.unwrap();
+        let guard = state
+            .task_store
+            .coordination_lock("stats-writer")
+            .await
+            .unwrap();
+        async fn grants() -> f64 {
+            let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+            let body = reqwest::get(format!("{endpoint}/metrics"))
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            let samples: Vec<f64> = body
+                .lines()
+                .filter(|line| {
+                    line.starts_with("grpc_server_started_total{")
+                        && line.contains("grpc_method=\"LeaseGrant\"")
+                })
+                .map(|line| line.split_whitespace().last().unwrap().parse().unwrap())
+                .collect();
+            assert!(!samples.is_empty());
+            samples.iter().sum()
+        }
+        // Global RPC counters are meaningful only when a local runner gives
+        // this test exclusive use of etcd. Parallel CI still checks latency.
+        let before = if std::env::var("ETCD_TEST_EXCLUSIVE").as_deref() == Ok("1") {
+            Some(grants().await)
+        } else {
+            None
+        };
+        let start = std::time::Instant::now();
+        update_stats_after_compaction(&state, "exp", &store).await;
+        let elapsed = start.elapsed();
+        let count = if let Some(before) = before {
+            Some(grants().await - before)
+        } else {
+            None
+        };
+        eprintln!(
+            "busy post-compact stats refresh: elapsed={elapsed:?}, LeaseGrant RPCs={count:?}"
+        );
+        state
+            .task_store
+            .release_coordination_lock(guard)
+            .await
+            .unwrap();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "optional refresh waited {elapsed:?}"
+        );
+        if let Some(count) = count {
+            assert_eq!(count, 1.0);
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn prepared_compact_does_not_hold_slot_for_busy_stats_writer() {
         for owned in [true, false] {
             let dir = TempDir::new().unwrap();
             let mut cfg = config(&dir);
@@ -2050,12 +2122,15 @@ mod tests {
                 let _permit = permit;
                 run_task(&runner_state, claim, TaskClaimTiming::default()).await;
             });
-            // This is shorter than STATS_REFRESH_LOCK_WAIT. Completion must
-            // become durable while the competing stats writer still holds on.
+            // Both durable completion and the capacity permit must be released
+            // while the competing stats writer continues its long scan.
             let finished = await_terminal(&state, &compact.id).await;
             assert_eq!(finished.state, TaskState::Done, "{:?}", finished.error);
-            assert!(!runner.is_finished());
-            assert_eq!(state.compaction_permits.available_permits(), 0);
+            tokio::time::timeout(Duration::from_secs(2), runner)
+                .await
+                .expect("optional stats refresh must not retain a compaction slot")
+                .unwrap();
+            assert_eq!(state.compaction_permits.available_permits(), 1);
             enqueue(&state, TaskKind::MergeWal, "exp").await.unwrap();
             let merge = state
                 .task_store
@@ -2068,17 +2143,13 @@ mod tests {
                 .finish(merge, Ok("next writer admitted during stats wait".into()))
                 .await
                 .unwrap();
-            assert!(!runner.is_finished());
             state
                 .task_store
                 .release_coordination_lock(stats_guard)
                 .await
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), runner)
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(state.compaction_permits.available_permits(), 1);
+            // A later uncontended refresh still updates the row normally.
+            update_stats_after_compaction(&state, "exp", &store).await;
             let stats = state.stats.lock().await.get("exp").await.unwrap().unwrap();
             assert_eq!(stats.total_compactions, 1);
             assert_eq!(stats.row_count, 4);
