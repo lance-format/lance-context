@@ -29,6 +29,15 @@ pub struct ClaimProof {
     pub lease_id: i64,
 }
 
+/// The durable execution version observed by a recovery scan. This is not a
+/// wire-format field or write authority; consumers use it only to reject stale
+/// scheduling observations in their enqueue transaction.
+#[derive(Clone, Debug)]
+pub struct ExecutionObservation {
+    pub execution: Execution,
+    pub revision: i64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
@@ -208,6 +217,16 @@ impl Coordinator {
         &self,
         after: Option<&str>,
     ) -> Result<(Vec<Execution>, Option<String>)> {
+        let (rows, next) = self.execution_observation_page(after).await?;
+        Ok((rows.into_iter().map(|row| row.execution).collect(), next))
+    }
+
+    /// Preserve the version already returned by this bounded read, so delayed
+    /// scans cannot enqueue work after an execution has been released/replaced.
+    pub async fn execution_observation_page(
+        &self,
+        after: Option<&str>,
+    ) -> Result<(Vec<ExecutionObservation>, Option<String>)> {
         let prefix = format!("{}/merge-executions/", self.prefix.trim_end_matches('/'));
         let (start, options) = match after {
             None => (prefix.clone(), etcd_client::GetOptions::new().with_prefix()),
@@ -230,8 +249,18 @@ impl Coordinator {
         let rows = response
             .kvs()
             .iter()
-            .map(|kv| serde_json::from_slice(kv.value()).map_err(|e| e.to_string()))
-            .collect::<Result<Vec<Execution>>>()?;
+            .map(|kv| {
+                let execution: Execution =
+                    serde_json::from_slice(kv.value()).map_err(|e| e.to_string())?;
+                if kv.key() != execution_key(&self.prefix, &execution.target).as_bytes() {
+                    return Err("execution target does not match inventory key".into());
+                }
+                Ok(ExecutionObservation {
+                    execution,
+                    revision: kv.mod_revision(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         let next = response
             .more()
             .then(|| {

@@ -27,8 +27,9 @@ pub(crate) fn retry_kind(endpoint: &str) -> Option<TaskKind> {
 pub(crate) async fn enqueue_recovery(
     state: &Arc<MasterState>,
     coordinator: &Coordinator,
-    execution: &Execution,
+    observed: &lance_context_merge::ExecutionObservation,
 ) -> Result<(), String> {
+    let execution = &observed.execution;
     let Some(task_kind) = retry_kind(&execution.endpoint) else {
         return Ok(());
     };
@@ -47,7 +48,7 @@ pub(crate) async fn enqueue_recovery(
     {
         return Ok(());
     }
-    crate::scheduler::enqueue(state, task_kind, &execution.target)
+    crate::scheduler::enqueue_observed_execution(state, task_kind, observed)
         .await
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -1432,7 +1433,7 @@ mod tests {
             .finish(old_claim, Err("lost ambiguous execution".into()))
             .await
             .unwrap();
-        let (rows, _) = coordinator.execution_page(None).await.unwrap();
+        let (rows, _) = coordinator.execution_observation_page(None).await.unwrap();
         assert_eq!(rows.len(), 1);
         // There is deliberately no failure ledger yet: execution inventory
         // alone must schedule recovery even with all stats sweeps disabled.

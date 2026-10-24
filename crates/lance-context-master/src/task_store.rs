@@ -525,6 +525,23 @@ impl TaskStore {
         self.inner.enqueue(kind, target, depends_on).await
     }
 
+    /// Recovery inventory is a hint, not new demand. Bind a new queue entry to
+    /// the observed execution version without adding an ownership read/RPC.
+    pub(crate) async fn enqueue_execution_recovery(
+        &self,
+        kind: TaskKind,
+        observed: &lance_context_merge::ExecutionObservation,
+    ) -> lance::Result<Option<TaskRecord>> {
+        if observed.revision <= 0 {
+            return Err(lance::Error::io("recovery requires an execution revision"));
+        }
+        let target = &observed.execution.target;
+        let key = lance_context_merge::execution_key(&self.inner.prefix, target);
+        self.inner
+            .enqueue_guarded(kind, target, Vec::new(), Some((key, observed.revision)))
+            .await
+    }
+
     /// Admit and acknowledge a writer hint atomically. An old scan page must
     /// not create another merge after a peer has served the same request.
     pub(crate) async fn enqueue_merge_request(
@@ -1002,6 +1019,18 @@ impl EtcdTaskStore {
         target: &str,
         depends_on: Vec<String>,
     ) -> lance::Result<TaskRecord> {
+        self.enqueue_guarded(kind, target, depends_on, None)
+            .await?
+            .ok_or_else(|| lance::Error::io("unguarded enqueue unexpectedly superseded"))
+    }
+
+    async fn enqueue_guarded(
+        &self,
+        kind: TaskKind,
+        target: &str,
+        depends_on: Vec<String>,
+        execution: Option<(String, i64)>,
+    ) -> lance::Result<Option<TaskRecord>> {
         let task = new_task(kind, target, depends_on);
         let task_key = self.task_key(&task.id);
         let queue_key = self.queue_key(&task.id);
@@ -1012,34 +1041,88 @@ impl EtcdTaskStore {
                 // Recovery scanners mostly rediscover an already-active task.
                 // Resolve those with reads instead of first proposing a write
                 // transaction that is guaranteed to lose the dedupe compare.
-                if let Some(existing_id) = self.get_text(&dedupe_key).await? {
+                let existing_id = if let Some((key, revision)) = &execution {
+                    // Replace the usual dedupe GET with one read-only Txn;
+                    // stale inventory does not propose a guaranteed-losing write.
+                    let snapshot = client
+                        .txn(
+                            Txn::new()
+                                .when([Compare::mod_revision(
+                                    key.as_str(),
+                                    CompareOp::Equal,
+                                    *revision,
+                                )])
+                                .and_then([TxnOp::get(dedupe_key.as_str(), None)]),
+                        )
+                        .await
+                        .map_err(etcd_error("read recovery enqueue observation"))?;
+                    if !snapshot.succeeded() {
+                        return Ok(None);
+                    }
+                    let responses = snapshot.op_responses();
+                    let [TxnOpResponse::Get(dedupe)] = responses.as_slice() else {
+                        return Err(lance::Error::io("missing recovery dedupe snapshot"));
+                    };
+                    dedupe
+                        .kvs()
+                        .first()
+                        .map(|kv| String::from_utf8(kv.value().to_vec()))
+                        .transpose()
+                        .map_err(|e| lance::Error::io(e.to_string()))?
+                } else {
+                    self.get_text(&dedupe_key).await?
+                };
+                if let Some(existing_id) = existing_id {
                     if let Some(existing) = self.get(&existing_id).await? {
                         if matches!(existing.state, TaskState::Queued | TaskState::Running) {
-                            return Ok(existing);
+                            return Ok(Some(existing));
                         }
                     }
                     self.delete_owned_key(&dedupe_key, &existing_id).await?;
                 }
+                let mut compares = vec![Compare::version(dedupe_key.as_str(), CompareOp::Equal, 0)];
+                let mut otherwise = Vec::new();
+                if let Some((key, revision)) = &execution {
+                    compares.push(Compare::mod_revision(
+                        key.as_str(),
+                        CompareOp::Equal,
+                        *revision,
+                    ));
+                    // Resolve a stale observation from the failed CAS itself;
+                    // do not add a second query or retry an obsolete page.
+                    otherwise.push(TxnOp::get(key.as_str(), None));
+                }
                 let txn = Txn::new()
-                    .when([Compare::version(dedupe_key.as_str(), CompareOp::Equal, 0)])
+                    .when(compares)
                     .and_then([
                         TxnOp::put(task_key.as_str(), value.clone(), None),
                         TxnOp::put(queue_key.as_str(), value.clone(), None),
                         TxnOp::put(dedupe_key.as_str(), task.id.as_bytes(), None),
-                    ]);
-                if client
-                    .txn(txn)
-                    .await
-                    .map_err(etcd_error("enqueue task"))?
-                    .succeeded()
-                {
-                    return Ok(task);
+                    ])
+                    .or_else(otherwise);
+                let response = client.txn(txn).await.map_err(etcd_error("enqueue task"))?;
+                if response.succeeded() {
+                    return Ok(Some(task));
+                }
+                if let Some((_, revision)) = &execution {
+                    let responses = response.op_responses();
+                    let [TxnOpResponse::Get(current)] = responses.as_slice() else {
+                        return Err(lance::Error::io(
+                            "missing recovery enqueue conflict snapshot",
+                        ));
+                    };
+                    if current.kvs().first().map(|kv| kv.mod_revision()) != Some(*revision) {
+                        return Ok(None);
+                    }
                 }
             }
             return Err(lance::Error::io(
                 "failed to resolve concurrent etcd task enqueue",
             ));
         }
+        // Recovery tasks are always depless and all four kinds deduplicate.
+        // Ordinary explicit dependency chains retain their existing behavior.
+        assert!(execution.is_none());
         client
             .txn(Txn::new().and_then([
                 TxnOp::put(task_key, value.clone(), None),
@@ -1047,7 +1130,7 @@ impl EtcdTaskStore {
             ]))
             .await
             .map_err(etcd_error("enqueue task"))?;
-        Ok(task)
+        Ok(Some(task))
     }
 
     async fn enqueue_merge_request(
@@ -2775,6 +2858,217 @@ fn etcd_error(action: &'static str) -> impl FnOnce(etcd_client::Error) -> lance:
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn recovery_enqueue_versions_preserve_dedupe_and_new_writer_demand() {
+        let (_dir, store) = bounded_scheduler_store(vec![]).await;
+        let coordinator = store.merge_coordinator();
+        let mut client = store.inner.client.clone();
+        for kind in [
+            TaskKind::MergeWal,
+            TaskKind::Compact,
+            TaskKind::IndexId,
+            TaskKind::Repair,
+        ] {
+            let target = format!("recovery-{}", kind_label(kind));
+            let execution = lance_context_merge::Execution::new(&target, "worker", "old", 60);
+            let key = lance_context_merge::execution_key(&store.inner.prefix, &target);
+            // Legacy/default-omitted and unknown fields must not force a
+            // reserialization comparison that silently disables recovery.
+            let mut value = serde_json::to_value(execution).unwrap();
+            value.as_object_mut().unwrap().remove("protocol");
+            value["future_metadata"] = serde_json::json!("preserve");
+            client
+                .put(key.clone(), value.to_string(), None)
+                .await
+                .unwrap();
+            let observed = coordinator
+                .execution_observation_page(None)
+                .await
+                .unwrap()
+                .0
+                .into_iter()
+                .find(|o| o.execution.target == target)
+                .unwrap();
+            // Identical bytes at a different revision are still a new record.
+            client
+                .put(key.clone(), value.to_string(), None)
+                .await
+                .unwrap();
+            coordinator.request_merge(&target).await.unwrap();
+            let demand = coordinator
+                .get_merge_request(&target)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(store
+                .enqueue_execution_recovery(kind, &observed)
+                .await
+                .unwrap()
+                .is_none());
+            assert!(store.get_active_id(kind, &target).await.unwrap().is_none());
+            assert_eq!(
+                coordinator
+                    .get_merge_request(&target)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .revision,
+                demand.revision
+            );
+            let fresh = coordinator
+                .execution_observation_page(None)
+                .await
+                .unwrap()
+                .0
+                .into_iter()
+                .find(|o| o.execution.target == target)
+                .unwrap();
+            let (first, second) = tokio::join!(
+                store.enqueue_execution_recovery(kind, &fresh),
+                store.enqueue_execution_recovery(kind, &fresh),
+            );
+            let first = first.unwrap().unwrap();
+            assert_eq!(first.id, second.unwrap().unwrap().id);
+            assert_eq!(first.kind, kind);
+            client.delete(key, None).await.unwrap();
+            assert!(store
+                .enqueue_execution_recovery(kind, &fresh)
+                .await
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                store.get_active_id(kind, &target).await.unwrap(),
+                Some(first.id)
+            );
+            assert_eq!(
+                coordinator
+                    .get_merge_request(&target)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .revision,
+                demand.revision
+            );
+        }
+        assert_eq!(store.list().await.unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires exclusive loopback ETCD_TEST_ENDPOINTS and ETCD_TEST_EXCLUSIVE=1"]
+    async fn recovery_enqueue_rechecks_execution_after_dedupe_snapshot() {
+        assert_eq!(std::env::var("ETCD_TEST_EXCLUSIVE").as_deref(), Ok("1"));
+        let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+        assert!(!endpoint.contains(',') && endpoint.starts_with("http://127.0.0.1:"));
+        async fn transactions(endpoint: &str) -> u64 {
+            reqwest::get(format!("{endpoint}/metrics"))
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap()
+                .lines()
+                .filter(|line| {
+                    line.starts_with("grpc_server_handled_total{")
+                        && line.contains("grpc_method=\"Txn\"")
+                        && line.contains("grpc_code=\"OK\"")
+                })
+                .map(|line| {
+                    line.split_whitespace()
+                        .last()
+                        .unwrap()
+                        .parse::<f64>()
+                        .unwrap() as u64
+                })
+                .sum()
+        }
+        let (_dir, proxy, store, mut observer) = lease_proxy_store().await;
+        let coordinator = store.merge_coordinator();
+        for replace in [false, true] {
+            let target = format!("race-{replace}");
+            let key = lance_context_merge::execution_key(&store.inner.prefix, &target);
+            let execution = lance_context_merge::Execution::new(&target, "worker", "old", 60);
+            observer
+                .put(key.clone(), serde_json::to_vec(&execution).unwrap(), None)
+                .await
+                .unwrap();
+            let observed = coordinator
+                .execution_observation_page(None)
+                .await
+                .unwrap()
+                .0
+                .into_iter()
+                .find(|o| o.execution.target == target)
+                .unwrap();
+            proxy.responses.send(false).unwrap();
+            let before = transactions(&endpoint).await;
+            let candidate = store.clone();
+            let stale = observed.clone();
+            let enqueue = tokio::spawn(async move {
+                candidate
+                    .enqueue_execution_recovery(TaskKind::MergeWal, &stale)
+                    .await
+            });
+            // The read-only dedupe transaction has completed in real etcd,
+            // but its successful response has not reached the scheduler yet.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while transactions(&endpoint).await == before {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(!enqueue.is_finished());
+            if replace {
+                let replacement = lance_context_merge::Execution::new(&target, "worker", "new", 60);
+                observer
+                    .put(key.clone(), serde_json::to_vec(&replacement).unwrap(), None)
+                    .await
+                    .unwrap();
+            } else {
+                observer.delete(key.clone(), None).await.unwrap();
+            }
+            proxy.responses.send(true).unwrap();
+            assert!(tokio::time::timeout(Duration::from_secs(5), enqueue)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .is_none());
+            assert!(store
+                .get_active_id(TaskKind::MergeWal, &target)
+                .await
+                .unwrap()
+                .is_none());
+            // Repeated obsolete scanner pages create no replicated writes.
+            let revision = observer
+                .get(key.clone(), None)
+                .await
+                .unwrap()
+                .header()
+                .unwrap()
+                .revision();
+            for _ in 0..20 {
+                assert!(store
+                    .enqueue_execution_recovery(TaskKind::MergeWal, &observed)
+                    .await
+                    .unwrap()
+                    .is_none());
+            }
+            assert_eq!(
+                observer
+                    .get(key, None)
+                    .await
+                    .unwrap()
+                    .header()
+                    .unwrap()
+                    .revision(),
+                revision
+            );
+        }
+        assert!(store.list().await.unwrap().is_empty());
+    }
 
     struct LeaseTestProxy {
         endpoint: String,
