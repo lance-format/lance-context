@@ -431,6 +431,8 @@ pub struct RolloutStore {
     blob_read_pause: std::sync::Mutex<Option<Arc<BlobReadPause>>>,
     #[cfg(test)]
     point_read_pause: std::sync::Mutex<Option<Arc<PointReadPause>>>,
+    #[cfg(test)]
+    observation_pause: std::sync::Mutex<Option<Arc<PointReadPause>>>,
 }
 
 #[cfg(test)]
@@ -549,6 +551,8 @@ impl RolloutStore {
             blob_read_pause: Default::default(),
             #[cfg(test)]
             point_read_pause: Default::default(),
+            #[cfg(test)]
+            observation_pause: Default::default(),
         })
     }
     /// URI of the underlying Lance dataset.
@@ -853,30 +857,44 @@ impl RolloutStore {
     /// master-driven compaction only rewrites the shared base table, while each
     /// writer owns and merges its own WAL shard.
     pub async fn observe(&self) -> LanceResult<RolloutObservation> {
-        let shard_snapshots = self.wal_shard_snapshots().await?;
-        let base_rows = self.base.dataset.count_rows(None).await? as u64;
-        let pending_rows = self.base.pending_wal_rows(&shard_snapshots).await?;
-        let row_count = (base_rows + pending_rows) as i64;
-        let fragment_count = self.base.dataset.count_fragments() as i64;
-        let version = self.base.dataset.manifest.version;
-        let last_updated = self.base.dataset.manifest.timestamp().timestamp_millis();
-        let pending_wal_generations = shard_snapshots
-            .iter()
-            .map(|snapshot| snapshot.sstables.len() as i64)
-            .sum();
-        Ok(RolloutObservation {
-            row_count,
-            fragment_count,
-            version,
-            last_updated,
-            pending_wal_generations,
-            max_pending_wal_generations_per_shard: shard_snapshots
-                .iter()
-                .map(|s| s.sstables.len() as i64)
-                .max()
-                .unwrap_or(0),
-            unflushed_rows: self.unflushed_rows().await,
-        })
+        // Match ordinary reads: bracket WAL capture with fresh base metadata
+        // and retry if a peer merge reclaims a generation before its count is
+        // read. All persisted fields must come from this same accepted view.
+        self.base
+            .read_consistent(ListSource::All, |dataset, shard_snapshots| async move {
+                #[cfg(test)]
+                {
+                    let pause = self.observation_pause.lock().unwrap().take();
+                    if let Some(pause) = pause {
+                        pause.checked_base.notify_one();
+                        pause.resume.notified().await;
+                    }
+                }
+                let base_rows = dataset.count_rows(None).await? as u64;
+                let pending_rows = self.base.pending_wal_rows(&shard_snapshots).await?;
+                let row_count = (base_rows + pending_rows) as i64;
+                let fragment_count = dataset.count_fragments() as i64;
+                let version = dataset.manifest.version;
+                let last_updated = dataset.manifest.timestamp().timestamp_millis();
+                let pending_wal_generations = shard_snapshots
+                    .iter()
+                    .map(|snapshot| snapshot.sstables.len() as i64)
+                    .sum();
+                Ok(RolloutObservation {
+                    row_count,
+                    fragment_count,
+                    version,
+                    last_updated,
+                    pending_wal_generations,
+                    max_pending_wal_generations_per_shard: shard_snapshots
+                        .iter()
+                        .map(|s| s.sstables.len() as i64)
+                        .max()
+                        .unwrap_or(0),
+                    unflushed_rows: self.unflushed_rows().await,
+                })
+            })
+            .await
     }
 
     /// Rows buffered in this instance's resident writer that have not yet been
@@ -3882,6 +3900,8 @@ mod tests {
         let mut store = RolloutStore {
             blob_read_pause: Default::default(),
             point_read_pause: Default::default(),
+            #[cfg(test)]
+            observation_pause: Default::default(),
             base: StorageBase::open(
                 &uri,
                 StorageBaseOptions {
@@ -4038,6 +4058,118 @@ mod tests {
             assert!(store.get_by_id("missing").await.unwrap().is_none());
             assert_eq!(store.get_blob("missing").await.unwrap(), None);
         });
+    }
+
+    #[tokio::test]
+    async fn observe_refreshes_base_after_peer_merge_and_honors_pinning() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut writer = RolloutStore::open(uri).await.unwrap();
+        writer.add(&[assistant_record("first")]).await.unwrap();
+        writer.flush().await.unwrap();
+        writer.cleanup_own_shard().await.unwrap();
+        let mut reader = RolloutStore::open(uri).await.unwrap();
+        let pinned_version = reader.version();
+        writer.add(&[assistant_record("second")]).await.unwrap();
+        writer.flush().await.unwrap();
+        writer.cleanup_own_shard().await.unwrap();
+        let latest = Dataset::open(uri).await.unwrap();
+        let observed = reader.observe().await.unwrap();
+        assert_eq!(
+            observed.row_count, 2,
+            "merged WAL must not disappear from a cached observer"
+        );
+        assert_eq!(observed.version, latest.manifest.version);
+        assert_eq!(observed.fragment_count, latest.count_fragments() as i64);
+        assert_eq!(
+            observed.last_updated,
+            latest.manifest.timestamp().timestamp_millis()
+        );
+        assert_eq!(observed.pending_wal_generations, 0);
+        reader.checkout(pinned_version).await.unwrap();
+        writer.add(&[assistant_record("unmerged")]).await.unwrap();
+        writer.flush().await.unwrap();
+        let pinned = reader.observe().await.unwrap();
+        assert_eq!(pinned.version, pinned_version);
+        assert_eq!(pinned.row_count, 1);
+        assert_eq!(pinned.pending_wal_generations, 0);
+        writer.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn observe_retries_wal_reclaimed_after_capture() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut writer = RolloutStore::open(uri).await.unwrap();
+        writer.add(&[assistant_record("survives")]).await.unwrap();
+        writer.flush().await.unwrap();
+        let reader = Arc::new(RolloutStore::open(uri).await.unwrap());
+        let captured = reader.wal_shard_snapshots().await.unwrap();
+        let pause = Arc::new(PointReadPause::default());
+        *reader.observation_pause.lock().unwrap() = Some(pause.clone());
+        let read = {
+            let reader = reader.clone();
+            tokio::spawn(async move { reader.observe().await })
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            pause.checked_base.notified(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(writer.cleanup_own_shard().await.unwrap(), 1);
+        for snapshot in &captured {
+            for generation in &snapshot.sstables {
+                let path = reader.flushed_generation_uri(snapshot.shard_id, &generation.path);
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    while std::path::Path::new(&path).exists() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+            }
+        }
+        pause.resume.notify_one();
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(10), read)
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("observation must refresh after concurrent WAL reclamation");
+        let latest = Dataset::open(uri).await.unwrap();
+        assert_eq!(observed.row_count, 1);
+        assert_eq!(observed.version, latest.manifest.version);
+        assert_eq!(observed.pending_wal_generations, 0);
+        assert_eq!(observed.max_pending_wal_generations_per_shard, 0);
+        writer.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn observe_does_not_hide_a_missing_unmerged_generation() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut writer = RolloutStore::open(uri).await.unwrap();
+        writer.add(&[assistant_record("missing")]).await.unwrap();
+        writer.flush().await.unwrap();
+        let reader = RolloutStore::open(uri).await.unwrap();
+        let snapshots = reader.wal_shard_snapshots().await.unwrap();
+        assert_eq!(snapshots.iter().map(|s| s.sstables.len()).sum::<usize>(), 1);
+        for snapshot in snapshots {
+            for generation in snapshot.sstables {
+                std::fs::remove_dir_all(
+                    reader.flushed_generation_uri(snapshot.shard_id, &generation.path),
+                )
+                .unwrap();
+            }
+        }
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), reader.observe())
+            .await
+            .expect("a missing generation must not cause an unbounded retry");
+        assert!(
+            result.is_err(),
+            "unmerged data loss cannot become a successful zero observation"
+        );
+        writer.close().await.unwrap();
     }
 
     #[test]

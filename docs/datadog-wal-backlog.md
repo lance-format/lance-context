@@ -13,10 +13,10 @@ The scope is the stores represented by the registry/stats scan, and **flushed** 
 | Metric suffix after `master_wal_backlog_` | Meaning |
 | --- | --- |
 | `generations` | Sum of pending generations across the represented stores. |
-| `largest_store_generations` | Largest store's sum across all its shards. Do not draw a read-cap line here. |
+| `largest_store_generations` | Largest store's sum across all its shards. Draw the configured whole-store read-cap reference (default 4,096). |
 | `stores_over_1000` | Stores with >1,000 pending generations, including those above 4,096. |
 | `largest_shard_generations` | Largest single-shard pending count observed. |
-| `stores_with_shard_over_4096` | Stores with any shard >4,096. Reference-threshold risk, not observed HTTP 503s. |
+| `stores_with_shard_over_4096` | Stores with any shard >4,096. A shard diagnostic, not all stores at read-cap risk or observed HTTP 503s. |
 | `observed_stores` | Stores represented by a complete, usable snapshot. |
 | `snapshot_age_seconds` | Age from the older of scan start and oldest retained row observation. Scraping/re-reading cannot reset it. |
 | `snapshot_complete` | 1 only if no registry entry failed observation, including failures without an older row. |
@@ -40,11 +40,11 @@ Use the chart-building instructions below with the Datadog agent after deploymen
 - For publisher diagnosis, group by `pod_name` (or the actual Pod-identity tag emitted in your environment). Deployment/host can conflate multiple Pods. Do not hardcode a host or assume the scanner has a stable leader role.
 - Coverage-age/failed-store charts are grouped by Pod, so a stale reader is visible. `snapshot_revision` is exposed numerically; do not turn each revision into a tag.
 
-4,096 is a **per-shard reference threshold**. Two shards of 2,500 make a store total of 5,000 without either hitting the default read cap. Workers may override or disable `ROLLOUT_WAL_PENDING_MAX_GENERATIONS`; confirm their deployed setting before interpreting the reference-threshold chart as cap risk. The >1,000-store count is not a measured latency threshold, and the old arbitrary count-of-20 line is not an established SLO.
+The default 4,096 read cap applies **both per shard and to the sum across all shards in a store**. Two shards of 2,500 exceed the whole-store cap even though neither exceeds it individually. Include the reference on both largest-store and largest-shard charts. `stores_with_shard_over_4096` misses aggregate-only breaches; there is currently no whole-store-over-cap count gauge. Workers may override or disable `ROLLOUT_WAL_PENDING_MAX_GENERATIONS`; confirm their deployed setting before interpreting the reference-threshold chart as cap risk. The >1,000-store count is not a measured latency threshold, and the old arbitrary count-of-20 line is not an established SLO.
 
 ## Refusals, slow reads and no data
 
-Backlog is a risk signal. Use worker HTTP response counters/application signals and latency histograms for actual responses; neither a low backlog nor a missing refusal series proves zero 503s/slow reads. In particular `rollout_reads_refused_pending_total` is recorded at a shard-cap rejection and can be incremented more than once for one request reading multiple shards. Do not label it exact refused HTTP requests/second. Its per-store series is created on an event: no series may mean no event since process start, missing collection, a wrong query or a missing process. On-demand-index counters have the same no-event versus missing-telemetry ambiguity.
+Backlog is a risk signal. Use worker HTTP response counters/application signals and latency histograms for actual responses; neither a low backlog nor a missing refusal series proves zero 503s/slow reads. In particular `rollout_reads_refused_pending_total` is recorded at a shard-cap or aggregate store-cap rejection and can be incremented more than once for one request reading multiple shards. Do not label it exact refused HTTP requests/second. Its per-store series is created on an event: no series may mean no event since process start, missing collection, a wrong query or a missing process. On-demand-index counters have the same no-event versus missing-telemetry ambiguity.
 
 Check `up`/collector health and the relevant endpoint/process coverage alongside event counters. Do not fix a missing event counter by filling an unverified scrape gap with zero. These hints exclude ingress-only failures and errors while streaming response bodies.
 
@@ -57,9 +57,9 @@ Build time-series charts with solid, thick lines and a default one-hour window. 
 | Chart title | Metric suffix | Threshold / interpretation |
 | --- | --- | --- |
 | Pending WAL generations — fleet | `generations` | No fixed threshold. |
-| Largest single-store backlog | `largest_store_generations` | No read-cap threshold; sums shards. |
+| Largest single-store backlog | `largest_store_generations` | Dashed reference at 4096; the default cap also applies to the whole-store sum. Configured caps can differ. |
 | Largest single-shard backlog | `largest_shard_generations` | Dashed reference line at 4096; configured caps can differ. |
-| Stores with a shard above 4096 | `stores_with_shard_over_4096` | Dashed line at 0; above zero indicates risk, not measured 503s. |
+| Stores with a shard above 4096 | `stores_with_shard_over_4096` | Dashed line at 0; shard risk, not measured 503s. Does not count aggregate-only cap breaches. |
 | Stores above 1000 pending | `stores_over_1000` | Includes stores above 4096. Do not label 1k–4k or imply measured slow reads. |
 | Usable backlog snapshot | `snapshot_available` | 1 = usable, 0 = unknown. Alert on sustained 0 and on no data. |
 | Stores represented | `observed_stores` | Coverage of the committed scan, not an independent registry count. |
