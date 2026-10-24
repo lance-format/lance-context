@@ -31,7 +31,9 @@ const SCHEDULER_CLAIM_MAX_CANDIDATES: usize = 64;
 const SCHEDULER_CLAIM_MAX_PAGES: usize = 4;
 // Bound advisory lookahead independently of queue pages and eligible-candidate
 // budgets. Claims are still serial CAS operations; this batches reads only.
-const CLAIM_READ_BATCH_TASKS: usize = 4;
+// Eight ordinary tasks fill the existing 64-key envelope. Dependency-heavy
+// batches still stop at the key limit below.
+const CLAIM_READ_BATCH_TASKS: usize = 8;
 const CLAIM_READ_BATCH_KEYS: usize = 64;
 
 /// Owned by one scheduler pool, never shared between kind/target filters.
@@ -3382,7 +3384,7 @@ mod tests {
         assert_eq!(p.queue_candidates, 64);
         // A blocked candidate must not require its own network round trip.
         // Includes the recovery page and queue page, not just preflight reads.
-        assert!((2..=20).contains(&p.completed_etcd_responses), "{p:?}");
+        assert!((2..=12).contains(&p.completed_etcd_responses), "{p:?}");
         assert!(snapshot
             .operations
             .values()
