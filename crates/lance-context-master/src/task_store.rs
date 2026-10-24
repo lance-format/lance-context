@@ -542,6 +542,63 @@ impl TaskStore {
             .await
     }
 
+    /// Advisory duplicate suppression for a recovery inventory page. Missing
+    /// or terminal tasks still go through the ordinary revision-guarded enqueue.
+    /// These reads never create a claim, acknowledge demand, or retire an owner.
+    pub(crate) async fn recovery_enqueue_needed(
+        &self,
+        targets: &[(TaskKind, String)],
+    ) -> lance::Result<Vec<bool>> {
+        let mut needed = vec![true; targets.len()];
+        for (batch_index, batch) in targets.chunks(CLAIM_READ_BATCH_TASKS).enumerate() {
+            // A singleton gains nothing from speculative reads.
+            if batch.len() == 1 {
+                continue;
+            }
+            let keys = batch
+                .iter()
+                .map(|(kind, target)| {
+                    self.inner
+                        .dedupe_key(*kind, target, &[])
+                        .ok_or_else(|| lance::Error::io("recovery kind does not deduplicate"))
+                })
+                .collect::<lance::Result<Vec<_>>>()?;
+            let ids = self.inner.read_values(&keys).await?;
+            let mut active = Vec::new();
+            let mut task_keys = Vec::new();
+            for (index, value) in ids.into_iter().enumerate() {
+                if let Some(value) = value {
+                    let Ok(id) = String::from_utf8(value) else {
+                        // Leave malformed entries to the ordinary per-target
+                        // path; one bad record must not suppress its neighbors.
+                        continue;
+                    };
+                    task_keys.push(self.inner.task_key(&id));
+                    active.push((index, id));
+                }
+            }
+            if task_keys.is_empty() {
+                continue;
+            }
+            let tasks = self.inner.read_values(&task_keys).await?;
+            for ((index, id), value) in active.into_iter().zip(tasks) {
+                if let Some(value) = value {
+                    let Ok(task) = decode_task(&value, &id) else {
+                        continue;
+                    };
+                    let (kind, target) = &batch[index];
+                    if task.id != id || task.kind != *kind || task.target != *target {
+                        continue;
+                    }
+                    if matches!(task.state, TaskState::Queued | TaskState::Running) {
+                        needed[batch_index * CLAIM_READ_BATCH_TASKS + index] = false;
+                    }
+                }
+            }
+        }
+        Ok(needed)
+    }
+
     /// Admit and acknowledge a writer hint atomically. An old scan page must
     /// not create another merge after a peer has served the same request.
     pub(crate) async fn enqueue_merge_request(
@@ -2858,6 +2915,162 @@ fn etcd_error(action: &'static str) -> impl FnOnce(etcd_client::Error) -> lance:
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn recovery_prefilter_retains_missing_terminal_and_malformed_work() {
+        let (_dir, store) = bounded_scheduler_store(vec![]).await;
+        let mut client = store.inner.client.clone();
+        let kinds = [
+            TaskKind::MergeWal,
+            TaskKind::Compact,
+            TaskKind::IndexId,
+            TaskKind::Repair,
+        ];
+        let mut targets = Vec::new();
+        let mut tasks = Vec::new();
+        for i in 0..11 {
+            let kind = kinds[i % kinds.len()];
+            let target = format!("prefilter-{i}");
+            tasks.push(store.enqueue(kind, &target, vec![]).await.unwrap());
+            targets.push((kind, target));
+        }
+        for (index, state) in [
+            (1, TaskState::Running),
+            (2, TaskState::Done),
+            (3, TaskState::Failed),
+        ] {
+            tasks[index].state = state;
+            client
+                .put(
+                    store.inner.task_key(&tasks[index].id),
+                    encode_task(&tasks[index]).unwrap(),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        for index in [4, 9] {
+            client
+                .delete(store.inner.task_key(&tasks[index].id), None)
+                .await
+                .unwrap();
+        }
+        let dedupe = |index: usize| {
+            store
+                .inner
+                .dedupe_key(targets[index].0, &targets[index].1, &[])
+                .unwrap()
+        };
+        client.put(dedupe(5), vec![255], None).await.unwrap();
+        client
+            .put(store.inner.task_key(&tasks[6].id), "not json", None)
+            .await
+            .unwrap();
+        let mut wrong = tasks[7].clone();
+        wrong.target = "another-target".into();
+        client
+            .put(
+                store.inner.task_key(&wrong.id),
+                encode_task(&wrong).unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .merge_coordinator()
+            .request_merge(&targets[10].1)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.recovery_enqueue_needed(&targets).await.unwrap(),
+            vec![false, false, true, true, true, true, true, true, false, true, false]
+        );
+        assert!(store
+            .merge_coordinator()
+            .get_merge_request(&targets[10].1)
+            .await
+            .unwrap()
+            .is_some());
+        // No speculative reads for a singleton; the existing enqueue handles it.
+        assert_eq!(
+            store.recovery_enqueue_needed(&targets[..1]).await.unwrap(),
+            vec![true]
+        );
+        assert!(store.recovery_enqueue_needed(&[]).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn recovery_prefilter_revisits_completed_tasks_without_losing_execution() {
+        let (_dir, store) = bounded_scheduler_store(vec![]).await;
+        let coordinator = store.merge_coordinator();
+        let mut client = store.inner.client.clone();
+        let mut targets = Vec::new();
+        let mut tasks = Vec::new();
+        for target in ["finishing", "still-active"] {
+            let mut execution = lance_context_merge::Execution::new(target, "worker", "old", 60);
+            execution.background = true;
+            assert!(coordinator.reserve_background(&execution).await.unwrap());
+            tasks.push(
+                store
+                    .enqueue(TaskKind::MergeWal, target, vec![])
+                    .await
+                    .unwrap(),
+            );
+            targets.push((TaskKind::MergeWal, target.to_string()));
+        }
+        let observed = coordinator
+            .execution_observation_page(None)
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(
+            store.recovery_enqueue_needed(&targets).await.unwrap(),
+            vec![false, false]
+        );
+        // Completion just after an advisory read is seen on the next sweep.
+        tasks[0].state = TaskState::Done;
+        client
+            .put(
+                store.inner.task_key(&tasks[0].id),
+                encode_task(&tasks[0]).unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+        coordinator.request_merge("finishing").await.unwrap();
+        assert_eq!(
+            store.recovery_enqueue_needed(&targets).await.unwrap(),
+            vec![true, false]
+        );
+        let old = observed
+            .iter()
+            .find(|row| row.execution.target == "finishing")
+            .unwrap();
+        let next = store
+            .enqueue_execution_recovery(TaskKind::MergeWal, old)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(next.id, tasks[0].id);
+        assert_eq!(
+            coordinator.get("finishing").await.unwrap().unwrap().id,
+            old.execution.id
+        );
+        assert!(coordinator
+            .get_merge_request("finishing")
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            store
+                .get_active_id(TaskKind::MergeWal, "still-active")
+                .await
+                .unwrap(),
+            Some(tasks[1].id.clone())
+        );
+    }
 
     #[tokio::test]
     #[ignore = "requires ETCD_TEST_ENDPOINTS"]

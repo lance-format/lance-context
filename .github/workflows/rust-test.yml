@@ -234,6 +234,7 @@ jobs:
           cargo test -p lance-context-master -p lance-context-server -p lance-context-merge -- --ignored \
             --skip quiet_execution_bounds_etcd_reads_without_delaying_completion \
             --skip recovery_enqueue_rechecks_execution_after_dedupe_snapshot \
+            --skip active_execution_inventory_bounds_duplicate_reads \
             --skip execution_watch_compaction_requires_fresh_snapshot_then_resumes \
             --skip task_store::tests::bounded_scheduler_compacted_snapshot_restarts_without_stealing_locks
           cargo test -p lance-context-core registry --lib -- --ignored
@@ -258,6 +259,9 @@ jobs:
             -- --exact --ignored --test-threads=1
           cargo test -p lance-context-master --lib \
             task_store::tests::recovery_enqueue_rechecks_execution_after_dedupe_snapshot \
+            -- --exact --ignored --test-threads=1
+          cargo test -p lance-context-master --lib \
+            scheduler::tests::active_execution_inventory_bounds_duplicate_reads \
             -- --exact --ignored --test-threads=1
 
       - name: Ingestion application process recovery
@@ -351,6 +355,7 @@ jobs:
             -p lance-context-master -p lance-context-server -p lance-context-merge -- --ignored \
             --skip quiet_execution_bounds_etcd_reads_without_delaying_completion \
             --skip recovery_enqueue_rechecks_execution_after_dedupe_snapshot \
+            --skip active_execution_inventory_bounds_duplicate_reads \
             --skip execution_watch_compaction_requires_fresh_snapshot_then_resumes \
             --skip task_store::tests::bounded_scheduler_compacted_snapshot_restarts_without_stealing_locks
           cargo llvm-cov --no-report --all-features \
@@ -374,6 +379,9 @@ jobs:
             --exact --ignored --test-threads=1
           cargo llvm-cov --no-report --all-features -p lance-context-master --lib -- \
             task_store::tests::recovery_enqueue_rechecks_execution_after_dedupe_snapshot \
+            --exact --ignored --test-threads=1
+          cargo llvm-cov --no-report --all-features -p lance-context-master --lib -- \
+            scheduler::tests::active_execution_inventory_bounds_duplicate_reads \
             --exact --ignored --test-threads=1
       - name: Merge coverage reports
         run: cargo llvm-cov report --lcov --output-path lcov.info
