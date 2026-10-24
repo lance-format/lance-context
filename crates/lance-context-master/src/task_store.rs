@@ -4989,6 +4989,58 @@ mod tests {
             .unwrap();
     }
 
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn generic_recovery_releases_reserved_catchup_after_claim_loss() {
+        use lance_context_merge::{Execution, MaintenanceKind, Phase};
+        let (_dir, cfg, store) = preparation_test_store().await;
+        let state = crate::state::MasterState::new(cfg).await.unwrap();
+        store
+            .enqueue(TaskKind::MergeWal, "hot", vec![])
+            .await
+            .unwrap();
+        let old_claim = store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        let coordinator = store.merge_coordinator();
+        let mut reserved = Execution::new("hot", "master:catchup", "old-instance", 600);
+        reserved.maintenance = Some(MaintenanceKind::Catchup);
+        assert!(coordinator
+            .reserve(&store.merge_claim(&old_claim), &reserved)
+            .await
+            .unwrap());
+        store.abandon_claim_for_test(old_claim).await.unwrap();
+        let recovery = store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        let proof = store.merge_claim(&recovery);
+        crate::merge_execution::recover_execution(&state, &coordinator, &proof, reserved.clone())
+            .await
+            .unwrap();
+        assert!(coordinator.get("hot").await.unwrap().is_none());
+        assert!(coordinator.start(&reserved).await.unwrap().is_none());
+        let mut late = reserved.clone();
+        late.phase = Phase::Running;
+        assert!(coordinator
+            .authorize_commit(&late, &state.rollout_uri("hot"), "base", 1)
+            .await
+            .is_err());
+        let successor = Execution::new("hot", "master:catchup", "new-instance", 600);
+        assert!(coordinator.reserve(&proof, &successor).await.unwrap());
+        let running = coordinator.start(&successor).await.unwrap().unwrap();
+        assert!(coordinator.finish(&running, Ok(0)).await.unwrap());
+        let terminal = coordinator.get("hot").await.unwrap().unwrap();
+        assert!(coordinator.release(&proof, &terminal).await.unwrap());
+        store
+            .finish(recovery, Ok("replacement completed".into()))
+            .await
+            .unwrap();
+    }
+
     async fn preparation_test_store() -> (TempDir, MasterConfig, TaskStore) {
         let dir = TempDir::new().unwrap();
         let mut cfg = config(&dir);

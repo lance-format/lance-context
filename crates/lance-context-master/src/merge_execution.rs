@@ -603,6 +603,15 @@ pub(crate) async fn recover_execution(
             return coordinator.release(proof, &old).await?.then_some(())
                 .ok_or_else(|| "claim lost before releasing terminal merge execution".to_string());
         }
+        // Protocol 2 admits no storage writes before Reserved -> Running.
+        // Cancel that exact reservation under the current recovery claim. If
+        // start raced and won, leave its ownership intact for normal fencing.
+        if old.phase == Phase::Reserved {
+            let terminal = coordinator.cancel_reserved_for_recovery(proof, &old).await?
+                .ok_or_else(|| "merge reservation or recovery claim changed before cancellation".to_string())?;
+            return coordinator.release(proof, &terminal).await?.then_some(())
+                .ok_or_else(|| "claim lost before releasing cancelled merge reservation".to_string());
+        }
         let frozen = coordinator.freeze(proof, &old).await?
             .ok_or_else(|| "merge execution changed while freezing commit admission".to_string())?;
         let watermarks = coordinator.watermarks(&frozen).await?;

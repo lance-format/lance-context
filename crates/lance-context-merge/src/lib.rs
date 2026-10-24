@@ -325,6 +325,44 @@ impl Coordinator {
         .await
     }
 
+    /// Cancel only a protocol-2 reservation that still has no admitted writer.
+    /// The claim, exact execution, and persistent target owner are compared in
+    /// one transaction. A racing start wins or loses this same execution CAS;
+    /// neither a stale recovery claim nor a late start can reclaim ownership.
+    pub async fn cancel_reserved_for_recovery(
+        &self,
+        claim: &ClaimProof,
+        execution: &Execution,
+    ) -> Result<Option<Execution>> {
+        if execution.protocol != 2 || execution.phase != Phase::Reserved {
+            return Err("recovery cancellation requires a protocol-2 reservation".into());
+        }
+        let terminal = execution.finished(Err("cancelled before admission".into()));
+        Ok(self
+            .transact(
+                vec![
+                    Compare::value(claim.key.as_str(), CompareOp::Equal, claim.token.as_bytes()),
+                    Compare::value(
+                        execution_key(&self.prefix, &execution.target),
+                        CompareOp::Equal,
+                        encode(execution),
+                    ),
+                    Compare::value(
+                        target_lock_key(&self.prefix, &execution.target),
+                        CompareOp::Equal,
+                        execution_owner(execution),
+                    ),
+                ],
+                vec![TxnOp::put(
+                    execution_key(&self.prefix, &execution.target),
+                    encode(&terminal),
+                    None,
+                )],
+            )
+            .await?
+            .then_some(terminal))
+    }
+
     /// Never delete on elapsed time, an HTTP error, or claim expiry. Both the
     /// terminal result and the current task claim must still match atomically.
     pub async fn release(&self, claim: &ClaimProof, execution: &Execution) -> Result<bool> {
@@ -679,6 +717,167 @@ mod tests {
             proof,
             lease,
         )
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn reserved_recovery_excludes_a_racing_start_and_preserves_running_permits() {
+        let (coordinator, _, proof, _) = fixture().await;
+        for mode in 0..24 {
+            let mut reserved = Execution::new("table", "master:catchup", "old", 600);
+            reserved.maintenance = Some(MaintenanceKind::Catchup);
+            assert!(coordinator.reserve(&proof, &reserved).await.unwrap());
+            let (started, cancelled) = match mode {
+                0 => {
+                    let cancelled = coordinator
+                        .cancel_reserved_for_recovery(&proof, &reserved)
+                        .await;
+                    (coordinator.start(&reserved).await, cancelled)
+                }
+                1 => {
+                    let started = coordinator.start(&reserved).await;
+                    (
+                        started,
+                        coordinator
+                            .cancel_reserved_for_recovery(&proof, &reserved)
+                            .await,
+                    )
+                }
+                _ => tokio::join!(
+                    coordinator.start(&reserved),
+                    coordinator.cancel_reserved_for_recovery(&proof, &reserved)
+                ),
+            };
+            let started = started.unwrap();
+            let cancelled = cancelled.unwrap();
+            assert_ne!(started.is_some(), cancelled.is_some());
+            if let Some(terminal) = cancelled {
+                assert_eq!(terminal.phase, Phase::Finished);
+                assert!(coordinator.start(&reserved).await.unwrap().is_none());
+                let mut late = reserved.clone();
+                late.phase = Phase::Running;
+                assert!(coordinator
+                    .authorize_commit(&late, "file:///table", "base", 7)
+                    .await
+                    .is_err());
+                assert!(coordinator.release(&proof, &terminal).await.unwrap());
+            } else {
+                let running = started.unwrap();
+                coordinator
+                    .authorize_commit(&running, "file:///table", "base", 7)
+                    .await
+                    .unwrap();
+                assert!(coordinator
+                    .cancel_reserved_for_recovery(&proof, &reserved)
+                    .await
+                    .unwrap()
+                    .is_none());
+                assert!(coordinator.release(&proof, &running).await.is_err());
+                assert_eq!(
+                    coordinator.get("table").await.unwrap(),
+                    Some(running.clone())
+                );
+                let frozen = coordinator.freeze(&proof, &running).await.unwrap().unwrap();
+                assert_eq!(
+                    coordinator.watermarks(&frozen).await.unwrap().versions["base"],
+                    7
+                );
+                assert!(coordinator
+                    .authorize_commit(&running, "file:///table", "base", 8)
+                    .await
+                    .is_err());
+                // Coordinator-only fixture: no actual storage write was issued.
+                assert!(coordinator.finish_recovery(&proof, &frozen).await.unwrap());
+                let terminal = coordinator.get("table").await.unwrap().unwrap();
+                assert!(coordinator.release(&proof, &terminal).await.unwrap());
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn reserved_recovery_rejects_expired_claim_and_unknown_protocol() {
+        let (coordinator, mut client, proof, lease) = fixture().await;
+        let mut reserved = Execution::new("table", "master:catchup", "old", 600);
+        reserved.maintenance = Some(MaintenanceKind::Catchup);
+        assert!(coordinator.reserve(&proof, &reserved).await.unwrap());
+        client.lease_revoke(lease).await.unwrap();
+        assert!(coordinator
+            .cancel_reserved_for_recovery(&proof, &reserved)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            coordinator.get("table").await.unwrap(),
+            Some(reserved.clone())
+        );
+        let next_lease = client.lease_grant(30, None).await.unwrap().id();
+        let next = ClaimProof {
+            token: "replacement".into(),
+            lease_id: next_lease,
+            ..proof.clone()
+        };
+        client
+            .put(
+                next.key.clone(),
+                next.token.clone(),
+                Some(etcd_client::PutOptions::new().with_lease(next_lease)),
+            )
+            .await
+            .unwrap();
+        assert!(coordinator
+            .cancel_reserved_for_recovery(&proof, &reserved)
+            .await
+            .unwrap()
+            .is_none());
+        // Existing records with an unknown protocol must remain protected.
+        let mut unknown = reserved.clone();
+        unknown.protocol = 0;
+        client
+            .put(
+                execution_key(&coordinator.prefix, "table"),
+                encode(&unknown),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(coordinator
+            .cancel_reserved_for_recovery(&next, &unknown)
+            .await
+            .is_err());
+        assert_eq!(coordinator.get("table").await.unwrap(), Some(unknown));
+        client
+            .put(
+                execution_key(&coordinator.prefix, "table"),
+                encode(&reserved),
+                None,
+            )
+            .await
+            .unwrap();
+        let terminal = coordinator
+            .cancel_reserved_for_recovery(&next, &reserved)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!coordinator.release(&proof, &terminal).await.unwrap());
+        assert!(coordinator.release(&next, &terminal).await.unwrap());
+        let successor = Execution::new("table", "master:catchup", "new", 600);
+        assert!(coordinator.reserve(&next, &successor).await.unwrap());
+        assert!(coordinator
+            .cancel_reserved_for_recovery(&next, &reserved)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            coordinator.get("table").await.unwrap(),
+            Some(successor.clone())
+        );
+        let terminal = coordinator
+            .cancel_reserved_for_recovery(&next, &successor)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(coordinator.release(&next, &terminal).await.unwrap());
     }
 
     #[tokio::test]
