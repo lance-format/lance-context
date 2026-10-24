@@ -2,8 +2,9 @@
 use super::*;
 use lance::dataset::{transaction::Operation, InsertBuilder, WriteMode, WriteParams};
 use lance::deps::datafusion::{
-    error::DataFusionError, execution::SendableRecordBatchStream,
-    physical_plan::stream::RecordBatchStreamAdapter,
+    error::DataFusionError,
+    execution::SendableRecordBatchStream,
+    physical_plan::stream::{RecordBatchReceiverStreamBuilder, RecordBatchStreamAdapter},
 };
 use tokio::sync::Semaphore;
 
@@ -63,8 +64,24 @@ pub(super) async fn materialize(
     write_streams(dataset, streams, reservation, phases).await
 }
 
-fn prefetch(source: SendableRecordBatchStream, _capacity: usize) -> SendableRecordBatchStream {
-    source
+fn prefetch(mut source: SendableRecordBatchStream, capacity: usize) -> SendableRecordBatchStream {
+    // Poll WAL fetches independently while the file writer encodes or uploads.
+    // The existing full-source reservation covers these queued Arrow batches;
+    // sending them transfers shared buffers without another encode or decode.
+    let mut output = RecordBatchReceiverStreamBuilder::new(source.schema(), capacity);
+    let send = output.tx();
+    output.spawn(async move {
+        while let Some(batch) = source.try_next().await? {
+            if send.send(Ok(batch)).await.is_err() {
+                break;
+            }
+        }
+        Ok(())
+    });
+    // DataFusion propagates task errors/panics and cancels the producer when
+    // its receiver is dropped. A previously started blocking decode retains
+    // its own reservation and fetch permit until it actually finishes.
+    output.build()
 }
 
 async fn write_streams(
