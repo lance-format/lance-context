@@ -43,7 +43,8 @@ Writers and scanners already publish demand events regardless of this flag
 | `planner_is_leader` | exactly one master at 1 | flaps — lease keepalive is losing to something; disable |
 | `planner_page_shrink_total` | occasional | continuous — records are larger than expected; fine, but note the shard distribution |
 | Real merge progress (`master_merge_wal_generations_reclaimed_total`, `master_rollout_append_generations_reclaimed_total`) | unchanged | drops — the planner must not be the cause (it executes nothing); look elsewhere, but disable to rule it out |
-| Pending WAL and 503s (`master_wal_pending_generations_max`, `master_stores_pending_over_read_cap`) | unchanged | worsens — same as above |
+| Pending WAL (`master_wal_backlog_generations`, `master_wal_backlog_largest_shard_generations`, with `master_wal_backlog_snapshot_available == 1`) | unchanged | worsens — same as above; unknown/missing snapshots do not prove health ([queries](../datadog-wal-backlog.md)) |
+| Actual HTTP failures and read latency | unchanged | rises — investigate response counters and latency separately; backlog above a reference threshold is not a count of 503s |
 
 ## What the comparison means
 

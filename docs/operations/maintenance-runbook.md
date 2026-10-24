@@ -26,7 +26,7 @@ restart something because it "has been running a long time", stop and check
 
 | Question | Look at |
 |---|---|
-| Is WAL piling up anywhere? | `master_wal_pending_generations_max`, `master_wal_pending_generations_total`, `master_stores_pending_over_read_cap`; per table `GET /api/v1/experiments/{name}` → `pending_wal_generations`, `fragment_count` |
+| Is WAL piling up anywhere? | `master_wal_backlog_generations`, `master_wal_backlog_largest_store_generations`, `master_wal_backlog_stores_with_shard_over_4096`; first verify `master_wal_backlog_snapshot_available == 1` ([metric semantics and Datadog queries](../datadog-wal-backlog.md)); per table `GET /api/v1/experiments/{name}` → `pending_wal_generations`, `fragment_count` |
 | Are tasks waiting instead of running? | `master_task_schedule_to_bind_seconds{kind}` (enqueue → claim). Rising with `master_task_pool_in_use{pool,state="running"}` at capacity = **capacity**. Rising with `state="claiming"` high = **the etcd claim itself is slow or blocked** (§4, admission scan). Rising with both low = **nothing eligible** (§4). |
 | Is something queued at all? | `master_task_queue_depth`; `GET /api/v1/tasks/{id}` for a specific task |
 | Is a running merge actually working? | `GET /api/v1/merge-progress?target=<name>` (§3) |
@@ -34,7 +34,7 @@ restart something because it "has been running a long time", stop and check
 | Is a table being skipped on purpose? | `GET /api/v1/scheduler/cooldowns`, `GET /api/v1/scheduler/repairs`, failure ledger `P/merge-failures/<hex>/` (§4) |
 | Did the last task fail, and how? | `GET /api/v1/tasks/{id}` → `error`; `master_tasks_total{kind,result}` |
 | Is a catch-up Job stuck? | `master_catchup_*`; `P/catchup-records/<hex>`, `P/catchup-active/<hex>`; `kubectl get job -n $CATCHUP_NAMESPACE` |
-| Is the stats view stale? | `master_scan_duration_seconds`, `master_stats_version`; `POST /api/v1/experiments/{name}/rescan` refreshes one table now |
+| Is the stats view stale? | `master_wal_backlog_snapshot_age_seconds`, `master_wal_backlog_snapshot_available`, `master_scan_duration_seconds`, `master_stats_version`; `POST /api/v1/experiments/{name}/rescan` refreshes one table now |
 | Is this replica draining? | `GET /api/v1/executor` |
 
 ## 2. Backlog is growing on a table
