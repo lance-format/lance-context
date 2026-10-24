@@ -213,12 +213,13 @@ pub(crate) async fn run_merge_wal(
                 }
             }
         }
-        let outcome = run_workers(
+        let outcome = run_workers_admitted(
             &state.http,
             &coordinator,
             &proof,
             &claim.task.target,
             &state.config.worker_endpoints,
+            Some(&state.admission),
         )
         .await;
         if outcome.is_ok()
@@ -239,7 +240,7 @@ async fn run_legacy(state: &Arc<MasterState>, claim: &TaskClaim) -> Result<Strin
     }
     let coordinator = state.task_store.merge_coordinator();
     let proof = state.task_store.merge_claim(claim);
-    run_legacy_workers_inner(
+    run_legacy_workers_admitted(
         &state.http,
         &state.config.worker_endpoints,
         &claim.task.target,
@@ -247,6 +248,9 @@ async fn run_legacy(state: &Arc<MasterState>, claim: &TaskClaim) -> Result<Strin
             coordinator: &coordinator,
             proof: &proof,
         },
+        // A manually submitted legacy task has no automatic demand consumer.
+        // Keep its original full pass rather than silently abandoning its tail.
+        (state.config.merge_wal_interval_secs > 0).then_some(&state.admission),
     )
     .await
 }
@@ -393,16 +397,44 @@ async fn run_legacy_workers(
     run_legacy_workers_inner(http, endpoints, target, LegacyOwnership::HttpTest).await
 }
 
+#[cfg(test)]
 async fn run_legacy_workers_inner(
     http: &reqwest::Client,
     endpoints: &[String],
     target: &str,
     ownership: LegacyOwnership<'_>,
 ) -> Result<String, String> {
+    run_legacy_workers_admitted(http, endpoints, target, ownership, None).await
+}
+
+// A task may span many workers. Admission is reserved separately at each turn
+// so executor drain joins only the in-flight turn, not the rest of the fleet.
+async fn run_legacy_workers_admitted(
+    http: &reqwest::Client,
+    endpoints: &[String],
+    target: &str,
+    ownership: LegacyOwnership<'_>,
+    admission: Option<&Arc<crate::admission::Admission>>,
+) -> Result<String, String> {
     let mut reclaimed = 0u64;
     let mut completed = 0usize;
     let mut unavailable = Vec::new();
+    let mut yielded = false;
     for endpoint in endpoints {
+        let _turn = match admit_worker_turn(admission, target) {
+            Ok(turn) => turn,
+            Err(()) => {
+                match &ownership {
+                    LegacyOwnership::Durable { coordinator, .. } => {
+                        coordinator.request_merge(target).await?;
+                    }
+                    #[cfg(test)]
+                    LegacyOwnership::HttpTest => unreachable!("test ownership has no drain"),
+                }
+                yielded = true;
+                break;
+            }
+        };
         let endpoint = endpoint.trim_end_matches('/');
         let reprobed = match ownership.retry(http, target, endpoint).await? {
             WorkerRetry::Deferred(deferred) => {
@@ -531,8 +563,13 @@ async fn run_legacy_workers_inner(
         }
     }
     let detail = format!(
-        "merged {reclaimed} generations across {completed}/{} workers (legacy)",
-        endpoints.len()
+        "merged {reclaimed} generations across {completed}/{} workers (legacy){}",
+        endpoints.len(),
+        if yielded {
+            "; executor draining; durable continuation requested"
+        } else {
+            ""
+        }
     );
     if unavailable.is_empty() {
         Ok(detail)
@@ -716,12 +753,41 @@ pub(crate) async fn recover_execution(
     result
 }
 
+// Use the same admission lock as begin_drain, rather than a check followed by
+// an untracked start. A turn admitted before drain retains ownership through
+// terminal acknowledgement; drain never cancels a progressing worker.
+fn admit_worker_turn(
+    admission: Option<&Arc<crate::admission::Admission>>,
+    target: &str,
+) -> Result<Option<crate::admission::Operation>, ()> {
+    match admission {
+        Some(admission) => {
+            let operation = admission.try_admit_named("merge_worker_turn").ok_or(())?;
+            operation.target(target);
+            Ok(Some(operation))
+        }
+        None => Ok(None),
+    }
+}
+
+#[cfg(test)]
 async fn run_workers(
     http: &reqwest::Client,
     coordinator: &Coordinator,
     proof: &ClaimProof,
     target: &str,
     endpoints: &[String],
+) -> Result<String, String> {
+    run_workers_admitted(http, coordinator, proof, target, endpoints, None).await
+}
+
+async fn run_workers_admitted(
+    http: &reqwest::Client,
+    coordinator: &Coordinator,
+    proof: &ClaimProof,
+    target: &str,
+    endpoints: &[String],
+    admission: Option<&Arc<crate::admission::Admission>>,
 ) -> Result<String, String> {
     if endpoints.is_empty() {
         return Err("no worker endpoints configured after reconciling recorded execution".into());
@@ -730,14 +796,29 @@ async fn run_workers(
     let mut deferred = Vec::new();
 
     let mut reclaimed = 0;
+    let mut completed = 0;
+    let mut yielded = false;
     let mut errors = Vec::new();
-    for attempt in 0..ATTEMPTS {
+    'attempts: for attempt in 0..ATTEMPTS {
         if attempt > 0 {
             tokio::time::sleep(RETRY_DELAY).await;
         }
         let mut retry = Vec::new();
-        errors.clear();
         for endpoint in pending {
+            let _turn = match admit_worker_turn(admission, target) {
+                Ok(turn) => turn,
+                Err(()) => {
+                    // Persist the tail before declaring this bounded pass done.
+                    // A failed put remains a failed canonical task. Do not clear
+                    // endpoint failure history or bypass an unresolved owner.
+                    coordinator.request_merge(target).await?;
+                    yielded = true;
+                    break 'attempts;
+                }
+            };
+            // Keep earlier retry errors for endpoints not revisited before
+            // drain. Only this endpoint's next result replaces its failure.
+            errors.retain(|(failed, _): &(String, String)| failed != &endpoint);
             // Probe at this worker's turn, not before earlier workers run:
             // their merges may take long enough for its identity to change.
             let reprobed = if attempt == 0 {
@@ -768,6 +849,9 @@ async fn run_workers(
             match outcome {
                 Ok(n) => {
                     reclaimed += n;
+                    completed += 1;
+                    metrics::counter!("master_merge_wal_generations_reclaimed_total")
+                        .increment(n as u64);
                 }
                 Err(error) => {
                     // An execution still in storage is not a failed endpoint we
@@ -792,7 +876,7 @@ async fn run_workers(
                         failure.needs_attention
                     );
                     if failure.consecutive_attempts < ATTEMPTS as u32 && !failure.needs_attention {
-                        errors.push(message);
+                        errors.push((endpoint.clone(), message));
                         retry.push(endpoint);
                     } else {
                         deferred.push(message);
@@ -805,15 +889,19 @@ async fn run_workers(
             break;
         }
     }
-    metrics::counter!("master_merge_wal_generations_reclaimed_total").increment(reclaimed as u64);
+    let mut errors: Vec<_> = errors.into_iter().map(|(_, error)| error).collect();
     errors.extend(deferred);
     if !errors.is_empty() {
         return Err(format!("merged {reclaimed} generations; {} worker(s) failed or cooling down (up to {ATTEMPTS} targeted attempts): {}", errors.len(), errors.join("; ")));
     }
     Ok(format!(
-        "merged {reclaimed} generations across {}/{} workers",
+        "merged {reclaimed} generations across {completed}/{} workers{}",
         endpoints.len(),
-        endpoints.len()
+        if yielded {
+            "; executor draining; durable continuation requested"
+        } else {
+            ""
+        }
     ))
 }
 
@@ -1156,6 +1244,136 @@ mod tests {
                 axum::serve(listener, app).await.unwrap();
             }),
         )
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn fanout_drain_before_first_turn_preserves_demand_and_failure_history() {
+        let (coordinator, proof) = fixture().await;
+        let admission = Arc::new(crate::admission::Admission::default());
+        admission.begin_drain();
+        let endpoints = vec!["http://127.0.0.1:1".to_owned()];
+        let failure = coordinator
+            .record_failure(&proof, "table", &endpoints[0], "invalid payload fixture")
+            .await
+            .unwrap();
+        for legacy in [false, true] {
+            let outcome = if legacy {
+                run_legacy_workers_admitted(
+                    &reqwest::Client::new(),
+                    &endpoints,
+                    "table",
+                    LegacyOwnership::Durable {
+                        coordinator: &coordinator,
+                        proof: &proof,
+                    },
+                    Some(&admission),
+                )
+                .await
+            } else {
+                run_workers_admitted(
+                    &reqwest::Client::new(),
+                    &coordinator,
+                    &proof,
+                    "table",
+                    &endpoints,
+                    Some(&admission),
+                )
+                .await
+            }
+            .unwrap();
+            assert!(outcome.contains("merged 0 generations across 0/1 workers"));
+            assert!(outcome.contains("durable continuation requested"));
+            assert!(coordinator
+                .get_merge_request("table")
+                .await
+                .unwrap()
+                .is_some());
+            assert!(coordinator.get("table").await.unwrap().is_none());
+            let after = coordinator
+                .failure("table", &endpoints[0])
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(after.consecutive_attempts, failure.consecutive_attempts);
+            assert_eq!(after.next_retry_ms, failure.next_retry_ms);
+            assert_eq!(after.last_error, failure.last_error);
+        }
+        assert!(admission.status().drained());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn fanout_drain_before_retry_retains_real_failure() {
+        let (coordinator, proof) = fixture().await;
+        let admission = Arc::new(crate::admission::Admission::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/api/v1/internal/merge-executor",
+                get(|| async {
+                    Json(
+                        serde_json::json!({"protocol":2,"instance":"test","timeout_secs":60,
+                    "queue_timeout_secs":60,"idle_timeout_secs":60,"progress_protocol":1,
+                    "owned_targets":["table"]}),
+                    )
+                }),
+            )
+            .route(
+                "/api/v1/internal/merge-executor/start",
+                post({
+                    let coordinator = coordinator.clone();
+                    let admission = admission.clone();
+                    let calls = calls.clone();
+                    move |Json(execution): Json<Execution>| {
+                        let coordinator = coordinator.clone();
+                        let admission = admission.clone();
+                        let calls = calls.clone();
+                        async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            let running = coordinator.start(&execution).await.unwrap().unwrap();
+                            assert!(coordinator
+                                .finish(&running, Err("injected shard failure".into()))
+                                .await
+                                .unwrap());
+                            admission.begin_drain();
+                            axum::http::StatusCode::ACCEPTED
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let result = run_workers_admitted(
+            &reqwest::Client::new(),
+            &coordinator,
+            &proof,
+            "table",
+            std::slice::from_ref(&endpoint),
+            Some(&admission),
+        )
+        .await;
+        server.abort();
+        let _ = server.await;
+        assert!(result.unwrap_err().contains("injected shard failure"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(coordinator
+            .get_merge_request("table")
+            .await
+            .unwrap()
+            .is_some());
+        assert!(coordinator.get("table").await.unwrap().is_none());
+        assert_eq!(
+            coordinator
+                .failure("table", &endpoint)
+                .await
+                .unwrap()
+                .unwrap()
+                .consecutive_attempts,
+            1
+        );
+        assert!(admission.status().drained());
     }
 
     async fn fixture() -> (Coordinator, ClaimProof) {

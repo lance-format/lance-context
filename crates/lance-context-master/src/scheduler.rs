@@ -4507,6 +4507,143 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn executor_drain_does_not_start_another_worker_in_same_fanout() {
+        fanout_drain_continues_on_successor(true).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn executor_drain_stops_durable_legacy_fanout_and_continues_on_successor() {
+        fanout_drain_continues_on_successor(false).await;
+    }
+
+    async fn fanout_drain_continues_on_successor(owned: bool) {
+        use axum::{routing::post, Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(Semaphore::new(0));
+        let second_calls = Arc::new(AtomicUsize::new(0));
+        let first = Router::new().route(
+            "/api/v1/internal/merge-wal/{name}",
+            post({
+                let started = started.clone();
+                let release = release.clone();
+                move || {
+                    let started = started.clone();
+                    let release = release.clone();
+                    async move {
+                        started.notify_one();
+                        release.acquire().await.unwrap().forget();
+                        Json(serde_json::json!({"reclaimed": 3}))
+                    }
+                }
+            }),
+        );
+        let second = Router::new().route(
+            "/api/v1/internal/merge-wal/{name}",
+            post({
+                let calls = second_calls.clone();
+                move || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    async { Json(serde_json::json!({"reclaimed": 5})) }
+                }
+            }),
+        );
+        let first_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.merge_wal_concurrency = 1;
+        if !owned {
+            cfg.merge_rollout.owned_targets.clear();
+            cfg.merge_wal_interval_secs = 3600;
+        }
+        cfg.worker_endpoints = vec![
+            format!("http://{}", first_listener.local_addr().unwrap()),
+            format!("http://{}", second_listener.local_addr().unwrap()),
+        ];
+        let first = owned_stub(first.clone(), &cfg).await.merge(first);
+        let second = owned_stub(second.clone(), &cfg).await.merge(second);
+        let first_server = tokio::spawn(async move {
+            axum::serve(first_listener, first).await.unwrap();
+        });
+        let second_server = tokio::spawn(async move {
+            axum::serve(second_listener, second).await.unwrap();
+        });
+        let state = MasterState::new(cfg.clone()).await.unwrap();
+        let scheduler = spawn_scheduler(&state);
+        let current = enqueue(&state, TaskKind::MergeWal, "exp").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), started.notified())
+            .await
+            .unwrap();
+        state.admission.begin_drain();
+        release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(10), state.admission.wait_drained())
+            .await
+            .unwrap();
+        let task = state.task_store.get(&current.id).await.unwrap().unwrap();
+        let demand = state
+            .task_store
+            .merge_coordinator()
+            .get_merge_request("exp")
+            .await
+            .unwrap();
+        let before_successor = second_calls.load(Ordering::SeqCst);
+        // Enqueue from the persisted hint using the same canonical admission
+        // used by the periodic recovery scan; no new manual merge task.
+        let other = MasterState::new(cfg).await.unwrap();
+        let coordinator = other.task_store.merge_coordinator();
+        let continuation = if let Some(ref demand) = demand {
+            enqueue_merge_request(&other, &coordinator, demand)
+                .await
+                .unwrap();
+            other
+                .task_store
+                .get_active_id(TaskKind::MergeWal, "exp")
+                .await
+                .unwrap()
+        } else {
+            None
+        };
+        release.add_permits(1);
+        let successor = spawn_scheduler(&other);
+        let terminal = match continuation.as_ref() {
+            Some(id) => Some(await_terminal(&other, id).await),
+            None => None,
+        };
+        other.admission.begin_drain();
+        tokio::time::timeout(Duration::from_secs(10), other.admission.wait_drained())
+            .await
+            .unwrap();
+        for handle in [scheduler, successor, first_server, second_server] {
+            handle.abort();
+            let _ = handle.await;
+        }
+        assert_eq!(
+            before_successor, 0,
+            "draining must finish the admitted worker without starting the next worker"
+        );
+        assert_eq!(task.state, TaskState::Done);
+        let detail = task.detail.unwrap();
+        assert!(detail.contains("merged 3 generations across 1/2 workers"));
+        assert!(detail.contains("durable continuation requested"));
+        assert_eq!(terminal.unwrap().state, TaskState::Done);
+        assert_eq!(second_calls.load(Ordering::SeqCst), 1);
+        assert!(coordinator
+            .get_merge_request("exp")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(coordinator.get("exp").await.unwrap().is_none());
+        assert!(
+            demand.is_some(),
+            "unvisited workers need durable continuation demand"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
     async fn executor_drain_finishes_current_merge_and_leaves_queue_for_other_master() {
         use axum::{routing::post, Json, Router};
         let started = Arc::new(tokio::sync::Notify::new());
