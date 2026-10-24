@@ -547,6 +547,30 @@ impl TaskStore {
             .await
     }
 
+    pub(crate) async fn enqueue_failure_recovery(
+        &self,
+        kind: TaskKind,
+        observed: &lance_context_merge::failure::FailureObservation,
+    ) -> lance::Result<Option<TaskRecord>> {
+        if observed.revision <= 0 {
+            return Err(lance::Error::io("recovery requires a failure revision"));
+        }
+        let failure = &observed.failure;
+        let key = lance_context_merge::failure::failure_key(
+            &self.inner.prefix,
+            &failure.target,
+            &failure.endpoint,
+        );
+        self.inner
+            .enqueue_guarded(
+                kind,
+                &failure.target,
+                Vec::new(),
+                Some((key, observed.revision)),
+            )
+            .await
+    }
+
     /// Advisory duplicate suppression for a recovery inventory page. Missing
     /// or terminal tasks still go through the ordinary revision-guarded enqueue.
     /// These reads never create a claim, acknowledge demand, or retire an owner.
@@ -2958,6 +2982,109 @@ fn etcd_error(action: &'static str) -> impl FnOnce(etcd_client::Error) -> lance:
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn failure_recovery_observation_preserves_new_budget_and_writer_demand() {
+        use lance_context_merge::failure::{failure_key, FailureClass, ShardFailure};
+        let (_dir, store) = bounded_scheduler_store(vec![]).await;
+        let c = store.merge_coordinator();
+        let mut client = store.inner.client.clone();
+        for kind in [
+            TaskKind::MergeWal,
+            TaskKind::Compact,
+            TaskKind::IndexId,
+            TaskKind::Repair,
+        ] {
+            let target = format!("failure-{}", kind_label(kind));
+            let key = failure_key(&store.inner.prefix, &target, "worker");
+            let mut failure = ShardFailure {
+                target: target.clone(),
+                endpoint: "worker".into(),
+                consecutive_attempts: 1,
+                class: FailureClass::Retryable,
+                last_error: "transport failure".into(),
+                last_failure_ms: 1,
+                next_retry_ms: 0,
+                needs_attention: false,
+            };
+            client
+                .put(key.clone(), serde_json::to_vec(&failure).unwrap(), None)
+                .await
+                .unwrap();
+            let old = c
+                .failure_observation_page(None, 256)
+                .await
+                .unwrap()
+                .0
+                .into_iter()
+                .find(|row| row.failure.target == target)
+                .unwrap();
+            failure.consecutive_attempts = 15;
+            failure.next_retry_ms = lance_context_merge::failure::now_ms() + 60_000;
+            client
+                .put(key.clone(), serde_json::to_vec(&failure).unwrap(), None)
+                .await
+                .unwrap();
+            c.request_merge(&target).await.unwrap();
+            let request = c.get_merge_request(&target).await.unwrap().unwrap();
+            assert!(store
+                .enqueue_failure_recovery(kind, &old)
+                .await
+                .unwrap()
+                .is_none());
+            assert!(store.get_active_id(kind, &target).await.unwrap().is_none());
+            let seen = c.failure(&target, "worker").await.unwrap().unwrap();
+            assert_eq!(seen.consecutive_attempts, 15);
+            assert_eq!(seen.next_retry_ms, failure.next_retry_ms);
+            assert_eq!(
+                c.get_merge_request(&target)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .revision,
+                request.revision
+            );
+            // A current due observation still gets one deduplicated recovery.
+            failure.next_retry_ms = 0;
+            client
+                .put(key.clone(), serde_json::to_vec(&failure).unwrap(), None)
+                .await
+                .unwrap();
+            let fresh = c
+                .failure_observation_page(None, 256)
+                .await
+                .unwrap()
+                .0
+                .into_iter()
+                .find(|row| row.failure.target == target)
+                .unwrap();
+            let (a, b) = tokio::join!(
+                store.enqueue_failure_recovery(kind, &fresh),
+                store.enqueue_failure_recovery(kind, &fresh)
+            );
+            let a = a.unwrap().unwrap();
+            assert_eq!(a.id, b.unwrap().unwrap().id);
+            client.delete(key, None).await.unwrap();
+            assert!(store
+                .enqueue_failure_recovery(kind, &fresh)
+                .await
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                store.get_active_id(kind, &target).await.unwrap(),
+                Some(a.id)
+            );
+            assert_eq!(
+                c.get_merge_request(&target)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .revision,
+                request.revision
+            );
+        }
+    }
 
     #[tokio::test]
     #[ignore = "requires ETCD_TEST_ENDPOINTS"]

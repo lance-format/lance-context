@@ -1129,6 +1129,24 @@ async fn should_probe_failure(
     false
 }
 
+async fn enqueue_failure_recovery(
+    state: &Arc<MasterState>,
+    kind: TaskKind,
+    observed: &lance_context_merge::failure::FailureObservation,
+) -> lance::Result<()> {
+    if state
+        .task_store
+        .enqueue_failure_recovery(kind, observed)
+        .await?
+        .is_some()
+    {
+        metrics::counter!("master_task_enqueued_total", "kind" => kind_label(kind)).increment(1);
+    } else {
+        metrics::counter!("master_failure_recovery_enqueue_superseded_total", "kind" => kind_label(kind)).increment(1);
+    }
+    Ok(())
+}
+
 pub(crate) async fn enqueue_merge_request(
     state: &Arc<MasterState>,
     coordinator: &lance_context_merge::Coordinator,
@@ -1399,11 +1417,15 @@ pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
                 }
                 Err(error) => tracing::warn!(%error, "local execution recovery scan failed"),
             }
-            match coordinator.failure_page(cursor.as_deref(), 256).await {
+            match coordinator
+                .failure_observation_page(cursor.as_deref(), 256)
+                .await
+            {
                 Ok((rows, next)) => {
                     cursor = next;
                     let mut targets = std::collections::HashSet::new();
-                    for failure in rows {
+                    for observed in rows {
+                        let failure = &observed.failure;
                         let task_kind = crate::maintenance_execution::retry_kind(&failure.endpoint)
                             .or_else(|| {
                                 retry_state
@@ -1417,10 +1439,10 @@ pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
                         };
                         if failure.next_retry_ms <= lance_context_merge::failure::now_ms()
                             && targets.insert((failure.target.clone(), kind_label(task_kind)))
-                            && should_probe_failure(&retry_state, &failure).await
+                            && should_probe_failure(&retry_state, failure).await
                         {
                             if let Err(error) =
-                                enqueue(&retry_state, task_kind, &failure.target).await
+                                enqueue_failure_recovery(&retry_state, task_kind, &observed).await
                             {
                                 tracing::warn!(target = %failure.target, %error, "maintenance recovery enqueue failed");
                             }
@@ -2753,6 +2775,68 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "released execution inventory must not create a fresh zero-work fanout"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn stale_failure_inventory_does_not_recreate_recovered_work() {
+        use lance_context_merge::failure::{FailureClass, ShardFailure};
+        let dir = TempDir::new().unwrap();
+        let cfg = config(&dir);
+        let mut client = etcd_client::Client::connect(&cfg.etcd.etcd_endpoints, None)
+            .await
+            .unwrap();
+        let hex = |s: &str| {
+            s.as_bytes()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        let key = format!(
+            "{}/merge-failures/{}/{}",
+            cfg.etcd.etcd_prefix,
+            hex("exp"),
+            hex("worker")
+        );
+        let state = MasterState::new(cfg).await.unwrap();
+        let coordinator = state.task_store.merge_coordinator();
+        let failure = ShardFailure {
+            target: "exp".into(),
+            endpoint: "worker".into(),
+            consecutive_attempts: 1,
+            class: FailureClass::Retryable,
+            last_error: "temporary transport failure".into(),
+            last_failure_ms: 1,
+            next_retry_ms: 0,
+            needs_attention: false,
+        };
+        client
+            .put(key.clone(), serde_json::to_vec(&failure).unwrap(), None)
+            .await
+            .unwrap();
+        let observed = coordinator
+            .failure_observation_page(None, 256)
+            .await
+            .unwrap()
+            .0
+            .remove(0);
+        assert!(observed.failure.next_retry_ms <= lance_context_merge::failure::now_ms());
+        assert!(should_probe_failure(&state, &observed.failure).await);
+        // Successful recovery removes the durable failure after this scanner's
+        // page was read. The old page is not fresh demand.
+        client.delete(key, None).await.unwrap();
+        enqueue_failure_recovery(&state, TaskKind::MergeWal, &observed)
+            .await
+            .unwrap();
+        assert!(
+            state
+                .task_store
+                .get_active_id(TaskKind::MergeWal, "exp")
+                .await
+                .unwrap()
+                .is_none(),
+            "cleared failure inventory must not recreate zero-work tasks"
         );
     }
 
