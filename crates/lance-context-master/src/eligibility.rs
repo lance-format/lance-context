@@ -28,6 +28,9 @@ pub enum Skip {
     OwnershipBlocked,
     /// Only MergeWal reconciles a worker (non-maintenance) execution.
     WorkerExecutionNeedsMerge,
+    /// An unfenced legacy worker may still be writing; this poller cannot
+    /// reconcile it until the durable record contains a terminal acknowledgement.
+    LegacyExecutionUnacknowledged,
 }
 
 /// Static per-target scheduling configuration consulted by the filter.
@@ -144,6 +147,30 @@ pub fn claim_shape(
     }
 }
 
+/// Keep demand queued when dispatch would only reject a retained legacy
+/// execution. Reuse the ownership snapshot; never probe or release its writer.
+/// Owned, fenced and draining paths retain their existing recovery behavior.
+pub fn execution_filter(
+    kind: TaskKind,
+    target: &str,
+    rollout: &MergeRollout,
+    execution: Option<&lance_context_merge::Execution>,
+) -> Result<(), Skip> {
+    if kind == TaskKind::MergeWal
+        && !rollout.owned(target)
+        && !rollout.draining(target)
+        && !rollout.fence_legacy
+        && execution.is_some_and(|e| {
+            e.protocol == 0
+                && e.maintenance.is_none()
+                && e.phase != lance_context_merge::Phase::Finished
+        })
+    {
+        return Err(Skip::LegacyExecutionUnacknowledged);
+    }
+    Ok(())
+}
+
 /// Filter applied after the seven-key ownership snapshot.
 ///
 /// `expected_owner` is the `merge-execution:{id}` owner string when a merge
@@ -191,6 +218,75 @@ pub fn admission_filter(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_legacy_execution_defers_only_unacknowledged_legacy_dispatch() {
+        use lance_context_merge::{Execution, MaintenanceKind, Phase};
+        let mut execution = Execution::new("hot", "worker", "legacy-http", 600);
+        execution.protocol = 0;
+        let default = MergeRollout::default();
+        for phase in [
+            Phase::Reserved,
+            Phase::Running,
+            Phase::Uncertain,
+            Phase::Recovering,
+            Phase::Recovered,
+        ] {
+            execution.phase = phase;
+            assert_eq!(
+                execution_filter(TaskKind::MergeWal, "hot", &default, Some(&execution)),
+                Err(Skip::LegacyExecutionUnacknowledged)
+            );
+        }
+        for config in [
+            MergeRollout {
+                owned_targets: vec!["hot".into()],
+                ..Default::default()
+            },
+            MergeRollout {
+                drain_targets: vec!["hot".into()],
+                ..Default::default()
+            },
+            MergeRollout {
+                fence_legacy: true,
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(
+                execution_filter(TaskKind::MergeWal, "hot", &config, Some(&execution)),
+                Ok(())
+            );
+        }
+        for kind in [TaskKind::Compact, TaskKind::IndexId, TaskKind::Repair] {
+            assert_eq!(
+                execution_filter(kind, "hot", &default, Some(&execution)),
+                Ok(())
+            );
+        }
+        execution.phase = Phase::Finished;
+        assert_eq!(
+            execution_filter(TaskKind::MergeWal, "hot", &default, Some(&execution)),
+            Ok(())
+        );
+        execution.phase = Phase::Running;
+        for protocol in [1, 2, 3] {
+            execution.protocol = protocol;
+            assert_eq!(
+                execution_filter(TaskKind::MergeWal, "hot", &default, Some(&execution)),
+                Ok(())
+            );
+        }
+        execution.protocol = 0;
+        execution.maintenance = Some(MaintenanceKind::Compact);
+        assert_eq!(
+            execution_filter(TaskKind::MergeWal, "hot", &default, Some(&execution)),
+            Ok(())
+        );
+        assert_eq!(
+            execution_filter(TaskKind::MergeWal, "hot", &default, None),
+            Ok(())
+        );
+    }
 
     fn rollout(owned: &[&str], draining: &[&str]) -> MergeRollout {
         MergeRollout {
