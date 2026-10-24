@@ -95,7 +95,7 @@ pub(crate) fn spawn_scan_demand(
     });
 }
 
-/// Base-table index read for the merged watermarks plus one etcd put per shard.
+/// Base index and bounded shard-manifest reads, plus one etcd join per shard.
 const MERGED_PUBLISH_TIMEOUT: Duration = Duration::from_secs(15);
 
 static MERGED_PUBLISH_SLOTS: std::sync::LazyLock<Arc<Semaphore>> =
@@ -115,14 +115,16 @@ pub(crate) fn spawn_merged_demand(coordinator: Coordinator, target: String, uri:
     tokio::spawn(async move {
         let _permit = permit;
         let result = tokio::time::timeout(MERGED_PUBLISH_TIMEOUT, async {
-            let marks = lance_context_core::rollout_append::merged_watermarks(&uri)
+            let marks = lance_context_core::read_demand_watermarks(&uri)
                 .await
                 .map_err(|e| e.to_string())?;
             let merged: Vec<ShardMerged> = marks
                 .into_iter()
-                .map(|(shard, generation)| ShardMerged {
-                    shard: shard.to_string(),
-                    merged_through: generation,
+                .filter_map(|mark| {
+                    mark.merged_through.map(|generation| ShardMerged {
+                        shard: mark.shard_id.to_string(),
+                        merged_through: generation,
+                    })
                 })
                 .collect();
             let mut written = 0usize;

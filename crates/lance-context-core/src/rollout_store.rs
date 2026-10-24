@@ -4061,6 +4061,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_base_index_metadata_does_not_publish_zero_watermarks() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut store = RolloutStore::open(uri).await.unwrap();
+        store.add(&[assistant_record("first")]).await.unwrap();
+        store.flush().await.unwrap();
+        store.close().await.unwrap();
+        // Disable metadata caching so a real missing index object cannot be
+        // masked by the metadata loaded while opening the dataset.
+        let dataset = lance::dataset::builder::DatasetBuilder::from_uri(uri)
+            .with_read_params(lance::dataset::ReadParams {
+                index_cache_size_bytes: 0,
+                metadata_cache_size_bytes: 0,
+                ..Default::default()
+            })
+            .load()
+            .await
+            .unwrap();
+        assert!(dataset.manifest.index_section.is_some());
+        let manifest_path =
+            std::path::Path::new("/").join(dataset.manifest_location().path.as_ref());
+        assert!(manifest_path.starts_with(dir.path()));
+        std::fs::remove_file(manifest_path).unwrap();
+        assert!(crate::wal_watermarks::from_dataset(&dataset).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn demand_watermarks_preserve_flush_between_prepare_and_commit() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut writer = RolloutStore::open_with_options(
+            uri,
+            RolloutStoreOptions {
+                merge_after_generations: Some(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        writer.add(&[assistant_record("first")]).await.unwrap();
+        writer.flush().await.unwrap();
+        let (manifests, manifest, prepared) =
+            writer.prepare_merge_if_ready(1).await.unwrap().unwrap();
+        writer.add(&[assistant_record("second")]).await.unwrap();
+        writer.flush().await.unwrap();
+        assert_eq!(
+            writer
+                .commit_prepared_merge(&manifests, &manifest, prepared)
+                .await
+                .unwrap(),
+            1
+        );
+        let marks = crate::read_demand_watermarks(uri).await.unwrap();
+        assert_eq!(marks.len(), 1);
+        assert_eq!(marks[0].sealed_through, 2);
+        assert_eq!(marks[0].merged_through, Some(1));
+        assert_eq!(marks[0].pending_generations, 1);
+        for id in ["first", "second"] {
+            assert_eq!(writer.get_by_id(id).await.unwrap().unwrap().id, id);
+        }
+        writer.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shard_watermarks_reconcile_upsert_merges_without_append_cutover() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let options = RolloutStoreOptions {
+            shard_id: Some("watermark-writer".into()),
+            merge_after_generations: Some(0),
+            merge_max_generations: Some(1),
+            ..Default::default()
+        };
+        let mut writer = RolloutStore::open_with_options(uri, options.clone())
+            .await
+            .unwrap();
+        for id in ["first", "second"] {
+            writer.add(&[assistant_record(id)]).await.unwrap();
+            writer.flush().await.unwrap();
+        }
+        let reader = RolloutStore::open_existing_with_options(uri, Default::default())
+            .await
+            .unwrap();
+        assert_eq!(writer.cleanup_own_shard().await.unwrap(), 1);
+        assert!(crate::rollout_append::merged_watermarks(uri)
+            .await
+            .unwrap()
+            .is_empty());
+        let marks = reader.all_shard_watermarks().await.unwrap();
+        assert_eq!(marks.len(), 1);
+        assert_eq!(marks[0].sealed_through, 2);
+        assert_eq!(marks[0].pending_generations, 1);
+        assert_eq!(marks[0].merged_through, Some(1));
+        assert_eq!(crate::read_demand_watermarks(uri).await.unwrap(), marks);
+
+        assert_eq!(writer.cleanup_own_shard().await.unwrap(), 1);
+        let marks = reader.all_shard_watermarks().await.unwrap();
+        assert_eq!(marks[0].sealed_through, 2);
+        assert_eq!(marks[0].pending_generations, 0);
+        assert_eq!(marks[0].merged_through, Some(2));
+        assert_eq!(crate::read_demand_watermarks(uri).await.unwrap(), marks);
+        let epoch = marks[0].writer_epoch;
+        writer.close().await.unwrap();
+        let mut writer = RolloutStore::open_with_options(uri, options).await.unwrap();
+        writer.add(&[assistant_record("third")]).await.unwrap();
+        let unsealed = reader.all_shard_watermarks().await.unwrap();
+        assert_eq!(unsealed[0].sealed_through, 2);
+        assert_eq!(unsealed[0].merged_through, Some(2));
+        writer.flush().await.unwrap();
+        let marks = reader.all_shard_watermarks().await.unwrap();
+        assert!(marks[0].writer_epoch > epoch);
+        assert_eq!(marks[0].sealed_through, 3);
+        assert_eq!(marks[0].pending_generations, 1);
+        assert_eq!(marks[0].merged_through, Some(2));
+        for id in ["first", "second", "third"] {
+            assert_eq!(reader.get_by_id(id).await.unwrap().unwrap().id, id);
+        }
+        let mut pinned = reader;
+        pinned.checkout(pinned.version()).await.unwrap();
+        assert!(pinned.all_shard_watermarks().await.unwrap().is_empty());
+        writer.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn observe_refreshes_base_after_peer_merge_and_honors_pinning() {
         let dir = TempDir::new().unwrap();
         let uri = dir.path().to_str().unwrap();

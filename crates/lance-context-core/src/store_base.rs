@@ -224,13 +224,13 @@ pub const DEFAULT_PENDING_GENERATIONS_MAX: usize = 4096;
 pub struct ShardWatermark {
     pub shard_id: Uuid,
     pub writer_epoch: u64,
-    /// Highest flushed generation number; 0 when none are flushed.
+    /// Highest flushed generation number, retained after drain; 0 before any flush.
     pub sealed_through: u64,
     /// Flushed generations not yet merged into the base table.
     pub pending_generations: usize,
-    /// Highest generation the base table's MemWAL index records as merged
-    /// for this shard, when the caller read the base index. `None` means
-    /// "not read", not "nothing merged".
+    /// Conservative completed prefix from the base index and durable shard drain.
+    /// Advisory only, never a replay/commit fence. `None` means unobserved;
+    /// `Some(0)` means no completed prefix was established.
     pub merged_through: Option<u64>,
 }
 
@@ -2318,50 +2318,7 @@ impl StorageBase {
         if self.is_version_pinned() {
             return Ok(Vec::new());
         }
-        // The base table's MemWAL index is the authority on what has been
-        // merged. A scan must report it, or a lost completion event leaves
-        // a fully merged shard looking pending forever, and an old table's
-        // first contact reads generation 1001 as 1001 pending.
-        let merged = Arc::new(
-            crate::rollout_append::watermarks(&self.dataset)
-                .await
-                .unwrap_or_default(),
-        );
-        let object_store = self.dataset.object_store(None).await?;
-        let branch_path = self.dataset.branch_location().path.clone();
-        let shard_ids = self.dataset.list_mem_wal_latest_shard_ids().await?;
-        let marks: Vec<Option<ShardWatermark>> = stream::iter(shard_ids)
-            .map(|shard_id| {
-                let object_store = object_store.clone();
-                let branch_path = branch_path.clone();
-                let merged = merged.clone();
-                async move {
-                    let manifest_store = ShardManifestStore::new(
-                        object_store,
-                        &branch_path,
-                        shard_id,
-                        DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
-                    );
-                    Ok::<_, LanceError>(manifest_store.refresh_latest().await?.map(|manifest| {
-                        ShardWatermark {
-                            shard_id: manifest.shard_id,
-                            writer_epoch: manifest.writer_epoch,
-                            sealed_through: manifest
-                                .sstables
-                                .iter()
-                                .map(|g| g.generation)
-                                .max()
-                                .unwrap_or(0),
-                            pending_generations: manifest.sstables.len(),
-                            merged_through: merged.get(&manifest.shard_id).copied(),
-                        }
-                    }))
-                }
-            })
-            .buffer_unordered(8)
-            .try_collect()
-            .await?;
-        Ok(marks.into_iter().flatten().collect())
+        crate::wal_watermarks::from_dataset(&self.dataset).await
     }
 
     /// Read the latest manifest for every MemWAL shard. Manifest reads are
