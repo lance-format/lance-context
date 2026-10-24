@@ -431,30 +431,64 @@ async fn watch_maintenance_preparation(
     claim: &TaskClaim,
     scope: &lance_context_core::merge_write_scope::MergeWriteScope,
 ) -> String {
+    watch_preparation_ownership(
+        scope,
+        Duration::from_secs(state.config.maintenance.maintenance_idle_timeout_secs),
+        || state.task_store.preparation_owned(claim),
+    )
+    .await
+}
+
+/// A read failure is uncertainty, not proof of lease loss. Preparation cannot
+/// commit a manifest (PreparationOnly); allow one retry at the existing probe
+/// cadence while every eventual promotion still validates the exact token.
+pub(crate) async fn watch_preparation_ownership<F, Fut>(
+    scope: &lance_context_core::merge_write_scope::MergeWriteScope,
+    idle_budget: Duration,
+    mut probe: F,
+) -> String
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = lance::Result<bool>>,
+{
     let mut sequence = scope.completed_steps();
     if sequence > 0 {
         crate::merge_capacity::observed_work();
     }
     let mut changed = std::time::Instant::now();
+    let mut read_failed = false;
     loop {
         tokio::time::sleep(Duration::from_secs(2)).await;
-        match state.task_store.preparation_owned(claim).await {
-            Ok(true) => {}
-            Ok(false) => return "maintenance preparation claim lost".into(),
-            Err(error) => return error.to_string(),
-        }
+        let ownership = probe().await;
         let current = scope.completed_steps();
         if current > sequence {
             crate::merge_capacity::observed_work();
-        }
-        if current != sequence {
             changed = std::time::Instant::now();
             sequence = current;
         }
-        if changed.elapsed()
-            >= Duration::from_secs(state.config.maintenance.maintenance_idle_timeout_secs)
-        {
+        // Neither an ownership response nor a retry resets actual-work idle.
+        // Check after the RPC too: its elapsed time is part of the idle budget.
+        if changed.elapsed() >= idle_budget {
             return "maintenance preparation made no progress".into();
+        }
+        match ownership {
+            Ok(true) => {
+                if read_failed {
+                    metrics::counter!("master_preparation_ownership_read_recovered_total")
+                        .increment(1);
+                }
+                read_failed = false;
+            }
+            Ok(false) => return "maintenance preparation claim lost".into(),
+            Err(error) => {
+                metrics::counter!("master_preparation_ownership_read_errors_total").increment(1);
+                if read_failed {
+                    return format!("maintenance preparation ownership read failed twice: {error}");
+                }
+                read_failed = true;
+                tracing::warn!(%error,
+                    "maintenance preparation ownership read failed; retrying once without resetting progress");
+            }
         }
     }
 }
@@ -5381,5 +5415,92 @@ mod tests {
             artifact_type: None,
             metadata: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod preparation_ownership_tests {
+    use super::*;
+    use lance_context_core::merge_write_scope::{checkpoint, MergeWriteScope};
+
+    #[tokio::test]
+    async fn preparation_read_retry_is_bounded_and_lease_loss_is_terminal() {
+        for (responses, expected, expected_calls) in [
+            (vec![Ok(false)], "claim lost", 1),
+            (
+                vec![Err("first timeout"), Err("second timeout")],
+                "ownership read failed twice",
+                2,
+            ),
+        ] {
+            let scope = MergeWriteScope::new();
+            let mut replies: VecDeque<_> = responses.into();
+            let mut calls = 0;
+            let result = tokio::time::timeout(
+                Duration::from_secs(8),
+                watch_preparation_ownership(&scope, Duration::from_secs(20), || {
+                    calls += 1;
+                    std::future::ready(replies.pop_front().unwrap().map_err(lance::Error::io))
+                }),
+            )
+            .await
+            .unwrap();
+            assert!(result.contains(expected), "{result}");
+            assert_eq!(calls, expected_calls);
+        }
+    }
+
+    #[tokio::test]
+    async fn productive_preparation_survives_read_errors_but_not_replaced_owner() {
+        let scope = MergeWriteScope::new();
+        let mut replies = VecDeque::from([
+            Err("etcd timeout"),
+            Ok(true),
+            Err("later etcd timeout"),
+            Ok(false),
+        ]);
+        let mut calls = 0;
+        let work = async {
+            loop {
+                scope.run(async { checkpoint() }).await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
+        let watch = watch_preparation_ownership(&scope, Duration::from_secs(3), || {
+            calls += 1;
+            std::future::ready(replies.pop_front().unwrap().map_err(lance::Error::io))
+        });
+        let result = tokio::time::timeout(Duration::from_secs(12), async {
+            tokio::select! {
+                result = watch => result,
+                () = work => unreachable!(),
+            }
+        })
+        .await
+        .unwrap();
+        assert!(result.contains("claim lost"), "{result}");
+        assert_eq!(calls, 4);
+        assert!(scope.completed_steps() > 4);
+    }
+
+    #[tokio::test]
+    async fn preparation_read_retry_does_not_keep_idle_work_alive() {
+        let scope = MergeWriteScope::new();
+        let mut calls = 0;
+        let result = tokio::time::timeout(
+            Duration::from_secs(8),
+            watch_preparation_ownership(&scope, Duration::from_secs(3), || {
+                calls += 1;
+                std::future::ready(if calls == 1 {
+                    Err(lance::Error::io("etcd timeout"))
+                } else {
+                    Ok(true)
+                })
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(result.contains("made no progress"), "{result}");
+        assert_eq!(calls, 2);
     }
 }

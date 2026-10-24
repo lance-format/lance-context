@@ -2883,6 +2883,94 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires loopback ETCD_TEST_ENDPOINTS"]
+    async fn preparation_watch_recovers_transport_but_rejects_replaced_lease() {
+        use lance_context_core::merge_write_scope::{checkpoint, MergeWriteScope};
+        let (_dir, mut cfg, _) = preparation_test_store().await;
+        let upstream = cfg.etcd.etcd_endpoints[0].clone();
+        let proxy = LeaseTestProxy::start(&upstream).await;
+        let observer = Client::connect([upstream], None).await.unwrap();
+        cfg.etcd.etcd_endpoints = vec![proxy.endpoint.clone()];
+        let store = TaskStore::open(&cfg).await.unwrap();
+        store
+            .enqueue(TaskKind::Compact, "hot", vec![])
+            .await
+            .unwrap();
+        let mut old = store
+            .claim_next_of_kinds(TaskKinds::COMPACT)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(old.preparing_maintenance());
+        let scope = MergeWriteScope::new();
+        let mut calls = 0;
+        let watch =
+            crate::scheduler::watch_preparation_ownership(&scope, Duration::from_secs(3), || {
+                calls += 1;
+                let attempt = calls;
+                let proxy = &proxy;
+                let store = &store;
+                let claim = &old;
+                let mut observer = observer.clone();
+                async move {
+                    if attempt == 1 {
+                        proxy.online.send(false).unwrap();
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    let result = store.preparation_owned(claim).await;
+                    if attempt == 1 {
+                        assert!(
+                            result.is_err(),
+                            "TCP fault did not reach the ownership read"
+                        );
+                        proxy.online.send(true).unwrap();
+                    }
+                    if attempt == 2 {
+                        assert!(matches!(result, Ok(true)), "{result:?}");
+                        let current = observer
+                            .get(claim.backend.claim_key.clone(), None)
+                            .await
+                            .unwrap();
+                        assert_eq!(current.kvs()[0].lease(), claim.backend.lease_id);
+                        assert_eq!(current.kvs()[0].value(), claim.backend.token.as_bytes());
+                        // Successful read uncertainty recovery cannot hide a
+                        // subsequent real lease loss, even with ongoing work.
+                        observer.lease_revoke(claim.backend.lease_id).await.unwrap();
+                    }
+                    result
+                }
+            });
+        let work = async {
+            loop {
+                scope.run(async { checkpoint() }).await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
+        let result = tokio::time::timeout(Duration::from_secs(25), async {
+            tokio::select! {
+                result = watch => result,
+                () = work => unreachable!(),
+            }
+        })
+        .await
+        .unwrap();
+        assert!(result.contains("claim lost"), "{result}");
+        assert_eq!(calls, 3);
+        store.recover_orphaned().await.unwrap();
+        let mut replacement = store
+            .claim_next_of_kinds(TaskKinds::COMPACT)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(replacement.task.id, old.task.id);
+        assert!(!store.promote_maintenance(&mut old).await.unwrap());
+        assert!(store.finish(old, Ok("stale".into())).await.is_err());
+        assert!(store.preparation_owned(&replacement).await.unwrap());
+        assert!(store.promote_maintenance(&mut replacement).await.unwrap());
+        store.finish(replacement, Ok("valid".into())).await.unwrap();
+    }
+
+    #[tokio::test]
     #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn backlog_snapshot_handoff_fences_old_scanner() {
         let (_dir, first) = bounded_scheduler_store(vec![]).await;
