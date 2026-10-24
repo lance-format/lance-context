@@ -55,6 +55,10 @@ pub struct MergeWork {
     pub encoded_bytes: u64,
     pub encoded_rows: u64,
     pub encoded_files: u64,
+    /// Existing data/deletion references confirmed by validation HEADs.
+    /// This is metadata progress, never evidence of rows merged or reclaimed.
+    #[serde(default)]
+    pub references_validated: u64,
     pub base_commits: u64,
     pub generations_reclaimed: u64,
     pub last_completed_stage: Option<String>,
@@ -275,6 +279,15 @@ impl MergeWriteScope {
 /// stall diagnostic, not evidence that WAL has been durably reclaimed.
 pub fn checkpoint() {
     let _ = CURRENT.try_with(|scope| scope.completed_steps.fetch_add(1, Ordering::Relaxed));
+}
+
+pub(crate) fn reference_validated() {
+    let _ = CURRENT.try_with(|scope| {
+        let mut work = scope.work.lock().unwrap();
+        work.references_validated = work.references_validated.saturating_add(1);
+        work.last_completed_stage = Some("reference_validation".into());
+    });
+    checkpoint();
 }
 
 pub(crate) fn wal_batch_read(rows: usize, bytes: usize) {

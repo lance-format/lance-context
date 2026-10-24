@@ -37,6 +37,7 @@ pub struct Policy<'a> {
     pub compaction_prepare_targets: &'a [String],
     pub index_prepare_targets: &'a [String],
     pub maintenance_catchup_targets: &'a [String],
+    pub repair_validate_only_targets: &'a [String],
 }
 
 /// The seven ownership keys `claim_next` snapshots for one candidate.
@@ -124,15 +125,18 @@ pub fn claim_shape(
         && !is_generic(target)
         && !policy.rollout.draining(target)
         && listed(preparation_targets, target);
+    let sharing_opt_in: &[String] = match kind {
+        TaskKind::Repair if lance_context_core::validate_store_name(target).is_ok() => {
+            policy.repair_validate_only_targets
+        }
+        TaskKind::Compact | TaskKind::IndexId => policy.maintenance_catchup_targets,
+        _ => &[],
+    };
     let shared_owner = catchup_active
-        && maintenance
         && policy.rollout.owned(target)
         && !policy.rollout.draining(target)
         && !is_generic(target)
-        && policy
-            .maintenance_catchup_targets
-            .iter()
-            .any(|t| t == target);
+        && sharing_opt_in.iter().any(|t| t == target);
     ClaimShape {
         preparing,
         write_claim: requires_target_lock(kind) && !preparing,
@@ -222,6 +226,7 @@ mod tests {
             compaction_prepare_targets: &[],
             index_prepare_targets: &[],
             maintenance_catchup_targets: &[],
+            repair_validate_only_targets: &[],
         };
         let targets = strings(&["hot", "draining", "generic:gs"]);
         let run = |k| k == TaskKind::MergeWal;
@@ -270,6 +275,7 @@ mod tests {
             compaction_prepare_targets: &compact,
             index_prepare_targets: &index,
             maintenance_catchup_targets: &[],
+            repair_validate_only_targets: &[],
         };
         let shape = claim_shape(TaskKind::Compact, "t", &policy, false);
         assert!(shape.preparing && !shape.write_claim);
@@ -301,6 +307,7 @@ mod tests {
             compaction_prepare_targets: &[],
             index_prepare_targets: &[],
             maintenance_catchup_targets: &shared,
+            repair_validate_only_targets: &[],
         };
         assert!(claim_shape(TaskKind::Compact, "t", &policy, true).shared_owner);
         assert!(!claim_shape(TaskKind::Compact, "t", &policy, false).shared_owner);
@@ -315,6 +322,83 @@ mod tests {
             !claim_shape(TaskKind::Compact, "t", &policy, true).shared_owner,
             "catch-up sharing is exact-match only"
         );
+    }
+
+    #[test]
+    fn repair_sharing_requires_separate_exact_opt_in_and_keeps_exclusive_claim() {
+        for (target, owned, draining, selected, allowed) in [
+            ("hot", true, false, "hot", true),
+            ("hot", true, false, "", false),
+            ("hot", true, false, "*", false),
+            ("hot", false, false, "hot", false),
+            ("hot", true, true, "hot", false),
+            ("generic:hot", true, false, "generic:hot", false),
+            ("datagen:hot", true, false, "datagen:hot", false),
+        ] {
+            let owned_targets = if owned { strings(&[target]) } else { vec![] };
+            let draining_targets = if draining { strings(&[target]) } else { vec![] };
+            let rollout = MergeRollout {
+                fence_legacy: false,
+                owned_targets,
+                drain_targets: draining_targets,
+            };
+            let selected = strings(&[selected]);
+            let existing = strings(&[target]);
+            let policy = Policy {
+                auto_local_merge: true,
+                rollout: &rollout,
+                compaction_prepare_targets: &existing,
+                index_prepare_targets: &existing,
+                maintenance_catchup_targets: &existing,
+                repair_validate_only_targets: &selected,
+            };
+            let shape = claim_shape(TaskKind::Repair, target, &policy, true);
+            assert_eq!(shape.shared_owner, allowed, "{target} {owned} {draining}");
+            assert!(shape.write_claim && !shape.preparing);
+            let snapshot = Snapshot {
+                catchup_active: Some(b"owner"),
+                ..EMPTY
+            };
+            assert_eq!(
+                admission_filter(TaskKind::Repair, shape, &snapshot, None, false, None).is_ok(),
+                allowed
+            );
+            if allowed {
+                for snapshot in [
+                    Snapshot {
+                        task_claim: Some(b"task"),
+                        ..snapshot
+                    },
+                    Snapshot {
+                        merge_claim: Some(b"merge"),
+                        ..snapshot
+                    },
+                    Snapshot {
+                        target_lock: Some(b"lock"),
+                        ..snapshot
+                    },
+                ] {
+                    assert_eq!(
+                        admission_filter(TaskKind::Repair, shape, &snapshot, None, false, None),
+                        Err(Skip::OwnershipBlocked)
+                    );
+                }
+                let old = Snapshot {
+                    merge_execution: Some(b"old"),
+                    target_lock: Some(b"old-lock"),
+                    ..snapshot
+                };
+                assert_eq!(
+                    admission_filter(TaskKind::Repair, shape, &old, Some("old-lock"), false, None),
+                    Ok(()),
+                    "maintenance crash recovery remains admissible"
+                );
+                assert_eq!(
+                    admission_filter(TaskKind::Repair, shape, &old, Some("old-lock"), true, None),
+                    Err(Skip::WorkerExecutionNeedsMerge)
+                );
+            }
+        }
     }
 
     #[test]
@@ -558,6 +642,7 @@ mod tests {
             compaction_prepare_targets: &[],
             index_prepare_targets: &[],
             maintenance_catchup_targets: &[],
+            repair_validate_only_targets: &[],
         };
         let targets = strings(&["*"]);
         for name in ["new-hot", "generic:new-hot"] {

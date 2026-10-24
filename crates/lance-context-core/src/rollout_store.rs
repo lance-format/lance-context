@@ -789,6 +789,13 @@ impl RolloutStore {
         self.base.base_data_files()
     }
 
+    /// Validate current data/deletion references without modifying storage.
+    pub async fn validate_fragment_references(
+        &mut self,
+    ) -> LanceResult<crate::ReferenceValidation> {
+        self.base.validate_fragment_references().await
+    }
+
     /// See `StorageBase::repair_missing_fragments`.
     pub async fn repair_missing_fragments(&mut self) -> LanceResult<crate::RepairReport> {
         self.base.repair_missing_fragments().await
@@ -3783,7 +3790,7 @@ mod tests {
         store.close().await.unwrap();
     }
 
-    fn assistant_record(id: &str) -> RolloutRecord {
+    pub(super) fn assistant_record(id: &str) -> RolloutRecord {
         RolloutRecord {
             id: id.to_string(),
             rollout_id: "rollout-1".to_string(),
@@ -5871,6 +5878,97 @@ mod tests {
             store.flush().await.unwrap();
             assert_eq!(store.list(None, None).await.unwrap().len(), 1);
         });
+    }
+
+    #[tokio::test]
+    async fn reference_validation_preserves_healthy_and_missing_data() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut store = RolloutStore::open(uri).await.unwrap();
+        for id in ["a", "b", "c"] {
+            store.add(&[assistant_record(id)]).await.unwrap();
+            store.cleanup_own_shard().await.unwrap();
+        }
+        let version = store.version();
+        let files = store.base_data_files();
+        assert_eq!(files.len(), 3);
+        let scope = crate::merge_write_scope::MergeWriteScope::new();
+        let report = scope
+            .run(store.validate_fragment_references())
+            .await
+            .unwrap();
+        assert_eq!(report.read_version, version);
+        assert_eq!(report.references_checked, 3);
+        assert_eq!(scope.completed_steps(), 3);
+        assert_eq!(scope.work().references_validated, 3);
+        assert_eq!(store.version(), version);
+        assert_eq!(store.list(None, None).await.unwrap().len(), 3);
+
+        let path = dir.path().join("data").join(&files[1]);
+        let original = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let error = store
+            .validate_fragment_references()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("missing data reference"), "{error}");
+        assert_eq!(store.version(), version);
+        assert_eq!(store.base_data_files(), files);
+        // Restoring the reference restores all original rows; validation never
+        // made the absence permanent by deleting a fragment from the manifest.
+        std::fs::write(path, original).unwrap();
+        store.validate_fragment_references().await.unwrap();
+        assert_eq!(store.list(None, None).await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn reference_validation_preserves_missing_deletion_reference() {
+        let dir = TempDir::new().unwrap();
+        let mut store = RolloutStore::open(dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        store
+            .add(&[assistant_record("a"), assistant_record("b")])
+            .await
+            .unwrap();
+        store.cleanup_own_shard().await.unwrap();
+        store.base.dataset.delete("id = 'a'").await.unwrap();
+        store.base.reload().await.unwrap();
+        let fragment = &store.base.dataset.fragments()[0];
+        let deletion = fragment
+            .deletion_file
+            .as_ref()
+            .expect("partial deletion file");
+        let name = format!(
+            "{}-{}-{}.{}",
+            fragment.id,
+            deletion.read_version,
+            deletion.id,
+            deletion.file_type.suffix()
+        );
+        let path = dir.path().join("_deletions").join(name);
+        let original = std::fs::read(&path).unwrap();
+        let version = store.version();
+        let scope = crate::merge_write_scope::MergeWriteScope::new();
+        let report = scope
+            .run(store.validate_fragment_references())
+            .await
+            .unwrap();
+        assert_eq!(report.references_checked, 2);
+        assert_eq!(scope.completed_steps(), 2);
+        std::fs::remove_file(&path).unwrap();
+        let error = store
+            .validate_fragment_references()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("missing deletion reference"), "{error}");
+        assert_eq!(store.version(), version);
+        assert!(store.base.dataset.fragments()[0].deletion_file.is_some());
+        std::fs::write(path, original).unwrap();
+        store.validate_fragment_references().await.unwrap();
+        assert_eq!(store.list(None, None).await.unwrap().len(), 1);
     }
 
     /// A manifest that names a data file storage no longer has makes every
@@ -8488,3 +8586,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod reference_validation_tests;

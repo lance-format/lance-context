@@ -196,6 +196,13 @@ pub struct RepairReport {
     pub dropped: Vec<DroppedFragment>,
 }
 
+/// Successful read-only validation of a stable base manifest's file references.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReferenceValidation {
+    pub read_version: u64,
+    pub references_checked: usize,
+}
+
 /// Statistics about compaction status and history.
 #[derive(Debug, Clone)]
 pub struct CompactionStats {
