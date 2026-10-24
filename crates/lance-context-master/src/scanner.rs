@@ -31,6 +31,25 @@ const OBSERVE_TIMEOUT: Duration = Duration::from_secs(30);
 
 type ScanObservation = (String, Option<(StatRow, bool)>);
 
+/// Stop scheduling reads at the next table boundary. The caller still joins
+/// the bounded set of observations already admitted into `buffer_unordered`.
+fn observations_until_drain<'a, S: futures::Stream + 'a>(
+    admission: &'a crate::admission::Admission,
+    entries: S,
+) -> impl futures::Stream<Item = S::Item> + 'a {
+    entries.take_while(move |_| futures::future::ready(admission.is_accepting()))
+}
+
+fn require_scan_admission(state: &MasterState) -> lance::Result<()> {
+    if state.admission.is_accepting() {
+        Ok(())
+    } else {
+        Err(lance::Error::io(
+            "stats scan yielded during executor drain; previous snapshot retained",
+        ))
+    }
+}
+
 /// Early admission uses the ordinary durable queue, never a separate executor.
 /// Bound both new tasks and total control-plane time per scan. A degraded queue
 /// must not turn table observation into thousands of serial request timeouts.
@@ -53,6 +72,7 @@ impl ScanMergeAdmission {
 
     async fn observe(&mut self, state: &Arc<MasterState>, row: &StatRow) {
         if self.remaining == 0
+            || !state.admission.is_accepting()
             || self.time_left.is_zero()
             || row.pending_wal_generations <= 0
             || row.pending_wal_generations < state.config.merge_wal_min_generations
@@ -329,7 +349,7 @@ async fn try_scan_once(state: &Arc<MasterState>, maintain: bool) -> lance::Resul
     let result = scan_once_inner(state, &operation, &guard).await;
     // Maintenance runs under the same writer lock as the scan that just
     // created the versions, and its failure never fails the scan round.
-    if maintain && result.is_ok() {
+    if maintain && result.is_ok() && state.admission.is_accepting() {
         operation.phase("stats_maintenance");
         if let Err(e) = maintain_stats(state).await {
             tracing::warn!(error = %e, "stats maintenance failed");
@@ -339,8 +359,14 @@ async fn try_scan_once(state: &Arc<MasterState>, maintain: bool) -> lance::Resul
             ("generic", &state.generic_registry),
             ("datagen", &state.datagen_registry),
         ] {
+            if !state.admission.is_accepting() {
+                break;
+            }
             if let Err(e) = maintain_registry(state, label, registry).await {
                 tracing::warn!(registry = label, error = %e, "registry maintenance failed");
+            }
+            if !state.admission.is_accepting() {
+                break;
             }
             if let Some(m) = registry
                 .as_any()
@@ -372,6 +398,7 @@ async fn scan_once_inner(
     operation: &crate::admission::Operation,
     guard: &crate::task_store::CoordinationGuard,
 ) -> lance::Result<usize> {
+    require_scan_admission(state)?;
     operation.phase("registry_read");
     let scan_start = std::time::Instant::now();
     let scan_started_ms = Utc::now().timestamp_millis();
@@ -422,6 +449,7 @@ async fn scan_once_inner(
             .collect()
     };
     let previous = Arc::new(previous);
+    require_scan_admission(state)?;
     let rollout_options = state.rollout_store_options();
     let generic_options = state.generic_store_options();
 
@@ -430,7 +458,7 @@ async fn scan_once_inner(
     // rather than dropped.
     operation.phase("observe_tables");
     let shard_counts = Arc::new(std::sync::Mutex::new(HashMap::new()));
-    let observations = stream::iter(entries)
+    let observations = observations_until_drain(&state.admission, stream::iter(entries))
         .map(|entry| {
             let shard_counts = shard_counts.clone();
             let previous = previous.clone();
@@ -473,14 +501,16 @@ async fn scan_once_inner(
                         // `entry.name` is already the task target: bare for
                         // rollout, `generic:<name>` for generic stores.
                         let target = entry.name.clone();
-                        crate::demand_publish::spawn_scan_demand(
-                            state.clone(),
-                            target,
-                            entry.uri.clone(),
-                            entry.kind,
-                            rollout_options,
-                            generic_options,
-                        );
+                        if state.admission.is_accepting() {
+                            crate::demand_publish::spawn_scan_demand(
+                                state.clone(),
+                                target,
+                                entry.uri.clone(),
+                                entry.kind,
+                                rollout_options,
+                                generic_options,
+                            );
+                        }
                         (entry.name, Some(result))
                     }
                     Err(e) => {
@@ -492,6 +522,9 @@ async fn scan_once_inner(
         })
         .buffer_unordered(concurrency);
     let mut observed = collect_observations(state, observations).await;
+    // An interrupted scan is not a smaller complete registry. Keep the entire
+    // previously committed stats/cache/summary, with their original ages.
+    require_scan_admission(state)?;
     // Preserve the previous observation for an ambiguous registry identity,
     // just as for a failed store read; unrelated tables continue to scan.
     observed.extend(ambiguous.iter().cloned().map(|name| (name, None)));
@@ -564,6 +597,7 @@ async fn scan_once_inner(
         state.rollout_store_options(),
         state.compaction_config(),
         state.compaction_permits.clone(),
+        &state.admission,
     )
     .await;
     if !retired.is_empty() {
@@ -572,8 +606,10 @@ async fn scan_once_inner(
     metrics::histogram!("master_stats_retire_duration_seconds")
         .record(retire_start.elapsed().as_secs_f64());
 
+    require_scan_admission(state)?;
     operation.phase("commit_snapshot");
     let mut stats = state.stats.lock().await;
+    require_scan_admission(state)?;
 
     let mut total_rows: i64 = 0;
     let mut total_fragments: i64 = 0;
@@ -980,6 +1016,7 @@ async fn retire_cold_experiments(
     options: RolloutStoreOptions,
     compaction_config: CompactionConfig,
     compaction_permits: Arc<Semaphore>,
+    admission: &crate::admission::Admission,
 ) -> HashSet<String> {
     if retire_after.is_zero() {
         return HashSet::new();
@@ -988,6 +1025,11 @@ async fn retire_cold_experiments(
 
     let mut retired = HashSet::new();
     for row in rows {
+        // Finish an accepted retirement under the writer guard, but do not
+        // start another table's merge/compaction while draining.
+        if !admission.is_accepting() {
+            break;
+        }
         if row.last_updated > cutoff_ms {
             continue;
         }
@@ -1149,6 +1191,74 @@ pub fn spawn_scanner(state: &Arc<MasterState>) -> Option<JoinHandle<()>> {
 }
 
 #[cfg(test)]
+mod drain_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn scan_drain_joins_admitted_reads_without_opening_remaining_tables() {
+        let admission = Arc::new(crate::admission::Admission::default());
+        let operation = admission.try_admit_named("stats_scan").unwrap();
+        let started = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let scanning = admission.clone();
+        let pending = release.clone();
+        let opened = started.clone();
+        let scan = tokio::spawn(async move {
+            let rows: Vec<_> = observations_until_drain(&scanning, stream::iter(0..20))
+                .map(|i| {
+                    let opened = opened.clone();
+                    let pending = pending.clone();
+                    async move {
+                        opened.add_permits(1);
+                        pending.acquire().await.unwrap().forget();
+                        i
+                    }
+                })
+                .buffer_unordered(3)
+                .collect()
+                .await;
+            drop(operation);
+            rows
+        });
+        tokio::time::timeout(Duration::from_secs(5), started.acquire_many(3))
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        admission.begin_drain();
+        assert!(!scan.is_finished());
+        assert!(!admission.status().drained());
+        release.add_permits(20);
+        let mut observed = tokio::time::timeout(Duration::from_secs(5), scan)
+            .await
+            .unwrap()
+            .unwrap();
+        observed.sort_unstable();
+        assert_eq!(observed, vec![0, 1, 2]);
+        assert_eq!(
+            started.available_permits(),
+            0,
+            "remaining tables must not open"
+        );
+        assert!(admission.status().drained());
+    }
+
+    #[tokio::test]
+    async fn scan_admission_preserves_full_scan_and_rejects_drained_start() {
+        let admission = crate::admission::Admission::default();
+        let all: Vec<_> = observations_until_drain(&admission, stream::iter(0..20))
+            .collect()
+            .await;
+        assert_eq!(all, (0..20).collect::<Vec<_>>());
+        admission.begin_drain();
+        let none: Vec<_> = observations_until_drain(&admission, stream::iter(0..20))
+            .collect()
+            .await;
+        assert!(none.is_empty());
+    }
+}
+
+#[cfg(test)]
 mod early_merge_tests {
     use super::*;
     use clap::Parser;
@@ -1183,6 +1293,141 @@ mod early_merge_tests {
             scanned_at: Utc::now().timestamp_millis(),
             version: 1,
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn scan_drain_preserves_snapshot_and_releases_writer_for_successor() {
+        let (_dir, state) = fixture(false).await;
+        let previous = row("previous", 80);
+        let mut stats = state.stats.lock().await;
+        publish_snapshot(&mut stats, &state.stats_cache, vec![previous.clone()], 0)
+            .await
+            .unwrap();
+        let version = stats.version();
+        let mut summary = crate::backlog_metrics::Snapshot::new(
+            &[previous],
+            0,
+            Utc::now().timestamp_millis(),
+            80,
+            0,
+        );
+        summary.committed_ms = Utc::now().timestamp_millis();
+        let guard = state
+            .task_store
+            .coordination_lock("stats-writer")
+            .await
+            .unwrap();
+        state
+            .task_store
+            .publish_backlog_snapshot(&guard, &summary)
+            .await
+            .unwrap();
+        state
+            .task_store
+            .release_coordination_lock(guard)
+            .await
+            .unwrap();
+        let before = state
+            .task_store
+            .read_backlog_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Hold the actual stats mutex after the scan has acquired its writer
+        // guard. Drain then arrives during an admitted scan, not before entry.
+        let scanning = state.clone();
+        let scan = tokio::spawn(async move { scan_once(&scanning).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if state
+                    .admission
+                    .status()
+                    .operations
+                    .values()
+                    .any(|op| op.phase == "previous_snapshot")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        state.admission.begin_drain();
+        assert!(!state.admission.status().drained());
+        drop(stats);
+        let result = tokio::time::timeout(Duration::from_secs(5), scan)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "draining scan must not publish a truncated snapshot"
+        );
+        assert!(state.admission.status().drained());
+        assert_eq!(state.stats.lock().await.version(), version);
+        assert_eq!(
+            state.stats_cache.read().await[0].pending_wal_generations,
+            80
+        );
+        let after = state
+            .task_store
+            .read_backlog_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            before.1, after.1,
+            "drain must not publish a new summary revision"
+        );
+        assert_eq!(
+            serde_json::to_value(before.0).unwrap(),
+            serde_json::to_value(after.0).unwrap()
+        );
+
+        let successor = MasterState::new(state.config.clone()).await.unwrap();
+        // The registry is genuinely empty: only a fresh complete successor
+        // scan may now clear the previous snapshot.
+        assert_eq!(scan_once(&successor).await.unwrap(), 0);
+        assert!(successor.stats_cache.read().await.is_empty());
+        let next = successor
+            .task_store
+            .read_backlog_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(next.1 > after.1);
+        assert_eq!(next.0.generations, 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn scan_drain_does_not_enqueue_later_hot_observations() {
+        let (_dir, state) = fixture(true).await;
+        let mut admission = ScanMergeAdmission::new(&state);
+        admission.observe(&state, &row("accepted", 80)).await;
+        assert!(state
+            .task_store
+            .get_active_id(TaskKind::MergeWal, "accepted")
+            .await
+            .unwrap()
+            .is_some());
+        state.admission.begin_drain();
+        admission.observe(&state, &row("later", 80)).await;
+        assert!(state
+            .task_store
+            .get_active_id(TaskKind::MergeWal, "later")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(state
+            .task_store
+            .get_active_id(TaskKind::MergeWal, "accepted")
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]
@@ -1951,6 +2196,30 @@ mod retirement_tests {
         let now = Utc::now().timestamp_millis();
         let old = now - Duration::from_secs(30 * 86_400).as_millis() as i64;
         let (compaction_config, compaction_permits) = compaction_limits();
+        let draining = crate::admission::Admission::default();
+        draining.begin_drain();
+        let deferred = retire_cold_experiments(
+            &[row("e", &uri, old)],
+            Duration::from_secs(7 * 86_400),
+            now,
+            RolloutStoreOptions::default(),
+            compaction_config.clone(),
+            compaction_permits.clone(),
+            &draining,
+        )
+        .await;
+        assert!(deferred.is_empty());
+        let pending =
+            RolloutStore::open_existing_with_options(&uri, RolloutStoreOptions::default())
+                .await
+                .unwrap()
+                .pending_wal_generations()
+                .await
+                .unwrap();
+        assert_eq!(
+            pending, 3,
+            "draining scanner must not start cold-table writes"
+        );
         let retired = retire_cold_experiments(
             &[row("e", &uri, old)],
             Duration::from_secs(7 * 86_400),
@@ -1958,6 +2227,7 @@ mod retirement_tests {
             RolloutStoreOptions::default(),
             compaction_config,
             compaction_permits,
+            &crate::admission::Admission::default(),
         )
         .await;
 
@@ -1998,6 +2268,7 @@ mod retirement_tests {
             RolloutStoreOptions::default(),
             compaction_config,
             compaction_permits,
+            &crate::admission::Admission::default(),
         )
         .await;
         assert!(
@@ -2018,6 +2289,7 @@ mod retirement_tests {
             RolloutStoreOptions::default(),
             compaction_config,
             compaction_permits,
+            &crate::admission::Admission::default(),
         )
         .await;
         assert!(retired.is_empty());
@@ -2037,6 +2309,7 @@ mod retirement_tests {
             RolloutStoreOptions::default(),
             compaction_config,
             compaction_permits,
+            &crate::admission::Admission::default(),
         )
         .await;
         assert!(
