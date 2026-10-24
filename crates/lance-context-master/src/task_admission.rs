@@ -19,6 +19,7 @@ pub(crate) struct AdmissionExplanation {
     pub skip: Option<eligibility::Skip>,
     pub claim_shape: Option<eligibility::ClaimShape>,
     pub ownership: Option<OwnershipPresence>,
+    pub orphaned_catchup_recovery: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -47,6 +48,7 @@ impl AdmissionExplanation {
             skip: None,
             claim_shape: None,
             ownership: None,
+            orphaned_catchup_recovery: false,
         }
     }
 }
@@ -84,6 +86,7 @@ impl EtcdTaskStore {
             self.compaction_commit_key(&task.target),
             self.queue_key(id),
             self.task_key(id),
+            execution_key.replace("/merge-executions/", "/catchup-records/"),
         ];
         keys.extend(task.depends_on.iter().map(|id| self.task_key(id)));
         let response = self
@@ -138,9 +141,9 @@ impl EtcdTaskStore {
         }
         let mut waiting = None;
         for (index, dependency) in task.depends_on.iter().enumerate() {
-            let record = values[9 + index]
+            let record = values[10 + index]
                 .as_deref()
-                .map(|v| decode_task(v, &keys[9 + index]))
+                .map(|v| decode_task(v, &keys[10 + index]))
                 .transpose()?;
             match record {
                 Some(record) if record.state == TaskState::Done => {}
@@ -184,13 +187,25 @@ impl EtcdTaskStore {
             compact_preparation: values[5].as_deref(),
             compact_commit_ready: values[6].as_deref(),
         };
+        result.orphaned_catchup_recovery = values[9].is_none()
+            && eligibility::orphaned_catchup_candidate(
+                task.kind,
+                &task.target,
+                &self.eligibility_policy(),
+                execution.as_ref(),
+                values[2].as_deref(),
+            );
         result.skip = eligibility::admission_filter(
             task.kind,
             shape,
             &snapshot,
             owner.as_deref(),
             execution.as_ref().is_some_and(|e| e.maintenance.is_none()),
-            None,
+            if result.orphaned_catchup_recovery {
+                values[2].as_deref()
+            } else {
+                None
+            },
         )
         .err();
         result.reason = if result.skip.is_some() {

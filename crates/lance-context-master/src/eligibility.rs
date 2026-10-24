@@ -144,6 +144,27 @@ pub fn claim_shape(
     }
 }
 
+/// A matching, unstarted protocol-2 catch-up may be reconciled by an ordinary
+/// master. The caller must additionally require no catch-up inventory record
+/// and CAS the exact execution, marker and absent record when taking the claim.
+/// This is recovery authority, not shared ownership or a new Job identity.
+pub fn orphaned_catchup_candidate(
+    kind: TaskKind,
+    target: &str,
+    policy: &Policy<'_>,
+    execution: Option<&lance_context_merge::Execution>,
+    active: Option<&[u8]>,
+) -> bool {
+    kind == TaskKind::MergeWal
+        && (policy.rollout.owned(target) || policy.auto_local_merge)
+        && execution.is_some_and(|execution| {
+            execution.target == target
+                && execution.unstarted_catchup()
+                && !execution.instance.is_empty()
+                && active == Some(execution.instance.as_bytes())
+        })
+}
+
 /// Filter applied after the seven-key ownership snapshot.
 ///
 /// `expected_owner` is the `merge-execution:{id}` owner string when a merge
@@ -213,6 +234,68 @@ mod tests {
         compact_preparation: None,
         compact_commit_ready: None,
     };
+
+    #[test]
+    fn orphaned_catchup_admission_requires_exact_unstarted_owned_execution() {
+        use lance_context_merge::{Execution, MaintenanceKind, Phase};
+        let rollout = rollout(&["hot"], &[]);
+        let policy = Policy {
+            auto_local_merge: false,
+            rollout: &rollout,
+            compaction_prepare_targets: &[],
+            index_prepare_targets: &[],
+            maintenance_catchup_targets: &[],
+            repair_validate_only_targets: &[],
+        };
+        let mut execution = Execution::new("hot", "master:catchup", "old-job", 600);
+        execution.maintenance = Some(MaintenanceKind::Catchup);
+        let check = |kind, target, execution: &Execution, active| {
+            orphaned_catchup_candidate(kind, target, &policy, Some(execution), active)
+        };
+        assert!(check(
+            TaskKind::MergeWal,
+            "hot",
+            &execution,
+            Some(b"old-job")
+        ));
+        assert!(!check(
+            TaskKind::Compact,
+            "hot",
+            &execution,
+            Some(b"old-job")
+        ));
+        assert!(!check(
+            TaskKind::MergeWal,
+            "unowned",
+            &execution,
+            Some(b"old-job")
+        ));
+        assert!(!check(
+            TaskKind::MergeWal,
+            "hot",
+            &execution,
+            Some(b"other-job")
+        ));
+        assert!(!check(TaskKind::MergeWal, "hot", &execution, None));
+        for mutation in 0..8 {
+            let mut incompatible = execution.clone();
+            match mutation {
+                0 => incompatible.protocol = 0,
+                1 => incompatible.background = true,
+                2 => incompatible.maintenance = None,
+                3 => incompatible.endpoint = "worker".into(),
+                4 => incompatible.phase = Phase::Running,
+                5 => incompatible.phase = Phase::Uncertain,
+                6 => incompatible.phase = Phase::Recovered, // no cancellation evidence
+                7 => incompatible.reclaimed = 1,
+                _ => unreachable!(),
+            }
+            assert!(
+                !check(TaskKind::MergeWal, "hot", &incompatible, Some(b"old-job")),
+                "{mutation}"
+            );
+        }
+    }
 
     #[test]
     fn resident_filter_only_admits_owned_opted_in_non_draining_merges() {

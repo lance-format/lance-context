@@ -69,6 +69,29 @@ pub(crate) async fn reconcile_previous(
     }
     let proof = state.task_store.merge_claim(claim);
     crate::merge_execution::ensure_recovery_due(&coordinator, &old).await?;
+    if claim.recovering_orphaned_catchup() {
+        // This claim was admitted for exact unstarted catch-up recovery only.
+        // A racing start is not permission to clear that Job's marker or write.
+        if !old.unstarted_catchup() {
+            return Err("catch-up execution changed before reservation recovery".into());
+        }
+        let terminal = if old.phase == Phase::Reserved {
+            coordinator
+                .cancel_reserved_for_recovery(&proof, &old)
+                .await?
+                .ok_or("catch-up reservation or recovery claim changed")?
+        } else {
+            old
+        };
+        if !coordinator
+            .release_orphaned_catchup(&proof, &terminal)
+            .await?
+        {
+            return Err("catch-up owner or recovery claim changed before release".into());
+        }
+        metrics::counter!("master_orphaned_catchup_reservations_recovered_total").increment(1);
+        return Ok(());
+    }
     match old.phase {
         Phase::Reserved if old.protocol == 2 => {
             crate::merge_execution::recover_execution(state, &coordinator, &proof, old).await?;

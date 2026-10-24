@@ -197,6 +197,10 @@ pub struct TaskClaim {
 }
 
 impl TaskClaim {
+    pub(crate) fn recovering_orphaned_catchup(&self) -> bool {
+        self.backend.orphaned_catchup
+    }
+
     pub(crate) fn preparing_maintenance(&self) -> bool {
         self.backend.preparation_key.is_some() && self.backend.target_key.is_none()
     }
@@ -209,6 +213,7 @@ struct ClaimBackend {
     target_key: Option<String>,
     preparation_key: Option<String>,
     preparation_owner: Option<Vec<u8>>,
+    orphaned_catchup: bool,
     keepalive: LeaseKeepalive,
 }
 
@@ -1533,14 +1538,41 @@ impl EtcdTaskStore {
                 let expected_owner = merge_execution
                     .as_ref()
                     .map(lance_context_merge::execution_owner);
-                let expected_job =
-                    only_id
-                        .map(|(_, job)| job.as_bytes())
-                        .or(if shape.shared_owner {
-                            snapshot[2].as_deref()
-                        } else {
-                            None
-                        });
+                let orphaned_catchup = only_id.is_none()
+                    && snapshot[3].is_none()
+                    && snapshot[4].is_none()
+                    && snapshot[1].as_deref() == expected_owner.as_deref().map(str::as_bytes)
+                    && eligibility::orphaned_catchup_candidate(
+                        task.kind,
+                        &task.target,
+                        &policy,
+                        merge_execution.as_ref(),
+                        snapshot[2].as_deref(),
+                    );
+                let catchup_record_key =
+                    lance_context_merge::execution_key(&self.prefix, &task.target)
+                        .replace("/merge-executions/", "/catchup-records/");
+                if orphaned_catchup {
+                    // Rare recovery candidate only: regular admission keeps its
+                    // existing eight-key batch and incurs no additional reads.
+                    let record = self
+                        .read_values(std::slice::from_ref(&catchup_record_key))
+                        .await?;
+                    if let Some(operation) = operation {
+                        operation.claim_completed(1, 0, 0);
+                    }
+                    if record[0].is_some() {
+                        advance(&mut scan);
+                        continue;
+                    }
+                }
+                let expected_job = only_id.map(|(_, job)| job.as_bytes()).or(
+                    if shape.shared_owner || orphaned_catchup {
+                        snapshot[2].as_deref()
+                    } else {
+                        None
+                    },
+                );
                 let view = eligibility::Snapshot {
                     merge_execution: snapshot[0].as_deref(),
                     target_lock: snapshot[1].as_deref(),
@@ -1625,6 +1657,16 @@ impl EtcdTaskStore {
                     Compare::version(claim_key.as_str(), CompareOp::Equal, 0),
                     Compare::version(queue_key.as_str(), CompareOp::Greater, 0),
                 ];
+                if orphaned_catchup {
+                    compares.extend([
+                        Compare::value(
+                            lance_context_merge::execution_key(&self.prefix, &task.target),
+                            CompareOp::Equal,
+                            snapshot[0].clone().expect("recovery execution"),
+                        ),
+                        Compare::version(catchup_record_key, CompareOp::Equal, 0),
+                    ]);
+                }
                 if let Some(key) = &preparation_key {
                     compares.push(Compare::version(key.as_str(), CompareOp::Equal, 0));
                     let active_key = crate::catchup::store::active_key(&self.prefix, &task.target);
@@ -1749,6 +1791,7 @@ impl EtcdTaskStore {
                                 target_key,
                                 preparation_key,
                                 preparation_owner: snapshot[2].clone(),
+                                orphaned_catchup,
                                 keepalive,
                             },
                         }),
@@ -5125,6 +5168,378 @@ mod tests {
         assert!(coordinator.release(&proof, &terminal).await.unwrap());
         store
             .finish(recovery, Ok("replacement completed".into()))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn orphaned_catchup_reservation_reaches_normal_recovery() {
+        use lance_context_merge::{Execution, MaintenanceKind, Phase};
+        let (_dir, mut cfg, _) = preparation_test_store().await;
+        cfg.merge_rollout.owned_targets = vec!["hot".into()];
+        let store = TaskStore::open(&cfg).await.unwrap();
+        let state = crate::state::MasterState::new(cfg.clone()).await.unwrap();
+        store
+            .enqueue(TaskKind::MergeWal, "hot", vec![])
+            .await
+            .unwrap();
+        let old_claim = store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        let coordinator = store.merge_coordinator();
+        let mut reserved = Execution::new("hot", "master:catchup", "old-instance", 600);
+        reserved.maintenance = Some(MaintenanceKind::Catchup);
+        assert!(coordinator
+            .reserve(&store.merge_claim(&old_claim), &reserved)
+            .await
+            .unwrap());
+        let active = crate::catchup::store::active_key(&cfg.etcd.etcd_prefix, "hot");
+        store
+            .inner
+            .client
+            .clone()
+            .put(active.clone(), reserved.instance.clone(), None)
+            .await
+            .unwrap();
+        // The old task has lost its lease, but the catchup reservation and
+        // execution remain. No matching Job identity is supplied by this poller.
+        store.abandon_claim_for_test(old_claim).await.unwrap();
+        let recovery = store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        let proof = store.merge_claim(&recovery);
+        crate::maintenance_execution::reconcile_previous(&state, &recovery)
+            .await
+            .unwrap();
+        assert!(store
+            .inner
+            .client
+            .clone()
+            .get(active, None)
+            .await
+            .unwrap()
+            .kvs()
+            .is_empty());
+        assert!(coordinator.get("hot").await.unwrap().is_none());
+        assert!(coordinator.start(&reserved).await.unwrap().is_none());
+        let mut late = reserved.clone();
+        late.phase = Phase::Running;
+        assert!(coordinator
+            .authorize_commit(&late, &state.rollout_uri("hot"), "base", 1)
+            .await
+            .is_err());
+        let successor = Execution::new("hot", "master:catchup", "new-instance", 600);
+        assert!(coordinator.reserve(&proof, &successor).await.unwrap());
+        let running = coordinator.start(&successor).await.unwrap().unwrap();
+        assert!(coordinator.finish(&running, Ok(0)).await.unwrap());
+        let terminal = coordinator.get("hot").await.unwrap().unwrap();
+        assert!(coordinator.release(&proof, &terminal).await.unwrap());
+        store
+            .finish(recovery, Ok("replacement completed".into()))
+            .await
+            .unwrap();
+    }
+
+    async fn orphan_catchup_fixture() -> (
+        TempDir,
+        Arc<crate::state::MasterState>,
+        TaskStore,
+        lance_context_merge::Execution,
+    ) {
+        use lance_context_merge::{Execution, MaintenanceKind};
+        let (dir, mut cfg, _) = preparation_test_store().await;
+        cfg.merge_rollout.owned_targets = vec!["hot".into()];
+        let state = crate::state::MasterState::new(cfg.clone()).await.unwrap();
+        let store = TaskStore::open(&cfg).await.unwrap();
+        store
+            .enqueue(TaskKind::MergeWal, "hot", vec![])
+            .await
+            .unwrap();
+        let claim = store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut execution = Execution::new("hot", "master:catchup", "old-job", 600);
+        execution.maintenance = Some(MaintenanceKind::Catchup);
+        let coordinator = store.merge_coordinator();
+        assert!(coordinator
+            .reserve(&store.merge_claim(&claim), &execution)
+            .await
+            .unwrap());
+        store
+            .inner
+            .client
+            .clone()
+            .put(
+                crate::catchup::store::active_key(&cfg.etcd.etcd_prefix, "hot"),
+                execution.instance.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+        store.abandon_claim_for_test(claim).await.unwrap();
+        (dir, state, store, execution)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn orphaned_catchup_reservation_preserves_failure_history_and_cancelled_crash() {
+        let (_dir, state, store, reserved) = orphan_catchup_fixture().await;
+        let coordinator = store.merge_coordinator();
+        let claim = store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        let proof = store.merge_claim(&claim);
+        let error = "merge ownership unresolved: recovery barrier failed: execution lacks recoverable storage fencing protocol";
+        for _ in 0..15 {
+            coordinator
+                .record_failure(&proof, "hot", "master:catchup", error)
+                .await
+                .unwrap();
+        }
+        let before = coordinator
+            .failure("hot", "master:catchup")
+            .await
+            .unwrap()
+            .unwrap();
+        // The first recovery crashes after cancelling, before releasing either
+        // persistent key. A normal replacement must resume the same terminal CAS.
+        let cancelled = coordinator
+            .cancel_reserved_for_recovery(&proof, &reserved)
+            .await
+            .unwrap()
+            .unwrap();
+        store.abandon_claim_for_test(claim).await.unwrap();
+        let replacement = store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        let explanation = store
+            .inner
+            .explain_admission(&replacement.task.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(explanation.reason, "not_queued");
+        crate::maintenance_execution::reconcile_previous(&state, &replacement)
+            .await
+            .unwrap();
+        assert!(coordinator.get("hot").await.unwrap().is_none());
+        let after = coordinator
+            .failure("hot", "master:catchup")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.consecutive_attempts, before.consecutive_attempts);
+        assert_eq!(after.last_error, before.last_error);
+        assert_eq!(after.last_failure_ms, before.last_failure_ms);
+        assert!(after.next_retry_ms <= lance_context_merge::failure::now_ms());
+        assert!(!coordinator
+            .release_orphaned_catchup(&proof, &cancelled)
+            .await
+            .unwrap());
+        let result = crate::maintenance_execution::run_as(
+            &state,
+            &replacement,
+            lance_context_merge::MaintenanceKind::Catchup,
+            async { Err("invalid schema from actual payload work".into()) },
+        )
+        .await;
+        assert_eq!(
+            result.unwrap_err(),
+            "invalid schema from actual payload work"
+        );
+        let failure = coordinator
+            .failure("hot", "master:catchup")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failure.consecutive_attempts, 16);
+        assert!(failure.next_retry_ms > lance_context_merge::failure::now_ms());
+        store
+            .finish(replacement, Err("fixture payload failed".into()))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn orphaned_catchup_reservation_claim_rejects_changed_ownership() {
+        for changed in [
+            "start",
+            "active",
+            "record",
+            "target",
+            "merge_claim",
+            "task_claim",
+        ] {
+            let (_dir, state, store, reserved) = orphan_catchup_fixture().await;
+            store.inner.recover_orphaned().await.unwrap();
+            let id = store
+                .get_active_id(TaskKind::MergeWal, "hot")
+                .await
+                .unwrap()
+                .unwrap();
+            let before = store.inner.explain_admission(&id).await.unwrap().unwrap();
+            assert!(before.orphaned_catchup_recovery);
+            assert!(before.skip.is_none());
+            let execution_key =
+                lance_context_merge::execution_key(&state.config.etcd.etcd_prefix, "hot");
+            let (key, value) = match changed {
+                "start" => {
+                    let mut running = reserved.clone();
+                    running.phase = lance_context_merge::Phase::Running;
+                    (
+                        execution_key.clone(),
+                        serde_json::to_string(&running).unwrap(),
+                    )
+                }
+                "active" => (
+                    crate::catchup::store::active_key(&state.config.etcd.etcd_prefix, "hot"),
+                    "new-job".into(),
+                ),
+                "record" => (
+                    execution_key.replace("/merge-executions/", "/catchup-records/"),
+                    "new-inventory".into(),
+                ),
+                "target" => (store.inner.target_lock_key("hot"), "new-owner".into()),
+                "merge_claim" => (
+                    execution_key.replace("/merge-executions/", "/merge-claims/"),
+                    "live".into(),
+                ),
+                "task_claim" => (store.inner.claim_key(&id), "live".into()),
+                _ => unreachable!(),
+            };
+            // Change after the advisory snapshot, immediately before the claim
+            // transaction, including Reserved -> Running with the same owner ID.
+            *store.inner.claim_owner_swap.lock().unwrap() = Some((key.clone(), value.clone()));
+            assert!(
+                store
+                    .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{changed}"
+            );
+            assert_eq!(
+                store.inner.get_text(&key).await.unwrap().as_deref(),
+                Some(value.as_str())
+            );
+            assert_eq!(
+                store.get(&id).await.unwrap().unwrap().state,
+                TaskState::Queued
+            );
+            assert!(store
+                .inner
+                .explain_admission(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .skip
+                .is_some());
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn orphaned_catchup_reservation_release_is_atomic_and_preserves_replacements() {
+        for changed in ["active", "record", "execution", "target", "claim"] {
+            let (_dir, state, store, reserved) = orphan_catchup_fixture().await;
+            let coordinator = store.merge_coordinator();
+            let claim = store
+                .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+                .await
+                .unwrap()
+                .unwrap();
+            let proof = store.merge_claim(&claim);
+            let terminal = coordinator
+                .cancel_reserved_for_recovery(&proof, &reserved)
+                .await
+                .unwrap()
+                .unwrap();
+            let execution_key =
+                lance_context_merge::execution_key(&state.config.etcd.etcd_prefix, "hot");
+            let active = crate::catchup::store::active_key(&state.config.etcd.etcd_prefix, "hot");
+            let (key, value) = match changed {
+                "active" => (active.clone(), "new-job".into()),
+                "record" => (
+                    execution_key.replace("/merge-executions/", "/catchup-records/"),
+                    "new-inventory".into(),
+                ),
+                "execution" => {
+                    let mut replacement = terminal.clone();
+                    replacement.id = "successor".into();
+                    (
+                        execution_key.clone(),
+                        serde_json::to_string(&replacement).unwrap(),
+                    )
+                }
+                "target" => (store.inner.target_lock_key("hot"), "new-owner".into()),
+                "claim" => (proof.key.clone(), "new-claim".into()),
+                _ => unreachable!(),
+            };
+            store
+                .inner
+                .client
+                .clone()
+                .put(key.clone(), value.clone(), None)
+                .await
+                .unwrap();
+            assert!(
+                !coordinator
+                    .release_orphaned_catchup(&proof, &terminal)
+                    .await
+                    .unwrap(),
+                "{changed}"
+            );
+            assert_eq!(
+                store.inner.get_text(&key).await.unwrap().as_deref(),
+                Some(value.as_str())
+            );
+            assert!(coordinator.get("hot").await.unwrap().is_some());
+            assert!(store.inner.get_text(&active).await.unwrap().is_some());
+            store.abandon_claim_for_test(claim).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn orphaned_catchup_reservation_racing_start_keeps_marker_and_writer() {
+        let (_dir, state, store, reserved) = orphan_catchup_fixture().await;
+        let coordinator = store.merge_coordinator();
+        let claim = store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        let running = coordinator.start(&reserved).await.unwrap().unwrap();
+        assert!(
+            crate::maintenance_execution::reconcile_previous(&state, &claim)
+                .await
+                .is_err()
+        );
+        assert_eq!(coordinator.get("hot").await.unwrap(), Some(running));
+        let active = crate::catchup::store::active_key(&state.config.etcd.etcd_prefix, "hot");
+        assert_eq!(
+            store.inner.get_text(&active).await.unwrap().as_deref(),
+            Some(reserved.instance.as_str())
+        );
+        assert!(store
+            .claim_merge_target("hot", &reserved.instance)
+            .await
+            .unwrap()
+            .is_none());
+        store
+            .finish(claim, Err("racing executor remains protected".into()))
             .await
             .unwrap();
     }

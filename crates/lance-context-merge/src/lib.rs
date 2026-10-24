@@ -126,6 +126,19 @@ impl Execution {
         }
     }
 
+    /// Catch-up work with no admitted storage writer, including cancellation
+    /// persisted before a recovery process lost its claim.
+    pub fn unstarted_catchup(&self) -> bool {
+        self.protocol == 2
+            && !self.background
+            && self.maintenance == Some(MaintenanceKind::Catchup)
+            && self.endpoint == MaintenanceKind::Catchup.endpoint()
+            && self.reclaimed == 0
+            && (self.phase == Phase::Reserved
+                || (self.phase == Phase::Recovered
+                    && self.error.as_deref() == Some(RESERVED_RECOVERY_REASON)))
+    }
+
     pub fn finished(&self, outcome: Result<usize>) -> Self {
         let mut next = self.clone();
         next.phase = Phase::Finished;
@@ -382,11 +395,51 @@ impl Coordinator {
     /// Never delete on elapsed time, an HTTP error, or claim expiry. Both the
     /// terminal result and the current task claim must still match atomically.
     pub async fn release(&self, claim: &ClaimProof, execution: &Execution) -> Result<bool> {
+        self.release_inner(claim, execution, false).await
+    }
+
+    /// Retire an orphan catch-up reservation only in the same transaction as
+    /// its cancelled execution. Never clear a marker on time or Pod absence.
+    pub async fn release_orphaned_catchup(
+        &self,
+        claim: &ClaimProof,
+        execution: &Execution,
+    ) -> Result<bool> {
+        if !execution.unstarted_catchup() || execution.phase != Phase::Recovered {
+            return Err(
+                "orphan catch-up release requires a cancelled protocol-2 reservation".into(),
+            );
+        }
+        self.release_inner(claim, execution, true).await
+    }
+
+    async fn release_inner(
+        &self,
+        claim: &ClaimProof,
+        execution: &Execution,
+        orphaned_catchup: bool,
+    ) -> Result<bool> {
         if !matches!(execution.phase, Phase::Finished | Phase::Recovered) {
             return Err("cannot release a live execution".into());
         }
         let key = execution_key(&self.prefix, &execution.target);
         let (mut compares, mut operations) = self.completion_changes(execution).await?;
+        if orphaned_catchup {
+            let active = key.replace("/merge-executions/", "/catchup-active/");
+            compares.extend([
+                Compare::value(
+                    active.as_str(),
+                    CompareOp::Equal,
+                    execution.instance.as_bytes(),
+                ),
+                Compare::version(
+                    key.replace("/merge-executions/", "/catchup-records/"),
+                    CompareOp::Equal,
+                    0,
+                ),
+            ]);
+            operations.push(TxnOp::delete(active, None));
+        }
         compares.extend([
             Compare::value(claim.key.as_str(), CompareOp::Equal, claim.token.as_bytes()),
             Compare::value(key.as_str(), CompareOp::Equal, encode(execution)),
