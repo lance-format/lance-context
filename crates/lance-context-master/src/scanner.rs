@@ -304,7 +304,7 @@ pub async fn scan_once(state: &Arc<MasterState>) -> lance::Result<usize> {
         .ok_or_else(|| lance::Error::io("master executor is draining; stats scan not admitted"))?;
     operation.phase("coordination_lock");
     let guard = state.task_store.coordination_lock("stats-writer").await?;
-    let result = scan_once_inner(state, &operation).await;
+    let result = scan_once_inner(state, &operation, &guard).await;
     operation.phase("release_coordination_lock");
     let release = state.task_store.release_coordination_lock(guard).await;
     match (result, release) {
@@ -326,7 +326,7 @@ async fn try_scan_once(state: &Arc<MasterState>, maintain: bool) -> lance::Resul
     else {
         return Ok(None);
     };
-    let result = scan_once_inner(state, &operation).await;
+    let result = scan_once_inner(state, &operation, &guard).await;
     // Maintenance runs under the same writer lock as the scan that just
     // created the versions, and its failure never fails the scan round.
     if maintain && result.is_ok() {
@@ -370,9 +370,11 @@ async fn try_scan_once(state: &Arc<MasterState>, maintain: bool) -> lance::Resul
 async fn scan_once_inner(
     state: &Arc<MasterState>,
     operation: &crate::admission::Operation,
+    guard: &crate::task_store::CoordinationGuard,
 ) -> lance::Result<usize> {
     operation.phase("registry_read");
     let scan_start = std::time::Instant::now();
+    let scan_started_ms = Utc::now().timestamp_millis();
     // Rollout experiments under their bare name; generic stores under the
     // `generic:` task-target prefix, so they occupy distinct rows and the
     // WAL-merge sweep enqueues them as generic tasks. Their MemWAL merges
@@ -427,8 +429,10 @@ async fn scan_once_inner(
     // not observe that experiment; its previous row is carried over below
     // rather than dropped.
     operation.phase("observe_tables");
+    let shard_counts = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let observations = stream::iter(entries)
         .map(|entry| {
+            let shard_counts = shard_counts.clone();
             let previous = previous.clone();
             let rollout_options = rollout_options.clone();
             let generic_options = generic_options.clone();
@@ -437,15 +441,31 @@ async fn scan_once_inner(
                 let prev = previous.get(&entry.name);
                 let observed = match entry.kind {
                     ScanKind::Rollout => {
-                        observe_one(&entry.name, &entry.uri, prev, rollout_options.clone()).await
+                        observe_one_with_shards(
+                            &entry.name,
+                            &entry.uri,
+                            prev,
+                            rollout_options.clone(),
+                        )
+                        .await
                     }
                     ScanKind::Generic => {
-                        observe_generic(&entry.name, &entry.uri, prev, generic_options.clone())
-                            .await
+                        observe_generic_with_shards(
+                            &entry.name,
+                            &entry.uri,
+                            prev,
+                            generic_options.clone(),
+                        )
+                        .await
                     }
                 };
                 match observed {
-                    Ok(result) => {
+                    Ok((row, skipped, shard_max)) => {
+                        shard_counts
+                            .lock()
+                            .unwrap()
+                            .insert(row.name.clone(), shard_max);
+                        let result = (row, skipped);
                         operation.observed_table();
                         // Demand reconciliation rides the scan: publish every
                         // shard's watermark as a scan-sourced event. Detached
@@ -566,7 +586,28 @@ async fn scan_once_inner(
         }
     }
 
+    // Retirement can remove rows after observation. Summarize only retained
+    // stores, and never let a failed observation masquerade as a zero shard.
+    let (largest_shard, stores_with_shard_over_4096) = {
+        let shards = shard_counts.lock().unwrap();
+        let counts: Vec<usize> = snapshot
+            .iter()
+            .filter_map(|row| shards.get(&row.name).copied())
+            .collect();
+        (
+            counts.iter().copied().max().unwrap_or(0),
+            counts.iter().filter(|&&n| n > 4096).count(),
+        )
+    };
+    let mut backlog = crate::backlog_metrics::Snapshot::new(
+        &snapshot,
+        failed,
+        scan_started_ms,
+        largest_shard as u64,
+        stores_with_shard_over_4096 as u64,
+    );
     publish_snapshot(&mut stats, &state.stats_cache, snapshot, failed).await?;
+    backlog.committed_ms = Utc::now().timestamp_millis();
 
     metrics::histogram!("master_scan_duration_seconds").record(scan_start.elapsed().as_secs_f64());
     // How much of the round was avoided by the version check. A ratio near 1 is
@@ -596,6 +637,20 @@ async fn scan_once_inner(
     metrics::gauge!("master_rollout_rows_total").set(total_rows as f64);
     metrics::gauge!("master_rollout_fragments_total").set(total_fragments as f64);
     drop(stats);
+    // Advisory publication cannot stall or fail a completed stats scan. The
+    // compare fences an old scanner whose writer lease expired during storage I/O.
+    match tokio::time::timeout(
+        Duration::from_secs(5),
+        state.task_store.publish_backlog_snapshot(guard, &backlog),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        result => {
+            metrics::counter!("master_backlog_snapshot_publication_errors_total").increment(1);
+            tracing::warn!(?result, "shared backlog metric snapshot was not confirmed; previous observation will age out");
+        }
+    }
     Ok(count)
 }
 
@@ -620,7 +675,6 @@ async fn publish_snapshot(
     // Acquire the cache lock before publishing any gauges: cancellation while
     // waiting must not expose new gauges paired with the previous cache.
     let mut cached = cache.write().await;
-    record_backlog_gauges(&snapshot);
     metrics::gauge!("master_stats_hot_experiments").set(snapshot.len() as f64);
     *cached = Arc::new(snapshot);
     Ok(())
@@ -692,56 +746,15 @@ fn unique_scan_entries(mut entries: Vec<ScanEntry>) -> (Vec<ScanEntry>, HashSet<
 
 /// Count pending generations under the observe timeout; shard manifests are
 /// one small object read per shard, but object storage still has to answer.
-async fn pending_or_timeout(
+async fn pending_or_timeout<T>(
     name: &str,
-    pending: impl std::future::Future<Output = lance::Result<usize>>,
-) -> lance::Result<usize> {
+    pending: impl std::future::Future<Output = lance::Result<T>>,
+) -> lance::Result<T> {
     match tokio::time::timeout(OBSERVE_TIMEOUT, pending).await {
         Ok(result) => result,
         Err(_) => Err(lance::Error::io(format!(
             "pending-generation count timed out for store '{name}'"
         ))),
-    }
-}
-
-/// Fleet-wide view of the WAL backlog, refreshed every scan. The read cap
-/// (`ROLLOUT_WAL_PENDING_MAX_GENERATIONS`, 4,096 by default) turns pending
-/// generations into refused reads, so `stores_over_read_cap` is the number of
-/// stores whose reads are failing right now; it is the alert that was
-/// missing when a store sat at 17k for hours.
-fn record_backlog_gauges(snapshot: &[StatRow]) {
-    let b = Backlog::summarize(snapshot);
-    metrics::gauge!("master_wal_pending_generations_total").set(b.total as f64);
-    metrics::gauge!("master_wal_pending_generations_max").set(b.max as f64);
-    metrics::gauge!("master_stores_pending_over_read_cap").set(b.over_read_cap as f64);
-    metrics::gauge!("master_stores_pending_over_1k").set(b.over_1k as f64);
-}
-
-#[derive(Debug, Default, PartialEq, Eq)]
-struct Backlog {
-    total: i64,
-    max: i64,
-    over_read_cap: i64,
-    over_1k: i64,
-}
-
-impl Backlog {
-    const READ_CAP: i64 = lance_context_core::DEFAULT_PENDING_GENERATIONS_MAX as i64;
-
-    fn summarize(snapshot: &[StatRow]) -> Self {
-        let mut b = Self::default();
-        for row in snapshot {
-            let p = row.pending_wal_generations.max(0);
-            b.total += p;
-            b.max = b.max.max(p);
-            if p > Self::READ_CAP {
-                b.over_read_cap += 1;
-            }
-            if p > 1000 {
-                b.over_1k += 1;
-            }
-        }
-        b
     }
 }
 
@@ -769,12 +782,26 @@ fn note_pending_drift(name: &str, previous: i64, current: usize) {
 /// fragment count and pending MemWAL generations. Compaction counters stay at
 /// their carried-over values because the master does not compact generic
 /// stores.
+#[cfg(test)]
 async fn observe_generic(
     name: &str,
     uri: &str,
     previous: Option<&StatRow>,
     options: GenericStoreOptions,
 ) -> lance::Result<(StatRow, bool)> {
+    observe_generic_with_shards(name, uri, previous, options)
+        .await
+        .map(|(row, skipped, _)| (row, skipped))
+}
+
+async fn observe_generic_with_shards(
+    name: &str,
+    uri: &str,
+    previous: Option<&StatRow>,
+    mut options: GenericStoreOptions,
+) -> lance::Result<(StatRow, bool, usize)> {
+    // Metadata observation must see shards over the worker read cap.
+    options.pending_generations_max = Some(0);
     let open = GenericStore::open_existing(uri, options);
     let store = match tokio::time::timeout(OBSERVE_TIMEOUT, open).await {
         Ok(Ok(store)) => store,
@@ -795,22 +822,23 @@ async fn observe_generic(
     let current_version = store.version() as i64;
     if let Some(prev) = previous {
         if prev.version != StatRow::UNKNOWN_VERSION && prev.version == current_version {
-            let pending = pending_or_timeout(name, store.pending_wal_generations()).await?;
+            let (pending, shard_max) =
+                pending_or_timeout(name, store.pending_wal_generation_counts()).await?;
             note_pending_drift(name, prev.pending_wal_generations, pending);
             let mut row = prev.clone();
             row.uri = uri.to_string();
             row.pending_wal_generations = pending as i64;
             row.scanned_at = Utc::now().timestamp_millis();
-            return Ok((row, true));
+            return Ok((row, true, shard_max));
         }
     }
 
     let observe = async {
-        let pending = store.pending_wal_generations().await?;
+        let (pending, shard_max) = store.pending_wal_generation_counts().await?;
         let rows = store.count_base_rows().await?;
-        Ok::<_, lance::Error>((pending, rows))
+        Ok::<_, lance::Error>((pending, rows, shard_max))
     };
-    let (pending, rows) = match tokio::time::timeout(OBSERVE_TIMEOUT, observe).await {
+    let (pending, rows, shard_max) = match tokio::time::timeout(OBSERVE_TIMEOUT, observe).await {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => return Err(e),
         Err(_) => {
@@ -839,6 +867,7 @@ async fn observe_generic(
             version: current_version,
         },
         false,
+        shard_max,
     ))
 }
 
@@ -848,6 +877,17 @@ async fn observe_one(
     previous: Option<&StatRow>,
     options: RolloutStoreOptions,
 ) -> lance::Result<(StatRow, bool)> {
+    observe_one_with_shards(name, uri, previous, options)
+        .await
+        .map(|(row, skipped, _)| (row, skipped))
+}
+
+async fn observe_one_with_shards(
+    name: &str,
+    uri: &str,
+    previous: Option<&StatRow>,
+    options: RolloutStoreOptions,
+) -> lance::Result<(StatRow, bool, usize)> {
     let open = RolloutStore::open_existing_with_options(uri, options);
     let store = match tokio::time::timeout(OBSERVE_TIMEOUT, open).await {
         Ok(Ok(store)) => store,
@@ -865,13 +905,14 @@ async fn observe_one(
     let current_version = store.version() as i64;
     if let Some(prev) = previous {
         if prev.version != StatRow::UNKNOWN_VERSION && prev.version == current_version {
-            let pending = pending_or_timeout(name, store.pending_wal_generations()).await?;
+            let (pending, shard_max) =
+                pending_or_timeout(name, store.pending_wal_generation_counts()).await?;
             note_pending_drift(name, prev.pending_wal_generations, pending);
             let mut row = prev.clone();
             row.uri = uri.to_string();
             row.pending_wal_generations = pending as i64;
             row.scanned_at = Utc::now().timestamp_millis();
-            return Ok((row, true));
+            return Ok((row, true, shard_max));
         }
     }
 
@@ -907,6 +948,7 @@ async fn observe_one(
             version: obs.version as i64,
         },
         false,
+        obs.max_pending_wal_generations_per_shard.max(0) as usize,
     ))
 }
 
@@ -1873,22 +1915,17 @@ mod retirement_tests {
     /// generations would strand them: never merged, read amplification never
     /// recovers, `_mem_wal/` never reclaimed, and no process left to notice.
     #[test]
-    fn backlog_summary_counts_stores_over_the_read_cap() {
-        let mut a = row("a", "u", 0);
-        a.pending_wal_generations = 17_254;
-        let mut b = row("b", "u", 0);
-        b.pending_wal_generations = 1_200;
-        let mut c = row("c", "u", 0);
-        c.pending_wal_generations = 3;
-        assert_eq!(
-            Backlog::summarize(&[a, b, c]),
-            Backlog {
-                total: 18_457,
-                max: 17_254,
-                over_read_cap: 1,
-                over_1k: 2,
-            }
-        );
+    fn backlog_summary_distinguishes_store_sum_from_per_shard_threshold() {
+        let mut a = row("a", "u", 100_000);
+        a.pending_wal_generations = 5000;
+        // Two shards of 2500 each exceed the STORE threshold but neither the
+        // per-shard reference cap. This used to count one refused-read store.
+        let summary = crate::backlog_metrics::Snapshot::new(&[a], 0, 100_000, 2500, 0);
+        assert_eq!(summary.generations, 5000);
+        assert_eq!(summary.largest_store, 5000);
+        assert_eq!(summary.largest_shard, 2500);
+        assert_eq!(summary.stores_with_shard_over_4096, 0);
+        assert_eq!(summary.stores_over_1000, 1);
     }
 
     #[tokio::test]

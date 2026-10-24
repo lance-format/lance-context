@@ -1569,6 +1569,7 @@ mod tests {
             host: "127.0.0.1".to_string(),
             port: 0,
             stats_scan_interval_secs: 0,
+            backlog_metrics_max_age_secs: 900,
             scan_concurrency: 4,
             rollout_cache_bytes: 2 * 1024 * 1024 * 1024,
             stats_maintenance_every_n_scans: 0,

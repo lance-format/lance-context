@@ -1101,6 +1101,7 @@ mod tests {
             host: "127.0.0.1".to_string(),
             port: 0,
             stats_scan_interval_secs: 0,
+            backlog_metrics_max_age_secs: 900,
             scan_concurrency: 4,
             rollout_cache_bytes: 2 * 1024 * 1024 * 1024,
             stats_maintenance_every_n_scans: 0,
@@ -1337,6 +1338,63 @@ mod tests {
         .unwrap();
         assert_eq!(one.total, 1);
         assert_eq!(one.experiments[0].name, "exp-1");
+    }
+
+    /// Real registry, WAL manifests, Lance stats commit and shared etcd metric
+    /// publication. A missing new registry entry must invalidate completeness,
+    /// even when there is no previous row available to carry over.
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn backlog_scan_publication_tracks_wal_and_unknown_registry_entries() {
+        let dir = TempDir::new().unwrap();
+        let state = MasterState::new(test_config(&dir)).await.unwrap();
+        let uri = state.rollout_uri("metrics-hot");
+        let store = RolloutStore::open(&uri).await.unwrap();
+        state.registry.upsert("metrics-hot", &uri).await.unwrap();
+        for id in ["a", "b"] {
+            store.add(&[test_record(id, false)]).await.unwrap();
+            store.flush().await.unwrap();
+        }
+        scanner::scan_once(&state).await.unwrap();
+        let (full, first_revision) = state
+            .task_store
+            .read_backlog_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(full.validate());
+        assert_eq!(full.stores, 1);
+        assert_eq!(full.generations, 2);
+        assert_eq!(full.largest_shard, 2);
+        assert_eq!(full.failed_observations, 0);
+        assert!(full.committed_ms >= full.oldest_observation_ms);
+        let row = state
+            .stats
+            .lock()
+            .await
+            .get("metrics-hot")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(full.generations, row.pending_wal_generations as u64);
+
+        let missing = dir.path().join("does-not-exist.lance");
+        state
+            .registry
+            .upsert("unreadable", missing.to_str().unwrap())
+            .await
+            .unwrap();
+        scanner::scan_once(&state).await.unwrap();
+        let (partial, second_revision) = state
+            .task_store
+            .read_backlog_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(second_revision > first_revision);
+        assert_eq!(partial.generations, 2);
+        assert_eq!(partial.stores, 1);
+        assert_eq!(partial.failed_observations, 1);
     }
 
     /// `/experiments` must answer even while a scan round holds the stats lock.

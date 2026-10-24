@@ -2,6 +2,7 @@
 #![recursion_limit = "256"]
 
 pub mod admission;
+pub mod backlog_metrics;
 pub mod catchup;
 pub mod config;
 pub mod demand_publish;

@@ -798,6 +798,81 @@ impl TaskStore {
         self.inner.revoke_lease(lease_id).await
     }
 
+    /// A compact metrics summary, outside scheduler watch ranges. One write
+    /// per completed scan, conditional on the original stats writer's token.
+    pub(crate) async fn publish_backlog_snapshot(
+        &self,
+        guard: &CoordinationGuard,
+        snapshot: &crate::backlog_metrics::Snapshot,
+    ) -> lance::Result<()> {
+        let expected = format!(
+            "{}/coordination/{}",
+            self.inner.prefix,
+            encode_segment("stats-writer")
+        );
+        if guard.key != expected || !snapshot.validate() {
+            return Err(lance::Error::io(
+                "invalid backlog snapshot or stats-writer guard",
+            ));
+        }
+        let value = serde_json::to_vec(snapshot).map_err(|e| lance::Error::io(e.to_string()))?;
+        if value.len() > crate::backlog_metrics::MAX_SNAPSHOT_BYTES {
+            return Err(lance::Error::io(
+                "backlog snapshot exceeds fixed size limit",
+            ));
+        }
+        let result = self
+            .inner
+            .client
+            .clone()
+            .txn(
+                Txn::new()
+                    .when([Compare::value(
+                        guard.key.clone(),
+                        CompareOp::Equal,
+                        guard.token.clone(),
+                    )])
+                    .and_then([TxnOp::put(
+                        format!("{}/observability/wal-backlog", self.inner.prefix),
+                        value,
+                        None,
+                    )]),
+            )
+            .await
+            .map_err(etcd_error("publish backlog metrics"))?;
+        if !result.succeeded() {
+            return Err(lance::Error::io(
+                "stats writer ownership changed before metric publication",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Read exactly one bounded summary key. No queue or table enumeration.
+    pub(crate) async fn read_backlog_snapshot(
+        &self,
+    ) -> lance::Result<Option<(crate::backlog_metrics::Snapshot, i64)>> {
+        let result = self
+            .inner
+            .client
+            .clone()
+            .get(
+                format!("{}/observability/wal-backlog", self.inner.prefix),
+                None,
+            )
+            .await
+            .map_err(etcd_error("read backlog metrics"))?;
+        let Some(kv) = result.kvs().first() else {
+            return Ok(None);
+        };
+        if kv.value().len() > crate::backlog_metrics::MAX_SNAPSHOT_BYTES {
+            return Err(lance::Error::io("backlog metrics exceed fixed size limit"));
+        }
+        let snapshot = serde_json::from_slice(kv.value())
+            .map_err(|e| lance::Error::io(format!("invalid backlog metrics: {e}")))?;
+        Ok(Some((snapshot, kv.mod_revision())))
+    }
+
     async fn recover_orphaned(&self) -> lance::Result<usize> {
         self.inner.recover_orphaned().await
     }
@@ -2790,6 +2865,66 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn backlog_snapshot_handoff_fences_old_scanner() {
+        let (_dir, first) = bounded_scheduler_store(vec![]).await;
+        let mut cfg = config(&_dir);
+        cfg.etcd.etcd_endpoints = std::env::var("ETCD_TEST_ENDPOINTS")
+            .unwrap()
+            .split(',')
+            .map(str::to_owned)
+            .collect();
+        cfg.etcd.etcd_prefix = first.inner.prefix.clone();
+        let second = TaskStore::open(&cfg).await.unwrap();
+        assert!(first.read_backlog_snapshot().await.unwrap().is_none());
+        let old = first.coordination_lock("stats-writer").await.unwrap();
+        let mut high = crate::backlog_metrics::Snapshot::new(&[], 0, now_ms(), 0, 0);
+        high.stores = 1;
+        high.generations = 3913;
+        high.largest_store = 3913;
+        first.publish_backlog_snapshot(&old, &high).await.unwrap();
+        let (seen, before) = second.read_backlog_snapshot().await.unwrap().unwrap();
+        assert_eq!(seen.generations, 3913);
+        // Real etcd lease loss, while the old process and its cached high value
+        // survive. Only the successor may replace the shared observation.
+        first.inner.revoke_lease(old.lease_id).await.unwrap();
+        let new = second.coordination_lock("stats-writer").await.unwrap();
+        let mut low = high.clone();
+        low.generations = 1964;
+        low.largest_store = 1964;
+        second.publish_backlog_snapshot(&new, &low).await.unwrap();
+        assert!(first.publish_backlog_snapshot(&old, &high).await.is_err());
+        let (seen, after) = first.read_backlog_snapshot().await.unwrap().unwrap();
+        assert_eq!(seen.generations, 1964);
+        assert!(after > before);
+        // A failed observation is published as incomplete, not erased/zeroed.
+        low.failed_observations = 1;
+        second.publish_backlog_snapshot(&new, &low).await.unwrap();
+        assert_eq!(
+            first
+                .read_backlog_snapshot()
+                .await
+                .unwrap()
+                .unwrap()
+                .0
+                .failed_observations,
+            1
+        );
+        second.release_coordination_lock(new).await.unwrap();
+        drop(old);
+        second
+            .inner
+            .client
+            .clone()
+            .delete(
+                format!("{}/observability/wal-backlog", second.inner.prefix),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn scheduler_notifications_reconnect_after_transport_loss() {
         let (_dir, proxy, store, mut observer) = lease_proxy_store().await;
         let mut rx = store.scheduler_notifications();
@@ -4561,6 +4696,7 @@ mod tests {
             host: "127.0.0.1".to_string(),
             port: 0,
             stats_scan_interval_secs: 0,
+            backlog_metrics_max_age_secs: 900,
             scan_concurrency: 4,
             rollout_cache_bytes: 2 * 1024 * 1024 * 1024,
             stats_maintenance_every_n_scans: 0,

@@ -136,6 +136,8 @@ pub struct RolloutObservation {
     pub last_updated: i64,
     /// Flushed MemWAL generations pending merge across all shards.
     pub pending_wal_generations: i64,
+    /// Largest pending count on any one shard in the same observation.
+    pub max_pending_wal_generations_per_shard: i64,
     /// Rows durably accepted by *this instance's* resident writer but not yet
     /// sealed into a flushed generation, and so not yet counted by
     /// [`Self::row_count`] or visible to any reader.
@@ -834,6 +836,11 @@ impl RolloutStore {
         self.base.pending_wal_generations().await
     }
 
+    /// Total and largest per-shard pending counts from one manifest pass.
+    pub async fn pending_wal_generation_counts(&self) -> LanceResult<(usize, usize)> {
+        self.base.pending_wal_generation_counts().await
+    }
+
     /// Snapshot read-only observability metrics for the rollout store.
     ///
     /// `row_count` combines base-table fragment metadata with row counts from
@@ -863,6 +870,11 @@ impl RolloutStore {
             version,
             last_updated,
             pending_wal_generations,
+            max_pending_wal_generations_per_shard: shard_snapshots
+                .iter()
+                .map(|s| s.sstables.len() as i64)
+                .max()
+                .unwrap_or(0),
             unflushed_rows: self.unflushed_rows().await,
         })
     }

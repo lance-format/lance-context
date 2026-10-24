@@ -41,6 +41,15 @@ pub struct MasterConfig {
     #[arg(long, env = "STATS_SCAN_INTERVAL_SECS", default_value_t = 300)]
     pub stats_scan_interval_secs: u64,
 
+    /// Maximum age of scan observations usable for fleet backlog dashboards.
+    /// Older/incomplete snapshots are unknown, never a zero backlog.
+    #[arg(
+        long,
+        env = "MASTER_BACKLOG_METRICS_MAX_AGE_SECS",
+        default_value_t = 900
+    )]
+    pub backlog_metrics_max_age_secs: u64,
+
     /// Bounded concurrency when scanning experiments each round.
     #[arg(long, env = "SCAN_CONCURRENCY", default_value_t = 8)]
     pub scan_concurrency: usize,

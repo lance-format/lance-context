@@ -734,6 +734,11 @@ impl GenericStore {
         self.base.pending_wal_generations().await
     }
 
+    /// Total and largest per-shard pending counts from one manifest pass.
+    pub async fn pending_wal_generation_counts(&self) -> LanceResult<(usize, usize)> {
+        self.base.pending_wal_generation_counts().await
+    }
+
     /// Compact the base table's small fragments. Drive from a single external
     /// trigger, not per worker — see [`StorageBase::compact`].
     pub async fn compact(

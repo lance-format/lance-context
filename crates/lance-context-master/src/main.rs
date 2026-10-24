@@ -97,6 +97,12 @@ async fn main() {
         }
     };
 
+    let backlog_metrics = lance_context_master::backlog_metrics::BacklogMetrics::new(
+        std::time::Duration::from_secs(state.config.backlog_metrics_max_age_secs),
+    );
+    let _backlog_reader = backlog_metrics.spawn(state.task_store.clone());
+    let metrics_handle = metrics_handle.with_extra_metrics(move || backlog_metrics.render());
+
     // Background stats scanner (detached; stops when the last Arc drops).
     let _scanner = scanner::spawn_scanner(&state);
 

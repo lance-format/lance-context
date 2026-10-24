@@ -81,6 +81,7 @@ const PENDING_GENERATIONS_BUCKETS: &[f64] =
 pub struct MetricsHandle {
     prometheus: PrometheusHandle,
     process: Arc<Collector>,
+    extra: Option<Arc<dyn Fn() -> String + Send + Sync>>,
 }
 
 /// Install the global Prometheus recorder for this process.
@@ -123,6 +124,20 @@ pub fn install_recorder() -> MetricsHandle {
     MetricsHandle {
         prometheus,
         process: Arc::new(process),
+        extra: None,
+    }
+}
+
+impl MetricsHandle {
+    /// Add bounded, in-memory exposition evaluated at scrape time. This allows
+    /// expiring observations to disappear instead of remaining immortal gauges.
+    /// The callback must not perform I/O or wait on application work.
+    pub fn with_extra_metrics(
+        mut self,
+        extra: impl Fn() -> String + Send + Sync + 'static,
+    ) -> Self {
+        self.extra = Some(Arc::new(extra));
+        self
     }
 }
 
@@ -326,7 +341,10 @@ pub fn metrics_router(handle: MetricsHandle) -> Router {
 async fn render(State(handle): State<MetricsHandle>) -> impl IntoResponse {
     // Refresh process CPU/memory/FD/thread gauges just before rendering.
     handle.process.collect();
-    let body = handle.prometheus.render();
+    let mut body = handle.prometheus.render();
+    if let Some(extra) = &handle.extra {
+        body.push_str(&extra());
+    }
     ([("content-type", "text/plain; version=0.0.4")], body)
 }
 
@@ -371,7 +389,15 @@ mod tests {
     async fn metrics_endpoint_renders_prometheus_text() {
         // install_recorder can only run once per process; guard so parallel
         // tests don't double-install.
-        let handle = install_recorder();
+        let present = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let exposed = present.clone();
+        let handle = install_recorder().with_extra_metrics(move || {
+            if exposed.load(std::sync::atomic::Ordering::Relaxed) {
+                "# HELP test_expiring_gauge Current observation.\n# TYPE test_expiring_gauge gauge\ntest_expiring_gauge 3913\n".to_owned()
+            } else {
+                String::new()
+            }
+        });
         metrics::counter!("test_counter_total").increment(7);
         // A request-scale and a job-scale latency sample, to assert both bucket
         // sets render as true histograms rather than summaries.
@@ -412,6 +438,7 @@ mod tests {
         assert_eq!(invalid_nonce.status(), StatusCode::BAD_REQUEST);
         assert_eq!(invalid_nonce.headers()["cache-control"], "no-store");
         let resp = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/metrics")
@@ -427,6 +454,26 @@ mod tests {
             .unwrap();
         let text = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(text.contains("test_counter_total 7"), "body: {text}");
+        assert!(text.contains("# TYPE test_expiring_gauge gauge\ntest_expiring_gauge 3913\n"));
+        // Expiration is evaluated on every HTTP scrape: an earlier value must
+        // not be retained by the recorder after the callback removes it.
+        present.store(false, std::sync::atomic::Ordering::Relaxed);
+        let expired = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(expired.status(), StatusCode::OK);
+        let expired = axum::body::to_bytes(expired.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let expired = String::from_utf8(expired.to_vec()).unwrap();
+        assert!(!expired.contains("test_expiring_gauge"));
+        assert!(expired.contains("test_counter_total 7"));
 
         // Latency metrics must export as bucketed histograms, not summaries.
         assert!(

@@ -2461,12 +2461,20 @@ impl StorageBase {
     /// across all shards. Read-only: unlike [`Self::cleanup_own_shard`] it never
     /// merges.
     pub async fn pending_wal_generations(&self) -> LanceResult<usize> {
-        Ok(self
-            .wal_shard_snapshots()
-            .await?
-            .iter()
-            .map(|snapshot| snapshot.sstables.len())
-            .sum())
+        Ok(self.pending_wal_generation_counts().await?.0)
+    }
+
+    /// Total and largest per-shard pending counts from the same manifest read.
+    pub async fn pending_wal_generation_counts(&self) -> LanceResult<(usize, usize)> {
+        let snapshots = self.wal_shard_snapshots().await?;
+        Ok((
+            snapshots.iter().map(|s| s.sstables.len()).sum(),
+            snapshots
+                .iter()
+                .map(|s| s.sstables.len())
+                .max()
+                .unwrap_or(0),
+        ))
     }
 
     /// Count rows in all immutable flushed-generation datasets using metadata
