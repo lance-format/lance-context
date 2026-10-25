@@ -331,7 +331,7 @@ impl AnnotationStaging {
         }
         let mut pending = Values::new();
         let mut batch_bytes = 0;
-        for (chunk_index, chunk) in mutations.chunks(COLD_LOOKUP_ROWS).enumerate() {
+        for (chunk_index, chunk) in mutations.chunks(COLD_LOOKUP_KEYS).enumerate() {
             let keys = chunk
                 .iter()
                 .map(|m| m.turn)
@@ -346,7 +346,7 @@ impl AnnotationStaging {
                 .collect::<std::collections::BTreeSet<_>>();
             let mut cold = read_bases(&state.base, &keys).await?;
             for (offset, Mutation { turn, patch }) in chunk.iter().enumerate() {
-                let row = chunk_index * COLD_LOOKUP_ROWS + offset;
+                let row = chunk_index * COLD_LOOKUP_KEYS + offset;
                 let previous = pending
                     .get(*turn)
                     .cloned()
@@ -536,10 +536,11 @@ async fn read_base(base: &Dataset, turn: &str, max_bytes: usize) -> Result<Optio
     Ok(value)
 }
 
-// Keep the cold lookup's projected Arrow rows bounded independently of the
-// accepted WAL batch. Values are decoded one at a time in mutation order;
-// slices share the scanner's Arrow buffers, not cloned annotation strings.
+// Scanner vectors and query key windows are independent. A 2048-row mutation
+// batch needs at most one cold query, while point reads retain small vectors.
+// Values are decoded in mutation order; slices share projected Arrow buffers.
 const COLD_LOOKUP_ROWS: usize = 128;
+const COLD_LOOKUP_KEYS: usize = 2048;
 
 async fn read_bases<'a>(
     base: &Dataset,

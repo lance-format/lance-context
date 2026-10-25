@@ -6,7 +6,7 @@ cold turn created a separate Lance scanner while `pending_batch` held the stagin
 mutex. Increasing request size mostly increased the time readers and publication
 waited for that mutex.
 
-Application now processes lookup windows of at most 128 mutations. It collects
+Application now processes lookup windows of at most 2048 mutations. It collects
 only keys missing from pending, active and frozen values, and reads those keys
 with one Lance `IN` filter against the same base snapshot. Only `id`, `labels`,
 `status` and `score` are projected. The temporary map borrows request keys and
@@ -22,13 +22,22 @@ applied cursor. A duplicate base key or storage failure stops application withou
 exposing partial values. One extra result row detects duplicate keys without
 retaining an arbitrarily large corrupt result set.
 
-At most 128 requested keys and their projected row views are retained for one
+At most 2048 requested keys and their projected row views are retained for one
 lookup window. Staged values retain the existing byte/entry charges. Arrow
 scanner buffers and Lance I/O workspace remain separate from staging charges;
 row limits and shared slices do not establish a total RSS bound. This change
 adds no WAL format, request identity, read barrier, or publication protocol.
 
-## Release comparison
+Query windows are independent of scanner vectors, which remain 128 rows. The
+original implementation used that vector size as the key-window size too: a
+2048-row cold mutation batch could issue 16 sequential Lance queries while
+holding the staging lock. A window now issues one query for those keys. Larger
+accepted batches still use bounded windows; repeated keys and rejection row
+numbers retain their original whole-batch order. The temporary projected row
+views can retain more Arrow buffers than before, so this trades bounded lookup
+workspace for fewer query starts. It does not increase the durable staging limits.
+
+## Original 128-key release comparison
 
 The same one-host experiment, budgets, 4,096-turn working set and two writers
 produced these 30-second results. Each update batch is followed by cross-ingress
@@ -115,3 +124,61 @@ reclamation. The point-read scan improvement is not a body-ingestion or WAL
 throughput result.
 
 Refs #378.
+
+## 2048-key query windows
+
+A separate-process indexed comparison used 65,536 turns, 2048-row mutation
+batches, one RF3 group, one owner, two ingresses and two independent client
+writers on one host. Both arms used the same saved client and WAL binaries,
+128-row scan vectors, one-second publication aggregation, 16 MiB / 16,384-entry
+staging, 32 MiB upload/apply budgets and a 64 MiB publication reserve. Only the
+owner/ingress binary changed the query-key window; ingress forwarding does not
+perform these Lance lookups. Initial test-table files were synced before each
+load; WAL durability was unchanged.
+
+| Query keys | Duration | Updates/s | ACK p99 bound | Point-read p99 bound |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 30 s | 27,234 | 272 ms | 34 ms |
+| 2048 | 30 s | 34,390 | 308 ms | 14 ms |
+| 2048 | 120 s | 33,549 | 299 ms | 15 ms |
+
+All runs passed complete value/index checks for 65,536 rows, source reclamation
+and final empty staging/source observations, with zero refusals or read errors.
+The 120-second run acknowledged 4,026,368 updates and checked 3932 post-ACK reads
+plus 64 final point samples. This demonstrates sustained drain for this bounded
+annotation workload, not body-ingest bandwidth, a production capacity limit or a
+300-billion-turn lookup qualification. The shared local disk still recorded
+occasional 100–200 ms WAL write/poll stalls; improved point reads did not eliminate
+ACK tail latency. Projected lookup workspace is larger even though staging limits
+and row-vector size remain unchanged.
+
+A sequential cloud comparison used three WAL replicas on separate hosts and
+Lance on blob storage, with the same 65,536-turn indexed table, two writers and
+budgets above. The table was reused, so cache state and accumulated content are
+not controlled as they would be in an isolated repeated A/B experiment.
+
+| Query keys | Publication wait | Duration | Updates/s | ACK p99 bound | Point-read p99 bound |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 128 | 1 s | 120 s | 9,238 | 628 ms | 267 ms |
+| 128 | 3 s | 120 s | 6,859 | 1063 ms | 353 ms |
+| 2048 | 1 s | 120 s | 20,977 | 477 ms | 382 ms |
+
+The longer publication wait reduced throughput and reached staging pressure;
+it is not recommended by this experiment. The larger key window improved
+throughput but worsened cloud point-read p99. Application still holds the staging
+mutex during cold lookup, so this is not a claim of improved read tail latency.
+
+The 2048-key cloud run acknowledged 2,519,040 updates, checked 2460 post-ACK
+reads and 64 final samples, and verified all 65,536 values, the original ID-index
+identity/fragment coverage, source GC and final empty staging. It reached the
+16,384-entry limit, with 46 backpressured observations and zero client refusals;
+waiting under pressure still contributes to latency. Peak observed staging
+charge was 8,798,208 bytes and owner RSS was about 165 MiB. No OOM or CPU
+throttling was observed; two synchronous WAL writes took about 104 and 154 ms.
+
+A following fault phase acknowledged 4096 updates while publication was delayed,
+then killed the owner and all three WAL processes with SIGKILL. Reopening the
+original persistent directories first observed the old materialized cut, then
+all 4096 replayed entries before publication. Recovery passed point reads, full
+value/index checks, source GC and final drain. This qualifies process termination
+with retained storage, not power failure or loss of all replica disks.

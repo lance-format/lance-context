@@ -29,7 +29,7 @@ async fn cold_batches_keep_frozen_values_and_order_across_lookup_windows() -> Re
         status: Clear,
         ..Default::default()
     };
-    let mut batch = (0..COLD_LOOKUP_ROWS)
+    let mut batch = (0..COLD_LOOKUP_KEYS)
         .map(|_| Mutation {
             turn: "T",
             patch: &score,
@@ -68,7 +68,7 @@ async fn cold_batches_keep_frozen_values_and_order_across_lookup_windows() -> Re
     assert_eq!(
         staging.apply_committed(2, 3, &batch).await?,
         ApplyOutcome::Rejected(Rejection {
-            row: COLD_LOOKUP_ROWS + 2,
+            row: COLD_LOOKUP_KEYS + 2,
             reason: RejectionReason::MissingTurn,
         })
     );
