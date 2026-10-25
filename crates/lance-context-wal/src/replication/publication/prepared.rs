@@ -1,6 +1,7 @@
 //! One immutable materialization result per pending plan. Recording descriptors
 //! does not authorize a Lance commit or certify that remote source pins exist.
 use super::*;
+use crate::ingest_contract::WritePolicy;
 
 #[cfg(test)]
 mod tests;
@@ -35,6 +36,14 @@ impl Descriptors {
         Self::new(3, bytes)
     }
 
+    /// Native narrow-column annotation update metadata. The application must
+    /// validate the operation and its source cut before publishing. Replicas
+    /// enforce the table's annotation policy, length and digest only.
+    /// Enable only after all voters and publishers support format 4.
+    pub fn lance_annotations(bytes: Bytes) -> Result<Self> {
+        Self::new(4, bytes)
+    }
+
     fn new(format: u32, bytes: Bytes) -> Result<Self> {
         let descriptors = Self {
             format,
@@ -45,17 +54,20 @@ impl Descriptors {
         Ok(descriptors)
     }
 
-    pub(super) fn matches_plan(&self, plan: &Plan) -> bool {
+    pub(super) fn matches_plan(&self, plan: &Plan, policy: &WritePolicy) -> bool {
         if plan.is_maintenance() {
             matches!(self.format, 2 | 3)
         } else {
-            self.format == 1
+            match policy {
+                WritePolicy::ImmutableUniqueIds => self.format == 1,
+                WritePolicy::TurnAnnotations => self.format == 4,
+            }
         }
     }
 
     pub fn validate(&self, maximum: u64) -> Result<()> {
         ensure!(
-            (1..=3).contains(&self.format)
+            (1..=4).contains(&self.format)
                 && !self.bytes.is_empty()
                 && self.bytes.len() <= MAX_DESCRIPTOR_BYTES
                 && self.bytes.len() as u64 <= maximum
@@ -113,7 +125,10 @@ impl Catalog {
         if pending.index != request.plan_index || pending.plan.transaction != request.transaction {
             return Reply::Rejected(Rejection::PlanIdentity);
         }
-        if !request.descriptors.matches_plan(&pending.plan) {
+        if !request
+            .descriptors
+            .matches_plan(&pending.plan, &table.ingest.policy)
+        {
             return Reply::Rejected(Rejection::PreparedConflict);
         }
         if let Some(prepared) = &table.progress.prepared {

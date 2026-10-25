@@ -110,7 +110,7 @@ enum Request {
 }
 #[derive(Serialize, Deserialize)]
 enum Response {
-    Publisher(Option<Table>),
+    Publisher(Option<Box<Table>>),
     Events(Vec<WirePacket>, Vec<Completion>, Vec<ReadCompletion>),
     Status(Status),
     Record(Option<Batch>),
@@ -171,7 +171,9 @@ fn run(worker: &mut Worker, request: Request) -> Result<Response> {
         Request::Plan(token, plan) => node.plan_publication(token, plan)?,
         Request::Acquire(token, acquire) => node.acquire_publisher(token, acquire)?,
         Request::Publisher(table) => {
-            return Ok(Response::Publisher(node.publisher(table)?.cloned()))
+            return Ok(Response::Publisher(
+                node.publisher(table)?.cloned().map(Box::new),
+            ))
         }
         Request::Campaign(group) => node.campaign(group)?,
         Request::Propose(group, token, batch) => node.propose(group, token, batch)?,
@@ -1149,7 +1151,7 @@ fn publisher_epochs_require_quorum_and_survive_snapshot_transfer_and_restart() -
     else {
         anyhow::bail!("publisher quorum view missing");
     };
-    assert_eq!(*captured, table);
+    assert_eq!(*captured, *table);
     assert!(cut.quorum_index >= table.authority.grant_index);
     assert!(cut.applied >= cut.quorum_index);
 

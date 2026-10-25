@@ -211,7 +211,9 @@ impl Progress {
                 .context("prepared result without plan")?;
             prepared.descriptors.validate(limits.max_descriptor_bytes)?;
             ensure!(
-                prepared.descriptors.matches_plan(&pending.plan)
+                prepared
+                    .descriptors
+                    .matches_plan(&pending.plan, &table.ingest.policy)
                     && prepared.plan_index == pending.index
                     && prepared.transaction == pending.plan.transaction
                     && prepared.index > pending.index
