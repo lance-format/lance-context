@@ -1425,4 +1425,112 @@ mod tests {
         );
         store.release_coordination_lock(next).await.unwrap();
     }
+    #[tokio::test]
+    #[ignore = "requires isolated ETCD_TEST_ENDPOINTS"]
+    async fn lost_assignment_response_recovers_only_the_original_canonical_claim() {
+        let (_dir, cfg, store, leader) = setup().await;
+        let publisher = store.discovery_publisher(&leader);
+        let admission = Arc::new(admission::Admission::default());
+        let operation = admission.try_admit_named("merge").unwrap();
+        for replace in [false, true] {
+            let target = format!("lost-response-{replace}");
+            let task = store
+                .enqueue(TaskKind::MergeWal, &target, vec![])
+                .await
+                .unwrap();
+            let ticket = store
+                .create_dispatch_ticket(
+                    serde_json::to_vec(&Ticket::new(
+                        &cfg,
+                        "receiver",
+                        "merge",
+                        TaskKinds::MERGE_WAL,
+                        false,
+                    ))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            let mut cache = list(store.etcd_client(), cfg.etcd.prefix()).await.unwrap();
+            while place(&publisher, cfg.etcd.prefix(), &mut cache)
+                .await
+                .unwrap()
+            {}
+            let offer = offer_for(&store, &cfg, &ticket).await;
+            let key = lance_context_merge::target_lock_key(cfg.etcd.prefix(), &target);
+            store.lose_next_claim_response_for_test(
+                replace.then(|| (key.clone(), "other-live-owner".into())),
+            );
+            let result = store
+                .claim_assignment(&offer, TaskKinds::MERGE_WAL, None, &operation)
+                .await;
+            if replace {
+                assert!(
+                    result.is_err(),
+                    "a rejected transaction with lost response must not adopt a foreign owner"
+                );
+                assert_eq!(
+                    store.get(&task.id).await.unwrap().unwrap().state,
+                    TaskState::Queued
+                );
+                assert_eq!(
+                    store
+                        .etcd_client()
+                        .clone()
+                        .get(key, None)
+                        .await
+                        .unwrap()
+                        .kvs()[0]
+                        .value(),
+                    b"other-live-owner"
+                );
+                store.release_coordination_lock(ticket).await.unwrap();
+            } else {
+                let accepted = result.unwrap().unwrap();
+                assert_eq!(accepted.task.id, task.id);
+                assert!(store
+                    .etcd_client()
+                    .clone()
+                    .get(offer.offer_key.as_str(), None)
+                    .await
+                    .unwrap()
+                    .kvs()
+                    .is_empty());
+                assert!(store
+                    .etcd_client()
+                    .clone()
+                    .get(offer.reservation_key.as_str(), None)
+                    .await
+                    .unwrap()
+                    .kvs()
+                    .is_empty());
+                store.release_coordination_lock(ticket).await.unwrap();
+                let claim_key = format!("{}/claims/{}", cfg.etcd.prefix(), task.id);
+                assert_eq!(
+                    store
+                        .etcd_client()
+                        .clone()
+                        .get(claim_key, None)
+                        .await
+                        .unwrap()
+                        .kvs()
+                        .len(),
+                    1,
+                    "ticket cleanup must not revoke the recovered canonical task"
+                );
+                store
+                    .finish(
+                        accepted,
+                        Ok("adopted original claim after response loss".into()),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    store.get(&task.id).await.unwrap().unwrap().state,
+                    TaskState::Done
+                );
+            }
+        }
+        store.release_coordination_lock(leader).await.unwrap();
+    }
 }

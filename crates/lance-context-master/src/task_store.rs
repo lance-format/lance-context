@@ -217,6 +217,8 @@ struct EtcdTaskStore {
     auto_local_merge: bool,
     #[cfg(test)]
     claim_owner_swap: std::sync::Mutex<Option<(String, String)>>,
+    #[cfg(test)]
+    lose_claim_response: AtomicBool,
 }
 
 /// Ownership of one running task. Dropping the claim stops lease renewal; etcd
@@ -908,6 +910,14 @@ impl TaskStore {
         Ok(claim)
     }
 
+    #[cfg(test)]
+    pub(crate) fn lose_next_claim_response_for_test(&self, owner_swap: Option<(String, String)>) {
+        *self.inner.claim_owner_swap.lock().unwrap() = owner_swap;
+        self.inner
+            .lose_claim_response
+            .store(true, Ordering::Release);
+    }
+
     /// Consume one controller offer through the same claim/fencing transaction
     /// as ordinary scheduling. The receiver has already reserved local capacity.
     pub(crate) async fn claim_assignment(
@@ -1553,6 +1563,8 @@ impl EtcdTaskStore {
             client,
             #[cfg(test)]
             claim_owner_swap: Default::default(),
+            #[cfg(test)]
+            lose_claim_response: AtomicBool::new(false),
             prefix: config.etcd.prefix().to_string(),
             lease_ttl: config.etcd_lease_ttl_secs,
             prepare_targets: config.maintenance.compaction_prepare_targets.clone(),
@@ -2460,6 +2472,16 @@ impl EtcdTaskStore {
                 let response = client
                     .txn(Txn::new().when(compares).and_then(operations))
                     .await;
+                #[cfg(test)]
+                let response = if self.lose_claim_response.swap(false, Ordering::AcqRel) {
+                    // The real transaction has completed, but the caller sees
+                    // a lost response and must reconcile its original token.
+                    Err(etcd_client::Error::Internal(
+                        "injected lost claim response".into(),
+                    ))
+                } else {
+                    response
+                };
                 if let Some(operation) = operation {
                     operation.claim_phase("claim_reconciliation");
                 }
