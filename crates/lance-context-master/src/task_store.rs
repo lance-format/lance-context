@@ -28,6 +28,10 @@ use crate::eligibility;
 mod diagnostic;
 pub(crate) use diagnostic::AdmissionExplanation;
 
+#[path = "maintenance_watch.rs"]
+mod maintenance_watch;
+pub(crate) use maintenance_watch::MaintenanceChange;
+
 const TASK_POLL_BATCH: usize = 256;
 const SCHEDULER_CLAIM_MAX_CANDIDATES: usize = 64;
 const SCHEDULER_CLAIM_MAX_PAGES: usize = 4;
