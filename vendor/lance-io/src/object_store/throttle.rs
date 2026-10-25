@@ -2607,7 +2607,7 @@ mod tests {
             .await
             .unwrap();
         let xml = std::str::from_utf8(&body).unwrap();
-        assert_eq!(xml.matches("<Uncommitted>").count(), 36, "{xml}");
+        assert_eq!(xml.matches("<Latest>").count(), 36, "{xml}");
         assert_eq!(
             original.headers()["x-ms-blob-content-type"],
             "application/x-lance"
