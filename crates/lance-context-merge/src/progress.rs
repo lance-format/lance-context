@@ -3,7 +3,7 @@
 use crate::{encode, execution_key, Coordinator, Execution, Phase, Result};
 use etcd_client::{Compare, CompareOp, Txn, TxnOp, TxnOpResponse, WatchOptions, WatchStream};
 
-/// Two exact keys on one stream, owned by the waiting execution. Dropping this
+/// Exact keys on one stream, owned by the waiting execution. Dropping this
 /// value closes the stream; there is no detached task or fleet-wide progress
 /// subscription. Events are hints to reread, never authorization to commit.
 pub struct ExecutionWatch(WatchStream);
@@ -134,6 +134,29 @@ impl WorkProgressPublisher {
 }
 
 impl Coordinator {
+    /// Watch only durable ownership, not this execution's own progress writes.
+    /// Start after an authoritative read so revocation during setup is replayed.
+    /// Stream errors require a fresh read; they are never evidence of fencing.
+    pub async fn watch_execution_owner(
+        &self,
+        target: &str,
+        revision: i64,
+    ) -> Result<ExecutionWatch> {
+        if revision <= 0 || revision == i64::MAX {
+            return Err("invalid execution watch revision".into());
+        }
+        let stream = self
+            .client
+            .clone()
+            .watch(
+                execution_key(&self.prefix, target),
+                Some(WatchOptions::new().with_start_revision(revision + 1)),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(ExecutionWatch(stream))
+    }
+
     /// Replay changes after the authoritative execution read, including changes
     /// that occur before either watch is registered. After disconnect or
     /// compaction, callers must take a new snapshot before calling this again.

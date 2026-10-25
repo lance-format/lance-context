@@ -248,6 +248,8 @@ jobs:
             --skip demand_controller::tests::compaction_forces_consistent_relist_and_retains_new_demand \
             --skip demand_controller::aggregate::tests:: \
             --skip execution_watch_compaction_requires_fresh_snapshot_then_resumes \
+            --skip owner_watch_compaction_requires_refresh_not_fencing \
+            --skip ownership_observer_does_not_poll_or_wake_on_own_progress \
             --skip task_store::tests::bounded_scheduler_compacted_snapshot_restarts_without_stealing_locks
           cargo test -p lance-context-core registry --lib -- --ignored
           cargo test -p lance-context-ingest --features worker --lib tests::worker -- --ignored
@@ -268,6 +270,12 @@ jobs:
             -- --exact --ignored --test-threads=1
           cargo test -p lance-context-merge --lib \
             tests::execution_watch_compaction_requires_fresh_snapshot_then_resumes \
+            -- --exact --ignored --test-threads=1
+          cargo test -p lance-context-merge --lib \
+            tests::owner_watch_compaction_requires_refresh_not_fencing \
+            -- --exact --ignored --test-threads=1
+          cargo test -p lance-context-server --bin lance-context-server \
+            merge_execution::tests::ownership_observer_does_not_poll_or_wake_on_own_progress \
             -- --exact --ignored --test-threads=1
           cargo test -p lance-context-master --lib \
             merge_execution::tests::quiet_execution_bounds_etcd_reads_without_delaying_completion \
@@ -393,6 +401,8 @@ jobs:
             --skip demand_controller::tests::compaction_forces_consistent_relist_and_retains_new_demand \
             --skip demand_controller::aggregate::tests:: \
             --skip execution_watch_compaction_requires_fresh_snapshot_then_resumes \
+            --skip owner_watch_compaction_requires_refresh_not_fencing \
+            --skip ownership_observer_does_not_poll_or_wake_on_own_progress \
             --skip task_store::tests::bounded_scheduler_compacted_snapshot_restarts_without_stealing_locks
           cargo llvm-cov --no-report --all-features \
             -p lance-context-core --lib -- registry --ignored
@@ -409,6 +419,12 @@ jobs:
             --exact --ignored --test-threads=1
           cargo llvm-cov --no-report --all-features -p lance-context-merge --lib -- \
             tests::execution_watch_compaction_requires_fresh_snapshot_then_resumes \
+            --exact --ignored --test-threads=1
+          cargo llvm-cov --no-report --all-features -p lance-context-merge --lib -- \
+            tests::owner_watch_compaction_requires_refresh_not_fencing \
+            --exact --ignored --test-threads=1
+          cargo llvm-cov --no-report --all-features -p lance-context-server --bin lance-context-server -- \
+            merge_execution::tests::ownership_observer_does_not_poll_or_wake_on_own_progress \
             --exact --ignored --test-threads=1
           cargo llvm-cov --no-report --all-features -p lance-context-master --lib -- \
             merge_execution::tests::quiet_execution_bounds_etcd_reads_without_delaying_completion \

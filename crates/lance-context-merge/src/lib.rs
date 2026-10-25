@@ -784,6 +784,106 @@ mod tests {
     // Isolated prefix on a LOCAL test etcd. These tests never use production.
     #[tokio::test]
     #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn owner_watch_ignores_own_progress_and_replays_revocation_and_delete() {
+        let (coordinator, _client, proof, _) = fixture().await;
+        let execution = Execution::new("table", "worker", "boot", 600);
+        assert!(coordinator.reserve(&proof, &execution).await.unwrap());
+        let running = coordinator.start(&execution).await.unwrap().unwrap();
+        let (_, revision) = coordinator.get_with_revision("table").await.unwrap();
+        let mut watch = coordinator
+            .watch_execution_owner("table", revision)
+            .await
+            .unwrap();
+        for sequence in 1..=8 {
+            assert!(coordinator
+                .publish_progress(&running, sequence)
+                .await
+                .unwrap());
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), watch.changed())
+                .await
+                .is_err()
+        );
+        drop(watch);
+
+        // Revoke after the read but before subscribing: revision + 1 must replay it.
+        let frozen = coordinator.freeze(&proof, &running).await.unwrap().unwrap();
+        let mut watch = coordinator
+            .watch_execution_owner("table", revision)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), watch.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            coordinator.get("table").await.unwrap(),
+            Some(frozen.clone())
+        );
+        drop(watch);
+
+        assert!(coordinator.finish_recovery(&proof, &frozen).await.unwrap());
+        let recovered = coordinator.get("table").await.unwrap().unwrap();
+        let (_, revision) = coordinator.get_with_revision("table").await.unwrap();
+        assert!(coordinator.release(&proof, &recovered).await.unwrap());
+        let mut watch = coordinator
+            .watch_execution_owner("table", revision)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), watch.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(coordinator.get("table").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS; compacts test instance"]
+    async fn owner_watch_compaction_requires_refresh_not_fencing() {
+        assert_eq!(
+            std::env::var("ETCD_TEST_ALLOW_COMPACTION").as_deref(),
+            Ok("1")
+        );
+        let (coordinator, mut client, proof, _) = fixture().await;
+        let execution = Execution::new("table", "worker", "boot", 600);
+        assert!(coordinator.reserve(&proof, &execution).await.unwrap());
+        let running = coordinator.start(&execution).await.unwrap().unwrap();
+        let (_, revision) = coordinator.get_with_revision("table").await.unwrap();
+        for sequence in 1..=3 {
+            assert!(coordinator
+                .publish_progress(&running, sequence)
+                .await
+                .unwrap());
+        }
+        let (_, compact_revision) = coordinator.get_with_revision("table").await.unwrap();
+        client.compact(compact_revision, None).await.unwrap();
+        let mut watch = coordinator
+            .watch_execution_owner("table", revision)
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), watch.changed())
+                .await
+                .unwrap()
+                .is_err()
+        );
+        drop(watch);
+        let (current, revision) = coordinator.get_with_revision("table").await.unwrap();
+        assert_eq!(current, Some(running.clone()));
+        let mut watch = coordinator
+            .watch_execution_owner("table", revision)
+            .await
+            .unwrap();
+        assert!(coordinator.finish(&running, Ok(3)).await.unwrap());
+        tokio::time::timeout(Duration::from_secs(2), watch.changed())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
     async fn execution_watch_replays_progress_and_terminal_changes_during_setup() {
         let (coordinator, _client, proof, _) = fixture().await;
         let execution = Execution::new("table", "worker", "boot", 600);

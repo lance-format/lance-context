@@ -492,25 +492,19 @@ async fn run(
     .unwrap_or_else(|_| Err("merge executor panicked".into()));
     // Top-level cancellation cannot acknowledge a write still in flight at
     // object storage. Join those leaf commits before publishing Finished.
-    loop {
-        tokio::select! {
-            biased;
-            _ = write_scope.drain() => break,
-            _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                match coordinator.get(&execution.target).await {
-                    Ok(None) => {
-                        // Only a terminal outcome or a completed storage
-                        // barrier permits removal of this execution record.
-                        write_scope.abort_fenced_leaves().await;
-                        return Ok(());
-                    }
-                    Ok(Some(current)) if current.id != execution.id || current.phase == Phase::Recovered => {
-                        write_scope.abort_fenced_leaves().await;
-                        return Ok(());
-                    }
-                    _ => {},
-                }
-            }
+    tokio::select! {
+        biased;
+        _ = write_scope.drain() => {},
+        _ = wait_for_execution_state(&coordinator, &execution.target, |current| {
+            // Recovering alone cannot authorize aborting admitted writes.
+            current.is_none_or(|current| {
+                current.id != execution.id || current.phase == Phase::Recovered
+            })
+        }) => {
+            // Only a terminal outcome or a completed storage barrier permits
+            // removal/replacement of this execution record.
+            write_scope.abort_fenced_leaves().await;
+            return Ok(());
         }
     }
     // Do not admit another memory-heavy merge into this slot while a
@@ -566,15 +560,48 @@ async fn run(
 // This only cancels preparation; the caller still drains or fences admitted
 // storage writes before releasing the merge slot and publishing a terminal state.
 async fn watch_ownership(coordinator: &Coordinator, execution: &Execution) -> String {
+    wait_for_execution_state(coordinator, &execution.target, |current| {
+        current != Some(execution)
+    })
+    .await;
+    "merge ownership revoked during execution".into()
+}
+
+// No periodic read while the owner watch is healthy, and no subscription to
+// progress (which would wake on our own publications). Every event/disconnect
+// is reconciled with a new authoritative read; the revision covers setup races.
+async fn wait_for_execution_state(
+    coordinator: &Coordinator,
+    target: &str,
+    predicate: impl Fn(Option<&Execution>) -> bool,
+) {
     loop {
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        match tokio::time::timeout(Duration::from_secs(2), coordinator.get(&execution.target)).await
-        {
-            Ok(Ok(Some(current))) if current == *execution => {}
-            Ok(Ok(_)) => return "merge ownership revoked during execution".into(),
+        let observation = async {
+            let (current, revision) = tokio::time::timeout(
+                Duration::from_secs(2),
+                coordinator.get_with_revision(target),
+            )
+            .await
+            .map_err(|e| e.to_string())??;
+            if predicate(current.as_ref()) {
+                return Ok::<_, String>(true);
+            }
+            let mut watch = tokio::time::timeout(
+                Duration::from_secs(2),
+                coordinator.watch_execution_owner(target, revision),
+            )
+            .await
+            .map_err(|e| e.to_string())??;
+            watch.changed().await?;
+            Ok(false)
+        };
+        match observation.await {
+            Ok(true) => return,
+            Ok(false) => {}
             // An unavailable coordinator is not evidence of a completed fence.
-            // Queue and real-progress idle deadlines remain independent.
-            _ => {}
+            // Queue and real-progress idle deadlines remain independent. Rate
+            // limit retries only after errors, never delay an observed change.
+            Err(_) => tokio::time::sleep(Duration::from_secs(2)).await,
         }
     }
 }
@@ -644,6 +671,129 @@ mod tests {
     use super::*;
     use lance_context_merge::{ClaimProof, EtcdConfig};
     use tokio::io::AsyncWriteExt;
+
+    async fn isolated_etcd_rpc_counts() -> (u64, u64) {
+        use tokio::io::AsyncReadExt;
+        assert_eq!(std::env::var("ETCD_TEST_EXCLUSIVE").as_deref(), Ok("1"));
+        let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+        let address = endpoint.strip_prefix("http://127.0.0.1:").unwrap();
+        let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{address}"))
+            .await
+            .unwrap();
+        stream
+            .write_all(b"GET /metrics HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        tokio::time::timeout(Duration::from_secs(2), stream.read_to_string(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(response.starts_with("HTTP/1.0 200") || response.starts_with("HTTP/1.1 200"));
+        let count = |method: &str| -> u64 {
+            response
+                .lines()
+                .filter(|line| {
+                    line.starts_with("grpc_server_started_total{")
+                        && line.contains(&format!("grpc_method=\"{method}\""))
+                })
+                .map(|line| {
+                    line.split_whitespace()
+                        .last()
+                        .unwrap()
+                        .parse::<f64>()
+                        .unwrap() as u64
+                })
+                .sum()
+        };
+        (count("Range"), count("Watch"))
+    }
+
+    #[tokio::test]
+    #[ignore = "requires exclusive isolated local ETCD_TEST_ENDPOINTS"]
+    async fn ownership_observer_does_not_poll_or_wake_on_own_progress() {
+        let (_state, original, proof, _dir) = deadline_fixture().await;
+        let execution = Execution::new("hot", "worker", "boot", 600);
+        assert!(original.reserve(&proof, &execution).await.unwrap());
+        let running = original.start(&execution).await.unwrap().unwrap();
+        // Use the real connection timeouts/keepalive, not just a bare test client.
+        let coordinator = EtcdConfig {
+            etcd_endpoints: vec![std::env::var("ETCD_TEST_ENDPOINTS").unwrap()],
+            etcd_prefix: proof.key.strip_suffix("/claim").unwrap().into(),
+            etcd_username: None,
+            etcd_password: None,
+            etcd_ca_cert: None,
+            etcd_client_cert: None,
+            etcd_client_key: None,
+        }
+        .connect()
+        .await
+        .unwrap();
+        let initial = isolated_etcd_rpc_counts().await;
+        let observer_coordinator = coordinator.clone();
+        let observed = running.clone();
+        let mut observer =
+            tokio::spawn(async move { watch_ownership(&observer_coordinator, &observed).await });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while isolated_etcd_rpc_counts().await.1 == initial.1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let baseline = isolated_etcd_rpc_counts().await;
+        // Beyond the configured 10-second RPC timeout, with continuous progress.
+        for sequence in 1..=120 {
+            assert!(coordinator
+                .publish_progress(&running, sequence)
+                .await
+                .unwrap());
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(!observer.is_finished());
+        }
+        let after = isolated_etcd_rpc_counts().await;
+        assert_eq!(
+            after, baseline,
+            "healthy owner stream must not reread or resubscribe on progress"
+        );
+        assert_eq!(baseline.0 - initial.0, 1, "one initial owner read");
+        assert_eq!(baseline.1 - initial.1, 1, "one owner watch");
+        assert!(coordinator
+            .freeze(&proof, &running)
+            .await
+            .unwrap()
+            .is_some());
+        let result = tokio::time::timeout(Duration::from_secs(2), &mut observer)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.contains("revoked"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn storage_drain_observer_waits_for_completed_fence() {
+        let (_state, coordinator, proof, _dir) = deadline_fixture().await;
+        let execution = Execution::new("hot", "worker", "boot", 600);
+        assert!(coordinator.reserve(&proof, &execution).await.unwrap());
+        let running = coordinator.start(&execution).await.unwrap().unwrap();
+        let wait = wait_for_execution_state(&coordinator, "hot", |current| {
+            current
+                .is_none_or(|current| current.id != running.id || current.phase == Phase::Recovered)
+        });
+        tokio::pin!(wait);
+        assert!(tokio::time::timeout(Duration::from_millis(100), &mut wait)
+            .await
+            .is_err());
+        let frozen = coordinator.freeze(&proof, &running).await.unwrap().unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(200), &mut wait)
+            .await
+            .is_err());
+        assert!(coordinator.finish_recovery(&proof, &frozen).await.unwrap());
+        tokio::time::timeout(Duration::from_secs(2), &mut wait)
+            .await
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn unavailable_etcd_does_not_block_startup_or_flush_configuration() {
