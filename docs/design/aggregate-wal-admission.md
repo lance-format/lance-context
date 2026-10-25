@@ -50,8 +50,36 @@ five minutes; a healthy informer never polls. Fresh writer events cannot bypass
 a failed admission retry deadline. These error paths do not stop dispatch or
 the existing periodic storage scans.
 
+Historical hints are subject to an admission budget: at most twice the sum of
+ordinary WAL merge slots advertised by live members, capped at 4,096 tasks.
+Members which disable WAL claiming advertise zero; old members without the
+field contribute zero. Shared-pool configuration uses the scheduler's effective
+minimum of one slot. Reserved local-only pools are not counted. This budget
+bounds this new admission source, not the existing total queue or execution
+concurrency. Capacity shrink never cancels admitted tasks.
+
+Frontiers also retain the admitted task identity. Matching it to the watched
+dedupe reconstructs aggregate-owned queued/running work across restart. Excess
+demand waits in the bounded cache without advancing any seal or issuing RPCs;
+dedupe completion returns credit through Watch. Newer writer evidence receives
+freed credit ahead of historical hints. Existing periodic discovery remains
+responsible for older storage backlog, including hints already entrusted to a
+task; it does not depend on new writer events.
+
+Before publishing, the leader reserves one credit. An ambiguous response keeps
+that reservation and suspends further aggregate publication until resolved.
+A leader-fenced CAS rewrites only the PREVIOUS admitted frontier at the original
+revision. Either the original enqueue already won and its actual state is read,
+or this neutral rewrite invalidates the delayed enqueue's CAS without consuming
+new seals. Resolution is required before same-leader resnapshot after Watch
+compaction as well. New leaders are protected by the existing leadership fence.
+These transport-error retries retain their deadlines; healthy full-capacity
+operation does not poll. Existing dispatch and recovery run independently.
+
 Metrics are low-cardinality: snapshot/list RPC counts, admission outcomes,
-errors by phase, invalid inputs by kind and cache table/shard/byte gauges. Gauges
+errors by phase, invalid inputs by kind, cache table/shard/byte gauges, and
+`master_aggregate_wal_capacity`, `master_aggregate_wal_outstanding` and
+`master_aggregate_wal_waiting`. Gauges
 reset when this loop loses leadership; counters remain cumulative per process.
 The additional Watch does not require periodic per-table reads or writes.
 
@@ -61,3 +89,7 @@ leader loss and reconstruction, consistent paginated snapshots and compaction,
 quiet active dedupe, 13,000 tables with twenty shards, and actual process-level
 merging and readback. Local unit/integration results do not constitute image or
 production qualification, or a claim of reduced fleet etcd traffic.
+
+Regression coverage also includes a 100-table bootstrap bounded to four tasks
+with two slots, fresh demand receiving completion-driven credit, member capacity
+growth/shrink, queued restart, and completed or delayed ambiguous publication.

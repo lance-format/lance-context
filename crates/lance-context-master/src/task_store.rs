@@ -671,6 +671,16 @@ impl TaskStore {
         let dedupe = inner.dedupe_key(TaskKind::MergeWal, target, &[]).unwrap();
         let task = new_task(TaskKind::MergeWal, target, vec![]);
         let value = encode_task(&task)?;
+        let mut frontier: crate::demand_controller::aggregate::Frontier =
+            serde_json::from_slice(frontier_value).map_err(|e| lance::Error::io(e.to_string()))?;
+        frontier.task = Some(task.id.clone());
+        let frontier_value =
+            serde_json::to_vec(&frontier).map_err(|e| lance::Error::io(e.to_string()))?;
+        if frontier_value.len() > 256 * 1024 {
+            return Err(lance::Error::io(
+                "oversized aggregate frontier with task identity",
+            ));
+        }
         let mut client = inner.client.clone();
         let response = client
             .txn(
@@ -690,7 +700,7 @@ impl TaskStore {
                         TxnOp::put(inner.task_key(&task.id), value.clone(), None),
                         TxnOp::put(inner.queue_key(&task.id), value, None),
                         TxnOp::put(dedupe.as_str(), task.id.as_str(), None),
-                        TxnOp::put(checkpoint.as_str(), frontier_value, None),
+                        TxnOp::put(checkpoint.as_str(), frontier_value.clone(), None),
                     ])
                     .or_else([
                         TxnOp::get(checkpoint.as_str(), None),
@@ -700,12 +710,14 @@ impl TaskStore {
             .await
             .map_err(etcd_error("admit aggregate WAL demand"))?;
         if response.succeeded() {
-            return Ok(Admission::Admitted(
-                response
+            return Ok(Admission::Admitted {
+                revision: response
                     .header()
                     .ok_or_else(|| lance::Error::io("missing WAL admission revision"))?
                     .revision(),
-            ));
+                frontier: frontier_value,
+                task: task.id,
+            });
         }
         let replies = response.op_responses();
         let [TxnOpResponse::Get(current), TxnOpResponse::Get(existing)] = replies.as_slice() else {
@@ -752,6 +764,77 @@ impl TaskStore {
             .await
             .map_err(etcd_error("clean terminal aggregate WAL dedupe"))?;
         Ok(Admission::Changed)
+    }
+
+    /// Resolve an ambiguous aggregate publication without waiting for its old
+    /// RPC. Rewriting the PREVIOUS frontier at the expected revision invalidates
+    /// that RPC's CAS without consuming any unadmitted seal. If it already won,
+    /// the comparison fails and returns its actual frontier/dedupe instead.
+    pub(crate) async fn resolve_aggregate_admission(
+        &self,
+        target: &str,
+        revision: i64,
+        previous: &[u8],
+    ) -> lance::Result<crate::demand_controller::aggregate::AdmissionSnapshot> {
+        use crate::demand_controller::aggregate::{frontier_key, AdmissionSnapshot};
+        let fence = self
+            .publication_fence
+            .as_ref()
+            .ok_or_else(|| lance::Error::io("aggregate resolution requires leader fence"))?;
+        if revision < 0 || previous.len() > 256 * 1024 {
+            return Err(lance::Error::io("invalid aggregate resolution observation"));
+        }
+        let checkpoint = frontier_key(&self.inner.prefix, target);
+        let dedupe = self
+            .inner
+            .dedupe_key(TaskKind::MergeWal, target, &[])
+            .unwrap();
+        let response = self
+            .inner
+            .client
+            .clone()
+            .txn(
+                Txn::new()
+                    .when(with_publication_fence(
+                        vec![Compare::mod_revision(
+                            checkpoint.as_str(),
+                            CompareOp::Equal,
+                            revision,
+                        )],
+                        Some(fence),
+                    ))
+                    .and_then([
+                        TxnOp::put(checkpoint.as_str(), previous, None),
+                        TxnOp::get(checkpoint.as_str(), None),
+                        TxnOp::get(dedupe.as_str(), None),
+                    ])
+                    .or_else([
+                        TxnOp::get(checkpoint.as_str(), None),
+                        TxnOp::get(dedupe.as_str(), None),
+                    ]),
+            )
+            .await
+            .map_err(etcd_error("resolve aggregate admission outcome"))?;
+        let observed = response
+            .header()
+            .ok_or_else(|| lance::Error::io("missing resolution revision"))?
+            .revision();
+        let mut replies = response.op_responses();
+        if response.succeeded() {
+            replies.remove(0);
+        }
+        let [TxnOpResponse::Get(frontier), TxnOpResponse::Get(dedupe)] = replies.as_slice() else {
+            return Err(lance::Error::io("invalid aggregate resolution response"));
+        };
+        let row = |response: &etcd_client::GetResponse| {
+            response.kvs().first().map_or((observed, None), |kv| {
+                (kv.mod_revision(), Some(kv.value().to_vec()))
+            })
+        };
+        Ok(AdmissionSnapshot {
+            frontier: row(frontier),
+            dedupe: row(dedupe),
+        })
     }
 
     /// Recovery inventory is a hint, not new demand. Bind a new queue entry to

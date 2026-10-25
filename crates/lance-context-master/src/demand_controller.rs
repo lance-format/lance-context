@@ -58,6 +58,8 @@ struct Policy {
     automatic: bool,
     #[serde(default)]
     aggregate_min_generations: Option<i64>,
+    #[serde(default)]
+    aggregate_merge_slots: usize,
     endpoints: Vec<String>,
     fence_legacy: bool,
     owned: Vec<String>,
@@ -72,6 +74,13 @@ impl Policy {
             v: 1,
             automatic: config.merge_wal_interval_secs > 0,
             aggregate_min_generations: Some(config.merge_wal_min_generations),
+            aggregate_merge_slots: if !config.maintenance.claim_wal_merges {
+                0
+            } else if config.merge_wal_concurrency > 0 {
+                config.merge_wal_concurrency
+            } else {
+                config.task_concurrency.max(1)
+            },
             endpoints: config.worker_endpoints.clone(),
             fence_legacy: config.merge_rollout.fence_legacy,
             owned: config.merge_rollout.owned_targets.clone(),
