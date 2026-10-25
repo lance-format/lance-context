@@ -135,12 +135,17 @@ fn exhausted() -> Error {
 }
 
 fn reserve(counter: &AtomicU64, amount: u64, limit: u64) -> Result<()> {
-    counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
-            used.checked_add(amount).filter(|next| *next <= limit)
-        })
-        .map(|_| ())
-        .map_err(|_| exhausted())
+    let mut used = counter.load(Ordering::Relaxed);
+    loop {
+        let next = used
+            .checked_add(amount)
+            .filter(|next| *next <= limit)
+            .ok_or_else(exhausted)?;
+        match counter.compare_exchange_weak(used, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return Ok(()),
+            Err(actual) => used = actual,
+        }
+    }
 }
 
 impl WrappingObjectStore for Budget {
@@ -391,6 +396,30 @@ mod tests {
             }
         }
         assert!(has_pending_wal(uri).await.is_err());
+    }
+
+    #[test]
+    fn concurrent_budget_reservations_never_exceed_the_limit() {
+        let counter = Arc::new(AtomicU64::new(0));
+        let threads: Vec<_> = (0..16)
+            .map(|_| {
+                let counter = counter.clone();
+                std::thread::spawn(move || {
+                    (0..100)
+                        .filter(|_| reserve(&counter, 3, 512).is_ok())
+                        .count()
+                })
+            })
+            .collect();
+        let successes: usize = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .sum();
+        assert_eq!(successes, 170);
+        assert_eq!(counter.load(Ordering::Relaxed), 510);
+        let overflow = AtomicU64::new(u64::MAX);
+        assert!(reserve(&overflow, 1, u64::MAX).is_err());
+        assert_eq!(overflow.load(Ordering::Relaxed), u64::MAX);
     }
 
     #[tokio::test]
