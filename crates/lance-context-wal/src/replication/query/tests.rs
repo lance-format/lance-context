@@ -222,6 +222,48 @@ fn compact_visibility_uses_catalog_quorum_and_fits_control_reply_budget() -> Res
     maximum.incarnation = Some(Uuid::from_u128(100));
     maximum.checkpoint = (1..=64).map(|group| (group, u64::MAX - 1)).collect();
     assert!(bincode::serialized_size(&maximum)? < 16 * 1024);
+
+    let binding = Query::PublisherBinding {
+        table: acquire.table,
+    };
+    assert!(nodes[0].query(20, 4, binding.clone()).is_err());
+    nodes[0].query(10, 4, binding.clone())?;
+    let observed = pump(&mut nodes)?;
+    let Outcome::Observed {
+        cut,
+        value: Value::PublisherBinding(Some(view)),
+    } = &observed.reads[0].outcome
+    else {
+        anyhow::bail!("missing quorum publisher binding");
+    };
+    assert!(cut.quorum_index > 0 && cut.applied >= cut.quorum_index);
+    assert_eq!(view.authority.epoch, 1);
+    assert_eq!(view.authority.owner, acquire.owner);
+    assert_eq!(view.destination, acquire.destination);
+    assert_eq!(view.ingest, acquire.ingest);
+    assert_eq!(view.incarnation, None);
+    let mut maximum = view.clone();
+    maximum.incarnation = Some(Uuid::from_u128(100));
+    assert!(bincode::serialized_size(&maximum)? < 16 * 1024);
+    let successor = publication::Acquire {
+        owner: Uuid::from_u128(22),
+        request: Uuid::from_u128(23),
+        expected_epoch: 1,
+        ..acquire
+    };
+    nodes[0].acquire_publisher(5, successor.clone())?;
+    pump(&mut nodes)?;
+    nodes[0].query(10, 6, binding)?;
+    let observed = pump(&mut nodes)?;
+    let Outcome::Observed {
+        value: Value::PublisherBinding(Some(view)),
+        ..
+    } = &observed.reads[0].outcome
+    else {
+        anyhow::bail!("missing successor publisher binding");
+    };
+    assert_eq!(view.authority.epoch, 2);
+    assert_eq!(view.authority.owner, successor.owner);
     Ok(())
 }
 

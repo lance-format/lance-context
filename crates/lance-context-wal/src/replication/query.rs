@@ -60,6 +60,10 @@ pub enum Query {
         after: u64,
         limit: usize,
     },
+    /// Fencing identity without plans, file descriptors or manifest history.
+    PublisherBinding {
+        table: Uuid,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,6 +85,15 @@ pub enum Value {
     ManifestRetired(publication::HistoryBoundary),
     ProducerSlot(Option<producer::View>),
     Visibility(Option<Box<Visibility>>),
+    PublisherBinding(Option<Box<PublisherBinding>>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublisherBinding {
+    pub authority: publication::Authority,
+    pub destination: publication::Destination,
+    pub ingest: crate::ingest_contract::IngestContract,
+    pub incarnation: Option<Uuid>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,7 +171,9 @@ impl Query {
             | Self::ClosedProof { table } => {
                 ensure!(!table.is_nil(), "nil source table")
             }
-            Self::Publisher { table } | Self::Visibility { table } => ensure!(
+            Self::Publisher { table }
+            | Self::Visibility { table }
+            | Self::PublisherBinding { table } => ensure!(
                 !table.is_nil() && group == publication::control_group(layout),
                 "invalid publisher query scope"
             ),
@@ -300,6 +315,16 @@ impl Query {
             Self::SourcePin { table } => Value::SourcePin(state.pins.get(table).cloned()),
             Self::Publisher { table } => {
                 Value::Publisher(state.catalog.tables.get(table).cloned().map(Box::new))
+            }
+            Self::PublisherBinding { table } => {
+                Value::PublisherBinding(state.catalog.tables.get(table).map(|table| {
+                    Box::new(PublisherBinding {
+                        authority: table.authority.clone(),
+                        destination: table.destination.clone(),
+                        ingest: table.ingest.clone(),
+                        incarnation: table.manifests.as_ref().map(|m| m.incarnation),
+                    })
+                }))
             }
             Self::Visibility { table } => {
                 Value::Visibility(state.catalog.tables.get(table).map(|table| {

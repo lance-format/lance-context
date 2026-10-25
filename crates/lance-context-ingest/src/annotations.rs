@@ -116,10 +116,10 @@ impl Service {
             !self.shared.progress.borrow().stopped,
             "annotation runtime stopped"
         );
-        let query::Value::Publisher(Some(view)) = crate::materializer::query(
+        let query::Value::PublisherBinding(Some(view)) = crate::materializer::query(
             &self.ingress,
             self.ingress.client.catalog_group(),
-            query::Query::Publisher {
+            query::Query::PublisherBinding {
                 table: self.ingress.scope.table,
             },
         )
@@ -131,10 +131,7 @@ impl Service {
             view.authority == *authority
                 && view.destination == self.ingress.scope.destination
                 && view.ingest == self.ingress.scope.contract
-                && view
-                    .manifests
-                    .as_ref()
-                    .is_some_and(|m| m.incarnation == self.ingress.scope.incarnation),
+                && view.incarnation == Some(self.ingress.scope.incarnation),
             "annotation owner changed"
         );
         Ok(())

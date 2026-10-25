@@ -14,6 +14,8 @@ use tokio::sync::oneshot;
 
 const TOKEN: &str = "annotation-test-workload-token-00000000";
 
+mod pressure;
+
 struct Server {
     address: std::net::SocketAddr,
     stop: oneshot::Sender<()>,

@@ -361,10 +361,12 @@ async fn concurrent_publisher_reads_distinguish_byte_and_request_admission_limit
     // Sixteen materializer tasks must fit both the response-byte and request
     // limits. Use real quorum reads, retaining each response credit until its
     // caller consumes the result, rather than measuring a semaphore in isolation.
-    for (control_bytes, control_requests, accepted, byte_rejections, slot_rejections) in [
-        (4 << 20, 64, 2, 14, 0),
-        (32 << 20, 64, 16, 0, 0),
-        (32 << 20, 2, 2, 0, 14),
+    for (compact, control_bytes, control_requests, accepted, byte_rejections, slot_rejections) in [
+        (false, 4 << 20, 64, 2, 14, 0),
+        (false, 32 << 20, 64, 16, 0, 0),
+        (false, 32 << 20, 2, 2, 0, 14),
+        (true, 4 << 20, 64, 16, 0, 0),
+        (true, 4 << 20, 2, 2, 0, 14),
     ] {
         let directory = tempfile::tempdir()?;
         let c = Cluster::open(
@@ -380,13 +382,17 @@ async fn concurrent_publisher_reads_distinguish_byte_and_request_admission_limit
         commit(handle, 10, batch(1)).await?;
         let before = handle.admission();
         let mut reads = Vec::new();
+        let query = if compact {
+            query::Query::PublisherBinding {
+                table: batch(1).meta.stream,
+            }
+        } else {
+            query::Query::Publisher {
+                table: batch(1).meta.stream,
+            }
+        };
         for _ in 0..16 {
-            match handle.query(
-                10,
-                query::Query::Publisher {
-                    table: batch(1).meta.stream,
-                },
-            ) {
+            match handle.query(10, query.clone()) {
                 Ok(read) => reads.push(read),
                 Err(error) => assert!(error.to_string().contains("credits exhausted"), "{error:#}"),
             }
@@ -397,6 +403,9 @@ async fn concurrent_publisher_reads_distinguish_byte_and_request_admission_limit
         assert_eq!(busy.control.capacity_requests, control_requests);
         assert_eq!(busy.control.used_requests, accepted);
         assert!(busy.control.used_bytes > 0 && busy.control.used_bytes <= control_bytes);
+        if compact {
+            assert!(busy.control.used_bytes < 512 << 10);
+        }
         assert_eq!(
             busy.control.rejected_bytes - before.control.rejected_bytes,
             byte_rejections
@@ -408,13 +417,17 @@ async fn concurrent_publisher_reads_distinguish_byte_and_request_admission_limit
         assert_eq!(busy.data.rejected_requests, before.data.rejected_requests);
         assert_eq!(busy.data.rejected_bytes, before.data.rejected_bytes);
         for read in reads {
-            assert!(matches!(
-                read.await?,
-                query::Outcome::Observed {
-                    value: query::Value::Publisher(None),
-                    ..
+            let query::Outcome::Observed { value, .. } = read.await? else {
+                anyhow::bail!("publisher read lost its quorum");
+            };
+            assert_eq!(
+                value,
+                if compact {
+                    query::Value::PublisherBinding(None)
+                } else {
+                    query::Value::Publisher(None)
                 }
-            ));
+            );
         }
         let drained = handle.admission();
         assert_eq!(drained.control.used_requests, 0);

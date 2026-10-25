@@ -102,6 +102,13 @@ type Signers = (
     BTreeMap<u64, Arc<lance_context_wal::replication::source::SourceSigner>>,
 );
 impl Cluster {
+    #[cfg(feature = "service")]
+    pub(super) fn control_admission(&self) -> Vec<runtime::Admission> {
+        self.nodes
+            .iter()
+            .map(|n| n.0.handle().admission())
+            .collect()
+    }
     pub async fn open(root: &Path, layout: Arc<Layout>) -> Result<Self> {
         Self::open_inner(root, layout, None).await
     }

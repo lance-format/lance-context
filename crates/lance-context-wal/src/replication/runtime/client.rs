@@ -172,6 +172,7 @@ impl WireRequest {
                     query::Query::ClosedProof { .. } => "query.closed_proof",
                     query::Query::ProducerSlot { .. } => "query.producer_slot",
                     query::Query::Visibility { .. } => "query.visibility",
+                    query::Query::PublisherBinding { .. } => "query.publisher_binding",
                     query::Query::AcceptedBucket { .. } => "query.accepted_bucket",
                 },
             ),
