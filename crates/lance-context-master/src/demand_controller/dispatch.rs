@@ -273,68 +273,127 @@ pub(crate) async fn claim(
 pub(super) struct Placement {
     cursor: Option<Vec<u8>>,
     ticket_cursor: Option<Vec<u8>>,
-    dependencies: BTreeMap<String, (Option<TaskState>, i64)>,
+    dependencies: BTreeMap<String, DependencyEvaluation>,
+    more_dependencies: bool,
+}
+
+/// One compact evaluation per queued dependency chain. Its dependency IDs are
+/// bounded by that queued record, and removed with it; no global eviction sweep.
+struct DependencyEvaluation {
+    ids: Vec<String>,
+    revision: i64,
+    changed: i64,
+    next: usize,
+    waiting: bool,
+    failed: bool,
+}
+
+impl DependencyEvaluation {
+    fn new(ids: &[String]) -> Self {
+        Self {
+            ids: ids.to_vec(),
+            revision: 0,
+            changed: 0,
+            next: 0,
+            waiting: false,
+            failed: false,
+        }
+    }
+    fn reset(&mut self) {
+        self.revision = 0;
+        self.next = 0;
+        self.waiting = false;
+        self.failed = false;
+    }
+}
+
+struct DependencyCheck {
+    ready: bool,
+    read: bool,
 }
 
 impl Placement {
-    pub(super) fn observe_dependency(&mut self, key: &[u8], value: Option<&[u8]>, revision: i64) {
+    pub(super) fn forget_queue_entry(&mut self, key: &[u8]) {
+        if let Some((parent, id)) = std::str::from_utf8(key)
+            .ok()
+            .and_then(|key| key.rsplit_once('/'))
+        {
+            if parent.ends_with("/queue") {
+                self.dependencies.remove(id);
+            }
+        }
+    }
+
+    pub(super) fn observe_dependency(&mut self, key: &[u8], _value: Option<&[u8]>, revision: i64) {
         let Some(id) = std::str::from_utf8(key)
             .ok()
             .and_then(|key| key.rsplit('/').next())
         else {
             return;
         };
-        if let Some((state, old_revision)) = self.dependencies.get_mut(id) {
-            if revision > *old_revision {
-                *state = value
-                    .and_then(|value| serde_json::from_slice::<TaskRecord>(value).ok())
-                    .filter(|task| task.id == id)
-                    .map(|task| task.state);
-                *old_revision = revision;
+        // Only outstanding dependent tasks participate, not the fleet/history.
+        // Retaining per-chain observations avoids cache eviction causing reads
+        // on every unrelated queue/ownership event.
+        for observation in self.dependencies.values_mut() {
+            if revision > observation.revision && observation.ids.iter().any(|dep| dep == id) {
+                observation.changed = observation.changed.max(revision);
             }
         }
     }
+
     async fn dependencies_ready(
         &mut self,
         publisher: &TaskStore,
         task: &TaskRecord,
-    ) -> Result<bool, String> {
-        if task.depends_on.len() > 10_000 {
-            return Ok(true);
-        } // authoritative executor handles long chains
-        if self.dependencies.len() + task.depends_on.len() > 10_000 {
-            self.dependencies.clear();
+    ) -> Result<DependencyCheck, String> {
+        if task.depends_on.is_empty() {
+            return Ok(DependencyCheck {
+                ready: true,
+                read: false,
+            });
         }
-        let missing: Vec<_> = task
-            .depends_on
-            .iter()
-            .filter(|id| !self.dependencies.contains_key(*id))
-            .cloned()
-            .collect();
-        for chunk in missing.chunks(64) {
-            let observations = publisher
-                .dispatch_dependency_observations(chunk)
+        let observation = self
+            .dependencies
+            .entry(task.id.clone())
+            .or_insert_with(|| DependencyEvaluation::new(&task.depends_on));
+        if observation.next == observation.ids.len() && observation.changed > observation.revision {
+            observation.reset();
+        }
+        let mut read = false;
+        if observation.next < observation.ids.len() {
+            // At most one 64-key transaction per placement step, all pages at
+            // one revision. Long chains yield to other tasks and Watch events.
+            let end = (observation.next + 64).min(observation.ids.len());
+            let (states, revision) = publisher
+                .dispatch_dependency_observations(
+                    &observation.ids[observation.next..end],
+                    observation.revision,
+                )
                 .await
                 .map_err(|e| e.to_string())?;
-            for (id, observation) in chunk.iter().zip(observations) {
-                self.dependencies.insert(id.clone(), observation);
+            observation.revision = revision;
+            observation.next = end;
+            read = true;
+            for state in states {
+                match state {
+                    Some(TaskState::Done) => {}
+                    Some(TaskState::Queued | TaskState::Running) => observation.waiting = true,
+                    None | Some(TaskState::Failed) => observation.failed = true,
+                }
+            }
+            if observation.failed {
+                observation.next = observation.ids.len();
             }
         }
-        // Missing/failed dependencies propagate failure even when another
-        // dependency is still running, matching canonical claim semantics.
-        let failed = task.depends_on.iter().any(|id| {
-            matches!(
-                self.dependencies.get(id),
-                Some((None | Some(TaskState::Failed), _))
-            )
-        });
-        Ok(failed
-            || task.depends_on.iter().all(|id| {
-                !matches!(
-                    self.dependencies.get(id),
-                    Some((Some(TaskState::Queued | TaskState::Running), _))
-                )
-            }))
+        if observation.next == observation.ids.len() && observation.changed > observation.revision {
+            observation.reset();
+        }
+        let complete = observation.next == observation.ids.len();
+        self.more_dependencies |= !complete;
+        Ok(DependencyCheck {
+            ready: complete && (observation.failed || !observation.waiting),
+            read,
+        })
     }
 }
 
@@ -412,7 +471,11 @@ pub(super) async fn place(
         else {
             continue;
         };
-        if !cache.placement.dependencies_ready(publisher, &task).await? {
+        let dependencies = cache.placement.dependencies_ready(publisher, &task).await?;
+        if !dependencies.ready {
+            if dependencies.read {
+                return Ok(true);
+            }
             continue;
         }
         let ticket_key = std::str::from_utf8(ticket_key).map_err(|e| e.to_string())?;
@@ -453,7 +516,7 @@ pub(super) async fn place(
         }
         cache.placement.ticket_cursor = None;
     }
-    Ok(has_more)
+    Ok(has_more || std::mem::take(&mut cache.placement.more_dependencies))
 }
 
 pub(super) async fn recover(
@@ -928,35 +991,51 @@ mod tests {
             placement
                 .dependencies_ready(&store, &failed_child)
                 .await
-                .unwrap(),
+                .unwrap()
+                .ready,
             "missing dependency must reach executor failure propagation"
         );
         let only_waiting = store
             .enqueue(TaskKind::MergeWal, "later", vec![waiting.id.clone()])
             .await
             .unwrap();
-        assert!(!placement
-            .dependencies_ready(&store, &only_waiting)
-            .await
-            .unwrap());
+        assert!(
+            !placement
+                .dependencies_ready(&store, &only_waiting)
+                .await
+                .unwrap()
+                .ready
+        );
         let mut complete = waiting.clone();
         complete.state = TaskState::Done;
         let key = format!("{}/tasks/{}", cfg.etcd.prefix(), waiting.id);
-        let revision = placement.dependencies[&waiting.id].1;
+        let revision = placement.dependencies[&only_waiting.id].revision;
+        let changed = store
+            .etcd_client()
+            .clone()
+            .put(key.clone(), serde_json::to_vec(&complete).unwrap(), None)
+            .await
+            .unwrap()
+            .header()
+            .unwrap()
+            .revision();
         placement.observe_dependency(
             key.as_bytes(),
             Some(&serde_json::to_vec(&complete).unwrap()),
-            revision + 1,
+            changed,
         );
         placement.observe_dependency(
             key.as_bytes(),
             Some(&serde_json::to_vec(&waiting).unwrap()),
             revision,
         );
-        assert!(placement
-            .dependencies_ready(&store, &only_waiting)
-            .await
-            .unwrap());
+        assert!(
+            placement
+                .dependencies_ready(&store, &only_waiting)
+                .await
+                .unwrap()
+                .ready
+        );
         let op_admission = Arc::new(admission::Admission::default());
         let op = op_admission.try_admit_named("merge").unwrap();
         let ticket = store
@@ -994,6 +1073,175 @@ mod tests {
             TaskState::Queued
         );
         store.release_coordination_lock(ticket).await.unwrap();
+        store.release_coordination_lock(leader).await.unwrap();
+    }
+    #[tokio::test]
+    #[ignore = "requires exclusive loopback ETCD_TEST_ENDPOINTS"]
+    async fn long_dependency_chain_yields_and_unrelated_changes_do_not_repeat_reads() {
+        assert_eq!(std::env::var("ETCD_TEST_EXCLUSIVE").as_deref(), Ok("1"));
+        let (_dir, cfg, store, leader) = setup().await;
+        let mut record = store
+            .enqueue(TaskKind::IndexId, "seed", vec![])
+            .await
+            .unwrap();
+        let ids: Vec<_> = (0..10_001).map(|n| format!("dependency-{n:05}")).collect();
+        for (page, ids) in ids.chunks(100).enumerate() {
+            let ops = ids
+                .iter()
+                .enumerate()
+                .map(|(index, id)| {
+                    record.id = id.clone();
+                    record.state = if page == 0 && index == 0 {
+                        TaskState::Running
+                    } else {
+                        TaskState::Done
+                    };
+                    etcd_client::TxnOp::put(
+                        format!("{}/tasks/{id}", cfg.etcd.prefix()),
+                        serde_json::to_vec(&record).unwrap(),
+                        None,
+                    )
+                })
+                .collect::<Vec<_>>();
+            store
+                .etcd_client()
+                .clone()
+                .txn(etcd_client::Txn::new().and_then(ops))
+                .await
+                .unwrap();
+        }
+        let task = store
+            .enqueue(TaskKind::MergeWal, "long-chain", ids.clone())
+            .await
+            .unwrap();
+        let cold = store
+            .enqueue(TaskKind::MergeWal, "cold", vec![])
+            .await
+            .unwrap();
+        let mut placement = Placement::default();
+        let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+        let before = super::super::tests::rpc_count(&endpoint, &["Range", "Txn"]).await;
+        for page in 0..157 {
+            let check = placement.dependencies_ready(&store, &task).await.unwrap();
+            assert!(!check.ready);
+            assert!(check.read);
+            assert_eq!(
+                super::super::tests::rpc_count(&endpoint, &["Range", "Txn"]).await - before,
+                page + 1,
+                "each long-chain step may make only one bounded transaction"
+            );
+            let cold = placement.dependencies_ready(&store, &cold).await.unwrap();
+            assert!(
+                cold.ready && !cold.read,
+                "unrelated work must be runnable between chunks"
+            );
+        }
+        let revision = placement.dependencies[&task.id].revision;
+        placement.observe_dependency(
+            format!("{}/tasks/unrelated", cfg.etcd.prefix()).as_bytes(),
+            None,
+            revision + 1,
+        );
+        for _ in 0..10 {
+            let check = placement.dependencies_ready(&store, &task).await.unwrap();
+            assert!(!check.ready && !check.read);
+        }
+        assert_eq!(
+            super::super::tests::rpc_count(&endpoint, &["Range", "Txn"]).await - before,
+            157
+        );
+        record.id = ids[0].clone();
+        record.state = TaskState::Done;
+        let key = format!("{}/tasks/{}", cfg.etcd.prefix(), record.id);
+        let response = store
+            .etcd_client()
+            .clone()
+            .put(key.clone(), serde_json::to_vec(&record).unwrap(), None)
+            .await
+            .unwrap();
+        placement.observe_dependency(key.as_bytes(), None, response.header().unwrap().revision());
+        let mut ready = false;
+        for _ in 0..157 {
+            ready = placement
+                .dependencies_ready(&store, &task)
+                .await
+                .unwrap()
+                .ready;
+        }
+        assert!(ready);
+        let snapshot = placement.dependencies[&task.id].revision;
+        placement.observe_dependency(key.as_bytes(), None, snapshot - 1);
+        let check = placement.dependencies_ready(&store, &task).await.unwrap();
+        assert!(
+            check.ready && !check.read,
+            "old watch replay must not cause fresh reads"
+        );
+        placement.forget_queue_entry(format!("{}/queue/{}", cfg.etcd.prefix(), task.id).as_bytes());
+        assert!(
+            placement.dependencies.is_empty(),
+            "summary lifetime follows queued task lifetime"
+        );
+        store.release_coordination_lock(leader).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated ETCD_TEST_ENDPOINTS"]
+    async fn dependency_change_during_paged_snapshot_is_revisited_after_finite_sweep() {
+        let (_dir, cfg, store, leader) = setup().await;
+        let mut dep = store
+            .enqueue(TaskKind::IndexId, "dependency", vec![])
+            .await
+            .unwrap();
+        // Repeated IDs still exercise the multi-page snapshot without expanding
+        // storage inventory. The authoritative semantics of duplicates agree.
+        let task = store
+            .enqueue(TaskKind::MergeWal, "child", vec![dep.id.clone(); 65])
+            .await
+            .unwrap();
+        let mut placement = Placement::default();
+        assert!(
+            !placement
+                .dependencies_ready(&store, &task)
+                .await
+                .unwrap()
+                .ready
+        );
+        let first_revision = placement.dependencies[&task.id].revision;
+        dep.state = TaskState::Done;
+        let key = format!("{}/tasks/{}", cfg.etcd.prefix(), dep.id);
+        let response = store
+            .etcd_client()
+            .clone()
+            .put(key.clone(), serde_json::to_vec(&dep).unwrap(), None)
+            .await
+            .unwrap();
+        let changed = response.header().unwrap().revision();
+        assert!(changed > first_revision);
+        placement.observe_dependency(key.as_bytes(), None, changed);
+        assert!(
+            !placement
+                .dependencies_ready(&store, &task)
+                .await
+                .unwrap()
+                .ready,
+            "old snapshot finishes then refreshes, never mixes revisions"
+        );
+        assert_eq!(placement.dependencies[&task.id].next, 0);
+        assert!(
+            !placement
+                .dependencies_ready(&store, &task)
+                .await
+                .unwrap()
+                .ready
+        );
+        assert!(placement.dependencies[&task.id].revision >= changed);
+        assert!(
+            placement
+                .dependencies_ready(&store, &task)
+                .await
+                .unwrap()
+                .ready
+        );
         store.release_coordination_lock(leader).await.unwrap();
     }
 }

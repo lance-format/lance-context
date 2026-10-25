@@ -164,6 +164,7 @@ impl Cache {
             return Err("demand informer capacity exceeded; durable records retained".into());
         }
         let due = old.map_or_else(Instant::now, |e| e.due);
+        self.placement.forget_queue_entry(key);
         if let Some(old) = self.entries.remove(key) {
             self.ready.remove(&(old.due, key.to_vec()));
             if let Some(active) = old.active {

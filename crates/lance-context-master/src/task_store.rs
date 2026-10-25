@@ -1192,12 +1192,10 @@ impl TaskStore {
     pub(crate) async fn dispatch_dependency_observations(
         &self,
         ids: &[String],
-    ) -> lance::Result<Vec<(Option<TaskState>, i64)>> {
-        if ids.len() > 64 {
-            return Err(lance::Error::io("dependency observation exceeds bound"));
-        }
-        if ids.is_empty() {
-            return Ok(Vec::new());
+        revision: i64,
+    ) -> lance::Result<(Vec<Option<TaskState>>, i64)> {
+        if ids.len() > 64 || ids.is_empty() {
+            return Err(lance::Error::io("invalid dependency observation batch"));
         }
         let response = self
             .inner
@@ -1206,21 +1204,30 @@ impl TaskStore {
             .txn(
                 Txn::new().and_then(
                     ids.iter()
-                        .map(|id| TxnOp::get(self.inner.task_key(id), None))
+                        .map(|id| {
+                            TxnOp::get(
+                                self.inner.task_key(id),
+                                (revision > 0).then(|| GetOptions::new().with_revision(revision)),
+                            )
+                        })
                         .collect::<Vec<_>>(),
                 ),
             )
             .await
             .map_err(etcd_error("observe dispatch dependencies"))?;
-        let revision = response
-            .header()
-            .ok_or_else(|| lance::Error::io("missing dependency snapshot revision"))?
-            .revision();
+        let snapshot = if revision > 0 {
+            revision
+        } else {
+            response
+                .header()
+                .ok_or_else(|| lance::Error::io("missing dependency snapshot revision"))?
+                .revision()
+        };
         let responses = response.op_responses();
         if responses.len() != ids.len() {
             return Err(lance::Error::io("incomplete dependency observations"));
         }
-        responses
+        let states = responses
             .into_iter()
             .zip(ids)
             .map(|(op, id)| match op {
@@ -1230,13 +1237,14 @@ impl TaskStore {
                         if task.id != *id {
                             return Err(lance::Error::io("dependency identity mismatch"));
                         }
-                        Ok((Some(task.state), kv.mod_revision()))
+                        Ok(Some(task.state))
                     }
-                    None => Ok((None, revision)),
+                    None => Ok(None),
                 },
                 _ => Err(lance::Error::io("invalid dependency observation response")),
             })
-            .collect()
+            .collect::<lance::Result<Vec<_>>>()?;
+        Ok((states, snapshot))
     }
 
     pub(crate) async fn recover_observed_task(&self, task: &TaskRecord) -> lance::Result<bool> {
@@ -2989,18 +2997,28 @@ impl EtcdTaskStore {
         operation: Option<&crate::admission::Operation>,
     ) -> lance::Result<DependencyStatus> {
         let mut waiting = false;
-        for dependency in &task.depends_on {
-            let record = self.get(dependency).await?;
+        for dependencies in task.depends_on.chunks(64) {
+            let keys = dependencies
+                .iter()
+                .map(|id| self.task_key(id))
+                .collect::<Vec<_>>();
+            let values = self.read_values(&keys).await?;
             if let Some(operation) = operation {
                 operation.claim_completed(1, 0, 0);
             }
-            match record {
-                Some(record) if record.state == TaskState::Done => {}
-                Some(record) if record.state == TaskState::Failed => {
-                    return Ok(DependencyStatus::Failed(dependency.clone()));
+            for (dependency, value) in dependencies.iter().zip(values) {
+                let record = value
+                    .as_deref()
+                    .map(|value| decode_task(value, dependency))
+                    .transpose()?;
+                match record {
+                    Some(record) if record.state == TaskState::Done => {}
+                    Some(record) if record.state == TaskState::Failed => {
+                        return Ok(DependencyStatus::Failed(dependency.clone()))
+                    }
+                    Some(_) => waiting = true,
+                    None => return Ok(DependencyStatus::Failed(dependency.clone())),
                 }
-                Some(_) => waiting = true,
-                None => return Ok(DependencyStatus::Failed(dependency.clone())),
             }
         }
         Ok(if waiting {

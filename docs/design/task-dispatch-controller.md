@@ -26,11 +26,14 @@ leader every five minutes, separately from placement, with a revision-consistent
 paged snapshot and explicit memory bounds. Followers do not publish stale queue
 depth. Existing standalone TaskStore clients retain their legacy behavior.
 
-Dependency states are fetched by exact ID in batches of at most 64 and updated
-by a task-event watch. Retained task history is not loaded into the informer.
-Point-read revisions prevent older watch replay from regressing dependency state.
-Missing/failed dependencies are sent to canonical failure propagation even when
-another dependency is waiting. The dependency cache is capped at 10,000 IDs.
+Dependency evaluations are retained per queued dependency chain and removed
+with that queue entry. Each placement step reads at most 64 IDs; longer chains
+yield between chunks and finish at one etcd revision. Related task events mark
+the evaluation for refresh; unrelated events and older watch replay do not cause
+new reads. No global dependency-cache eviction or oversized-chain fallback is
+needed. Retained task history is not loaded into the informer. Missing/failed
+dependencies reach canonical failure propagation even when another dependency
+is waiting. The executor also batches its authoritative dependency reads by 64.
 
 The new election key is `demand-controller/leader-v2`: a discovery-only old leader
 cannot strand new capacity tickets during rolling migration. Old replicas still
@@ -49,10 +52,18 @@ use zero Range/Txn calls. This excludes ticket registration, lease traffic,
 canonical claims, startup snapshot and task completion. It is not production
 throughput evidence.
 
-Before activation, validate actual shared-pool saturation, preparation sharing,
-claim-response ambiguity, sustained dependency churn/cache eviction and very
-large dependency chains; measure cold-target admission and cache byte bounds
-against representative traffic. Chains above the dependency cache cap currently
-fall back to exact executor dependency checks and need a bounded rejection
-strategy before production. Review history retention races and stale-leader
-reporting before release. Production etcd version remains unchanged.
+Actual scheduler tests verify that a one-slot shared pool completes indexing
+while the compaction budget is occupied, and that resident merge memory pressure
+does not stop the general pool. A 10,001-dependency fixture verifies bounded
+chunks, no repeated reads on unrelated events, and eventual refresh on relevant
+progress. Mid-snapshot dependency changes trigger a new finite sweep.
+
+Startup initialization survives an actual transport outage during final lock
+cleanup; genuine initialization errors still fail. The old guard stops renewal
+and expires. This avoids replaying already completed initialization.
+
+Before activation, validate preparation sharing and claim-response ambiguity,
+and measure cold-target admission and cache byte bounds against representative
+traffic. Review pending same-target offer contention and history retention
+races/stale-leader reporting before release. Production etcd version remains
+unchanged.
