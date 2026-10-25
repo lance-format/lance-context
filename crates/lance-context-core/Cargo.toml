@@ -58,3 +58,7 @@ uuid = { version = "1.20.0", features = ["v4", "v5", "v7"] }
 metrics-util = { version = "0.19", default-features = false, features = ["debugging"] }
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread"] }
+
+[[example]]
+name = "annotation_column_update"
+required-features = ["lance-io-metrics"]
