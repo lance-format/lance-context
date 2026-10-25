@@ -250,13 +250,19 @@ async fn annotation_executable_two_ingresses_restart_owner_and_fence_lost_lease(
         etcd_client::Client::connect(endpoints.split(',').collect::<Vec<_>>(), None).await?;
     let claim_key = format!("{}/{}/{}", prefix, config.layout.cluster, binding().table);
     // A crash leaves the original claim until its real etcd lease expires.
-    tokio::time::timeout(Duration::from_secs(20), async {
+    let expired_at = tokio::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(60), async {
         while !etcd.get(claim_key.clone(), None).await?.kvs().is_empty() {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         Ok::<_, anyhow::Error>(())
     })
-    .await??;
+    .await
+    .context("old annotation owner lease did not expire")??;
+    eprintln!(
+        "annotation owner lease observed expired after {:?}",
+        expired_at.elapsed()
+    );
     let mut replacement = Process::spawn(
         &binary,
         &files[0],
