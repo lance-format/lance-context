@@ -24,6 +24,7 @@ pub(crate) fn retry_kind(endpoint: &str) -> Option<TaskKind> {
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn enqueue_recovery(
     state: &Arc<MasterState>,
     coordinator: &Coordinator,

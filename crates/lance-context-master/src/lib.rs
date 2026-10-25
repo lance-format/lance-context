@@ -29,3 +29,5 @@ pub mod state;
 pub mod stats_store;
 pub mod task_store;
 pub mod wal_tail;
+
+pub(crate) mod demand_controller;

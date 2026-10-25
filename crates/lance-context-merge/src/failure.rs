@@ -202,10 +202,10 @@ impl ShardFailure {
         (needs_attention, delay_secs)
     }
 
-    // Read old records with corrected semantics without resetting attempts,
-    // moving the failure timestamp, or mutating ownership/durable records.
-    // The next fenced completion persists the normal retry result.
-    pub(crate) fn corrected(mut self) -> Self {
+    /// Read old records with corrected semantics without resetting attempts,
+    /// moving the failure timestamp, or mutating ownership/durable records.
+    /// The next fenced completion persists the normal retry result.
+    pub fn corrected(mut self) -> Self {
         // One rule set: whatever `classify` says today is the effective
         // class. Only a DataOrConfiguration record can be softened; a stored
         // Retryable is never hardened on read.

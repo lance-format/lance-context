@@ -22,6 +22,7 @@
 //! Each task runs in its own `tokio::spawn`, so one task's failure never affects
 //! another. A global [`Semaphore`] bounds how many run at once.
 
+#[cfg(test)]
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1103,6 +1104,7 @@ async fn sweep_merge_wal_inner(state: &Arc<MasterState>) -> lance::Result<usize>
 
 // A draining target still needs metadata recovery while ownership is unresolved.
 // Once released, its old failure ledger must not enqueue fresh merge tasks.
+#[cfg(test)]
 async fn should_probe_failure(
     state: &Arc<MasterState>,
     failure: &lance_context_merge::failure::ShardFailure,
@@ -1129,6 +1131,7 @@ async fn should_probe_failure(
     false
 }
 
+#[cfg(test)]
 async fn enqueue_failure_recovery(
     state: &Arc<MasterState>,
     kind: TaskKind,
@@ -1189,6 +1192,7 @@ pub(crate) async fn enqueue_merge_request(
     Ok(())
 }
 
+#[cfg(test)]
 async fn enqueue_execution_recovery(
     state: &Arc<MasterState>,
     coordinator: &lance_context_merge::Coordinator,
@@ -1207,6 +1211,7 @@ async fn enqueue_execution_recovery(
     Ok(())
 }
 
+#[cfg(test)]
 async fn enqueue_execution_recovery_page(
     state: &Arc<MasterState>,
     coordinator: &lance_context_merge::Coordinator,
@@ -1247,6 +1252,7 @@ async fn enqueue_execution_recovery_page(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) async fn enqueue_observed_execution(
     state: &Arc<MasterState>,
     kind: TaskKind,
@@ -1269,6 +1275,7 @@ pub(crate) async fn enqueue_observed_execution(
 /// the unattempted entries for the next scheduled tick. The failed entry is
 /// still durable (unless its acknowledgement actually committed), and the
 /// normal paged scan revisits it without starving later targets on the page.
+#[cfg(test)]
 async fn enqueue_request_page<A, F, Fut>(
     pending: &mut VecDeque<lance_context_merge::rollout::MergeRequest>,
     mut accepting: A,
@@ -1289,6 +1296,7 @@ where
     Ok(())
 }
 
+#[cfg(test)]
 async fn enqueue_buffered_merge_request(
     state: &Arc<MasterState>,
     coordinator: &lance_context_merge::Coordinator,
@@ -1342,117 +1350,7 @@ pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
             }
         }
     });
-    // Retry metadata independently of coarse stats sweeps. Every replica may
-    // enqueue; the existing task dedupe/claim transaction elects one executor.
-    let retry_state = state.clone();
-    tokio::spawn(async move {
-        let coordinator = retry_state.task_store.merge_coordinator();
-        let mut cursor = None;
-        let mut request_cursor = None;
-        let mut pending_requests = VecDeque::new();
-        let mut execution_cursor = None;
-        let mut ticker = tokio::time::interval(Duration::from_secs(15));
-        // Slow or failed metadata calls must not accumulate immediate retries
-        // when the backend recovers. Durable demand survives a missed tick.
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            ticker.tick().await;
-            if let Some(operation) = retry_state.admission.try_admit_named("worker_merge_demand") {
-                operation.phase("enqueue_worker_demand");
-                let resumed_page = !pending_requests.is_empty();
-                if pending_requests.is_empty() {
-                    match coordinator.request_page(request_cursor.as_deref()).await {
-                        Ok((targets, next)) => {
-                            request_cursor = next;
-                            pending_requests.extend(targets);
-                        }
-                        Err(error) => tracing::warn!(%error, "worker merge demand scan failed"),
-                    }
-                }
-                if let Err((target, error)) = enqueue_request_page(
-                    &mut pending_requests,
-                    || retry_state.admission.status().accepting,
-                    |request| {
-                        let state = &retry_state;
-                        let coordinator = &coordinator;
-                        let operation = &operation;
-                        async move {
-                            operation.target(&request.target);
-                            let result = enqueue_buffered_merge_request(
-                                state,
-                                coordinator,
-                                request,
-                                resumed_page,
-                            )
-                            .await;
-                            if result.is_ok() {
-                                operation.observed_work();
-                            }
-                            result
-                        }
-                    },
-                )
-                .await
-                {
-                    metrics::counter!("master_worker_demand_enqueue_page_errors_total")
-                        .increment(1);
-                    tracing::warn!(%target, %error, remaining = pending_requests.len(),
-                    "worker merge demand enqueue failed; remaining page deferred to next tick");
-                }
-            }
-            match coordinator
-                .execution_observation_page(execution_cursor.as_deref())
-                .await
-            {
-                Ok((executions, next)) => {
-                    // Each observation remains durable for the next sweep;
-                    // an error on this page must not starve later targets.
-                    execution_cursor = next;
-                    if let Err(error) =
-                        enqueue_execution_recovery_page(&retry_state, &coordinator, &executions)
-                            .await
-                    {
-                        tracing::warn!(%error, "local execution recovery page deferred");
-                    }
-                }
-                Err(error) => tracing::warn!(%error, "local execution recovery scan failed"),
-            }
-            match coordinator
-                .failure_observation_page(cursor.as_deref(), 256)
-                .await
-            {
-                Ok((rows, next)) => {
-                    cursor = next;
-                    let mut targets = std::collections::HashSet::new();
-                    for observed in rows {
-                        let failure = &observed.failure;
-                        let task_kind = crate::maintenance_execution::retry_kind(&failure.endpoint)
-                            .or_else(|| {
-                                retry_state
-                                    .config
-                                    .worker_endpoints
-                                    .contains(&failure.endpoint)
-                                    .then_some(TaskKind::MergeWal)
-                            });
-                        let Some(task_kind) = task_kind else {
-                            continue;
-                        };
-                        if failure.next_retry_ms <= lance_context_merge::failure::now_ms()
-                            && targets.insert((failure.target.clone(), kind_label(task_kind)))
-                            && should_probe_failure(&retry_state, failure).await
-                        {
-                            if let Err(error) =
-                                enqueue_failure_recovery(&retry_state, task_kind, &observed).await
-                            {
-                                tracing::warn!(target = %failure.target, %error, "maintenance recovery enqueue failed");
-                            }
-                        }
-                    }
-                }
-                Err(error) => tracing::warn!(%error, "merge recovery metadata scan failed"),
-            }
-        }
-    });
+    crate::demand_controller::spawn(state);
 
     // Optional periodic compaction auto-sweep feeds the same queue.
     let interval_secs = state.config.compaction_interval_secs;
