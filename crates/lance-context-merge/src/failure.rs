@@ -25,6 +25,28 @@ pub struct ShardFailure {
     pub needs_attention: bool,
 }
 
+/// Version of a failure observed by a recovery scan, not a new retry request.
+#[derive(Clone, Debug)]
+pub struct FailureObservation {
+    pub failure: ShardFailure,
+    pub revision: i64,
+}
+
+pub fn failure_key(prefix: &str, target: &str, endpoint: &str) -> String {
+    let hex = |s: &str| {
+        s.as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    };
+    format!(
+        "{}/merge-failures/{}/{}",
+        prefix.trim_end_matches('/'),
+        hex(target),
+        hex(endpoint)
+    )
+}
+
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -180,10 +202,10 @@ impl ShardFailure {
         (needs_attention, delay_secs)
     }
 
-    // Read old records with corrected semantics without resetting attempts,
-    // moving the failure timestamp, or mutating ownership/durable records.
-    // The next fenced completion persists the normal retry result.
-    pub(crate) fn corrected(mut self) -> Self {
+    /// Read old records with corrected semantics without resetting attempts,
+    /// moving the failure timestamp, or mutating ownership/durable records.
+    /// The next fenced completion persists the normal retry result.
+    pub fn corrected(mut self) -> Self {
         // One rule set: whatever `classify` says today is the effective
         // class. Only a DataOrConfiguration record can be softened; a stored
         // Retryable is never hardened on read.
@@ -228,18 +250,7 @@ impl Coordinator {
         format!("{}/merge-failures/", self.prefix.trim_end_matches('/'))
     }
     pub(crate) fn failure_key(&self, target: &str, endpoint: &str) -> String {
-        let hex = |s: &str| {
-            s.as_bytes()
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>()
-        };
-        format!(
-            "{}{}/{}",
-            self.failures_prefix(),
-            hex(target),
-            hex(endpoint)
-        )
+        failure_key(&self.prefix, target, endpoint)
     }
     pub async fn failure(&self, target: &str, endpoint: &str) -> Result<Option<ShardFailure>> {
         let response = self
@@ -399,6 +410,15 @@ impl Coordinator {
         after: Option<&str>,
         limit: i64,
     ) -> Result<(Vec<ShardFailure>, Option<String>)> {
+        let (rows, next) = self.failure_observation_page(after, limit).await?;
+        Ok((rows.into_iter().map(|row| row.failure).collect(), next))
+    }
+
+    pub async fn failure_observation_page(
+        &self,
+        after: Option<&str>,
+        limit: i64,
+    ) -> Result<(Vec<FailureObservation>, Option<String>)> {
         let prefix = self.failures_prefix();
         let (start, options) = match after {
             Some(key) if key.starts_with(&prefix) => {
@@ -419,9 +439,20 @@ impl Coordinator {
             .kvs()
             .iter()
             .map(|kv| {
-                serde_json::from_slice::<ShardFailure>(kv.value())
+                let failure = serde_json::from_slice::<ShardFailure>(kv.value())
                     .map(ShardFailure::corrected)
-                    .map_err(|e| e.to_string())
+                    .map_err(|e| e.to_string())?;
+                if kv.key()
+                    != self
+                        .failure_key(&failure.target, &failure.endpoint)
+                        .as_bytes()
+                {
+                    return Err("failure target or endpoint does not match inventory key".into());
+                }
+                Ok(FailureObservation {
+                    failure,
+                    revision: kv.mod_revision(),
+                })
             })
             .collect::<Result<Vec<_>>>()?;
         let next = if response.more() {
