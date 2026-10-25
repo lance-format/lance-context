@@ -1,6 +1,6 @@
 //! Bounded metadata-only service for WAL tails below the normal count trigger.
 //! A service interval is not a claim about the creation age of a generation.
-use crate::{config::MasterConfig, scheduler, state::MasterState, stats_store::StatRow};
+use crate::{config::MasterConfig, state::MasterState, stats_store::StatRow};
 use etcd_client::{Compare, CompareOp, Txn, TxnOp};
 use lance_context_api::TaskKind;
 use serde::{Deserialize, Serialize};
@@ -214,7 +214,14 @@ async fn enqueue_tail(state: &Arc<MasterState>, target: &str) -> Result<bool, St
     {
         return Ok(false);
     }
-    scheduler::enqueue(state, TaskKind::MergeWal, target)
+    state
+        .task_store
+        .enqueue_with_context(
+            TaskKind::MergeWal,
+            target,
+            vec![],
+            crate::admission_telemetry::Context::new(crate::admission_telemetry::Origin::WalTail),
+        )
         .await
         .map_err(|e| e.to_string())?;
     Ok(true)
@@ -223,6 +230,7 @@ async fn enqueue_tail(state: &Arc<MasterState>, target: &str) -> Result<bool, St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scheduler;
     use clap::Parser;
 
     fn config() -> MasterConfig {

@@ -94,7 +94,18 @@ impl ScanMergeAdmission {
                 .await?;
             // Use the ordinary enqueue even when an active pointer exists:
             // it validates the record and repairs a stale terminal pointer.
-            let task = crate::scheduler::enqueue(state, TaskKind::MergeWal, &row.name).await?;
+            let task = state
+                .task_store
+                .enqueue_with_context(
+                    TaskKind::MergeWal,
+                    &row.name,
+                    vec![],
+                    crate::admission_telemetry::Context::stats(
+                        crate::admission_telemetry::Origin::Scan,
+                        row,
+                    ),
+                )
+                .await?;
             // Another producer may have won the race. Count conservatively:
             // admission must never exceed its bound because of concurrency.
             Ok::<_, lance::Error>(before.as_deref() != Some(task.id.as_str()))

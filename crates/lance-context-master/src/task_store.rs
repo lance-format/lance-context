@@ -21,6 +21,7 @@ use lance_context_core::generate_id;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
+use crate::admission_telemetry::{Context as AdmissionContext, Origin, Outcome};
 use crate::config::MasterConfig;
 use crate::eligibility;
 
@@ -625,12 +626,40 @@ impl TaskStore {
         self.inner.enqueue(kind, target, depends_on).await
     }
 
+    pub(crate) async fn enqueue_with_context(
+        &self,
+        kind: TaskKind,
+        target: &str,
+        depends_on: Vec<String>,
+        context: AdmissionContext,
+    ) -> lance::Result<TaskRecord> {
+        self.inner
+            .enqueue_guarded(kind, target, depends_on, None, None, context)
+            .await?
+            .ok_or_else(|| lance::Error::io("unguarded enqueue unexpectedly superseded"))
+    }
+
     /// Automatic discovery must not publish after losing its elected owner.
     /// Manual enqueue retains its existing semantics and does not use this API.
+    #[cfg(test)]
     pub(crate) async fn enqueue_discovered(
         &self,
         kind: TaskKind,
         target: &str,
+    ) -> lance::Result<TaskRecord> {
+        self.enqueue_discovered_with_context(
+            kind,
+            target,
+            AdmissionContext::new(Origin::PeriodicStats),
+        )
+        .await
+    }
+
+    pub(crate) async fn enqueue_discovered_with_context(
+        &self,
+        kind: TaskKind,
+        target: &str,
+        context: AdmissionContext,
     ) -> lance::Result<TaskRecord> {
         if self.publication_fence.is_none() {
             return Err(lance::Error::io(
@@ -644,6 +673,7 @@ impl TaskStore {
                 Vec::new(),
                 None,
                 self.publication_fence.as_ref(),
+                context,
             )
             .await?
             .ok_or_else(|| lance::Error::io("discovery enqueue lost leadership"))
@@ -666,6 +696,7 @@ impl TaskStore {
         if frontier_revision < 0 || frontier_value.len() > 256 * 1024 {
             return Err(lance::Error::io("invalid aggregate frontier observation"));
         }
+        let context = AdmissionContext::revision(Origin::AggregateFrontier, frontier_revision);
         let inner = &self.inner;
         let checkpoint = frontier_key(&inner.prefix, target);
         let dedupe = inner.dedupe_key(TaskKind::MergeWal, target, &[]).unwrap();
@@ -710,6 +741,7 @@ impl TaskStore {
             .await
             .map_err(etcd_error("admit aggregate WAL demand"))?;
         if response.succeeded() {
+            context.record(TaskKind::MergeWal, target, Some(&task.id), Outcome::Created);
             return Ok(Admission::Admitted {
                 revision: response
                     .header()
@@ -724,9 +756,11 @@ impl TaskStore {
             return Err(lance::Error::io("invalid WAL admission conflict response"));
         };
         if current.kvs().first().map_or(0, |kv| kv.mod_revision()) != frontier_revision {
+            context.record(TaskKind::MergeWal, target, None, Outcome::Superseded);
             return Ok(Admission::Changed);
         }
         let Some(existing) = existing.kvs().first() else {
+            context.record(TaskKind::MergeWal, target, None, Outcome::Superseded);
             return Ok(Admission::Changed);
         };
         let id =
@@ -742,6 +776,7 @@ impl TaskStore {
                 return Err(lance::Error::io("aggregate WAL dedupe target mismatch"));
             }
             if matches!(record.state, TaskState::Queued | TaskState::Running) {
+                context.record(TaskKind::MergeWal, target, Some(id), Outcome::Deduplicated);
                 return Ok(Admission::Blocked {
                     id: id.to_string(),
                     revision: existing.mod_revision(),
@@ -763,6 +798,7 @@ impl TaskStore {
             )
             .await
             .map_err(etcd_error("clean terminal aggregate WAL dedupe"))?;
+        context.record(TaskKind::MergeWal, target, None, Outcome::Superseded);
         Ok(Admission::Changed)
     }
 
@@ -856,6 +892,7 @@ impl TaskStore {
                 Vec::new(),
                 Some((key, observed.revision)),
                 self.publication_fence.as_ref(),
+                AdmissionContext::revision(Origin::ExecutionRecovery, observed.revision),
             )
             .await
     }
@@ -881,6 +918,7 @@ impl TaskStore {
                 Vec::new(),
                 Some((key, observed.revision)),
                 self.publication_fence.as_ref(),
+                AdmissionContext::revision(Origin::FailureRecovery, observed.revision),
             )
             .await
     }
@@ -1005,7 +1043,19 @@ impl TaskStore {
                     .and_then([TxnOp::delete(request_key, None)]),
             )
             .await
-            .map(|response| response.succeeded())
+            .map(|response| {
+                if response.succeeded() {
+                    AdmissionContext::revision(Origin::WriterRequest, request.revision).record(
+                        TaskKind::MergeWal,
+                        &request.target,
+                        Some(&queued.id),
+                        Outcome::Deduplicated,
+                    );
+                }
+                // A failed cache acknowledgement falls back to normal admission.
+                // It is not a separate terminal outcome.
+                response.succeeded()
+            })
             .map_err(etcd_error("acknowledge cached merge demand"))
     }
 
@@ -1852,9 +1902,16 @@ impl EtcdTaskStore {
         target: &str,
         depends_on: Vec<String>,
     ) -> lance::Result<TaskRecord> {
-        self.enqueue_guarded(kind, target, depends_on, None, None)
-            .await?
-            .ok_or_else(|| lance::Error::io("unguarded enqueue unexpectedly superseded"))
+        self.enqueue_guarded(
+            kind,
+            target,
+            depends_on,
+            None,
+            None,
+            AdmissionContext::new(Origin::Explicit),
+        )
+        .await?
+        .ok_or_else(|| lance::Error::io("unguarded enqueue unexpectedly superseded"))
     }
 
     async fn delete_owned_key_fenced(
@@ -1885,6 +1942,7 @@ impl EtcdTaskStore {
         depends_on: Vec<String>,
         execution: Option<(String, i64)>,
         fence: Option<&PublicationFence>,
+        context: AdmissionContext,
     ) -> lance::Result<Option<TaskRecord>> {
         let task = new_task(kind, target, depends_on);
         let task_key = self.task_key(&task.id);
@@ -1915,6 +1973,7 @@ impl EtcdTaskStore {
                         .await
                         .map_err(etcd_error("read recovery enqueue observation"))?;
                     if !snapshot.succeeded() {
+                        context.record(kind, target, None, Outcome::Superseded);
                         return Ok(None);
                     }
                     let responses = snapshot.op_responses();
@@ -1933,6 +1992,7 @@ impl EtcdTaskStore {
                 if let Some(existing_id) = existing_id {
                     if let Some(existing) = self.get(&existing_id).await? {
                         if matches!(existing.state, TaskState::Queued | TaskState::Running) {
+                            context.record(kind, target, Some(&existing.id), Outcome::Deduplicated);
                             return Ok(Some(existing));
                         }
                     }
@@ -1961,6 +2021,7 @@ impl EtcdTaskStore {
                     .or_else(otherwise);
                 let response = client.txn(txn).await.map_err(etcd_error("enqueue task"))?;
                 if response.succeeded() {
+                    context.record(kind, target, Some(&task.id), Outcome::Created);
                     return Ok(Some(task));
                 }
                 if let Some((_, revision)) = &execution {
@@ -1971,6 +2032,7 @@ impl EtcdTaskStore {
                         ));
                     };
                     if current.kvs().first().map(|kv| kv.mod_revision()) != Some(*revision) {
+                        context.record(kind, target, None, Outcome::Superseded);
                         return Ok(None);
                     }
                 }
@@ -1989,6 +2051,7 @@ impl EtcdTaskStore {
             ]))
             .await
             .map_err(etcd_error("enqueue task"))?;
+        context.record(kind, target, Some(&task.id), Outcome::Created);
         Ok(Some(task))
     }
 
@@ -2003,6 +2066,7 @@ impl EtcdTaskStore {
             ));
         }
         let target = &request.target;
+        let context = AdmissionContext::revision(Origin::WriterRequest, request.revision);
         let request_key = lance_context_merge::execution_key(&self.prefix, target)
             .replace("/merge-executions/", "/merge-requests/");
         let dedupe_key = self.dedupe_key(TaskKind::MergeWal, target, &[]).unwrap();
@@ -2023,6 +2087,7 @@ impl EtcdTaskStore {
                 .await
                 .map_err(etcd_error("read merge demand admission"))?;
             if !snapshot.succeeded() {
+                context.record(TaskKind::MergeWal, target, None, Outcome::Superseded);
                 return Ok(None);
             }
             let existing_id = match snapshot.op_responses().into_iter().next() {
@@ -2044,6 +2109,12 @@ impl EtcdTaskStore {
                     if existing.state == TaskState::Running {
                         // This pass may already have visited the requesting
                         // shard. Keep the demand for its durable continuation.
+                        context.record(
+                            TaskKind::MergeWal,
+                            target,
+                            Some(&existing.id),
+                            Outcome::Deduplicated,
+                        );
                         return Ok(Some(existing));
                     }
                     if existing.state == TaskState::Queued {
@@ -2071,6 +2142,12 @@ impl EtcdTaskStore {
                             .await
                             .map_err(etcd_error("acknowledge queued merge demand"))?;
                         if acknowledged.succeeded() {
+                            context.record(
+                                TaskKind::MergeWal,
+                                target,
+                                Some(&existing.id),
+                                Outcome::Deduplicated,
+                            );
                             return Ok(Some(existing));
                         }
                         continue;
@@ -2100,6 +2177,7 @@ impl EtcdTaskStore {
                 .await
                 .map_err(etcd_error("admit merge demand"))?;
             if admitted.succeeded() {
+                context.record(TaskKind::MergeWal, target, Some(&task.id), Outcome::Created);
                 return Ok(Some(task));
             }
         }
@@ -3828,6 +3906,10 @@ fn etcd_error(action: &'static str) -> impl FnOnce(etcd_client::Error) -> lance:
 pub(crate) mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    mod admission_outcomes {
+        include!("admission_tests.rs");
+    }
 
     #[tokio::test]
     #[ignore = "requires ETCD_TEST_ENDPOINTS"]

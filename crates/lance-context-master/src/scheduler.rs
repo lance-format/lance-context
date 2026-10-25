@@ -22,6 +22,7 @@
 //! Each task runs in its own `tokio::spawn`, so one task's failure never affects
 //! another. A global [`Semaphore`] bounds how many run at once.
 
+use crate::admission_telemetry::{Context as AdmissionContext, Origin};
 #[cfg(test)]
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -116,7 +117,6 @@ pub async fn enqueue_with_deps(
     depends_on: Vec<String>,
 ) -> lance::Result<TaskRecord> {
     let record = state.task_store.enqueue(kind, target, depends_on).await?;
-    metrics::counter!("master_task_enqueued_total", "kind" => kind_label(kind)).increment(1);
     Ok(record)
 }
 
@@ -1072,7 +1072,7 @@ async fn sweep_candidates_inner(
             .task_store
             .get_active_id(TaskKind::Compact, &row.name)
             .await?;
-        let task = enqueue_sweep_candidate(state, publisher, TaskKind::Compact, &row.name).await?;
+        let task = enqueue_sweep_candidate(state, publisher, TaskKind::Compact, &row).await?;
         if before.as_deref() != Some(task.id.as_str()) {
             queued += 1;
         }
@@ -1157,7 +1157,7 @@ async fn sweep_merge_wal_inner(
             .task_store
             .get_active_id(TaskKind::MergeWal, &row.name)
             .await?;
-        let task = enqueue_sweep_candidate(state, publisher, TaskKind::MergeWal, &row.name).await?;
+        let task = enqueue_sweep_candidate(state, publisher, TaskKind::MergeWal, &row).await?;
         if before.as_deref() == Some(task.id.as_str()) {
             deduped += 1;
         } else {
@@ -1172,16 +1172,21 @@ async fn enqueue_sweep_candidate(
     state: &Arc<MasterState>,
     publisher: Option<&crate::task_store::TaskStore>,
     kind: TaskKind,
-    target: &str,
+    row: &crate::stats_store::StatRow,
 ) -> lance::Result<TaskRecord> {
+    let context = AdmissionContext::stats(Origin::PeriodicStats, row);
     match publisher {
         Some(publisher) => {
-            let task = publisher.enqueue_discovered(kind, target).await?;
-            metrics::counter!("master_task_enqueued_total", "kind" => kind_label(kind))
-                .increment(1);
-            Ok(task)
+            publisher
+                .enqueue_discovered_with_context(kind, &row.name, context)
+                .await
         }
-        None => enqueue(state, kind, target).await,
+        None => {
+            state
+                .task_store
+                .enqueue_with_context(kind, &row.name, vec![], context)
+                .await
+        }
     }
 }
 
@@ -1224,10 +1229,8 @@ async fn enqueue_failure_recovery(
         .task_store
         .enqueue_failure_recovery(kind, observed)
         .await?
-        .is_some()
+        .is_none()
     {
-        metrics::counter!("master_task_enqueued_total", "kind" => kind_label(kind)).increment(1);
-    } else {
         metrics::counter!("master_failure_recovery_enqueue_superseded_total", "kind" => kind_label(kind)).increment(1);
     }
     Ok(())
@@ -1262,7 +1265,6 @@ pub(crate) async fn enqueue_merge_request(
         .map_err(|e| e.to_string())?;
     let outcome = match task {
         Some(task) => {
-            metrics::counter!("master_task_enqueued_total", "kind" => kind_label(TaskKind::MergeWal)).increment(1);
             if task.state == lance_context_api::TaskState::Queued {
                 "queued"
             } else {
@@ -1345,9 +1347,7 @@ pub(crate) async fn enqueue_observed_execution(
         .task_store
         .enqueue_execution_recovery(kind, observed)
         .await?;
-    if admitted.is_some() {
-        metrics::counter!("master_task_enqueued_total", "kind" => kind_label(kind)).increment(1);
-    } else {
+    if admitted.is_none() {
         metrics::counter!("master_execution_recovery_enqueue_superseded_total", "kind" => kind_label(kind)).increment(1);
     }
     Ok(())
