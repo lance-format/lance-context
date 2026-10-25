@@ -1,5 +1,12 @@
 # Leader-owned merge demand discovery
 
+This document describes the discovery layer introduced in #565. The
+[capacity-backed task dispatch extension](task-dispatch-controller.md) replaces
+the per-executor queue scans mentioned below. With that extension the election
+key is `demand-controller/leader-v2`, and the snapshot also includes capacity,
+offers and canonical ownership (17 Range/Txn RPCs for the fixed fixture). The
+seven-RPC measurements below apply to discovery alone.
+
 Each master previously paged merge requests, execution inventory, and failures
 once every 15 seconds. With N masters, discovery and advisory enqueue reads were
 repeated N times even when the durable queue already contained the work.

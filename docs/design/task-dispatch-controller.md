@@ -12,12 +12,16 @@ not fallback scans. Capacity release wakes local scheduling promptly.
 
 The controller keeps queue, running tasks, ownership and capacity in its bounded
 List/Watch cache. Placement traverses finite 64-task by 64-ticket slices, including
-heterogeneous capacity beyond the first page. Publishing an offer compares the
+heterogeneous capacity beyond the first page. Pagination advances over raw
+records, so malformed or already-occupied tickets cannot hide later capacity. Publishing an offer compares the
 leader token, ticket lease/value, absent task reservation and queue revision.
 The offer itself grants no storage ownership. The receiving executor uses the
 original exact task admission/claim transaction, with ticket/offer/reservation
 comparisons added. Accepted claims retain their own leases and storage fencing.
 Losing leadership or the capacity lease does not cancel productive execution.
+Only one unaccepted offer per target is published at a time. Consumption removes
+that restriction, so preparation sharing still permits compaction and merge
+to execute concurrently under their existing canonical admission rules.
 
 Native replicas do not run startup global recovery or completion-triggered
 history scans. The leader observes orphaned running tasks and uses the original
@@ -62,8 +66,17 @@ Startup initialization survives an actual transport outage during final lock
 cleanup; genuine initialization errors still fail. The old guard stops renewal
 and expires. This avoids replaying already completed initialization.
 
-Before activation, validate preparation sharing and claim-response ambiguity,
-and measure cold-target admission and cache byte bounds against representative
-traffic. Review pending same-target offer contention and history retention
-races/stale-leader reporting before release. Production etcd version remains
-unchanged.
+Real-etcd tests verify concurrent prepared compaction and merge claims after
+pending-offer consumption. They inject response loss after the actual claim
+transaction: a committed original token is recovered; a foreign owner remains
+untouched. Ticket cleanup does not revoke an accepted task lease. A stale leader
+cannot prune history, and dependencies already present in the history snapshot
+are retained.
+
+Before activation, measure cold-target admission and cache byte bounds against
+representative immutable-image traffic. The pre-existing history-pruning race
+with concurrently created dependencies is not solved by centralization: a new
+chain can reference terminal history selected for deletion after the pruning
+snapshot. Missing dependencies fail explicitly; no task may bypass them. This
+requires a separate atomic reference/retention protocol before claiming history
+retention is race-free. Production etcd version remains unchanged.

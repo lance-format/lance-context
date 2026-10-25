@@ -419,10 +419,23 @@ pub(super) async fn place(
         .ticket_cursor
         .clone()
         .unwrap_or_else(|| ticket_prefix.as_bytes().to_vec());
-    let tickets: Vec<_> = cache
+    // Advance by the raw bounded page, including malformed and occupied
+    // tickets. Filtering first can hide every valid executor behind bad data
+    // or traverse an unbounded occupied prefix in one scheduler step.
+    let page: Vec<_> = cache
         .entries
         .range(ticket_start..)
         .take_while(|(key, _)| key.starts_with(ticket_prefix.as_bytes()))
+        .take(64)
+        .map(|(key, entry)| (key.clone(), entry.clone()))
+        .collect();
+    let next_ticket = (page.len() == 64).then(|| {
+        let mut next = page.last().unwrap().0.clone();
+        next.push(0);
+        next
+    });
+    let tickets: Vec<_> = page
+        .into_iter()
         .filter(|(key, _)| {
             !cache.entries.contains_key(
                 String::from_utf8_lossy(key)
@@ -430,17 +443,17 @@ pub(super) async fn place(
                     .as_bytes(),
             )
         })
-        .take(64)
         .filter_map(|(key, entry)| {
             serde_json::from_slice::<Ticket>(&entry.value)
                 .ok()
-                .map(|ticket| (key.clone(), entry.clone(), ticket))
+                .map(|ticket| (key, entry, ticket))
         })
         .collect();
     if tickets.is_empty() {
-        cache.placement.ticket_cursor = None;
+        let more = next_ticket.is_some();
+        cache.placement.ticket_cursor = next_ticket;
         cache.placement.cursor = None;
-        return Ok(false);
+        return Ok(more || std::mem::take(&mut cache.placement.more_dependencies));
     }
     let queue_prefix = prefix_key(prefix, "queue");
     let start = cache
@@ -519,9 +532,7 @@ pub(super) async fn place(
     }
     if !has_more {
         cache.placement.cursor = None;
-        if tickets.len() == 64 {
-            let mut next = tickets.last().unwrap().0.clone();
-            next.push(0);
+        if let Some(next) = next_ticket {
             cache.placement.ticket_cursor = Some(next);
             return Ok(true);
         }
@@ -981,6 +992,101 @@ mod tests {
         }
         store.release_coordination_lock(leader).await.unwrap();
     }
+    #[tokio::test]
+    #[ignore = "requires isolated ETCD_TEST_ENDPOINTS"]
+    async fn malformed_or_occupied_ticket_page_does_not_hide_healthy_capacity() {
+        for occupied in [false, true] {
+            let (_dir, cfg, store, leader) = setup().await;
+            let wanted = store
+                .enqueue(TaskKind::MergeWal, "wanted", vec![])
+                .await
+                .unwrap();
+            let value = serde_json::to_vec(&Ticket::new(
+                &cfg,
+                "healthy",
+                "merge",
+                TaskKinds::MERGE_WAL,
+                false,
+            ))
+            .unwrap();
+            let ticket = store.create_dispatch_ticket(value.clone()).await.unwrap();
+            let mut client = store.etcd_client().clone();
+            for n in 0..64 {
+                // These sort before generated ticket IDs. They model a bad
+                // writer or already occupied capacity at the start of a page.
+                let key = format!(
+                    "{}/demand-controller/tickets/!first-{n:03}",
+                    cfg.etcd.prefix()
+                );
+                assert!(key.as_str() < ticket.key());
+                client
+                    .put(
+                        key.clone(),
+                        if occupied {
+                            value.clone()
+                        } else {
+                            b"invalid".to_vec()
+                        },
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                if occupied {
+                    let offer = Offer {
+                        v: 1,
+                        task_id: format!("occupied-{n}"),
+                        target: format!("other-{n}"),
+                        nonce: "test".into(),
+                    };
+                    client
+                        .put(
+                            key.replace("/tickets/", "/offers/"),
+                            serde_json::to_vec(&offer).unwrap(),
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+            let publisher = store.discovery_publisher(&leader);
+            let mut cache = list(store.etcd_client(), cfg.etcd.prefix()).await.unwrap();
+            assert!(place(&publisher, cfg.etcd.prefix(), &mut cache)
+                .await
+                .unwrap());
+            assert!(
+                cache.placement.ticket_cursor.is_some(),
+                "first step must advance past the raw page"
+            );
+            let offer_key = ticket.key().replace("/tickets/", "/offers/");
+            assert!(client
+                .get(offer_key.clone(), None)
+                .await
+                .unwrap()
+                .kvs()
+                .is_empty());
+            let mut complete = false;
+            for _ in 0..8 {
+                if !place(&publisher, cfg.etcd.prefix(), &mut cache)
+                    .await
+                    .unwrap()
+                {
+                    complete = true;
+                    break;
+                }
+            }
+            assert!(complete, "finite queue and ticket sweep must stop");
+            let response = client.get(offer_key, None).await.unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Offer>(response.kvs()[0].value())
+                    .unwrap()
+                    .task_id,
+                wanted.id
+            );
+            store.release_coordination_lock(ticket).await.unwrap();
+            store.release_coordination_lock(leader).await.unwrap();
+        }
+    }
+
     #[tokio::test]
     #[ignore = "requires isolated ETCD_TEST_ENDPOINTS"]
     async fn dependency_failure_is_not_hidden_by_waiting_and_old_watch_cannot_regress_point_read() {
