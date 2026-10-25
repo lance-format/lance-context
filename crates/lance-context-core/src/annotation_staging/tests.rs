@@ -9,6 +9,172 @@ use lance_context_api::annotation::AnnotationFieldUpdate::{Clear, Set};
 use std::collections::BTreeSet;
 
 #[tokio::test]
+async fn committed_rejection_advances_without_losing_later_updates() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let base = fixture(&root.path().join("turns.lance")).await?;
+    let staging = AnnotationStaging::new(base.clone(), scope(), 0, Limits::default())?;
+    let status = TurnAnnotationPatch {
+        status: Set("reviewed".into()),
+        ..Default::default()
+    };
+    let batch = [
+        Mutation {
+            turn: "T",
+            patch: &status,
+        },
+        Mutation {
+            turn: "missing",
+            patch: &status,
+        },
+    ];
+    let result = staging.apply_committed(0, 2, &batch).await?;
+    assert_eq!(
+        result,
+        ApplyOutcome::Rejected(Rejection {
+            row: 1,
+            reason: RejectionReason::MissingTurn,
+        })
+    );
+    assert_eq!(
+        current(&staging, "T").await?.status.as_deref(),
+        Some("pending")
+    );
+    assert_eq!(staging.observation().await.applied, 2);
+    assert_eq!(staging.observation().await.retained_bytes, 0);
+    assert!(staging.apply_committed(0, 2, &batch).await.is_err());
+    staging.advance_processed(2, 4).await?;
+    assert_eq!(
+        staging.apply_committed(4, 5, &batch[..1]).await?,
+        ApplyOutcome::Applied
+    );
+    assert_eq!(
+        current(&staging, "T").await?.status.as_deref(),
+        Some("reviewed")
+    );
+    // A reconstructed applier produces the same rejection from base + WAL.
+    let replay = AnnotationStaging::new(base, scope(), 0, Limits::default())?;
+    assert_eq!(replay.apply_committed(0, 2, &batch).await?, result);
+    Ok(())
+}
+
+#[tokio::test]
+async fn pressure_keeps_the_committed_record_pending_until_publication_releases_space() -> Result<()>
+{
+    let root = tempfile::tempdir()?;
+    let base = fixture(&root.path().join("turns.lance")).await?;
+    let staging = AnnotationStaging::new(
+        base,
+        scope(),
+        0,
+        Limits {
+            retained_entries: 1,
+            ..Limits::default()
+        },
+    )?;
+    let patch = TurnAnnotationPatch {
+        score: Set(0.9),
+        ..Default::default()
+    };
+    let first = [Mutation {
+        turn: "T",
+        patch: &patch,
+    }];
+    let next = [Mutation {
+        turn: "U",
+        patch: &patch,
+    }];
+    assert_eq!(
+        staging.apply_committed(0, 1, &first).await?,
+        ApplyOutcome::Applied
+    );
+    let frozen = staging.freeze(uuid::Uuid::new_v4()).await?.unwrap();
+    let before = staging.observation().await;
+    assert_eq!(
+        staging.apply_committed(1, 2, &next).await?,
+        ApplyOutcome::Backpressure
+    );
+    assert_eq!(staging.observation().await, before);
+    assert_eq!(current(&staging, "U").await?.score, None);
+    let prepared = frozen
+        .prepare(&crate::MergeMemoryBudget::new(8 << 20), 8192)
+        .await?;
+    staging
+        .install_published(&prepared, commit(&prepared).await?)
+        .await?;
+    // External holders still charge retired generations.
+    assert_eq!(
+        staging.apply_committed(1, 2, &next).await?,
+        ApplyOutcome::Backpressure
+    );
+    drop(prepared);
+    drop(frozen);
+    assert_eq!(
+        staging.apply_committed(1, 2, &next).await?,
+        ApplyOutcome::Applied
+    );
+    assert_eq!(current(&staging, "T").await?.score, Some(0.9));
+    assert_eq!(current(&staging, "U").await?.score, Some(0.9));
+    Ok(())
+}
+
+#[tokio::test]
+async fn impossible_atomic_batches_are_rejected_instead_of_waiting_forever() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let base = fixture(&root.path().join("turns.lance")).await?;
+    let staging = AnnotationStaging::new(
+        base,
+        scope(),
+        0,
+        Limits {
+            retained_entries: 1,
+            ..Limits::default()
+        },
+    )?;
+    let patch = TurnAnnotationPatch::default();
+    let batch = [
+        Mutation {
+            turn: "T",
+            patch: &patch,
+        },
+        Mutation {
+            turn: "U",
+            patch: &patch,
+        },
+    ];
+    assert_eq!(
+        staging.apply_committed(0, 1, &batch).await?,
+        ApplyOutcome::Rejected(Rejection {
+            row: 1,
+            reason: RejectionReason::BatchTooLarge,
+        })
+    );
+    assert_eq!(staging.observation().await.applied, 1);
+    assert_eq!(staging.observation().await.retained_entries, 0);
+    let invalid = TurnAnnotationPatch {
+        score: Set(f32::NAN),
+        ..Default::default()
+    };
+    assert_eq!(
+        staging
+            .apply_committed(
+                1,
+                2,
+                &[Mutation {
+                    turn: "T",
+                    patch: &invalid
+                }]
+            )
+            .await?,
+        ApplyOutcome::Rejected(Rejection {
+            row: 0,
+            reason: RejectionReason::InvalidPatch
+        })
+    );
+    assert_eq!(current(&staging, "T").await?.score, None);
+    Ok(())
+}
+
+#[tokio::test]
 async fn one_wal_batch_merges_repeated_keys_and_never_exposes_a_partial_failure() -> Result<()> {
     let root = tempfile::tempdir()?;
     let base = fixture(&root.path().join("turns.lance")).await?;

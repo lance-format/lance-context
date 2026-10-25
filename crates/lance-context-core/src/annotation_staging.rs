@@ -63,6 +63,38 @@ pub struct Mutation<'a> {
     pub patch: &'a TurnAnnotationPatch,
 }
 
+/// A deterministic rejection of the whole committed batch. No partial values
+/// are installed. Persist this outcome before releasing its recovery evidence.
+#[derive(Clone, Debug, PartialEq, Eq, ::serde::Serialize, ::serde::Deserialize)]
+pub struct Rejection {
+    pub row: usize,
+    pub reason: RejectionReason,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, ::serde::Serialize, ::serde::Deserialize)]
+pub enum RejectionReason {
+    InvalidPatch,
+    InvalidTurn,
+    MissingTurn,
+    ValueTooLarge,
+    BatchTooLarge,
+}
+
+/// Application pressure is not a mutation rejection and must not advance the
+/// ordered cursor. Storage/invariant errors are returned separately as errors.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ApplyOutcome {
+    Applied,
+    Rejected(Rejection),
+    Backpressure,
+}
+
+enum PendingBatch {
+    Values(Values),
+    Rejected(Rejection),
+    Backpressure,
+}
+
 struct State {
     base: Arc<Dataset>,
     applied: u64,
@@ -207,18 +239,81 @@ impl AnnotationStaging {
         through: u64,
         mutations: &[Mutation<'_>],
     ) -> Result<()> {
-        if mutations.is_empty() || mutations.len() > 65_536 {
-            return Err(invalid("invalid annotation mutation batch size"));
+        match self.apply_inner(after, through, mutations, false).await? {
+            ApplyOutcome::Applied => Ok(()),
+            ApplyOutcome::Rejected(rejection) => Err(invalid(format!(
+                "annotation mutation rejected: {rejection:?}"
+            ))),
+            ApplyOutcome::Backpressure => Err(invalid("annotation staging capacity exhausted")),
         }
-        for Mutation { turn, patch } in mutations {
-            self.validate_input(turn, patch)?;
-        }
+    }
+
+    /// Apply one deduplicated, quorum-committed batch. A permanent rejection
+    /// advances the cursor without changing any values, allowing later records
+    /// to make progress. Backpressure and storage errors leave it unchanged.
+    /// The caller must retain the returned result independently of dirty values
+    /// and include it in durable recovery state before closing the source WAL.
+    /// Limits affecting rejection must remain fixed across replay.
+    pub async fn apply_committed(
+        &self,
+        after: u64,
+        through: u64,
+        mutations: &[Mutation<'_>],
+    ) -> Result<ApplyOutcome> {
+        self.apply_inner(after, through, mutations, true).await
+    }
+
+    /// Advance through already processed control/unrelated entries. This must
+    /// never skip an unapplied mutation; a bare quorum index is not that proof.
+    pub async fn advance_processed(&self, after: u64, through: u64) -> Result<()> {
         let mut state = self.state.lock().await;
-        if after != state.applied || through <= after || through == u64::MAX {
-            return Err(invalid("annotation apply is not an ordered suffix"));
+        check_order(&state, after, through)?;
+        state.applied = through;
+        Ok(())
+    }
+
+    async fn apply_inner(
+        &self,
+        after: u64,
+        through: u64,
+        mutations: &[Mutation<'_>],
+        advance_rejection: bool,
+    ) -> Result<ApplyOutcome> {
+        let mut state = self.state.lock().await;
+        check_order(&state, after, through)?;
+        match self.pending_batch(&state, mutations).await? {
+            PendingBatch::Values(pending) => {
+                // No awaits/fallible operations after installing the whole batch.
+                state.active.extend(pending);
+                state.applied = through;
+                Ok(ApplyOutcome::Applied)
+            }
+            PendingBatch::Rejected(rejection) => {
+                if advance_rejection {
+                    state.applied = through;
+                }
+                Ok(ApplyOutcome::Rejected(rejection))
+            }
+            PendingBatch::Backpressure => Ok(ApplyOutcome::Backpressure),
+        }
+    }
+
+    async fn pending_batch(
+        &self,
+        state: &State,
+        mutations: &[Mutation<'_>],
+    ) -> Result<PendingBatch> {
+        if mutations.is_empty() || mutations.len() > 65_536 {
+            return Ok(reject(0, RejectionReason::BatchTooLarge));
+        }
+        for (row, Mutation { turn, patch }) in mutations.iter().enumerate() {
+            if let Err(reason) = self.validate_input(turn, patch) {
+                return Ok(reject(row, reason));
+            }
         }
         let mut pending = Values::new();
-        for Mutation { turn, patch } in mutations {
+        let mut batch_bytes = 0;
+        for (row, Mutation { turn, patch }) in mutations.iter().enumerate() {
             let previous = pending
                 .get(*turn)
                 .cloned()
@@ -231,21 +326,40 @@ impl AnnotationStaging {
                 });
             let mut current = match &previous {
                 Some(value) => value.value.clone(),
-                None => read_base(&state.base, turn, self.limits.value_bytes)
-                    .await?
-                    .ok_or_else(|| invalid("annotation turn does not exist"))?,
+                None => match read_base(&state.base, turn, self.limits.value_bytes).await? {
+                    Some(value) => value,
+                    None => return Ok(reject(row, RejectionReason::MissingTurn)),
+                },
             };
             patch
                 .apply_to(&mut current)
                 .map_err(|e| invalid(e.to_string()))?;
             let bytes = charge(turn, &current)?;
             if bytes > self.limits.value_bytes {
-                return Err(invalid("annotation result exceeds value budget"));
+                return Ok(reject(row, RejectionReason::ValueTooLarge));
             }
-            let allocation = reserve(&self.bytes, bytes)?;
+            batch_bytes += bytes;
+            if let Some(old) = pending.get(*turn) {
+                batch_bytes -= charge(turn, &old.value)?;
+            }
+            // Reject batches that could never fit, even with empty staging.
+            // Leave half the byte budget for an old value held during replace.
+            if batch_bytes > self.limits.retained_bytes / 2
+                || (!pending.contains_key(*turn) && pending.len() == self.limits.retained_entries)
+            {
+                return Ok(reject(row, RejectionReason::BatchTooLarge));
+            }
+            let Ok(allocation) = self.bytes.clone().try_acquire_many_owned(bytes as u32) else {
+                return Ok(PendingBatch::Backpressure);
+            };
             let entry = match pending.get(*turn).or_else(|| state.active.get(*turn)) {
                 Some(old) => old._entry.clone(),
-                None => Arc::new(reserve(&self.entries, 1)?),
+                None => {
+                    let Ok(entry) = self.entries.clone().try_acquire_owned() else {
+                        return Ok(PendingBatch::Backpressure);
+                    };
+                    Arc::new(entry)
+                }
             };
             pending.insert(
                 (*turn).to_owned(),
@@ -256,16 +370,19 @@ impl AnnotationStaging {
                 }),
             );
         }
-        // No awaits/fallible operations after installing the complete batch.
-        state.active.extend(pending);
-        state.applied = through;
-        Ok(())
+        Ok(PendingBatch::Values(pending))
     }
 
-    fn validate_input(&self, turn: &str, patch: &TurnAnnotationPatch) -> Result<()> {
-        patch.validate().map_err(|e| invalid(e.to_string()))?;
+    fn validate_input(
+        &self,
+        turn: &str,
+        patch: &TurnAnnotationPatch,
+    ) -> std::result::Result<(), RejectionReason> {
+        patch
+            .validate()
+            .map_err(|_| RejectionReason::InvalidPatch)?;
         if turn.is_empty() || turn.len() > self.limits.value_bytes {
-            return Err(invalid("invalid annotation turn key"));
+            return Err(RejectionReason::InvalidTurn);
         }
         // Reject oversized input before cloning its strings into current state.
         let input_bytes = patch
@@ -279,9 +396,9 @@ impl AnnotationStaging {
                 }
                 _ => Some(n),
             })
-            .ok_or_else(|| invalid("annotation patch size overflow"))?;
+            .ok_or(RejectionReason::ValueTooLarge)?;
         if input_bytes > self.limits.value_bytes {
-            return Err(invalid("annotation patch exceeds value budget"));
+            return Err(RejectionReason::ValueTooLarge);
         }
         Ok(())
     }
@@ -325,6 +442,17 @@ impl AnnotationStaging {
             readers: self.limits.readers - self.readers.available_permits(),
         }
     }
+}
+
+fn check_order(state: &State, after: u64, through: u64) -> Result<()> {
+    if after != state.applied || through <= after || through == u64::MAX {
+        return Err(invalid("annotation apply is not an ordered suffix"));
+    }
+    Ok(())
+}
+
+fn reject(row: usize, reason: RejectionReason) -> PendingBatch {
+    PendingBatch::Rejected(Rejection { row, reason })
 }
 
 enum PointSource {
