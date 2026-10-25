@@ -176,6 +176,23 @@ fn assignment(
     })
 }
 
+/// A reserved pool slot in one dispatch phase. All production callers use the
+/// fixed scheduler pool names. Unwinding/cancellation pays the gauge back.
+struct PoolPhase(metrics::Gauge);
+impl PoolPhase {
+    fn new(pool: &str, phase: &'static str) -> Self {
+        let gauge =
+            metrics::gauge!("master_task_pool_in_use", "pool" => pool.to_owned(), "state" => phase);
+        gauge.increment(1.0);
+        Self(gauge)
+    }
+}
+impl Drop for PoolPhase {
+    fn drop(&mut self) {
+        self.0.decrement(1.0);
+    }
+}
+
 /// Caller holds the existing pool/compaction permits for this entire operation.
 /// Waiting does no fleet scan. Once an offer arrives, claim completion/ambiguity
 /// is joined even if master admission starts draining concurrently.
@@ -184,8 +201,13 @@ pub(crate) async fn claim(
     ticket: &Ticket,
     operation: &admission::Operation,
     refresh_compaction: bool,
-) -> lance::Result<Option<TaskClaim>> {
+) -> lance::Result<Option<(TaskClaim, Duration)>> {
     let store = &state.task_store;
+    // Advertising and waiting owns capacity but no table. Do not report an
+    // idle, potentially hours-long wait as a slow ownership transaction.
+    let mut phase = PoolPhase::new(&ticket.pool, "waiting_for_offer");
+    operation.phase("waiting_for_offer");
+    let wait_start = std::time::Instant::now();
     let value = serde_json::to_vec(ticket).map_err(|e| lance::Error::io(e.to_string()))?;
     let guard = store.create_dispatch_ticket(value.clone()).await?;
     let prefix = state.config.etcd.prefix();
@@ -248,6 +270,14 @@ pub(crate) async fn claim(
         }
     };
     let received = tokio::select! { result = waiting => result, _ = stopped => Ok(None) };
+    let claim_start = std::time::Instant::now();
+    if matches!(&received, Ok(Some(_))) {
+        metrics::histogram!("master_controller_offer_wait_seconds", "pool" => ticket.pool.clone())
+            .record(wait_start.elapsed().as_secs_f64());
+        drop(phase);
+        phase = PoolPhase::new(&ticket.pool, "claiming");
+        operation.phase("claiming");
+    }
     let result = match received {
         Ok(Some(offer)) => match assignment(prefix, guard.key(), &value, &offer) {
             Ok(offer) => {
@@ -267,12 +297,14 @@ pub(crate) async fn claim(
     };
     // This lease only owns ticket/offer/reservation, never a running task.
     let cleanup = store.release_coordination_lock(guard).await;
+    drop(phase);
+    let claim_elapsed = claim_start.elapsed();
     match (result, cleanup) {
-        (Ok(claim), Ok(())) => Ok(claim),
+        (Ok(claim), Ok(())) => Ok(claim.map(|claim| (claim, claim_elapsed))),
         (Err(error), _) => Err(error),
         (Ok(Some(claim)), Err(error)) => {
             tracing::warn!(%error, "accepted task retained after dispatch ticket cleanup failed");
-            Ok(Some(claim))
+            Ok(Some((claim, claim_elapsed)))
         }
         (Ok(None), Err(error)) => Err(error),
     }
@@ -862,6 +894,7 @@ mod tests {
         let pool = Arc::new(tokio::sync::Semaphore::new(1));
         let permit = pool.clone().acquire_owned().await.unwrap();
         let receiver_state = state.clone();
+        let receive_start = std::time::Instant::now();
         let receiver = tokio::spawn(async move {
             let _permit = permit;
             let operation = receiver_state.admission.try_admit_named("merge").unwrap();
@@ -870,6 +903,22 @@ mod tests {
                 .unwrap()
                 .unwrap()
         });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if state
+                    .admission
+                    .status()
+                    .operations
+                    .values()
+                    .any(|op| op.phase == "waiting_for_offer")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(pool.available_permits(), 0);
         assert!(
@@ -881,10 +930,14 @@ mod tests {
             .await
             .unwrap();
         let controller = super::super::spawn(&state);
-        let accepted = tokio::time::timeout(Duration::from_secs(10), receiver)
+        let (accepted, claim_elapsed) = tokio::time::timeout(Duration::from_secs(10), receiver)
             .await
             .unwrap()
             .unwrap();
+        assert!(
+            receive_start.elapsed().saturating_sub(claim_elapsed) >= Duration::from_millis(100),
+            "idle offer wait must be excluded from ownership claim duration"
+        );
         assert_eq!(accepted.task.id, task.id);
         // Lose leadership while a canonical execution remains live.
         controller.abort();

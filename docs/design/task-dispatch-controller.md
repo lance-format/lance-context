@@ -80,3 +80,14 @@ chain can reference terminal history selected for deletion after the pruning
 snapshot. Missing dependencies fail explicitly; no task may bypass them. This
 requires a separate atomic reference/retention protocol before claiming history
 retention is race-free. Production etcd version remains unchanged.
+
+## Dispatch observability
+
+`master_task_pool_in_use{pool,state="waiting_for_offer"}` counts capacity that
+is advertised or waiting, without table ownership. `state="claiming"` counts
+actual assigned-task admission and ticket cleanup; `state="running"` counts
+execution. All pool/state labels have fixed scheduler values.
+`master_controller_offer_wait_seconds{pool}` records time until an offer is
+received, including idle periods. It is not task queue latency. The existing
+claim-phase duration excludes that wait. Use `master_task_schedule_to_bind_seconds`
+for a task's actual enqueue-to-claim latency.

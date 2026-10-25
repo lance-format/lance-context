@@ -1447,14 +1447,6 @@ fn spawn_pool_poller(
     spawn_filtered_pool_poller(state, pool, kinds, report_depth, false)
 }
 
-/// Decrements a gauge when dropped, so unwinding pays it back.
-struct GaugeHold(metrics::Gauge);
-impl Drop for GaugeHold {
-    fn drop(&mut self) {
-        self.0.decrement(1.0);
-    }
-}
-
 fn spawn_filtered_pool_poller(
     state: Arc<MasterState>,
     pool: Arc<Semaphore>,
@@ -1471,15 +1463,13 @@ fn spawn_filtered_pool_poller(
     } else {
         "general"
     };
-    // Permits in use are split by what holds them: `claiming` while the etcd
-    // claim is outstanding, `running` once a task owns the permit. Both are
-    // updated at the permit boundaries themselves, so a claim that blocks on
-    // etcd for minutes shows as a held permit rather than as idle capacity.
-    let claiming =
-        metrics::gauge!("master_task_pool_in_use", "pool" => pool_label, "state" => "claiming");
+    // Dispatch owns the waiting/claiming gauges at the actual phase
+    // boundaries; reserving capacity is not an in-flight ownership request.
+    for phase in ["waiting_for_offer", "claiming"] {
+        metrics::gauge!("master_task_pool_in_use", "pool" => pool_label, "state" => phase).set(0.0);
+    }
     let running =
         metrics::gauge!("master_task_pool_in_use", "pool" => pool_label, "state" => "running");
-    claiming.set(0.0);
     running.set(0.0);
     tokio::spawn(async move {
         let executor = state.admission.status().executor_id;
@@ -1503,12 +1493,6 @@ fn spawn_filtered_pool_poller(
                 let Some(operation) = state.admission.try_admit_named(pool_label) else {
                     break;
                 };
-                // Held across the await so a poller aborted mid-claim (drain,
-                // shutdown, test teardown) still pays the gauge back.
-                claiming.increment(1.0);
-                let claiming_hold = GaugeHold(claiming.clone());
-                operation.phase("claiming");
-                let claim_start = std::time::Instant::now();
                 // Shared pools advertise one combined policy so an idle
                 // compact ticket cannot monopolize capacity needed by other kinds.
                 let offered_kinds = if compact_permit.is_some() {
@@ -1532,9 +1516,8 @@ fn spawn_filtered_pool_poller(
                     refresh_compaction,
                 )
                 .await;
-                drop(claiming_hold);
                 match claim {
-                    Ok(Some(claim)) => {
+                    Ok(Some((claim, claim_elapsed))) => {
                         let compact_permit = if claim.task.kind == TaskKind::Compact {
                             compact_permit
                         } else {
@@ -1542,7 +1525,6 @@ fn spawn_filtered_pool_poller(
                             None
                         };
                         operation.task(&claim.task.id, &claim.task.target);
-                        let claim_elapsed = claim_start.elapsed();
                         // Local capacity was reserved before the claim. No
                         // claimed table waits on a compaction semaphore.
                         let timing = TaskClaimTiming {
