@@ -53,8 +53,8 @@ keys, the scanner batch size increases from two rows to 128, and the key column
 is projected. Faster application also revisits this finite working set more
 often while values remain staged. These are achieved annotation-update rates
 with final drain, not pure cold-scan throughput, body ingestion bandwidth, or
-multi-host capacity. The ordinary point-read miss still uses the existing
-single-key scanner.
+multi-host capacity. At the time of this experiment, the ordinary point-read
+miss still used the existing single-key scanner with a two-row scan batch.
 
 An additional five-second run used 65,536 turns and 128-row batches with the
 same budgets. It acknowledged 32,000 updates to 32,000 distinct keys, so every
@@ -82,5 +82,36 @@ ANNOTATION_LOAD_BATCH_ROWS=128 cargo test --release -p lance-context-ingest \
   tests::annotation_http::batches::annotation_http_batch_load_preserves_values_and_drains \
   -- --ignored --exact --nocapture
 ```
+
+## Point-read scan batches
+
+A point read now uses the same 128-row scan batch size while retaining its
+two-match result limit for duplicate detection. It still projects only labels,
+status and score against the captured base snapshot. The result limit and scan
+batch size serve different purposes: vectorizing a scan two rows at a time
+made an unindexed miss from staging unnecessarily expensive.
+
+A separate ten-second release experiment measured sequential point reads with
+empty staging against fixed local Lance 13 files, no ID index, the full rollout
+schema and 16 KiB bodies. Labels/status schema setup completed before timing.
+Every returned annotation was checked, and staging retained zero values.
+
+| Table rows | Before reads/s | After reads/s | Before p50 | After p50 | After p99 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 4,096 | 50.20 | 624.32 | 18.720 ms | 1.571 ms | 2.089 ms |
+| 65,536 | 3.45 | 148.23 | 284.634 ms | 6.404 ms | 8.672 ms |
+
+Repeating the old executable after the candidate on the same files yielded
+52.59 and 3.42 reads/s respectively. These are staging misses, not cold OS-cache
+measurements. The original 65,536-row run had only 35 samples, so it does not
+support a reliable tail-latency estimate. A larger scan batch does not replace
+an ID index or establish large-table lookup capacity.
+
+The separate 30-second RF3 process experiment with one owner, two ingresses,
+two writer loops, 128-row updates and durable client journals changed from
+3235.55 to 3251.57 updates/s: no meaningful aggregate throughput gain. Both
+runs passed all post-ACK reads, complete 4,096-row verification and source
+reclamation. The point-read scan improvement is not a body-ingestion or WAL
+throughput result.
 
 Refs #378.

@@ -520,7 +520,9 @@ async fn read_base(base: &Dataset, turn: &str, max_bytes: usize) -> Result<Optio
     scan.project(&["labels", "status", "score"])?;
     scan.filter_expr(col("id").eq(lit(turn)));
     scan.limit(Some(2), None)?;
-    scan.batch_size(2);
+    // The two-row result limit detects duplicates. Scan vectors can be larger
+    // without returning more matches or projecting the turn body.
+    scan.batch_size(COLD_LOOKUP_ROWS);
     let mut stream = scan.try_into_stream().await?;
     let mut value = None;
     while let Some(batch) = stream.try_next().await? {

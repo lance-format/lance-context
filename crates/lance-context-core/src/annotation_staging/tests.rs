@@ -130,6 +130,7 @@ async fn cold_lookup_projects_narrow_rows_and_rejects_duplicate_keys() -> Result
         .await?,
     );
     let staging = AnnotationStaging::new(duplicate, scope(), 0, Limits::default())?;
+    assert!(staging.capture("T").await?.resolve().await.is_err());
     let before = staging.observation().await;
     let patch = TurnAnnotationPatch::default();
     assert!(staging
