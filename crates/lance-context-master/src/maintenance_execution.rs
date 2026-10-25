@@ -156,16 +156,38 @@ async fn wait_for_short_backoff(
     target: &str,
     endpoint: &str,
 ) -> Result<(), String> {
-    let wait_until = tokio::time::Instant::now() + Duration::from_secs(2);
-    while let Some(failure) = coordinator.failure(target, endpoint).await? {
-        let remaining = failure
-            .next_retry_ms
-            .saturating_sub(lance_context_merge::failure::now_ms());
+    wait_for_short_backoff_with(
+        target,
+        endpoint,
+        || coordinator.failure(target, endpoint),
+        || {
+            (
+                lance_context_merge::failure::now_ms(),
+                tokio::time::Instant::now(),
+            )
+        },
+    )
+    .await
+}
+
+async fn wait_for_short_backoff_with<F>(
+    target: &str,
+    endpoint: &str,
+    mut read: impl FnMut() -> F,
+    clock: impl Fn() -> (u64, tokio::time::Instant),
+) -> Result<(), String>
+where
+    F: Future<Output = Result<Option<lance_context_merge::failure::ShardFailure>, String>>,
+{
+    let wait_until = clock().1 + Duration::from_secs(2);
+    while let Some(failure) = read().await? {
+        let (now_ms, now) = clock();
+        let remaining = failure.next_retry_ms.saturating_sub(now_ms);
         if remaining == 0 {
             break;
         }
         let delay = Duration::from_millis(remaining);
-        if delay > wait_until.saturating_duration_since(tokio::time::Instant::now()) {
+        if delay > wait_until.saturating_duration_since(now) {
             return Err(format!(
                 "maintenance retry at {} after {:?} failure",
                 failure.next_retry_ms, failure.class
@@ -1285,8 +1307,36 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn short_retry_wait_rechecks_an_extended_failure_deadline() {
+        let now = tokio::time::Instant::now();
+        let mut reads = 0;
+        let result = wait_for_short_backoff_with(
+            "table",
+            "master:index_id",
+            || {
+                reads += 1;
+                assert!(reads <= 2, "the extended deadline must stop admission");
+                std::future::ready(Ok(Some(lance_context_merge::failure::ShardFailure {
+                    target: "table".into(),
+                    endpoint: "master:index_id".into(),
+                    consecutive_attempts: reads,
+                    class: lance_context_merge::failure::FailureClass::Deadline,
+                    last_error: "temporary storage timeout".into(),
+                    last_failure_ms: 1000,
+                    next_retry_ms: if reads == 1 { 1001 } else { 3_601_000 },
+                    needs_attention: false,
+                })))
+            },
+            || (1000, now),
+        )
+        .await;
+        assert_eq!(reads, 2, "must re-read after the short sleep");
+        assert!(result.unwrap_err().contains("retry at 3601000"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn an_extended_failure_visible_before_admission_preserves_backoff() {
         let (_dir, state) = fixture().await;
         let first = claim(&state, TaskKind::IndexId).await;
         let result = run(&state, &first, async {
@@ -1297,17 +1347,14 @@ mod tests {
         let coordinator = state.task_store.merge_coordinator();
         let next = claim(&state, TaskKind::IndexId).await;
         let proof = state.task_store.merge_claim(&next);
-        let update = async {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            coordinator
-                .record_failure(&proof, "table", "master:index_id", "invalid index schema")
-                .await
-                .unwrap()
-        };
-        let run = run(&state, &next, async {
+        let extended = coordinator
+            .record_failure(&proof, "table", "master:index_id", "invalid index schema")
+            .await
+            .unwrap();
+        let result = run(&state, &next, async {
             panic!("extended backoff must prevent payload work")
-        });
-        let (result, extended) = tokio::join!(run, update);
+        })
+        .await;
         assert!(result.as_ref().unwrap_err().contains("retry at"));
         state.task_store.finish(next, result).await.unwrap();
         let after = coordinator
