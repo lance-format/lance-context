@@ -30,7 +30,8 @@ recovery remain responsible for those actions.
 
 ## Snapshot and change processing
 
-The leader lists the three inventory prefixes and policy membership in pages
+The leader lists the three inventory prefixes, policy membership, and active
+queue/running records in pages
 at one etcd revision. It starts no admission from a partial snapshot. It then
 watches each range from that revision plus one on a shared stream.
 
@@ -41,6 +42,10 @@ new consistent, paged snapshot. The code does not periodically relist a healthy 
 
 One indexed timer per source key coalesces repeated updates. Updates replace the
 observation without adding duplicate queue entries or postponing older work.
+Queue/running records maintain an in-memory dedupe index. Already-active
+recovery entries need no advisory etcd reads. Dependency-chain tasks do not
+suppress independent recovery. Only demand records have timers; task and policy
+records update their indexes on events. Policies are decoded once per update.
 The 15-second reconciliation timer handles time-based failure eligibility and
 requests retained during a running task; it reads the local cache, not every
 etcd prefix. A reconcile has a bounded duration and leaves durable demand intact
@@ -56,11 +61,13 @@ verify cold-target admission latency under representative failure inventory.
 The isolated-etcd tests cover List/Watch setup gaps, reconnect replay, compaction,
 policy union, stale-leader publication rejection, real process-task loss and
 lease expiry. A fixed 256-request fixture checks 1, 10 and 50 participants. Its
-measured discovery snapshot is five Range/Txn RPCs in each case, with no follower
+measured discovery snapshot is seven Range/Txn RPCs (including active-task state) in each case, with no follower
 discovery reads while the leader is healthy; the 50-participant quiet window
 exceeds the old 15-second poll interval. Registration and failover election
 traffic are explicitly outside that steady-state measurement. This is not a
-measurement of total production RPCs or WAL throughput.
+measurement of total production RPCs or WAL throughput. A separate 64-active-
+execution fixture verifies zero Range/Txn RPCs for repeated recovery reconciliation
+and proves task completion removes suppression through Watch.
 
 Mixed versions remain safe because the existing admission dedupe/revision
 checks still apply, but old replicas continue their legacy scans. The full

@@ -681,6 +681,61 @@ impl TaskStore {
             .await
     }
 
+    /// An informer already has a queued task snapshot. Acknowledge the hint
+    /// with one fenced transaction instead of rereading dedupe and task keys.
+    /// A changed task/dedupe/request falls back to ordinary admission; a running
+    /// pass must never consume a hint for a shard it may already have visited.
+    pub(crate) async fn acknowledge_cached_merge_request(
+        &self,
+        request: &lance_context_merge::rollout::MergeRequest,
+        queued_value: &[u8],
+    ) -> lance::Result<bool> {
+        let queued: TaskRecord = serde_json::from_slice(queued_value)
+            .map_err(|e| lance::Error::io(format!("decode queued demand hint: {e}")))?;
+        if request.revision <= 0
+            || queued.state != TaskState::Queued
+            || queued.kind != TaskKind::MergeWal
+            || queued.target != request.target
+            || !queued.depends_on.is_empty()
+        {
+            return Ok(false);
+        }
+        let request_key = lance_context_merge::execution_key(&self.inner.prefix, &request.target)
+            .replace("/merge-executions/", "/merge-requests/");
+        let dedupe = self
+            .inner
+            .dedupe_key(TaskKind::MergeWal, &request.target, &[])
+            .unwrap();
+        let compares = with_publication_fence(
+            vec![
+                Compare::mod_revision(request_key.as_str(), CompareOp::Equal, request.revision),
+                Compare::value(dedupe, CompareOp::Equal, queued.id.as_str()),
+                Compare::value(
+                    self.inner.task_key(&queued.id),
+                    CompareOp::Equal,
+                    queued_value,
+                ),
+                Compare::value(
+                    self.inner.queue_key(&queued.id),
+                    CompareOp::Equal,
+                    queued_value,
+                ),
+            ],
+            self.publication_fence.as_ref(),
+        );
+        self.inner
+            .client
+            .clone()
+            .txn(
+                Txn::new()
+                    .when(compares)
+                    .and_then([TxnOp::delete(request_key, None)]),
+            )
+            .await
+            .map(|response| response.succeeded())
+            .map_err(etcd_error("acknowledge cached merge demand"))
+    }
+
     pub async fn list(&self) -> lance::Result<Vec<TaskRecord>> {
         self.inner.list().await
     }

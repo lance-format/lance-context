@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use etcd_client::{Client, EventType, GetOptions, WatchOptions};
-use lance_context_api::TaskKind;
+use lance_context_api::{TaskKind, TaskRecord, TaskState};
 use lance_context_merge::{
     failure::{FailureObservation, ShardFailure},
     rollout::MergeRequest,
@@ -26,6 +26,8 @@ const RANGES: &[&str] = &[
     "merge-executions",
     "merge-failures",
     "demand-controller/members",
+    "queue",
+    "running",
 ];
 const MAX_KEYS: usize = 100_000;
 const MAX_BYTES: usize = 64 * 1024 * 1024;
@@ -107,6 +109,8 @@ struct Entry {
     value: Vec<u8>,
     revision: i64,
     due: Instant,
+    active: Option<(TaskKind, String)>,
+    policy: Option<Result<Policy, String>>,
 }
 
 struct Cache {
@@ -116,6 +120,7 @@ struct Cache {
     ready: BTreeSet<(Instant, Vec<u8>)>,
     bytes: usize,
     revisions: Vec<i64>,
+    active: BTreeMap<(TaskKind, String), BTreeSet<Vec<u8>>>,
 }
 
 impl Cache {
@@ -125,6 +130,7 @@ impl Cache {
             ready: BTreeSet::new(),
             bytes: 0,
             revisions: vec![0; RANGES.len()],
+            active: BTreeMap::new(),
         }
     }
 
@@ -143,18 +149,60 @@ impl Cache {
         let due = old.map_or_else(Instant::now, |e| e.due);
         if let Some(old) = self.entries.remove(key) {
             self.ready.remove(&(old.due, key.to_vec()));
+            if let Some(active) = old.active {
+                if let Some(keys) = self.active.get_mut(&active) {
+                    keys.remove(key);
+                    if keys.is_empty() {
+                        self.active.remove(&active);
+                    }
+                }
+            }
         }
         self.bytes = bytes;
         if let Some(value) = value {
+            let location = std::str::from_utf8(key)
+                .ok()
+                .and_then(|key| key.rsplit_once('/'));
+            let task_state = location.and_then(|(parent, _)| {
+                if parent.ends_with("/queue") {
+                    Some(TaskState::Queued)
+                } else if parent.ends_with("/running") {
+                    Some(TaskState::Running)
+                } else {
+                    None
+                }
+            });
+            let policy = location
+                .filter(|(parent, _)| parent.ends_with("/demand-controller/members"))
+                .map(|_| serde_json::from_slice::<Policy>(value).map_err(|e| e.to_string()));
+            let active = task_state.and_then(|expected| {
+                let task: TaskRecord = serde_json::from_slice(value).ok()?;
+                // Dependency chains deliberately do not participate in dedupe.
+                (task.state == expected
+                    && task.depends_on.is_empty()
+                    && location.is_some_and(|(_, id)| id == task.id))
+                .then_some((task.kind, task.target))
+            });
+            if let Some(active) = &active {
+                self.active
+                    .entry(active.clone())
+                    .or_default()
+                    .insert(key.to_vec());
+            }
+            let auxiliary = task_state.is_some() || policy.is_some();
             self.entries.insert(
                 key.to_vec(),
                 Entry {
                     value: value.to_vec(),
                     revision,
                     due,
+                    active,
+                    policy,
                 },
             );
-            self.ready.insert((due, key.to_vec()));
+            if !auxiliary {
+                self.ready.insert((due, key.to_vec()));
+            }
         }
         Ok(())
     }
@@ -184,13 +232,30 @@ impl Cache {
             .transpose()
     }
 
-    fn policies(&self, prefix: &str) -> Result<Vec<Policy>, String> {
+    fn has_active(&self, kind: TaskKind, target: &str) -> bool {
+        self.active.contains_key(&(kind, target.to_string()))
+    }
+
+    fn queued(&self, prefix: &str, kind: TaskKind, target: &str) -> Option<&Entry> {
+        self.active
+            .get(&(kind, target.to_string()))?
+            .iter()
+            .find(|key| key.starts_with(prefix_key(prefix, "queue").as_bytes()))
+            .and_then(|key| self.entries.get(key))
+    }
+
+    fn policies(&self, prefix: &str) -> Result<Vec<&Policy>, String> {
         let prefix = format!("{prefix}/demand-controller/members/");
         self.entries
             .range(prefix.as_bytes().to_vec()..)
             .take_while(|(key, _)| key.starts_with(prefix.as_bytes()))
             .map(|(_, e)| {
-                let policy: Policy = serde_json::from_slice(&e.value).map_err(|e| e.to_string())?;
+                let policy = e
+                    .policy
+                    .as_ref()
+                    .ok_or("missing decoded policy")?
+                    .as_ref()
+                    .map_err(Clone::clone)?;
                 if policy.v != 1 {
                     return Err("unsupported discovery policy version".into());
                 }
@@ -349,11 +414,25 @@ async fn reconcile(
             .iter()
             .any(|p| p.admits_request(target, execution.as_ref()))
         {
+            let request = MergeRequest {
+                target: target.to_string(),
+                revision: entry.revision,
+            };
+            if let Some(queued) = cache.queued(prefix, TaskKind::MergeWal, target) {
+                if publisher
+                    .acknowledge_cached_merge_request(&request, &queued.value)
+                    .await
+                    .map_err(|e| e.to_string())?
+                {
+                    metrics::counter!("master_worker_demand_admission_total", "outcome" => "queued").increment(1);
+                    return Ok(());
+                }
+            } else if cache.has_active(TaskKind::MergeWal, target) {
+                // Keep the request durable until this running pass completes.
+                return Ok(());
+            }
             publisher
-                .enqueue_merge_request(&MergeRequest {
-                    target: target.to_string(),
-                    revision: entry.revision,
-                })
+                .enqueue_merge_request(&request)
                 .await
                 .map_err(|e| e.to_string())?;
         }
@@ -378,6 +457,10 @@ async fn reconcile(
         } else {
             TaskKind::MergeWal
         };
+        if cache.has_active(kind, &execution.target) {
+            metrics::counter!("master_execution_recovery_already_active_total").increment(1);
+            return Ok(());
+        }
         let failure = cache
             .value::<ShardFailure>(&lance_context_merge::failure::failure_key(
                 prefix,
@@ -421,6 +504,10 @@ async fn reconcile(
             .iter()
             .find_map(|p| p.admits_failure(&failure, execution.as_ref()))
         {
+            if cache.has_active(kind, &failure.target) {
+                metrics::counter!("master_failure_recovery_already_active_total").increment(1);
+                return Ok(());
+            }
             publisher
                 .enqueue_failure_recovery(
                     kind,
@@ -926,9 +1013,9 @@ mod tests {
             })
             .await;
             let reads = rpc_count(&endpoint, &["Range", "Txn"]).await - baseline;
-            // Two request pages plus execution/failure/member pages. All
+            // Two request pages plus execution/failure/member/queue/running pages. All
             // membership records fit on one page even with fifty masters.
-            assert_eq!(reads, 5, "discovery reads grew with replicas={replicas}");
+            assert_eq!(reads, 7, "discovery reads grew with replicas={replicas}");
             assert_eq!(cache.entries.len(), 256 + replicas as usize);
             eprintln!("replicas={replicas} demand_keys=256 discovery_range_txn={reads} follower_discovery_range_txn=0");
             let before = Instant::now();
@@ -1127,5 +1214,178 @@ mod tests {
         controller_b.abort();
         assert!(controller_b.await.unwrap_err().is_cancelled());
         assert_eq!(store.list().await.unwrap().len(), 2);
+    }
+    #[tokio::test]
+    #[ignore = "requires exclusive loopback ETCD_TEST_ENDPOINTS"]
+    async fn active_inventory_reconciles_without_rpc_and_watch_releases_suppression() {
+        let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+        assert_eq!(std::env::var("ETCD_TEST_EXCLUSIVE").as_deref(), Ok("1"));
+        assert!(endpoint.starts_with("http://127.0.0.1:") && !endpoint.contains(','));
+        let (_dir, cfg, store) = fixture().await;
+        let session = store
+            .discovery_session(serde_json::to_vec(&Policy::from_config(&cfg)).unwrap())
+            .await
+            .unwrap();
+        assert!(store.elect_discovery_leader(&session).await.unwrap());
+        let publisher = store.discovery_publisher(&session);
+        let coordinator = store.merge_coordinator();
+        for i in 0..64 {
+            let target = format!("active-{i:03}");
+            let mut execution = Execution::new(&target, "worker-a", "old", 60);
+            execution.background = true;
+            assert!(coordinator.reserve_background(&execution).await.unwrap());
+            store
+                .enqueue(TaskKind::MergeWal, &target, vec![])
+                .await
+                .unwrap();
+        }
+        let mut cache = list(store.etcd_client(), cfg.etcd.prefix()).await.unwrap();
+        let before = rpc_count(&endpoint, &["Range", "Txn"]).await;
+        for (key, entry) in &cache.entries {
+            reconcile(&publisher, cfg.etcd.prefix(), &cache, key, entry)
+                .await
+                .unwrap();
+        }
+        let reads = rpc_count(&endpoint, &["Range", "Txn"]).await - before;
+        // reserve_background emits a fresh writer hint as well as inventory.
+        // Each hint is acknowledged by one transaction, with no advisory reads.
+        assert_eq!(
+            reads, 64,
+            "writer hints should only need their acknowledgement transaction"
+        );
+        let mut stream = watch(store.etcd_client(), cfg.etcd.prefix(), &cache)
+            .await
+            .unwrap();
+        next_events(&mut stream, &mut cache, |c| {
+            !c.entries.keys().any(|key| {
+                key.starts_with(prefix_key(cfg.etcd.prefix(), "merge-requests").as_bytes())
+            })
+        })
+        .await;
+        let before = rpc_count(&endpoint, &["Range", "Txn"]).await;
+        for (key, entry) in &cache.entries {
+            reconcile(&publisher, cfg.etcd.prefix(), &cache, key, entry)
+                .await
+                .unwrap();
+        }
+        let reads = rpc_count(&endpoint, &["Range", "Txn"]).await - before;
+        assert_eq!(reads, 0, "active inventory must not repeat advisory reads");
+        eprintln!("active_inventory_rows=64 writer_hint_acknowledgements=64 repeated_reconciliation_range_txn={reads}");
+        let claim = store
+            .claim_next_of_kinds(crate::task_store::TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        let target = claim.task.target.clone();
+        store
+            .finish(claim, Ok("test metadata completion".into()))
+            .await
+            .unwrap();
+        next_events(&mut stream, &mut cache, |c| {
+            !c.has_active(TaskKind::MergeWal, &target)
+        })
+        .await;
+        let key = lance_context_merge::execution_key(cfg.etcd.prefix(), &target);
+        reconcile(
+            &publisher,
+            cfg.etcd.prefix(),
+            &cache,
+            key.as_bytes(),
+            &cache.entries[key.as_bytes()],
+        )
+        .await
+        .unwrap();
+        assert!(store
+            .get_active_id(TaskKind::MergeWal, &target)
+            .await
+            .unwrap()
+            .is_some());
+        store.release_coordination_lock(session).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated ETCD_TEST_ENDPOINTS"]
+    async fn dependency_chain_does_not_hide_independent_recovery() {
+        let (_dir, cfg, store) = fixture().await;
+        let dependency = store
+            .enqueue(TaskKind::IndexId, "dependency", vec![])
+            .await
+            .unwrap();
+        store
+            .enqueue(TaskKind::MergeWal, "waiting", vec![dependency.id])
+            .await
+            .unwrap();
+        let cache = list(store.etcd_client(), cfg.etcd.prefix()).await.unwrap();
+        assert!(!cache.has_active(TaskKind::MergeWal, "waiting"));
+        assert!(cache.has_active(TaskKind::IndexId, "dependency"));
+    }
+    #[tokio::test]
+    #[ignore = "requires isolated ETCD_TEST_ENDPOINTS"]
+    async fn cached_acknowledgement_preserves_newer_flush_and_running_followup() {
+        let (_dir, cfg, store) = fixture().await;
+        let session = store
+            .discovery_session(serde_json::to_vec(&Policy::from_config(&cfg)).unwrap())
+            .await
+            .unwrap();
+        assert!(store.elect_discovery_leader(&session).await.unwrap());
+        let publisher = store.discovery_publisher(&session);
+        let coordinator = store.merge_coordinator();
+        store
+            .enqueue(TaskKind::MergeWal, "table", vec![])
+            .await
+            .unwrap();
+        coordinator.request_merge("table").await.unwrap();
+        let cache = list(store.etcd_client(), cfg.etcd.prefix()).await.unwrap();
+        let queued = &cache
+            .queued(cfg.etcd.prefix(), TaskKind::MergeWal, "table")
+            .unwrap()
+            .value;
+        let old = coordinator
+            .get_merge_request("table")
+            .await
+            .unwrap()
+            .unwrap();
+        coordinator.request_merge("table").await.unwrap();
+        assert!(!publisher
+            .acknowledge_cached_merge_request(&old, queued)
+            .await
+            .unwrap());
+        let latest = coordinator
+            .get_merge_request("table")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(latest.revision > old.revision);
+        let claim = store
+            .claim_next_of_kinds(crate::task_store::TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!publisher
+            .acknowledge_cached_merge_request(&latest, queued)
+            .await
+            .unwrap());
+        publisher.enqueue_merge_request(&latest).await.unwrap();
+        assert!(coordinator
+            .get_merge_request("table")
+            .await
+            .unwrap()
+            .is_some());
+        store
+            .finish(claim, Ok("completed earlier pass".into()))
+            .await
+            .unwrap();
+        let successor = publisher
+            .enqueue_merge_request(&latest)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(successor.state, TaskState::Queued);
+        assert!(coordinator
+            .get_merge_request("table")
+            .await
+            .unwrap()
+            .is_none());
+        store.release_coordination_lock(session).await.unwrap();
     }
 }
