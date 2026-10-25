@@ -737,13 +737,6 @@ impl AppendCoordinator {
     }
 }
 
-/// Keep legacy fallback publications recoverable after an append-mode cutover.
-pub(crate) fn has_cutover(dataset: &Dataset, shard: Uuid) -> bool {
-    dataset
-        .metadata()
-        .contains_key(&format!("{CUTOVER_PREFIX}{shard}"))
-}
-
 pub(crate) async fn commit_files(
     dataset: &mut Dataset,
     fragments: Vec<Fragment>,
@@ -2164,18 +2157,49 @@ mod tests {
     async fn legacy_append_without_drain_is_not_duplicated_at_cutover() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
-        let mut a = writer(uri, "a").await;
+        let a = writer(uri, "a").await;
         put(&a, "a1", 4096).await;
-        let guard = Arc::new(FailDrain(AtomicBool::new(true)));
-        let scope = MergeWriteScope::with_pinned_authorizer(guard);
-        // Open inside the scope so the legacy publisher uses its guard.
-        scope
-            .run(async {
-                a = writer(uri, "a").await;
-                assert!(a.cleanup_own_shard().await.is_err());
+        // Model an actual old publisher: append WAL rows without any atomic
+        // coverage or drain. The new upsert writer now publishes coverage and
+        // would not exercise this rolling-upgrade compatibility case.
+        let base = Dataset::open(uri).await.unwrap();
+        let shard = derive_shard_id(Some("a"));
+        let manifest = shard_store(&base, shard)
+            .await
+            .unwrap()
+            .refresh_latest()
+            .await
+            .unwrap()
+            .unwrap();
+        let generation = Dataset::open(&format!(
+            "{uri}/_mem_wal/{shard}/{}",
+            manifest.sstables[0].path
+        ))
+        .await
+        .unwrap();
+        let schema: Arc<Schema> = Arc::new(base.schema().into());
+        let raw = generation
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let batches = raw
+            .into_iter()
+            .map(|batch| align_batch_to_schema(batch, schema.clone()))
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        InsertBuilder::new(Arc::new(base))
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
             })
-            .await;
-        scope.drain().await;
+            .execute(batches)
+            .await
+            .unwrap();
+        assert!(merged_watermarks(uri).await.unwrap().is_empty());
         assert_eq!(rows(uri).await, 1);
         put(&a, "a2", 4096).await;
         let mut commit = AppendCoordinator::open(uri, None).await.unwrap();

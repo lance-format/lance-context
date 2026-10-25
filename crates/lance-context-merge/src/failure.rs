@@ -510,6 +510,22 @@ mod tests {
     }
 
     #[test]
+    fn atomic_upsert_preparation_changes_retry_with_code_emission_disabled() {
+        // Readers may still use legacy classification during a rolling upgrade.
+        // These messages describe a stale snapshot, not a permanent bad schema.
+        for message in [
+            "base fields or metadata changed during atomic upsert; reprepare",
+            "shard coverage changed during atomic upsert; reprepare",
+        ] {
+            let error = format!(
+                "LanceError(IO): {message}, crates/lance-context-core/src/store_base.rs:1630:36"
+            );
+            assert!(!error.contains("[LC_"));
+            assert_eq!(classify(&error), FailureClass::Retryable, "{error}");
+        }
+    }
+
+    #[test]
     fn coded_preparation_conflicts_classify_regardless_of_wrapper_or_path() {
         let tagged = MaintenanceErrorCode::StalePreparation
             .tag_forced("compaction source fragment changed; reprepare");
