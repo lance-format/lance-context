@@ -905,7 +905,7 @@ async fn compact_inner(
 
 // Include every effective rewrite option. Scheduling intervals/quiet hours do
 // not affect the plan. JSON keeps the encoding stable across master restarts.
-fn compact_options_key(config: &CompactionConfig) -> String {
+pub(crate) fn compact_options_key(config: &CompactionConfig) -> String {
     serde_json::json!({
         "target_rows": config.target_rows_per_fragment,
         "row_group": config.max_rows_per_group,
@@ -995,6 +995,13 @@ async fn update_stats_after_compaction(state: &Arc<MasterState>, name: &str, sto
 /// above the configured threshold, honoring quiet hours. Reads candidates from
 /// the stats table.
 pub async fn sweep_candidates(state: &Arc<MasterState>) -> lance::Result<usize> {
+    sweep_candidates_with_publisher(state, None).await
+}
+
+pub(crate) async fn sweep_candidates_with_publisher(
+    state: &Arc<MasterState>,
+    publisher: Option<&crate::task_store::TaskStore>,
+) -> lance::Result<usize> {
     let Some(guard) = state
         .task_store
         .try_coordination_lock("compaction-sweep")
@@ -1002,7 +1009,7 @@ pub async fn sweep_candidates(state: &Arc<MasterState>) -> lance::Result<usize> 
     else {
         return Ok(0);
     };
-    let result = sweep_candidates_inner(state).await;
+    let result = sweep_candidates_inner(state, publisher).await;
     let release = state.task_store.release_coordination_lock(guard).await;
     match (result, release) {
         (Ok(count), Ok(())) => Ok(count),
@@ -1011,7 +1018,10 @@ pub async fn sweep_candidates(state: &Arc<MasterState>) -> lance::Result<usize> 
     }
 }
 
-async fn sweep_candidates_inner(state: &Arc<MasterState>) -> lance::Result<usize> {
+async fn sweep_candidates_inner(
+    state: &Arc<MasterState>,
+    publisher: Option<&crate::task_store::TaskStore>,
+) -> lance::Result<usize> {
     let config = state.compaction_config();
     // Quiet-hours gate applies to the whole sweep.
     if in_quiet_hours(&config) {
@@ -1062,7 +1072,7 @@ async fn sweep_candidates_inner(state: &Arc<MasterState>) -> lance::Result<usize
             .task_store
             .get_active_id(TaskKind::Compact, &row.name)
             .await?;
-        let task = enqueue(state, TaskKind::Compact, &row.name).await?;
+        let task = enqueue_sweep_candidate(state, publisher, TaskKind::Compact, &row.name).await?;
         if before.as_deref() != Some(task.id.as_str()) {
             queued += 1;
         }
@@ -1088,6 +1098,13 @@ fn in_quiet_hours(config: &CompactionConfig) -> bool {
 /// task-store lock so only one replica sweeps at a time. Depless `MergeWal`
 /// enqueues de-dupe, so a still-running fan-out is not re-queued.
 pub async fn sweep_merge_wal_candidates(state: &Arc<MasterState>) -> lance::Result<usize> {
+    sweep_merge_wal_with_publisher(state, None).await
+}
+
+pub(crate) async fn sweep_merge_wal_with_publisher(
+    state: &Arc<MasterState>,
+    publisher: Option<&crate::task_store::TaskStore>,
+) -> lance::Result<usize> {
     let Some(guard) = state
         .task_store
         .try_coordination_lock("merge-wal-sweep")
@@ -1095,7 +1112,7 @@ pub async fn sweep_merge_wal_candidates(state: &Arc<MasterState>) -> lance::Resu
     else {
         return Ok(0);
     };
-    let result = sweep_merge_wal_inner(state).await;
+    let result = sweep_merge_wal_inner(state, publisher).await;
     let release = state.task_store.release_coordination_lock(guard).await;
     match (result, release) {
         (Ok(count), Ok(())) => Ok(count),
@@ -1104,7 +1121,10 @@ pub async fn sweep_merge_wal_candidates(state: &Arc<MasterState>) -> lance::Resu
     }
 }
 
-async fn sweep_merge_wal_inner(state: &Arc<MasterState>) -> lance::Result<usize> {
+async fn sweep_merge_wal_inner(
+    state: &Arc<MasterState>,
+    publisher: Option<&crate::task_store::TaskStore>,
+) -> lance::Result<usize> {
     let threshold = state.config.merge_wal_min_generations;
     // The cap bounds *new* tasks per tick, not candidates considered. The
     // first MAX_SWEEP_ENQUEUE rows by pending count are mostly stores that
@@ -1137,7 +1157,7 @@ async fn sweep_merge_wal_inner(state: &Arc<MasterState>) -> lance::Result<usize>
             .task_store
             .get_active_id(TaskKind::MergeWal, &row.name)
             .await?;
-        let task = enqueue(state, TaskKind::MergeWal, &row.name).await?;
+        let task = enqueue_sweep_candidate(state, publisher, TaskKind::MergeWal, &row.name).await?;
         if before.as_deref() == Some(task.id.as_str()) {
             deduped += 1;
         } else {
@@ -1146,6 +1166,23 @@ async fn sweep_merge_wal_inner(state: &Arc<MasterState>) -> lance::Result<usize>
     }
     metrics::gauge!("master_merge_sweep_deduped").set(deduped as f64);
     Ok(queued)
+}
+
+async fn enqueue_sweep_candidate(
+    state: &Arc<MasterState>,
+    publisher: Option<&crate::task_store::TaskStore>,
+    kind: TaskKind,
+    target: &str,
+) -> lance::Result<TaskRecord> {
+    match publisher {
+        Some(publisher) => {
+            let task = publisher.enqueue_discovered(kind, target).await?;
+            metrics::counter!("master_task_enqueued_total", "kind" => kind_label(kind))
+                .increment(1);
+            Ok(task)
+        }
+        None => enqueue(state, kind, target).await,
+    }
 }
 
 // A draining target still needs metadata recovery while ownership is unresolved.
@@ -1377,44 +1414,7 @@ pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
     crate::planner::spawn(state);
     crate::executors::spawn(state);
     crate::demand_controller::spawn(state);
-
-    // Optional periodic compaction auto-sweep feeds the same queue.
-    let interval_secs = state.config.compaction_interval_secs;
-    if interval_secs > 0 {
-        let sweep_state = state.clone();
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
-            ticker.tick().await; // skip immediate tick
-            loop {
-                ticker.tick().await;
-                match sweep_candidates(&sweep_state).await {
-                    Ok(n) if n > 0 => tracing::info!(queued = n, "auto-sweep queued experiments"),
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!(error = %e, "auto-sweep failed"),
-                }
-            }
-        });
-    }
-
-    // Optional periodic WAL-merge auto-sweep, independent of compaction.
-    let merge_interval_secs = state.config.merge_wal_interval_secs;
-    if merge_interval_secs > 0 {
-        let sweep_state = state.clone();
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(merge_interval_secs));
-            ticker.tick().await; // skip immediate tick
-            loop {
-                ticker.tick().await;
-                match sweep_merge_wal_candidates(&sweep_state).await {
-                    Ok(n) if n > 0 => {
-                        tracing::info!(queued = n, "auto merge-wal sweep queued experiments")
-                    }
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!(error = %e, "auto merge-wal sweep failed"),
-                }
-            }
-        });
-    }
+    crate::periodic_sweep::spawn(state);
 
     let concurrency = state.config.task_concurrency.max(1);
     let sem = Arc::new(Semaphore::new(concurrency));
@@ -6000,6 +6000,311 @@ mod tests {
         );
 
         worker.abort();
+    }
+
+    async fn periodic_test_state(dir: &TempDir) -> Arc<MasterState> {
+        let mut cfg = config(dir);
+        cfg.merge_wal_interval_secs = 3600;
+        cfg.worker_endpoints = vec!["http://unused-worker.invalid".into()];
+        let state = MasterState::new(cfg).await.unwrap();
+        state
+            .stats
+            .lock()
+            .await
+            .upsert(&crate::stats_store::StatRow {
+                version: 17,
+                name: "exp".into(),
+                uri: state.rollout_uri("exp"),
+                row_count: 0,
+                fragment_count: 0,
+                last_updated: 0,
+                pending_wal_generations: 8,
+                last_compaction: crate::stats_store::StatRow::NO_COMPACTION,
+                total_compactions: 0,
+                scanned_at: 1,
+            })
+            .await
+            .unwrap();
+        state
+    }
+
+    async fn periodic_wait_claim(state: &Arc<MasterState>) -> TaskClaim {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(claim) = state.task_store.claim_next().await.unwrap() {
+                    break claim;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated ETCD_TEST_ENDPOINTS"]
+    async fn periodic_same_policy_followers_stay_quiet_and_take_over_on_drain() {
+        let dir = TempDir::new().unwrap();
+        let first = periodic_test_state(&dir).await;
+        let second = MasterState::new(first.config.clone()).await.unwrap();
+        let first_handles = crate::periodic_sweep::spawn(&first);
+        assert_eq!(first_handles.len(), 1);
+        let claim = periodic_wait_claim(&first).await;
+        first
+            .task_store
+            .finish(
+                claim,
+                Ok("merged 0 generations across 20/20 workers".into()),
+            )
+            .await
+            .unwrap();
+
+        // Start the follower after completion: ordinary task dedupe alone would
+        // allow it to run the unchanged candidate again (the diagnostic below).
+        let second_handles = crate::periodic_sweep::spawn(&second);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+        let before = maintenance_rpc_count(&endpoint, &["Range", "Txn", "LeaseGrant"]).await;
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        let after = maintenance_rpc_count(&endpoint, &["Range", "Txn", "LeaseGrant"]).await;
+        assert_eq!(after, before, "idle leader/follower must not poll etcd");
+        assert!(second
+            .task_store
+            .get_active_id(TaskKind::MergeWal, "exp")
+            .await
+            .unwrap()
+            .is_none());
+
+        // Fresh demand is independent of the one-hour periodic cadence.
+        let coordinator = second.task_store.merge_coordinator();
+        coordinator.request_merge("fresh").await.unwrap();
+        let request = coordinator
+            .get_merge_request("fresh")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(second
+            .task_store
+            .enqueue_merge_request(&request)
+            .await
+            .unwrap()
+            .is_some());
+        let claim = periodic_wait_claim(&second).await;
+        assert_eq!(claim.task.target, "fresh");
+        second
+            .task_store
+            .finish(claim, Ok("done".into()))
+            .await
+            .unwrap();
+
+        first.admission.begin_drain();
+        for handle in first_handles {
+            tokio::time::timeout(Duration::from_secs(5), handle)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let claim = periodic_wait_claim(&second).await;
+        assert_eq!(
+            claim.task.target, "exp",
+            "successor must resume periodic discovery"
+        );
+        second
+            .task_store
+            .finish(claim, Ok("done".into()))
+            .await
+            .unwrap();
+        second.admission.begin_drain();
+        for handle in second_handles {
+            tokio::time::timeout(Duration::from_secs(5), handle)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated ETCD_TEST_ENDPOINTS"]
+    async fn periodic_lost_owner_cannot_publish_another_task() {
+        let dir = TempDir::new().unwrap();
+        let state = periodic_test_state(&dir).await;
+        let owner = state
+            .task_store
+            .try_coordination_lock("periodic-test-owner")
+            .await
+            .unwrap()
+            .unwrap();
+        let publisher = state.task_store.discovery_publisher(&owner);
+        publisher
+            .enqueue_discovered(TaskKind::MergeWal, "before")
+            .await
+            .unwrap();
+        state
+            .task_store
+            .release_coordination_lock(owner)
+            .await
+            .unwrap();
+        assert!(publisher
+            .enqueue_discovered(TaskKind::MergeWal, "after")
+            .await
+            .is_err());
+        assert!(state
+            .task_store
+            .get_active_id(TaskKind::MergeWal, "after")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(state
+            .task_store
+            .enqueue_discovered(TaskKind::MergeWal, "unfenced")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated ETCD_TEST_ENDPOINTS"]
+    async fn periodic_slow_stats_read_does_not_block_writer_demand() {
+        let dir = TempDir::new().unwrap();
+        let state = periodic_test_state(&dir).await;
+        let stats = state.stats.lock().await;
+        let handles = crate::periodic_sweep::spawn(&state);
+        let controller = crate::demand_controller::spawn(&state);
+        state
+            .task_store
+            .merge_coordinator()
+            .request_merge("fresh")
+            .await
+            .unwrap();
+        let claim = periodic_wait_claim(&state).await;
+        assert_eq!(claim.task.target, "fresh");
+        state
+            .task_store
+            .finish(claim, Ok("done".into()))
+            .await
+            .unwrap();
+        state.admission.begin_drain();
+        drop(stats);
+        for handle in handles {
+            tokio::time::timeout(Duration::from_secs(5), handle)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        // This fixture verifies dispatch isolation, not the existing demand
+        // controller's five-second reconnect delay during shutdown.
+        controller.abort();
+        let _ = controller.await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated ETCD_TEST_ENDPOINTS"]
+    async fn periodic_distinct_policy_and_disabled_replicas_preserve_work() {
+        let dir = TempDir::new().unwrap();
+        let first = periodic_test_state(&dir).await;
+        let mut cold = first.stats.lock().await.get("exp").await.unwrap().unwrap();
+        cold.name = "cold".into();
+        cold.uri = first.rollout_uri("cold");
+        cold.pending_wal_generations = 1;
+        first.stats.lock().await.upsert(&cold).await.unwrap();
+        let first_handles = crate::periodic_sweep::spawn(&first);
+        let claim = periodic_wait_claim(&first).await;
+        assert_eq!(claim.task.target, "exp");
+        first
+            .task_store
+            .finish(claim, Ok("done".into()))
+            .await
+            .unwrap();
+
+        let mut config = first.config.clone();
+        config.merge_wal_min_generations = 1;
+        let second = MasterState::new(config.clone()).await.unwrap();
+        let second_handles = crate::periodic_sweep::spawn(&second);
+        let mut targets = std::collections::BTreeSet::new();
+        for _ in 0..2 {
+            let claim = periodic_wait_claim(&second).await;
+            targets.insert(claim.task.target.clone());
+            second
+                .task_store
+                .finish(claim, Ok("done".into()))
+                .await
+                .unwrap();
+        }
+        assert_eq!(targets, ["cold".to_string(), "exp".to_string()].into());
+
+        config.merge_wal_interval_secs = 0;
+        let disabled = MasterState::new(config).await.unwrap();
+        assert!(crate::periodic_sweep::spawn(&disabled).is_empty());
+        first.admission.begin_drain();
+        second.admission.begin_drain();
+        for handle in first_handles.into_iter().chain(second_handles) {
+            tokio::time::timeout(Duration::from_secs(5), handle)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    /// Diagnostic reproduction: the coordination lock deduplicates overlapping
+    /// sweeps, but completed tasks do not consume an unchanged stats observation.
+    #[tokio::test]
+    #[ignore = "requires isolated ETCD_TEST_ENDPOINTS; diagnostic reproduction"]
+    async fn reproduce_staggered_sweeps_requeue_completed_stats_snapshot() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.merge_wal_min_generations = 3;
+        let first = MasterState::new(cfg.clone()).await.unwrap();
+        first
+            .stats
+            .lock()
+            .await
+            .upsert(&crate::stats_store::StatRow {
+                version: 17,
+                name: "exp".into(),
+                uri: first.rollout_uri("exp"),
+                row_count: 0,
+                fragment_count: 0,
+                last_updated: 0,
+                pending_wal_generations: 8,
+                last_compaction: crate::stats_store::StatRow::NO_COMPACTION,
+                total_compactions: 0,
+                scanned_at: 1,
+            })
+            .await
+            .unwrap();
+        let second = MasterState::new(cfg).await.unwrap();
+        let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+        let before = maintenance_rpc_count(&endpoint, &["Range", "Txn"]).await;
+        let mut task_ids = std::collections::BTreeSet::new();
+        for state in [&first, &second, &first, &second] {
+            assert_eq!(sweep_merge_wal_candidates(state).await.unwrap(), 1);
+            let claim = state.task_store.claim_next().await.unwrap().unwrap();
+            assert_eq!(claim.task.target, "exp");
+            assert!(task_ids.insert(claim.task.id.clone()));
+            // Isolate scheduling from storage: publish the same terminal zero
+            // outcome observed in production, without pretending to merge data.
+            finish_task(
+                state,
+                claim,
+                Ok("merged 0 generations across 20/20 workers".into()),
+            )
+            .await
+            .unwrap();
+            assert!(state
+                .task_store
+                .merge_coordinator()
+                .get_merge_request("exp")
+                .await
+                .unwrap()
+                .is_none());
+        }
+        let after = maintenance_rpc_count(&endpoint, &["Range", "Txn"]).await;
+        assert_eq!(task_ids.len(), 4);
+        let row = second.stats.lock().await.get("exp").await.unwrap().unwrap();
+        assert_eq!(
+            (row.version, row.scanned_at, row.pending_wal_generations),
+            (17, 1, 8)
+        );
+        eprintln!("REPRO unchanged_stats=1 independent_masters=2 zero_outcomes=4 fresh_writer_requests=0 range_txn={}", after - before);
     }
 
     /// WAL sweeps enqueue over-threshold targets and dedupe a second sweep.

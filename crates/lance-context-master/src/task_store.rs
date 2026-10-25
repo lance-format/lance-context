@@ -625,6 +625,30 @@ impl TaskStore {
         self.inner.enqueue(kind, target, depends_on).await
     }
 
+    /// Automatic discovery must not publish after losing its elected owner.
+    /// Manual enqueue retains its existing semantics and does not use this API.
+    pub(crate) async fn enqueue_discovered(
+        &self,
+        kind: TaskKind,
+        target: &str,
+    ) -> lance::Result<TaskRecord> {
+        if self.publication_fence.is_none() {
+            return Err(lance::Error::io(
+                "discovery enqueue requires a leader fence",
+            ));
+        }
+        self.inner
+            .enqueue_guarded(
+                kind,
+                target,
+                Vec::new(),
+                None,
+                self.publication_fence.as_ref(),
+            )
+            .await?
+            .ok_or_else(|| lance::Error::io("discovery enqueue lost leadership"))
+    }
+
     /// Recovery inventory is a hint, not new demand. Bind a new queue entry to
     /// the observed execution version without adding an ownership read/RPC.
     pub(crate) async fn enqueue_execution_recovery(
@@ -1088,6 +1112,14 @@ impl TaskStore {
         name: &str,
     ) -> lance::Result<Option<CoordinationGuard>> {
         self.inner.try_coordination_lock(name).await
+    }
+
+    pub(crate) fn coordination_key(&self, name: &str) -> String {
+        format!(
+            "{}/coordination/{}",
+            self.inner.prefix,
+            encode_segment(name)
+        )
     }
 
     /// Register immutable discovery policy once per process lease. Followers

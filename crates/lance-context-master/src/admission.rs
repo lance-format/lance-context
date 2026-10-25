@@ -72,6 +72,14 @@ impl Admission {
         self.state.borrow().accepting
     }
 
+    pub(crate) async fn wait_closed(&self) {
+        let mut updates = self.state.subscribe();
+        updates
+            .wait_for(|status| !status.accepting)
+            .await
+            .expect("admission sender remains alive");
+    }
+
     pub fn status(&self) -> Status {
         self.state.borrow().clone()
     }

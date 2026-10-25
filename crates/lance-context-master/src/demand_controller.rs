@@ -586,7 +586,11 @@ async fn reconcile(
 
 /// Followers use one quiet watch. No prefix scan, per-table read, election
 /// transaction, or new lease while a healthy leader holds the key.
-async fn wait_for_vacancy(client: &Client, key: &str, owner: Option<&str>) -> Result<(), String> {
+pub(crate) async fn wait_for_vacancy(
+    client: &Client,
+    key: &str,
+    owner: Option<&str>,
+) -> Result<(), String> {
     let response = client
         .clone()
         .get(key, None)
