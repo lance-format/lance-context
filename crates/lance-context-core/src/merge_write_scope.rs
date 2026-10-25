@@ -775,6 +775,14 @@ impl GuardedCommit {
 #[async_trait::async_trait]
 #[allow(clippy::too_many_arguments)]
 impl CommitHandler for GuardedCommit {
+    fn is_version_not_found_definitive(&self) -> bool {
+        // Preserve the storage resolver's guarantee. In particular, a local
+        // prepublication version rejection must not become CommitStatusUnknown
+        // merely because this wrapper defaults to an eventual-consistency model.
+        // External/custom handlers retain their conservative default.
+        self.inner.is_version_not_found_definitive()
+    }
+
     async fn commit(
         &self,
         manifest: &mut Manifest,
