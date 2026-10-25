@@ -1146,6 +1146,51 @@ impl TaskStore {
         })
     }
 
+    /// Re-advertise a reserved local slot after its previous offer was consumed.
+    /// Reuses the pool's lease; running tasks have their own independent leases.
+    pub(crate) async fn rearm_dispatch_ticket(
+        &self,
+        guard: &mut CoordinationGuard,
+        policy: Vec<u8>,
+    ) -> lance::Result<i64> {
+        if !guard.is_live() {
+            return Err(lance::Error::io("dispatch session lease ended"));
+        }
+        let token = String::from_utf8(policy).map_err(|e| lance::Error::io(e.to_string()))?;
+        let response = self
+            .inner
+            .client
+            .clone()
+            .txn(
+                Txn::new()
+                    .when([
+                        Compare::version(guard.key.as_str(), CompareOp::Equal, 0),
+                        Compare::version(
+                            guard.key.replace("/tickets/", "/offers/"),
+                            CompareOp::Equal,
+                            0,
+                        ),
+                    ])
+                    .and_then([TxnOp::put(
+                        guard.key.as_str(),
+                        token.as_str(),
+                        Some(PutOptions::new().with_lease(guard.lease_id)),
+                    )]),
+            )
+            .await
+            .map_err(etcd_error("rearm dispatch capacity"))?;
+        if !response.succeeded() {
+            return Err(lance::Error::io(
+                "previous dispatch capacity still advertised",
+            ));
+        }
+        guard.token = token;
+        response
+            .header()
+            .map(|header| header.revision())
+            .ok_or_else(|| lance::Error::io("missing dispatch capacity revision"))
+    }
+
     pub(crate) async fn publish_assignment(
         &self,
         offer: &DispatchAssignment,

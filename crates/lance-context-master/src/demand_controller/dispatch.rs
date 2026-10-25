@@ -6,7 +6,7 @@ use crate::{
     config::MasterConfig,
     eligibility,
     state::MasterState,
-    task_store::{DispatchAssignment, TaskClaim, TaskKinds, TaskStore},
+    task_store::{CoordinationGuard, DispatchAssignment, TaskClaim, TaskKinds, TaskStore},
 };
 use etcd_client::WatchOptions;
 use lance_context_api::{TaskKind, TaskRecord, TaskState};
@@ -193,120 +193,189 @@ impl Drop for PoolPhase {
     }
 }
 
-/// Caller holds the existing pool/compaction permits for this entire operation.
-/// Waiting does no fleet scan. Once an offer arrives, claim completion/ambiguity
-/// is joined even if master admission starts draining concurrently.
-pub(crate) async fn claim(
-    state: &Arc<MasterState>,
-    ticket: &Ticket,
-    operation: &admission::Operation,
-    refresh_compaction: bool,
-) -> lance::Result<Option<(TaskClaim, Duration)>> {
-    let store = &state.task_store;
-    // Advertising and waiting owns capacity but no table. Do not report an
-    // idle, potentially hours-long wait as a slow ownership transaction.
-    let mut phase = PoolPhase::new(&ticket.pool, "waiting_for_offer");
-    operation.phase("waiting_for_offer");
-    let wait_start = std::time::Instant::now();
-    let value = serde_json::to_vec(ticket).map_err(|e| lance::Error::io(e.to_string()))?;
-    let guard = store.create_dispatch_ticket(value.clone()).await?;
-    let prefix = state.config.etcd.prefix();
-    let offer_key = guard.key().replace("/tickets/", "/offers/");
-    operation.claim_phase("waiting_for_controller_offer");
-    let waiting = async {
-        let snapshot = store
-            .etcd_client()
-            .clone()
-            .get(offer_key.clone(), None)
-            .await
-            .map_err(|e| lance::Error::io(e.to_string()))?;
-        if let Some(kv) = snapshot.kvs().first() {
-            return serde_json::from_slice::<Offer>(kv.value())
-                .map(Some)
-                .map_err(|e| lance::Error::io(e.to_string()));
+/// One session per scheduler pool, retained while tasks run. The ticket is
+/// absent when no local permit is reserved, even though the lease/watch live on.
+#[derive(Default)]
+pub(crate) struct Receiver {
+    session: Option<Session>,
+}
+
+struct Session {
+    guard: CoordinationGuard,
+    stream: etcd_client::WatchStream,
+    pending: Option<Offer>,
+    revision: i64,
+}
+
+impl Session {
+    async fn open(store: &TaskStore, value: Vec<u8>) -> lance::Result<Self> {
+        let guard = store.create_dispatch_ticket(value).await?;
+        let offer_key = guard.key().replace("/tickets/", "/offers/");
+        let setup = async {
+            let snapshot = store
+                .etcd_client()
+                .clone()
+                .get(offer_key.clone(), None)
+                .await
+                .map_err(|e| lance::Error::io(e.to_string()))?;
+            let pending = snapshot
+                .kvs()
+                .first()
+                .map(|kv| serde_json::from_slice::<Offer>(kv.value()))
+                .transpose()
+                .map_err(|e| lance::Error::io(e.to_string()))?;
+            let revision = snapshot
+                .header()
+                .ok_or_else(|| lance::Error::io("missing offer snapshot revision"))?
+                .revision();
+            let stream = store
+                .etcd_client()
+                .clone()
+                .watch(
+                    offer_key,
+                    Some(WatchOptions::new().with_start_revision(revision + 1)),
+                )
+                .await
+                .map_err(|e| lance::Error::io(e.to_string()))?;
+            Ok::<_, lance::Error>((stream, pending, revision))
         }
-        let revision = snapshot
-            .header()
-            .ok_or_else(|| lance::Error::io("missing offer snapshot revision"))?
-            .revision();
-        let mut stream = store
-            .etcd_client()
-            .clone()
-            .watch(
-                offer_key.clone(),
-                Some(WatchOptions::new().with_start_revision(revision + 1)),
-            )
-            .await
-            .map_err(|e| lance::Error::io(e.to_string()))?;
-        while let Some(response) = stream
-            .message()
-            .await
-            .map_err(|e| lance::Error::io(e.to_string()))?
-        {
-            if response.canceled() {
-                return Err(lance::Error::io("offer watch canceled"));
+        .await;
+        match setup {
+            Ok((stream, pending, revision)) => Ok(Self {
+                guard,
+                stream,
+                pending,
+                revision,
+            }),
+            Err(error) => {
+                let _ = store.release_coordination_lock(guard).await;
+                Err(error)
             }
-            for event in response.events() {
-                if event.event_type() == etcd_client::EventType::Put {
-                    return serde_json::from_slice::<Offer>(
-                        event
+        }
+    }
+}
+
+impl Receiver {
+    pub(crate) async fn close(&mut self, store: &TaskStore) -> lance::Result<()> {
+        if let Some(session) = self.session.take() {
+            // No canonical task is attached to this lease.
+            store.release_coordination_lock(session.guard).await?;
+        }
+        Ok(())
+    }
+
+    /// Caller holds pool/compaction permits throughout. A successful claim
+    /// consumes the ticket atomically, then the next reserved slot reuses this
+    /// lease and exact-key Watch. Faults invalidate only the dispatch session.
+    pub(crate) async fn claim(
+        &mut self,
+        state: &Arc<MasterState>,
+        ticket: &Ticket,
+        operation: &admission::Operation,
+        refresh_compaction: bool,
+    ) -> lance::Result<Option<(TaskClaim, Duration)>> {
+        let result = self
+            .receive(state, ticket, operation, refresh_compaction)
+            .await;
+        if !matches!(&result, Ok(Some(_))) {
+            // Also removes any rejected offer/reservation on this lease. Never
+            // reuse a session after an ambiguous re-advertisement or claim.
+            if let Err(error) = self.close(&state.task_store).await {
+                tracing::warn!(%error, "dispatch session cleanup failed; lease will expire");
+            }
+        }
+        result
+    }
+
+    async fn receive(
+        &mut self,
+        state: &Arc<MasterState>,
+        ticket: &Ticket,
+        operation: &admission::Operation,
+        refresh_compaction: bool,
+    ) -> lance::Result<Option<(TaskClaim, Duration)>> {
+        let store = &state.task_store;
+        let mut phase = PoolPhase::new(&ticket.pool, "waiting_for_offer");
+        operation.phase("waiting_for_offer");
+        let wait_start = std::time::Instant::now();
+        let value = serde_json::to_vec(ticket).map_err(|e| lance::Error::io(e.to_string()))?;
+        if let Some(session) = &mut self.session {
+            session.revision = store
+                .rearm_dispatch_ticket(&mut session.guard, value.clone())
+                .await?;
+        } else {
+            self.session = Some(Session::open(store, value.clone()).await?);
+        }
+        let session = self.session.as_mut().expect("dispatch session opened");
+        let guard = &session.guard;
+        let prefix = state.config.etcd.prefix();
+        operation.claim_phase("waiting_for_controller_offer");
+        let waiting = async {
+            if let Some(offer) = session.pending.take() {
+                return Ok(Some(offer));
+            }
+            while let Some(response) = session
+                .stream
+                .message()
+                .await
+                .map_err(|e| lance::Error::io(e.to_string()))?
+            {
+                if response.canceled() {
+                    return Err(lance::Error::io("offer watch canceled"));
+                }
+                for event in response.events() {
+                    if event.event_type() == etcd_client::EventType::Put {
+                        let kv = event
                             .kv()
-                            .ok_or_else(|| lance::Error::io("offer event missing value"))?
-                            .value(),
-                    )
-                    .map(Some)
-                    .map_err(|e| lance::Error::io(e.to_string()));
+                            .ok_or_else(|| lance::Error::io("offer event missing value"))?;
+                        // Ignore buffered events from an earlier slot advertisement.
+                        if kv.mod_revision() >= session.revision {
+                            return serde_json::from_slice::<Offer>(kv.value())
+                                .map(Some)
+                                .map_err(|e| lance::Error::io(e.to_string()));
+                        }
+                    }
                 }
             }
-        }
-        Err(lance::Error::io("offer watch ended"))
-    };
-    let stopped = async {
-        while state.admission.is_accepting()
-            && guard.is_live()
-            && !(refresh_compaction && state.compaction_permits.available_permits() > 0)
-        {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-    };
-    let received = tokio::select! { result = waiting => result, _ = stopped => Ok(None) };
-    let claim_start = std::time::Instant::now();
-    if matches!(&received, Ok(Some(_))) {
-        metrics::histogram!("master_controller_offer_wait_seconds", "pool" => ticket.pool.clone())
-            .record(wait_start.elapsed().as_secs_f64());
-        drop(phase);
-        phase = PoolPhase::new(&ticket.pool, "claiming");
-        operation.phase("claiming");
-    }
-    let result = match received {
-        Ok(Some(offer)) => match assignment(prefix, guard.key(), &value, &offer) {
-            Ok(offer) => {
-                store
-                    .claim_assignment(
-                        &offer,
-                        ticket.kinds,
-                        ticket.resident_targets.as_deref(),
-                        operation,
-                    )
-                    .await
+            Err(lance::Error::io("offer watch ended"))
+        };
+        let stopped = async {
+            while state.admission.is_accepting()
+                && guard.is_live()
+                && !(refresh_compaction && state.compaction_permits.available_permits() > 0)
+            {
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
-            Err(error) => Err(lance::Error::io(error)),
-        },
-        Ok(None) => Ok(None),
-        Err(error) => Err(error),
-    };
-    // This lease only owns ticket/offer/reservation, never a running task.
-    let cleanup = store.release_coordination_lock(guard).await;
-    drop(phase);
-    let claim_elapsed = claim_start.elapsed();
-    match (result, cleanup) {
-        (Ok(claim), Ok(())) => Ok(claim.map(|claim| (claim, claim_elapsed))),
-        (Err(error), _) => Err(error),
-        (Ok(Some(claim)), Err(error)) => {
-            tracing::warn!(%error, "accepted task retained after dispatch ticket cleanup failed");
-            Ok(Some((claim, claim_elapsed)))
+        };
+        let received = tokio::select! { result = waiting => result, _ = stopped => Ok(None) };
+        let claim_start = std::time::Instant::now();
+        if matches!(&received, Ok(Some(_))) {
+            metrics::histogram!("master_controller_offer_wait_seconds", "pool" => ticket.pool.clone())
+            .record(wait_start.elapsed().as_secs_f64());
+            drop(phase);
+            phase = PoolPhase::new(&ticket.pool, "claiming");
+            operation.phase("claiming");
         }
-        (Ok(None), Err(error)) => Err(error),
+        let result = match received {
+            Ok(Some(offer)) => match assignment(prefix, guard.key(), &value, &offer) {
+                Ok(offer) => {
+                    store
+                        .claim_assignment(
+                            &offer,
+                            ticket.kinds,
+                            ticket.resident_targets.as_deref(),
+                            operation,
+                        )
+                        .await
+                }
+                Err(error) => Err(lance::Error::io(error)),
+            },
+            Ok(None) => Ok(None),
+            Err(error) => Err(error),
+        };
+        drop(phase);
+        let claim_elapsed = claim_start.elapsed();
+        result.map(|claim| claim.map(|claim| (claim, claim_elapsed)))
     }
 }
 
@@ -898,7 +967,8 @@ mod tests {
         let receiver = tokio::spawn(async move {
             let _permit = permit;
             let operation = receiver_state.admission.try_admit_named("merge").unwrap();
-            claim(&receiver_state, &ticket, &operation, false)
+            Receiver::default()
+                .claim(&receiver_state, &ticket, &operation, false)
                 .await
                 .unwrap()
                 .unwrap()
@@ -961,6 +1031,207 @@ mod tests {
         .unwrap();
         successor_controller.abort();
         assert!(successor_controller.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires exclusive loopback ETCD_TEST_ENDPOINTS"]
+    async fn receiver_reuses_lease_and_watch_and_withdraws_busy_capacity() {
+        let (_dir, cfg, store, leader) = setup().await;
+        let state = crate::state::MasterState::new(cfg.clone()).await.unwrap();
+        let publisher = store.discovery_publisher(&leader);
+        let mut receiver = Receiver::default();
+        let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+        let leases = super::super::tests::rpc_count(&endpoint, &["LeaseGrant"]).await;
+        let watches = super::super::tests::rpc_count(&endpoint, &["Watch"]).await;
+        let mut session_key = None;
+        let mut last_claim = None;
+        for n in 0..16 {
+            // Exercise changes to the offered kind policy on the SAME session.
+            let kinds = if n % 2 == 0 {
+                TaskKinds::MERGE_WAL
+            } else {
+                TaskKinds::ANY
+            };
+            let ticket = Ticket::new(&cfg, "persistent", "general", kinds, false);
+            let wanted = store
+                .enqueue(TaskKind::MergeWal, &format!("reuse-{n}"), vec![])
+                .await
+                .unwrap();
+            let operation = state.admission.try_admit_named("general").unwrap();
+            let place_one = async {
+                loop {
+                    let mut cache = list(store.etcd_client(), cfg.etcd.prefix()).await.unwrap();
+                    if cache.entries.keys().any(|k| {
+                        k.starts_with(
+                            prefix_key(cfg.etcd.prefix(), "demand-controller/tickets").as_bytes(),
+                        )
+                    }) {
+                        while place(&publisher, cfg.etcd.prefix(), &mut cache)
+                            .await
+                            .unwrap()
+                        {}
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            };
+            let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(
+                    receiver.claim(&state, &ticket, &operation, false),
+                    place_one
+                )
+            })
+            .await
+            .unwrap();
+            let (claim, _) = result.unwrap().unwrap();
+            assert_eq!(claim.task.id, wanted.id);
+            let session = receiver.session.as_ref().unwrap();
+            let key = session.guard.key().to_string();
+            assert_eq!(session_key.get_or_insert(key.clone()), &key);
+            let policy: Ticket = serde_json::from_str(session.guard.token()).unwrap();
+            assert_eq!(policy.kinds, kinds);
+            // This receiver has no spare slot advertised while its task runs.
+            for prefix in ["tickets", "offers", "reservations"] {
+                assert!(store
+                    .etcd_client()
+                    .clone()
+                    .get(
+                        prefix_key(cfg.etcd.prefix(), &format!("demand-controller/{prefix}")),
+                        Some(GetOptions::new().with_prefix())
+                    )
+                    .await
+                    .unwrap()
+                    .kvs()
+                    .is_empty());
+            }
+            if let Some(previous) = last_claim.replace(claim) {
+                store.finish(previous, Ok("finished".into())).await.unwrap();
+            }
+        }
+        // 16 canonical execution leases + ONE pool lease. No per-task Watch.
+        assert_eq!(
+            super::super::tests::rpc_count(&endpoint, &["LeaseGrant"]).await - leases,
+            17
+        );
+        assert_eq!(
+            super::super::tests::rpc_count(&endpoint, &["Watch"]).await - watches,
+            1
+        );
+        receiver.close(&store).await.unwrap();
+        let last = last_claim.unwrap();
+        assert_eq!(
+            store.get(&last.task.id).await.unwrap().unwrap().state,
+            TaskState::Running
+        );
+        store
+            .finish(last, Ok("survived receiver shutdown".into()))
+            .await
+            .unwrap();
+        store.release_coordination_lock(leader).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated ETCD_TEST_ENDPOINTS"]
+    async fn receiver_recovers_canceled_watch_and_expired_capacity_without_reclaiming_tasks() {
+        let (_dir, cfg, store, leader) = setup().await;
+        let state = crate::state::MasterState::new(cfg.clone()).await.unwrap();
+        let publisher = store.discovery_publisher(&leader);
+        let ticket = Ticket::new(&cfg, "persistent", "merge", TaskKinds::MERGE_WAL, false);
+        let mut receiver = Receiver::default();
+        let operation = state.admission.try_admit_named("merge").unwrap();
+        // Seed a session as though its prior slot were already consumed.
+        let mut session = Session::open(&store, serde_json::to_vec(&ticket).unwrap())
+            .await
+            .unwrap();
+        let created = session.stream.message().await.unwrap().unwrap();
+        assert!(created.created());
+        session.stream.cancel(created.watch_id()).await.unwrap();
+        store
+            .etcd_client()
+            .clone()
+            .delete(session.guard.key(), None)
+            .await
+            .unwrap();
+        receiver.session = Some(session);
+        assert!(tokio::time::timeout(
+            Duration::from_secs(5),
+            receiver.claim(&state, &ticket, &operation, false)
+        )
+        .await
+        .unwrap()
+        .is_err());
+        assert!(receiver.session.is_none());
+        for fault in [false, true] {
+            let wanted = store
+                .enqueue(TaskKind::MergeWal, &format!("after-fault-{fault}"), vec![])
+                .await
+                .unwrap();
+            let place_one = async {
+                loop {
+                    let mut cache = list(store.etcd_client(), cfg.etcd.prefix()).await.unwrap();
+                    if cache.entries.keys().any(|k| {
+                        k.starts_with(
+                            prefix_key(cfg.etcd.prefix(), "demand-controller/tickets").as_bytes(),
+                        )
+                    }) {
+                        while place(&publisher, cfg.etcd.prefix(), &mut cache)
+                            .await
+                            .unwrap()
+                        {}
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            };
+            let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(
+                    receiver.claim(&state, &ticket, &operation, false),
+                    place_one
+                )
+            })
+            .await
+            .unwrap();
+            let (claim, _) = result.unwrap().unwrap();
+            assert_eq!(claim.task.id, wanted.id);
+            if !fault {
+                // Obtain the pool lease from a re-advertisement, then revoke it.
+                let session = receiver.session.as_mut().unwrap();
+                store
+                    .rearm_dispatch_ticket(&mut session.guard, serde_json::to_vec(&ticket).unwrap())
+                    .await
+                    .unwrap();
+                let kv = store
+                    .etcd_client()
+                    .clone()
+                    .get(session.guard.key(), None)
+                    .await
+                    .unwrap();
+                store
+                    .etcd_client()
+                    .clone()
+                    .lease_revoke(kv.kvs()[0].lease())
+                    .await
+                    .unwrap();
+                assert!(tokio::time::timeout(
+                    Duration::from_secs(5),
+                    receiver.claim(&state, &ticket, &operation, false)
+                )
+                .await
+                .unwrap()
+                .is_err());
+                assert!(receiver.session.is_none());
+                assert_eq!(
+                    store.get(&wanted.id).await.unwrap().unwrap().state,
+                    TaskState::Running
+                );
+            }
+            store
+                .finish(claim, Ok("survived capacity fault".into()))
+                .await
+                .unwrap();
+        }
+        receiver.close(&store).await.unwrap();
+        store.release_coordination_lock(leader).await.unwrap();
     }
 
     #[tokio::test]

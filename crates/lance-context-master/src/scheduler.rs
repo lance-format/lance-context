@@ -1473,8 +1473,12 @@ fn spawn_filtered_pool_poller(
     running.set(0.0);
     tokio::spawn(async move {
         let executor = state.admission.status().executor_id;
+        let mut receiver = crate::demand_controller::dispatch::Receiver::default();
         loop {
             if !state.admission.is_accepting() {
+                if let Err(error) = receiver.close(&state.task_store).await {
+                    tracing::warn!(%error, "dispatch session cleanup failed during drain");
+                }
                 return;
             }
             while pool.available_permits() > 0 {
@@ -1509,13 +1513,9 @@ fn spawn_filtered_pool_poller(
                     offered_kinds,
                     resident_only,
                 );
-                let claim = crate::demand_controller::dispatch::claim(
-                    &state,
-                    &ticket,
-                    &operation,
-                    refresh_compaction,
-                )
-                .await;
+                let claim = receiver
+                    .claim(&state, &ticket, &operation, refresh_compaction)
+                    .await;
                 match claim {
                     Ok(Some((claim, claim_elapsed))) => {
                         let compact_permit = if claim.task.kind == TaskKind::Compact {
