@@ -556,7 +556,7 @@ pub(super) async fn place(
         next.push(0);
         next
     });
-    let tickets: Vec<_> = page
+    let mut tickets: Vec<_> = page
         .into_iter()
         .filter(|(key, _)| {
             !cache.entries.contains_key(
@@ -571,6 +571,12 @@ pub(super) async fn place(
                 .map(|ticket| (key, entry, ticket))
         })
         .collect();
+    // A resident ticket reserves a slot whose target scope was resolved through
+    // local_merge::targets. Prefer that existing capacity over a worker fan-out,
+    // but keep the same bounded raw page and first eligible fallback. Stable
+    // ordering preserves ticket rotation within each class; an ineligible local
+    // ticket cannot delay a task that an ordinary pool can claim.
+    tickets.sort_by_key(|(_, _, ticket)| ticket.resident_targets.is_none());
     if tickets.is_empty() {
         let more = next_ticket.is_some();
         cache.placement.ticket_cursor = next_ticket;
@@ -732,6 +738,126 @@ mod tests {
             &offer,
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated ETCD_TEST_ENDPOINTS"]
+    async fn resident_capacity_precedes_fanout_with_immediate_eligible_fallback() {
+        // The older ordinary ticket wins before resident preference is applied.
+        // Local scope, draining and kind exclusions must still fall back without
+        // reserving the task for an executor that cannot run it.
+        for exclusion in ["none", "target", "draining", "kind"] {
+            let (_dir, cfg, store, leader) = setup().await;
+            let wanted = store
+                .enqueue(TaskKind::MergeWal, "wanted", vec![])
+                .await
+                .unwrap();
+            let ordinary = store
+                .create_dispatch_ticket(
+                    serde_json::to_vec(&Ticket::new(
+                        &cfg,
+                        "ordinary",
+                        "merge",
+                        TaskKinds::MERGE_WAL,
+                        false,
+                    ))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            let mut local_cfg = cfg.clone();
+            local_cfg.local_merge.master_local_merge_auto = true;
+            local_cfg.local_merge.master_local_merge_targets = vec!["*".into()];
+            local_cfg.maintenance.fence_legacy_maintenance = true;
+            if exclusion == "target" {
+                local_cfg.maintenance.wal_claim_targets = vec!["elsewhere".into()];
+            }
+            if exclusion == "draining" {
+                local_cfg.merge_rollout.drain_targets = vec!["wanted".into()];
+            }
+            let kinds = if exclusion == "kind" {
+                TaskKinds::COMPACT
+            } else {
+                TaskKinds::MERGE_WAL
+            };
+            let local = store
+                .create_dispatch_ticket(
+                    serde_json::to_vec(&Ticket::new(
+                        &local_cfg,
+                        "local",
+                        "resident_merge",
+                        kinds,
+                        true,
+                    ))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(ordinary.key() < local.key());
+            let publisher = store.discovery_publisher(&leader);
+            let mut cache = list(store.etcd_client(), cfg.etcd.prefix()).await.unwrap();
+            for _ in 0..8 {
+                if !place(&publisher, cfg.etcd.prefix(), &mut cache)
+                    .await
+                    .unwrap()
+                {
+                    break;
+                }
+            }
+            let (chosen, rejected) = if exclusion == "none" {
+                (&local, &ordinary)
+            } else {
+                (&ordinary, &local)
+            };
+            let offer = offer_for(&store, &cfg, chosen).await;
+            assert_eq!(offer.task_id, wanted.id, "{exclusion}");
+            assert!(
+                store
+                    .etcd_client()
+                    .clone()
+                    .get(rejected.key().replace("/tickets/", "/offers/"), None)
+                    .await
+                    .unwrap()
+                    .kvs()
+                    .is_empty(),
+                "{exclusion}"
+            );
+            // A preferred offer remains advisory. An owner appearing after
+            // placement must defeat the canonical claim on either route.
+            store
+                .etcd_client()
+                .clone()
+                .put(
+                    lance_context_merge::target_lock_key(cfg.etcd.prefix(), "wanted"),
+                    "concurrent-writer",
+                    None,
+                )
+                .await
+                .unwrap();
+            let local_store = TaskStore::open(&local_cfg).await.unwrap();
+            let (claim_store, targets) = if exclusion == "none" {
+                (&local_store, Some(vec!["*".to_string()]))
+            } else {
+                (&store, None)
+            };
+            let admission = Arc::new(admission::Admission::default());
+            let operation = admission.try_admit_named("merge").unwrap();
+            assert!(
+                claim_store
+                    .claim_assignment(&offer, TaskKinds::MERGE_WAL, targets.as_deref(), &operation,)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{exclusion}"
+            );
+            assert_eq!(
+                store.get(&wanted.id).await.unwrap().unwrap().state,
+                TaskState::Queued
+            );
+            store.release_coordination_lock(local).await.unwrap();
+            store.release_coordination_lock(ordinary).await.unwrap();
+            store.release_coordination_lock(leader).await.unwrap();
+        }
     }
 
     #[tokio::test]
