@@ -17,6 +17,8 @@ use {
 
 #[cfg(feature = "materializer")]
 mod annotation_checkpoint;
+#[cfg(feature = "service")]
+mod annotation_http;
 #[cfg(feature = "materializer")]
 mod annotation_publication;
 #[cfg(feature = "materializer")]

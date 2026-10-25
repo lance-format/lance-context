@@ -13,7 +13,7 @@ use lance_context_core::annotation_staging::Limits;
 #[cfg(unix)]
 mod process;
 
-async fn owner(
+pub(super) async fn owner(
     c: &network::Cluster,
     storage: &Storage,
     limits: &Limits,
@@ -55,7 +55,7 @@ async fn owner_with_wait(
     .await
 }
 
-async fn drained(service: &Service, through: u64) -> Result<()> {
+pub(super) async fn drained(service: &Service, through: u64) -> Result<()> {
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let (observed, pressured) = service.observation().await;
@@ -74,7 +74,7 @@ async fn drained(service: &Service, through: u64) -> Result<()> {
     Ok(())
 }
 
-fn run_owner(
+pub(super) fn run_owner(
     runtime: Runtime,
 ) -> (
     tokio::sync::oneshot::Sender<()>,

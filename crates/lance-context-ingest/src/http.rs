@@ -13,6 +13,8 @@ use receipt::ReceiptKeys;
 use std::{collections::BTreeMap, sync::Mutex};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
+#[cfg(feature = "materializer")]
+pub mod annotations;
 mod body;
 #[cfg(feature = "http-client")]
 pub mod journal;

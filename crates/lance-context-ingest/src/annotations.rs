@@ -76,7 +76,69 @@ pub struct Driver {
     pending: Option<Pending>,
 }
 
+/// Connect an authorized ingress without opening Lance or creating an applier.
+/// Such ingresses forward annotation operations to the deployment's shard owner.
+pub async fn connect_ingress(
+    client: Arc<Client>,
+    layout: Arc<Layout>,
+    binding: TableBinding,
+    limits: &Limits,
+    budget: Arc<MergeMemoryBudget>,
+) -> Result<Ingress> {
+    ensure!(
+        layout.buckets.len() == 1,
+        "annotation ingress requires one shard"
+    );
+    let contract = Service::contract(&binding, limits)?;
+    Ingress::connect_with_schema(
+        client,
+        layout,
+        binding,
+        budget,
+        contract,
+        wire::schema(limits),
+    )
+    .await
+}
+
 impl Service {
+    #[cfg(feature = "http")]
+    pub(crate) fn ingress(&self) -> &Ingress {
+        &self.ingress
+    }
+
+    #[cfg(feature = "http")]
+    pub(crate) async fn check_owner(
+        &self,
+        authority: &lance_context_wal::replication::publication::Authority,
+    ) -> Result<()> {
+        ensure!(
+            !self.shared.progress.borrow().stopped,
+            "annotation runtime stopped"
+        );
+        let query::Value::Publisher(Some(view)) = crate::materializer::query(
+            &self.ingress,
+            self.ingress.client.catalog_group(),
+            query::Query::Publisher {
+                table: self.ingress.scope.table,
+            },
+        )
+        .await?
+        else {
+            bail!("annotation owner unavailable");
+        };
+        ensure!(
+            view.authority == *authority
+                && view.destination == self.ingress.scope.destination
+                && view.ingest == self.ingress.scope.contract
+                && view
+                    .manifests
+                    .as_ref()
+                    .is_some_and(|m| m.incarnation == self.ingress.scope.incarnation),
+            "annotation owner changed"
+        );
+        Ok(())
+    }
     /// Initially support exactly one virtual shard. The table is already
     /// provisioned with narrow annotation columns and the explicit policy.
     pub async fn connect(

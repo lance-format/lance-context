@@ -31,6 +31,13 @@ struct Publisher {
 }
 
 impl Runtime {
+    #[cfg(feature = "http")]
+    pub(crate) fn http_binding(&self) -> (Service, p::Authority) {
+        (
+            self.publisher.service.clone(),
+            self.publisher.catalog.authority().clone(),
+        )
+    }
     /// The caller supplies the existing durable scheduler's acquisition identity.
     /// Reopening resolves a retained preparation before exposing the new service.
     pub async fn connect(
