@@ -157,6 +157,8 @@ pub struct FrozenCheckpoint {
     origin: Arc<Shared>,
     annotations: FrozenAnnotations,
     results: Arc<Snapshot>,
+    sources: lance_context_wal::replication::publication::SourceRange,
+    _source_generation: tokio::sync::OwnedSemaphorePermit,
 }
 pub struct PreparedCheckpoint {
     origin: Arc<Shared>,
@@ -164,6 +166,11 @@ pub struct PreparedCheckpoint {
     results: Arc<Snapshot>,
 }
 impl FrozenCheckpoint {
+    /// Complete source metadata captured under the same gate as values/results.
+    /// The publisher still pins this selection before recording preparation.
+    pub fn sources(&self) -> &lance_context_wal::replication::publication::SourceRange {
+        &self.sources
+    }
     pub fn through(&self) -> u64 {
         self.annotations.through()
     }
@@ -209,6 +216,14 @@ impl Service {
         };
         let encoded = serde_json::to_string(&snapshot.encoded)?;
         Snapshot::decode(&encoded, through)?;
+        // Old public handles may outlive installation. Bound their retained
+        // source vectors too, independently of the value/result allocations.
+        let source_generation = self
+            .shared
+            .source_generations
+            .clone()
+            .try_acquire_owned()
+            .context("annotation source metadata retained by older checkpoints")?;
         let annotations = self
             .shared
             .staging
@@ -223,6 +238,8 @@ impl Service {
             origin: self.shared.clone(),
             annotations,
             results: Arc::new(snapshot),
+            sources: self.shared.window.lock().unwrap().freeze(through),
+            _source_generation: source_generation,
         }))
     }
 

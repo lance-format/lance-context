@@ -47,6 +47,8 @@ async fn prepare(
         );
         cursor = page.through;
     }
+    assert_eq!(records, frozen.sources().records);
+    assert_eq!(after, frozen.sources().after);
     let selection = annotation_publication::select_range(
         c,
         records,
@@ -60,6 +62,118 @@ async fn prepare(
     let descriptors = publication::descriptors(prepared.annotations(), &selection)?;
     let commit = annotation_publication::save(c, &selection, descriptors.clone()).await?;
     Ok((prepared, selection, descriptors, commit))
+}
+
+#[tokio::test]
+async fn annotation_source_record_limit_drains_repeated_updates_of_one_turn() -> Result<()> {
+    bounded_prefix(false).await
+}
+
+#[tokio::test]
+async fn annotation_source_byte_limit_drains_repeated_updates_of_one_turn() -> Result<()> {
+    bounded_prefix(true).await
+}
+
+async fn bounded_prefix(byte_limit: bool) -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let c = network::Cluster::open_signed(root.path(), annotation_publication::one_shard()).await?;
+    let storage = Storage::resolve(
+        root.path().join("turns.lance").to_str().unwrap().into(),
+        Default::default(),
+        Arc::new(lance::session::Session::default()),
+    )
+    .await?;
+    let limits = Limits::default();
+    let body = wire(&limits, &["T"], 1, Some("reviewed"), 0, None)?;
+    let mut binding = binding();
+    binding.max_record_bytes = body.len() as u32;
+    annotation_publication::seed_contract(&c, &storage, Service::contract(&binding, &limits)?)
+        .await?;
+    let (service, driver) = Service::connect(
+        c.client.clone(),
+        annotation_publication::one_shard(),
+        binding,
+        &storage,
+        limits,
+        MergeMemoryBudget::new(8 << 20),
+        MergeMemoryBudget::new(8 << 20),
+    )
+    .await?;
+    let driver = driver.with_publication_limits(
+        if byte_limit { p::MAX_INPUTS } else { 2 },
+        if byte_limit {
+            (body.len() * 2) as u64
+        } else {
+            c.client.max_plan_source_bytes()
+        },
+    )?;
+    let (stop, task) = run(driver);
+    let producer = producer(&service, 1).await?;
+    let mut after = 0;
+    for round in 0..3 {
+        for offset in 1..=2 {
+            let request = request(&service, &producer, round * 3 + offset, body.clone()).await?;
+            assert_eq!(
+                service
+                    .submit(&request, Duration::from_secs(10))
+                    .await?
+                    .result,
+                MutationResult::Applied
+            );
+        }
+        assert_eq!(service.source_observation().records, 2);
+        assert_eq!(service.source_observation().bytes, (body.len() * 2) as u64);
+        assert_eq!(service.observation().await.0.active_entries, 1);
+        let third = Arc::new(request(&service, &producer, round * 3 + 3, body.clone()).await?);
+        let submitted = tokio::spawn({
+            let service = service.clone();
+            let third = third.clone();
+            async move { service.submit(&third, Duration::from_secs(30)).await }
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !service.observation().await.1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await?;
+        assert!(
+            !submitted.is_finished(),
+            "source pressure must not acknowledge or reject the pending mutation"
+        );
+        assert_eq!(service.source_observation().records, 2);
+        after = publish(&c, &service, &storage, after).await?;
+        let completed = submitted.await??;
+        assert_eq!(completed.result, MutationResult::Applied);
+        assert_eq!(
+            service.submit(&third, Duration::from_secs(10)).await?,
+            completed
+        );
+        assert_eq!(
+            service
+                .get("T", Duration::from_secs(10))
+                .await?
+                .unwrap()
+                .status
+                .as_deref(),
+            Some("reviewed")
+        );
+        after = publish(&c, &service, &storage, after).await?;
+        assert_eq!(service.source_observation().records, 0);
+        assert_eq!(service.source_observation().bytes, 0);
+        let (observed, pressured) = service.observation().await;
+        assert!(!pressured);
+        assert_eq!(
+            (
+                observed.retained_entries,
+                observed.retained_bytes,
+                observed.retained_metadata_bytes
+            ),
+            (0, 0, 0)
+        );
+    }
+    stop.send(()).unwrap();
+    task.await??;
+    c.shutdown().await
 }
 
 async fn publish(

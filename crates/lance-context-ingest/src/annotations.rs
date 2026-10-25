@@ -15,8 +15,10 @@ use std::{future::Future, sync::Mutex};
 use tokio::sync::watch;
 
 pub(crate) mod checkpoint;
+mod window;
 pub mod wire;
 pub use checkpoint::{FrozenCheckpoint, PreparedCheckpoint};
+pub use window::SourceObservation;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MutationResult {
@@ -43,6 +45,8 @@ struct Progress {
 struct Shared {
     staging: AnnotationStaging,
     results: Mutex<checkpoint::Results>,
+    window: Mutex<window::Window>,
+    source_generations: Arc<tokio::sync::Semaphore>,
     ordered: tokio::sync::Mutex<()>,
     progress: watch::Sender<Progress>,
 }
@@ -116,6 +120,7 @@ impl Service {
             backpressured: false,
         });
         let outcomes = vec![None; ingress.client.producer_slots() as usize];
+        let window = window::Window::new(through, ingress.client.max_plan_source_bytes());
         let service = Self {
             ingress,
             limits,
@@ -126,6 +131,8 @@ impl Service {
                     base: snapshot,
                     latest: outcomes,
                 }),
+                window: Mutex::new(window),
+                source_generations: Arc::new(tokio::sync::Semaphore::new(2)),
                 ordered: tokio::sync::Mutex::new(()),
                 progress,
             }),
@@ -406,6 +413,13 @@ impl Driver {
             })
             .collect();
         let _ordered = service.shared.ordered.lock().await;
+        if !service.shared.window.lock().unwrap().admits(&pending.meta) {
+            service
+                .shared
+                .progress
+                .send_modify(|p| p.backpressured = true);
+            return Ok(());
+        }
         let result = match service
             .shared
             .staging
@@ -426,6 +440,12 @@ impl Driver {
         // publishing progress to waiters. Cancellation cannot split this handoff.
         let pending = self.pending.take().unwrap();
         let slot = slot(&pending.meta, ingress.client.producer_slots())?;
+        service
+            .shared
+            .window
+            .lock()
+            .unwrap()
+            .record(pending.index, pending.meta.clone());
         service.shared.results.lock().unwrap().latest[slot] = Some(Completed {
             index: pending.index,
             meta: pending.meta,
