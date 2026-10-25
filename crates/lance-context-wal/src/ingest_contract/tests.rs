@@ -26,7 +26,7 @@ fn binary_contract_fixture_preserves_field_order_policy_and_limits() {
         contract()
     );
     let mut foreign_policy = fixture;
-    foreign_policy[50] = 1;
+    foreign_policy[50] = 2;
     assert!(bincode::deserialize::<IngestContract>(&foreign_policy).is_err());
     let mut invalid_limit = fixture;
     invalid_limit[54..58].fill(0);
@@ -36,6 +36,21 @@ fn binary_contract_fixture_preserves_field_order_policy_and_limits() {
             .validate(),
         Err(ValidationError::InvalidRecordLimit)
     );
+}
+
+#[test]
+fn annotation_binding_has_a_distinct_policy_without_changing_append_bytes() {
+    let mut annotation = contract();
+    annotation.policy = WritePolicy::TurnAnnotations;
+    annotation.validate().unwrap();
+    let mut expected = bincode::serialize(&contract()).unwrap();
+    expected[50..54].copy_from_slice(&1u32.to_le_bytes());
+    assert_eq!(bincode::serialize(&annotation).unwrap(), expected);
+    assert_eq!(
+        bincode::deserialize::<IngestContract>(&expected).unwrap(),
+        annotation
+    );
+    assert_ne!(annotation, contract());
 }
 
 #[test]

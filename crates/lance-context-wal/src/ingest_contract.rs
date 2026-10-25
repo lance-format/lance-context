@@ -21,6 +21,10 @@ pub const MAX_ROWS: u32 = 1_048_576;
 pub enum WritePolicy {
     /// Caller owns unique immutable row IDs; producer dedup is a separate layer.
     ImmutableUniqueIds,
+    /// Ordered patches to existing turns' narrow annotations. This is a new
+    /// binding, not permission to reinterpret an immutable append stream.
+    /// Enable only after all voters and application workers support it.
+    TurnAnnotations,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
