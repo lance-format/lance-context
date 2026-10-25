@@ -34,6 +34,7 @@ arrow-ipc = { version = "58", optional = true }
 base64 = "0.22"
 bytes = "1"
 lance-context-core = { version = "0.6.7", path = "../lance-context-core" }
+lance-context-api = { version = "0.6.7", path = "../lance-context-api" }
 lance-context-wal = { version = "0.6.7", path = "../lance-context-wal", features = ["peer-transport", "ipc", "arrow-contract"] }
 ring = "0.17"
 serde = { version = "1", features = ["derive"] }
@@ -43,7 +44,6 @@ uuid = { version = "1.20.0", features = ["v4", "serde"] }
 
 [dev-dependencies]
 async-trait = "0.1.92"
-lance-context-api = { version = "0.6.7", path = "../lance-context-api" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
 arrow-ipc = "58"
 lance = "13.0.0"

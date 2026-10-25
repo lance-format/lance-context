@@ -18,7 +18,7 @@ use lance_table::{
 };
 use prost::Message;
 
-fn one_shard() -> Arc<Layout> {
+pub(super) fn one_shard() -> Arc<Layout> {
     let mut value = (*layout()).clone();
     value.groups.remove(&20);
     value.buckets = vec![10];
@@ -102,6 +102,19 @@ fn staging(base: Arc<Dataset>, materialized: u64) -> Result<AnnotationStaging> {
 }
 
 async fn seed(c: &network::Cluster, storage: &Storage) -> Result<()> {
+    let contract = IngestContract {
+        schema: arrow_schema_fingerprint(&patch_schema())?,
+        policy: WritePolicy::TurnAnnotations,
+        ..binding().contract()?
+    };
+    seed_contract(c, storage, contract).await
+}
+
+pub(super) async fn seed_contract(
+    c: &network::Cluster,
+    storage: &Storage,
+    contract: IngestContract,
+) -> Result<()> {
     let mut labels = ListBuilder::new(StringBuilder::new());
     for _ in 0..2 {
         labels.values().append_value("original");
@@ -140,11 +153,6 @@ async fn seed(c: &network::Cluster, storage: &Storage) -> Result<()> {
         }),
     )
     .await?;
-    let contract = IngestContract {
-        schema: arrow_schema_fingerprint(&patch_schema())?,
-        policy: WritePolicy::TurnAnnotations,
-        ..binding().contract()?
-    };
     let Applied::Publisher(p::Reply::Acquired(authority)) = command(
         c,
         Command::Acquire(p::Acquire {

@@ -101,7 +101,7 @@ pub async fn read_session(
     ))
 }
 
-async fn observe(
+pub(super) async fn observe(
     ingress: &Ingress,
     group: u64,
     query: query::Query,

@@ -31,6 +31,8 @@ use uuid::Uuid;
 
 #[cfg(feature = "materializer")]
 pub mod annotation_publication;
+#[cfg(feature = "materializer")]
+pub mod annotations;
 #[cfg(feature = "service")]
 pub mod application;
 #[cfg(feature = "materializer")]
@@ -201,6 +203,26 @@ impl Ingress {
         binding: TableBinding,
         budget: Arc<MergeMemoryBudget>,
     ) -> Result<Self> {
+        let contract = binding.contract()?;
+        Self::connect_with_schema(
+            client,
+            layout,
+            binding,
+            budget,
+            contract,
+            Arc::new(rollout_schema()),
+        )
+        .await
+    }
+
+    async fn connect_with_schema(
+        client: Arc<Client>,
+        layout: Arc<Layout>,
+        binding: TableBinding,
+        budget: Arc<MergeMemoryBudget>,
+        contract: IngestContract,
+        schema: SchemaRef,
+    ) -> Result<Self> {
         let fingerprint = layout.fingerprint()?;
         ensure!(
             client.identity() == (layout.cluster, fingerprint),
@@ -210,7 +232,7 @@ impl Ingress {
             !binding.table.is_nil() && !binding.incarnation.is_nil() && client.producer_slots() > 0,
             "ingress requires a generation and bounded producer slots"
         );
-        let contract = binding.contract()?;
+        contract.validate()?;
         ensure!(
             contract.max_record_bytes as usize <= client.max_record_bytes(),
             "contract exceeds WAL record capacity"
@@ -230,7 +252,7 @@ impl Ingress {
                 incarnation: binding.incarnation,
                 contract,
             }),
-            schema: Arc::new(rollout_schema()),
+            schema,
             budget,
             #[cfg(feature = "materializer")]
             session_read_concurrency: reader::default_concurrency(),
