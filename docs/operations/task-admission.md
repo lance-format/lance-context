@@ -41,4 +41,9 @@ A missing task returns 404 and a malformed/oversized task ID returns 400.
 prove FIFO traversal reached this task, or guarantee a claim will succeed. The
 scheduler still reserves its local capacity and runs the normal claim CAS.
 Compare `master_task_pool_in_use{pool,state}` and `/executor` claim progress
-when investigating time spent scanning or waiting for capacity.
+when investigating time spent waiting for capacity or an assignment.
+`state="waiting_for_offer"` means a reserved slot is advertised to the controller,
+without table ownership. `state="claiming"` starts after an offer arrives and
+includes exact task admission and ticket cleanup. `master_controller_offer_wait_seconds`
+includes idle periods and must not be interpreted as etcd request latency;
+`master_task_schedule_to_bind_seconds` measures a task's enqueue-to-claim wait.
