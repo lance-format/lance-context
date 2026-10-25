@@ -257,6 +257,7 @@ impl Cluster {
             materializer_memory_bytes: 64 << 20,
             http: None,
             etcd: None,
+            annotations: None,
             preparation: None,
             worker: crate::worker::Options {
                 publication: crate::materializer::Options {

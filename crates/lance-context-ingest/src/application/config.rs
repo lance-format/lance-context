@@ -82,6 +82,15 @@ pub struct Http {
     pub options: http::Options,
 }
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Annotations {
+    /// Stable deployment-authorized service address; never supplied by a client.
+    pub owner_url: String,
+    pub apply_memory_bytes: usize,
+    #[serde(default)]
+    pub staging: lance_context_core::annotation_staging::Limits,
+}
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Preparation {
     pub listen: Option<SocketAddr>,
@@ -129,6 +138,8 @@ pub struct Config {
     pub materializer_memory_bytes: usize,
     pub http: Option<Http>,
     pub etcd: Option<Etcd>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<Annotations>,
     #[serde(default)]
     pub preparation: Option<Preparation>,
     #[serde(default)]
@@ -180,6 +191,22 @@ impl Config {
             self.ingress_memory_bytes > 0 && self.materializer_memory_bytes > 0,
             "application memory budgets must be nonzero"
         );
+        if let Some(a) = &self.annotations {
+            ensure!(
+                self.tables.len() == 1 && self.layout.buckets.len() == 1,
+                "annotation application requires exactly one table and one shard"
+            );
+            ensure!(
+                a.apply_memory_bytes > 0
+                    && !a.owner_url.is_empty()
+                    && a.owner_url.len() <= 8192
+                    && self.preparation.is_none()
+                    && self.worker.publication.compaction.is_none()
+                    && self.worker.publication.session_index.is_none()
+                    && !self.worker.publication.pipeline_preparation,
+                "invalid annotation application options"
+            );
+        }
         let (mut names, mut ids, mut destinations) =
             (HashSet::new(), HashSet::new(), HashSet::new());
         for t in &self.tables {

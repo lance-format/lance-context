@@ -24,7 +24,8 @@ mod tests;
 
 /// Limits for retained annotation values/map nodes and captured point reads.
 /// Lance scan/merge workspace and RPC queues require separate admission.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, ::serde::Serialize, ::serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Limits {
     pub retained_bytes: usize,
     pub retained_entries: usize,

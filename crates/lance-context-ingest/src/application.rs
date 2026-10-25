@@ -19,6 +19,7 @@ use std::{
 };
 use tokio::net::TcpListener;
 
+pub mod annotations;
 pub mod config;
 pub use config::Config;
 
@@ -34,6 +35,10 @@ impl Registry {
     }
     pub(crate) async fn connect_with_client(config: &Config, client: Arc<Client>) -> Result<Self> {
         config.validate()?;
+        ensure!(
+            config.annotations.is_none(),
+            "use an annotation application role"
+        );
         let layout = Arc::new(config.layout.clone());
         let budget = MergeMemoryBudget::new(config.ingress_memory_bytes);
         let session = Arc::new(lance::session::Session::default());
@@ -61,20 +66,12 @@ impl Registry {
         Ok(Self { tables })
     }
     pub fn gateway(&self, options: &config::Http) -> Result<Gateway> {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Keys {
-            active: u32,
-            keys: BTreeMap<u32, [u8; 32]>,
-        }
-        let keys: Keys =
-            serde_json::from_slice(&config::read(&options.receipt_key_file, 64 << 10)?)?;
         Gateway::new(
             self.tables
                 .iter()
                 .map(|(name, a)| (name.clone(), a.ingress.clone()))
                 .collect(),
-            receipt::ReceiptKeys::new(keys.active, keys.keys)?,
+            receipt_keys(options)?,
             options.options.clone(),
         )
     }
@@ -138,9 +135,24 @@ impl Registry {
         crate::reader::read_session(&assignment.ingress, &assignment.storage, session).await
     }
 }
+
+fn receipt_keys(options: &config::Http) -> Result<receipt::ReceiptKeys> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Keys {
+        active: u32,
+        keys: BTreeMap<u32, [u8; 32]>,
+    }
+    let keys: Keys = serde_json::from_slice(&config::read(&options.receipt_key_file, 64 << 10)?)?;
+    receipt::ReceiptKeys::new(keys.active, keys.keys)
+}
 /// Run explicitly during provisioning, using the SAME persisted operation IDs
 /// after an ambiguous result. Normal ingress/worker startup never bootstraps.
 pub async fn provision(config: &Config) -> Result<()> {
+    ensure!(
+        config.annotations.is_none(),
+        "annotation generations must already be provisioned"
+    );
     let client = config.client()?;
     let layout = Arc::new(config.layout.clone());
     let session = Arc::new(lance::session::Session::default());

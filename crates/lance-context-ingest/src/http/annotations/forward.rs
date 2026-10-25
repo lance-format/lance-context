@@ -74,6 +74,7 @@ impl Forwarder {
     }
     pub fn router(&self) -> Router {
         Router::new()
+            .route("/api/v1/health", get(health))
             .route("/api/v1/annotations/{table}/producer", post(open))
             .route("/api/v1/annotations/{table}/update", post(update))
             .route("/api/v1/annotations/{table}/read", post(read))
@@ -229,6 +230,10 @@ impl Forwarder {
         };
         Ok((response, reservation))
     }
+}
+
+async fn health(State(g): State<Forwarder>) -> StatusCode {
+    super::super::health(State(g.gate)).await
 }
 
 async fn open(State(g): State<Forwarder>, Path(t): Path<String>, r: Request) -> Response {

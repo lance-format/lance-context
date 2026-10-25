@@ -27,6 +27,7 @@ impl Owner {
     }
     pub fn router(&self) -> Router {
         Router::new()
+            .route("/api/v1/health", get(health))
             .route("/api/v1/annotations/{table}/producer", post(open))
             .route("/api/v1/annotations/{table}/update", post(update))
             .route("/api/v1/annotations/{table}/read", post(read))
@@ -216,6 +217,17 @@ impl Owner {
                 )
             })?;
         Ok(response)
+    }
+}
+
+async fn health(State(owner): State<Owner>) -> StatusCode {
+    let Ok(_guard) = owner.gate.enter(false) else {
+        return StatusCode::SERVICE_UNAVAILABLE;
+    };
+    if owner.service.check_owner(&owner.authority).await.is_ok() {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
     }
 }
 

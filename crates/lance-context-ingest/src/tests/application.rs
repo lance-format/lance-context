@@ -9,6 +9,8 @@ use std::{
     process::{Child, Command},
 };
 
+mod annotations;
+
 struct Process(Child);
 impl Drop for Process {
     fn drop(&mut self) {

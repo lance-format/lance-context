@@ -175,7 +175,23 @@ impl Claim {
         options: PublishOptions,
         budget: Arc<MergeMemoryBudget>,
     ) -> Result<Option<Publisher>> {
-        let ingress = &assignment.ingress;
+        let Some(acquisition) = self.acquisition(&assignment.ingress).await? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            Publisher::acquire(
+                assignment.ingress,
+                assignment.storage,
+                options,
+                budget,
+                acquisition,
+            )
+            .await?,
+        ))
+    }
+    /// Reuse the persisted claim identity for either a file publisher or an
+    /// annotation runtime. Preserve epoch-read-before-lease-validation ordering.
+    pub(crate) async fn acquisition(&self, ingress: &Ingress) -> Result<Option<Acquisition>> {
         ensure!(
             super::super::receipt::scope_hash(&ingress.scope)? == self.scope,
             "claim belongs to another binding"
@@ -206,20 +222,11 @@ impl Claim {
         if !self.valid().await? {
             return Ok(None);
         }
-        Ok(Some(
-            Publisher::acquire(
-                assignment.ingress,
-                assignment.storage,
-                options,
-                budget,
-                Acquisition {
-                    owner: self.owner,
-                    request: self.request,
-                    expected_epoch: view.authority.epoch,
-                },
-            )
-            .await?,
-        ))
+        Ok(Some(Acquisition {
+            owner: self.owner,
+            request: self.request,
+            expected_epoch: view.authority.epoch,
+        }))
     }
     pub(crate) async fn release(mut self) -> Result<()> {
         let _ = self.stop.send(true);

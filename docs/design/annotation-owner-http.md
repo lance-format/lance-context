@@ -44,6 +44,7 @@ identity, control traffic during a partial upload, definite overload rejection,
 original outcomes after publication and source GC, epoch fencing, replacement at
 the same address, field clearing, and producer slot reuse. This is a correctness
 test, not a throughput measurement. Application configuration, authenticated role
-composition, and etcd scheduling integration are subsequent work.
+composition, and etcd scheduling integration are described in
+[Running one annotation shard](annotation-application.md).
 
 Refs #378.
