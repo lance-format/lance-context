@@ -11,6 +11,149 @@ use lance_index::{scalar::ScalarIndexParams, IndexType};
 use std::collections::BTreeSet;
 
 #[tokio::test]
+async fn cold_batches_keep_frozen_values_and_order_across_lookup_windows() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let base = fixture(&root.path().join("turns.lance")).await?;
+    let staging = AnnotationStaging::new(base, scope(), 0, Limits::default())?;
+    let status = TurnAnnotationPatch {
+        status: Set("reviewed".into()),
+        ..Default::default()
+    };
+    staging.apply(0, 1, "T", &status).await?;
+    let frozen = staging.freeze(uuid::Uuid::new_v4()).await?.unwrap();
+    let score = TurnAnnotationPatch {
+        score: Set(0.9),
+        ..Default::default()
+    };
+    let clear = TurnAnnotationPatch {
+        status: Clear,
+        ..Default::default()
+    };
+    let mut batch = (0..COLD_LOOKUP_ROWS)
+        .map(|_| Mutation {
+            turn: "T",
+            patch: &score,
+        })
+        .collect::<Vec<_>>();
+    batch[1] = Mutation {
+        turn: "U",
+        patch: &status,
+    };
+    batch.push(Mutation {
+        turn: "U",
+        patch: &score,
+    });
+    batch.push(Mutation {
+        turn: "o'hara",
+        patch: &clear,
+    });
+    staging.apply_batch(1, 2, &batch).await?;
+    for key in ["T", "U"] {
+        let value = current(&staging, key).await?;
+        assert_eq!(value.status.as_deref(), Some("reviewed"));
+        assert_eq!(value.score, Some(0.9));
+        assert_eq!(value.labels, BTreeSet::from(["original".into()]));
+    }
+    assert_eq!(current(&staging, "o'hara").await?.status, None);
+    let before = staging.observation().await;
+    let expected = current(&staging, "T").await?;
+    batch[0] = Mutation {
+        turn: "T",
+        patch: &clear,
+    };
+    batch.push(Mutation {
+        turn: "missing",
+        patch: &score,
+    });
+    assert_eq!(
+        staging.apply_committed(2, 3, &batch).await?,
+        ApplyOutcome::Rejected(Rejection {
+            row: COLD_LOOKUP_ROWS + 2,
+            reason: RejectionReason::MissingTurn,
+        })
+    );
+    assert_eq!(current(&staging, "T").await?, expected);
+    assert_eq!(
+        staging.observation().await,
+        Observation {
+            applied: 3,
+            ..before
+        }
+    );
+    let prepared = frozen
+        .prepare(&crate::MergeMemoryBudget::new(8 << 20), 8192)
+        .await?;
+    staging
+        .install_published(&prepared, commit(&prepared).await?)
+        .await?;
+    assert_eq!(current(&staging, "T").await?, expected);
+    assert_eq!(current(&staging, "U").await?.score, Some(0.9));
+    Ok(())
+}
+
+#[tokio::test]
+async fn cold_lookup_projects_narrow_rows_and_rejects_duplicate_keys() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let base = fixture(&root.path().join("turns.lance")).await?;
+    let keys = BTreeSet::from(["o'hara", "U", "T", "missing"]);
+    let rows = read_bases(&base, &keys).await?;
+    assert_eq!(rows.len(), 3);
+    for key in ["T", "U", "o'hara"] {
+        let row = &rows[key];
+        assert_eq!(row.num_rows(), 1);
+        assert_eq!(row.num_columns(), 4);
+        assert!(row.schema().field_with_name("body").is_err());
+        assert_eq!(
+            Some(decode_base_row(row, 0, key, 4096)?),
+            read_base(&base, key, 4096).await?
+        );
+    }
+    // A corrupt base must fail without installing any part of the WAL batch.
+    let batches = base
+        .scan()
+        .try_into_stream()
+        .await?
+        .try_collect::<Vec<_>>()
+        .await?;
+    let duplicate = Arc::new(
+        Dataset::write(
+            RecordBatchIterator::new(
+                batches.into_iter().map(Ok),
+                Arc::new(Schema::from(base.schema())),
+            ),
+            base.uri(),
+            Some(WriteParams {
+                mode: lance::dataset::WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await?,
+    );
+    let staging = AnnotationStaging::new(duplicate, scope(), 0, Limits::default())?;
+    let before = staging.observation().await;
+    let patch = TurnAnnotationPatch::default();
+    assert!(staging
+        .apply_batch(
+            0,
+            1,
+            &[
+                Mutation {
+                    turn: "T",
+                    patch: &patch
+                },
+                Mutation {
+                    turn: "U",
+                    patch: &patch
+                },
+            ]
+        )
+        .await
+        .is_err());
+    assert_eq!(staging.observation().await, before);
+    Ok(())
+}
+
+#[tokio::test]
 async fn result_only_generation_publishes_a_new_version_without_data_files() -> Result<()> {
     let root = tempfile::tempdir()?;
     let base = fixture(&root.path().join("turns.lance")).await?;

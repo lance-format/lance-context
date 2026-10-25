@@ -7,7 +7,7 @@
 //! is not permission to acknowledge a client or reclaim WAL records.
 use std::{collections::BTreeMap, sync::Arc};
 
-use arrow_array::{Array, Float32Array, ListArray, StringArray};
+use arrow_array::{Array, Float32Array, ListArray, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field};
 use datafusion::prelude::{col, lit};
 use futures::TryStreamExt;
@@ -331,62 +331,79 @@ impl AnnotationStaging {
         }
         let mut pending = Values::new();
         let mut batch_bytes = 0;
-        for (row, Mutation { turn, patch }) in mutations.iter().enumerate() {
-            let previous = pending
-                .get(*turn)
-                .cloned()
-                .or_else(|| state.active.get(*turn).cloned())
-                .or_else(|| {
-                    state
-                        .frozen
-                        .as_ref()
-                        .and_then(|f| f.values.get(*turn).cloned())
-                });
-            let mut current = match &previous {
-                Some(value) => value.value.clone(),
-                None => match read_base(&state.base, turn, self.limits.value_bytes).await? {
-                    Some(value) => value,
-                    None => return Ok(reject(row, RejectionReason::MissingTurn)),
-                },
-            };
-            patch
-                .apply_to(&mut current)
-                .map_err(|e| invalid(e.to_string()))?;
-            let bytes = charge(turn, &current)?;
-            if bytes > self.limits.value_bytes {
-                return Ok(reject(row, RejectionReason::ValueTooLarge));
-            }
-            batch_bytes += bytes;
-            if let Some(old) = pending.get(*turn) {
-                batch_bytes -= charge(turn, &old.value)?;
-            }
-            // Reject batches that could never fit, even with empty staging.
-            // Leave half the byte budget for an old value held during replace.
-            if batch_bytes > self.limits.retained_bytes / 2
-                || (!pending.contains_key(*turn) && pending.len() == self.limits.retained_entries)
-            {
-                return Ok(reject(row, RejectionReason::BatchTooLarge));
-            }
-            let Ok(allocation) = self.bytes.clone().try_acquire_many_owned(bytes as u32) else {
-                return Ok(PendingBatch::Backpressure);
-            };
-            let entry = match pending.get(*turn).or_else(|| state.active.get(*turn)) {
-                Some(old) => old._entry.clone(),
-                None => {
-                    let Ok(entry) = self.entries.clone().try_acquire_owned() else {
-                        return Ok(PendingBatch::Backpressure);
-                    };
-                    Arc::new(entry)
+        for (chunk_index, chunk) in mutations.chunks(COLD_LOOKUP_ROWS).enumerate() {
+            let keys = chunk
+                .iter()
+                .map(|m| m.turn)
+                .filter(|turn| {
+                    !pending.contains_key(*turn)
+                        && !state.active.contains_key(*turn)
+                        && !state
+                            .frozen
+                            .as_ref()
+                            .is_some_and(|f| f.values.contains_key(*turn))
+                })
+                .collect::<std::collections::BTreeSet<_>>();
+            let mut cold = read_bases(&state.base, &keys).await?;
+            for (offset, Mutation { turn, patch }) in chunk.iter().enumerate() {
+                let row = chunk_index * COLD_LOOKUP_ROWS + offset;
+                let previous = pending
+                    .get(*turn)
+                    .cloned()
+                    .or_else(|| state.active.get(*turn).cloned())
+                    .or_else(|| {
+                        state
+                            .frozen
+                            .as_ref()
+                            .and_then(|f| f.values.get(*turn).cloned())
+                    });
+                let mut current = match &previous {
+                    Some(value) => value.value.clone(),
+                    None => match cold.remove(*turn) {
+                        Some(batch) => decode_base_row(&batch, 0, turn, self.limits.value_bytes)?,
+                        None => return Ok(reject(row, RejectionReason::MissingTurn)),
+                    },
+                };
+                patch
+                    .apply_to(&mut current)
+                    .map_err(|e| invalid(e.to_string()))?;
+                let bytes = charge(turn, &current)?;
+                if bytes > self.limits.value_bytes {
+                    return Ok(reject(row, RejectionReason::ValueTooLarge));
                 }
-            };
-            pending.insert(
-                (*turn).to_owned(),
-                Arc::new(Stored {
-                    value: current,
-                    _bytes: allocation,
-                    _entry: entry,
-                }),
-            );
+                batch_bytes += bytes;
+                if let Some(old) = pending.get(*turn) {
+                    batch_bytes -= charge(turn, &old.value)?;
+                }
+                // Reject batches that could never fit, even with empty staging.
+                // Leave half the byte budget for an old value held during replace.
+                if batch_bytes > self.limits.retained_bytes / 2
+                    || (!pending.contains_key(*turn)
+                        && pending.len() == self.limits.retained_entries)
+                {
+                    return Ok(reject(row, RejectionReason::BatchTooLarge));
+                }
+                let Ok(allocation) = self.bytes.clone().try_acquire_many_owned(bytes as u32) else {
+                    return Ok(PendingBatch::Backpressure);
+                };
+                let entry = match pending.get(*turn).or_else(|| state.active.get(*turn)) {
+                    Some(old) => old._entry.clone(),
+                    None => {
+                        let Ok(entry) = self.entries.clone().try_acquire_owned() else {
+                            return Ok(PendingBatch::Backpressure);
+                        };
+                        Arc::new(entry)
+                    }
+                };
+                pending.insert(
+                    (*turn).to_owned(),
+                    Arc::new(Stored {
+                        value: current,
+                        _bytes: allocation,
+                        _entry: entry,
+                    }),
+                );
+            }
         }
         Ok(PendingBatch::Values(pending))
     }
@@ -511,75 +528,125 @@ async fn read_base(base: &Dataset, turn: &str, max_bytes: usize) -> Result<Optio
             if value.is_some() {
                 return Err(invalid("duplicate annotation turn key in Lance"));
             }
-            let labels = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .ok_or_else(|| invalid("invalid annotation labels"))?;
-            let status = batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| invalid("invalid annotation status"))?;
-            let score = batch
-                .column(2)
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .ok_or_else(|| invalid("invalid annotation score"))?;
-            let strings = labels.value(row);
-            let strings = strings
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| invalid("invalid annotation label values"))?;
-            // Additive migration can represent an unset label set as a virtual
-            // all-null column. Its logical value is empty; ignore hidden values
-            // beneath a null list slot. Published annotations write actual sets.
-            let label_count = if labels.is_null(row) {
-                0
-            } else {
-                strings.len()
-            };
-            // Bound owned-value allocation before copying projected strings.
-            // The scanner's Arrow buffers still use its separate Lance budget.
-            let mut projected_bytes = 512usize
-                .checked_add(turn.len())
-                .and_then(|n| {
-                    n.checked_add(if status.is_null(row) {
-                        0
-                    } else {
-                        status.value(row).len()
-                    })
-                })
-                .ok_or_else(|| invalid("base annotation size overflow"))?;
-            for label in strings.iter().take(label_count) {
-                let label = label
-                    .filter(|s| !s.is_empty())
-                    .ok_or_else(|| invalid("null/empty annotation label"))?;
-                projected_bytes = projected_bytes
-                    .checked_add(512)
-                    .and_then(|n| n.checked_add(label.len()))
-                    .ok_or_else(|| invalid("base annotation size overflow"))?;
-            }
-            if projected_bytes > max_bytes {
-                return Err(invalid("base annotation exceeds value budget"));
-            }
-            let mut current = TurnAnnotation {
-                status: (!status.is_null(row)).then(|| status.value(row).to_owned()),
-                score: (!score.is_null(row)).then(|| score.value(row)),
-                ..Default::default()
-            };
-            for label in strings.iter().take(label_count) {
-                let label = label
-                    .filter(|s| !s.is_empty())
-                    .ok_or_else(|| invalid("null/empty annotation label"))?;
-                current.labels.insert(label.to_owned());
-            }
-            if current.score.is_some_and(|s| !s.is_finite()) || charge(turn, &current)? > max_bytes
-            {
-                return Err(invalid("invalid/oversized base annotation"));
-            }
-            value = Some(current);
+            value = Some(decode_base_row(&batch, row, turn, max_bytes)?);
         }
     }
     Ok(value)
+}
+
+// Keep the cold lookup's projected Arrow rows bounded independently of the
+// accepted WAL batch. Values are decoded one at a time in mutation order;
+// slices share the scanner's Arrow buffers, not cloned annotation strings.
+const COLD_LOOKUP_ROWS: usize = 128;
+
+async fn read_bases<'a>(
+    base: &Dataset,
+    turns: &std::collections::BTreeSet<&'a str>,
+) -> Result<BTreeMap<&'a str, RecordBatch>> {
+    let mut rows = BTreeMap::new();
+    if turns.is_empty() {
+        return Ok(rows);
+    }
+    let mut scan = base.scan();
+    scan.project(&["labels", "status", "score", "id"])?;
+    scan.filter_expr(col("id").in_list(turns.iter().map(|turn| lit(*turn)).collect(), false));
+    // A valid table returns at most one row per requested key. One extra row
+    // proves a duplicate without retaining an unbounded corrupt result set.
+    scan.limit(Some(turns.len() as i64 + 1), None)?;
+    scan.batch_size(COLD_LOOKUP_ROWS);
+    let mut stream = scan.try_into_stream().await?;
+    while let Some(batch) = stream.try_next().await? {
+        let ids = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| invalid("invalid annotation id"))?;
+        for row in 0..batch.num_rows() {
+            let turn = ids
+                .is_valid(row)
+                .then(|| ids.value(row))
+                .and_then(|id| turns.get(id))
+                .copied()
+                .ok_or_else(|| invalid("unexpected annotation lookup key"))?;
+            if rows.insert(turn, batch.slice(row, 1)).is_some() {
+                return Err(invalid("duplicate annotation turn key in Lance"));
+            }
+        }
+    }
+    Ok(rows)
+}
+
+fn decode_base_row(
+    batch: &RecordBatch,
+    row: usize,
+    turn: &str,
+    max_bytes: usize,
+) -> Result<TurnAnnotation> {
+    let labels = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .ok_or_else(|| invalid("invalid annotation labels"))?;
+    let status = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| invalid("invalid annotation status"))?;
+    let score = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .ok_or_else(|| invalid("invalid annotation score"))?;
+    let strings = labels.value(row);
+    let strings = strings
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| invalid("invalid annotation label values"))?;
+    // Additive migration can represent an unset label set as a virtual
+    // all-null column. Its logical value is empty; ignore hidden values
+    // beneath a null list slot. Published annotations write actual sets.
+    let label_count = if labels.is_null(row) {
+        0
+    } else {
+        strings.len()
+    };
+    // Bound owned-value allocation before copying projected strings.
+    // The scanner's Arrow buffers still use its separate Lance budget.
+    let mut projected_bytes = 512usize
+        .checked_add(turn.len())
+        .and_then(|n| {
+            n.checked_add(if status.is_null(row) {
+                0
+            } else {
+                status.value(row).len()
+            })
+        })
+        .ok_or_else(|| invalid("base annotation size overflow"))?;
+    for label in strings.iter().take(label_count) {
+        let label = label
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| invalid("null/empty annotation label"))?;
+        projected_bytes = projected_bytes
+            .checked_add(512)
+            .and_then(|n| n.checked_add(label.len()))
+            .ok_or_else(|| invalid("base annotation size overflow"))?;
+    }
+    if projected_bytes > max_bytes {
+        return Err(invalid("base annotation exceeds value budget"));
+    }
+    let mut current = TurnAnnotation {
+        status: (!status.is_null(row)).then(|| status.value(row).to_owned()),
+        score: (!score.is_null(row)).then(|| score.value(row)),
+        ..Default::default()
+    };
+    for label in strings.iter().take(label_count) {
+        let label = label
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| invalid("null/empty annotation label"))?;
+        current.labels.insert(label.to_owned());
+    }
+    if current.score.is_some_and(|s| !s.is_finite()) || charge(turn, &current)? > max_bytes {
+        return Err(invalid("invalid/oversized base annotation"));
+    }
+    Ok(current)
 }
