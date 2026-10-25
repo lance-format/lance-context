@@ -23,6 +23,7 @@ pub mod rollout_append;
 pub mod routes;
 pub mod scanner;
 pub mod scheduler;
+#[cfg(test)]
 mod scheduler_wakeup;
 pub mod scoring;
 pub mod state;

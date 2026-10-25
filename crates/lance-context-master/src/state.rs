@@ -156,7 +156,7 @@ impl MasterState {
                 "legacy foreground interval must be positive",
             ));
         }
-        let task_store = TaskStore::open(&config).await?;
+        let task_store = TaskStore::open_executor(&config).await?;
         config.merge_rollout.fence_legacy = task_store
             .merge_coordinator()
             .legacy_fencing_mode(config.merge_rollout.fence_legacy)

@@ -237,6 +237,7 @@ jobs:
             --skip active_execution_inventory_bounds_duplicate_reads \
             --skip demand_controller::tests::one_ten_fifty_followers_do_not_multiply_discovery_reads_and_take_over \
             --skip demand_controller::tests::active_inventory_reconciles_without_rpc_and_watch_releases_suppression \
+            --skip demand_controller::dispatch::tests::fifty_executors_do_not_repeat_blocked_candidate_reads_and_reach_tail \
             --skip demand_controller::tests::compaction_forces_consistent_relist_and_retains_new_demand \
             --skip execution_watch_compaction_requires_fresh_snapshot_then_resumes \
             --skip task_store::tests::bounded_scheduler_compacted_snapshot_restarts_without_stealing_locks
@@ -266,7 +267,7 @@ jobs:
           cargo test -p lance-context-master --lib \
             scheduler::tests::active_execution_inventory_bounds_duplicate_reads \
             -- --exact --ignored --test-threads=1
-          cargo test -p lance-context-master --lib demand_controller::tests \
+          cargo test -p lance-context-master --lib demand_controller:: \
             -- --ignored --test-threads=1
 
       - name: Ingestion application process recovery
@@ -363,6 +364,7 @@ jobs:
             --skip active_execution_inventory_bounds_duplicate_reads \
             --skip demand_controller::tests::one_ten_fifty_followers_do_not_multiply_discovery_reads_and_take_over \
             --skip demand_controller::tests::active_inventory_reconciles_without_rpc_and_watch_releases_suppression \
+            --skip demand_controller::dispatch::tests::fifty_executors_do_not_repeat_blocked_candidate_reads_and_reach_tail \
             --skip demand_controller::tests::compaction_forces_consistent_relist_and_retains_new_demand \
             --skip execution_watch_compaction_requires_fresh_snapshot_then_resumes \
             --skip task_store::tests::bounded_scheduler_compacted_snapshot_restarts_without_stealing_locks
@@ -392,7 +394,7 @@ jobs:
             scheduler::tests::active_execution_inventory_bounds_duplicate_reads \
             --exact --ignored --test-threads=1
           cargo llvm-cov --no-report --all-features -p lance-context-master --lib -- \
-            demand_controller::tests --ignored --test-threads=1
+            demand_controller:: --ignored --test-threads=1
       - name: Merge coverage reports
         run: cargo llvm-cov report --lcov --output-path lcov.info
       - name: Save coverage report
