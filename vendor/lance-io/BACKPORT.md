@@ -56,3 +56,34 @@ archive contains the byte-identical patched throttle source.
 
 Remove this patch after a compatible published Lance release includes the fix
 and the same regressions pass against that release.
+
+## Azure completion after a lost success response
+
+The workspace and this crate's standalone test manifest temporarily pin
+`object_store 0.14.2` to commit
+`09b0593d4702ba390bab1710b3e67f86fd7defcb` in the maintainer's fork of
+`apache/arrow-rs-object-store`, implementing
+[upstream PR #886](https://github.com/apache/arrow-rs-object-store/pull/886).
+The base commit `279572ea60f3a7a6e5237e066a6f4a35eee611e0` has the same 59 Rust
+source files and original Cargo manifest as the published 0.14.2 package.
+The only source changes are the Azure block-list serializer and its tests.
+This does not upgrade object_store, Lance, or the separate object_store 0.13.2
+used transitively by DataFusion.
+
+Azure moves selected blocks from uncommitted to committed when completion
+succeeds. If the success response is lost, replaying `<Uncommitted>` entries
+returns `InvalidBlockList`. `<Latest>` resolves the same upload's block IDs
+from either state, preserving the existing HTTP request retry without
+re-uploading parts or retrying arbitrary HTTP 400 responses. Serialization
+changes before request signing; signed bodies are never rewritten.
+
+The upstream regression exercises actual SDK retries with a stateful transport,
+including a separate genuine missing-block failure. The serializer fix was also
+verified with a lost successful response against real Azure using SDK 0.14.2:
+the original request fails on retry, the fixed request succeeds, and both
+objects read back with the expected payload before cleanup. The existing
+36-part throttle regression now expects `Latest` entries while retaining its
+checks for identical requests, headers, bounded retries, and no re-uploads.
+
+Replace the fork pin with an upstream commit containing the fix when available,
+and remove both patches after a compatible crates.io release includes it.

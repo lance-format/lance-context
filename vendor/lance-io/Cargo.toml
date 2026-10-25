@@ -365,3 +365,7 @@ check-cfg = ["cfg(coverage,coverage_nightly)"]
 [dependencies.quick-xml]
 version = "0.41"
 optional = true
+
+# Match the workspace patch when running this backport's standalone tests.
+[patch.crates-io]
+object_store = { git = "https://github.com/beinan/arrow-rs-object-store", rev = "09b0593d4702ba390bab1710b3e67f86fd7defcb" }
