@@ -16,6 +16,8 @@ use {
 };
 
 #[cfg(feature = "materializer")]
+mod annotation_publication;
+#[cfg(feature = "materializer")]
 mod bootstrap;
 #[cfg(all(feature = "http-client", feature = "materializer"))]
 mod http;
