@@ -198,6 +198,7 @@ impl Drop for PoolPhase {
 #[derive(Default)]
 pub(crate) struct Receiver {
     session: Option<Session>,
+    resuming: Arc<crate::merge_capacity::Resuming>,
 }
 
 struct Session {
@@ -256,6 +257,13 @@ impl Session {
 }
 
 impl Receiver {
+    pub(crate) fn new(resuming: Arc<crate::merge_capacity::Resuming>) -> Self {
+        Self {
+            session: None,
+            resuming,
+        }
+    }
+
     pub(crate) async fn close(&mut self, store: &TaskStore) -> lance::Result<()> {
         if let Some(session) = self.session.take() {
             // No canonical task is attached to this lease.
@@ -352,7 +360,15 @@ impl Receiver {
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
         };
-        let received = tokio::select! { result = waiting => result, _ = stopped => Ok(None) };
+        let received = tokio::select! {
+            biased;
+            _ = self.resuming.wait() => {
+                metrics::counter!("master_controller_idle_reservation_yields_total", "pool" => ticket.pool.clone()).increment(1);
+                Ok(None)
+            },
+            result = waiting => result,
+            _ = stopped => Ok(None),
+        };
         let claim_start = std::time::Instant::now();
         if matches!(&received, Ok(Some(_))) {
             metrics::histogram!("master_controller_offer_wait_seconds", "pool" => ticket.pool.clone())
@@ -1041,6 +1057,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires exclusive loopback ETCD_TEST_ENDPOINTS"]
     async fn receiver_reuses_lease_and_watch_and_withdraws_busy_capacity() {
+        assert_eq!(std::env::var("ETCD_TEST_EXCLUSIVE").as_deref(), Ok("1"));
         let (_dir, cfg, store, leader) = setup().await;
         let state = crate::state::MasterState::new(cfg.clone()).await.unwrap();
         let publisher = store.discovery_publisher(&leader);

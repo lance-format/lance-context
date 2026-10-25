@@ -26,6 +26,13 @@ The offer itself grants no storage ownership. The receiving executor uses the
 original exact task admission/claim transaction, with ticket/offer/reservation
 comparisons added. Accepted claims retain their own leases and storage fencing.
 Losing leadership or the capacity lease does not cancel productive execution.
+When a previously yielded legacy HTTP response arrives, it first joins its
+pool's fair semaphore queue, then notifies that pool's idle receiver to withdraw
+its capacity reservation. Otherwise a receiver could hold the last slot while
+waiting for a task that depends on the returning execution finishing. Responses
+still in flight do not signal, and unrelated pools keep their capacity. A resume
+guard clears the notification state on reacquisition or cancellation. A claim
+already in flight is joined rather than canceled.
 Only one unaccepted offer per target is published at a time. Consumption removes
 that restriction, so preparation sharing still permits compaction and merge
 to execute concurrently under their existing canonical admission rules.
@@ -116,3 +123,11 @@ the same traffic with all unary RPCs and stream starts reported separately befor
 claiming an end-to-end improvement. Stream starts are not message counts or an
 estimate of total etcd CPU. The fixture is small local traffic, not production
 throughput evidence, and one earlier run had a 7.35-second list-read outlier.
+
+A CI failure exposed the last-slot response/dependency cycle above. The regression
+test now deterministically waits for the idle reservation before releasing the
+old response: it fails before the fix and completes afterward using the original
+timeout. A separate test checks pool isolation and canceled-resumer cleanup.
+`master_controller_idle_reservation_yields_total{pool}` counts reservations
+withdrawn for ready executions. The receiver RPC-count test runs in the existing
+exclusive etcd step, so concurrent suites cannot contaminate global counters.

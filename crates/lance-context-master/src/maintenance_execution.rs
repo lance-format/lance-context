@@ -743,6 +743,7 @@ mod tests {
                 Duration::from_secs(1),
                 metrics::gauge!("test_maintenance_progress_running"),
                 operation,
+                Arc::default(),
             ));
         }
         let read_done = Notify::new();

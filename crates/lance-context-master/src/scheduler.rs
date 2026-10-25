@@ -1473,7 +1473,8 @@ fn spawn_filtered_pool_poller(
     running.set(0.0);
     tokio::spawn(async move {
         let executor = state.admission.status().executor_id;
-        let mut receiver = crate::demand_controller::dispatch::Receiver::default();
+        let resuming = Arc::new(crate::merge_capacity::Resuming::default());
+        let mut receiver = crate::demand_controller::dispatch::Receiver::new(resuming.clone());
         loop {
             if !state.admission.is_accepting() {
                 if let Err(error) = receiver.close(&state.task_store).await {
@@ -1540,6 +1541,7 @@ fn spawn_filtered_pool_poller(
                             Duration::from_secs(state.config.legacy_merge_foreground_secs),
                             running.clone(),
                             operation.clone(),
+                            resuming.clone(),
                         );
                         tokio::spawn(async move {
                             crate::merge_capacity::scope(capacity, run_task(&st, claim, timing))
@@ -4680,6 +4682,22 @@ mod tests {
             TaskState::Queued
         );
         assert!(state.admission.status().active_operations > 0);
+        // Make the idle reservation deterministic: the only free slot is
+        // advertised while the next queued task still depends on this response.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !state
+                .admission
+                .status()
+                .operations
+                .values()
+                .any(|op| op.phase == "waiting_for_offer")
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(pool.available_permits(), 0);
         release.notify_one();
         tokio::time::timeout(Duration::from_secs(10), async {
             while state
