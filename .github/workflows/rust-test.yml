@@ -174,7 +174,9 @@ jobs:
 
   ha-tests:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    # Cold feature builds and recovery tests can take 59 minutes before cache
+    # upload. Leave room for cleanup so passing tests do not end as cancelled.
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
       - name: Setup rust toolchain
