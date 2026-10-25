@@ -516,18 +516,28 @@ struct CommitWaitProgress {
 }
 
 impl CommitWaitProgress {
+    #[cfg(test)]
     fn observe(
         &mut self,
         snapshot: &lance_context_merge::progress::ProgressSnapshot,
         waited: Duration,
     ) {
-        if snapshot.execution.phase != lance_context_merge::Phase::Running {
+        self.observe_execution(&snapshot.execution, snapshot.progress.as_ref(), waited);
+    }
+
+    fn observe_execution(
+        &mut self,
+        execution: &lance_context_merge::Execution,
+        progress: Option<&lance_context_merge::progress::ExecutionProgress>,
+        waited: Duration,
+    ) {
+        if execution.phase != lance_context_merge::Phase::Running {
             return;
         }
-        let Some(progress) = &snapshot.progress else {
+        let Some(progress) = progress else {
             return;
         };
-        let id = &snapshot.execution.id;
+        let id = &execution.id;
         match &mut self.seen {
             Some((previous_id, previous_sequence)) if previous_id == id => {
                 if progress.sequence > *previous_sequence {
@@ -558,8 +568,6 @@ async fn wait_for_maintenance_commit(
 ) -> Result<(), String> {
     let waiting = std::time::Instant::now();
     let mut progress = CommitWaitProgress::default();
-    let mut next_progress_read = Duration::ZERO;
-    let coordinator = state.task_store.merge_coordinator();
     let wait_budget = match claim.task.kind {
         TaskKind::IndexId => state.config.maintenance.index_commit_wait_secs,
         _ => state.config.maintenance.compaction_commit_wait_secs,
@@ -572,47 +580,85 @@ async fn wait_for_maintenance_commit(
     {
         return Err("maintenance preparation claim lost before requesting commit".into());
     }
+    let budget = Duration::from_secs(wait_budget);
+    let mut changes = None;
+    let mut attempt = true;
     loop {
-        if !state
-            .task_store
-            .preparation_owned(claim)
-            .await
-            .map_err(|e| e.to_string())?
-        {
+        if changes.is_none() {
+            let opened = tokio::time::timeout(
+                Duration::from_secs(2),
+                state.task_store.watch_maintenance_commit(claim),
+            )
+            .await;
+            match opened {
+                Ok(Ok(watch)) => {
+                    changes = Some(watch);
+                    attempt = true;
+                }
+                error => {
+                    // Read/watch failures never authorize a write or reset the
+                    // useful-progress budget. Reconnect from a fresh revision.
+                    metrics::counter!("master_maintenance_commit_watch_reconnects_total")
+                        .increment(1);
+                    let error = match error {
+                        Ok(Err(error)) => error.to_string(),
+                        Err(error) => error.to_string(),
+                        Ok(Ok(_)) => unreachable!("successful watch handled above"),
+                    };
+                    tracing::warn!(%error, "maintenance commit watch could not open");
+                    let remaining = budget.saturating_sub(progress.idle_for(waiting.elapsed()));
+                    if remaining.is_zero() {
+                        record_commit_turn(claim.task.kind, waiting.elapsed(), "expired");
+                        return Err(
+                            "maintenance commit ownership wait budget exhausted; reprepare".into(),
+                        );
+                    }
+                    tokio::time::sleep(remaining.min(Duration::from_secs(1))).await;
+                    continue;
+                }
+            }
+        }
+        let watch = changes.as_mut().expect("maintenance watch opened");
+        if !watch.preparation_owned() {
             return Err("maintenance preparation claim lost before commit".into());
         }
-        if state
-            .task_store
-            .promote_maintenance(claim)
-            .await
-            .map_err(|e| e.to_string())?
-        {
-            record_commit_turn(claim.task.kind, waiting.elapsed(), "served");
-            return Ok(());
+        if let Some(execution) = watch.execution() {
+            progress.observe_execution(execution, watch.progress(), waiting.elapsed());
         }
-        // Observe at most once per second, only after promotion definitively
-        // declined. Progress is not ownership: the next promotion must still
-        // pass every existing claim/lock compare. Bound this optional read so
-        // unavailable progress cannot pin a preparation slot indefinitely.
-        if wait_budget > 0 && waiting.elapsed() >= next_progress_read {
-            if let Ok(Ok(Some(snapshot))) = tokio::time::timeout(
-                Duration::from_secs(1),
-                coordinator.progress_snapshot(&claim.task.target),
-            )
-            .await
+        if attempt {
+            // Notifications only wake this existing atomic protocol. Never
+            // cancel an in-flight promotion, including at the idle deadline.
+            if state
+                .task_store
+                .promote_maintenance(claim)
+                .await
+                .map_err(|e| e.to_string())?
             {
-                progress.observe(&snapshot, waiting.elapsed());
+                record_commit_turn(claim.task.kind, waiting.elapsed(), "served");
+                return Ok(());
             }
-            next_progress_read = waiting.elapsed() + Duration::from_secs(1);
+            attempt = false;
         }
-        // Heartbeats and storage/ownership uncertainty never reset this idle
-        // budget. Never cancel an in-flight acquisition and mistake an accepted
-        // claim for a timeout. Expiry leaves the current writer untouched.
-        if progress.idle_for(waiting.elapsed()) >= Duration::from_secs(wait_budget) {
+        let remaining = budget.saturating_sub(progress.idle_for(waiting.elapsed()));
+        if remaining.is_zero() {
             record_commit_turn(claim.task.kind, waiting.elapsed(), "expired");
             return Err("maintenance commit ownership wait budget exhausted; reprepare".into());
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Unchanged state issues no RPC. Progress events update the idle budget
+        // locally; only ownership changes retry the fenced promotion.
+        match tokio::time::timeout(remaining, watch.changed()).await {
+            Ok(Ok(crate::task_store::MaintenanceChange::Ownership)) => attempt = true,
+            Ok(Ok(crate::task_store::MaintenanceChange::Progress)) => {}
+            Ok(Ok(crate::task_store::MaintenanceChange::Resnapshot)) => changes = None,
+            Ok(Err(error)) => {
+                metrics::counter!("master_maintenance_commit_watch_reconnects_total").increment(1);
+                tracing::warn!(%error, "maintenance commit watch ended; retaining progress budget");
+                changes = None;
+                let remaining = budget.saturating_sub(progress.idle_for(waiting.elapsed()));
+                tokio::time::sleep(remaining.min(Duration::from_secs(1))).await;
+            }
+            Err(_) => {}
+        }
     }
 }
 
@@ -1705,6 +1751,340 @@ mod tests {
     #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn commit_wait_yields_when_real_progress_stops() {
         exercise_commit_wait(TaskKind::IndexId, 2).await;
+    }
+
+    async fn held_commit_turn() -> (
+        TempDir,
+        Arc<MasterState>,
+        TaskClaim,
+        TaskClaim,
+        lance_context_merge::Execution,
+    ) {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.maintenance.index_prepare_targets = vec!["exp".into()];
+        cfg.maintenance.index_commit_wait_secs = 10;
+        let state = MasterState::new(cfg).await.unwrap();
+        enqueue(&state, TaskKind::IndexId, "exp").await.unwrap();
+        let prep = state
+            .task_store
+            .claim_next_of_kinds(TaskKinds::GENERAL)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(prep.preparing_maintenance());
+        enqueue(&state, TaskKind::MergeWal, "exp").await.unwrap();
+        let merge = state
+            .task_store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        let coordinator = state.task_store.merge_coordinator();
+        let execution = lance_context_merge::Execution::new("exp", "worker", "instance", 600);
+        assert!(coordinator
+            .reserve(&state.task_store.merge_claim(&merge), &execution)
+            .await
+            .unwrap());
+        let running = coordinator.start(&execution).await.unwrap().unwrap();
+        assert!(coordinator.publish_progress(&running, 0).await.unwrap());
+        (dir, state, prep, merge, running)
+    }
+
+    async fn maintenance_rpc_count(endpoint: &str, methods: &[&str]) -> u64 {
+        reqwest::get(format!("{endpoint}/metrics"))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap()
+            .lines()
+            .filter(|line| {
+                line.starts_with("grpc_server_started_total{")
+                    && methods
+                        .iter()
+                        .any(|method| line.contains(&format!("grpc_method=\"{method}\"")))
+            })
+            .map(|line| {
+                line.split_whitespace()
+                    .last()
+                    .unwrap()
+                    .parse::<f64>()
+                    .unwrap() as u64
+            })
+            .sum()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires exclusive etcd for RPC counts"]
+    async fn quiet_maintenance_commit_wait_does_not_poll_etcd() {
+        assert_eq!(std::env::var("ETCD_TEST_EXCLUSIVE").as_deref(), Ok("1"));
+        let (_dir, state, mut prep, merge, running) = held_commit_turn().await;
+        let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+        let watching = maintenance_rpc_count(&endpoint, &["Watch"]).await;
+        let waiting_state = state.clone();
+        let waiter = tokio::spawn(async move {
+            let result = wait_for_maintenance_commit(&waiting_state, &mut prep).await;
+            (prep, result)
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while maintenance_rpc_count(&endpoint, &["Watch"]).await == watching {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let before = maintenance_rpc_count(&endpoint, &["Range", "Txn"]).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(!waiter.is_finished());
+        let quiet = maintenance_rpc_count(&endpoint, &["Range", "Txn"]).await - before;
+        // The first fenced promotion may race the first Watch observation.
+        assert!(quiet <= 1, "quiet wait issued {quiet} Range/Txn RPCs");
+        let coordinator = state.task_store.merge_coordinator();
+        let before = maintenance_rpc_count(&endpoint, &["Range", "Txn"]).await;
+        for sequence in 1..=4 {
+            assert!(coordinator
+                .publish_progress(&running, sequence)
+                .await
+                .unwrap());
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let progressing = maintenance_rpc_count(&endpoint, &["Range", "Txn"]).await - before;
+        assert_eq!(
+            progressing, 4,
+            "only the four progress publications should access etcd"
+        );
+        assert!(coordinator.finish(&running, Ok(4)).await.unwrap());
+        assert!(coordinator
+            .release(
+                &state.task_store.merge_claim(&merge),
+                &running.finished(Ok(4))
+            )
+            .await
+            .unwrap());
+        state
+            .task_store
+            .finish(merge, Ok("writer done".into()))
+            .await
+            .unwrap();
+        let (prep, result) = tokio::time::timeout(Duration::from_secs(3), waiter)
+            .await
+            .unwrap()
+            .unwrap();
+        result.unwrap();
+        assert!(!prep.preparing_maintenance());
+        state
+            .task_store
+            .finish(prep, Ok("commit granted".into()))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires etcd"]
+    async fn maintenance_watch_observes_release_before_wait_and_rejects_lost_claim() {
+        let (_dir, state, mut prep, merge, running) = held_commit_turn().await;
+        let snapshot = state
+            .task_store
+            .capture_maintenance_commit(&prep)
+            .await
+            .unwrap();
+        assert!(state
+            .task_store
+            .request_maintenance_commit(&prep)
+            .await
+            .unwrap());
+        let coordinator = state.task_store.merge_coordinator();
+        assert!(coordinator.finish(&running, Ok(1)).await.unwrap());
+        assert!(coordinator
+            .release(
+                &state.task_store.merge_claim(&merge),
+                &running.finished(Ok(1))
+            )
+            .await
+            .unwrap());
+        state
+            .task_store
+            .finish(merge, Ok("writer done".into()))
+            .await
+            .unwrap();
+        // Release occurred after capture, before any Watch was registered.
+        let mut watch = snapshot
+            .subscribe(state.task_store.etcd_client())
+            .await
+            .unwrap();
+        assert!(watch.preparation_owned());
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if matches!(
+                    watch.changed().await.unwrap(),
+                    crate::task_store::MaintenanceChange::Resnapshot
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let mut watch = state
+            .task_store
+            .watch_maintenance_commit(&prep)
+            .await
+            .unwrap();
+        assert!(watch.execution().is_none());
+        let mut client = state.task_store.etcd_client().clone();
+        let key = format!(
+            "{}/claims/{}",
+            state.config.etcd.prefix().trim_end_matches('/'),
+            prep.task.id
+        );
+        let lease = client.get(key, None).await.unwrap().kvs()[0].lease();
+        client.lease_revoke(lease).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while watch.preparation_owned() {
+                watch.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!state
+            .task_store
+            .promote_maintenance(&mut prep)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires etcd"]
+    async fn maintenance_watch_same_execution_value_change_retries_promotion() {
+        let (_dir, state, prep, merge, running) = held_commit_turn().await;
+        let mut watch = state
+            .task_store
+            .watch_maintenance_commit(&prep)
+            .await
+            .unwrap();
+        let coordinator = state.task_store.merge_coordinator();
+        assert!(coordinator.finish(&running, Ok(1)).await.unwrap());
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if matches!(
+                    watch.changed().await.unwrap(),
+                    crate::task_store::MaintenanceChange::Ownership
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(watch.execution().unwrap().id, running.id);
+        assert_eq!(
+            watch.execution().unwrap().phase,
+            lance_context_merge::Phase::Finished
+        );
+        assert!(coordinator
+            .release(
+                &state.task_store.merge_claim(&merge),
+                &running.finished(Ok(1))
+            )
+            .await
+            .unwrap());
+        state
+            .task_store
+            .finish(merge, Ok("writer done".into()))
+            .await
+            .unwrap();
+        state
+            .task_store
+            .finish(prep, Err("test preparation discarded".into()))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires exclusive etcd and compaction opt-in"]
+    async fn maintenance_watch_registration_compaction_requires_fresh_snapshot() {
+        assert_eq!(std::env::var("ETCD_TEST_EXCLUSIVE").as_deref(), Ok("1"));
+        assert_eq!(
+            std::env::var("ETCD_TEST_ALLOW_COMPACTION").as_deref(),
+            Ok("1")
+        );
+        let (_dir, state, mut prep, merge, running) = held_commit_turn().await;
+        let snapshot = state
+            .task_store
+            .capture_maintenance_commit(&prep)
+            .await
+            .unwrap();
+        let coordinator = state.task_store.merge_coordinator();
+        assert!(coordinator.publish_progress(&running, 1).await.unwrap());
+        assert!(coordinator.publish_progress(&running, 2).await.unwrap());
+        let mut client = state.task_store.etcd_client().clone();
+        let revision = client
+            .get(
+                lance_context_merge::execution_key(state.config.etcd.prefix(), "exp"),
+                None,
+            )
+            .await
+            .unwrap()
+            .header()
+            .unwrap()
+            .revision();
+        client.compact(revision, None).await.unwrap();
+        let mut obsolete = snapshot.subscribe(&client).await.unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(3), obsolete.changed())
+            .await
+            .unwrap()
+            .err()
+            .expect("compacted start revision must be rejected");
+        assert!(error.to_string().contains("canceled"));
+        drop(obsolete);
+        let mut fresh = state
+            .task_store
+            .watch_maintenance_commit(&prep)
+            .await
+            .unwrap();
+        assert!(fresh.preparation_owned());
+        assert_eq!(fresh.progress().unwrap().sequence, 2);
+        assert!(!state
+            .task_store
+            .promote_maintenance(&mut prep)
+            .await
+            .unwrap());
+        assert!(coordinator.finish(&running, Ok(2)).await.unwrap());
+        assert!(coordinator
+            .release(
+                &state.task_store.merge_claim(&merge),
+                &running.finished(Ok(2))
+            )
+            .await
+            .unwrap());
+        state
+            .task_store
+            .finish(merge, Ok("writer done".into()))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if matches!(
+                    fresh.changed().await.unwrap(),
+                    crate::task_store::MaintenanceChange::Resnapshot
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(state
+            .task_store
+            .promote_maintenance(&mut prep)
+            .await
+            .unwrap());
+        state
+            .task_store
+            .finish(prep, Ok("commit granted".into()))
+            .await
+            .unwrap();
     }
 
     async fn exercise_commit_wait(kind: TaskKind, advancing_steps: u64) {

@@ -238,6 +238,8 @@ jobs:
             --skip demand_controller::tests::one_ten_fifty_followers_do_not_multiply_discovery_reads_and_take_over \
             --skip demand_controller::tests::active_inventory_reconciles_without_rpc_and_watch_releases_suppression \
             --skip demand_controller::dispatch::tests::receiver_reuses_lease_and_watch_and_withdraws_busy_capacity \
+            --skip scheduler::tests::quiet_maintenance_commit_wait_does_not_poll_etcd \
+            --skip scheduler::tests::maintenance_watch_registration_compaction_requires_fresh_snapshot \
             --skip demand_controller::dispatch::tests::fifty_executors_do_not_repeat_blocked_candidate_reads_and_reach_tail \
             --skip demand_controller::dispatch::tests::long_dependency_chain_yields_and_unrelated_changes_do_not_repeat_reads \
             --skip demand_controller::tests::compaction_forces_consistent_relist_and_retains_new_demand \
@@ -271,6 +273,12 @@ jobs:
             -- --exact --ignored --test-threads=1
           cargo test -p lance-context-master --lib demand_controller:: \
             -- --ignored --test-threads=1
+          cargo test -p lance-context-master --lib \
+            scheduler::tests::quiet_maintenance_commit_wait_does_not_poll_etcd \
+            -- --exact --ignored --test-threads=1
+          cargo test -p lance-context-master --lib \
+            scheduler::tests::maintenance_watch_registration_compaction_requires_fresh_snapshot \
+            -- --exact --ignored --test-threads=1
 
       - name: Ingestion application process recovery
         env:
@@ -367,6 +375,8 @@ jobs:
             --skip demand_controller::tests::one_ten_fifty_followers_do_not_multiply_discovery_reads_and_take_over \
             --skip demand_controller::tests::active_inventory_reconciles_without_rpc_and_watch_releases_suppression \
             --skip demand_controller::dispatch::tests::receiver_reuses_lease_and_watch_and_withdraws_busy_capacity \
+            --skip scheduler::tests::quiet_maintenance_commit_wait_does_not_poll_etcd \
+            --skip scheduler::tests::maintenance_watch_registration_compaction_requires_fresh_snapshot \
             --skip demand_controller::dispatch::tests::fifty_executors_do_not_repeat_blocked_candidate_reads_and_reach_tail \
             --skip demand_controller::dispatch::tests::long_dependency_chain_yields_and_unrelated_changes_do_not_repeat_reads \
             --skip demand_controller::tests::compaction_forces_consistent_relist_and_retains_new_demand \
@@ -399,6 +409,12 @@ jobs:
             --exact --ignored --test-threads=1
           cargo llvm-cov --no-report --all-features -p lance-context-master --lib -- \
             demand_controller:: --ignored --test-threads=1
+          cargo llvm-cov --no-report --all-features -p lance-context-master --lib -- \
+            scheduler::tests::quiet_maintenance_commit_wait_does_not_poll_etcd \
+            --exact --ignored --test-threads=1
+          cargo llvm-cov --no-report --all-features -p lance-context-master --lib -- \
+            scheduler::tests::maintenance_watch_registration_compaction_requires_fresh_snapshot \
+            --exact --ignored --test-threads=1
       - name: Merge coverage reports
         run: cargo llvm-cov report --lcov --output-path lcov.info
       - name: Save coverage report

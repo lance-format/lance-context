@@ -25,3 +25,5 @@ license = "Apache-2.0"
 # Temporary Lance 13 backport of lance-format/lance#9913; see vendor/lance-io/BACKPORT.md.
 [patch.crates-io]
 lance-io = { path = "vendor/lance-io" }
+# Azure completion response-loss fix; same object_store 0.14.2, see vendor/lance-io/BACKPORT.md.
+object_store = { git = "https://github.com/beinan/arrow-rs-object-store", rev = "09b0593d4702ba390bab1710b3e67f86fd7defcb" }

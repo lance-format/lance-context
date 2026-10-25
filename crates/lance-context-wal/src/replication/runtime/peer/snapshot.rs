@@ -581,7 +581,12 @@ async fn receive_image<S: AsyncRead + AsyncWrite + Unpin>(
                     receiver.write(part, offset, &bytes)?;
                     #[cfg(test)]
                     if let Some(marker) = pause {
-                        std::fs::write(&marker, (offset + bytes.len() as u64).to_string())?;
+                        // The parent waits for existence before reading the
+                        // count. Publish it only after the full write; creating
+                        // the marker directly exposes a transient empty file.
+                        let pending = marker.with_extension("pending");
+                        std::fs::write(&pending, (offset + bytes.len() as u64).to_string())?;
+                        std::fs::rename(pending, &marker)?;
                         let deadline = std::time::Instant::now() + Duration::from_secs(15);
                         while !marker.with_extension("resume").exists() {
                             ensure!(
