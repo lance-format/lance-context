@@ -1494,6 +1494,9 @@ fn spawn_filtered_pool_poller(
                 } else {
                     None
                 };
+                if kinds == TaskKinds::COMPACT && compact_permit.is_none() {
+                    break;
+                }
                 let Ok(permit) = pool.clone().try_acquire_owned() else {
                     break;
                 };
@@ -1936,6 +1939,7 @@ mod tests {
         enqueue(&state, TaskKind::MergeWal, "exp").await.unwrap();
         enqueue(&state, TaskKind::IndexId, "other").await.unwrap();
         let pool = Arc::new(Semaphore::new(2));
+        let controller = crate::demand_controller::spawn(&state);
         let poller = spawn_pool_poller(state.clone(), pool.clone(), TaskKinds::COMPACT, false);
         tokio::time::sleep(Duration::from_millis(650)).await;
         assert_eq!(
@@ -1986,6 +1990,7 @@ mod tests {
         .await
         .unwrap();
         poller.abort();
+        controller.abort();
     }
 
     #[tokio::test]
@@ -4328,6 +4333,7 @@ mod tests {
         let budget = state.local_append.as_ref().unwrap().budget.clone();
         let held = budget.reserve(budget.limit()).await;
         let merge = enqueue(&state, TaskKind::MergeWal, "exp").await.unwrap();
+        let controller = crate::demand_controller::spawn(&state);
         let merge_poller = spawn_pool_poller(
             state.clone(),
             Arc::new(Semaphore::new(1)),
@@ -4386,6 +4392,7 @@ mod tests {
         );
         merge_poller.abort();
         general.abort();
+        controller.abort();
     }
 
     /// Enqueuing the same experiment twice while queued de-dupes to one task.
@@ -4647,6 +4654,7 @@ mod tests {
         let state = MasterState::new(cfg).await.unwrap();
         let slow = enqueue(&state, TaskKind::MergeWal, "slow").await.unwrap();
         let pool = Arc::new(Semaphore::new(1));
+        let controller = crate::demand_controller::spawn(&state);
         let poller = spawn_pool_poller(state.clone(), pool.clone(), TaskKinds::MERGE_WAL, false);
         tokio::time::timeout(Duration::from_secs(5), started.notified())
             .await
@@ -4718,6 +4726,7 @@ mod tests {
         assert_eq!(pool.available_permits(), 1);
         poller.abort();
         let _ = poller.await;
+        controller.abort();
         server.abort();
     }
 
@@ -5768,6 +5777,62 @@ mod tests {
             artifact_type: None,
             metadata: None,
         }
+    }
+    #[tokio::test]
+    #[ignore = "requires isolated ETCD_TEST_ENDPOINTS"]
+    async fn controller_shared_capacity_keeps_index_moving_while_compaction_budget_is_full() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.task_concurrency = 1;
+        cfg.merge_wal_concurrency = 0;
+        let state = MasterState::new(cfg).await.unwrap();
+        for name in ["exp", "other"] {
+            let mut writer = RolloutStore::open(&state.rollout_uri(name)).await.unwrap();
+            for n in 0..3 {
+                writer
+                    .add(&[rollout_record(&format!("row-{n}"))])
+                    .await
+                    .unwrap();
+                writer.cleanup_own_shard().await.unwrap();
+            }
+        }
+        let occupied = state
+            .compaction_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let compact = enqueue(&state, TaskKind::Compact, "exp").await.unwrap();
+        let index = enqueue(&state, TaskKind::IndexId, "other").await.unwrap();
+        let scheduler = spawn_scheduler(&state);
+        let indexed = await_terminal(&state, &index.id).await;
+        assert_eq!(indexed.state, TaskState::Done, "{indexed:?}");
+        let waiting = state.task_store.get(&compact.id).await.unwrap().unwrap();
+        assert_eq!(waiting.state, TaskState::Queued);
+        assert_eq!(
+            waiting.started_at, None,
+            "no task may own storage while waiting for the compaction permit"
+        );
+        drop(occupied);
+        let compacted = await_terminal(&state, &compact.id).await;
+        assert_eq!(compacted.state, TaskState::Done, "{compacted:?}");
+        for name in ["exp", "other"] {
+            assert_eq!(
+                lance::Dataset::open(&state.rollout_uri(name))
+                    .await
+                    .unwrap()
+                    .count_rows(None)
+                    .await
+                    .unwrap(),
+                3
+            );
+        }
+        state.admission.begin_drain();
+        tokio::time::timeout(Duration::from_secs(10), state.admission.wait_drained())
+            .await
+            .unwrap();
+        scheduler.abort();
+        let _ = scheduler.await;
     }
 }
 

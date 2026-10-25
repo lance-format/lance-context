@@ -3513,7 +3513,7 @@ fn etcd_error(action: &'static str) -> impl FnOnce(etcd_client::Error) -> lance:
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use tempfile::TempDir;
 
@@ -3987,15 +3987,15 @@ mod tests {
         assert!(store.list().await.unwrap().is_empty());
     }
 
-    struct LeaseTestProxy {
-        endpoint: String,
-        online: tokio::sync::watch::Sender<bool>,
+    pub(crate) struct LeaseTestProxy {
+        pub(crate) endpoint: String,
+        pub(crate) online: tokio::sync::watch::Sender<bool>,
         responses: tokio::sync::watch::Sender<bool>,
         task: JoinHandle<()>,
     }
 
     impl LeaseTestProxy {
-        async fn start(upstream: &str) -> Self {
+        pub(crate) async fn start(upstream: &str) -> Self {
             let upstream = upstream.strip_prefix("http://").unwrap().to_owned();
             assert!(upstream.starts_with("127.0.0.1:") || upstream.starts_with("localhost:"));
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
