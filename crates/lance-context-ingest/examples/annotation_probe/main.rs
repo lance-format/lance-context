@@ -16,7 +16,7 @@ use tokio::time::Instant;
 mod storage;
 mod writer;
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Workload {
     turns: usize,
@@ -28,6 +28,10 @@ struct Workload {
     ingresses: [String; 2],
     directory: PathBuf,
     #[serde(default)]
+    id_index: bool,
+    #[serde(default)]
+    expected_id_index: Option<String>,
+    #[serde(default)]
     prior_journals: Vec<PathBuf>,
 }
 impl Workload {
@@ -38,7 +42,7 @@ impl Workload {
         );
         ensure!(
             (256..=65_536).contains(&self.turns)
-                && (1..=512).contains(&self.batch_rows)
+                && (1..=2048).contains(&self.batch_rows)
                 && self.turns.is_multiple_of(2 * self.batch_rows)
                 && (1..=600).contains(&self.seconds)
                 && self.max_batches.is_none_or(|v| v > 0)

@@ -148,18 +148,23 @@ async fn writer(
     let mut reads = Hist::new();
     let mut refused = 0u64;
     let mut acked_bytes = 0u64;
+    let mut phases = [Duration::ZERO; 5];
     let started = Instant::now();
     let outcome = async {
         let mut sequence = 1u64;
         while Instant::now() < until && w.max_batches.is_none_or(|n| sequence <= n) {
+            let encode_started = Instant::now();
             let first = which * (w.turns / 2) + ((sequence - 1) as usize * w.batch_rows) % (w.turns / 2);
             let ids = (first..first + w.batch_rows).map(|n| format!("t{n:08}")).collect::<Vec<_>>();
             let value = format!("{}:{}:{sequence}", w.phase, w.slots[which]);
             let body = body(config, &ids, &value)?;
+            phases[0] += encode_started.elapsed();
             let begin = Instant::now();
             durable_json(&directory.join("pending.json"), &serde_json::json!({
                 "producer":producer.producer,"sequence":sequence,"body_base64":STANDARD.encode(&body)
             }))?;
+            phases[1] += begin.elapsed();
+            let request_started = Instant::now();
             let reply: MutationReply = loop {
                 let response = post(client, config, &w.ingresses[which], token, "update")
                     .header(http::PRODUCER, &producer.producer).header(http::SEQUENCE, sequence)
@@ -174,11 +179,14 @@ async fn writer(
                 }
                 break response.error_for_status()?.json().await?;
             };
+            phases[2] += request_started.elapsed();
             ensure!(reply.completion.result == MutationResult::Applied, "mutation was rejected");
+            let journal_started = Instant::now();
             let ack = Ack { first, rows: w.batch_rows, status: value.clone(), index: reply.completion.index };
             serde_json::to_writer(&mut journal, &ack)?;
             journal.write_all(b"\n")?;
             journal.sync_data()?;
+            phases[3] += journal_started.elapsed();
             acks.record(begin.elapsed());
             acked_bytes += body.len() as u64;
             for row in [0, w.batch_rows - 1].into_iter().take(if w.batch_rows == 1 { 1 } else { 2 }) {
@@ -186,6 +194,7 @@ async fn writer(
                 let value_read = read(client, config, &w.ingresses[1 - which], token, ids[row].clone()).await?;
                 check_value(&value_read, &value)?;
                 reads.record(begin.elapsed());
+                phases[4] += begin.elapsed();
             }
             sequence += 1;
         }
@@ -198,6 +207,8 @@ async fn writer(
         "updated_rows":acks.count * w.batch_rows as u64,"ack_p99_ms_upper_bound":acks.p99(),
         "reads":reads.count,"read_p99_ms_upper_bound":reads.p99(),"refused":refused,
         "acked_arrow_bytes":acked_bytes,"elapsed_ms":started.elapsed().as_millis(),
+        "client_phase_us": {"encode":phases[0].as_micros(),"pending_journal":phases[1].as_micros(),
+        "update_request":phases[2].as_micros(),"ack_journal":phases[3].as_micros(),"point_reads":phases[4].as_micros()},
         "error":outcome.as_ref().err().map(|e| format!("{e:#}"))})
     );
     outcome?;
@@ -217,11 +228,15 @@ pub(super) async fn run(config: &Config, w: &Workload) -> Result<()> {
     let token = token(config)?;
     let started = Instant::now();
     let until = started + Duration::from_secs(w.seconds);
-    let (a, b) = tokio::join!(
-        writer(config, w, 0, &client, &token, until),
-        writer(config, w, 1, &client, &token, until)
-    );
-    let rows = a? + b?;
+    let spawn_writer = |which| {
+        let config = config.clone();
+        let workload = w.clone();
+        let client = client.clone();
+        let token = token.clone();
+        tokio::spawn(async move { writer(&config, &workload, which, &client, &token, until).await })
+    };
+    let (a, b) = tokio::join!(spawn_writer(0), spawn_writer(1));
+    let rows = a?? + b??;
     println!(
         "{}",
         serde_json::json!({"updated_rows":rows,"elapsed_ms":started.elapsed().as_millis(),

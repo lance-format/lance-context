@@ -48,8 +48,27 @@ The client needs access to both HTTP endpoints and the WAL/blob configuration.
    `verify` operation checks every row in Lance.
 
 The workload requires an even turn count between 256 and 65,536, divisible by
-both writers' batch size. Batches contain 1–512 rows and duration is 1–600 seconds.
+both writers' batch size. Batches contain 1–2048 rows and duration is 1–600 seconds.
 `max_batches` can cap each writer for an unmaterialized recovery experiment.
+
+For indexed point lookups, add `"id_index": true` before seeding. Seed builds an
+ID B-tree and emits `id_index_uuid`; copy that UUID into `expected_id_index` in
+both the steady and recovery workloads. The source version/transaction must come
+from this indexed seed. After publication, `verify` additionally requires the
+same index UUID, coverage of every current fragment and an annotation point-query
+plan using that index. This is separate from a future status/label filter index.
+
+A 2048-row workload also needs a table binding that admits 2048 rows. Set upload
+(`ingress_memory_bytes`) and annotation apply (`annotations.apply_memory_bytes`)
+budgets independently on the owner and both ingresses. The recorded experiments
+use 32 MiB each; the largest decoded input reservation exceeds 16 MiB. Staging
+and publication retain their separate bounds.
+
+Choose staging byte/entry and per-value limits before provisioning: they affect
+deterministic mutation rejection and are part of the durable schema fingerprint.
+Changing them when reopening the same generation is rejected. The publication
+aggregation timer and independent upload/apply/publication workspace budgets are
+separate configuration; changing those does not change the mutation contract.
 
 ## Crash checks and request identity
 
@@ -81,6 +100,12 @@ in-flight requests. This is a closed-loop correctness workload; it does not
 establish an offered-rate saturation limit. Report replica, owner, ingress and
 writer counts with every result.
 
+The writers run as independent Tokio tasks, and both are joined even if one
+fails. Per-writer `client_phase_us` splits encoding, pending-journal sync, the
+update request, ACK-journal sync and point reads. These are cumulative client
+timers, not server CPU profiles, and do not measure internal copies or decode
+work. Their sum across concurrent writers is not elapsed wall time.
+
 Capture the owner's existing once-per-second annotation observations during the
 load: applied/materialized positions, active/frozen entries, retained bytes,
 source records/bytes, and backpressure. Sampled staging usage is not process RSS.
@@ -89,6 +114,27 @@ cut advances during the load and that backlog stays bounded. Collect process
 resource observations separately, and report the deployment's actual batch and
 memory budgets. This probe changes status only; contract, concurrent field merge,
 publication uncertainty and fencing are covered by the separate protocol tests.
+
+## Single-shard acceptance evidence
+
+Use these checks together; a successful status-only load does not establish all
+mutation or failure semantics.
+
+| Gate | Existing evidence |
+| --- | --- |
+| Field and retry contract | API annotation tests; `annotation_http_two_ingresses_keep_values_and_exact_retries_through_owner_replacement`. CAS remains outside this contract. |
+| Bounded staging | Core staging tests for held readers, impossible batches and repeated drain; source-window tests for repeated updates to one turn. |
+| Durable ordered updates | `quorum_ack_waits_for_apply_and_another_ingress_reads_without_a_tail_scan`; atomic repeated-key batch and concurrent field-update tests. |
+| Immediate narrow point reads | The quorum/HTTP tests plus every successful load batch's opposite-ingress reads; core tests check narrow projection and duplicate IDs. |
+| Safe publication | Core old-reader/concurrent-suffix tests and native publication tests; indexed verification additionally checks retained ID-index coverage. |
+| Recovery, reclamation and pressure | Unknown-publication/checkpoint tests, `annotation_runtime_recovers_after_sigkill`, HTTP pressure tests and the deployed acknowledged-suffix recovery phase. |
+
+The deployment report must include all six roles/counts relevant to the workload
+(shards, replicas, owners, ingresses, writers and turns), configured limits,
+refusals and p99 bounds, materialization progress during load, final values and
+drain, and the exact failure phase. Keep failed runs with their recovery results;
+successful later runs do not convert an earlier failure into a throughput pass.
+Mixed ingestion, asynchronous filtering and shard expansion remain later gates.
 
 ## Recorded single-shard run
 
@@ -123,6 +169,7 @@ was bounded to 64 records / 8 MiB. Publication thresholds were 4 MiB or one seco
 This establishes drain and owner-recovery behavior for this bounded workload.
 It does not qualify large-table lookup cost, arbitrary offered load, body-ingest
 capacity, other failure combinations, or a 300-billion-turn deployment. The
-closed-loop driver serializes durable journal work in its writer futures; use
+recorded run used the original joined writer futures. The current driver spawns
+independent writer tasks, so preserve that distinction in comparisons and use
 separate client and service measurements before attributing a capacity ceiling
 to the WAL or owner.

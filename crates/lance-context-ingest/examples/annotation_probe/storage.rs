@@ -5,6 +5,7 @@ use arrow_array::{
 };
 use futures::TryStreamExt;
 use lance::dataset::{builder::DatasetBuilder, WriteParams};
+use lance::index::DatasetIndexExt;
 use lance_context_ingest::materializer::Storage;
 use lance_context_wal::replication::{
     publication::lance::ManagedManifest,
@@ -59,7 +60,7 @@ pub(super) async fn seed(config: &Config, w: &Workload) -> Result<()> {
     let batches = (0..turns)
         .step_by(256)
         .map(move |n| batch(n, (turns - n).min(256)));
-    let dataset = Dataset::write(
+    let mut dataset = Dataset::write(
         RecordBatchIterator::new(batches, Arc::new(lance_context_core::rollout_schema())),
         &store.uri,
         Some(WriteParams {
@@ -75,11 +76,30 @@ pub(super) async fn seed(config: &Config, w: &Workload) -> Result<()> {
         }),
     )
     .await?;
+    let index_started = Instant::now();
+    if w.id_index {
+        dataset
+            .create_index_builder(
+                &["id"],
+                lance_index::IndexType::BTree,
+                &lance_index::scalar::ScalarIndexParams::default(),
+            )
+            .name("annotation_point_id".to_string())
+            .await?;
+    }
+    let index_ms = index_started.elapsed().as_millis();
+    let id_index_uuid = dataset
+        .load_indices()
+        .await?
+        .iter()
+        .find(|index| index.name == "annotation_point_id")
+        .map(|index| index.uuid.to_string());
     println!(
         "{}",
         serde_json::json!({"source": {
         "version": dataset.version_id(), "transaction": dataset.read_transaction().await?.context("source transaction missing")?.uuid
-    }, "rows": w.turns, "fragments": dataset.manifest().fragments.len()})
+    }, "rows": w.turns, "fragments": dataset.manifest().fragments.len(),
+    "id_index_uuid": id_index_uuid, "index_build_ms": index_ms})
     );
     Ok(())
 }
@@ -188,6 +208,39 @@ pub(super) async fn verify(config: &Config, w: &Workload) -> Result<()> {
         }
     }
     ensure!(seen.into_iter().all(|v| v), "missing final rows");
+    if w.id_index {
+        let indices = dataset.load_indices().await?;
+        let index = indices
+            .iter()
+            .find(|index| index.name == "annotation_point_id")
+            .context("ID index disappeared after annotation publication")?;
+        ensure!(
+            w.expected_id_index.as_deref() == Some(index.uuid.to_string().as_str()),
+            "ID index was replaced during annotation publication"
+        );
+        let coverage = index
+            .fragment_bitmap
+            .as_ref()
+            .context("ID index fragment coverage missing")?;
+        for fragment in dataset.manifest().fragments.iter() {
+            ensure!(
+                coverage.contains(u32::try_from(fragment.id)?),
+                "ID index lost coverage of fragment {}",
+                fragment.id
+            );
+        }
+        let mut scan = dataset.scan();
+        scan.project(&["labels", "status", "score"])?;
+        scan.filter("id = 't00000000'")?;
+        scan.limit(Some(2), None)?;
+        scan.batch_size(128);
+        let plan = scan.explain_plan(false).await?;
+        ensure!(
+            plan.contains("annotation_point_id"),
+            "ID index not used: {plan}"
+        );
+        eprintln!("FINAL_ID_POINT_PLAN:\n{plan}");
+    }
     println!(
         "{}",
         serde_json::json!({"verified_rows":w.turns,"through":through,
