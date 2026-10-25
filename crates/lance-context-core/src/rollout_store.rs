@@ -2604,6 +2604,258 @@ mod tests {
     use tempfile::TempDir;
 
     #[tokio::test]
+    async fn productive_merges_do_not_require_a_quiet_window_for_complete_reads() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut writer = RolloutStore::open(uri).await.unwrap();
+        writer.add(&[assistant_record("base-row")]).await.unwrap();
+        writer.flush().await.unwrap();
+        writer.cleanup_own_shard().await.unwrap();
+        writer.add(&[assistant_record("wal-row")]).await.unwrap();
+        writer.flush().await.unwrap();
+        let reader = RolloutStore::open(uri).await.unwrap();
+        let writer = tokio::sync::Mutex::new(writer);
+        let captures = AtomicUsize::new(0);
+        let decodes = AtomicUsize::new(0);
+
+        let result = reader
+            .base
+            .read_consistent_with_snapshots(
+                ListSource::All,
+                || async {
+                    let snapshots = reader.base.wal_shard_snapshots().await?;
+                    let epoch = captures.fetch_add(1, Ordering::SeqCst);
+                    let mut writer = writer.lock().await;
+                    writer
+                        .add(&[assistant_record(&format!("concurrent-row-{epoch}"))])
+                        .await?;
+                    writer.flush().await?;
+                    // A real commit and WAL drain invalidate every lower-bound
+                    // capture. A read must recover while productive merges
+                    // continue, rather than depending on the writer stopping.
+                    writer.cleanup_own_shard().await?;
+                    Ok(snapshots)
+                },
+                |dataset, snapshots| {
+                    decodes.fetch_add(1, Ordering::SeqCst);
+                    reader.list_non_blob_snapshot(dataset, snapshots)
+                },
+            )
+            .await;
+        writer.lock().await.close().await.unwrap();
+        let rows = result.expect("productive merges must permit a complete read");
+        let ids: HashSet<_> = rows.iter().map(|row| row.id.as_str()).collect();
+        assert!(ids.contains("base-row"));
+        assert!(ids.contains("wal-row"));
+        assert_eq!(ids.len(), rows.len(), "merged WAL must not duplicate rows");
+        assert!(captures.load(Ordering::SeqCst) > 0);
+        assert!(decodes.load(Ordering::SeqCst) > 0);
+    }
+
+    #[tokio::test]
+    async fn rebased_read_keeps_new_values_blobs_and_unmerged_shards() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut writer = RolloutStore::open_with_options(
+            uri,
+            RolloutStoreOptions {
+                shard_id: Some("merging".into()),
+                merge_after_generations: Some(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        writer
+            .add(&[artifact_record("updated", &[1; 1024])])
+            .await
+            .unwrap();
+        writer.cleanup_own_shard().await.unwrap();
+        let mut middle = artifact_record("updated", &[2; 1024]);
+        middle.content_type = "application/middle".into();
+        writer.add(&[middle]).await.unwrap();
+        writer.flush().await.unwrap();
+        let mut tail = RolloutStore::open_with_options(
+            uri,
+            RolloutStoreOptions {
+                shard_id: Some("unmerged".into()),
+                merge_after_generations: Some(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        tail.add(&[artifact_record("wal-only", &[9; 1024])])
+            .await
+            .unwrap();
+        tail.flush().await.unwrap();
+        let reader = RolloutStore::open(uri).await.unwrap();
+        let writer = tokio::sync::Mutex::new(writer);
+        let captures = AtomicUsize::new(0);
+        let (rows, updated_blob, wal_blob) = reader
+            .base
+            .read_consistent_with_snapshots(
+                ListSource::All,
+                || async {
+                    let snapshots = reader.base.wal_shard_snapshots().await?;
+                    captures.fetch_add(1, Ordering::SeqCst);
+                    let mut writer = writer.lock().await;
+                    let mut newest = artifact_record("updated", &[3; 1024]);
+                    newest.content_type = "application/newest".into();
+                    writer.add(&[newest]).await?;
+                    writer.flush().await?;
+                    writer.cleanup_own_shard().await?;
+                    Ok(snapshots)
+                },
+                |dataset, snapshots| {
+                    let reader = &reader;
+                    async move {
+                        // The captured older WAL must not shadow the newly committed
+                        // value. The other shard remains WAL-only and must survive.
+                        assert!(snapshots
+                            .iter()
+                            .any(|s| s.shard_id == derive_shard_id(Some("unmerged"))
+                                && !s.sstables.is_empty()));
+                        let rows = reader
+                            .list_non_blob_snapshot(dataset.clone(), snapshots)
+                            .await?;
+                        let updated = reader.get_blob_from_snapshot(&dataset, "updated").await?;
+                        let tail = reader.get_blob_from_snapshot(&dataset, "wal-only").await?;
+                        Ok((rows, updated, tail))
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(captures.load(Ordering::SeqCst), 1);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.iter()
+                .find(|r| r.id == "updated")
+                .unwrap()
+                .content_type
+                .as_str(),
+            "application/newest"
+        );
+        assert!(rows.iter().any(|r| r.id == "wal-only"));
+        assert_eq!(updated_blob, Some(vec![3; 1024]));
+        assert_eq!(wal_blob, Some(vec![9; 1024]));
+        writer.lock().await.close().await.unwrap();
+        tail.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rebased_read_accepts_compaction_between_capture_and_merge() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut writer = RolloutStore::open(uri).await.unwrap();
+        for id in ["base-a", "base-b", "base-c"] {
+            writer.add(&[assistant_record(id)]).await.unwrap();
+            writer.cleanup_own_shard().await.unwrap();
+        }
+        writer.add(&[assistant_record("wal-row")]).await.unwrap();
+        writer.flush().await.unwrap();
+        let reader = RolloutStore::open(uri).await.unwrap();
+        let writer = tokio::sync::Mutex::new(writer);
+        let captures = AtomicUsize::new(0);
+        let rows = reader
+            .base
+            .read_consistent_with_snapshots(
+                ListSource::All,
+                || async {
+                    let snapshots = reader.base.wal_shard_snapshots().await?;
+                    if captures.fetch_add(1, Ordering::SeqCst) == 0 {
+                        let mut writer = writer.lock().await;
+                        let compacted = writer
+                            .compact(Some(CompactionConfig {
+                                min_fragments: 2,
+                                num_threads: Some(1),
+                                ..Default::default()
+                            }))
+                            .await?;
+                        assert!(compacted.fragments_removed >= 3);
+                        assert_eq!(writer.cleanup_own_shard().await?, 1);
+                    }
+                    Ok(snapshots)
+                },
+                |dataset, snapshots| reader.list_non_blob_snapshot(dataset, snapshots),
+            )
+            .await
+            .unwrap();
+        assert_eq!(captures.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            rows.iter().map(|r| r.id.as_str()).collect::<HashSet<_>>(),
+            HashSet::from(["base-a", "base-b", "base-c", "wal-row"])
+        );
+        assert_eq!(rows.len(), 4);
+        writer.lock().await.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn missing_merge_history_requires_a_fresh_capture() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let writer = RolloutStore::open(uri).await.unwrap();
+        writer
+            .add(&[assistant_record("before-capture")])
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        let reader = RolloutStore::open(uri).await.unwrap();
+        let writer = tokio::sync::Mutex::new(writer);
+        let captures = AtomicUsize::new(0);
+        let decodes = AtomicUsize::new(0);
+        let rows = reader
+            .base
+            .read_consistent_with_snapshots(
+                ListSource::All,
+                || async {
+                    let snapshots = reader.base.wal_shard_snapshots().await?;
+                    if captures.fetch_add(1, Ordering::SeqCst) == 0 {
+                        let mut writer = writer.lock().await;
+                        writer.cleanup_own_shard().await?;
+                        let middle = writer.base.dataset.manifest_location().path.clone();
+                        writer.add(&[assistant_record("during-capture")]).await?;
+                        writer.cleanup_own_shard().await?;
+                        // Keep the current base intact but remove a historical
+                        // manifest, as version cleanup can do during a long read.
+                        writer
+                            .base
+                            .dataset
+                            .object_store(None)
+                            .await?
+                            .delete(&middle)
+                            .await?;
+                    }
+                    Ok(snapshots)
+                },
+                |dataset, snapshots| {
+                    decodes.fetch_add(1, Ordering::SeqCst);
+                    reader.list_non_blob_snapshot(dataset, snapshots)
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            captures.load(Ordering::SeqCst),
+            2,
+            "missing history must never be certified from watermarks alone"
+        );
+        assert_eq!(decodes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            rows.iter().map(|r| r.id.as_str()).collect::<HashSet<_>>(),
+            HashSet::from(["before-capture", "during-capture"])
+        );
+        writer.lock().await.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn metadata_only_publications_do_not_starve_wal_snapshot_reads() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2892,7 +3144,7 @@ mod tests {
                     if captures.fetch_add(1, Ordering::SeqCst) == 0 {
                         // Azure metadata IO can consume the entire retry budget
                         // before any payload is decoded. An actual peer merge
-                        // then invalidates this first base/WAL pair.
+                        // must be reconciled from atomic coverage.
                         tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
                         writer.lock().await.cleanup_own_shard().await.unwrap();
                     }
@@ -2904,8 +3156,8 @@ mod tests {
                 },
             )
             .await
-            .expect("slow initial metadata must not suppress the first fresh snapshot attempt");
-        assert_eq!(captures.load(Ordering::SeqCst), 2);
+            .expect("slow metadata capture must rebase onto the committed rows");
+        assert_eq!(captures.load(Ordering::SeqCst), 1);
         assert_eq!(decodes.load(Ordering::SeqCst), 1);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, "survives-merge");
@@ -2916,7 +3168,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         // Exercise both the attempt cap and expiry of the metadata retry
-        // window. Every capture observes another real committed version.
+        // window. Unwatermarked external writes cannot certify WAL coverage.
         for slow in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let uri = dir.path().to_str().unwrap();
@@ -2935,11 +3187,12 @@ mod tests {
                             tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
                         }
                         let mut writer = writer.lock().await;
-                        writer
-                            .add(&[assistant_record(&format!("new-row-{epoch}"))])
-                            .await?;
-                        writer.flush().await?;
-                        writer.cleanup_own_shard().await?;
+                        let batch = writer.records_to_batch(&[assistant_record(&format!(
+                            "external-row-{epoch}"
+                        ))])?;
+                        let input =
+                            RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+                        writer.base.dataset.append(input, None).await?;
                         Ok(snapshots)
                     },
                     |_, _| {
@@ -3537,7 +3790,10 @@ mod tests {
                 let appending = transaction.as_ref().is_some_and(|tx| {
                     matches!(
                         tx.as_pb().operation,
-                        Some(lance_table::format::pb::transaction::Operation::Append(_))
+                        Some(
+                            lance_table::format::pb::transaction::Operation::Append(_)
+                                | lance_table::format::pb::transaction::Operation::Update(_)
+                        )
                     )
                 });
                 if appending && !self.once.swap(true, Ordering::SeqCst) {
@@ -4152,10 +4408,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(writer.cleanup_own_shard().await.unwrap(), 1);
-        assert!(crate::rollout_append::merged_watermarks(uri)
-            .await
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            crate::rollout_append::merged_watermarks(uri)
+                .await
+                .unwrap()
+                .get(&derive_shard_id(Some("watermark-writer"))),
+            Some(&1)
+        );
         let marks = reader.all_shard_watermarks().await.unwrap();
         assert_eq!(marks.len(), 1);
         assert_eq!(marks[0].sealed_through, 2);
@@ -5519,11 +5778,169 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bulk_key_delete_replays_after_append_is_fenced() {
+    async fn atomic_upsert_conflict_never_replays_over_newer_same_shard_values() {
+        use crate::merge_write_scope::{CommitAuthorizer, MergeWriteScope};
+
+        struct AdvanceOnce(tokio::sync::Mutex<Option<RolloutStore>>);
+        impl std::fmt::Debug for AdvanceOnce {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("AdvanceOnce")
+            }
+        }
+        impl CommitAuthorizer for AdvanceOnce {
+            fn authorize<'a>(
+                &'a self,
+                resource: &'a str,
+                _: u64,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = lance::Result<()>> + Send + 'a>>
+            {
+                Box::pin(async move {
+                    if resource == "base" {
+                        let peer = self.0.lock().await.take();
+                        if let Some(mut peer) = peer {
+                            // The old deletion masks/files are already prepared.
+                            // Publish a newer value before its conditional commit.
+                            peer.cleanup_own_shard().await?;
+                            peer.close().await?;
+                        }
+                    }
+                    Ok(())
+                })
+            }
+        }
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let options = RolloutStoreOptions {
+            shard_id: Some("same-shard".into()),
+            merge_after_generations: Some(0),
+            ..Default::default()
+        };
+        let mut old = RolloutStore::open_with_options(uri, options.clone())
+            .await
+            .unwrap();
+        old.add(&[artifact_record("updated", &[1; 1024])])
+            .await
+            .unwrap();
+        old.flush().await.unwrap();
+        let (manifests, manifest, prepared) = old.prepare_merge_if_ready(1).await.unwrap().unwrap();
+        let peer = RolloutStore::open_with_options(uri, options).await.unwrap();
+        peer.add(&[artifact_record("updated", &[2; 1024])])
+            .await
+            .unwrap();
+        peer.flush().await.unwrap();
+        let scope = MergeWriteScope::with_authorizer(Arc::new(AdvanceOnce(
+            tokio::sync::Mutex::new(Some(peer)),
+        )));
+        let error = scope
+            .run(old.commit_prepared_merge(&manifests, &manifest, prepared))
+            .await
+            .unwrap_err();
+        scope.drain().await;
+        assert!(
+            error
+                .to_string()
+                .contains("shard coverage changed during atomic upsert; reprepare"),
+            "{error}"
+        );
+        let latest = Dataset::open(uri).await.unwrap();
+        assert_eq!(latest.count_rows(None).await.unwrap(), 1);
+        assert!(
+            RolloutStore::get_blob_from_dataset(&latest, "updated")
+                .await
+                .unwrap()
+                .flatten()
+                .as_deref()
+                == Some(&[2; 1024])
+        );
+        assert_eq!(flushed_generation_count(&old).await, 0);
+    }
+
+    #[tokio::test]
+    async fn authorization_timeout_before_storage_preserves_definite_failure() {
         use crate::merge_write_scope::{CommitAuthorizer, MergeWriteScope};
         #[derive(Debug)]
-        struct DeleteOnly(u64);
-        impl CommitAuthorizer for DeleteOnly {
+        struct Unavailable;
+        impl CommitAuthorizer for Unavailable {
+            fn authorize<'a>(
+                &'a self,
+                _: &'a str,
+                _: u64,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = lance::Result<()>> + Send + 'a>>
+            {
+                Box::pin(async { Err(LanceError::io("etcdserver: request timed out")) })
+            }
+        }
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let store = RolloutStore::open(uri).await.unwrap();
+        let mut dataset = StorageBase::load_with_options(uri, None, None)
+            .await
+            .unwrap();
+        let before = dataset.version().version;
+        let scope = MergeWriteScope::with_authorizer(Arc::new(Unavailable));
+        let error = scope
+            .run(async {
+                dataset
+                    .update_metadata([("denied", "must-not-publish")])
+                    .await
+            })
+            .await
+            .unwrap_err();
+        scope.drain().await;
+        let message = error.to_string();
+        assert!(
+            message.contains("etcdserver: request timed out"),
+            "{message}"
+        );
+        assert!(!message.contains("Commit result"), "{message}");
+        assert!(
+            !scope.has_uncertain_commit(),
+            "no storage write was admitted"
+        );
+        let latest = Dataset::open(uri).await.unwrap();
+        assert_eq!(latest.version().version, before);
+        assert!(!latest.metadata().contains_key("denied"));
+        drop(store);
+    }
+
+    #[tokio::test]
+    async fn guarded_prepublication_conflict_is_definitive_for_local_storage() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let store = RolloutStore::open(uri).await.unwrap();
+        let mut stale = StorageBase::load_with_options(uri, None, None)
+            .await
+            .unwrap();
+        let attempted = stale.version().version + 1;
+        let mut peer = StorageBase::load_with_options(uri, None, None)
+            .await
+            .unwrap();
+        peer.update_metadata([("peer", "committed")]).await.unwrap();
+        let error = crate::merge_write_scope::at_base_version(attempted, async {
+            stale.update_metadata([("stale", "must-not-publish")]).await
+        })
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, LanceError::CommitConflict { .. }),
+            "{error}"
+        );
+        let latest = Dataset::open(uri).await.unwrap();
+        assert_eq!(latest.version().version, attempted);
+        assert_eq!(
+            latest.metadata().get("peer").map(String::as_str),
+            Some("committed")
+        );
+        assert!(!latest.metadata().contains_key("stale"));
+        drop(store);
+    }
+
+    #[tokio::test]
+    async fn atomic_upsert_keeps_base_intact_when_publication_is_fenced() {
+        use crate::merge_write_scope::{CommitAuthorizer, MergeWriteScope};
+        #[derive(Debug)]
+        struct DenyPublication(u64);
+        impl CommitAuthorizer for DenyPublication {
             fn authorize<'a>(
                 &'a self,
                 resource: &'a str,
@@ -5532,7 +5949,7 @@ mod tests {
             {
                 Box::pin(async move {
                     if resource == "base" && version > self.0 {
-                        return Err(lance::Error::io("append fenced after bulk delete"));
+                        return Err(lance::Error::io("atomic upsert fenced"));
                     }
                     Ok(())
                 })
@@ -5573,29 +5990,50 @@ mod tests {
         prepared.use_bulk_key_delete();
         prepared.use_parallel_upsert_io();
         let before = store.base.dataset.version().version;
-        let scope = MergeWriteScope::with_authorizer(Arc::new(DeleteOnly(before + 1)));
+        let scope = MergeWriteScope::with_authorizer(Arc::new(DenyPublication(before)));
         let error = scope
             .run(store.commit_prepared_merge(&manifests, &manifest, prepared))
             .await
             .unwrap_err();
         scope.drain().await;
         assert!(
-            error
-                .to_string()
-                .contains("append fenced after bulk delete"),
+            error.to_string().contains("atomic upsert fenced"),
             "{error}"
         );
         let base = lance::Dataset::open(uri).await.unwrap();
-        assert_eq!(base.version().version, before + 1);
+        assert_eq!(base.version().version, before);
         assert_eq!(
             base.count_rows(None).await.unwrap(),
-            1,
-            "only deletion committed"
+            2,
+            "fenced publication must not delete original base rows"
         );
         assert_eq!(flushed_generation_count(&store).await, 1);
         assert_eq!(budget.reserved(), 0);
-        // WAL still serves the replacement during the failed append window.
-        assert_eq!(store.get_blob("replace").await.unwrap(), Some(new.clone()));
+        // Verify both immutable views explicitly. Rollout's ordinary blob API
+        // is base-first for append-only IDs; this recovery test deliberately
+        // exercises an upsert of an existing ID.
+        assert!(
+            RolloutStore::get_blob_from_dataset(&base, "replace")
+                .await
+                .unwrap()
+                .flatten()
+                .as_deref()
+                == Some(old.as_slice())
+        );
+        let snapshots = store.wal_shard_snapshots().await.unwrap();
+        let generation = &snapshots[0].sstables[0];
+        let wal =
+            Dataset::open(&store.flushed_generation_uri(snapshots[0].shard_id, &generation.path))
+                .await
+                .unwrap();
+        assert!(
+            RolloutStore::get_blob_from_dataset(&wal, "replace")
+                .await
+                .unwrap()
+                .flatten()
+                .as_deref()
+                == Some(new.as_slice())
+        );
         store.close().await.unwrap();
         drop(store);
 
