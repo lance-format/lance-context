@@ -6042,8 +6042,11 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires isolated ETCD_TEST_ENDPOINTS"]
+    #[ignore = "requires exclusive ETCD_TEST_ENDPOINTS and ETCD_TEST_EXCLUSIVE=1"]
     async fn periodic_same_policy_followers_stay_quiet_and_take_over_on_drain() {
+        // The etcd RPC counters cover the server, including other test clients.
+        // CI runs this check alone, after all parallel users have finished.
+        assert_eq!(std::env::var("ETCD_TEST_EXCLUSIVE").as_deref(), Ok("1"));
         let dir = TempDir::new().unwrap();
         let first = periodic_test_state(&dir).await;
         let second = MasterState::new(first.config.clone()).await.unwrap();
