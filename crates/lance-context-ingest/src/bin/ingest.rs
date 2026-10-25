@@ -6,9 +6,14 @@ use std::path::Path;
 async fn main() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.len() < 2 || args.len() > 3 {
-        bail!("usage: lance-context-ingest <bootstrap|ingress|worker|preparer|inspect|annotation-owner|annotation-ingress> CONFIG [TABLE]");
+        bail!("usage: lance-context-ingest <bootstrap|ingress|worker|preparer|inspect|annotation-bootstrap|annotation-owner|annotation-ingress> CONFIG [TABLE]");
     }
     let config = Config::read(Path::new(&args[1]))?;
+    if args[0] == "annotation-bootstrap" && args.len() == 2 {
+        application::annotations::provision(&config).await?;
+        println!("{{\"annotation_initialized\":true}}");
+        return Ok(());
+    }
     if args[0] == "bootstrap" && args.len() == 2 {
         application::provision(&config).await?;
         println!("{{\"initialized\":true}}");

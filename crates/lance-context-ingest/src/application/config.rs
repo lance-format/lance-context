@@ -89,6 +89,9 @@ pub struct Annotations {
     pub apply_memory_bytes: usize,
     #[serde(default)]
     pub staging: lance_context_core::annotation_staging::Limits,
+    /// Fixed, quiesced source snapshot for the explicit annotation-bootstrap role.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<bootstrap::annotations::Snapshot>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]

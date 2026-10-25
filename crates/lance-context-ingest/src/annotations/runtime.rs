@@ -198,7 +198,13 @@ impl Publisher {
             let group = self.service.ingress.group(0)?;
             let plan = p::Plan {
                 transaction: Uuid::parse_str(frozen.identity())?,
-                read_version: view.progress.minimum_read_version,
+                // A handoff can start above version one. The progress value is
+                // only a lower bound until the first managed publication.
+                read_version: view
+                    .manifests
+                    .as_ref()
+                    .context("annotation manifests unavailable")?
+                    .head,
                 sources: BTreeMap::from([(group, frozen.sources().clone())]),
                 next_group: group,
             };

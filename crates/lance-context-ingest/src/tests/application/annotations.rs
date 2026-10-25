@@ -1,6 +1,5 @@
 use super::*;
 use crate::{
-    annotations::Service,
     http::annotations::{MutationReply, PointRequest},
     materializer::Storage,
     tests::{annotation_publication, annotations::wire},
@@ -92,8 +91,11 @@ async fn annotation_executable_two_ingresses_restart_owner_and_fence_lost_lease(
         value_bytes: 4096,
         readers: 16,
     };
-    annotation_publication::seed_contract(&c, &storage, Service::contract(&binding(), &limits)?)
-        .await?;
+    let original = bootstrap::annotations::original(&storage).await?;
+    let source = crate::bootstrap::annotations::Snapshot {
+        version: original.version_id(),
+        transaction: Uuid::parse_str(&original.read_transaction().await?.unwrap().uuid)?,
+    };
     let mut config = c.application.clone();
     config.tables.push(config::Table {
         binding: binding(),
@@ -140,6 +142,7 @@ async fn annotation_executable_two_ingresses_restart_owner_and_fence_lost_lease(
         owner_url: bases[0].clone(),
         apply_memory_bytes: 8 << 20,
         staging: limits.clone(),
+        source: Some(source),
     });
     config.worker.publication.max_records = 2;
     config.worker.publication.min_source_bytes = 1 << 20;
@@ -158,6 +161,17 @@ async fn annotation_executable_two_ingresses_restart_owner_and_fence_lost_lease(
         std::fs::write(file, serde_json::to_vec(&config)?)?;
     }
     drop(reserves);
+    let mut bootstrap = Process::spawn(
+        &binary,
+        &files[0],
+        "annotation-bootstrap",
+        &root.join("bootstrap.log"),
+    )?;
+    bootstrap.wait_success().await?;
+    assert_eq!(
+        Dataset::open(&storage.uri).await?.manifest().fragments,
+        original.manifest().fragments
+    );
     let mut owner = Process::spawn(
         &binary,
         &files[0],
@@ -196,6 +210,10 @@ async fn annotation_executable_two_ingresses_restart_owner_and_fence_lost_lease(
     )?;
     ready(&client, &bases[1], TOKEN, &mut a).await?;
     ready(&client, &bases[2], TOKEN, &mut b).await?;
+    let initial = read(&client, &bases[2]).await?;
+    assert_eq!(initial.score, Some(0.5));
+    assert!(initial.labels.is_empty());
+    assert_eq!(initial.status, None);
     for base in &bases[..3] {
         assert_eq!(
             client
@@ -282,10 +300,7 @@ async fn annotation_executable_two_ingresses_restart_owner_and_fence_lost_lease(
     reclaimed(&c, cleared.completion.index).await?;
     let value = read(&client, &bases[1]).await?;
     assert_eq!((value.status, value.score), (None, None));
-    assert_eq!(
-        value.labels,
-        std::collections::BTreeSet::from(["original".into()])
-    );
+    assert!(value.labels.is_empty());
     let lease = etcd.get(claim_key, None).await?.kvs()[0].lease();
     etcd.lease_revoke(lease).await?;
     failed(&mut replacement).await?;

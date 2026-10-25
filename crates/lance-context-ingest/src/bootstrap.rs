@@ -18,6 +18,8 @@ use std::collections::HashMap;
 
 const GENESIS: &str = "lance-context.ingest.genesis.v1";
 
+pub mod annotations;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Identity {

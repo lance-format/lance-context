@@ -6,6 +6,37 @@ use crate::{
 };
 use tokio::{sync::oneshot, task::JoinSet};
 
+/// Explicit offline handoff; normal owner/ingress startup never calls this.
+pub async fn provision(config: &Config) -> Result<()> {
+    config.validate()?;
+    let a = config
+        .annotations
+        .as_ref()
+        .context("annotation configuration missing")?;
+    let source = a
+        .source
+        .clone()
+        .context("annotation handoff requires a persisted source snapshot")?;
+    let table = &config.tables[0];
+    let storage = Storage::resolve(
+        table.uri.clone(),
+        table.storage_options.clone(),
+        Arc::new(lance::session::Session::default()),
+    )
+    .await?;
+    bootstrap::annotations::provision(
+        config.client()?,
+        Arc::new(config.layout.clone()),
+        table.binding.clone(),
+        storage,
+        table.bootstrap.clone(),
+        source,
+        a.staging.clone(),
+    )
+    .await?;
+    Ok(())
+}
+
 async fn connect(config: &Config) -> Result<Ingress> {
     config.validate()?;
     let options = config

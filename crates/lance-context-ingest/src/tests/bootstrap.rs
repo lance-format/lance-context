@@ -8,6 +8,8 @@ use lance::dataset::WriteParams;
 use lance_table::io::commit::ConditionalPutCommitHandler;
 use std::collections::HashMap;
 
+pub(super) mod annotations;
+
 pub(super) fn identity() -> Identity {
     Identity {
         owner: Uuid::from_u128(9000),

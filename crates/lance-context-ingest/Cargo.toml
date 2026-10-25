@@ -11,9 +11,10 @@ service = ["worker", "http", "dep:reqwest", "dep:tokio-rustls", "tokio/rt-multi-
 worker = ["materializer", "dep:etcd-client"]
 http = ["dep:axum", "dep:http-body-util", "dep:arrow-ipc"]
 http-client = ["http", "dep:reqwest", "lance-context-wal/client-journal"]
-materializer = ["lance-context-wal/lance-integration", "dep:lance", "dep:lance-table", "dep:lance-io", "dep:lance-index", "dep:prost", "dep:object_store", "dep:futures", "dep:async-stream"]
+materializer = ["lance-context-wal/lance-integration", "dep:lance", "dep:lance-table", "dep:lance-io", "dep:lance-index", "dep:prost", "dep:object_store", "dep:futures", "dep:async-stream", "dep:async-trait"]
 
 [dependencies]
+async-trait = { version = "0.1.92", optional = true }
 tokio-rustls = { version = "0.26.4", optional = true, default-features = false, features = ["ring", "tls12"] }
 etcd-client = { version = "0.19", features = ["tls"], optional = true }
 axum = { version = "0.8", optional = true, default-features = false, features = ["json", "http1", "tokio"] }

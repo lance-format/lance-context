@@ -208,6 +208,7 @@ impl Service {
     }
 
     pub fn contract(binding: &TableBinding, limits: &Limits) -> Result<IngestContract> {
+        limits.validate()?;
         Ok(IngestContract {
             policy: WritePolicy::TurnAnnotations,
             schema: arrow_schema_fingerprint(&wire::schema(limits))?,

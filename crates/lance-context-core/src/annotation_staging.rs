@@ -42,6 +42,20 @@ impl Default for Limits {
         }
     }
 }
+impl Limits {
+    pub fn validate(&self) -> Result<()> {
+        if self.value_bytes < 512
+            || self.value_bytes > self.retained_bytes / 2
+            || self.retained_bytes > u32::MAX as usize
+            || self.retained_entries == 0
+            || self.retained_entries > 1_000_000
+            || !(1..=4096).contains(&self.readers)
+        {
+            return Err(invalid("invalid annotation staging limits"));
+        }
+        Ok(())
+    }
+}
 
 /// Each position is scoped to one table instance and one shard in one group.
 /// It is not a proof that every other shard in this group has been published.
@@ -192,16 +206,11 @@ impl AnnotationStaging {
         limits: Limits,
     ) -> Result<Self> {
         validate_schema(&base)?;
+        limits.validate()?;
         if scope.table_instance.is_empty()
             || scope.table_instance.len() > 256
             || scope.source_group == 0
             || materialized == u64::MAX
-            || limits.value_bytes < 512
-            || limits.value_bytes > limits.retained_bytes / 2
-            || limits.retained_bytes > u32::MAX as usize
-            || limits.retained_entries == 0
-            || limits.retained_entries > 1_000_000
-            || !(1..=4096).contains(&limits.readers)
         {
             return Err(invalid("invalid annotation staging scope or limits"));
         }
@@ -516,14 +525,19 @@ async fn read_base(base: &Dataset, turn: &str, max_bytes: usize) -> Result<Optio
                 .as_any()
                 .downcast_ref::<Float32Array>()
                 .ok_or_else(|| invalid("invalid annotation score"))?;
-            if labels.is_null(row) {
-                return Err(invalid("annotation labels must be a non-null set"));
-            }
             let strings = labels.value(row);
             let strings = strings
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .ok_or_else(|| invalid("invalid annotation label values"))?;
+            // Additive migration can represent an unset label set as a virtual
+            // all-null column. Its logical value is empty; ignore hidden values
+            // beneath a null list slot. Published annotations write actual sets.
+            let label_count = if labels.is_null(row) {
+                0
+            } else {
+                strings.len()
+            };
             // Bound owned-value allocation before copying projected strings.
             // The scanner's Arrow buffers still use its separate Lance budget.
             let mut projected_bytes = 512usize
@@ -536,7 +550,7 @@ async fn read_base(base: &Dataset, turn: &str, max_bytes: usize) -> Result<Optio
                     })
                 })
                 .ok_or_else(|| invalid("base annotation size overflow"))?;
-            for label in strings.iter() {
+            for label in strings.iter().take(label_count) {
                 let label = label
                     .filter(|s| !s.is_empty())
                     .ok_or_else(|| invalid("null/empty annotation label"))?;
@@ -553,7 +567,7 @@ async fn read_base(base: &Dataset, turn: &str, max_bytes: usize) -> Result<Optio
                 score: (!score.is_null(row)).then(|| score.value(row)),
                 ..Default::default()
             };
-            for label in strings.iter() {
+            for label in strings.iter().take(label_count) {
                 let label = label
                     .filter(|s| !s.is_empty())
                     .ok_or_else(|| invalid("null/empty annotation label"))?;

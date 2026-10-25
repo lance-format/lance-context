@@ -193,16 +193,15 @@ impl FrozenAnnotations {
             ));
         }
         let reservation = workspace.reserve(bytes).await;
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Utf8, false),
-            Field::new(
-                "labels",
-                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
-                false,
-            ),
-            Field::new("status", DataType::Utf8, true),
-            Field::new("score", DataType::Float32, true),
-        ]));
+        // RewriteColumns interleaves original rows with updates. Preserve the
+        // base's nullability: an additive handoff can leave null label lists in
+        // untouched rows even though every update writes a non-null set.
+        let base_schema = Schema::from(self.0.base.schema());
+        let fields = ["id", "labels", "status", "score"]
+            .into_iter()
+            .map(|name| base_schema.field_with_name(name).cloned())
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let schema = Arc::new(Schema::new(fields));
         let mut batches = Vec::new();
         let mut values = self.0.values.iter().peekable();
         while values.peek().is_some() {

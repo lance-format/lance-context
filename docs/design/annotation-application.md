@@ -7,6 +7,39 @@ configuration. Existing unbound Lance tables require an explicit handoff before
 these roles can use them; normal startup does not adopt a table or overwrite its
 bootstrap identity.
 
+For an existing rollout table, run `annotation-bootstrap CONFIG` once before
+starting the owner. Stop and drain the old writer first, then persist the exact
+Lance version and native transaction UUID in `annotations.source`, for example:
+
+```json
+"source": {"version": 42, "transaction": "00000000-0000-0000-0000-000000000042"}
+```
+
+The UUID is read from that version's native transaction, not generated for this
+field. Keep the existing table binding, incarnation, URI, complete `bootstrap`
+identity, and source snapshot together for recovery. The command adds missing
+nullable `labels`, `status`, and `score` columns using a metadata-only native
+transaction and registers the resulting version as the managed genesis. Existing
+values and fragment/file references are preserved. A null physical label list
+means an empty logical label set. The source needs Lance v2 data files and unique,
+non-null UTF8 turn IDs. Existing annotation column types must match the contract;
+`score` and `status` must be nullable so the contract can clear them.
+
+This is an offline handoff of a quiesced, otherwise unmanaged table. A conflicting
+WAL policy is rejected before writing Lance. The command neither drains another
+writer's WAL nor migrates a live immutable-ingestion binding. Following handoff,
+route annotation reads/writes through these roles: the managed manifest catalog
+selects subsequent publications, so a plain canonical Lance open is not the
+annotation read path. Keep old writers stopped. Combining new ingestion with
+point updates remains separate work.
+
+On an uncertain result, repeat the same command/configuration. It checks the
+original source transaction, persisted handoff marker, exact output transaction,
+and managed bootstrap identity. An interrupted schema commit can be registered
+without writing another schema version. A completed handoff, even after later
+annotation publications, returns without taking another ownership epoch. A
+changed snapshot/identity is rejected. No source WAL is reclaimed by this command.
+
 Use the existing TLS/WAL endpoints, authorized table binding, HTTP workload token,
 receipt keys, and storage configuration. Add an `annotations` block:
 
@@ -57,7 +90,8 @@ report applied/materialized positions, retained staging bytes, active/frozen
 entries, source bytes/records, and application pressure once per second.
 
 The application process test uses real RF3 RPCs, etcd, Lance storage, two ingress
-executables and an owner executable. It checks cross-ingress reads, publication
+executables and an owner executable. It starts by handing off a full rollout
+table with existing scores and body columns. It checks cross-ingress reads, publication
 and source GC, exact retries, competing owner exclusion, SIGKILL plus natural
 lease expiry, replacement behind the same address, field clearing, and lease-loss
 shutdown. It also gives ingress processes an unusable Lance URI to verify that
