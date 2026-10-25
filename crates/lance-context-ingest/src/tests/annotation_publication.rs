@@ -55,7 +55,7 @@ async fn query(c: &network::Cluster, query: query::Query) -> Result<query::Value
     Ok(value)
 }
 
-async fn state(c: &network::Cluster) -> Result<Box<p::Table>> {
+pub(super) async fn state(c: &network::Cluster) -> Result<Box<p::Table>> {
     let query::Value::Publisher(Some(state)) = query(
         c,
         query::Query::Publisher {
@@ -69,7 +69,7 @@ async fn state(c: &network::Cluster) -> Result<Box<p::Table>> {
     Ok(state)
 }
 
-async fn read(
+pub(super) async fn read(
     c: &network::Cluster,
     storage: &Storage,
     version: Option<u64>,

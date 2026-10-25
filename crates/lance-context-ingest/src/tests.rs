@@ -20,6 +20,8 @@ mod annotation_checkpoint;
 #[cfg(feature = "materializer")]
 mod annotation_publication;
 #[cfg(feature = "materializer")]
+mod annotation_runtime;
+#[cfg(feature = "materializer")]
 mod annotations;
 #[cfg(feature = "materializer")]
 mod bootstrap;

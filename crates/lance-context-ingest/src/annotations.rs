@@ -1,8 +1,8 @@
 //! Single-shard annotation apply and read barrier over the RF3 WAL.
 //!
 //! Native checkpoints restore values and bounded request outcomes together.
-//! Publisher scheduling remains externally owned. This is not yet wired into
-//! the production application registry.
+//! `runtime` composes the applier with continuous publication and recovery. The
+//! application still supplies scheduling ownership and ingress routing.
 use super::*;
 use crate::{materializer::Storage, reader};
 use lance::dataset::builder::DatasetBuilder;
@@ -15,6 +15,7 @@ use std::{future::Future, sync::Mutex};
 use tokio::sync::watch;
 
 pub(crate) mod checkpoint;
+pub mod runtime;
 mod window;
 pub mod wire;
 pub use checkpoint::{FrozenCheckpoint, PreparedCheckpoint};
@@ -47,6 +48,7 @@ struct Shared {
     results: Mutex<checkpoint::Results>,
     window: Mutex<window::Window>,
     source_generations: Arc<tokio::sync::Semaphore>,
+    replay_cut: Mutex<Option<u64>>,
     ordered: tokio::sync::Mutex<()>,
     progress: watch::Sender<Progress>,
 }
@@ -133,6 +135,7 @@ impl Service {
                 }),
                 window: Mutex::new(window),
                 source_generations: Arc::new(tokio::sync::Semaphore::new(2)),
+                replay_cut: Mutex::new(None),
                 ordered: tokio::sync::Mutex::new(()),
                 progress,
             }),
@@ -317,6 +320,10 @@ impl Driver {
         let service = &self.service;
         let ingress = &service.ingress;
         let after = service.shared.progress.borrow().through;
+        let replay_cut = *service.shared.replay_cut.lock().unwrap();
+        if replay_cut.is_some_and(|cut| after >= cut) {
+            return Ok(());
+        }
         if self.pending.is_none() {
             service.barrier().await?;
             let (_, value) = reader::observe(
@@ -330,9 +337,13 @@ impl Driver {
                 },
             )
             .await?;
-            let query::Value::Accepted(page) = value else {
+            let query::Value::Accepted(mut page) = value else {
                 bail!("annotation source page unavailable");
             };
+            if let Some(cut) = replay_cut {
+                page.through = page.through.min(cut);
+                page.entries.retain(|(index, _)| *index <= cut);
+            }
             ensure!(page.through >= after, "annotation source cursor regressed");
             if let Some((index, meta)) = page.entries.into_iter().next() {
                 ensure!(

@@ -620,7 +620,7 @@ impl Publisher {
         self.finish_pending().await
     }
 
-    async fn pin(&self, pending: &p::PendingPlan) -> Result<()> {
+    pub(crate) async fn pin(&self, pending: &p::PendingPlan) -> Result<()> {
         stream::iter(
             pending
                 .plan
@@ -666,7 +666,7 @@ impl Publisher {
         .await?;
         Ok(())
     }
-    async fn retire_history(&self, view: &p::Table) -> Result<()> {
+    pub(crate) async fn retire_history(&self, view: &p::Table) -> Result<()> {
         let manifests = view
             .manifests
             .as_ref()
@@ -885,7 +885,7 @@ pub(super) async fn query(
     );
     Ok(value)
 }
-async fn commit(client: &Client, command: Command) -> Result<Applied> {
+pub(crate) async fn commit(client: &Client, command: Command) -> Result<Applied> {
     let response = client
         .request_routed(Request::Commit(Box::new(command)))
         .await?;

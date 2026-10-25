@@ -202,6 +202,14 @@ impl Service {
     pub async fn freeze(&self, transaction: Uuid) -> Result<Option<FrozenCheckpoint>> {
         let _ordered = self.shared.ordered.lock().await;
         let through = self.shared.progress.borrow().through;
+        ensure!(
+            self.shared
+                .replay_cut
+                .lock()
+                .unwrap()
+                .is_none_or(|cut| cut == through),
+            "pending publication must freeze at its original cut"
+        );
         let snapshot = {
             let results = self.shared.results.lock().unwrap();
             if !results
@@ -234,13 +242,15 @@ impl Service {
             annotations.through() == through,
             "value/result freeze cut differs"
         );
-        Ok(Some(FrozenCheckpoint {
+        let frozen = FrozenCheckpoint {
             origin: self.shared.clone(),
             annotations,
             results: Arc::new(snapshot),
             sources: self.shared.window.lock().unwrap().freeze(through),
             _source_generation: source_generation,
-        }))
+        };
+        *self.shared.replay_cut.lock().unwrap() = None;
+        Ok(Some(frozen))
     }
 
     /// Install only after the caller resolves the original managed publication.
@@ -369,7 +379,11 @@ pub(super) async fn open(
     Ok((base, Arc::new(snapshot)))
 }
 
-async fn load(ingress: &Ingress, storage: &Storage, version: u64) -> Result<Arc<Dataset>> {
+pub(super) async fn load(
+    ingress: &Ingress,
+    storage: &Storage,
+    version: u64,
+) -> Result<Arc<Dataset>> {
     let handler = ManagedManifest::reader(
         Arc::new(ingress.client.manifest_catalog()),
         storage.base.clone(),

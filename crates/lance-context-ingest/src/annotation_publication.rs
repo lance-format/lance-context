@@ -28,7 +28,7 @@ pub struct Selection {
     pub pending: p::PendingPlan,
 }
 impl Selection {
-    fn scope(&self) -> Result<(Scope, u64)> {
+    pub(crate) fn scope(&self) -> Result<(Scope, u64)> {
         let plan = &self.pending.plan;
         ensure!(
             !self.table.is_nil()

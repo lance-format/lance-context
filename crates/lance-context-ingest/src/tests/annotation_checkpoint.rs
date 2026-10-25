@@ -7,7 +7,7 @@ use crate::{
 };
 use lance_context_core::annotation_staging::Limits;
 
-async fn prepare(
+pub(super) async fn prepare(
     c: &network::Cluster,
     frozen: &FrozenCheckpoint,
     after: u64,
