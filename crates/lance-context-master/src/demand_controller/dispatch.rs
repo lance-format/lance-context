@@ -282,6 +282,11 @@ impl Receiver {
             // reuse a session after an ambiguous re-advertisement or claim.
             if let Err(error) = self.close(&state.task_store).await {
                 tracing::warn!(%error, "dispatch session cleanup failed; lease will expire");
+                if result.is_ok() {
+                    // Preserve the scheduler's error pacing if withdrawing
+                    // capacity failed, instead of reopening it as an empty poll.
+                    return Err(error);
+                }
             }
         }
         result
