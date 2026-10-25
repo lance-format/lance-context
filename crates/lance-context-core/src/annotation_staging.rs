@@ -16,7 +16,9 @@ use lance_context_api::annotation::{TurnAnnotation, TurnAnnotationPatch};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 mod publication;
-pub use publication::{FrozenAnnotations, PreparedAnnotations};
+pub use publication::{
+    FrozenAnnotations, PreparedAnnotations, MAX_RESULTS_BYTES, RESULTS_PROPERTY,
+};
 #[cfg(test)]
 mod tests;
 
@@ -112,6 +114,7 @@ pub struct AnnotationStaging {
     bytes: Arc<Semaphore>,
     entries: Arc<Semaphore>,
     readers: Arc<Semaphore>,
+    metadata: Arc<Semaphore>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -123,6 +126,9 @@ pub struct Observation {
     /// Conservative allocation charges, including held values/generations.
     pub retained_bytes: usize,
     pub retained_entries: usize,
+    /// Separately bounded publication metadata, including held retired handles.
+    /// Data admission cannot occupy this reserve and prevent its own flush.
+    pub retained_metadata_bytes: usize,
     pub readers: usize,
 }
 
@@ -203,6 +209,7 @@ impl AnnotationStaging {
             bytes: Arc::new(Semaphore::new(limits.retained_bytes)),
             entries: Arc::new(Semaphore::new(limits.retained_entries)),
             readers: Arc::new(Semaphore::new(limits.readers)),
+            metadata: Arc::new(Semaphore::new(publication::METADATA_BUDGET)),
             limits,
             state: Mutex::new(State {
                 base,
@@ -439,6 +446,8 @@ impl AnnotationStaging {
             frozen_entries: state.frozen.as_ref().map_or(0, |f| f.values.len()),
             retained_bytes: self.limits.retained_bytes - self.bytes.available_permits(),
             retained_entries: self.limits.retained_entries - self.entries.available_permits(),
+            retained_metadata_bytes: publication::METADATA_BUDGET
+                - self.metadata.available_permits(),
             readers: self.limits.readers - self.readers.available_permits(),
         }
     }

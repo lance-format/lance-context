@@ -316,16 +316,25 @@ async fn apply(
 }
 
 async fn select(c: &network::Cluster, record: &(u64, BatchMeta)) -> Result<annotations::Selection> {
+    select_range(c, vec![record.clone()], record.0, Uuid::new_v4()).await
+}
+
+pub(super) async fn select_range(
+    c: &network::Cluster,
+    records: Vec<(u64, BatchMeta)>,
+    through: u64,
+    transaction: Uuid,
+) -> Result<annotations::Selection> {
     let view = state(c).await?;
     let plan = p::Plan {
-        transaction: Uuid::new_v4(),
+        transaction,
         read_version: view.progress.minimum_read_version,
         sources: BTreeMap::from([(
             10,
             p::SourceRange {
                 after: view.progress.checkpoint.get(&10).copied().unwrap_or(0),
-                through: record.0,
-                records: vec![record.clone()],
+                through,
+                records,
             },
         )]),
         next_group: 10,
@@ -365,7 +374,7 @@ async fn select(c: &network::Cluster, record: &(u64, BatchMeta)) -> Result<annot
     })
 }
 
-async fn save(
+pub(super) async fn save(
     c: &network::Cluster,
     selection: &annotations::Selection,
     descriptors: p::Descriptors,
@@ -424,7 +433,7 @@ async fn confirm(c: &network::Cluster) -> Result<Arc<p::Published>> {
     Ok(published)
 }
 
-async fn finish(c: &network::Cluster) -> Result<()> {
+pub(super) async fn finish(c: &network::Cluster) -> Result<()> {
     let published = confirm(c).await?;
     let view = state(c).await?;
     let pending = view.progress.pending.as_ref().unwrap();
@@ -471,7 +480,7 @@ async fn finish(c: &network::Cluster) -> Result<()> {
 }
 
 #[derive(Debug)]
-struct LostReply(Arc<dyn p::lance::ManifestCatalog>);
+pub(super) struct LostReply(pub(super) Arc<dyn p::lance::ManifestCatalog>);
 #[async_trait::async_trait]
 impl p::lance::ManifestCatalog for LostReply {
     async fn read_manifest(&self, table: Uuid, version: Option<u64>) -> Result<query::Outcome> {

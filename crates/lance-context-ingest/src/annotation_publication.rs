@@ -143,6 +143,30 @@ fn validate(base: &Dataset, transaction: &Transaction, selection: &Selection) ->
         serde_json::from_str::<(Scope, u64)>(cut)? == selection.scope()?,
         "annotation transaction has a foreign source cut"
     );
+    let results = transaction
+        .transaction_properties
+        .as_ref()
+        .and_then(|p| p.get(lance_context_core::annotation_staging::RESULTS_PROPERTY));
+    if let Some(results) = results {
+        crate::annotations::checkpoint::Snapshot::decode(results, selection.scope()?.1)?;
+    }
+    if let Operation::UpdateConfig {
+        config_updates,
+        table_metadata_updates,
+        schema_metadata_updates,
+        field_metadata_updates,
+    } = &transaction.operation
+    {
+        ensure!(
+            results.is_some()
+                && config_updates.is_none()
+                && table_metadata_updates.is_none()
+                && schema_metadata_updates.is_none()
+                && field_metadata_updates.is_empty(),
+            "result-only publication may only record the application cut and results"
+        );
+        return Ok(());
+    }
     let Operation::Update {
         removed_fragment_ids,
         updated_fragments,

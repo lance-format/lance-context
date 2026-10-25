@@ -39,16 +39,14 @@ correctness; it does not establish the final multi-shard placement or throughput
 
 ## Remaining integration gates
 
-This service is not enabled in the application registry. It currently starts only
-from an unmaterialized source with its original Lance base. The source WAL is the
-durable recovery evidence for the bounded in-memory results as well as values.
-It refuses an existing publication cut or source closure, instead of pretending
-that a values-only snapshot can restore request outcomes.
+This service is not enabled in the application registry. Native result checkpoints
+now bind values and request outcomes to one cut, including result-only batches.
+Recovery validates the catalog-selected checkpoint before replaying its WAL suffix.
+See [the result checkpoint protocol](annotation-result-checkpoint.md).
 
-Next, freeze the result snapshot with the same ordered cut as annotation values,
-persist both through managed publication (including result-only batches), restore
-them before suffix replay, and wire scheduling/confirmation/source closure. Only
-then can this service reclaim WAL and demonstrate sustained draining. Existing
-staging/publication component tests do not substitute for that service test.
+Scheduling, publication takeover, confirmation and source closure still belong to
+the caller. Wire those into the running shard owner before claiming continuous
+draining. Existing staging/publication component tests do not substitute for that
+service test.
 Process SIGKILL, sustained mixed load, and publication/GC fault qualification remain
 outstanding. The RF3 restart test here uses orderly shutdown/reopen.

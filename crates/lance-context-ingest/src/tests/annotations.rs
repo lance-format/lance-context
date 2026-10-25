@@ -10,7 +10,7 @@ use arrow_array::{
 use lance_context_core::annotation_staging::{Limits, RejectionReason};
 use tokio::sync::oneshot;
 
-fn wire(
+pub(super) fn wire(
     limits: &Limits,
     ids: &[&str],
     status_op: u8,
@@ -48,7 +48,7 @@ fn wire(
     Ok(Bytes::from(bytes))
 }
 
-async fn connect(
+pub(super) async fn connect(
     c: &network::Cluster,
     storage: &Storage,
     limits: &Limits,
@@ -65,7 +65,7 @@ async fn connect(
     .await
 }
 
-fn run(driver: Driver) -> (oneshot::Sender<()>, tokio::task::JoinHandle<Result<()>>) {
+pub(super) fn run(driver: Driver) -> (oneshot::Sender<()>, tokio::task::JoinHandle<Result<()>>) {
     let (stop, done) = oneshot::channel();
     (
         stop,
@@ -75,7 +75,7 @@ fn run(driver: Driver) -> (oneshot::Sender<()>, tokio::task::JoinHandle<Result<(
     )
 }
 
-async fn producer(service: &Service, slot: u32) -> Result<Producer> {
+pub(super) async fn producer(service: &Service, slot: u32) -> Result<Producer> {
     service
         .open_producer(ProducerOpen {
             bucket: 0,
@@ -86,7 +86,7 @@ async fn producer(service: &Service, slot: u32) -> Result<Producer> {
         .await
 }
 
-async fn request(
+pub(super) async fn request(
     service: &Service,
     producer: &Producer,
     sequence: u64,

@@ -16,6 +16,8 @@ use {
 };
 
 #[cfg(feature = "materializer")]
+mod annotation_checkpoint;
+#[cfg(feature = "materializer")]
 mod annotation_publication;
 #[cfg(feature = "materializer")]
 mod annotations;

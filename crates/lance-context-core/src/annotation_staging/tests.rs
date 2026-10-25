@@ -9,6 +9,57 @@ use lance_context_api::annotation::AnnotationFieldUpdate::{Clear, Set};
 use std::collections::BTreeSet;
 
 #[tokio::test]
+async fn result_only_generation_publishes_a_new_version_without_data_files() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let base = fixture(&root.path().join("turns.lance")).await?;
+    let before = base.manifest().fragments.clone();
+    let staging = AnnotationStaging::new(base, scope(), 0, Limits::default())?;
+    let patch = TurnAnnotationPatch::default();
+    assert!(matches!(
+        staging
+            .apply_committed(
+                0,
+                1,
+                &[Mutation {
+                    turn: "absent",
+                    patch: &patch
+                }]
+            )
+            .await?,
+        ApplyOutcome::Rejected(_)
+    ));
+    assert_eq!(staging.observation().await.active_entries, 0);
+    let frozen = staging
+        .freeze_with_results(uuid::Uuid::new_v4(), Some("opaque-results".into()))
+        .await?
+        .unwrap();
+    assert_eq!(frozen.rows(), 0);
+    let prepared = frozen
+        .prepare(&crate::MergeMemoryBudget::new(8 << 20), 8192)
+        .await?;
+    assert_eq!(prepared.merge().stats.bytes_written, 0);
+    let selected = commit(&prepared).await?;
+    assert_eq!(selected.version_id(), 2);
+    assert_eq!(selected.manifest().fragments, before);
+    assert_eq!(
+        selected
+            .read_transaction()
+            .await?
+            .unwrap()
+            .transaction_properties
+            .unwrap()[RESULTS_PROPERTY],
+        "opaque-results"
+    );
+    staging.install_published(&prepared, selected).await?;
+    assert_eq!(staging.observation().await.materialized, 1);
+    assert!(staging.observation().await.retained_metadata_bytes > 0);
+    drop(prepared);
+    drop(frozen);
+    assert_eq!(staging.observation().await.retained_metadata_bytes, 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn committed_rejection_advances_without_losing_later_updates() -> Result<()> {
     let root = tempfile::tempdir()?;
     let base = fixture(&root.path().join("turns.lance")).await?;

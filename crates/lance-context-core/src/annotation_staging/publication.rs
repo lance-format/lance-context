@@ -7,9 +7,14 @@ use arrow_schema::Schema;
 use lance::dataset::{
     MergeInsertBuilder, MergeInsertWriteMode, UncommittedMergeInsert, WhenMatched, WhenNotMatched,
 };
+use lance_table::transaction::{Operation, Transaction};
 use std::collections::HashMap;
 
 use crate::{MergeMemoryBudget, MergeReservation};
+
+pub const RESULTS_PROPERTY: &str = "lance-context.annotation-results";
+pub const MAX_RESULTS_BYTES: usize = 640 << 10;
+pub(super) const METADATA_BUDGET: usize = 8 * MAX_RESULTS_BYTES + 1024;
 
 pub(super) struct Generation {
     pub values: Values,
@@ -18,6 +23,8 @@ pub(super) struct Generation {
     through: u64,
     id: String,
     prepared: Mutex<Option<Arc<Prepared>>>,
+    results: Option<String>,
+    _metadata: Option<OwnedSemaphorePermit>,
 }
 struct Prepared {
     merge: UncommittedMergeInsert,
@@ -55,6 +62,17 @@ impl AnnotationStaging {
     /// its original cut and freeze with that same identity. It must durably
     /// record this identity/cut before publishing it.
     pub async fn freeze(&self, transaction: uuid::Uuid) -> Result<Option<FrozenAnnotations>> {
+        self.freeze_with_results(transaction, None).await
+    }
+
+    /// The caller captures result metadata under the same ordered apply gate as
+    /// this cut. Result-only generations publish metadata without rewriting any
+    /// data file. Retired handles still charge their metadata against staging.
+    pub async fn freeze_with_results(
+        &self,
+        transaction: uuid::Uuid,
+        results: Option<String>,
+    ) -> Result<Option<FrozenAnnotations>> {
         if transaction.is_nil() {
             return Err(invalid("nil annotation publication identity"));
         }
@@ -62,9 +80,25 @@ impl AnnotationStaging {
         if state.frozen.is_some() {
             return Err(invalid("an annotation generation is already frozen"));
         }
-        if state.active.is_empty() {
+        if state.active.is_empty() && (results.is_none() || state.applied == state.materialized) {
             return Ok(None);
         }
+        let metadata = results
+            .as_ref()
+            .map(|value| {
+                if value.is_empty() || value.len() > MAX_RESULTS_BYTES {
+                    return Err(invalid("invalid annotation result metadata size"));
+                }
+                // Also cover the caller's compact decoded result snapshot. Its
+                // retained lifetime is tied to this generation by the service.
+                let charge = value
+                    .capacity()
+                    .checked_mul(4)
+                    .and_then(|n| n.checked_add(512))
+                    .ok_or_else(|| invalid("annotation metadata charge overflow"))?;
+                reserve(&self.metadata, charge)
+            })
+            .transpose()?;
         let generation = Arc::new(Generation {
             values: std::mem::take(&mut state.active),
             base: state.base.clone(),
@@ -72,6 +106,8 @@ impl AnnotationStaging {
             through: state.applied,
             id: transaction.to_string(),
             prepared: Mutex::new(None),
+            results,
+            _metadata: metadata,
         });
         state.frozen = Some(generation.clone());
         Ok(Some(FrozenAnnotations(generation)))
@@ -149,6 +185,7 @@ impl FrozenAnnotations {
                     .ok_or_else(|| invalid("publication size overflow"))
             })?
             .checked_mul(2)
+            .and_then(|n| n.checked_add(self.0.results.as_ref().map_or(0, |s| s.len() * 2)))
             .ok_or_else(|| invalid("publication workspace overflow"))?;
         if bytes > workspace.limit() {
             return Err(invalid(
@@ -192,15 +229,32 @@ impl FrozenAnnotations {
                 ],
             )?);
         }
-        let mut merge = MergeInsertBuilder::try_new(self.0.base.clone(), vec!["id".into()])?
-            .when_matched(WhenMatched::UpdateAll)
-            .when_not_matched(WhenNotMatched::DoNothing)
-            .write_mode(MergeInsertWriteMode::RewriteColumns)
-            .conflict_retries(0)
-            .skip_auto_cleanup(true)
-            .try_build()?
-            .execute_uncommitted_batches(batches)
-            .await?;
+        let mut merge = if batches.is_empty() {
+            UncommittedMergeInsert {
+                transaction: Transaction::new_from_version(
+                    self.0.base.version_id(),
+                    Operation::UpdateConfig {
+                        config_updates: None,
+                        table_metadata_updates: None,
+                        schema_metadata_updates: None,
+                        field_metadata_updates: HashMap::new(),
+                    },
+                ),
+                affected_rows: None,
+                stats: Default::default(),
+                inserted_rows_filter: None,
+            }
+        } else {
+            MergeInsertBuilder::try_new(self.0.base.clone(), vec!["id".into()])?
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::DoNothing)
+                .write_mode(MergeInsertWriteMode::RewriteColumns)
+                .conflict_retries(0)
+                .skip_auto_cleanup(true)
+                .try_build()?
+                .execute_uncommitted_batches(batches)
+                .await?
+        };
         if merge.stats.num_updated_rows != self.rows() as u64
             || merge.stats.num_inserted_rows != 0
             || merge.stats.num_deleted_rows != 0
@@ -212,10 +266,11 @@ impl FrozenAnnotations {
         merge.transaction.uuid = self.0.id.clone();
         let cut = serde_json::to_string(&(&self.0.scope, self.0.through))
             .map_err(|e| invalid(e.to_string()))?;
-        merge.transaction.transaction_properties = Some(Arc::new(HashMap::from([(
-            "lance-context.annotation-cut".into(),
-            cut,
-        )])));
+        let mut properties = HashMap::from([("lance-context.annotation-cut".into(), cut)]);
+        if let Some(results) = &self.0.results {
+            properties.insert(RESULTS_PROPERTY.into(), results.clone());
+        }
+        merge.transaction.transaction_properties = Some(Arc::new(properties));
         let result = Arc::new(Prepared {
             merge,
             _workspace: reservation,

@@ -1,8 +1,8 @@
 //! Single-shard annotation apply and read barrier over the RF3 WAL.
 //!
-//! This integration deliberately refuses a closed/materialized source: durable
-//! outcome checkpoints and publisher scheduling must be connected before GC is
-//! enabled. It is not yet wired into the production application registry.
+//! Native checkpoints restore values and bounded request outcomes together.
+//! Publisher scheduling remains externally owned. This is not yet wired into
+//! the production application registry.
 use super::*;
 use crate::{materializer::Storage, reader};
 use lance::dataset::builder::DatasetBuilder;
@@ -14,7 +14,9 @@ use lance_context_wal::replication::publication::lance::ManagedManifest;
 use std::{future::Future, sync::Mutex};
 use tokio::sync::watch;
 
+pub(crate) mod checkpoint;
 pub mod wire;
+pub use checkpoint::{FrozenCheckpoint, PreparedCheckpoint};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MutationResult {
@@ -40,7 +42,8 @@ struct Progress {
 
 struct Shared {
     staging: AnnotationStaging,
-    outcomes: Mutex<Vec<Option<Completed>>>,
+    results: Mutex<checkpoint::Results>,
+    ordered: tokio::sync::Mutex<()>,
     progress: watch::Sender<Progress>,
 }
 
@@ -95,33 +98,8 @@ impl Service {
             "annotation apply needs independent reserved workspace so waiting uploads cannot block it");
         let ingress =
             Ingress::connect_with_schema(client, layout, binding, budget, contract, schema).await?;
-        let visibility = ingress.visibility().await?;
-        ensure!(
-            visibility.checkpoint.is_empty(),
-            "annotation outcome checkpoint recovery is not connected"
-        );
-        let handler = ManagedManifest::reader(
-            Arc::new(ingress.client.manifest_catalog()),
-            storage.base.clone(),
-            &ingress.layout,
-            ingress.scope.table,
-            ingress.scope.incarnation,
-        )?;
-        let base = Arc::new(
-            DatasetBuilder::from_uri(&storage.uri)
-                .with_storage_options(storage.options.clone())
-                .with_session(storage.session.clone())
-                .with_commit_handler(Arc::new(handler))
-                .load()
-                .await?,
-        );
-        ensure!(
-            base.read_transaction().await?.is_none_or(|t| t
-                .transaction_properties
-                .as_ref()
-                .is_none_or(|p| !p.contains_key("lance-context.annotation-cut"))),
-            "selected annotation publication requires outcome checkpoint recovery"
-        );
+        let (base, snapshot) = checkpoint::open(&ingress, storage).await?;
+        let through = snapshot.through;
         let staging = AnnotationStaging::new(
             base,
             StagingScope {
@@ -129,11 +107,11 @@ impl Service {
                 source_group: ingress.group(0)?,
                 shard: 0,
             },
-            0,
+            through,
             limits.clone(),
         )?;
         let (progress, _) = watch::channel(Progress {
-            through: 0,
+            through,
             stopped: false,
             backpressured: false,
         });
@@ -144,7 +122,11 @@ impl Service {
             apply_budget,
             shared: Arc::new(Shared {
                 staging,
-                outcomes: Mutex::new(outcomes),
+                results: Mutex::new(checkpoint::Results {
+                    base: snapshot,
+                    latest: outcomes,
+                }),
+                ordered: tokio::sync::Mutex::new(()),
                 progress,
             }),
         };
@@ -236,15 +218,7 @@ impl Service {
             let accepted = self.ingress.append(prepared).await?;
             self.wait_through(accepted.position.index).await?;
             let slot = slot(&accepted.meta, self.ingress.client.producer_slots())?;
-            let outcomes = self.shared.outcomes.lock().unwrap();
-            let result = outcomes[slot]
-                .as_ref()
-                .context("annotation request outcome unavailable")?;
-            ensure!(
-                result.index == accepted.position.index && result.meta == accepted.meta,
-                "annotation request outcome expired; request must not be re-executed"
-            );
-            Ok(result.clone())
+            self.shared.results.lock().unwrap().resolve(&accepted, slot)
         })
         .await
         .context("annotation apply deadline expired; reconcile the original request")?
@@ -269,10 +243,19 @@ impl Service {
             },
         )
         .await?;
-        ensure!(
-            matches!(value, query::Value::SourceClosure(None)),
-            "source closure requires annotation outcome checkpoint recovery"
-        );
+        let query::Value::SourceClosure(closed) = value else {
+            bail!("source closure unavailable");
+        };
+        if let Some(closed) = closed {
+            let closure = closed.permit.closure();
+            ensure!(
+                closure.table == self.ingress.scope.table
+                    && closure.incarnation == self.ingress.scope.incarnation
+                    && closure.group == self.ingress.group(0)?
+                    && closure.through <= self.shared.results.lock().unwrap().base.through,
+                "annotation view is behind source closure; reconnect to its durable checkpoint"
+            );
+        }
         Ok(cut.quorum_index)
     }
 
@@ -397,6 +380,9 @@ impl Driver {
                 );
             } else {
                 if page.through > after {
+                    // Control progress participates in the same freeze gate;
+                    // otherwise values could freeze beyond the captured result cut.
+                    let _ordered = service.shared.ordered.lock().await;
                     service
                         .shared
                         .staging
@@ -419,6 +405,7 @@ impl Driver {
                 patch: &m.patch,
             })
             .collect();
+        let _ordered = service.shared.ordered.lock().await;
         let result = match service
             .shared
             .staging
@@ -439,7 +426,7 @@ impl Driver {
         // publishing progress to waiters. Cancellation cannot split this handoff.
         let pending = self.pending.take().unwrap();
         let slot = slot(&pending.meta, ingress.client.producer_slots())?;
-        service.shared.outcomes.lock().unwrap()[slot] = Some(Completed {
+        service.shared.results.lock().unwrap().latest[slot] = Some(Completed {
             index: pending.index,
             meta: pending.meta,
             result,
