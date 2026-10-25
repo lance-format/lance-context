@@ -483,10 +483,13 @@ fn spawn_publish_demand<S: Sweepable>(
                     sealed_times: Default::default(),
                 };
                 state
-                    .merge_executions
-                    .publish_demand_event(&target, &event)
+                    .demand_publisher
+                    .publish_writer_event(
+                        &target,
+                        &event,
+                        state.merge_executions.publish_demand_event(&target, &event),
+                    )
                     .await
-                    .map(|written| if written { "written" } else { "unchanged" })
             })
             .await;
             let label = match result {
@@ -1121,6 +1124,51 @@ mod tests {
                 2
             );
             assert_eq!(store.read().await.count_base_rows().await.unwrap(), 0);
+            if expected {
+                // A successful telemetry acknowledgement must never suppress
+                // another independent request for the same pending backlog.
+                let watermark = store.own_shard_watermark().await.unwrap().unwrap();
+                let event = lance_context_merge::demand::DemandEvent {
+                    v: lance_context_merge::demand::SCHEMA_VERSION,
+                    shard: watermark.shard_id.to_string(),
+                    sealed_through: watermark.sealed_through,
+                    sealed_bytes_through: 0,
+                    merged_through: None,
+                    merged_epoch: None,
+                    flushed_at_ms: chrono::Utc::now().timestamp_millis(),
+                    writer_epoch: watermark.writer_epoch,
+                    source: lance_context_merge::demand::EventSource::Writer,
+                    sealed_times: Default::default(),
+                };
+                state
+                    .demand_publisher
+                    .publish_writer_event(
+                        "generic:s",
+                        &event,
+                        coordinator.publish_demand_event("generic:s", &event),
+                    )
+                    .await
+                    .unwrap();
+                let request = coordinator
+                    .get_merge_request("generic:s")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(coordinator.acknowledge_request(&request).await.unwrap());
+                spawn_publish_demand(state.clone(), "generic:s".into(), store.clone());
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while coordinator
+                        .get_merge_request("generic:s")
+                        .await
+                        .unwrap()
+                        .is_none()
+                    {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("cached telemetry suppressed an independent merge request");
+            }
         }
     }
 
