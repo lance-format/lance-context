@@ -29,6 +29,7 @@ pub mod serde;
 mod storage;
 mod store;
 mod store_base;
+pub mod wal_presence;
 mod wal_watermarks;
 pub use store_base::{
     is_pending_generations_exceeded, ShardWatermark, DEFAULT_PENDING_GENERATIONS_MAX,

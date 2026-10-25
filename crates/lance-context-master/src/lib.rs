@@ -31,6 +31,7 @@ pub mod scoring;
 pub mod state;
 pub mod stats_store;
 pub mod task_store;
+mod wal_sweep_refresh;
 pub mod wal_tail;
 
 pub(crate) mod demand_controller;

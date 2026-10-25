@@ -46,7 +46,7 @@ metrics = { version = "0.24", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 futures = "0.3"
-tokio = { version = "1", features = ["sync", "time"] }
+tokio = { version = "1", features = ["sync", "time", "fs"] }
 clap = { version = "4", features = ["derive", "env"] }
 etcd-client = { version = "0.19", features = ["tls"] }
 tracing = "0.1"
@@ -57,7 +57,7 @@ uuid = { version = "1.20.0", features = ["v4", "v5", "v7"] }
 # emitted, without installing a process-global Prometheus exporter.
 metrics-util = { version = "0.19", default-features = false, features = ["debugging"] }
 tempfile = "3"
-tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util"] }
 
 [[example]]
 name = "annotation_column_update"

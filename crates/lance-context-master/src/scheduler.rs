@@ -1142,6 +1142,7 @@ async fn sweep_merge_wal_inner(
         .await?;
     let mut queued = 0;
     let mut deduped = 0;
+    let mut refresh = crate::wal_sweep_refresh::Refresh::new();
     for row in rows {
         if queued >= MAX_SWEEP_ENQUEUE {
             break;
@@ -1157,6 +1158,20 @@ async fn sweep_merge_wal_inner(
             .task_store
             .get_active_id(TaskKind::MergeWal, &row.name)
             .await?;
+        if before.is_none() {
+            // Persisted counts can outlive a completed merge. Recheck actual
+            // shard manifests before recreating work from those counts. Any
+            // remaining generation (even below the trigger) keeps a partial
+            // pass moving. Recovery and fresh writer/frontier paths bypass this.
+            let (kind, name) = parse_target(&row.name);
+            let uri = match kind {
+                StoreKind::Rollout => state.rollout_uri(name),
+                StoreKind::Generic => state.generic_uri(name),
+            };
+            if refresh.confirmed_empty(&row.name, &uri).await {
+                continue;
+            }
+        }
         let task = enqueue_sweep_candidate(state, publisher, TaskKind::MergeWal, &row).await?;
         if before.as_deref() == Some(task.id.as_str()) {
             deduped += 1;
@@ -6311,6 +6326,137 @@ mod tests {
     }
 
     /// WAL sweeps enqueue over-threshold targets and dedupe a second sweep.
+    #[tokio::test]
+    #[ignore = "requires isolated ETCD_TEST_ENDPOINTS"]
+    async fn stale_stats_refresh_preserves_partial_work_new_writes_and_recovery() {
+        use lance_context_api::schema_spec::{ColumnSpec, ColumnType, SchemaSpec};
+        use lance_context_core::{GenericStore, GenericStoreOptions};
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.merge_wal_min_generations = 3;
+        let first = MasterState::new(cfg.clone()).await.unwrap();
+        let uri = first.generic_uri("gs");
+        let mut writer = GenericStore::open(
+            &uri,
+            SchemaSpec::new(vec![(
+                "id".into(),
+                ColumnSpec::required(ColumnType::String { large: false }),
+            )]),
+            GenericStoreOptions {
+                shard_id: Some("historical-writer".into()),
+                seal_on_add: true,
+                merge_after_generations: Some(0),
+                merge_max_generations: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        for id in ["one", "two"] {
+            writer
+                .add(&[serde_json::json!({"id":id}).as_object().unwrap().clone()])
+                .await
+                .unwrap();
+        }
+        let stats = crate::stats_store::StatRow {
+            version: 17,
+            name: "generic:gs".into(),
+            uri: uri.clone(),
+            row_count: 0,
+            fragment_count: 0,
+            last_updated: 0,
+            pending_wal_generations: 8,
+            last_compaction: -1,
+            total_compactions: 0,
+            scanned_at: 1,
+        };
+        first.stats.lock().await.upsert(&stats).await.unwrap();
+        let second = MasterState::new(cfg).await.unwrap();
+        let mut ids = std::collections::BTreeSet::new();
+        for state in [&first, &second] {
+            assert_eq!(sweep_merge_wal_candidates(state).await.unwrap(), 1);
+            let claim = state.task_store.claim_next().await.unwrap().unwrap();
+            assert_eq!(claim.task.target, "generic:gs");
+            assert!(ids.insert(claim.task.id.clone()));
+            assert_eq!(writer.cleanup_wal().await.unwrap(), 1);
+            finish_task(state, claim, Ok("merged 1 generation".into()))
+                .await
+                .unwrap();
+        }
+        // The original four-zero diagnostic keeps this exact stale observation.
+        // Actual drain now prevents all four repeat tasks across two masters.
+        for state in [&first, &second, &first, &second] {
+            assert_eq!(sweep_merge_wal_candidates(state).await.unwrap(), 0);
+        }
+        let observed = second
+            .stats
+            .lock()
+            .await
+            .get("generic:gs")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                observed.version,
+                observed.scanned_at,
+                observed.pending_wal_generations
+            ),
+            (17, 1, 8)
+        );
+        writer
+            .add(&[serde_json::json!({"id":"new-seal"})
+                .as_object()
+                .unwrap()
+                .clone()])
+            .await
+            .unwrap();
+        assert_eq!(sweep_merge_wal_candidates(&second).await.unwrap(), 1);
+        let claim = second.task_store.claim_next().await.unwrap().unwrap();
+        assert_eq!(writer.cleanup_wal().await.unwrap(), 1);
+        finish_task(&second, claim, Ok("merged 1 generation".into()))
+            .await
+            .unwrap();
+        assert_eq!(writer.list(None, None).await.unwrap().len(), 3);
+        assert_eq!(sweep_merge_wal_candidates(&first).await.unwrap(), 0);
+
+        // Empty WAL must never disable recovery of an unresolved executor.
+        let execution = lance_context_merge::Execution::new("generic:gs", "worker", "old", 60);
+        first
+            .task_store
+            .etcd_client()
+            .clone()
+            .put(
+                lance_context_merge::execution_key(&first.config.etcd.etcd_prefix, "generic:gs"),
+                serde_json::to_vec(&execution).unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+        let c = first.task_store.merge_coordinator();
+        let old = c
+            .execution_observation_page(None)
+            .await
+            .unwrap()
+            .0
+            .remove(0);
+        assert_eq!(sweep_merge_wal_candidates(&first).await.unwrap(), 0);
+        assert!(first
+            .task_store
+            .enqueue_execution_recovery(TaskKind::MergeWal, &old)
+            .await
+            .unwrap()
+            .is_some());
+        c.request_merge("generic:gs").await.unwrap();
+        let request = c.get_merge_request("generic:gs").await.unwrap().unwrap();
+        assert!(first
+            .task_store
+            .enqueue_merge_request(&request)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
     #[tokio::test]
     #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn sweep_merge_wal_enqueues_over_threshold_and_dedupes() {
