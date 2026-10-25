@@ -18,6 +18,8 @@ use lance_table::{
 };
 use prost::Message;
 
+mod large;
+
 pub(super) fn one_shard() -> Arc<Layout> {
     let mut value = (*layout()).clone();
     value.groups.remove(&20);
@@ -153,6 +155,10 @@ pub(super) async fn seed_contract(
         }),
     )
     .await?;
+    seed_base(c, contract, &base).await
+}
+
+async fn seed_base(c: &network::Cluster, contract: IngestContract, base: &Dataset) -> Result<()> {
     let Applied::Publisher(p::Reply::Acquired(authority)) = command(
         c,
         Command::Acquire(p::Acquire {
@@ -176,7 +182,7 @@ pub(super) async fn seed_contract(
                 authority,
                 incarnation: binding().incarnation,
                 request: Uuid::new_v4(),
-                version: 1,
+                version: base.version_id(),
                 object: p::ManifestObject {
                     path: format!("_versions/{}", location.path.filename().unwrap()),
                     bytes: location.size.unwrap(),
@@ -328,7 +334,11 @@ pub(super) async fn select_range(
     let view = state(c).await?;
     let plan = p::Plan {
         transaction,
-        read_version: view.progress.minimum_read_version,
+        read_version: view
+            .manifests
+            .as_ref()
+            .context("test manifest missing")?
+            .head,
         sources: BTreeMap::from([(
             10,
             p::SourceRange {
@@ -647,6 +657,7 @@ async fn restart_at(stop: Stop) -> Result<()> {
         &saved.descriptors,
         &recovered_selection,
         &recovered.manifests.as_ref().unwrap().versions[&2],
+        &storage,
     )
     .await?;
     assert_eq!(cut, first.0);

@@ -291,7 +291,13 @@ impl Publisher {
         let prepared = frozen.prepare(&self.budget, 8192).await?;
         // Preserve these exact bytes until Prepare is resolved. On any unknown
         // result this runtime stops; a fenced restart reads the retained result.
-        let descriptors = publication::descriptors(prepared.annotations(), &selection)?;
+        let descriptors = publication::persist_descriptors(
+            prepared.annotations(),
+            &selection,
+            &self.storage,
+            self.service.ingress.client.max_descriptor_bytes(),
+        )
+        .await?;
         let reply = materializer::commit(
             &self.service.ingress.client,
             Command::Prepare(p::PrepareRequest {
@@ -379,8 +385,15 @@ impl Publisher {
             "annotation preparation index differs"
         );
         let selected = checkpoint::load(&self.service.ingress, &self.storage, target).await?;
-        publication::selected_cut(&selected, &base, &prepared.descriptors, &selection, record)
-            .await?;
+        publication::selected_cut(
+            &selected,
+            &base,
+            &prepared.descriptors,
+            &selection,
+            record,
+            &self.storage,
+        )
+        .await?;
         let reply = materializer::commit(
             &self.service.ingress.client,
             Command::Confirm(p::ConfirmPublication {

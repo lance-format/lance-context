@@ -201,7 +201,7 @@ fn annotation_descriptors_require_an_annotation_binding_and_a_source_prefix() ->
         WritePolicy::TurnAnnotations,
     ] {
         for maintenance in [false, true] {
-            for format in 1..=4 {
+            for format in 1..=5 {
                 let (mut catalog, mut plan) = fixture_with_policy(policy.clone())?;
                 if maintenance {
                     plan.plan.sources.clear();
@@ -216,7 +216,7 @@ fn annotation_descriptors_require_an_annotation_binding_and_a_source_prefix() ->
                 } else {
                     match policy {
                         WritePolicy::ImmutableUniqueIds => format == 1,
-                        WritePolicy::TurnAnnotations => format == 4,
+                        WritePolicy::TurnAnnotations => matches!(format, 4 | 5),
                     }
                 };
                 let before = catalog.clone();
@@ -270,7 +270,7 @@ fn descriptor_budget_digest_and_wire_type_limits_apply_before_admission() -> Res
             0 => invalid.descriptors = Descriptors::lance_fragments(Bytes::from(vec![7; 513]))?,
             1 => invalid.descriptors.bytes = Bytes::new(),
             2 => invalid.descriptors.digest[0] ^= 1,
-            3 => invalid.descriptors.format = 5,
+            3 => invalid.descriptors.format = 6,
             4 => invalid.authority.layout[0] ^= 1,
             5 => invalid.plan_index = 0,
             _ => unreachable!(),

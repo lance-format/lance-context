@@ -5,8 +5,9 @@ An immutable append binding continues to use `ImmutableUniqueIds`; changing a
 publisher's policy cannot reinterpret its existing source records. The existing
 full-contract comparison rejects such a takeover.
 
-The catalog accepts sourced annotation preparation only as descriptor format 4.
-It rejects format 4 for immutable append tables and for source-free maintenance,
+The catalog accepts sourced annotation preparation as inline descriptor format 4
+or a destination-store metadata reference in format 5. It rejects both formats
+for immutable append tables and for source-free maintenance,
 and rejects append descriptors for annotation sources. The same checks run when
 restoring catalog checkpoints. Formats 2 and 3 remain source-free maintenance.
 Recording preparation still does not advance source coverage or authorize GC.

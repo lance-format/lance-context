@@ -42,3 +42,46 @@ updates in this fixture leave one body file and one current annotation file per
 fragment: native manifest construction removes fully superseded column-file
 references. Physical deletion of historical blob objects is a separate retention
 operation. Abrupt process-crash and sustained-load qualification remain pending.
+
+## Preparations spanning many fragments
+
+The native transaction grows with the fragments it updates, independently of
+the dirty-value budget. A local Lance 13 experiment with 4,096 fragments and one
+updated row per fragment produced 1,134,379 bytes of native preparation metadata,
+before request-result checkpoints. That exceeds the WAL descriptor limit of
+1,048,576 bytes and prevents publication of that frozen generation.
+
+The annotation runtime keeps inline format 4 for transactions within the catalog's
+configured descriptor budget (256 KiB by default, at most 1 MiB).
+Larger transactions are conditionally created in the same authorized destination
+store as their Lance files. Format 5 retains only their table incarnation,
+publication identity, byte count and content digest in the quorum catalog. The
+object path is derived from that destination and identity; a descriptor cannot
+supply an arbitrary URI. This changes preparation metadata, not mutation payloads
+or the ACK path. All catalog voters and annotation owners must support format 5
+before a publisher emits it; it is not compatible with older voters.
+
+Persistence finishes before Prepare. Unknown upload errors stop the attempt;
+only a conditional-create conflict is resolved by reading and checking the exact
+object. A durable Prepare always recovers its original bytes and files. Without
+one, recovery uses the existing retained-plan protocol. Missing or corrupt
+metadata fails recovery without confirming publication or reclaiming its source.
+Selected-manifest recovery checks the referenced native transaction against the
+manifest, just as it checks an inline transaction.
+
+A 64 MiB limit bounds the raw metadata encoded or fetched by one operation. It
+does not bound decoded engine allocations or total process memory, and is
+separate from dirty staging admission. Preparations above that limit still fail;
+this is not arbitrary-fragment-count qualification. Physical deletion of these
+objects, including uploads orphaned before Prepare, remains part of blob
+retention work and is not provided by WAL source GC.
+
+Rust regression tests submit real annotation requests to three disk-backed WAL
+replicas and update one row per fragment. With 4,096 fragments, they restart after
+Prepare, after a lost manifest-selection reply, and after confirmation before GC.
+They verify exact original transaction reuse, request-result retries, a concurrent
+score-update suffix, untouched rows/body-file mappings and final staging/source
+drain. A 1,024-fragment case exercises the default 256 KiB catalog limit below the
+1 MiB hard cap. Missing, corrupt and foreign metadata cannot advance source GC.
+These are bounded local recovery tests with retained disks, not throughput or
+power-loss qualification.

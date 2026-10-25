@@ -367,6 +367,7 @@ pub(super) async fn open(
                 pending: (**pending).clone(),
             },
             record,
+            storage,
         )
         .await?;
         ensure!(selected == through, "selected request result cut differs");

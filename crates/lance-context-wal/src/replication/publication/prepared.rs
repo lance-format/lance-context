@@ -44,6 +44,12 @@ impl Descriptors {
         Self::new(4, bytes)
     }
 
+    /// Reference to immutable native annotation preparation metadata in the
+    /// destination object store. Upgrade all catalog voters before use.
+    pub fn lance_annotation_reference(bytes: Bytes) -> Result<Self> {
+        Self::new(5, bytes)
+    }
+
     fn new(format: u32, bytes: Bytes) -> Result<Self> {
         let descriptors = Self {
             format,
@@ -60,14 +66,14 @@ impl Descriptors {
         } else {
             match policy {
                 WritePolicy::ImmutableUniqueIds => self.format == 1,
-                WritePolicy::TurnAnnotations => self.format == 4,
+                WritePolicy::TurnAnnotations => matches!(self.format, 4 | 5),
             }
         }
     }
 
     pub fn validate(&self, maximum: u64) -> Result<()> {
         ensure!(
-            (1..=4).contains(&self.format)
+            (1..=5).contains(&self.format)
                 && !self.bytes.is_empty()
                 && self.bytes.len() <= MAX_DESCRIPTOR_BYTES
                 && self.bytes.len() as u64 <= maximum

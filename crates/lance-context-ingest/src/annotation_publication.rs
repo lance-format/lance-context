@@ -19,6 +19,8 @@ use uuid::Uuid;
 
 use crate::materializer::Storage;
 
+mod metadata;
+
 /// The first annotation publisher covers one shard in one source group. A
 /// source pin must prove this plan contains every relevant record in its range;
 /// a per-shard cut alone cannot authorize closing a shared group's prefix.
@@ -87,6 +89,42 @@ pub fn descriptors(
     ))
 }
 
+/// Persist large native preparation metadata with its immutable Lance files.
+/// Small preparations retain the existing inline encoding. An upload error
+/// stops this attempt before Prepare; recovery still follows the original plan.
+pub async fn persist_descriptors(
+    prepared: &PreparedAnnotations,
+    selection: &Selection,
+    storage: &Storage,
+    maximum: u64,
+) -> Result<p::Descriptors> {
+    ensure!(
+        (1..=p::MAX_DESCRIPTOR_BYTES as u64).contains(&maximum),
+        "invalid annotation descriptor budget"
+    );
+    ensure!(
+        prepared.base().uri() == storage.uri,
+        "foreign metadata storage"
+    );
+    let transaction = &prepared.merge().transaction;
+    validate(prepared.base(), transaction, selection)?;
+    ensure!(
+        prepared.through() == selection.scope()?.1,
+        "foreign metadata cut"
+    );
+    let native = pb::Transaction::from(transaction);
+    ensure!(
+        native.encoded_len() <= metadata::MAX_NATIVE_BYTES,
+        "native annotation preparation exceeds metadata limit"
+    );
+    let bytes = Bytes::from(native.encode_to_vec());
+    if bytes.len() as u64 <= maximum {
+        p::Descriptors::lance_annotations(bytes)
+    } else {
+        metadata::persist(prepared.base(), storage, selection, bytes, maximum).await
+    }
+}
+
 /// Recover the exact preparation against its original base. Do not run merge
 /// insert again when the catalog already retains these descriptors.
 pub fn transaction(
@@ -96,9 +134,36 @@ pub fn transaction(
 ) -> Result<Transaction> {
     descriptors.validate(p::MAX_DESCRIPTOR_BYTES as u64)?;
     ensure!(descriptors.format == 4, "not annotation descriptors");
-    let transaction = Transaction::try_from(pb::Transaction::decode(descriptors.bytes.clone())?)?;
+    decode(base, descriptors.bytes.clone(), selection)
+}
+
+fn decode(base: &Dataset, bytes: Bytes, selection: &Selection) -> Result<Transaction> {
+    ensure!(
+        bytes.len() <= metadata::MAX_NATIVE_BYTES,
+        "native annotation metadata too large"
+    );
+    let transaction = Transaction::try_from(pb::Transaction::decode(bytes)?)?;
     validate(base, &transaction, selection)?;
     Ok(transaction)
+}
+
+async fn resolve_transaction(
+    base: &Dataset,
+    descriptors: &p::Descriptors,
+    selection: &Selection,
+    storage: &Storage,
+) -> Result<Transaction> {
+    if descriptors.format == 4 {
+        transaction(base, descriptors, selection)
+    } else {
+        ensure!(descriptors.format == 5, "not annotation descriptors");
+        descriptors.validate(p::MAX_DESCRIPTOR_BYTES as u64)?;
+        decode(
+            base,
+            metadata::load(base, storage, selection, descriptors).await?,
+            selection,
+        )
+    }
 }
 
 /// Resolve a pending publication that already selected its manifest, including
@@ -110,8 +175,9 @@ pub async fn selected_cut(
     descriptors: &p::Descriptors,
     selection: &Selection,
     record: &p::ManifestRecord,
+    storage: &Storage,
 ) -> Result<u64> {
-    let expected = transaction(original_base, descriptors, selection)?;
+    let expected = resolve_transaction(original_base, descriptors, selection, storage).await?;
     ensure!(
         selected.uri() == original_base.uri()
             && selected.version_id() == selection.pending.plan.target_version()?
@@ -296,7 +362,7 @@ pub async fn publish(
             && base.uri() == storage.uri,
         "annotation manifest scope differs from preparation"
     );
-    let transaction = transaction(&base, descriptors, selection)?;
+    let transaction = resolve_transaction(&base, descriptors, selection, storage).await?;
     let handler = p::lance::ManagedManifest::new(catalog, storage.base.clone(), layout, commit)?;
     Ok(CommitBuilder::new(base)
         .with_commit_handler(Arc::new(handler))
