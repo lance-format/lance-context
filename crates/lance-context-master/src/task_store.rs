@@ -3060,7 +3060,7 @@ impl EtcdTaskStore {
                 .map(|id| TxnOp::delete(self.task_key(id), None))
                 .collect::<Vec<_>>();
             let mut client = self.client.clone();
-            client
+            let response = client
                 .txn(
                     Txn::new()
                         .when(with_publication_fence(Vec::new(), fence))
@@ -3068,6 +3068,9 @@ impl EtcdTaskStore {
                 )
                 .await
                 .map_err(etcd_error("prune task history"))?;
+            if !response.succeeded() {
+                return Err(lance::Error::io("task history controller lost leadership"));
+            }
         }
         Ok(())
     }

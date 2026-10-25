@@ -126,6 +126,7 @@ struct Entry {
     due: Instant,
     active: Option<(TaskKind, String)>,
     policy: Option<Result<Policy, String>>,
+    offered_target: Option<String>,
 }
 
 struct Cache {
@@ -137,6 +138,7 @@ struct Cache {
     revisions: Vec<i64>,
     active: BTreeMap<(TaskKind, String), BTreeSet<Vec<u8>>>,
     placement: dispatch::Placement,
+    offered_targets: BTreeMap<String, usize>,
 }
 
 impl Cache {
@@ -148,6 +150,7 @@ impl Cache {
             revisions: vec![0; RANGES.len()],
             active: BTreeMap::new(),
             placement: dispatch::Placement::default(),
+            offered_targets: BTreeMap::new(),
         }
     }
 
@@ -163,10 +166,27 @@ impl Cache {
         {
             return Err("demand informer capacity exceeded; durable records retained".into());
         }
+        let location = std::str::from_utf8(key)
+            .ok()
+            .and_then(|key| key.rsplit_once('/'));
+        let offered_target =
+            if location.is_some_and(|(parent, _)| parent.ends_with("/demand-controller/offers")) {
+                value.map(dispatch::offer_target).transpose()?
+            } else {
+                None
+            };
         let due = old.map_or_else(Instant::now, |e| e.due);
         self.placement.forget_queue_entry(key);
         if let Some(old) = self.entries.remove(key) {
             self.ready.remove(&(old.due, key.to_vec()));
+            if let Some(target) = old.offered_target {
+                if let Some(count) = self.offered_targets.get_mut(&target) {
+                    *count -= 1;
+                    if *count == 0 {
+                        self.offered_targets.remove(&target);
+                    }
+                }
+            }
             if let Some(active) = old.active {
                 if let Some(keys) = self.active.get_mut(&active) {
                     keys.remove(key);
@@ -178,9 +198,9 @@ impl Cache {
         }
         self.bytes = bytes;
         if let Some(value) = value {
-            let location = std::str::from_utf8(key)
-                .ok()
-                .and_then(|key| key.rsplit_once('/'));
+            if let Some(target) = &offered_target {
+                *self.offered_targets.entry(target.clone()).or_default() += 1;
+            }
             let task_state = location.and_then(|(parent, _)| {
                 if parent.ends_with("/queue") {
                     Some(TaskState::Queued)
@@ -222,6 +242,7 @@ impl Cache {
                     due,
                     active,
                     policy,
+                    offered_target,
                 },
             );
             if !auxiliary {
@@ -888,7 +909,7 @@ mod tests {
             .any(|p| p.admits_request("narrow", None)));
     }
 
-    async fn next_events(
+    pub(super) async fn next_events(
         stream: &mut etcd_client::WatchStream,
         cache: &mut Cache,
         predicate: impl Fn(&Cache) -> bool,

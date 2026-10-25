@@ -142,7 +142,16 @@ impl Ticket {
 struct Offer {
     v: u32,
     task_id: String,
+    target: String,
     nonce: String,
+}
+
+pub(super) fn offer_target(value: &[u8]) -> Result<String, String> {
+    let offer: Offer = serde_json::from_slice(value).map_err(|e| e.to_string())?;
+    if offer.v != 1 {
+        return Err("unsupported dispatch offer".into());
+    }
+    Ok(offer.target)
 }
 
 fn assignment(
@@ -459,9 +468,10 @@ pub(super) async fn place(
         {
             continue;
         }
-        if cache
-            .entries
-            .contains_key(format!("{prefix}/demand-controller/reservations/{}", task.id).as_bytes())
+        if cache.offered_targets.contains_key(&task.target)
+            || cache.entries.contains_key(
+                format!("{prefix}/demand-controller/reservations/{}", task.id).as_bytes(),
+            )
         {
             continue;
         }
@@ -482,6 +492,7 @@ pub(super) async fn place(
         let offer = Offer {
             v: 1,
             task_id: task.id,
+            target: task.target,
             nonce: lance_context_core::generate_id(),
         };
         let offer = assignment(prefix, ticket_key, &ticket_entry.value, &offer)?;
@@ -1243,5 +1254,175 @@ mod tests {
                 .ready
         );
         store.release_coordination_lock(leader).await.unwrap();
+    }
+    #[tokio::test]
+    #[ignore = "requires isolated ETCD_TEST_ENDPOINTS"]
+    async fn pending_offer_coalesces_one_target_but_prepared_compaction_and_merge_overlap() {
+        let (_dir, mut cfg, _store, leader) = setup().await;
+        cfg.maintenance.compaction_prepare_targets = vec!["table".into()];
+        let store = TaskStore::open_executor(&cfg).await.unwrap();
+        let compact = store
+            .enqueue(TaskKind::Compact, "table", vec![])
+            .await
+            .unwrap();
+        let merge = store
+            .enqueue(TaskKind::MergeWal, "table", vec![])
+            .await
+            .unwrap();
+        let compact_ticket = store
+            .create_dispatch_ticket(
+                serde_json::to_vec(&Ticket::new(
+                    &cfg,
+                    "executor",
+                    "compact",
+                    TaskKinds::COMPACT,
+                    false,
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let merge_ticket = store
+            .create_dispatch_ticket(
+                serde_json::to_vec(&Ticket::new(
+                    &cfg,
+                    "executor",
+                    "merge",
+                    TaskKinds::MERGE_WAL,
+                    false,
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let publisher = store.discovery_publisher(&leader);
+        let mut cache = list(store.etcd_client(), cfg.etcd.prefix()).await.unwrap();
+        while place(&publisher, cfg.etcd.prefix(), &mut cache)
+            .await
+            .unwrap()
+        {}
+        assert_eq!(cache.offered_targets.get("table"), Some(&1));
+        assert!(
+            store
+                .etcd_client()
+                .clone()
+                .get(merge_ticket.key().replace("/tickets/", "/offers/"), None)
+                .await
+                .unwrap()
+                .kvs()
+                .is_empty(),
+            "a pending offer must not fan out multiple competing claims on the same table"
+        );
+        let offered = offer_for(&store, &cfg, &compact_ticket).await;
+        assert_eq!(offered.task_id, compact.id);
+        let admission = Arc::new(admission::Admission::default());
+        let operation = admission.try_admit_named("compact").unwrap();
+        let mut stream = super::super::watch(store.etcd_client(), cfg.etcd.prefix(), &cache)
+            .await
+            .unwrap();
+        let preparing = store
+            .claim_assignment(&offered, TaskKinds::COMPACT, None, &operation)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(preparing.preparing_maintenance());
+        super::super::tests::next_events(&mut stream, &mut cache, |cache| {
+            !cache.offered_targets.contains_key("table")
+                && cache.entries.contains_key(
+                    lance_context_merge::execution_key(cfg.etcd.prefix(), "table")
+                        .replace("/merge-executions/", "/compact-preparations/")
+                        .as_bytes(),
+                )
+        })
+        .await;
+        while place(&publisher, cfg.etcd.prefix(), &mut cache)
+            .await
+            .unwrap()
+        {}
+        let offered = offer_for(&store, &cfg, &merge_ticket).await;
+        assert_eq!(offered.task_id, merge.id);
+        let merging = store
+            .claim_assignment(&offered, TaskKinds::MERGE_WAL, None, &operation)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.get(&compact.id).await.unwrap().unwrap().state,
+            TaskState::Running
+        );
+        assert_eq!(
+            store.get(&merge.id).await.unwrap().unwrap().state,
+            TaskState::Running
+        );
+        store
+            .finish(merging, Ok("merge coexists with preparation".into()))
+            .await
+            .unwrap();
+        store
+            .finish(preparing, Ok("preparation completed".into()))
+            .await
+            .unwrap();
+        store
+            .release_coordination_lock(compact_ticket)
+            .await
+            .unwrap();
+        store.release_coordination_lock(merge_ticket).await.unwrap();
+        store.release_coordination_lock(leader).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated ETCD_TEST_ENDPOINTS"]
+    async fn stale_history_controller_reports_rejection_and_live_dependency_remains_protected() {
+        let (_dir, mut cfg, store, leader) = setup().await;
+        let mut done = Vec::new();
+        for n in 0..3 {
+            let task = store
+                .enqueue(TaskKind::IndexId, &format!("done-{n}"), vec![])
+                .await
+                .unwrap();
+            let claim = store
+                .claim_next_of_kinds(TaskKinds::GENERAL)
+                .await
+                .unwrap()
+                .unwrap();
+            store
+                .finish(claim, Ok("test terminal history".into()))
+                .await
+                .unwrap();
+            done.push(task);
+        }
+        store
+            .enqueue(TaskKind::MergeWal, "child", vec![done[0].id.clone()])
+            .await
+            .unwrap();
+        cfg.task_history_limit = 1;
+        let limited = TaskStore::open_executor(&cfg).await.unwrap();
+        let stale = limited.discovery_publisher(&leader);
+        store.release_coordination_lock(leader).await.unwrap();
+        assert!(
+            stale.prune_controller_history().await.is_err(),
+            "lost fence must not be reported as successful pruning"
+        );
+        for task in &done {
+            assert!(store.get(&task.id).await.unwrap().is_some());
+        }
+        let next = store
+            .discovery_session(serde_json::to_vec(&Policy::from_config(&cfg)).unwrap())
+            .await
+            .unwrap();
+        assert!(store.elect_discovery_leader(&next).await.unwrap());
+        assert_eq!(
+            limited
+                .discovery_publisher(&next)
+                .prune_controller_history()
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(
+            store.get(&done[0].id).await.unwrap().is_some(),
+            "queued dependency must be retained"
+        );
+        store.release_coordination_lock(next).await.unwrap();
     }
 }
