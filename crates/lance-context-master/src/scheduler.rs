@@ -22,6 +22,7 @@
 //! Each task runs in its own `tokio::spawn`, so one task's failure never affects
 //! another. A global [`Semaphore`] bounds how many run at once.
 
+#[cfg(test)]
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1103,6 +1104,7 @@ async fn sweep_merge_wal_inner(state: &Arc<MasterState>) -> lance::Result<usize>
 
 // A draining target still needs metadata recovery while ownership is unresolved.
 // Once released, its old failure ledger must not enqueue fresh merge tasks.
+#[cfg(test)]
 async fn should_probe_failure(
     state: &Arc<MasterState>,
     failure: &lance_context_merge::failure::ShardFailure,
@@ -1127,6 +1129,25 @@ async fn should_probe_failure(
         }
     }
     false
+}
+
+#[cfg(test)]
+async fn enqueue_failure_recovery(
+    state: &Arc<MasterState>,
+    kind: TaskKind,
+    observed: &lance_context_merge::failure::FailureObservation,
+) -> lance::Result<()> {
+    if state
+        .task_store
+        .enqueue_failure_recovery(kind, observed)
+        .await?
+        .is_some()
+    {
+        metrics::counter!("master_task_enqueued_total", "kind" => kind_label(kind)).increment(1);
+    } else {
+        metrics::counter!("master_failure_recovery_enqueue_superseded_total", "kind" => kind_label(kind)).increment(1);
+    }
+    Ok(())
 }
 
 pub(crate) async fn enqueue_merge_request(
@@ -1171,6 +1192,7 @@ pub(crate) async fn enqueue_merge_request(
     Ok(())
 }
 
+#[cfg(test)]
 async fn enqueue_execution_recovery(
     state: &Arc<MasterState>,
     coordinator: &lance_context_merge::Coordinator,
@@ -1189,6 +1211,7 @@ async fn enqueue_execution_recovery(
     Ok(())
 }
 
+#[cfg(test)]
 async fn enqueue_execution_recovery_page(
     state: &Arc<MasterState>,
     coordinator: &lance_context_merge::Coordinator,
@@ -1229,6 +1252,7 @@ async fn enqueue_execution_recovery_page(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) async fn enqueue_observed_execution(
     state: &Arc<MasterState>,
     kind: TaskKind,
@@ -1251,6 +1275,7 @@ pub(crate) async fn enqueue_observed_execution(
 /// the unattempted entries for the next scheduled tick. The failed entry is
 /// still durable (unless its acknowledgement actually committed), and the
 /// normal paged scan revisits it without starving later targets on the page.
+#[cfg(test)]
 async fn enqueue_request_page<A, F, Fut>(
     pending: &mut VecDeque<lance_context_merge::rollout::MergeRequest>,
     mut accepting: A,
@@ -1271,6 +1296,7 @@ where
     Ok(())
 }
 
+#[cfg(test)]
 async fn enqueue_buffered_merge_request(
     state: &Arc<MasterState>,
     coordinator: &lance_context_merge::Coordinator,
@@ -1304,133 +1330,7 @@ pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
     crate::resident_recovery::spawn(state);
     crate::planner::spawn(state);
     crate::executors::spawn(state);
-    // Dependency failure bookkeeping must never delay an accepted claim.
-    // Coalesce cleanup into one admitted, joined operation per master.
-    let history_state = state.clone();
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_secs(5));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            ticker.tick().await;
-            if !history_state.task_store.history_prune_pending() {
-                continue;
-            }
-            let Some(operation) = history_state.admission.try_admit_named("task_history") else {
-                break;
-            };
-            operation.phase("prune_terminal_history");
-            if let Err(error) = history_state.task_store.prune_pending_history().await {
-                tracing::warn!(%error, "deferred task history pruning failed");
-            }
-        }
-    });
-    // Retry metadata independently of coarse stats sweeps. Every replica may
-    // enqueue; the existing task dedupe/claim transaction elects one executor.
-    let retry_state = state.clone();
-    tokio::spawn(async move {
-        let coordinator = retry_state.task_store.merge_coordinator();
-        let mut cursor = None;
-        let mut request_cursor = None;
-        let mut pending_requests = VecDeque::new();
-        let mut execution_cursor = None;
-        let mut ticker = tokio::time::interval(Duration::from_secs(15));
-        // Slow or failed metadata calls must not accumulate immediate retries
-        // when the backend recovers. Durable demand survives a missed tick.
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            ticker.tick().await;
-            if let Some(operation) = retry_state.admission.try_admit_named("worker_merge_demand") {
-                operation.phase("enqueue_worker_demand");
-                let resumed_page = !pending_requests.is_empty();
-                if pending_requests.is_empty() {
-                    match coordinator.request_page(request_cursor.as_deref()).await {
-                        Ok((targets, next)) => {
-                            request_cursor = next;
-                            pending_requests.extend(targets);
-                        }
-                        Err(error) => tracing::warn!(%error, "worker merge demand scan failed"),
-                    }
-                }
-                if let Err((target, error)) = enqueue_request_page(
-                    &mut pending_requests,
-                    || retry_state.admission.status().accepting,
-                    |request| {
-                        let state = &retry_state;
-                        let coordinator = &coordinator;
-                        let operation = &operation;
-                        async move {
-                            operation.target(&request.target);
-                            let result = enqueue_buffered_merge_request(
-                                state,
-                                coordinator,
-                                request,
-                                resumed_page,
-                            )
-                            .await;
-                            if result.is_ok() {
-                                operation.observed_work();
-                            }
-                            result
-                        }
-                    },
-                )
-                .await
-                {
-                    metrics::counter!("master_worker_demand_enqueue_page_errors_total")
-                        .increment(1);
-                    tracing::warn!(%target, %error, remaining = pending_requests.len(),
-                    "worker merge demand enqueue failed; remaining page deferred to next tick");
-                }
-            }
-            match coordinator
-                .execution_observation_page(execution_cursor.as_deref())
-                .await
-            {
-                Ok((executions, next)) => {
-                    // Each observation remains durable for the next sweep;
-                    // an error on this page must not starve later targets.
-                    execution_cursor = next;
-                    if let Err(error) =
-                        enqueue_execution_recovery_page(&retry_state, &coordinator, &executions)
-                            .await
-                    {
-                        tracing::warn!(%error, "local execution recovery page deferred");
-                    }
-                }
-                Err(error) => tracing::warn!(%error, "local execution recovery scan failed"),
-            }
-            match coordinator.failure_page(cursor.as_deref(), 256).await {
-                Ok((rows, next)) => {
-                    cursor = next;
-                    let mut targets = std::collections::HashSet::new();
-                    for failure in rows {
-                        let task_kind = crate::maintenance_execution::retry_kind(&failure.endpoint)
-                            .or_else(|| {
-                                retry_state
-                                    .config
-                                    .worker_endpoints
-                                    .contains(&failure.endpoint)
-                                    .then_some(TaskKind::MergeWal)
-                            });
-                        let Some(task_kind) = task_kind else {
-                            continue;
-                        };
-                        if failure.next_retry_ms <= lance_context_merge::failure::now_ms()
-                            && targets.insert((failure.target.clone(), kind_label(task_kind)))
-                            && should_probe_failure(&retry_state, &failure).await
-                        {
-                            if let Err(error) =
-                                enqueue(&retry_state, task_kind, &failure.target).await
-                            {
-                                tracing::warn!(target = %failure.target, %error, "maintenance recovery enqueue failed");
-                            }
-                        }
-                    }
-                }
-                Err(error) => tracing::warn!(%error, "merge recovery metadata scan failed"),
-            }
-        }
-    });
+    crate::demand_controller::spawn(state);
 
     // Optional periodic compaction auto-sweep feeds the same queue.
     let interval_secs = state.config.compaction_interval_secs;
@@ -1503,15 +1403,14 @@ pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
         state.clone(),
         sem.clone(),
         if !claim_merges || merge_sem.is_some() {
-            TaskKinds::GENERAL.without_compact()
+            TaskKinds::GENERAL
         } else {
             // No separate merge budget: the general pool runs everything, so it
             // must still be allowed to claim MergeWal.
-            TaskKinds::ANY.without_compact()
+            TaskKinds::ANY
         },
         true,
     );
-    spawn_pool_poller(state.clone(), sem, TaskKinds::COMPACT, false);
     if let Some(merge) = merge_sem {
         spawn_pool_poller(state.clone(), merge, TaskKinds::MERGE_WAL, false);
     }
@@ -1548,19 +1447,11 @@ fn spawn_pool_poller(
     spawn_filtered_pool_poller(state, pool, kinds, report_depth, false)
 }
 
-/// Decrements a gauge when dropped, so unwinding pays it back.
-struct GaugeHold(metrics::Gauge);
-impl Drop for GaugeHold {
-    fn drop(&mut self) {
-        self.0.decrement(1.0);
-    }
-}
-
 fn spawn_filtered_pool_poller(
     state: Arc<MasterState>,
     pool: Arc<Semaphore>,
     kinds: TaskKinds,
-    report_depth: bool,
+    _report_depth: bool,
     resident_only: bool,
 ) -> tokio::task::JoinHandle<()> {
     let pool_label: &'static str = if resident_only {
@@ -1572,63 +1463,69 @@ fn spawn_filtered_pool_poller(
     } else {
         "general"
     };
-    // Permits in use are split by what holds them: `claiming` while the etcd
-    // claim is outstanding, `running` once a task owns the permit. Both are
-    // updated at the permit boundaries themselves, so a claim that blocks on
-    // etcd for minutes shows as a held permit rather than as idle capacity.
-    let claiming =
-        metrics::gauge!("master_task_pool_in_use", "pool" => pool_label, "state" => "claiming");
+    // Dispatch owns the waiting/claiming gauges at the actual phase
+    // boundaries; reserving capacity is not an in-flight ownership request.
+    for phase in ["waiting_for_offer", "claiming"] {
+        metrics::gauge!("master_task_pool_in_use", "pool" => pool_label, "state" => phase).set(0.0);
+    }
     let running =
         metrics::gauge!("master_task_pool_in_use", "pool" => pool_label, "state" => "running");
-    claiming.set(0.0);
     running.set(0.0);
     tokio::spawn(async move {
-        let mut claim_cursor = crate::task_store::SchedulerClaimCursor::default();
-        let mut notifications = state.task_store.scheduler_notifications();
-        let mut next_depth = tokio::time::Instant::now();
+        let executor = state.admission.status().executor_id;
+        let resuming = Arc::new(crate::merge_capacity::Resuming::default());
+        let mut receiver = crate::demand_controller::dispatch::Receiver::new(resuming.clone());
         loop {
-            // Consume prior changes before reading. A change during the scan
-            // remains unseen and wakes the next pass, avoiding lost wakeups.
-            notifications.borrow_and_update();
-            if report_depth && tokio::time::Instant::now() >= next_depth {
-                next_depth =
-                    tokio::time::Instant::now() + crate::scheduler_wakeup::RECONCILE_INTERVAL;
-                if let Ok(queued) = state.task_store.queue_depth().await {
-                    metrics::gauge!("master_task_queue_depth").set(queued as f64);
+            if !state.admission.is_accepting() {
+                if let Err(error) = receiver.close(&state.task_store).await {
+                    tracing::warn!(%error, "dispatch session cleanup failed during drain");
                 }
+                return;
             }
             while pool.available_permits() > 0 {
                 // Reserve both budgets before taking durable table ownership.
-                let compact_permit = if kinds == TaskKinds::COMPACT {
-                    match state.compaction_permits.clone().try_acquire_owned() {
-                        Ok(permit) => Some(permit),
-                        Err(_) => break,
-                    }
+                let compact_permit = if kinds.contains(TaskKind::Compact) {
+                    state.compaction_permits.clone().try_acquire_owned().ok()
                 } else {
                     None
                 };
+                if kinds == TaskKinds::COMPACT && compact_permit.is_none() {
+                    break;
+                }
                 let Ok(permit) = pool.clone().try_acquire_owned() else {
                     break;
                 };
                 let Some(operation) = state.admission.try_admit_named(pool_label) else {
                     break;
                 };
-                // Held across the await so a poller aborted mid-claim (drain,
-                // shutdown, test teardown) still pays the gauge back.
-                claiming.increment(1.0);
-                let claiming_hold = GaugeHold(claiming.clone());
-                operation.phase("claiming");
-                let claim_start = std::time::Instant::now();
-                let targets = resident_only.then(|| crate::local_merge::targets(&state.config));
-                let claim = state
-                    .task_store
-                    .claim_scheduler_slice(kinds, targets.as_deref(), &mut claim_cursor, &operation)
+                // Shared pools advertise one combined policy so an idle
+                // compact ticket cannot monopolize capacity needed by other kinds.
+                let offered_kinds = if compact_permit.is_some() {
+                    kinds
+                } else {
+                    kinds.without_compact()
+                };
+                let refresh_compaction =
+                    kinds.contains(TaskKind::Compact) && compact_permit.is_none();
+                let ticket = crate::demand_controller::dispatch::Ticket::new(
+                    &state.config,
+                    &executor,
+                    pool_label,
+                    offered_kinds,
+                    resident_only,
+                );
+                let claim = receiver
+                    .claim(&state, &ticket, &operation, refresh_compaction)
                     .await;
-                drop(claiming_hold);
                 match claim {
-                    Ok(Some(claim)) => {
+                    Ok(Some((claim, claim_elapsed))) => {
+                        let compact_permit = if claim.task.kind == TaskKind::Compact {
+                            compact_permit
+                        } else {
+                            drop(compact_permit);
+                            None
+                        };
                         operation.task(&claim.task.id, &claim.task.target);
-                        let claim_elapsed = claim_start.elapsed();
                         // Local capacity was reserved before the claim. No
                         // claimed table waits on a compaction semaphore.
                         let timing = TaskClaimTiming {
@@ -1644,6 +1541,7 @@ fn spawn_filtered_pool_poller(
                             Duration::from_secs(state.config.legacy_merge_foreground_secs),
                             running.clone(),
                             operation.clone(),
+                            resuming.clone(),
                         );
                         tokio::spawn(async move {
                             crate::merge_capacity::scope(capacity, run_task(&st, claim, timing))
@@ -1654,13 +1552,23 @@ fn spawn_filtered_pool_poller(
                     }
                     Ok(None) => break,
                     Err(error) => {
-                        tracing::warn!(error = %error, "scheduler queue poll failed");
+                        tracing::warn!(error = %error, "controller assignment failed; retrying without a queue scan");
+                        tokio::time::sleep(Duration::from_secs(5)).await;
                         break;
                     }
                 }
             }
-            crate::scheduler_wakeup::wait(&mut notifications, &pool, claim_cursor.has_more_pages())
-                .await;
+            // Wake promptly when productive work releases local capacity.
+            // The timer only checks in-memory admission/handles empty claims;
+            // there is no recurring etcd scan or broad queue subscription.
+            if pool.available_permits() == 0 {
+                tokio::select! {
+                    permit = pool.clone().acquire_owned() => { drop(permit); },
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {},
+                }
+            } else {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
         }
     })
 }
@@ -2015,6 +1923,7 @@ mod tests {
         enqueue(&state, TaskKind::MergeWal, "exp").await.unwrap();
         enqueue(&state, TaskKind::IndexId, "other").await.unwrap();
         let pool = Arc::new(Semaphore::new(2));
+        let controller = crate::demand_controller::spawn(&state);
         let poller = spawn_pool_poller(state.clone(), pool.clone(), TaskKinds::COMPACT, false);
         tokio::time::sleep(Duration::from_millis(650)).await;
         assert_eq!(
@@ -2065,6 +1974,7 @@ mod tests {
         .await
         .unwrap();
         poller.abort();
+        controller.abort();
     }
 
     #[tokio::test]
@@ -2757,6 +2667,68 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn stale_failure_inventory_does_not_recreate_recovered_work() {
+        use lance_context_merge::failure::{FailureClass, ShardFailure};
+        let dir = TempDir::new().unwrap();
+        let cfg = config(&dir);
+        let mut client = etcd_client::Client::connect(&cfg.etcd.etcd_endpoints, None)
+            .await
+            .unwrap();
+        let hex = |s: &str| {
+            s.as_bytes()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        let key = format!(
+            "{}/merge-failures/{}/{}",
+            cfg.etcd.etcd_prefix,
+            hex("exp"),
+            hex("worker")
+        );
+        let state = MasterState::new(cfg).await.unwrap();
+        let coordinator = state.task_store.merge_coordinator();
+        let failure = ShardFailure {
+            target: "exp".into(),
+            endpoint: "worker".into(),
+            consecutive_attempts: 1,
+            class: FailureClass::Retryable,
+            last_error: "temporary transport failure".into(),
+            last_failure_ms: 1,
+            next_retry_ms: 0,
+            needs_attention: false,
+        };
+        client
+            .put(key.clone(), serde_json::to_vec(&failure).unwrap(), None)
+            .await
+            .unwrap();
+        let observed = coordinator
+            .failure_observation_page(None, 256)
+            .await
+            .unwrap()
+            .0
+            .remove(0);
+        assert!(observed.failure.next_retry_ms <= lance_context_merge::failure::now_ms());
+        assert!(should_probe_failure(&state, &observed.failure).await);
+        // Successful recovery removes the durable failure after this scanner's
+        // page was read. The old page is not fresh demand.
+        client.delete(key, None).await.unwrap();
+        enqueue_failure_recovery(&state, TaskKind::MergeWal, &observed)
+            .await
+            .unwrap();
+        assert!(
+            state
+                .task_store
+                .get_active_id(TaskKind::MergeWal, "exp")
+                .await
+                .unwrap()
+                .is_none(),
+            "cleared failure inventory must not recreate zero-work tasks"
+        );
+    }
+
+    #[tokio::test]
     #[ignore = "requires exclusive loopback ETCD_TEST_ENDPOINTS and ETCD_TEST_EXCLUSIVE=1"]
     async fn active_execution_inventory_bounds_duplicate_reads() {
         assert_eq!(std::env::var("ETCD_TEST_EXCLUSIVE").as_deref(), Ok("1"));
@@ -3377,15 +3349,15 @@ mod tests {
             rewriting_compactions += 1;
             assert!(rewriting_compactions <= 4, "compaction never converged");
         }
-        let indexes = state
-            .task_store
-            .list()
-            .await
-            .unwrap()
-            .into_iter()
+        let all_tasks = state.task_store.list().await.unwrap();
+        let indexes = all_tasks
+            .iter()
             .filter(|task| task.kind == TaskKind::IndexId)
             .count();
-        assert_eq!(indexes, rewriting_compactions);
+        assert_eq!(
+            indexes, rewriting_compactions,
+            "unexpected index tasks: {all_tasks:#?}"
+        );
 
         worker.abort();
     }
@@ -4345,6 +4317,7 @@ mod tests {
         let budget = state.local_append.as_ref().unwrap().budget.clone();
         let held = budget.reserve(budget.limit()).await;
         let merge = enqueue(&state, TaskKind::MergeWal, "exp").await.unwrap();
+        let controller = crate::demand_controller::spawn(&state);
         let merge_poller = spawn_pool_poller(
             state.clone(),
             Arc::new(Semaphore::new(1)),
@@ -4403,6 +4376,7 @@ mod tests {
         );
         merge_poller.abort();
         general.abort();
+        controller.abort();
     }
 
     /// Enqueuing the same experiment twice while queued de-dupes to one task.
@@ -4664,6 +4638,7 @@ mod tests {
         let state = MasterState::new(cfg).await.unwrap();
         let slow = enqueue(&state, TaskKind::MergeWal, "slow").await.unwrap();
         let pool = Arc::new(Semaphore::new(1));
+        let controller = crate::demand_controller::spawn(&state);
         let poller = spawn_pool_poller(state.clone(), pool.clone(), TaskKinds::MERGE_WAL, false);
         tokio::time::timeout(Duration::from_secs(5), started.notified())
             .await
@@ -4707,6 +4682,22 @@ mod tests {
             TaskState::Queued
         );
         assert!(state.admission.status().active_operations > 0);
+        // Make the idle reservation deterministic: the only free slot is
+        // advertised while the next queued task still depends on this response.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !state
+                .admission
+                .status()
+                .operations
+                .values()
+                .any(|op| op.phase == "waiting_for_offer")
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(pool.available_permits(), 0);
         release.notify_one();
         tokio::time::timeout(Duration::from_secs(10), async {
             while state
@@ -4735,6 +4726,7 @@ mod tests {
         assert_eq!(pool.available_permits(), 1);
         poller.abort();
         let _ = poller.await;
+        controller.abort();
         server.abort();
     }
 
@@ -5785,6 +5777,62 @@ mod tests {
             artifact_type: None,
             metadata: None,
         }
+    }
+    #[tokio::test]
+    #[ignore = "requires isolated ETCD_TEST_ENDPOINTS"]
+    async fn controller_shared_capacity_keeps_index_moving_while_compaction_budget_is_full() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.task_concurrency = 1;
+        cfg.merge_wal_concurrency = 0;
+        let state = MasterState::new(cfg).await.unwrap();
+        for name in ["exp", "other"] {
+            let mut writer = RolloutStore::open(&state.rollout_uri(name)).await.unwrap();
+            for n in 0..3 {
+                writer
+                    .add(&[rollout_record(&format!("row-{n}"))])
+                    .await
+                    .unwrap();
+                writer.cleanup_own_shard().await.unwrap();
+            }
+        }
+        let occupied = state
+            .compaction_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let compact = enqueue(&state, TaskKind::Compact, "exp").await.unwrap();
+        let index = enqueue(&state, TaskKind::IndexId, "other").await.unwrap();
+        let scheduler = spawn_scheduler(&state);
+        let indexed = await_terminal(&state, &index.id).await;
+        assert_eq!(indexed.state, TaskState::Done, "{indexed:?}");
+        let waiting = state.task_store.get(&compact.id).await.unwrap().unwrap();
+        assert_eq!(waiting.state, TaskState::Queued);
+        assert_eq!(
+            waiting.started_at, None,
+            "no task may own storage while waiting for the compaction permit"
+        );
+        drop(occupied);
+        let compacted = await_terminal(&state, &compact.id).await;
+        assert_eq!(compacted.state, TaskState::Done, "{compacted:?}");
+        for name in ["exp", "other"] {
+            assert_eq!(
+                lance::Dataset::open(&state.rollout_uri(name))
+                    .await
+                    .unwrap()
+                    .count_rows(None)
+                    .await
+                    .unwrap(),
+                3
+            );
+        }
+        state.admission.begin_drain();
+        tokio::time::timeout(Duration::from_secs(10), state.admission.wait_drained())
+            .await
+            .unwrap();
+        scheduler.abort();
+        let _ = scheduler.await;
     }
 }
 

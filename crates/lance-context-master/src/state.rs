@@ -136,7 +136,14 @@ pub(crate) fn worker_http_client() -> Result<reqwest::Client, reqwest::Error> {
 
 impl MasterState {
     /// Open the registry, stats dataset, and configured durable task store.
-    pub async fn new(mut config: MasterConfig) -> lance::Result<Arc<Self>> {
+    pub async fn new(config: MasterConfig) -> lance::Result<Arc<Self>> {
+        Self::initialize(config, std::future::ready(())).await
+    }
+
+    async fn initialize(
+        mut config: MasterConfig,
+        before_init_release: impl std::future::Future<Output = ()>,
+    ) -> lance::Result<Arc<Self>> {
         config.merge_rollout.validate().map_err(lance::Error::io)?;
         config.catchup.validate().map_err(lance::Error::io)?;
         config
@@ -156,7 +163,7 @@ impl MasterState {
                 "legacy foreground interval must be positive",
             ));
         }
-        let task_store = TaskStore::open(&config).await?;
+        let task_store = TaskStore::open_executor(&config).await?;
         config.merge_rollout.fence_legacy = task_store
             .merge_coordinator()
             .legacy_fencing_mode(config.merge_rollout.fence_legacy)
@@ -228,8 +235,15 @@ impl MasterState {
             }
         }
         let stats = StatsStore::open_or_create(&stats_uri, None).await?;
+        before_init_release.await;
         if let Some(guard) = init_guard {
-            task_store.release_coordination_lock(guard).await?;
+            // Initialization has completed and performs no further protected
+            // writes. Release stops renewal before contacting etcd; if cleanup
+            // fails, the lease expires without replaying successful startup.
+            if let Err(error) = task_store.release_coordination_lock(guard).await {
+                metrics::counter!("master_state_init_cleanup_errors_total").increment(1);
+                tracing::warn!(%error, "master initialized; startup lock cleanup failed and lease will expire");
+            }
         }
         let local_append = crate::local_merge::enabled(&config).then(|| {
             crate::rollout_append::LocalStaging::new(
@@ -477,8 +491,8 @@ mod tests {
     }
 
     /// A master that dies mid-task leaves the record in `Running`. Once its
-    /// etcd lease expires the claim key vanishes, and the next master's startup
-    /// `recover_orphaned` pass must return the task to `Queued` — otherwise an
+    /// etcd lease expires the claim key vanishes, and the elected controller
+    /// must return the task to `Queued` — otherwise an
     /// interrupted task is stranded in `Running` forever.
     ///
     /// The crash is simulated by revoking the claim's lease rather than just
@@ -507,8 +521,105 @@ mod tests {
         drop(first);
 
         let state = MasterState::new(config).await.unwrap();
-        let recovered = state.task_store.get(&task.id).await.unwrap().unwrap();
-        assert_eq!(recovered.state, TaskState::Queued);
-        assert_eq!(recovered.started_at, None);
+        assert_eq!(
+            state.task_store.get(&task.id).await.unwrap().unwrap().state,
+            TaskState::Running,
+            "opening an executor must not perform a global recovery scan"
+        );
+        let controller = crate::demand_controller::spawn(&state);
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let recovered = state.task_store.get(&task.id).await.unwrap().unwrap();
+                if recovered.state == TaskState::Queued {
+                    assert_eq!(recovered.started_at, None);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap();
+        controller.abort();
+        assert!(controller.await.unwrap_err().is_cancelled());
+    }
+    #[tokio::test]
+    #[ignore = "requires loopback ETCD_TEST_ENDPOINTS"]
+    async fn startup_survives_release_transport_failure_without_replaying_initialization() {
+        use crate::task_store::tests::LeaseTestProxy;
+        use std::time::Duration;
+        let dir = TempDir::new().unwrap();
+        let cfg = test_config(&dir);
+        let proxy = LeaseTestProxy::start(&cfg.etcd.etcd_endpoints[0]).await;
+        let mut proxied = cfg.clone();
+        proxied.etcd.etcd_endpoints = vec![proxy.endpoint.clone()];
+        let observer = cfg.etcd.connect().await.unwrap();
+        let hook_reached = std::sync::atomic::AtomicBool::new(false);
+        let state = tokio::time::timeout(
+            Duration::from_secs(20),
+            MasterState::initialize(proxied, async {
+                let keys = observer
+                    .clone()
+                    .get(
+                        format!("{}/coordination/", cfg.etcd.prefix()),
+                        Some(etcd_client::GetOptions::new().with_prefix()),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    keys.kvs().len(),
+                    1,
+                    "initialization owns its guard before disconnect"
+                );
+                assert!(keys.kvs()[0].lease() > 0);
+                proxy.online.send(false).unwrap();
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                hook_reached.store(true, std::sync::atomic::Ordering::Release);
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(hook_reached.load(std::sync::atomic::Ordering::Acquire));
+        assert!(state.admission.is_accepting());
+        assert!(dir.path().join("_stats.rollout.lance").exists());
+        proxy.online.send(true).unwrap();
+        let successor = TaskStore::open_executor(&cfg).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(guard) = successor.try_coordination_lock("state-init").await.unwrap() {
+                    successor.release_coordination_lock(guard).await.unwrap();
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let task = state
+            .task_store
+            .enqueue(TaskKind::IndexId, "after-reconnect", vec![])
+            .await
+            .unwrap();
+        assert_eq!(
+            successor.get(&task.id).await.unwrap().unwrap().state,
+            TaskState::Queued
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback ETCD_TEST_ENDPOINTS"]
+    async fn actual_initialization_failure_still_fails_before_cleanup_hook() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config(&dir);
+        let path = dir.path().join("not-a-directory");
+        std::fs::write(&path, b"file blocks dataset creation").unwrap();
+        cfg.data_dir = path.to_string_lossy().to_string();
+        let reached = std::sync::atomic::AtomicBool::new(false);
+        assert!(MasterState::initialize(cfg, async {
+            reached.store(true, std::sync::atomic::Ordering::Release);
+        })
+        .await
+        .is_err());
+        assert!(!reached.load(std::sync::atomic::Ordering::Acquire));
     }
 }
