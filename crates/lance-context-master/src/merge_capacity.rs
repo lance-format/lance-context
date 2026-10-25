@@ -5,10 +5,47 @@
 use crate::admission::Operation;
 use std::{
     future::Future,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+/// Pool-local demand from an execution whose response has actually arrived.
+/// An idle dispatcher must withdraw its reservation to let that execution
+/// regain capacity. Responses still pending do not block fresh work.
+#[derive(Default)]
+pub(crate) struct Resuming {
+    pending: AtomicUsize,
+    changed: tokio::sync::Notify,
+}
+
+impl Resuming {
+    fn request(&self) -> ResumeRequest<'_> {
+        self.pending.fetch_add(1, Ordering::AcqRel);
+        self.changed.notify_one();
+        ResumeRequest(self)
+    }
+
+    pub(crate) async fn wait(&self) {
+        loop {
+            let changed = self.changed.notified();
+            if self.pending.load(Ordering::Acquire) > 0 {
+                return;
+            }
+            changed.await;
+        }
+    }
+}
+
+struct ResumeRequest<'a>(&'a Resuming);
+impl Drop for ResumeRequest<'_> {
+    fn drop(&mut self) {
+        self.0.pending.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 tokio::task_local! {
     static CAPACITY: Arc<Capacity>;
@@ -21,6 +58,7 @@ pub(crate) struct Capacity {
     foreground: Duration,
     running: metrics::Gauge,
     operation: Arc<Operation>,
+    resuming: Arc<Resuming>,
 }
 
 impl Capacity {
@@ -31,6 +69,7 @@ impl Capacity {
         foreground: Duration,
         running: metrics::Gauge,
         operation: Arc<Operation>,
+        resuming: Arc<Resuming>,
     ) -> Arc<Self> {
         running.increment(1.0);
         Arc::new(Self {
@@ -40,6 +79,7 @@ impl Capacity {
             foreground,
             running,
             operation,
+            resuming,
         })
     }
 
@@ -71,12 +111,17 @@ impl Capacity {
         let acquire = self.pool.clone().acquire_owned();
         tokio::pin!(acquire);
         let first_poll = futures::poll!(&mut acquire);
+        // The fair semaphore request is registered first. Wake an idle
+        // receiver holding a reservation that could otherwise wait forever
+        // for a task dependent on this execution completing.
+        let resuming = first_poll.is_pending().then(|| self.resuming.request());
         drop(waiting);
         let permit = match first_poll {
             std::task::Poll::Ready(permit) => permit,
             std::task::Poll::Pending => acquire.await,
         }
         .expect("scheduler pool remains open");
+        drop(resuming);
         *self.permit.lock().unwrap() = Some(permit);
         self.running.increment(1.0);
         self.operation.phase("running");
@@ -154,6 +199,7 @@ mod tests {
             Duration::from_millis(10),
             metrics::gauge!("test_capacity_running"),
             operation,
+            Arc::default(),
         );
         let (reply, receive) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(scope(capacity, async {
@@ -193,6 +239,7 @@ mod tests {
                 Duration::from_millis(5),
                 metrics::gauge!("test_capacity_running"),
                 Arc::new(admission.try_admit_named("merge").unwrap()),
+                Arc::default(),
             )
         };
         let (reply_a, receive_a) = tokio::sync::oneshot::channel();
@@ -232,6 +279,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ready_response_wakes_only_its_pool_and_cancellation_clears_resume_demand() {
+        let admission = Arc::new(Admission::default());
+        let pool = Arc::new(Semaphore::new(1));
+        let waiters = Arc::new(Semaphore::new(1));
+        let resuming = Arc::new(Resuming::default());
+        let other_pool = Resuming::default();
+        let capacity = Capacity::new(
+            pool.clone().acquire_owned().await.unwrap(),
+            pool.clone(),
+            waiters.clone(),
+            Duration::from_millis(5),
+            metrics::gauge!("test_capacity_running"),
+            Arc::new(admission.try_admit_named("merge").unwrap()),
+            resuming.clone(),
+        );
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(scope(capacity, async {
+            observe(async { receive.await.unwrap() }).await
+        }));
+        let idle = tokio::time::timeout(Duration::from_secs(5), pool.clone().acquire_owned())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            resuming.pending.load(Ordering::Acquire),
+            0,
+            "a still-pending HTTP response must not prevent other work"
+        );
+        reply.send(7).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), resuming.wait())
+            .await
+            .unwrap();
+        assert_eq!(resuming.pending.load(Ordering::Acquire), 1);
+        assert_eq!(other_pool.pending.load(Ordering::Acquire), 0);
+        assert!(
+            !task.is_finished(),
+            "the ready response must still acquire a real slot"
+        );
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(resuming.pending.load(Ordering::Acquire), 0);
+        assert_eq!(waiters.available_permits(), 1);
+        drop(idle);
+        assert_eq!(pool.available_permits(), 1);
+        admission.begin_drain();
+        admission.wait_drained().await;
+    }
+
+    #[tokio::test]
     async fn full_response_wait_budget_keeps_original_slot_and_request() {
         let admission = Arc::new(Admission::default());
         let pool = Arc::new(Semaphore::new(1));
@@ -244,6 +340,7 @@ mod tests {
             Duration::from_millis(5),
             metrics::gauge!("test_capacity_running"),
             Arc::new(admission.try_admit_named("merge").unwrap()),
+            Arc::default(),
         );
         let (reply, receive) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(scope(capacity, async {
