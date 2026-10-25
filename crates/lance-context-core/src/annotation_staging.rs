@@ -15,6 +15,7 @@ use lance::{Dataset, Error, Result};
 use lance_context_api::annotation::{TurnAnnotation, TurnAnnotationPatch};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
+mod preserve_id;
 mod publication;
 pub use publication::{
     FrozenAnnotations, PreparedAnnotations, MAX_RESULTS_BYTES, RESULTS_PROPERTY,

@@ -263,6 +263,9 @@ impl FrozenAnnotations {
                 "annotation publication did not update exactly the frozen turns",
             ));
         }
+        if self.rows() != 0 {
+            super::preserve_id::preserve_id(&self.0.base, &mut merge.transaction.operation)?;
+        }
         merge.transaction.uuid = self.0.id.clone();
         let cut = serde_json::to_string(&(&self.0.scope, self.0.through))
             .map_err(|e| invalid(e.to_string()))?;

@@ -5,7 +5,9 @@ use arrow_array::{
 };
 use arrow_schema::Schema;
 use lance::dataset::{CommitBuilder, WriteParams};
+use lance::index::DatasetIndexExt;
 use lance_context_api::annotation::AnnotationFieldUpdate::{Clear, Set};
+use lance_index::{scalar::ScalarIndexParams, IndexType};
 use std::collections::BTreeSet;
 
 #[tokio::test]
@@ -323,6 +325,10 @@ fn scope() -> Scope {
 }
 
 async fn fixture(root: &std::path::Path) -> Result<Arc<Dataset>> {
+    fixture_with_row_ids(root, true).await
+}
+
+async fn fixture_with_row_ids(root: &std::path::Path, stable: bool) -> Result<Arc<Dataset>> {
     let mut labels = ListBuilder::new(StringBuilder::new());
     for _ in 0..3 {
         labels.values().append_value("original");
@@ -361,7 +367,7 @@ async fn fixture(root: &std::path::Path) -> Result<Arc<Dataset>> {
             Some(WriteParams {
                 max_rows_per_file: 2,
                 max_rows_per_group: 2,
-                enable_stable_row_ids: true,
+                enable_stable_row_ids: stable,
                 ..Default::default()
             }),
         )
@@ -400,6 +406,146 @@ async fn current(staging: &AnnotationStaging, turn: &str) -> Result<TurnAnnotati
         .resolve()
         .await?
         .ok_or_else(|| invalid("test turn missing"))
+}
+
+#[tokio::test]
+async fn annotation_publication_preserves_id_index_and_invalidates_status_index() -> Result<()> {
+    check_index_publication(false, true).await
+}
+
+#[tokio::test]
+async fn annotation_publication_preserves_index_with_deleted_rows_and_both_row_id_modes(
+) -> Result<()> {
+    for stable in [false, true] {
+        check_index_publication(true, stable).await?;
+    }
+    Ok(())
+}
+
+async fn check_index_publication(deleted: bool, stable: bool) -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let mut base = fixture_with_row_ids(&root.path().join("turns.lance"), stable).await?;
+    for field in ["id", "status"] {
+        Arc::get_mut(&mut base)
+            .unwrap()
+            .create_index_builder(&[field], IndexType::BTree, &ScalarIndexParams::default())
+            .name(format!("annotation_{field}"))
+            .await?;
+    }
+    if deleted {
+        Arc::get_mut(&mut base).unwrap().delete("id = 'U'").await?;
+    }
+    let original_indices = base.load_indices().await?;
+    let original_id = original_indices
+        .iter()
+        .find(|i| i.name == "annotation_id")
+        .unwrap();
+    let id_field = base.schema().field_id("id")?;
+    let original_body = body_paths(&base)?;
+    let staging = AnnotationStaging::new(base.clone(), scope(), 0, Limits::default())?;
+    let workspace = crate::MergeMemoryBudget::new(8 << 20);
+    for (position, turn) in [(1, "T"), (2, "o'hara"), (3, "T")] {
+        staging
+            .apply(
+                position - 1,
+                position,
+                turn,
+                &TurnAnnotationPatch {
+                    status: Set(format!("reviewed-{position}")),
+                    score: Set(position as f32 / 10.0),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let frozen = staging.freeze(uuid::Uuid::new_v4()).await?.unwrap();
+        let prepared = frozen.prepare(&workspace, 2).await?;
+        let selected = commit(&prepared).await?;
+        let indices = selected.load_indices().await?;
+        let id = indices.iter().find(|i| i.name == "annotation_id").unwrap();
+        assert_eq!(
+            id.uuid, original_id.uuid,
+            "the ID index must not be rebuilt"
+        );
+        assert_eq!(
+            id.fragment_bitmap, original_id.fragment_bitmap,
+            "annotation publication withdrew unchanged ID index coverage"
+        );
+        let status = indices
+            .iter()
+            .find(|i| i.name == "annotation_status")
+            .unwrap();
+        assert_eq!(
+            status.fragment_bitmap.as_ref().unwrap().len(),
+            if position == 1 { 1 } else { 0 }
+        );
+        for (original, updated) in base
+            .manifest()
+            .fragments
+            .iter()
+            .zip(selected.manifest().fragments.iter())
+        {
+            assert_eq!(original.id, updated.id);
+            assert_eq!(original.row_id_meta, updated.row_id_meta);
+            let original_file = original
+                .files
+                .iter()
+                .find(|f| f.fields.contains(&id_field))
+                .unwrap();
+            let updated_file = updated
+                .files
+                .iter()
+                .find(|f| f.fields.contains(&id_field))
+                .unwrap();
+            assert_eq!(original_file.path, updated_file.path);
+            assert_eq!(original_file.base_id, updated_file.base_id);
+            assert_eq!(
+                original_file.fields.iter().position(|f| *f == id_field),
+                updated_file.fields.iter().position(|f| *f == id_field)
+            );
+            assert_eq!(original_file.column_indices, updated_file.column_indices);
+        }
+        assert_eq!(body_paths(&selected)?, original_body);
+        assert_eq!(
+            selected.count_rows(None).await?,
+            if deleted { 2 } else { 3 }
+        );
+        // The changed annotation index must not return stale matches.
+        assert_eq!(
+            selected
+                .count_rows(Some(format!("status = 'reviewed-{position}'")))
+                .await?,
+            1
+        );
+        staging.install_published(&prepared, selected).await?;
+        assert_eq!(
+            current(&staging, turn).await?.score,
+            Some(position as f32 / 10.0)
+        );
+        if deleted {
+            assert!(staging.capture("U").await?.resolve().await?.is_none());
+        } else {
+            assert_eq!(
+                current(&staging, "U").await?.status.as_deref(),
+                Some("pending")
+            );
+        }
+    }
+    let reopened = Arc::new(Dataset::open(base.uri()).await?);
+    let mut scan = reopened.scan();
+    scan.project(&["labels", "status", "score"])?;
+    scan.filter("id = 'T'")?;
+    let plan = scan.explain_plan(false).await?;
+    assert!(
+        plan.contains("annotation_id"),
+        "point read lost ID index: {plan}"
+    );
+    let recovered = AnnotationStaging::new(reopened, scope(), 3, Limits::default())?;
+    assert_eq!(
+        current(&recovered, "T").await?.status.as_deref(),
+        Some("reviewed-3")
+    );
+    assert_eq!(current(&recovered, "o'hara").await?.score, Some(0.2));
+    Ok(())
 }
 
 #[tokio::test]

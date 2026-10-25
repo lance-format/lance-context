@@ -259,8 +259,14 @@ fn validate(base: &Dataset, transaction: &Transaction, selection: &Selection) ->
             {
                 continue;
             }
+            // An ID slot can be tombstoned when preparation keeps the original
+            // physical key column. Require a live narrow field as well.
             ensure!(
-                !file.fields.is_empty() && file.fields.iter().all(|id| allowed.contains(id)),
+                file.fields.iter().any(|id| allowed.contains(id))
+                    && file
+                        .fields
+                        .iter()
+                        .all(|id| *id == -2 || allowed.contains(id)),
                 "annotation update writes a field outside the narrow projection"
             );
         }

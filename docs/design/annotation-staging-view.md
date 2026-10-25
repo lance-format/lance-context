@@ -47,6 +47,15 @@ conflict retries and cleanup disabled. It rejects a result that does not update
 exactly the frozen keys, and records scoped coverage in the native transaction
 properties. Repeated preparation calls share the same transaction/file set.
 
+Lance 13's narrow merge also writes the `id` join key, which would invalidate
+the ID index on every touched fragment. Preparation retains the original ID
+file/column mapping and tombstones the unused ID mapping in the new narrow file.
+Only then does it remove ID from the transaction's modified fields. Annotation
+indexes still lose coverage where their values changed. The adjustment accepts
+only the expected column rewrite with unchanged physical rows and original file
+descriptors; it does not rebuild an index or override index metadata. The writer
+still emits the unused ID bytes, so this is not a claim of eliminating that I/O.
+
 The caller must durably preserve this identity, source coverage and descriptors,
 publish through the fenced managed-manifest path, and reconcile the original
 outcome. Only then may it install the selected dataset in this view. Installation

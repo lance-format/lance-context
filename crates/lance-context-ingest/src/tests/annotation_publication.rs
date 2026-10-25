@@ -810,7 +810,7 @@ fn rejects_foreign_preparation(
         }
         assert!(annotations::transaction(base, descriptors, &changed).is_err());
     }
-    for case in 0..6 {
+    for case in 0..9 {
         let mut changed = original.clone();
         match case {
             0 => changed.uuid = Uuid::new_v4().to_string(),
@@ -832,11 +832,26 @@ fn rejects_foreign_preparation(
                     updated_fragments[0].files[0].path = "foreign.lance".into();
                 }
             }
-            _ => {
+            5 => {
                 if let lance_table::transaction::Operation::Update { new_fragments, .. } =
                     &mut changed.operation
                 {
                     new_fragments.push(base.manifest().fragments[0].clone());
+                }
+            }
+            _ => {
+                if let lance_table::transaction::Operation::Update {
+                    updated_fragments, ..
+                } = &mut changed.operation
+                {
+                    let file = updated_fragments[0].files.last_mut().unwrap();
+                    let mut fields = file.fields.to_vec();
+                    match case {
+                        6 => fields.fill(-2),
+                        7 => fields[0] = -1,
+                        _ => fields[0] = base.schema().field_id("body")?,
+                    }
+                    file.fields = fields.into();
                 }
             }
         }
