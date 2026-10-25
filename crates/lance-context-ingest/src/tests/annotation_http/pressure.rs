@@ -1,23 +1,23 @@
 use super::*;
 use tokio::time::Instant;
 
-struct Samples {
-    count: u64,
+pub(super) struct Samples {
+    pub(super) count: u64,
     milliseconds: Vec<u64>,
 }
 impl Samples {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             count: 0,
             milliseconds: vec![0; 60_001],
         }
     }
-    fn record(&mut self, elapsed: Duration) {
+    pub(super) fn record(&mut self, elapsed: Duration) {
         self.count += 1;
         let bucket = elapsed.as_micros().div_ceil(1000).min(60_000) as usize;
         self.milliseconds[bucket] += 1;
     }
-    fn p99_ms_upper_bound(&self) -> usize {
+    pub(super) fn p99_ms_upper_bound(&self) -> usize {
         let wanted = (self.count * 99).div_ceil(100);
         let mut count = 0;
         self.milliseconds
