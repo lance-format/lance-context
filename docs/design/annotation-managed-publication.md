@@ -85,3 +85,7 @@ drain. A 1,024-fragment case exercises the default 256 KiB catalog limit below t
 1 MiB hard cap. Missing, corrupt and foreign metadata cannot advance source GC.
 These are bounded local recovery tests with retained disks, not throughput or
 power-loss qualification.
+
+After prepared-state recovery, the 4,096-fragment fixture also submits three more
+rounds of updates without waiting for publication between batches. It checks each
+ACK's point-read value, bounded staging charges, final values and source drain.

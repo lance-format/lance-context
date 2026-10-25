@@ -315,6 +315,68 @@ async fn recover_inner(stage: Stop, fragments: usize) -> Result<()> {
             .collect::<Vec<_>>()
     };
     assert_eq!(body_files(&base), body_files(&selected));
+    if stage == Stop::Prepared && fragments == 4096 {
+        // Start each next batch immediately after its ACK and point read. The
+        // publisher runs concurrently; do not wait for a drain between batches.
+        let mut through = suffix_result.index;
+        for round in 0..3 {
+            let status = format!("round-{}", round + 1);
+            for (batch, chunk) in ids.chunks(2048).enumerate() {
+                let keys: Vec<_> = chunk.iter().map(String::as_str).collect();
+                let req = request(
+                    &service,
+                    &a,
+                    3 + (round * 2 + batch) as u64,
+                    wire(&limits, &keys, 1, Some(&status), 0, None)?,
+                )
+                .await?;
+                let result = service.submit(&req, Duration::from_secs(30)).await?;
+                assert_eq!(result.result, crate::annotations::MutationResult::Applied);
+                through = result.index;
+                assert_eq!(
+                    service
+                        .get(keys[0], Duration::from_secs(30))
+                        .await?
+                        .unwrap()
+                        .status
+                        .as_deref(),
+                    Some(status.as_str())
+                );
+                assert!(service.observation().await.0.retained_bytes <= limits.retained_bytes);
+            }
+        }
+        runtime::drained(&service, through).await?;
+        let selected = read(&c, &storage, None).await?;
+        assert_eq!(
+            selected
+                .count_rows(Some("status = 'round-3'".into()))
+                .await?,
+            fragments
+        );
+        assert_eq!(
+            selected
+                .count_rows(Some("status = 'pending'".into()))
+                .await?,
+            fragments
+        );
+        assert_eq!(body_files(&base), body_files(&selected));
+        let value = service
+            .get("t00000000", Duration::from_secs(30))
+            .await?
+            .unwrap();
+        assert_eq!(value.status.as_deref(), Some("round-3"));
+        assert_eq!(value.score, Some(0.9));
+        assert!(matches!(
+            c.client
+                .request_routed(Request::Fetch {
+                    group: 10,
+                    index: through
+                })
+                .await?
+                .reply,
+            Reply::Record(None)
+        ));
+    }
     for index in [last_result.index, suffix_result.index] {
         assert!(matches!(
             c.client
