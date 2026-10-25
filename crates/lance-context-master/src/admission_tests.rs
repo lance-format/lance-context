@@ -472,7 +472,10 @@ async fn dependency_admissions_remain_distinct_and_count_each_committed_task() {
         .await
         .unwrap();
     assert_ne!(first.id, second.id);
-    assert_eq!(first.depends_on, [dependency.id.clone()]);
+    assert_eq!(
+        first.depends_on.as_slice(),
+        std::slice::from_ref(&dependency.id)
+    );
     assert_eq!(second.depends_on, [dependency.id]);
     assert_eq!(capture.outcomes("explicit"), counts(&[("created", 2)]));
     assert_eq!(capture.created_legacy(), 2);
