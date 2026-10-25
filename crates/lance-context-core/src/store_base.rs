@@ -1249,14 +1249,13 @@ impl StorageBase {
             )));
         }
 
-        let watermark = if crate::rollout_append::has_cutover(&self.dataset, self.write_shard) {
-            merged_generations
-                .iter()
-                .max()
-                .map(|high| lance_index::mem_wal::CompactedSsTable::new(self.write_shard, *high))
-        } else {
-            None
-        };
+        // Publish coverage with the data, including legacy/upsert merges. A
+        // reader can then distinguish immutable generations already in base
+        // from WAL that must still overlay it.
+        let watermark = merged_generations
+            .iter()
+            .max()
+            .map(|high| lance_index::mem_wal::CompactedSsTable::new(self.write_shard, *high));
         if !batches.is_empty() {
             observe_phase!(
                 "append",
@@ -1480,25 +1479,22 @@ impl StorageBase {
 
     /// Merge prepared WAL rows into the base table by primary key.
     ///
-    /// `read_flushed_generations` has already reduced the source to one newest
-    /// row per key. Delete old keys first, then append the prepared rows.
-    /// Bounded predicate deletes project only keys and row IDs, using any
-    /// existing BTree/ZoneMap coverage without publishing an index update.
+    /// `read_flushed_generations` reduces the source to the newest row per key.
+    /// Prepare deletion masks from keys/row IDs and encode new fragments, then
+    /// publish both with their WAL coverage in one manifest transaction. Neither
+    /// preparation publishes partial deletion or reads old target blob values.
+    /// Existing BTree/ZoneMap coverage can accelerate key lookup; this path never
+    /// builds an index as a merge prerequisite.
     ///
-    /// Not `WhenMatched::UpdateAll`, deliberately. An upsert takes the matched
-    /// target rows *with every column* to join and rewrite them, and rollout
-    /// rows carry multi-megabyte inline blobs: in production one merge of
-    /// 17k matched rows read 7.6 GB (459 KB/row), one of 1.4k rows read
-    /// 4.0 GB (3 MB/row), and two of those in flight held a worker at its
-    /// 32 GiB limit. Predicate deletion uses available index coverage and reads
-    /// only keys and row IDs for uncovered fragments; the append streams the new
-    /// rows straight to fresh fragments. Neither ever holds a target blob.
+    /// Avoid `WhenMatched::UpdateAll`: reading full target rows for a join has
+    /// previously loaded gigabytes of old inline blobs. The delete-only join
+    /// carries only keys and row IDs, within the existing merge byte reservation.
     ///
-    /// Last-write-wins and retry idempotence are preserved: a crash between
-    /// commits leaves the old rows deleted and the new ones still in
-    /// the WAL, and the retry deletes nothing and appends them once. A crash
-    /// after the append but before the manifest drain retries as delete (of
-    /// what was just appended) + append, the same end state.
+    /// A crash before publication leaves base and WAL intact. A crash after
+    /// publication leaves an atomic watermark that the next executor reconciles
+    /// before preparing, so already committed rows are never replayed over newer
+    /// values. Typed commit conflicts may reprepare masks against a newer base;
+    /// unknown commit results and ownership errors must return to recovery.
     async fn merge_prepared_batches(
         &mut self,
         batches: Vec<RecordBatch>,
@@ -1507,173 +1503,146 @@ impl StorageBase {
         bulk_key_delete: bool,
         parallel_upsert_io: bool,
     ) -> LanceResult<()> {
-        // Predicate deletion projects only the key and row IDs, including for
-        // unindexed fragments. It can use existing BTree/ZoneMap coverage but
-        // does not need to publish an index before every shard merge. Doing
-        // that here made parallel shards compete on CreateIndex transactions
-        // and repeatedly rebuild the same table-wide index.
+        use lance::dataset::{transaction::Operation, CommitBuilder, MergeInsertBuilder};
+
+        if parallel_upsert_io
+            && self.dataset.manifest().data_storage_format.version
+                == lance_file::version::ConcreteFileVersion::V1
+        {
+            return Err(LanceError::invalid_input(
+                "parallel upsert IO requires Lance V2 files",
+            ));
+        }
         let key_index = merge_schema.index_of(&self.key_column)?;
-        // These projections retain only key arrays, never the old/base blobs.
         let keys = batches
             .iter()
             .map(|batch| batch.project(&[key_index]))
             .collect::<Result<Vec<_>, _>>()?;
-        if parallel_upsert_io {
-            if self.dataset.manifest().data_storage_format.version
-                == lance_file::version::ConcreteFileVersion::V1
-            {
-                return Err(LanceError::invalid_input(
-                    "parallel upsert IO requires Lance V2 files",
-                ));
+        let snapshot = Arc::new(self.dataset.clone());
+        let schema = self.dataset.schema().clone();
+        let initial_coverage = crate::rollout_append::watermarks(&self.dataset)
+            .await?
+            .get(&self.write_shard)
+            .copied();
+        let key_column = self.key_column.clone();
+        let delete = |snapshot| {
+            let keys = keys.clone();
+            let key_column = key_column.clone();
+            async move {
+                // Delete-only projects keys/row IDs, never old blob values. The
+                // existing bulk choice controls index use, not commit atomicity.
+                let job = MergeInsertBuilder::try_new(snapshot, vec![key_column])?
+                    .when_matched(lance::dataset::WhenMatched::Delete)
+                    .when_not_matched(lance::dataset::WhenNotMatched::DoNothing)
+                    .use_index(!bulk_key_delete)
+                    .conflict_retries(0)
+                    .commit_retries(0)
+                    .try_build()?;
+                observe_phase!("delete_keys", job.execute_uncommitted_batches(keys).await)
             }
-            let snapshot = self.dataset.clone();
-            let schema = snapshot.schema().clone();
-            let stage = async move {
-                let _phase = crate::merge_write_scope::work_stage("file_encoding");
-                let params = WriteParams {
-                    mode: WriteMode::Append,
-                    write_progress: Some(crate::merge_write_scope::write_progress()),
-                    ..Default::default()
-                };
-                let tx = lance::dataset::InsertBuilder::new(Arc::new(snapshot))
-                    .with_params(&params)
-                    .execute_uncommitted(batches)
-                    .await?;
-                match tx.operation {
-                    lance::dataset::transaction::Operation::Append { fragments } => Ok(fragments),
-                    _ => Err(LanceError::io(
-                        "upsert staging produced a non-append transaction",
-                    )),
-                }
-            };
-            // Do not try_join: an error must not abandon the other admitted
-            // operation. Keep the existing full decoded-byte reservation until
-            // both finish; there is no extra prefetch batch or early release.
-            let (staged, deleted) = tokio::join!(
-                async { observe_phase!("encode_upload", stage.await) },
-                self.delete_prepared_keys(keys, bulk_key_delete),
-            );
-            deleted?;
-            let fragments = staged?;
-            // Delete transactions may rebase. Never attach files with stale
-            // field IDs or schema metadata to a differently shaped base.
-            if self.dataset.schema().fields != schema.fields
-                || self.dataset.schema().metadata != schema.metadata
-            {
-                return Err(LanceError::io(
-                    MaintenanceErrorCode::StalePreparation
-                        .tag("base schema changed during upsert encoding; reprepare"),
-                ));
-            }
-            crate::rollout_append::commit_files(
-                &mut self.dataset,
-                fragments,
-                watermark.into_iter().collect(),
-            )
-            .await?;
-            return Ok(());
-        }
-        self.delete_prepared_keys(keys, bulk_key_delete).await?;
-
-        if let Some(watermark) = watermark {
+        };
+        let deleting = delete(snapshot.clone());
+        let stage = async move {
+            let _phase = crate::merge_write_scope::work_stage("file_encoding");
             let params = WriteParams {
                 mode: WriteMode::Append,
                 write_progress: Some(crate::merge_write_scope::write_progress()),
                 ..Default::default()
             };
-            let staged = lance::dataset::InsertBuilder::new(Arc::new(self.dataset.clone()))
+            let tx = lance::dataset::InsertBuilder::new(snapshot)
                 .with_params(&params)
                 .execute_uncommitted(batches)
                 .await?;
-            let lance::dataset::transaction::Operation::Append { fragments } = staged.operation
+            match tx.operation {
+                Operation::Append { fragments } => Ok(fragments),
+                _ => Err(LanceError::io(
+                    "upsert staging produced a non-append transaction",
+                )),
+            }
+        };
+        let (mut deleted, fragments) = if parallel_upsert_io {
+            // Join both admitted operations even on failure; retain the decoded
+            // byte reservation until both finish. Neither publishes base state.
+            let (deleted, staged) = tokio::join!(deleting, stage);
+            (deleted?, staged?)
+        } else {
+            (deleting.await?, stage.await?)
+        };
+        // A definitive conflict means no publication took place. Recompute
+        // deletion masks on the newer base while reusing the immutable encoded
+        // files. Never replay an unknown result or an ownership/fencing error.
+        for attempt in 0..=10 {
+            let Operation::Update {
+                new_fragments,
+                compacted_sstables,
+                ..
+            } = &mut deleted.transaction.operation
             else {
                 return Err(LanceError::io(
-                    "legacy fallback did not stage append fragments",
+                    "key deletion produced a non-update transaction",
                 ));
             };
-            crate::rollout_append::commit_files(&mut self.dataset, fragments, vec![watermark])
-                .await?;
-        } else {
-            let reader = RecordBatchIterator::new(
-                batches.into_iter().map(Ok::<RecordBatch, ArrowError>),
-                merge_schema,
-            );
-            Box::pin(self.dataset.append(
-                reader,
-                Some(WriteParams {
-                    mode: WriteMode::Append,
-                    write_progress: Some(crate::merge_write_scope::write_progress()),
-                    ..Default::default()
-                }),
-            ))
-            .await?;
-        }
-        Ok(())
-    }
-
-    async fn delete_prepared_keys(
-        &mut self,
-        keys: Vec<RecordBatch>,
-        bulk_key_delete: bool,
-    ) -> LanceResult<()> {
-        if bulk_key_delete {
-            // Source rows were already deduplicated by read_flushed_generations.
-            // Project keys before the join so neither side carries blob columns.
-            // Delete-only must explicitly disable insertion of absent keys.
-            let job = lance::dataset::MergeInsertBuilder::try_new(
-                Arc::new(self.dataset.clone()),
-                vec![self.key_column.clone()],
-            )?
-            .when_matched(lance::dataset::WhenMatched::Delete)
-            .when_not_matched(lance::dataset::WhenNotMatched::DoNothing)
-            .use_index(false)
-            .conflict_retries(0)
-            .commit_retries(0)
-            .try_build()?;
-            let (dataset, _) = observe_phase!("delete_keys", job.execute_batches(keys).await)?;
-            self.dataset = Arc::unwrap_or_clone(dataset);
-            crate::merge_write_scope::checkpoint();
-        } else {
-            use datafusion::logical_expr::Expr;
-            let mut values = Vec::with_capacity(1024);
-            for batch in &keys {
-                for row in 0..batch.num_rows() {
-                    values.push(Expr::Literal(
-                        ScalarValue::try_from_array(batch.column(0), row)
-                            .map_err(|e| LanceError::invalid_input(e.to_string()))?,
-                        None,
-                    ));
-                    if values.len() == 1024 {
-                        self.delete_key_values(std::mem::take(&mut values)).await?;
-                    }
+            if !new_fragments.is_empty() || !compacted_sstables.is_empty() {
+                return Err(LanceError::io(
+                    "delete-only preparation unexpectedly inserted rows",
+                ));
+            }
+            *new_fragments = fragments.clone();
+            compacted_sstables.extend(watermark.clone());
+            let version = self.dataset.version().version;
+            if deleted.transaction.read_version != version {
+                return Err(LanceError::io(
+                    "upsert deletion and encoding snapshots differ",
+                ));
+            }
+            let mut commit = CommitBuilder::new(Arc::new(self.dataset.clone())).with_max_retries(0);
+            if let Some(affected) = deleted.affected_rows {
+                commit = commit.with_affected_rows(affected);
+            }
+            let result = {
+                let _phase = crate::merge_write_scope::work_stage("base_commit");
+                crate::merge_write_scope::at_base_version(
+                    version + 1,
+                    commit.execute(deleted.transaction),
+                )
+                .await
+            };
+            match result {
+                Ok(_) => {
+                    crate::merge_write_scope::base_committed();
+                    self.dataset.checkout_latest().await?;
+                    return Ok(());
                 }
-            }
-            if !values.is_empty() {
-                self.delete_key_values(values).await?;
+                Err(LanceError::CommitConflict { .. }) if attempt < 10 => {
+                    self.dataset.checkout_latest().await?;
+                    if self.dataset.schema().fields != schema.fields
+                        || self.dataset.schema().metadata != schema.metadata
+                    {
+                        return Err(LanceError::io(MaintenanceErrorCode::StalePreparation.tag(
+                            "base fields or metadata changed during atomic upsert; reprepare",
+                        )));
+                    }
+                    // Another executor may have published this shard while
+                    // we staged files. Replaying our old keys over its newer
+                    // values would undo that progress, even if the files are
+                    // reusable. Let the caller reconcile and prepare again.
+                    if crate::rollout_append::watermarks(&self.dataset)
+                        .await?
+                        .get(&self.write_shard)
+                        .copied()
+                        != initial_coverage
+                    {
+                        return Err(LanceError::io(
+                            MaintenanceErrorCode::StalePreparation
+                                .tag("shard coverage changed during atomic upsert; reprepare"),
+                        ));
+                    }
+                    deleted = delete(Arc::new(self.dataset.clone())).await?;
+                }
+                Err(error) => return Err(error),
             }
         }
-
-        Ok(())
-    }
-
-    async fn delete_key_values(
-        &mut self,
-        values: Vec<datafusion::logical_expr::Expr>,
-    ) -> LanceResult<()> {
-        use datafusion::{common::Column, logical_expr::Expr};
-        let predicate =
-            Expr::Column(Column::from_name(self.key_column.clone())).in_list(values, false);
-        let result = observe_phase!(
-            "delete_keys",
-            Box::pin(
-                lance::dataset::DeleteBuilder::from_expr(Arc::new(self.dataset.clone()), predicate)
-                    .execute()
-            )
-            .await
-        )?;
-        self.dataset = Arc::unwrap_or_clone(result.new_dataset);
-        crate::merge_write_scope::checkpoint();
-        Ok(())
+        unreachable!("last commit attempt always returns")
     }
 
     pub async fn create_configured_key_index(&mut self) -> LanceResult<()> {
@@ -2599,7 +2568,7 @@ impl StorageBase {
             base_open_secs += phase_started.elapsed().as_secs_f64();
             let version = dataset.manifest.version;
             let phase_started = std::time::Instant::now();
-            let snapshots = if source == ListSource::Fragments {
+            let mut snapshots = if source == ListSource::Fragments {
                 Vec::new()
             } else {
                 capture().await?
@@ -2609,11 +2578,14 @@ impl StorageBase {
                 let phase_started = std::time::Instant::now();
                 let mut latest = dataset.clone();
                 latest.checkout_latest().await?;
+                let compatible = latest.manifest.version == version
+                    || same_base_read_data(&dataset.manifest, &latest.manifest)
+                    || rebase_wal_read_snapshot(&dataset, &latest, &mut snapshots).await?;
+                // Include transaction-history IO in validation time so slow
+                // reads do not acquire an unaccounted metadata phase.
                 base_validate_secs += phase_started.elapsed().as_secs_f64();
                 last_versions = Some((version, latest.manifest.version));
-                if latest.manifest.version != version
-                    && !same_base_read_data(&dataset.manifest, &latest.manifest)
-                {
+                if !compatible {
                     // A merge could have drained WAL after we opened base.
                     // Retry this metadata pair before scanning any payloads,
                     // otherwise the view could omit its newly merged rows.
@@ -2624,8 +2596,8 @@ impl StorageBase {
                     next_dataset = Some(latest);
                     continue;
                 }
-                // Prefer the validated newer index metadata / WAL watermarks.
-                // Its data view is identical to the capture's lower bound.
+                // Prefer the validated newer base. Either its data is unchanged,
+                // or atomic WAL coverage proves how to rebase the captured WAL.
                 dataset = latest;
             }
             // A successful metadata capture ends that metadata-only window.
@@ -3047,6 +3019,77 @@ fn same_base_read_data(
     comparable.transaction_section = before.transaction_section;
     comparable.table_metadata = before.table_metadata.clone();
     *before == comparable
+}
+
+/// Accept a newer base only when every intervening data publication proves
+/// that its WAL coverage moved atomically with its rows. Legacy delete/append,
+/// external mutations, restore and missing history retain the original retry.
+/// No writer lock or etcd request is needed for immutable transaction history.
+async fn rebase_wal_read_snapshot(
+    before: &Dataset,
+    after: &Dataset,
+    snapshots: &mut [ShardSnapshot],
+) -> LanceResult<bool> {
+    use lance::dataset::transaction::Operation;
+
+    const MAX_READ_REBASE_VERSIONS: u64 = 32;
+    let lower = before.version().version;
+    let upper = after.version().version;
+    if upper <= lower
+        || upper - lower > MAX_READ_REBASE_VERSIONS
+        || before.schema().fields != after.schema().fields
+        || before.schema().metadata != after.schema().metadata
+    {
+        return Ok(false);
+    }
+    let mut required = HashMap::<Uuid, u64>::new();
+    for version in lower + 1..=upper {
+        let transaction = match after.read_transaction_by_version(version).await {
+            Ok(Some(transaction)) => transaction,
+            Ok(None) => return Ok(false),
+            Err(error) if is_not_found_error(&error) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        match transaction.operation {
+            // Compaction reserves fragment IDs before its data-preserving
+            // rewrite. Reservation changes no rows and needs no WAL coverage.
+            Operation::CreateIndex { .. }
+            | Operation::ReserveFragments { .. }
+            | Operation::Rewrite { .. } => {}
+            Operation::Update {
+                compacted_sstables,
+                fields_modified,
+                updated_fragment_offsets,
+                ..
+            } if !compacted_sstables.is_empty()
+                && fields_modified.is_empty()
+                && updated_fragment_offsets.is_none() =>
+            {
+                for covered in compacted_sstables {
+                    required
+                        .entry(covered.shard_id)
+                        .and_modify(|high| *high = (*high).max(covered.generation))
+                        .or_insert(covered.generation);
+                }
+            }
+            _ => return Ok(false),
+        }
+    }
+    let watermarks = crate::rollout_append::watermarks(after).await?;
+    if required
+        .iter()
+        .any(|(shard, high)| watermarks.get(shard).is_none_or(|actual| actual < high))
+    {
+        return Ok(false);
+    }
+    // Never let captured but already committed WAL override the newer base,
+    // and never open files its merge is now permitted to garbage collect.
+    for snapshot in snapshots {
+        if let Some(high) = watermarks.get(&snapshot.shard_id) {
+            snapshot.sstables.retain(|table| table.generation > *high);
+        }
+    }
+    Ok(true)
 }
 
 /// Derive the MemWAL shard UUID a server instance writes to from its stable
