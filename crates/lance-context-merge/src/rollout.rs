@@ -2,7 +2,7 @@
 use crate::{execution_key, Coordinator, Result};
 use etcd_client::{Compare, CompareOp, GetOptions, TxnOp};
 
-#[derive(Clone, Debug, Default, clap::Args)]
+#[derive(Clone, Debug, Default, clap::Args, serde::Serialize, serde::Deserialize)]
 pub struct MergeRollout {
     /// Record new legacy-target worker merges with commit fencing. This does
     /// not enroll targets for native catchup or fence pre-upgrade writers.
