@@ -21,6 +21,7 @@ use crate::{
     task_store::{CoordinationGuard, TaskStore},
 };
 
+pub(crate) mod aggregate;
 pub(crate) mod dispatch;
 
 const RANGES: &[&str] = &[
@@ -55,6 +56,8 @@ const RECONNECT: Duration = Duration::from_secs(5);
 struct Policy {
     v: u32,
     automatic: bool,
+    #[serde(default)]
+    aggregate_min_generations: Option<i64>,
     endpoints: Vec<String>,
     fence_legacy: bool,
     owned: Vec<String>,
@@ -68,6 +71,7 @@ impl Policy {
         Self {
             v: 1,
             automatic: config.merge_wal_interval_secs > 0,
+            aggregate_min_generations: Some(config.merge_wal_min_generations),
             endpoints: config.worker_endpoints.clone(),
             fence_legacy: config.merge_rollout.fence_legacy,
             owned: config.merge_rollout.owned_targets.clone(),
@@ -784,6 +788,7 @@ pub(crate) fn spawn(state: &Arc<MasterState>) -> tokio::task::JoinHandle<()> {
                 // if our lease expires. Publication also has a CAS fence.
                 tokio::select! {
                     result = lead(&state, &session) => result,
+                    _ = aggregate::run(&state, &session) => Ok(()),
                     result = maintain_history(&state, &session) => result,
                     result = wait_for_vacancy(store.etcd_client(), &key, Some(session.token())) => result,
                 }

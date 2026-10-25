@@ -246,6 +246,8 @@ jobs:
             --skip demand_controller::dispatch::tests::fifty_executors_do_not_repeat_blocked_candidate_reads_and_reach_tail \
             --skip demand_controller::dispatch::tests::long_dependency_chain_yields_and_unrelated_changes_do_not_repeat_reads \
             --skip demand_controller::tests::compaction_forces_consistent_relist_and_retains_new_demand \
+            --skip demand_controller::aggregate::tests::active_dedupe_and_unchanged_frontier_issue_no_repeated_rpc \
+            --skip demand_controller::aggregate::tests::compacted_watch_requires_new_snapshot_then_replays_new_seals \
             --skip execution_watch_compaction_requires_fresh_snapshot_then_resumes \
             --skip task_store::tests::bounded_scheduler_compacted_snapshot_restarts_without_stealing_locks
           cargo test -p lance-context-core registry --lib -- --ignored
@@ -387,6 +389,8 @@ jobs:
             --skip demand_controller::dispatch::tests::fifty_executors_do_not_repeat_blocked_candidate_reads_and_reach_tail \
             --skip demand_controller::dispatch::tests::long_dependency_chain_yields_and_unrelated_changes_do_not_repeat_reads \
             --skip demand_controller::tests::compaction_forces_consistent_relist_and_retains_new_demand \
+            --skip demand_controller::aggregate::tests::active_dedupe_and_unchanged_frontier_issue_no_repeated_rpc \
+            --skip demand_controller::aggregate::tests::compacted_watch_requires_new_snapshot_then_replays_new_seals \
             --skip execution_watch_compaction_requires_fresh_snapshot_then_resumes \
             --skip task_store::tests::bounded_scheduler_compacted_snapshot_restarts_without_stealing_locks
           cargo llvm-cov --no-report --all-features \
