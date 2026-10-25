@@ -50,7 +50,13 @@ cannot finish. It introduces no etcd operations or persisted keys.
 
 `master_periodic_wal_refresh_total{outcome}` counts `empty`, `pending`,
 `unknown`, and `budget`. These labels are finite and have no table identifiers.
+`master_periodic_wal_refresh_duration_seconds{outcome}` records the complete
+probe duration, including timeouts (a skipped budget entry makes no sample).
 Successful empty checks log the target. Storage failures are debug logs.
+Enabling `lance_context_core::wal_presence=debug` records per-probe logical
+operations, listing pages, requested body bytes and elapsed time without adding
+high-cardinality metric labels. Cancelled probes have a duration/unknown sample
+but no completed-probe debug event.
 Compare this with `master_task_admissions_total{kind,origin,outcome}` to
 separate periodic admissions from writer and recovery work.
 

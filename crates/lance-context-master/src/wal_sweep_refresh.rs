@@ -33,7 +33,8 @@ impl Refresh {
         let result =
             tokio::time::timeout(time, lance_context_core::wal_presence::has_pending_wal(uri))
                 .await;
-        self.time_left = self.time_left.saturating_sub(started.elapsed());
+        let elapsed = started.elapsed();
+        self.time_left = self.time_left.saturating_sub(elapsed);
         let outcome = match result {
             Ok(Ok(false)) => "empty",
             Ok(Ok(true)) => "pending",
@@ -44,6 +45,8 @@ impl Refresh {
             Err(_) => "unknown",
         };
         metrics::counter!("master_periodic_wal_refresh_total", "outcome" => outcome).increment(1);
+        metrics::histogram!("master_periodic_wal_refresh_duration_seconds", "outcome" => outcome)
+            .record(elapsed.as_secs_f64());
         if outcome == "empty" {
             tracing::info!(
                 target,

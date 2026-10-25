@@ -33,15 +33,38 @@ pub async fn has_pending_wal(uri: &str) -> lance::Result<bool> {
     // These are canonical main-branch storage URIs from the scheduler. Opening
     // only the object store avoids reading the base manifest/schema or listing
     // its version history merely to inspect WAL presence.
+    let budget = Arc::new(Budget::default());
+    let started = std::time::Instant::now();
     let (store, base) = lance_io::object_store::ObjectStore::from_uri_and_params(
         Arc::new(ObjectStoreRegistry::default()),
         uri,
         &ObjectStoreParams {
-            object_store_wrapper: Some(Arc::new(Budget::default())),
+            object_store_wrapper: Some(budget.clone()),
             ..Default::default()
         },
     )
     .await?;
+    let result = observe_wal(&store, &base).await;
+    tracing::debug!(
+        uri,
+        elapsed_seconds = started.elapsed().as_secs_f64(),
+        logical_operations = budget.requests.load(Ordering::Relaxed),
+        listing_pages = budget.pages.load(Ordering::Relaxed),
+        requested_body_bytes = budget.bytes.load(Ordering::Relaxed),
+        outcome = match &result {
+            Ok(true) => "pending",
+            Ok(false) => "empty",
+            Err(_) => "unknown",
+        },
+        "periodic WAL presence probe completed"
+    );
+    result
+}
+
+async fn observe_wal(
+    store: &Arc<lance_io::object_store::ObjectStore>,
+    base: &Path,
+) -> lance::Result<bool> {
     let mut shards = Vec::new();
     let mut page_token = None;
     let mut entries = 0;
@@ -80,7 +103,7 @@ pub async fn has_pending_wal(uri: &str) -> lance::Result<bool> {
     for shard in shards {
         // One manifest at a time; one forward HEAD per scan step. A stale hint
         // can exhaust the request budget but cannot turn an error into empty.
-        let manifest = ShardManifestStore::new(store.clone(), &base, shard, 1)
+        let manifest = ShardManifestStore::new(store.clone(), base, shard, 1)
             .refresh_latest()
             .await?;
         let Some(manifest) = manifest else {
