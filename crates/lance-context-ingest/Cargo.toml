@@ -58,3 +58,8 @@ tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring
 name = "lance-context-ingest"
 path = "src/bin/ingest.rs"
 required-features = ["service"]
+
+[[example]]
+name = "annotation_probe"
+path = "examples/annotation_probe/main.rs"
+required-features = ["service", "http-client"]
