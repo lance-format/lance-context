@@ -539,15 +539,21 @@ pub async fn enqueue_task(
     State(state): State<Arc<MasterState>>,
     Json(req): Json<EnqueueTaskRequest>,
 ) -> Result<(StatusCode, Json<TaskRecord>), MasterError> {
-    let exists = state
-        .registry
-        .contains(&req.target)
+    // Use the executor's target parser for registry lookup, but retain the
+    // canonical target below so generic and rollout tasks never share a lock
+    // or dedupe key merely because their bare names match.
+    let (kind, name) = scheduler::parse_target(&req.target);
+    let (registry, label) = match kind {
+        scheduler::StoreKind::Rollout => (&state.registry, "experiment"),
+        scheduler::StoreKind::Generic => (&state.generic_registry, "generic store"),
+    };
+    let exists = registry
+        .contains(name)
         .await
         .map_err(MasterError::from_lance)?;
     if !exists {
         return Err(MasterError::NotFound(format!(
-            "experiment '{}' does not exist",
-            req.target
+            "{label} '{name}' does not exist"
         )));
     }
     let task = scheduler::enqueue_with_deps(&state, req.kind, &req.target, req.depends_on)
@@ -1145,6 +1151,90 @@ mod tests {
         std::env::var("ETCD_TEST_ENDPOINTS")
             .map(|value| value.split(',').map(str::to_string).collect())
             .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn enqueue_task_uses_target_registry_and_preserves_generic_identity() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+
+        let dir = TempDir::new().unwrap();
+        let state = MasterState::new(test_config(&dir)).await.unwrap();
+        state
+            .generic_registry
+            .upsert("shared", &state.generic_uri("shared"))
+            .await
+            .unwrap();
+        let router = api_router().with_state(state.clone());
+        let request = |target: &str| {
+            Request::builder()
+                .method("POST")
+                .uri("/tasks")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"kind": "merge_wal", "target": target}).to_string(),
+                ))
+                .unwrap()
+        };
+        let response = router
+            .clone()
+            .oneshot(request("generic:shared"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let generic: TaskRecord = serde_json::from_slice(&body).unwrap();
+        assert_eq!(generic.target, "generic:shared");
+
+        // Existence in the other registry must never authorize admission.
+        state
+            .registry
+            .upsert("rollout-only", &state.rollout_uri("rollout-only"))
+            .await
+            .unwrap();
+        for target in [
+            "shared",
+            "generic:rollout-only",
+            "generic:missing",
+            "missing",
+        ] {
+            let response = router.clone().oneshot(request(target)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{target}");
+        }
+        assert_eq!(state.task_store.list().await.unwrap().len(), 1);
+
+        state
+            .registry
+            .upsert("shared", &state.rollout_uri("shared"))
+            .await
+            .unwrap();
+        let response = router.clone().oneshot(request("shared")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let rollout: TaskRecord = serde_json::from_slice(&body).unwrap();
+        assert_eq!(rollout.target, "shared");
+        assert_ne!(generic.id, rollout.id);
+
+        for expected in [&generic, &rollout] {
+            let response = router
+                .clone()
+                .oneshot(request(&expected.target))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+            let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+                .await
+                .unwrap();
+            let task: TaskRecord = serde_json::from_slice(&body).unwrap();
+            assert_eq!(task.id, expected.id);
+            assert_eq!(task.target, expected.target);
+        }
+        assert_eq!(state.task_store.list().await.unwrap().len(), 2);
     }
 
     #[tokio::test]

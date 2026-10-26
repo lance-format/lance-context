@@ -65,13 +65,13 @@ const GENERIC_TARGET_PREFIX: &str = "generic:";
 
 /// Which store kind a task target names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StoreKind {
+pub(crate) enum StoreKind {
     Rollout,
     Generic,
 }
 
 /// Split a task target into its store kind and bare name.
-fn parse_target(target: &str) -> (StoreKind, &str) {
+pub(crate) fn parse_target(target: &str) -> (StoreKind, &str) {
     match target.strip_prefix(GENERIC_TARGET_PREFIX) {
         Some(name) => (StoreKind::Generic, name),
         None => (StoreKind::Rollout, target),
