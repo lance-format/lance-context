@@ -202,19 +202,26 @@ impl Keys {
 pub(crate) fn local_heartbeat(state: &MasterState) -> Heartbeat {
     let cfg = &state.config;
     let mut slots_total = BTreeMap::new();
-    let mut kinds = vec![TaskKind::IndexId, TaskKind::Repair];
-    slots_total.insert(TaskKind::IndexId, cfg.task_concurrency.max(1) as u32);
-    slots_total.insert(TaskKind::Repair, cfg.task_concurrency.max(1) as u32);
-    if cfg.compaction_concurrency > 0 {
-        kinds.push(TaskKind::Compact);
-        slots_total.insert(TaskKind::Compact, cfg.compaction_concurrency as u32);
+    let mut kinds = Vec::new();
+    if cfg.maintenance.claim_maintenance_tasks {
+        kinds.extend([TaskKind::IndexId, TaskKind::Repair]);
+        slots_total.insert(TaskKind::IndexId, cfg.task_concurrency.max(1) as u32);
+        slots_total.insert(TaskKind::Repair, cfg.task_concurrency.max(1) as u32);
+        if cfg.compaction_concurrency > 0 {
+            kinds.push(TaskKind::Compact);
+            slots_total.insert(TaskKind::Compact, cfg.compaction_concurrency as u32);
+        }
     }
-    let merge_slots = if cfg.merge_wal_concurrency > 0 {
-        cfg.merge_wal_concurrency
-    } else {
-        cfg.task_concurrency.max(1)
-    } + if crate::local_merge::enabled(cfg) {
-        cfg.append.rollout_append_local_task_concurrency
+    let merge_slots = if cfg.maintenance.claim_wal_merges {
+        (if cfg.merge_wal_concurrency > 0 {
+            cfg.merge_wal_concurrency
+        } else {
+            cfg.task_concurrency.max(1)
+        }) + if crate::local_merge::enabled(cfg) {
+            cfg.append.rollout_append_local_task_concurrency
+        } else {
+            0
+        }
     } else {
         0
     };
@@ -222,7 +229,7 @@ pub(crate) fn local_heartbeat(state: &MasterState) -> Heartbeat {
         kinds.push(TaskKind::MergeWal);
         slots_total.insert(TaskKind::MergeWal, merge_slots as u32);
     }
-    let bytes_total = if crate::local_merge::enabled(cfg) {
+    let bytes_total = if cfg.maintenance.claim_wal_merges && crate::local_merge::enabled(cfg) {
         cfg.append.rollout_append_local_memory_bytes as u64
     } else {
         0
@@ -237,7 +244,7 @@ pub(crate) fn local_heartbeat(state: &MasterState) -> Heartbeat {
         slots_total,
         bytes_total,
         bytes_free_sample: state.local_append.as_ref().map_or(bytes_total, |l| {
-            (l.budget.limit() as u64).saturating_sub(l.budget.reserved() as u64)
+            bytes_total.saturating_sub(l.budget.reserved() as u64)
         }),
         draining: !status.accepting,
         heartbeat_ms: chrono::Utc::now().timestamp_millis(),
@@ -493,6 +500,59 @@ mod tests {
         assert_eq!(once["a"].bytes_free(), 60);
         assert_eq!(once["b"].bytes_free(), 0);
         assert_eq!(once["a"].slots_free(TaskKind::MergeWal), 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn disabled_admission_is_not_shadow_capacity() {
+        use clap::Parser;
+        for (maintenance, wal) in [(true, true), (false, true), (true, false), (false, false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut cfg = crate::config::MasterConfig::parse_from([
+                "test",
+                "--data-dir",
+                dir.path().to_str().unwrap(),
+            ]);
+            cfg.etcd.etcd_endpoints = std::env::var("ETCD_TEST_ENDPOINTS")
+                .unwrap()
+                .split(',')
+                .map(str::to_owned)
+                .collect();
+            cfg.etcd.etcd_prefix = format!(
+                "/executor-admission-test/{}",
+                lance_context_core::generate_id()
+            );
+            cfg.maintenance.claim_maintenance_tasks = maintenance;
+            cfg.maintenance.claim_wal_merges = wal;
+            cfg.task_concurrency = 2;
+            cfg.compaction_concurrency = 1;
+            cfg.merge_wal_concurrency = 3;
+            cfg.local_merge.master_local_merge_targets = vec!["hot".into()];
+            cfg.merge_rollout.owned_targets = vec!["hot".into()];
+            cfg.catchup.shards = vec!["writer".into()];
+            cfg.catchup.merge_max_bytes = 1024 * 1024;
+            cfg.append.rollout_append_local_memory_bytes = 128 * 1024 * 1024;
+            cfg.append.rollout_append_local_task_concurrency = 2;
+            let state = MasterState::new(cfg).await.unwrap();
+            let heartbeat = local_heartbeat(&state);
+            let capacity = headroom([("executor", &heartbeat)].into_iter(), [].iter());
+            for kind in [TaskKind::Compact, TaskKind::IndexId, TaskKind::Repair] {
+                assert_eq!(heartbeat.kinds.contains(&kind), maintenance);
+                assert_eq!(capacity["executor"].fits(kind, 0), maintenance);
+                assert_eq!(heartbeat.slots_total.contains_key(&kind), maintenance);
+            }
+            assert_eq!(heartbeat.kinds.contains(&TaskKind::MergeWal), wal);
+            assert_eq!(
+                capacity["executor"].slots_free(TaskKind::MergeWal),
+                if wal { 5 } else { 0 }
+            );
+            assert_eq!(capacity["executor"].fits(TaskKind::MergeWal, 1), wal);
+            assert_eq!(
+                heartbeat.bytes_total,
+                if wal { 128 * 1024 * 1024 } else { 0 }
+            );
+            assert_eq!(heartbeat.bytes_free_sample, heartbeat.bytes_total);
+        }
     }
 
     #[tokio::test]
