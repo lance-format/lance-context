@@ -6,7 +6,7 @@ use lance::dataset::{
     Dataset, MergeInsertBuilder, MergeInsertJob, UncommittedMergeInsert, WhenMatched,
     WhenNotMatched,
 };
-use lance::index::DatasetIndexInternalExt;
+use lance::index::DatasetIndexExt;
 use lance::Result;
 use lance_index::IndexCriteria;
 
