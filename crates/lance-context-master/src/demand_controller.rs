@@ -58,6 +58,10 @@ struct Policy {
     automatic: bool,
     #[serde(default)]
     aggregate_min_generations: Option<i64>,
+    /// Age-based admission is opt-in through the existing WAL tail setting.
+    /// Older members advertise no tail policy during a mixed-version rollout.
+    #[serde(default)]
+    aggregate_tail_interval_secs: u64,
     #[serde(default)]
     aggregate_merge_slots: usize,
     endpoints: Vec<String>,
@@ -74,6 +78,11 @@ impl Policy {
             v: 1,
             automatic: config.merge_wal_interval_secs > 0,
             aggregate_min_generations: Some(config.merge_wal_min_generations),
+            aggregate_tail_interval_secs: if config.wal_tail.wal_tail_stats_max_age_secs > 0 {
+                config.wal_tail.wal_tail_interval_secs
+            } else {
+                0
+            },
             aggregate_merge_slots: if !config.maintenance.claim_wal_merges {
                 0
             } else if config.merge_wal_concurrency > 0 {

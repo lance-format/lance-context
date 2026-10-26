@@ -1,6 +1,7 @@
 //! Table-wide WAL admission from existing writer watermarks. Only the elected
 //! demand controller runs this loop. Its streaming snapshot is independent of
-//! task dispatch, and retained values omit payloads and generation timestamps.
+//! task dispatch. Retained values omit payloads and keep only one conservative
+//! observation time per shard, rather than per-generation timestamp maps.
 //!
 //! An admitted frontier means "durably queued", not "merged". It is committed
 //! atomically with a NEW queue entry. Neither dedupe against a running task nor
@@ -38,6 +39,10 @@ struct Event {
     sealed_through: u64,
     #[serde(default)]
     merged_through: Option<u64>,
+    #[serde(default)]
+    flushed_at_ms: i64,
+    #[serde(default)]
+    source: Option<lance_context_merge::demand::EventSource>,
 }
 
 fn version() -> u32 {
@@ -77,6 +82,9 @@ struct Shard {
     admitted: u64,
     revision: i64,
     invalid: bool,
+    /// Lower bound on how long the latest sealed generation has been observed.
+    /// Scan time is deliberately not presented as the actual creation time.
+    seal_observed_at_ms: Option<i64>,
 }
 
 #[derive(Default)]
@@ -100,6 +108,22 @@ impl Table {
         self.shards.values().fold(0u64, |sum, s| {
             sum.saturating_add(s.sealed.saturating_sub(s.merged.max(s.admitted)))
         })
+    }
+
+    fn tail_delay(&self, interval_secs: u64, now_ms: i64) -> Option<Duration> {
+        let observed = self
+            .shards
+            .values()
+            .filter(|s| s.sealed > s.merged.max(s.admitted))
+            .filter_map(|s| s.seal_observed_at_ms)
+            .min()?;
+        let interval_ms = interval_secs.clamp(30, 86_400) as i64 * 1000;
+        Some(Duration::from_millis(
+            observed
+                .saturating_add(interval_ms)
+                .saturating_sub(now_ms)
+                .max(0) as u64,
+        ))
     }
 
     fn frontier(&self) -> Frontier {
@@ -158,7 +182,8 @@ struct Cache {
     shards: usize,
     bytes: usize,
     outstanding: BTreeSet<String>,
-    waiting: BTreeMap<String, i64>,
+    waiting: BTreeMap<String, (i64, Instant)>,
+    wake_oldest: bool,
     pending: Option<Attempt>,
 }
 
@@ -182,8 +207,36 @@ impl Cache {
             bytes: 0,
             outstanding: BTreeSet::new(),
             waiting: BTreeMap::new(),
+            wake_oldest: false,
             pending: None,
         }
+    }
+
+    /// Local scheduling only. The elected aggregate informer already has all
+    /// durable watermarks and member policies; this never reads stats or etcd.
+    fn admission_delay(&self, target: &str, now_ms: i64) -> Option<Duration> {
+        let table = self.tables.get(target)?;
+        if table.blocked() || table.pending() == 0 {
+            return None;
+        }
+        self.members
+            .values()
+            .filter(|p| {
+                p.automatic
+                    && !p.draining.iter().any(|t| t == target)
+                    && p.admits_request(target, None)
+            })
+            .filter_map(|p| {
+                let threshold = p.aggregate_min_generations?.max(1) as u64;
+                if table.pending() >= threshold {
+                    Some(Duration::ZERO)
+                } else if p.aggregate_tail_interval_secs > 0 {
+                    table.tail_delay(p.aggregate_tail_interval_secs, now_ms)
+                } else {
+                    None
+                }
+            })
+            .min()
     }
 
     fn capacity(&self) -> usize {
@@ -216,24 +269,30 @@ impl Cache {
             .map(|s| s.revision)
             .max()
             .unwrap_or(0);
-        self.waiting.insert(target.to_string(), revision);
+        self.waiting
+            .entry(target.to_string())
+            .and_modify(|(old_revision, _)| *old_revision = revision)
+            .or_insert_with(|| (revision, Instant::now()));
     }
 
     fn wake_capacity(&mut self) {
         if self.pending.is_some() || self.outstanding.len() >= self.capacity() {
             return;
         }
-        // Current writes get the next available credit instead of waiting for
-        // every historical table. Existing periodic discovery still serves old
-        // storage backlog independently of these advisory hints.
-        let Some(target) = self
-            .waiting
-            .iter()
-            .max_by_key(|(_, revision)| *revision)
-            .map(|(target, _)| target.clone())
-        else {
+        // Alternate fresh-write priority with the oldest waiting table. New
+        // events may update its revision but cannot reset its place in line;
+        // a stream of hot tables must not starve a quiet aged tail forever.
+        let selected = if self.wake_oldest {
+            self.waiting.iter().min_by_key(|(_, (_, since))| *since)
+        } else {
+            self.waiting
+                .iter()
+                .max_by_key(|(_, (revision, _))| *revision)
+        };
+        let Some(target) = selected.map(|(target, _)| target.clone()) else {
             return;
         };
+        self.wake_oldest = !self.wake_oldest;
         self.waiting.remove(&target);
         self.mark(&target, Duration::ZERO);
     }
@@ -281,7 +340,7 @@ impl Cache {
             .copied()
             .collect();
         let extra = if old.is_none() {
-            1280 + target.len() * 6
+            1344 + target.len() * 6
         } else {
             0
         } + additional.iter().map(|id| 192 + id.len()).sum::<usize>();
@@ -414,11 +473,34 @@ impl Cache {
                 if let Some(event) = event {
                     // Counts use the same monotonic per-dimension join as
                     // TableDemand::fold; writer epochs never reset numbering.
+                    let now = chrono::Utc::now().timestamp_millis();
+                    let observed = if event.source
+                        != Some(lance_context_merge::demand::EventSource::Executor)
+                        && event.flushed_at_ms > 0
+                        && event.flushed_at_ms <= now
+                    {
+                        event.flushed_at_ms
+                    } else {
+                        // A missing/future timestamp or executor completion is
+                        // not evidence of old WAL. Start a conservative local
+                        // observation clock without inventing its creation age.
+                        now
+                    };
+                    if event.sealed_through > state.sealed {
+                        state.seal_observed_at_ms = Some(observed);
+                    } else if event.sealed_through == state.sealed {
+                        state.seal_observed_at_ms = Some(
+                            state
+                                .seal_observed_at_ms
+                                .map_or(observed, |old| old.min(observed)),
+                        );
+                    }
                     state.sealed = state.sealed.max(event.sealed_through);
                     state.merged = state.merged.max(event.merged_through.unwrap_or(0));
                 } else {
                     state.sealed = 0;
                     state.merged = 0;
+                    state.seal_observed_at_ms = None;
                 }
             }
             1 => {
@@ -755,22 +837,16 @@ async fn reconcile_table(
     if cache.pending.is_some() {
         return resolve_pending(publisher, prefix, cache).await;
     }
-    let Some(threshold) = cache
-        .members
-        .values()
-        .filter(|p| {
-            p.automatic && !p.draining.iter().any(|t| t == target) && p.admits_request(target, None)
-        })
-        .filter_map(|p| p.aggregate_min_generations)
-        .map(|n| n.max(1) as u64)
-        .min()
-    else {
+    let Some(delay) = cache.admission_delay(target, chrono::Utc::now().timestamp_millis()) else {
         return Ok(());
     };
-    let table = cache.tables.get(target).ok_or("missing aggregate table")?;
-    if table.blocked() || table.pending() < threshold {
+    if !delay.is_zero() {
+        // A single local timer per table; no repeated reads, and no need for a
+        // second writer event or a completed fleet-wide stats scan to wake it.
+        cache.mark(target, delay);
         return Ok(());
     }
+    let table = cache.tables.get(target).ok_or("missing aggregate table")?;
     if !cache.outstanding.contains(target) && cache.outstanding.len() >= cache.capacity() {
         cache.wait_capacity(target);
         return Ok(());
@@ -998,6 +1074,251 @@ mod tests {
                 revision,
             )
             .unwrap();
+    }
+
+    fn tail_cache() -> Cache {
+        let mut config = MasterConfig::parse_from(["test"]);
+        config.worker_endpoints = vec!["worker-a".into()];
+        config.merge_wal_interval_secs = 600;
+        config.merge_wal_min_generations = 8;
+        config.wal_tail.wal_tail_interval_secs = 600;
+        let mut cache = Cache::new();
+        cache
+            .members
+            .insert(b"m".to_vec(), Policy::from_config(&config));
+        cache
+    }
+
+    #[test]
+    fn small_tail_wakes_without_another_event_or_completed_stats_scan() {
+        let mut cache = tail_cache();
+        publish(&mut cache, "t", "s", 7, None, 1);
+        assert_eq!(
+            cache.admission_delay("t", 1),
+            Some(Duration::from_secs(600))
+        );
+        assert_eq!(cache.admission_delay("t", 600_001), Some(Duration::ZERO));
+        // The durable scan hint is still actionable after a 28.5 minute scan,
+        // even though its separate stats-cache row would exceed the 900s cap.
+        assert_eq!(cache.admission_delay("t", 1_708_725), Some(Duration::ZERO));
+        let mut rebuilt = tail_cache();
+        publish(&mut rebuilt, "t", "s", 7, None, 1);
+        assert_eq!(
+            rebuilt.admission_delay("t", 1_708_725),
+            Some(Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn tail_uses_one_local_deadline_without_polling() {
+        let mut cache = tail_cache();
+        publish(&mut cache, "t", "s", 7, None, 1);
+        assert_eq!(cache.take_ready().as_deref(), Some("t"));
+        let delay = cache.admission_delay("t", 1).unwrap();
+        let before = Instant::now();
+        cache.mark("t", delay);
+        assert!(cache.next_due() >= before + delay);
+        assert!(cache.next_due() <= Instant::now() + delay);
+        for _ in 0..100 {
+            assert!(cache.take_ready().is_none());
+        }
+        assert_eq!(cache.ready.len(), 1);
+        assert_eq!(cache.due.len(), 1);
+    }
+
+    #[test]
+    fn aged_frontier_never_regenerates_empty_work_or_bypasses_dedupe() {
+        let mut cache = tail_cache();
+        publish(&mut cache, "t", "s", 7, None, 1);
+        let value = serde_json::to_vec(&cache.tables["t"].frontier()).unwrap();
+        cache
+            .apply(1, "/p", frontier_key("/p", "t").as_bytes(), Some(&value), 2)
+            .unwrap();
+        assert_eq!(cache.admission_delay("t", 1_708_725), None);
+        publish(&mut cache, "t", "s", 8, None, 3);
+        assert_eq!(cache.tables["t"].pending(), 1);
+        assert_eq!(cache.admission_delay("t", 1_708_725), Some(Duration::ZERO));
+        let table = cache.tables.get_mut("t").unwrap();
+        table.dedupe_id = Some("running".into());
+        table.checked_dedupe = Some("running".into());
+        assert_eq!(cache.admission_delay("t", 1_708_725), None);
+    }
+
+    #[test]
+    fn old_disabled_or_narrow_members_do_not_expand_tail_scope() {
+        let mut cache = tail_cache();
+        publish(&mut cache, "t", "s", 7, None, 1);
+        let member = cache.members.values_mut().next().unwrap();
+        member.draining.push("t".into());
+        assert_eq!(cache.admission_delay("t", 1_708_725), None);
+        let member = cache.members.values_mut().next().unwrap();
+        member.draining.clear();
+        member.endpoints.clear();
+        member.local_auto = false;
+        member.local = vec!["other".into()];
+        member.owned = vec!["other".into()];
+        assert_eq!(cache.admission_delay("t", 1_708_725), None);
+        let mut cache = tail_cache();
+        publish(&mut cache, "t", "s", 7, None, 1);
+        let mut old = serde_json::to_value(cache.members.values().next().unwrap()).unwrap();
+        old.as_object_mut()
+            .unwrap()
+            .remove("aggregate_tail_interval_secs");
+        cache
+            .members
+            .insert(b"m".to_vec(), serde_json::from_value(old).unwrap());
+        assert_eq!(cache.admission_delay("t", 1_708_725), None);
+        publish(&mut cache, "t", "s", 8, None, 2);
+        assert_eq!(cache.admission_delay("t", 1_708_725), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn executor_or_future_timestamp_does_not_invent_old_tail_age() {
+        for executor in [false, true] {
+            let mut cache = tail_cache();
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&event("s", 7, None)).unwrap();
+            if executor {
+                value["source"] = serde_json::json!("executor");
+            } else {
+                value["flushed_at_ms"] = serde_json::json!(i64::MAX);
+            }
+            let before = chrono::Utc::now().timestamp_millis();
+            cache
+                .apply(
+                    0,
+                    "/p",
+                    b"/p/demand-events/74/s",
+                    Some(&serde_json::to_vec(&value).unwrap()),
+                    1,
+                )
+                .unwrap();
+            let observed = cache.tables["t"].shards["s"].seal_observed_at_ms.unwrap();
+            assert!(observed >= before);
+            assert_eq!(
+                cache.admission_delay("t", observed),
+                Some(Duration::from_secs(600))
+            );
+        }
+    }
+
+    #[test]
+    fn hot_arrivals_cannot_starve_the_oldest_capacity_waiter() {
+        let mut cache = tail_cache();
+        cache
+            .members
+            .values_mut()
+            .next()
+            .unwrap()
+            .aggregate_merge_slots = 0;
+        publish(&mut cache, "cold", "s", 7, None, 1);
+        cache.wait_capacity("cold");
+        let since = cache.waiting["cold"].1;
+        publish(&mut cache, "hot", "s", 8, None, 2);
+        cache.wait_capacity("hot");
+        cache
+            .members
+            .values_mut()
+            .next()
+            .unwrap()
+            .aggregate_merge_slots = 1;
+        cache.wake_capacity();
+        assert_eq!(cache.take_ready().as_deref(), Some("hot"));
+        cache
+            .members
+            .values_mut()
+            .next()
+            .unwrap()
+            .aggregate_merge_slots = 0;
+        // An unrelated scan refresh must not move cold to the back of the line.
+        publish(&mut cache, "cold", "s", 7, None, 3);
+        assert_eq!(cache.waiting["cold"].1, since);
+        publish(&mut cache, "hotter", "s", 8, None, 4);
+        cache.wait_capacity("hotter");
+        cache
+            .members
+            .values_mut()
+            .next()
+            .unwrap()
+            .aggregate_merge_slots = 1;
+        cache.wake_capacity();
+        assert_eq!(cache.take_ready().as_deref(), Some("cold"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated ETCD_TEST_ENDPOINTS"]
+    async fn aged_small_tails_share_durable_capacity_and_do_not_requeue_after_rebuild() {
+        let (_dir, mut cfg, store) = super::super::tests::fixture().await;
+        cfg.wal_tail.wal_tail_interval_secs = 600;
+        cfg.merge_wal_min_generations = 8;
+        let mut policy = Policy::from_config(&cfg);
+        policy.aggregate_merge_slots = 1;
+        let session = store
+            .discovery_session(serde_json::to_vec(&policy).unwrap())
+            .await
+            .unwrap();
+        assert!(store.elect_discovery_leader(&session).await.unwrap());
+        let publisher = store.discovery_publisher(&session);
+        let prefix = cfg.etcd.prefix();
+        let mut client = store.etcd_client().clone();
+        for n in 1..=6 {
+            let name = format!("small-{n}");
+            let hex: String = name.bytes().map(|b| format!("{b:02x}")).collect();
+            client
+                .put(
+                    format!("{prefix}/demand-events/{hex}/s"),
+                    event("s", n, None),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let mut cache = snapshot(&client, prefix).await.unwrap();
+        while let Some(target) = cache.take_ready() {
+            reconcile(&publisher, prefix, &mut cache, &target)
+                .await
+                .unwrap();
+        }
+        assert_eq!(store.list().await.unwrap().len(), 2);
+        assert_eq!(cache.outstanding.len(), 2);
+        assert_eq!(cache.waiting.len(), 4);
+        // A leader restart must retain both the count budget and entrusted
+        // frontier even if completion has not published merged watermarks yet.
+        let mut rebuilt = snapshot(&client, prefix).await.unwrap();
+        while let Some(target) = rebuilt.take_ready() {
+            reconcile(&publisher, prefix, &mut rebuilt, &target)
+                .await
+                .unwrap();
+        }
+        assert_eq!(store.list().await.unwrap().len(), 2);
+        assert_eq!(rebuilt.outstanding.len(), 2);
+        assert_eq!(rebuilt.waiting.len(), 4);
+        for _ in 0..2 {
+            let claim = store
+                .claim_next_of_kinds(crate::task_store::TaskKinds::MERGE_WAL)
+                .await
+                .unwrap()
+                .unwrap();
+            store.finish(claim, Ok("done".into())).await.unwrap();
+        }
+        let mut after = snapshot(&client, prefix).await.unwrap();
+        while let Some(target) = after.take_ready() {
+            reconcile(&publisher, prefix, &mut after, &target)
+                .await
+                .unwrap();
+        }
+        let tasks = store.list().await.unwrap();
+        assert_eq!(tasks.len(), 4);
+        assert_eq!(
+            tasks
+                .iter()
+                .map(|t| &t.target)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            4
+        );
+        assert_eq!(after.outstanding.len(), 2);
+        store.release_coordination_lock(session).await.unwrap();
     }
 
     #[test]
