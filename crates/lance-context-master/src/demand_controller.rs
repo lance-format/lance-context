@@ -189,6 +189,8 @@ impl Cache {
                 None
             };
         let due = old.map_or_else(Instant::now, |e| e.due);
+        self.placement
+            .observe_ticket(key, old.map(|entry| entry.value.as_slice()), value);
         self.placement.forget_queue_entry(key);
         if let Some(old) = self.entries.remove(key) {
             self.ready.remove(&(old.due, key.to_vec()));

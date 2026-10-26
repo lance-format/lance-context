@@ -12,7 +12,12 @@ use etcd_client::WatchOptions;
 use lance_context_api::{TaskKind, TaskRecord, TaskState};
 use lance_context_merge::rollout::MergeRollout;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    ops::Bound,
+    sync::Arc,
+    time::Duration,
+};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Ticket {
@@ -404,8 +409,34 @@ impl Receiver {
 pub(super) struct Placement {
     cursor: Option<Vec<u8>>,
     ticket_cursor: Option<Vec<u8>>,
+    target_tickets: BTreeMap<String, TargetTickets>,
     dependencies: BTreeMap<String, DependencyEvaluation>,
     more_dependencies: bool,
+}
+
+/// Derived only from the leader's existing ticket snapshot/watch. An exact
+/// resident scope must not disappear behind an unrelated raw-ticket page.
+#[derive(Default)]
+struct TargetTickets {
+    keys: BTreeSet<Arc<[u8]>>,
+    cursor: Option<Arc<[u8]>>,
+}
+
+impl TargetTickets {
+    fn page(&mut self) -> Vec<Vec<u8>> {
+        let start = self.cursor.take().map_or(Bound::Unbounded, Bound::Excluded);
+        let mut keys: Vec<_> = self
+            .keys
+            .range::<Arc<[u8]>, _>((start, Bound::Unbounded))
+            .take(64)
+            .cloned()
+            .collect();
+        if keys.is_empty() {
+            keys = self.keys.iter().take(64).cloned().collect();
+        }
+        self.cursor = (keys.len() == 64).then(|| keys.last().unwrap().clone());
+        keys.into_iter().map(|key| key.to_vec()).collect()
+    }
 }
 
 /// One compact evaluation per queued dependency chain. Its dependency IDs are
@@ -444,6 +475,54 @@ struct DependencyCheck {
 }
 
 impl Placement {
+    pub(super) fn observe_ticket(
+        &mut self,
+        key: &[u8],
+        before: Option<&[u8]>,
+        after: Option<&[u8]>,
+    ) {
+        if !std::str::from_utf8(key)
+            .ok()
+            .and_then(|key| key.rsplit_once('/'))
+            .is_some_and(|(parent, _)| parent.ends_with("/demand-controller/tickets"))
+        {
+            return;
+        }
+        let targets = |value: Option<&[u8]>| -> Vec<String> {
+            let Some(ticket) = value.and_then(|v| serde_json::from_slice::<Ticket>(v).ok()) else {
+                return Vec::new();
+            };
+            if ticket.v != 1 || !ticket.kinds.contains(TaskKind::MergeWal) {
+                return Vec::new();
+            }
+            let Some(resident) = ticket.resident_targets else {
+                return Vec::new();
+            };
+            let scope = if ticket.wal_claim_targets.is_empty() {
+                resident
+            } else {
+                ticket.wal_claim_targets
+            };
+            scope.into_iter().filter(|target| target != "*").collect()
+        };
+        for target in targets(before) {
+            if let Some(index) = self.target_tickets.get_mut(&target) {
+                index.keys.remove(key);
+                if index.keys.is_empty() {
+                    self.target_tickets.remove(&target);
+                }
+            }
+        }
+        let key: Arc<[u8]> = key.into();
+        for target in targets(after) {
+            self.target_tickets
+                .entry(target)
+                .or_default()
+                .keys
+                .insert(key.clone());
+        }
+    }
+
     pub(super) fn forget_queue_entry(&mut self, key: &[u8]) {
         if let Some((parent, id)) = std::str::from_utf8(key)
             .ok()
@@ -577,7 +656,7 @@ pub(super) async fn place(
     // ordering preserves ticket rotation within each class; an ineligible local
     // ticket cannot delay a task that an ordinary pool can claim.
     tickets.sort_by_key(|(_, _, ticket)| ticket.resident_targets.is_none());
-    if tickets.is_empty() {
+    if tickets.is_empty() && cache.placement.target_tickets.is_empty() {
         let more = next_ticket.is_some();
         cache.placement.ticket_cursor = next_ticket;
         cache.placement.cursor = None;
@@ -616,10 +695,41 @@ pub(super) async fn place(
         {
             continue;
         }
-        let Some((ticket_key, ticket_entry, _)) = tickets
-            .iter()
-            .find(|(_, entry, ticket)| entry.lease_id > 0 && ticket.eligible(prefix, cache, &task))
-        else {
+        // Prefer an exact resident scope across the whole cached inventory.
+        // Each target probe is bounded and rotates; malformed, draining, busy
+        // or otherwise ineligible capacity falls back in this same call. This
+        // never reads etcd or reserves work for an unavailable executor.
+        let preferred_keys = if task.kind == TaskKind::MergeWal {
+            cache
+                .placement
+                .target_tickets
+                .get_mut(&task.target)
+                .map(TargetTickets::page)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let preferred = preferred_keys.into_iter().find_map(|key| {
+            if cache.entries.contains_key(
+                String::from_utf8_lossy(&key)
+                    .replace("/tickets/", "/offers/")
+                    .as_bytes(),
+            ) {
+                return None;
+            }
+            let entry = cache.entries.get(&key)?;
+            let ticket: Ticket = serde_json::from_slice(&entry.value).ok()?;
+            (entry.lease_id > 0 && ticket.eligible(prefix, cache, &task))
+                .then(|| (key, entry.clone()))
+        });
+        let Some((ticket_key, ticket_entry)) = preferred.or_else(|| {
+            tickets
+                .iter()
+                .find(|(_, entry, ticket)| {
+                    entry.lease_id > 0 && ticket.eligible(prefix, cache, &task)
+                })
+                .map(|(key, entry, _)| (key.clone(), entry.clone()))
+        }) else {
             continue;
         };
         let dependencies = cache.placement.dependencies_ready(publisher, &task).await?;
@@ -629,7 +739,7 @@ pub(super) async fn place(
             }
             continue;
         }
-        let ticket_key = std::str::from_utf8(ticket_key).map_err(|e| e.to_string())?;
+        let ticket_key = std::str::from_utf8(&ticket_key).map_err(|e| e.to_string())?;
         let offer = Offer {
             v: 1,
             task_id: task.id,
@@ -708,6 +818,59 @@ mod tests {
     use super::*;
     use etcd_client::GetOptions;
 
+    #[test]
+    fn exact_target_index_tracks_watch_updates_without_stale_members_or_unbounded_probe() {
+        use clap::Parser;
+        let mut cfg = MasterConfig::try_parse_from(["master"]).unwrap();
+        cfg.local_merge.master_local_merge_targets = vec!["*".into()];
+        cfg.maintenance.wal_claim_targets = vec!["hot".into()];
+        let mut ticket = Ticket::new(
+            &cfg,
+            "executor",
+            "resident_merge",
+            TaskKinds::MERGE_WAL,
+            true,
+        );
+        let key = b"/test/demand-controller/tickets/one";
+        let mut cache = Cache::new();
+        let original = serde_json::to_vec(&ticket).unwrap();
+        cache.apply(key, Some(&original), 1).unwrap();
+        assert!(cache.placement.target_tickets["hot"]
+            .keys
+            .contains(key.as_slice()));
+        ticket.wal_claim_targets = vec!["other".into()];
+        cache
+            .apply(key, Some(&serde_json::to_vec(&ticket).unwrap()), 3)
+            .unwrap();
+        cache.apply(key, Some(&original), 2).unwrap();
+        assert!(!cache.placement.target_tickets.contains_key("hot"));
+        assert!(cache.placement.target_tickets.contains_key("other"));
+        cache.apply(key, Some(b"malformed"), 4).unwrap();
+        assert!(cache.placement.target_tickets.is_empty());
+        cache.apply(key, Some(&original), 5).unwrap();
+        cache.apply(key, None, 6).unwrap();
+        assert!(cache.placement.target_tickets.is_empty());
+
+        let mut many = TargetTickets::default();
+        for i in 0..130 {
+            many.keys.insert(Arc::from(format!("{i:04}").into_bytes()));
+        }
+        let first = many.page();
+        let second = many.page();
+        let third = many.page();
+        assert_eq!((first.len(), second.len(), third.len()), (64, 64, 2));
+        assert_eq!(
+            first
+                .iter()
+                .chain(&second)
+                .chain(&third)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            130
+        );
+        assert_eq!(many.page(), first);
+    }
+
     async fn setup() -> (
         tempfile::TempDir,
         MasterConfig,
@@ -746,7 +909,14 @@ mod tests {
         // The older ordinary ticket wins before resident preference is applied.
         // Local scope, draining and kind exclusions must still fall back without
         // reserving the task for an executor that cannot run it.
-        for exclusion in ["none", "target", "draining", "kind"] {
+        for (exclusion, paged) in [
+            ("none", false),
+            ("target", false),
+            ("draining", false),
+            ("kind", false),
+            ("none", true),
+            ("draining", true),
+        ] {
             let (_dir, cfg, store, leader) = setup().await;
             let wanted = store
                 .enqueue(TaskKind::MergeWal, "wanted", vec![])
@@ -765,10 +935,33 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            let mut fillers = Vec::new();
+            if paged {
+                for _ in 0..64 {
+                    fillers.push(
+                        store
+                            .create_dispatch_ticket(
+                                serde_json::to_vec(&Ticket::new(
+                                    &cfg,
+                                    "maintenance",
+                                    "general",
+                                    TaskKinds::COMPACT,
+                                    false,
+                                ))
+                                .unwrap(),
+                            )
+                            .await
+                            .unwrap(),
+                    );
+                }
+            }
             let mut local_cfg = cfg.clone();
             local_cfg.local_merge.master_local_merge_auto = true;
             local_cfg.local_merge.master_local_merge_targets = vec!["*".into()];
             local_cfg.maintenance.fence_legacy_maintenance = true;
+            if paged {
+                local_cfg.maintenance.wal_claim_targets = vec!["wanted".into()];
+            }
             if exclusion == "target" {
                 local_cfg.maintenance.wal_claim_targets = vec!["elsewhere".into()];
             }
@@ -856,6 +1049,9 @@ mod tests {
             );
             store.release_coordination_lock(local).await.unwrap();
             store.release_coordination_lock(ordinary).await.unwrap();
+            for filler in fillers {
+                store.release_coordination_lock(filler).await.unwrap();
+            }
             store.release_coordination_lock(leader).await.unwrap();
         }
     }
