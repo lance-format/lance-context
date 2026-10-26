@@ -2911,6 +2911,18 @@ fn dedupe_merge_batches(
                 continue;
             }
 
+            // All rows survived: their original order is already the desired
+            // order. Reuse the arrays instead of copying every payload through
+            // Arrow take while the other generation batches remain resident.
+            // Keep applying the requested schema, including its metadata.
+            if selected.len() == batch.num_rows() {
+                deduped.push(RecordBatch::try_new(
+                    target_schema.clone(),
+                    batch.columns().to_vec(),
+                )?);
+                continue;
+            }
+
             // Restore source order within each retained batch. Cross-batch
             // ordering no longer affects results because keys are now unique.
             selected.reverse();
@@ -2925,6 +2937,10 @@ fn dedupe_merge_batches(
     }
     Ok(deduped)
 }
+
+#[cfg(test)]
+#[path = "store_base_dedupe_tests.rs"]
+mod dedupe_tests;
 
 /// Align a flushed-generation batch with the base table schema before append.
 ///
