@@ -61,6 +61,49 @@ impl WriterAcknowledgement {
     }
 }
 
+/// The pending manifest returns generation zero after a shard is drained.
+/// Keep that successfully acknowledged observation independently: the positive
+/// high-watermark must survive late completions, but cannot cover generation
+/// zero (or any other older event) without first observing its durable join.
+/// Two fixed slots per LRU entry keep memory bounded without retaining stores.
+#[derive(Default)]
+struct ShardAcknowledgements {
+    positive: Option<WriterAcknowledgement>,
+    empty: Option<WriterAcknowledgement>,
+}
+
+impl ShardAcknowledgements {
+    fn covers(&self, next: WriterAcknowledgement) -> bool {
+        let prior = if next.generation == 0 {
+            self.empty
+        } else {
+            self.positive
+        };
+        prior.is_some_and(|prior| prior.covers(next))
+    }
+
+    fn join(&mut self, next: WriterAcknowledgement) {
+        let slot = if next.generation == 0 {
+            &mut self.empty
+        } else {
+            &mut self.positive
+        };
+        if let Some(prior) = slot {
+            prior.join(next);
+        } else {
+            *slot = Some(next);
+        }
+    }
+}
+
+impl From<WriterAcknowledgement> for ShardAcknowledgements {
+    fn from(next: WriterAcknowledgement) -> Self {
+        let mut acknowledgements = Self::default();
+        acknowledgements.join(next);
+        acknowledgements
+    }
+}
+
 #[derive(Default)]
 struct Pending {
     order: VecDeque<String>,
@@ -74,7 +117,7 @@ struct Pending {
 pub(crate) struct DemandPublisher {
     capacity: usize,
     pending: Mutex<Pending>,
-    acknowledged: Mutex<LruCache<(String, String), WriterAcknowledgement>>,
+    acknowledged: Mutex<LruCache<(String, String), ShardAcknowledgements>>,
 }
 
 impl DemandPublisher {
@@ -128,7 +171,7 @@ impl DemandPublisher {
             if let Some(prior) = acknowledged.get_mut(&key) {
                 prior.join(next);
             } else {
-                acknowledged.put(key, next);
+                acknowledged.put(key, next.into());
             }
         }
         Ok(if written { "written" } else { "unchanged" })
@@ -267,6 +310,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn drained_shard_stops_republishing_empty_without_losing_positive_ack() {
+        let publisher = DemandPublisher::new(8);
+        let full = event();
+        publisher
+            .publish_writer_event("t", &full, async { Ok::<_, ()>(true) })
+            .await
+            .unwrap();
+        let mut empty = full.clone();
+        empty.sealed_through = 0;
+        empty.sealed_bytes_through = 0;
+        empty.flushed_at_ms += 1;
+        assert_eq!(
+            publisher
+                .publish_writer_event("t", &empty, async { Ok::<_, ()>(false) })
+                .await,
+            Ok("unchanged")
+        );
+        for _ in 0..100 {
+            empty.flushed_at_ms += 1;
+            must_skip(&publisher, "t", &empty).await;
+            must_skip(&publisher, "t", &full).await;
+        }
+        // Nonempty lower generations can carry useful age evidence; the empty
+        // acknowledgement must not accidentally suppress them.
+        let mut old = full.clone();
+        old.sealed_through -= 1;
+        assert_eq!(
+            publisher
+                .publish_writer_event("t", &old, async { Ok::<_, ()>(false) })
+                .await,
+            Ok("unchanged")
+        );
+        let mut fresh = full.clone();
+        fresh.sealed_through += 1;
+        assert_eq!(
+            publisher
+                .publish_writer_event("t", &fresh, async { Ok::<_, ()>(true) })
+                .await,
+            Ok("written")
+        );
+        must_skip(&publisher, "t", &fresh).await;
+        must_skip(&publisher, "t", &empty).await;
+    }
+
+    #[tokio::test]
+    async fn empty_ack_requires_success_and_preserves_new_evidence() {
+        let publisher = DemandPublisher::new(8);
+        let full = event();
+        publisher
+            .publish_writer_event("t", &full, async { Ok::<_, ()>(true) })
+            .await
+            .unwrap();
+        let mut empty = full.clone();
+        empty.sealed_through = 0;
+        for _ in 0..2 {
+            assert_eq!(
+                publisher
+                    .publish_writer_event("t", &empty, async { Err::<bool, _>("lost") })
+                    .await,
+                Err("lost")
+            );
+        }
+        let blocked = publisher.publish_writer_event("t", &empty, async {
+            futures::future::pending::<()>().await;
+            Ok::<_, ()>(false)
+        });
+        assert!(timeout(Duration::from_millis(10), blocked).await.is_err());
+        assert_eq!(
+            publisher
+                .publish_writer_event("t", &empty, async { Ok::<_, ()>(false) })
+                .await,
+            Ok("unchanged")
+        );
+        must_skip(&publisher, "t", &empty).await;
+        for dimension in 0..3 {
+            let mut changed = empty.clone();
+            match dimension {
+                0 => changed.writer_epoch += 1,
+                1 => changed.sealed_bytes_through += 1,
+                _ => changed.flushed_at_ms -= 1,
+            }
+            assert_eq!(
+                publisher
+                    .publish_writer_event("t", &changed, async { Ok::<_, ()>(false) })
+                    .await,
+                Ok("unchanged")
+            );
+        }
+        must_skip(&publisher, "t", &full).await;
+    }
+
+    #[tokio::test]
+    async fn empty_and_positive_acknowledgements_survive_out_of_order_completion() {
+        for empty_finishes_last in [false, true] {
+            let publisher = DemandPublisher::new(8);
+            let full = event();
+            let mut empty = full.clone();
+            empty.sealed_through = 0;
+            let (old, new) = if empty_finishes_last {
+                (&empty, &full)
+            } else {
+                (&full, &empty)
+            };
+            let (release, blocked) = tokio::sync::oneshot::channel();
+            let older = publisher.publish_writer_event("t", old, async {
+                blocked.await.unwrap();
+                Ok::<_, ()>(false)
+            });
+            tokio::pin!(older);
+            assert!(futures::poll!(&mut older).is_pending());
+            publisher
+                .publish_writer_event("t", new, async { Ok::<_, ()>(false) })
+                .await
+                .unwrap();
+            release.send(()).unwrap();
+            older.await.unwrap();
+            must_skip(&publisher, "t", &full).await;
+            must_skip(&publisher, "t", &empty).await;
+        }
+    }
+
+    #[tokio::test]
     async fn failure_and_cancelled_reply_never_acknowledge_writer() {
         let publisher = DemandPublisher::new(8);
         let observation = event();
@@ -379,6 +544,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_ack_is_bounded_and_replays_after_eviction_or_restart() {
+        let publisher = DemandPublisher::new(0);
+        let full = event();
+        let mut empty = full.clone();
+        empty.sealed_through = 0;
+        for i in 0..CONCURRENCY {
+            for observation in [&full, &empty] {
+                publisher
+                    .publish_writer_event(&i.to_string(), observation, async { Ok::<_, ()>(false) })
+                    .await
+                    .unwrap();
+            }
+        }
+        assert_eq!(publisher.acknowledged.lock().unwrap().len(), CONCURRENCY);
+        must_skip(&publisher, "0", &empty).await;
+        publisher
+            .publish_writer_event("extra", &empty, async { Ok::<_, ()>(false) })
+            .await
+            .unwrap();
+        assert_eq!(publisher.acknowledged.lock().unwrap().len(), CONCURRENCY);
+        assert_eq!(
+            publisher
+                .publish_writer_event("1", &empty, async { Ok::<_, ()>(false) })
+                .await,
+            Ok("unchanged")
+        );
+        let restarted = DemandPublisher::new(0);
+        assert_eq!(
+            restarted
+                .publish_writer_event("0", &empty, async { Ok::<_, ()>(false) })
+                .await,
+            Ok("unchanged")
+        );
+    }
+
+    #[tokio::test]
     async fn extended_events_and_large_keys_always_reach_durable_join() {
         let publisher = DemandPublisher::new(8);
         let observation = event();
@@ -476,6 +677,67 @@ mod tests {
         let stored: DemandEvent = serde_json::from_slice(stored.kvs()[0].value()).unwrap();
         assert_eq!(stored.sealed_through, observation.sealed_through);
         must_skip(&publisher, "t", &observation).await;
+        coordinator
+            .publish_merged_watermark(
+                "t",
+                &lance_context_merge::demand::ShardMerged {
+                    shard: observation.shard.clone(),
+                    merged_through: observation.sealed_through,
+                },
+            )
+            .await
+            .unwrap();
+        let mut empty = observation.clone();
+        empty.sealed_through = 0;
+        empty.sealed_bytes_through = 0;
+        // A durable no-op whose reply is lost must not populate the empty slot.
+        let lost_empty = publisher.publish_writer_event("t", &empty, async {
+            assert!(!coordinator.publish_demand_event("t", &empty).await?);
+            futures::future::pending::<()>().await;
+            Ok::<_, String>(false)
+        });
+        assert!(timeout(Duration::from_millis(50), lost_empty)
+            .await
+            .is_err());
+        assert_eq!(
+            publisher
+                .publish_writer_event("t", &empty, coordinator.publish_demand_event("t", &empty))
+                .await
+                .unwrap(),
+            "unchanged"
+        );
+        for _ in 0..100 {
+            empty.flushed_at_ms += 1;
+            must_skip(&publisher, "t", &empty).await;
+        }
+        let stored = client
+            .clone()
+            .get(format!("{prefix}/demand-events/74/shard"), None)
+            .await
+            .unwrap();
+        let stored: DemandEvent = serde_json::from_slice(stored.kvs()[0].value()).unwrap();
+        assert_eq!(stored.sealed_through, observation.sealed_through);
+        assert_eq!(stored.merged_through, Some(observation.sealed_through));
+        observation.sealed_through += 1;
+        assert_eq!(
+            publisher
+                .publish_writer_event(
+                    "t",
+                    &observation,
+                    coordinator.publish_demand_event("t", &observation)
+                )
+                .await
+                .unwrap(),
+            "written"
+        );
+        let stored = client
+            .clone()
+            .get(format!("{prefix}/demand-events/74/shard"), None)
+            .await
+            .unwrap();
+        let stored: DemandEvent = serde_json::from_slice(stored.kvs()[0].value()).unwrap();
+        assert_eq!(stored.sealed_through, observation.sealed_through);
+        assert_eq!(stored.merged_through, Some(observation.sealed_through - 1));
     }
 
     async fn occupy(publisher: &Arc<DemandPublisher>) -> Arc<Semaphore> {
