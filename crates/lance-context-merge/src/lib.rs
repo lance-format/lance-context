@@ -961,6 +961,93 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn typed_progress_watch_replays_payload_and_refreshes_on_owner_or_delete() {
+        use crate::progress::ExecutionUpdate;
+        let (coordinator, mut client, proof, _) = fixture().await;
+        let execution = Execution::new("table", "worker", "boot", 600);
+        assert!(coordinator.reserve(&proof, &execution).await.unwrap());
+        let running = coordinator.start(&execution).await.unwrap().unwrap();
+        let (_, revision) = coordinator.get_with_revision("table").await.unwrap();
+        assert!(coordinator.publish_progress(&running, 7).await.unwrap());
+        let mut watch = coordinator
+            .watch_execution(&running, revision)
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), watch.next_update())
+                .await
+                .unwrap()
+                .unwrap(),
+            ExecutionUpdate::Progress(7)
+        );
+        // A target reuse cannot feed another execution's sequence into this watch.
+        client
+            .put(
+                format!("{}/merge-progress/other", coordinator.prefix),
+                r#"{"sequence":999}"#,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), watch.next_update())
+                .await
+                .is_err()
+        );
+        client
+            .delete(
+                format!("{}/merge-progress/{}", coordinator.prefix, running.id),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), watch.next_update())
+                .await
+                .unwrap()
+                .unwrap(),
+            ExecutionUpdate::Refresh
+        );
+        assert!(coordinator.finish(&running, Ok(4)).await.unwrap());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), watch.next_update())
+                .await
+                .unwrap()
+                .unwrap(),
+            ExecutionUpdate::Refresh
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn typed_progress_watch_rejects_malformed_payload() {
+        let (coordinator, mut client, proof, _) = fixture().await;
+        let execution = Execution::new("table", "worker", "boot", 600);
+        assert!(coordinator.reserve(&proof, &execution).await.unwrap());
+        let (_, revision) = coordinator.get_with_revision("table").await.unwrap();
+        let mut watch = coordinator
+            .watch_execution(&execution, revision)
+            .await
+            .unwrap();
+        client
+            .put(
+                format!("{}/merge-progress/{}", coordinator.prefix, execution.id),
+                "malformed",
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), watch.next_update())
+                .await
+                .unwrap()
+                .is_err()
+        );
+        assert_eq!(coordinator.get("table").await.unwrap(), Some(execution));
+    }
+
+    #[tokio::test]
     #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS; compacts test instance"]
     async fn execution_watch_compaction_requires_fresh_snapshot_then_resumes() {
         assert_eq!(

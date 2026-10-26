@@ -4,20 +4,53 @@ use crate::{encode, execution_key, Coordinator, Execution, Phase, Result};
 use etcd_client::{Compare, CompareOp, Txn, TxnOp, TxnOpResponse, WatchOptions, WatchStream};
 
 /// Exact keys on one stream, owned by the waiting execution. Dropping this
-/// value closes the stream; there is no detached task or fleet-wide progress
-/// subscription. Events are hints to reread, never authorization to commit.
-pub struct ExecutionWatch(WatchStream);
+/// value closes the stream; there is no detached task or fleet-wide subscription.
+pub struct ExecutionWatch {
+    stream: WatchStream,
+    progress_key: Option<Vec<u8>>,
+}
+
+/// A progress event is evidence of work by this execution, never authorization
+/// to commit, release ownership, or replace an executor. Ownership changes and
+/// deleted progress require a new authoritative snapshot.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ExecutionUpdate {
+    Progress(u64),
+    Refresh,
+}
 
 impl ExecutionWatch {
     pub async fn changed(&mut self) -> Result<()> {
-        while let Some(response) = self.0.message().await.map_err(|e| e.to_string())? {
+        self.next_update().await.map(|_| ())
+    }
+
+    /// Retain the progress payload instead of turning every notification into
+    /// another pair of execution/progress GETs. The exact execution ID is part
+    /// of the subscribed progress key; callers must ignore non-increasing
+    /// sequences and still bound their ownership/freshness checks independently.
+    pub async fn next_update(&mut self) -> Result<ExecutionUpdate> {
+        while let Some(response) = self.stream.message().await.map_err(|e| e.to_string())? {
             if response.canceled() {
                 return Err(
                     "execution watch canceled; refresh snapshot before resubscribing".into(),
                 );
             }
-            if !response.events().is_empty() {
-                return Ok(());
+            let mut progress = None;
+            for event in response.events() {
+                let kv = event.kv().ok_or("execution watch event missing value")?;
+                if self.progress_key.as_deref() != Some(kv.key())
+                    || event.event_type() != etcd_client::EventType::Put
+                {
+                    return Ok(ExecutionUpdate::Refresh);
+                }
+                let current: ExecutionProgress =
+                    serde_json::from_slice(kv.value()).map_err(|e| e.to_string())?;
+                progress = Some(
+                    progress.map_or(current.sequence, |prior: u64| prior.max(current.sequence)),
+                );
+            }
+            if let Some(sequence) = progress {
+                return Ok(ExecutionUpdate::Progress(sequence));
             }
         }
         Err("execution watch ended".into())
@@ -154,7 +187,10 @@ impl Coordinator {
             )
             .await
             .map_err(|e| e.to_string())?;
-        Ok(ExecutionWatch(stream))
+        Ok(ExecutionWatch {
+            stream,
+            progress_key: None,
+        })
     }
 
     /// Replay changes after the authoritative execution read, including changes
@@ -182,7 +218,10 @@ impl Coordinator {
             .watch(self.progress_key(execution), Some(options))
             .await
             .map_err(|e| e.to_string())?;
-        Ok(ExecutionWatch(stream))
+        Ok(ExecutionWatch {
+            stream,
+            progress_key: Some(self.progress_key(execution).into_bytes()),
+        })
     }
 
     pub fn work_progress_publisher(&self, execution: &Execution) -> WorkProgressPublisher {

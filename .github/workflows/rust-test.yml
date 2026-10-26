@@ -235,6 +235,7 @@ jobs:
         run: |
           cargo test -p lance-context-master -p lance-context-server -p lance-context-merge -- --ignored \
             --skip quiet_execution_bounds_etcd_reads_without_delaying_completion \
+            --skip progressing_execution_consumes_watch_without_repeated_reads \
             --skip recovery_enqueue_rechecks_execution_after_dedupe_snapshot \
             --skip active_execution_inventory_bounds_duplicate_reads \
             --skip demand_controller::tests::one_ten_fifty_followers_do_not_multiply_discovery_reads_and_take_over \
@@ -279,6 +280,9 @@ jobs:
             -- --exact --ignored --test-threads=1
           cargo test -p lance-context-master --lib \
             merge_execution::tests::quiet_execution_bounds_etcd_reads_without_delaying_completion \
+            -- --exact --ignored --test-threads=1
+          cargo test -p lance-context-master --lib \
+            merge_execution::tests::progressing_execution_consumes_watch_without_repeated_reads \
             -- --exact --ignored --test-threads=1
           cargo test -p lance-context-master --lib \
             task_store::tests::recovery_enqueue_rechecks_execution_after_dedupe_snapshot \
@@ -388,6 +392,7 @@ jobs:
           cargo llvm-cov --no-report --all-features \
             -p lance-context-master -p lance-context-server -p lance-context-merge -- --ignored \
             --skip quiet_execution_bounds_etcd_reads_without_delaying_completion \
+            --skip progressing_execution_consumes_watch_without_repeated_reads \
             --skip recovery_enqueue_rechecks_execution_after_dedupe_snapshot \
             --skip active_execution_inventory_bounds_duplicate_reads \
             --skip demand_controller::tests::one_ten_fifty_followers_do_not_multiply_discovery_reads_and_take_over \
@@ -428,6 +433,9 @@ jobs:
             --exact --ignored --test-threads=1
           cargo llvm-cov --no-report --all-features -p lance-context-master --lib -- \
             merge_execution::tests::quiet_execution_bounds_etcd_reads_without_delaying_completion \
+            --exact --ignored --test-threads=1
+          cargo llvm-cov --no-report --all-features -p lance-context-master --lib -- \
+            merge_execution::tests::progressing_execution_consumes_watch_without_repeated_reads \
             --exact --ignored --test-threads=1
           cargo llvm-cov --no-report --all-features -p lance-context-master --lib -- \
             task_store::tests::recovery_enqueue_rechecks_execution_after_dedupe_snapshot \

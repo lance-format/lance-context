@@ -1158,25 +1158,56 @@ async fn reconcile_with_grace(
                 }
             }
         }
-        let now = tokio::time::Instant::now();
-        let mut wake = (now + WATCH_REFRESH).min(next_probe);
-        if let Some(started) = cancel_started {
-            wake = wake.min(started + grace).min(next_cancel);
-        } else {
-            wake = wake.min(deadlines.next_check());
-        }
-        match tokio::time::timeout_at(wake, changes.as_mut().unwrap().changed()).await {
-            Ok(Ok(())) => {
-                metrics::counter!("master_merge_execution_watch_notifications_total").increment(1);
-                // Coalesce bursts without exceeding the old observation rate.
-                tokio::time::sleep(POLL_DELAY).await;
+        // Progress already contains the sequence. Consume it locally instead
+        // of rereading two etcd keys for each notification. Fix the freshness
+        // boundary before entering the loop: continuous work must not postpone
+        // an owner probe, cancellation, or the next authoritative snapshot.
+        let refresh = tokio::time::Instant::now() + WATCH_REFRESH;
+        loop {
+            let mut wake = refresh.min(next_probe);
+            if let Some(started) = cancel_started {
+                wake = wake.min(started + grace).min(next_cancel);
+            } else {
+                wake = wake.min(deadlines.next_check());
             }
-            Ok(Err(_)) => {
-                metrics::counter!("master_merge_execution_watch_errors_total").increment(1);
-                changes = None;
-                tokio::time::sleep(RETRY_DELAY).await;
+            // An always-ready stream must not win over an expired timer.
+            if tokio::time::Instant::now() >= wake {
+                break;
             }
-            Err(_) => {} // bounded freshness/owner/deadline check, not progress
+            match tokio::time::timeout_at(wake, changes.as_mut().unwrap().next_update()).await {
+                Ok(Ok(update)) => {
+                    metrics::counter!("master_merge_execution_watch_notifications_total")
+                        .increment(1);
+                    match update {
+                        lance_context_merge::progress::ExecutionUpdate::Progress(sequence)
+                            if cancel_started.is_none() && current.phase == Phase::Running =>
+                        {
+                            if deadlines
+                                .sequence
+                                .is_none_or(|previous| sequence > previous)
+                            {
+                                failed_probes = 0;
+                            }
+                            deadlines.observe(sequence, tokio::time::Instant::now());
+                            metrics::counter!("master_merge_execution_watch_progress_total")
+                                .increment(1);
+                        }
+                        _ => {
+                            // Ownership changes, reserved work, and cancellation
+                            // still take the authoritative reconciliation path.
+                            tokio::time::sleep(POLL_DELAY).await;
+                            break;
+                        }
+                    }
+                }
+                Ok(Err(_)) => {
+                    metrics::counter!("master_merge_execution_watch_errors_total").increment(1);
+                    changes = None;
+                    tokio::time::sleep(RETRY_DELAY).await;
+                    break;
+                }
+                Err(_) => break, // freshness/owner/deadline check, not progress
+            }
         }
     }
 }
@@ -1203,6 +1234,8 @@ mod tests {
         // Receiving the same progress repeatedly is only a heartbeat.
         let stalled = started + Duration::from_secs(1131);
         deadlines.observe(10, stalled);
+        assert!(deadlines.expired(stalled));
+        deadlines.observe(9, stalled); // A replayed older Watch event is not work.
         assert!(deadlines.expired(stalled));
         // Real progress continues beyond the legacy total runtime ceiling.
         deadlines.observe(11, started + Duration::from_secs(1811));
@@ -1481,6 +1514,123 @@ mod tests {
                 .unwrap(),
             11
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires exclusive isolated ETCD_TEST_ENDPOINTS and ETCD_TEST_EXCLUSIVE=1"]
+    async fn progressing_execution_consumes_watch_without_repeated_reads() {
+        assert_eq!(std::env::var("ETCD_TEST_EXCLUSIVE").as_deref(), Ok("1"));
+        let (coordinator, proof) = fixture().await;
+        let probes = Arc::new(AtomicUsize::new(0));
+        let count = probes.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/api/v1/internal/merge-executor",
+                    get(move || {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        async { Json(serde_json::json!({"instance":"test"})) }
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let execution = Execution::new("table", &endpoint, "test", 600);
+        assert!(coordinator.reserve(&proof, &execution).await.unwrap());
+        let running = coordinator.start(&execution).await.unwrap().unwrap();
+        assert!(coordinator.publish_progress(&running, 0).await.unwrap());
+        let http = reqwest::Client::new();
+        async fn ranges(http: &reqwest::Client) -> f64 {
+            let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+            let metrics = http
+                .get(format!("{endpoint}/metrics"))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            let values: Vec<f64> = metrics
+                .lines()
+                .filter(|line| {
+                    line.starts_with("grpc_server_started_total{")
+                        && line.contains("grpc_method=\"Range\"")
+                })
+                .map(|line| line.split_whitespace().last().unwrap().parse().unwrap())
+                .collect();
+            assert!(!values.is_empty());
+            values.iter().sum()
+        }
+        let before = ranges(&http).await;
+        let observer = coordinator.clone();
+        let client = http.clone();
+        let waiter =
+            tokio::spawn(
+                async move { reconcile(&client, &observer, &proof, execution, false).await },
+            );
+        // Cross the fixed 10s owner check while delivering sustained progress.
+        // Publications use Txn, so this measures the observer's actual GETs.
+        for sequence in 1..=120 {
+            assert!(coordinator
+                .publish_progress(&running, sequence)
+                .await
+                .unwrap());
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let reads = ranges(&http).await - before;
+        let owner_checks = probes.load(Ordering::SeqCst);
+        assert!(coordinator.finish(&running, Ok(17)).await.unwrap());
+        let terminal = tokio::time::timeout(Duration::from_secs(2), waiter).await;
+        server.abort();
+        let _ = server.await;
+        eprintln!("120 progress publications: {reads} Range RPCs; {owner_checks} owner checks");
+        assert_eq!(terminal.unwrap().unwrap().unwrap(), 17);
+        assert!(owner_checks > 0, "progress starved the owner probe");
+        assert!(reads <= 8.0, "progress notifications caused {reads} GETs");
+        assert!(coordinator.get("table").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn repeated_watch_sequence_does_not_hide_stalled_execution() {
+        let (coordinator, proof) = fixture().await;
+        let mut execution = Execution::new("table", "http://127.0.0.1:1", "test", 600);
+        execution.idle_timeout_secs = 1;
+        assert!(coordinator.reserve(&proof, &execution).await.unwrap());
+        let running = coordinator.start(&execution).await.unwrap().unwrap();
+        assert!(coordinator.publish_progress(&running, 7).await.unwrap());
+        let writer = coordinator.clone();
+        let active = running.clone();
+        let publisher = tokio::spawn(async move {
+            loop {
+                assert!(writer.publish_progress(&active, 7).await.unwrap());
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(18),
+            reconcile_with_grace(
+                &reqwest::Client::new(),
+                &coordinator,
+                &proof,
+                execution,
+                false,
+                Duration::from_secs(2),
+            ),
+        )
+        .await;
+        publisher.abort();
+        let _ = publisher.await;
+        assert!(outcome
+            .unwrap()
+            .unwrap_err()
+            .contains("did not acknowledge termination"));
+        // Failed observation is never permission to remove a surviving writer.
+        assert_eq!(coordinator.get("table").await.unwrap(), Some(running));
     }
 
     #[tokio::test]
