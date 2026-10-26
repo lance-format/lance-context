@@ -37,7 +37,12 @@ const WORKER_PROTOCOL_UNSUPPORTED: &str = "worker lacks bounded owned-merge prot
 
 enum WorkerRetry {
     Deferred(String),
-    Eligible(Option<Capabilities>),
+    Eligible {
+        capabilities: Option<Capabilities>,
+        // Reuse only an observation made without an intervening capability
+        // request. A reprobe may overlap an administrative failure reset.
+        failures_before: Option<u32>,
+    },
 }
 
 fn validate_capabilities(capabilities: &Capabilities, target: &str) -> Result<(), String> {
@@ -65,10 +70,16 @@ async fn worker_retry(
 ) -> Result<WorkerRetry, String> {
     use lance_context_merge::failure::FailureClass;
     let Some(failure) = coordinator.failure(target, endpoint).await? else {
-        return Ok(WorkerRetry::Eligible(None));
+        return Ok(WorkerRetry::Eligible {
+            capabilities: None,
+            failures_before: Some(0),
+        });
     };
     if failure.next_retry_ms <= lance_context_merge::failure::now_ms() {
-        return Ok(WorkerRetry::Eligible(None));
+        return Ok(WorkerRetry::Eligible {
+            capabilities: None,
+            failures_before: Some(failure.consecutive_attempts),
+        });
     }
     let admission_failure = (failure.class == FailureClass::DataOrConfiguration
         && failure.last_error == WORKER_PROTOCOL_UNSUPPORTED)
@@ -83,7 +94,10 @@ async fn worker_retry(
             tokio::time::timeout(OWNER_PROBE_TIMEOUT, capabilities(http, endpoint)).await
         {
             if validate_capabilities(&caps, target).is_ok() {
-                return Ok(WorkerRetry::Eligible(Some(caps)));
+                return Ok(WorkerRetry::Eligible {
+                    capabilities: Some(caps),
+                    failures_before: None,
+                });
             }
         }
     }
@@ -358,7 +372,10 @@ impl LegacyOwnership<'_> {
                 worker_retry(http, coordinator, target, endpoint).await
             }
             #[cfg(test)]
-            Self::HttpTest => Ok(WorkerRetry::Eligible(None)),
+            Self::HttpTest => Ok(WorkerRetry::Eligible {
+                capabilities: None,
+                failures_before: None,
+            }),
         }
     }
 
@@ -443,7 +460,7 @@ async fn run_legacy_workers_admitted(
                 unavailable.push(deferred);
                 continue;
             }
-            WorkerRetry::Eligible(caps) => caps,
+            WorkerRetry::Eligible { capabilities, .. } => capabilities,
         };
         let started = std::time::Instant::now();
         match ownership
@@ -829,21 +846,28 @@ async fn run_workers_admitted(
             errors.retain(|(failed, _): &(String, String)| failed != &endpoint);
             // Probe at this worker's turn, not before earlier workers run:
             // their merges may take long enough for its identity to change.
-            let reprobed = if attempt == 0 {
+            let (reprobed, observed_failures) = if attempt == 0 {
                 match worker_retry(http, coordinator, target, &endpoint).await? {
                     WorkerRetry::Deferred(message) => {
                         deferred.push(message);
                         continue;
                     }
-                    WorkerRetry::Eligible(caps) => caps,
+                    WorkerRetry::Eligible {
+                        capabilities,
+                        failures_before,
+                    } => (capabilities, failures_before),
                 }
             } else {
-                None
+                (None, None)
             };
-            let failures_before = coordinator
-                .failure(target, &endpoint)
-                .await?
-                .map_or(0, |failure| failure.consecutive_attempts);
+            let failures_before = match observed_failures {
+                Some(count) => count,
+                // Later attempts and capability reprobes need a fresh baseline.
+                None => coordinator
+                    .failure(target, &endpoint)
+                    .await?
+                    .map_or(0, |failure| failure.consecutive_attempts),
+            };
             let started = std::time::Instant::now();
             let outcome = match reprobed {
                 Some(caps) => {
@@ -1273,12 +1297,35 @@ mod tests {
         events: Arc<Mutex<Vec<String>>>,
     }
 
+    #[derive(Default)]
+    struct CapabilityGate {
+        entered: tokio::sync::Notify,
+        proceed: tokio::sync::Notify,
+        calls: AtomicUsize,
+    }
+
     async fn worker(worker: Worker) -> (String, tokio::task::JoinHandle<()>) {
+        worker_with_capability_gate(worker, None).await
+    }
+
+    async fn worker_with_capability_gate(
+        worker: Worker,
+        gate: Option<Arc<CapabilityGate>>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
         let app = Router::new()
             .route(
                 "/api/v1/internal/merge-executor",
-                get(|| async {
+                get(move || {
+                    let gate = gate.clone();
+                    async move {
+                    if let Some(gate) = gate {
+                        if gate.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            gate.entered.notify_one();
+                            gate.proceed.notified().await;
+                        }
+                    }
                     Json(serde_json::json!({"protocol":2,"instance":"test","timeout_secs":1,"queue_timeout_secs":1,"idle_timeout_secs":1,"progress_protocol":1,"owned_targets":["table"]}))
+                    }
                 }),
             )
             .route(
@@ -1324,6 +1371,187 @@ mod tests {
                 axum::serve(listener, app).await.unwrap();
             }),
         )
+    }
+
+    #[tokio::test]
+    #[ignore = "requires exclusive isolated ETCD_TEST_ENDPOINTS and ETCD_TEST_EXCLUSIVE=1"]
+    async fn first_worker_turn_reuses_failure_read() {
+        assert_eq!(std::env::var("ETCD_TEST_EXCLUSIVE").as_deref(), Ok("1"));
+        async fn ranges(http: &reqwest::Client) -> f64 {
+            let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+            let body = http
+                .get(format!("{endpoint}/metrics"))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            let samples: Vec<f64> = body
+                .lines()
+                .filter(|line| {
+                    line.starts_with("grpc_server_started_total{")
+                        && line.contains("grpc_method=\"Range\"")
+                })
+                .map(|line| line.split_whitespace().last().unwrap().parse().unwrap())
+                .collect();
+            assert!(!samples.is_empty(), "etcd Range counter required");
+            samples.iter().sum()
+        }
+        for (previous_attempts, fail) in [(0, false), (2, false), (2, true)] {
+            let (coordinator, proof) = fixture().await;
+            let executor = Worker {
+                coordinator: coordinator.clone(),
+                calls: Arc::new(AtomicUsize::new(0)),
+                fail,
+                stall_first: false,
+                name: "first-turn",
+                events: Arc::new(Mutex::new(Vec::new())),
+            };
+            let gate = Arc::new(CapabilityGate::default());
+            let (endpoint, server) =
+                worker_with_capability_gate(executor.clone(), Some(gate.clone())).await;
+            for _ in 0..previous_attempts {
+                coordinator
+                    .record_failure(&proof, "table", &endpoint, "storage timeout")
+                    .await
+                    .unwrap();
+            }
+            if let Some(mut failure) = coordinator.failure("table", &endpoint).await.unwrap() {
+                // Make the persisted retry eligible without a wall-clock wait.
+                failure.next_retry_ms = 0;
+                let mut client = etcd_client::Client::connect(
+                    [std::env::var("ETCD_TEST_ENDPOINTS").unwrap()],
+                    None,
+                )
+                .await
+                .unwrap();
+                let key = lance_context_merge::failure::failure_key(
+                    proof.key.strip_suffix("/claim").unwrap(),
+                    "table",
+                    &endpoint,
+                );
+                client
+                    .put(key, serde_json::to_vec(&failure).unwrap(), None)
+                    .await
+                    .unwrap();
+            }
+            let http = reqwest::Client::new();
+            let before = ranges(&http).await;
+            let task = tokio::spawn({
+                let coordinator = coordinator.clone();
+                let proof = proof.clone();
+                let endpoint = endpoint.clone();
+                async move { run_workers(&http, &coordinator, &proof, "table", &[endpoint]).await }
+            });
+            tokio::time::timeout(Duration::from_secs(3), gate.entered.notified())
+                .await
+                .unwrap();
+            // The capability GET is blocked: reservation, execution and finish
+            // RPCs cannot contaminate the first-turn failure lookup count.
+            let reads = ranges(&reqwest::Client::new()).await - before;
+            gate.proceed.notify_one();
+            let result = tokio::time::timeout(Duration::from_secs(10), task)
+                .await
+                .unwrap()
+                .unwrap();
+            server.abort();
+            let _ = server.await;
+            assert_eq!(
+                reads, 1.0,
+                "previous_attempts={previous_attempts}, fail={fail}"
+            );
+            assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(result.is_err(), fail, "{result:?}");
+            let after = coordinator.failure("table", &endpoint).await.unwrap();
+            if fail {
+                assert_eq!(
+                    after.unwrap().consecutive_attempts,
+                    3,
+                    "count the executed failure once"
+                );
+            } else {
+                assert!(after.is_none());
+            }
+            assert!(coordinator.get("table").await.unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn capability_reprobe_refreshes_failure_baseline_after_reset() {
+        for replacement_attempts in [0, 2] {
+            let (coordinator, proof) = fixture().await;
+            let executor = Worker {
+                coordinator: coordinator.clone(),
+                calls: Arc::new(AtomicUsize::new(0)),
+                fail: true,
+                stall_first: false,
+                name: "reprobe-reset",
+                events: Arc::new(Mutex::new(Vec::new())),
+            };
+            let gate = Arc::new(CapabilityGate::default());
+            let (endpoint, server) =
+                worker_with_capability_gate(executor.clone(), Some(gate.clone())).await;
+            for _ in 0..15 {
+                coordinator
+                    .record_failure(&proof, "table", &endpoint, WORKER_ADMISSION_PENDING)
+                    .await
+                    .unwrap();
+            }
+            let task = tokio::spawn({
+                let coordinator = coordinator.clone();
+                let proof = proof.clone();
+                let endpoint = endpoint.clone();
+                async move {
+                    run_workers(
+                        &reqwest::Client::new(),
+                        &coordinator,
+                        &proof,
+                        "table",
+                        &[endpoint],
+                    )
+                    .await
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(3), gate.entered.notified())
+                .await
+                .unwrap();
+            // The old admission error triggered a capability reprobe. Reset or
+            // replace its history while that HTTP request is still in flight.
+            coordinator
+                .clear_failure(&proof, "table", &endpoint)
+                .await
+                .unwrap();
+            for _ in 0..replacement_attempts {
+                coordinator
+                    .record_failure(&proof, "table", &endpoint, WORKER_ADMISSION_PENDING)
+                    .await
+                    .unwrap();
+            }
+            gate.proceed.notify_one();
+            let result = tokio::time::timeout(Duration::from_secs(15), task)
+                .await
+                .unwrap()
+                .unwrap();
+            server.abort();
+            let _ = server.await;
+            assert!(result.is_err());
+            assert_eq!(
+                executor.calls.load(Ordering::SeqCst),
+                3 - replacement_attempts
+            );
+            assert_eq!(
+                coordinator
+                    .failure("table", &endpoint)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .consecutive_attempts,
+                3
+            );
+            assert!(coordinator.get("table").await.unwrap().is_none());
+        }
     }
 
     #[tokio::test]

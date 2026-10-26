@@ -234,6 +234,7 @@ jobs:
           ETCD_TEST_ENDPOINTS: http://127.0.0.1:2379
         run: |
           cargo test -p lance-context-master -p lance-context-server -p lance-context-merge -- --ignored \
+            --skip first_worker_turn_reuses_failure_read \
             --skip quiet_execution_bounds_etcd_reads_without_delaying_completion \
             --skip progressing_execution_consumes_watch_without_repeated_reads \
             --skip recovery_enqueue_rechecks_execution_after_dedupe_snapshot \
@@ -277,6 +278,9 @@ jobs:
             -- --exact --ignored --test-threads=1
           cargo test -p lance-context-server --bin lance-context-server \
             merge_execution::tests::ownership_observer_does_not_poll_or_wake_on_own_progress \
+            -- --exact --ignored --test-threads=1
+          cargo test -p lance-context-master --lib \
+            merge_execution::tests::first_worker_turn_reuses_failure_read \
             -- --exact --ignored --test-threads=1
           cargo test -p lance-context-master --lib \
             merge_execution::tests::quiet_execution_bounds_etcd_reads_without_delaying_completion \
@@ -391,6 +395,7 @@ jobs:
         run: |
           cargo llvm-cov --no-report --all-features \
             -p lance-context-master -p lance-context-server -p lance-context-merge -- --ignored \
+            --skip first_worker_turn_reuses_failure_read \
             --skip quiet_execution_bounds_etcd_reads_without_delaying_completion \
             --skip progressing_execution_consumes_watch_without_repeated_reads \
             --skip recovery_enqueue_rechecks_execution_after_dedupe_snapshot \
@@ -430,6 +435,9 @@ jobs:
             --exact --ignored --test-threads=1
           cargo llvm-cov --no-report --all-features -p lance-context-server --bin lance-context-server -- \
             merge_execution::tests::ownership_observer_does_not_poll_or_wake_on_own_progress \
+            --exact --ignored --test-threads=1
+          cargo llvm-cov --no-report --all-features -p lance-context-master --lib -- \
+            merge_execution::tests::first_worker_turn_reuses_failure_read \
             --exact --ignored --test-threads=1
           cargo llvm-cov --no-report --all-features -p lance-context-master --lib -- \
             merge_execution::tests::quiet_execution_bounds_etcd_reads_without_delaying_completion \
