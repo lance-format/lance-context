@@ -33,6 +33,9 @@ pub(crate) use diagnostic::AdmissionExplanation;
 mod maintenance_watch;
 pub(crate) use maintenance_watch::MaintenanceChange;
 
+#[path = "preparation_watch.rs"]
+mod preparation_watch;
+
 const TASK_POLL_BATCH: usize = 256;
 const SCHEDULER_CLAIM_MAX_CANDIDATES: usize = 64;
 const SCHEDULER_CLAIM_MAX_PAGES: usize = 4;
@@ -344,6 +347,7 @@ impl TaskStore {
         Ok(values[0].is_some())
     }
 
+    #[cfg(test)]
     pub(crate) async fn preparation_owned(&self, claim: &TaskClaim) -> lance::Result<bool> {
         let Some(key) = &claim.backend.preparation_key else {
             return Ok(false);
@@ -4487,6 +4491,57 @@ pub(crate) mod tests {
         cfg.maintenance.wal_claim_targets = targets;
         let store = TaskStore::open(&cfg).await.unwrap();
         (dir, store)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback ETCD_TEST_ENDPOINTS"]
+    async fn preparation_owner_stream_recovers_transport_without_trusting_old_claim() {
+        let (_dir, mut cfg, _) = preparation_test_store().await;
+        let upstream = cfg.etcd.etcd_endpoints[0].clone();
+        let proxy = LeaseTestProxy::start(&upstream).await;
+        let mut direct = Client::connect([upstream], None).await.unwrap();
+        cfg.etcd.etcd_endpoints = vec![proxy.endpoint.clone()];
+        cfg.etcd_lease_ttl_secs = 30;
+        let store = TaskStore::open(&cfg).await.unwrap();
+        store
+            .enqueue(TaskKind::Compact, "hot", vec![])
+            .await
+            .unwrap();
+        let claim = store
+            .claim_next_of_kinds(TaskKinds::COMPACT)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut observer = store.preparation_observer(&claim).unwrap();
+        assert!(observer.observe().await.unwrap());
+        proxy.online.send(false).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), observer.observe())
+                .await
+                .unwrap()
+                .is_err()
+        );
+        proxy.online.send(true).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), observer.observe())
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        direct
+            .delete(claim.backend.preparation_key.clone().unwrap(), None)
+            .await
+            .unwrap();
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(2), observer.observe())
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        store
+            .finish(claim, Err("test ownership revoked".into()))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

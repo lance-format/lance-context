@@ -432,10 +432,17 @@ async fn watch_maintenance_preparation(
     claim: &TaskClaim,
     scope: &lance_context_core::merge_write_scope::MergeWriteScope,
 ) -> String {
+    let observer = match state.task_store.preparation_observer(claim) {
+        Ok(observer) => Arc::new(tokio::sync::Mutex::new(observer)),
+        Err(error) => return error.to_string(),
+    };
     watch_preparation_ownership(
         scope,
         Duration::from_secs(state.config.maintenance.maintenance_idle_timeout_secs),
-        || state.task_store.preparation_owned(claim),
+        || {
+            let observer = observer.clone();
+            async move { observer.lock().await.observe().await }
+        },
     )
     .await
 }
@@ -458,9 +465,31 @@ where
     }
     let mut changed = std::time::Instant::now();
     let mut read_failed = false;
+    let mut samples = tokio::time::interval(Duration::from_secs(2));
+    samples.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::time::sleep(Duration::from_secs(2)).await;
-        let ownership = probe().await;
+        let observation = probe();
+        tokio::pin!(observation);
+        let ownership = loop {
+            // A quiet Watch or slow snapshot must not block local progress
+            // observation, and a busy stream must not starve the idle check.
+            tokio::select! {
+                biased;
+                _ = samples.tick() => {
+                    let current = scope.completed_steps();
+                    if current > sequence {
+                        crate::merge_capacity::observed_work();
+                        changed = std::time::Instant::now();
+                        sequence = current;
+                    }
+                    if changed.elapsed() >= idle_budget {
+                        return "maintenance preparation made no progress".into();
+                    }
+                }
+                result = &mut observation => break result,
+            }
+        };
         let current = scope.completed_steps();
         if current > sequence {
             crate::merge_capacity::observed_work();
@@ -6780,6 +6809,45 @@ mod tests {
 mod preparation_ownership_tests {
     use super::*;
     use lance_context_core::merge_write_scope::{checkpoint, MergeWriteScope};
+
+    #[tokio::test]
+    async fn quiet_ownership_watch_does_not_hide_idle_preparation() {
+        let scope = MergeWriteScope::new();
+        let result = tokio::time::timeout(
+            Duration::from_secs(7),
+            watch_preparation_ownership(&scope, Duration::from_secs(3), || {
+                std::future::pending::<lance::Result<bool>>()
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(result.contains("made no progress"), "{result}");
+    }
+
+    #[tokio::test]
+    async fn quiet_ownership_watch_keeps_observing_real_local_progress() {
+        let scope = MergeWriteScope::new();
+        let watch = watch_preparation_ownership(&scope, Duration::from_secs(3), || async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            Ok(false)
+        });
+        let work = async {
+            loop {
+                scope.run(async { checkpoint() }).await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
+        let result = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                result = watch => result,
+                () = work => unreachable!(),
+            }
+        })
+        .await
+        .unwrap();
+        assert!(result.contains("claim lost"), "{result}");
+        assert!(scope.completed_steps() > 10);
+    }
 
     #[tokio::test]
     async fn preparation_read_retry_is_bounded_and_lease_loss_is_terminal() {
