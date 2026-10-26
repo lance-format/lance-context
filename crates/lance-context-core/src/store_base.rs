@@ -1503,7 +1503,7 @@ impl StorageBase {
         bulk_key_delete: bool,
         parallel_upsert_io: bool,
     ) -> LanceResult<()> {
-        use lance::dataset::{transaction::Operation, CommitBuilder, MergeInsertBuilder};
+        use lance::dataset::{transaction::Operation, CommitBuilder};
 
         if parallel_upsert_io
             && self.dataset.manifest().data_storage_format.version
@@ -1513,11 +1513,8 @@ impl StorageBase {
                 "parallel upsert IO requires Lance V2 files",
             ));
         }
-        let key_index = merge_schema.index_of(&self.key_column)?;
-        let keys = batches
-            .iter()
-            .map(|batch| batch.project(&[key_index]))
-            .collect::<Result<Vec<_>, _>>()?;
+        merge_schema.index_of(&self.key_column)?;
+        let delete_batches = batches.clone();
         let snapshot = Arc::new(self.dataset.clone());
         let schema = self.dataset.schema().clone();
         let initial_coverage = crate::rollout_append::watermarks(&self.dataset)
@@ -1526,19 +1523,19 @@ impl StorageBase {
             .copied();
         let key_column = self.key_column.clone();
         let delete = |snapshot| {
-            let keys = keys.clone();
+            let batches = delete_batches.clone();
             let key_column = key_column.clone();
             async move {
-                // Delete-only projects keys/row IDs, never old blob values. The
-                // existing bulk choice controls index use, not commit atomicity.
-                let job = MergeInsertBuilder::try_new(snapshot, vec![key_column])?
-                    .when_matched(lance::dataset::WhenMatched::Delete)
-                    .when_not_matched(lance::dataset::WhenNotMatched::DoNothing)
-                    .use_index(!bulk_key_delete)
-                    .conflict_retries(0)
-                    .commit_retries(0)
-                    .try_build()?;
-                observe_phase!("delete_keys", job.execute_uncommitted_batches(keys).await)
+                observe_phase!(
+                    "delete_keys",
+                    crate::wal_key_delete::prepare(
+                        snapshot,
+                        &batches,
+                        &key_column,
+                        bulk_key_delete
+                    )
+                    .await
+                )
             }
         };
         let deleting = delete(snapshot.clone());

@@ -111,3 +111,5 @@ pub use lance::Error as LanceError;
 pub use lance::session::Session;
 
 pub use store_base::{PreparedCompaction, PreparedKeyIndex};
+
+mod wal_key_delete;
