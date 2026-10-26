@@ -41,6 +41,21 @@ fn metrics() -> BTreeMap<String, f64> {
 
 fn phase(rows: &mut Vec<Value>, name: &str, before: BTreeMap<String, f64>, extra: Value) {
     let after = metrics();
+    let expected_txns = match name {
+        "serial_base_100" | "serial_shard_100" => Some(100.),
+        "concurrent_200" => Some(200.),
+        _ => None,
+    };
+    if let Some(expected) = expected_txns {
+        assert_eq!(
+            after["Range"] - before.get("Range").copied().unwrap_or(0.),
+            0.
+        );
+        assert_eq!(
+            after["Txn"] - before.get("Txn").copied().unwrap_or(0.),
+            expected
+        );
+    }
     let delta: BTreeMap<_, _> = after
         .iter()
         .map(|(k, v)| (k, v - before.get(k).unwrap_or(&0.)))
