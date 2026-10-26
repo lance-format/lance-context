@@ -1423,6 +1423,8 @@ async fn enqueue_buffered_merge_request(
 /// the process. Aborting the returned handle therefore stops general dispatch,
 /// not every scheduler task -- adequate for tests, which drop the whole
 /// `MasterState` immediately after.
+/// If no general-pool kinds are enabled, the returned handle is already done;
+/// the independent WAL and resident pools still run when enabled.
 pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
     crate::wal_tail::spawn(state);
     crate::resident_recovery::spawn(state);
@@ -1460,18 +1462,22 @@ pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
     // free compaction slot reaches past any number of queued MergeWal tasks.
     // Each pool scans keys in order within a finite sweep. Blocked candidates
     // are revisited next sweep; new arrivals cannot extend a sweep forever.
-    let general = spawn_pool_poller(
-        state.clone(),
-        sem.clone(),
-        if !claim_merges || merge_sem.is_some() {
-            TaskKinds::GENERAL
-        } else {
-            // No separate merge budget: the general pool runs everything, so it
-            // must still be allowed to claim MergeWal.
-            TaskKinds::ANY
-        },
-        true,
-    );
+    let general_kinds = match (
+        state.config.maintenance.claim_maintenance_tasks,
+        claim_merges && merge_sem.is_none(),
+    ) {
+        (true, true) => Some(TaskKinds::ANY),
+        (true, false) => Some(TaskKinds::GENERAL),
+        // Preserve WAL dispatch when it uses the shared concurrency budget.
+        (false, true) => Some(TaskKinds::MERGE_WAL),
+        (false, false) => None,
+    };
+    let general = match general_kinds {
+        Some(kinds) => spawn_pool_poller(state.clone(), sem, kinds, true),
+        // Do not advertise general capacity or take a claim and reject it
+        // afterward. Maintenance stays queued for an enabled peer.
+        None => tokio::spawn(async {}),
+    };
     if let Some(merge) = merge_sem {
         spawn_pool_poller(state.clone(), merge, TaskKinds::MERGE_WAL, false);
     }
@@ -4842,6 +4848,105 @@ mod tests {
             peer.finish(claim, Ok("peer accepted".into()))
                 .await
                 .unwrap();
+        }
+    }
+
+    /// WAL-only masters never take maintenance ownership, including with the
+    /// shared-pool fallback and a separate resident merge lane.
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn disabled_maintenance_claims_preserve_wal_and_peer_admission() {
+        for (merge_concurrency, resident, claim_merges) in [
+            (0, false, true),
+            (2, false, true),
+            (0, true, true),
+            (2, true, true),
+            (2, true, false),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let mut cfg = config(&dir);
+            cfg.maintenance.claim_maintenance_tasks = false;
+            cfg.maintenance.claim_wal_merges = claim_merges;
+            cfg.merge_wal_concurrency = merge_concurrency;
+            if resident {
+                cfg.local_merge.master_local_merge_targets = vec!["exp".into()];
+                cfg.catchup.shards = vec!["writer".into()];
+                cfg.catchup.slice_secs = 2;
+                cfg.catchup.merge_max_bytes = 1024 * 1024;
+            }
+            let state = MasterState::new(cfg).await.unwrap();
+            if resident {
+                let writer = RolloutStore::open_with_options(
+                    &state.rollout_uri("exp"),
+                    lance_context_core::RolloutStoreOptions {
+                        shard_id: Some("writer".into()),
+                        merge_after_generations: Some(0),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+                writer.add(&[rollout_record("row")]).await.unwrap();
+                writer.flush().await.unwrap();
+            }
+            let mut maintenance = Vec::new();
+            for kind in [TaskKind::Compact, TaskKind::IndexId, TaskKind::Repair] {
+                maintenance.push(enqueue(&state, kind, "other").await.unwrap());
+            }
+            let merge = enqueue(&state, TaskKind::MergeWal, "exp").await.unwrap();
+            let scheduler = spawn_scheduler(&state);
+            if claim_merges {
+                let terminal = await_terminal(&state, &merge.id).await;
+                if resident {
+                    assert_eq!(terminal.state, TaskState::Done, "{terminal:?}");
+                    assert!(terminal.detail.unwrap().contains("reclaimed 1 generations"));
+                    assert_eq!(
+                        lance::Dataset::open(&state.rollout_uri("exp"))
+                            .await
+                            .unwrap()
+                            .count_rows(None)
+                            .await
+                            .unwrap(),
+                        1
+                    );
+                } else {
+                    assert_eq!(terminal.state, TaskState::Failed);
+                    assert!(terminal.error.unwrap().contains("worker endpoints"));
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            state.admission.begin_drain();
+            tokio::time::timeout(Duration::from_secs(10), state.admission.wait_drained())
+                .await
+                .unwrap();
+            scheduler.abort();
+            let _ = scheduler.await;
+            for task in &maintenance {
+                let queued = state.task_store.get(&task.id).await.unwrap().unwrap();
+                assert_eq!(queued.state, TaskState::Queued, "{queued:?}");
+                assert!(queued.started_at.is_none());
+            }
+            if !claim_merges {
+                let queued = state.task_store.get(&merge.id).await.unwrap().unwrap();
+                assert_eq!(queued.state, TaskState::Queued);
+                assert!(queued.started_at.is_none());
+            }
+            // The switch is local dispatch policy. Every maintenance task is
+            // still claimable by an enabled peer, without a reset or reenqueue.
+            for _ in &maintenance {
+                let claim = state
+                    .task_store
+                    .claim_next_of_kinds(TaskKinds::GENERAL)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(maintenance.iter().any(|task| task.id == claim.task.id));
+                state
+                    .task_store
+                    .finish(claim, Ok("peer accepted".into()))
+                    .await
+                    .unwrap();
+            }
         }
     }
 

@@ -356,6 +356,22 @@ mod tests {
     }
 
     #[test]
+    fn maintenance_claims_can_be_disabled_without_disabling_wal() {
+        let default = MasterConfig::try_parse_from(["master"]).unwrap();
+        assert!(default.maintenance.claim_maintenance_tasks);
+        assert!(MaintenanceConfig::default().claim_maintenance_tasks);
+        let merge_only = MasterConfig::try_parse_from([
+            "master",
+            "--claim-maintenance-tasks=false",
+            "--wal-claim-targets=hot",
+        ])
+        .unwrap();
+        assert!(!merge_only.maintenance.claim_maintenance_tasks);
+        assert!(merge_only.maintenance.claim_wal_merges);
+        assert_eq!(merge_only.maintenance.wal_claim_targets, ["hot"]);
+    }
+
+    #[test]
     fn wal_claim_targets_are_exact_and_do_not_enable_native_ownership() {
         let default = MasterConfig::try_parse_from(["lance-context-master"]).unwrap();
         assert!(default.maintenance.wal_claim_targets.is_empty());
@@ -379,6 +395,12 @@ mod tests {
 /// Admission and progress deadlines for local master table mutations.
 #[derive(Debug, Clone, clap::Args)]
 pub struct MaintenanceConfig {
+    /// Allow this master to claim Compact, IndexId and Repair tasks. Disable
+    /// on WAL-only executors to keep maintenance out of their memory envelope.
+    /// This does not disable WAL claims, enqueueing, recovery or other masters,
+    /// and is not a runtime drain or proof that previous writes have ended.
+    #[arg(long, env = "MASTER_CLAIM_MAINTENANCE_TASKS", default_value_t = true, action = clap::ArgAction::Set)]
+    pub claim_maintenance_tasks: bool,
     /// Allow this master's scheduler to claim queued MergeWal tasks. Set false
     /// for maintenance-only executors; Compact, IndexId and Repair still run.
     /// This is independent of enqueue intervals and concurrency budgets, and
@@ -440,6 +462,7 @@ pub struct MaintenanceConfig {
 impl Default for MaintenanceConfig {
     fn default() -> Self {
         Self {
+            claim_maintenance_tasks: true,
             claim_wal_merges: true,
             wal_claim_targets: Vec::new(),
             fence_legacy_maintenance: false,
