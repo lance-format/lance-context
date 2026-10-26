@@ -1,7 +1,7 @@
 //! Close commit admission before fencing the finite set of already admitted
 //! manifest versions. Lease expiry and process identity are not storage fences.
 use crate::{encode, execution_key, ClaimProof, Coordinator, Execution, Phase, Result};
-use etcd_client::{Compare, CompareOp, TxnOp};
+use etcd_client::{Compare, CompareOp, Txn, TxnOp, TxnOpResponse};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -12,7 +12,127 @@ pub struct CommitWatermarks {
     pub versions: BTreeMap<String, u64>,
 }
 
+#[derive(Default)]
+struct PermitState {
+    revision: i64,
+    watermarks: CommitWatermarks,
+}
+
+/// One publisher per execution scope, shared by its parallel manifest writers.
+/// Only permission updates are serialized; storage I/O remains outside this lock.
+/// Cached watermarks never authorize a write: every call CASes the exact owner.
+pub struct CommitPermitPublisher {
+    coordinator: Coordinator,
+    execution: Execution,
+    dataset_uri: String,
+    state: tokio::sync::Mutex<PermitState>,
+}
+
+impl CommitPermitPublisher {
+    pub async fn authorize(&self, resource: &str, version: u64) -> Result<()> {
+        let running = &self.execution;
+        if running.protocol != 2 || running.phase != Phase::Running {
+            return Err("merge commit requires fencing protocol 2".into());
+        }
+        if resource != "base"
+            && resource
+                .strip_prefix("shard:")
+                .is_none_or(|s| uuid::Uuid::parse_str(s).is_err())
+        {
+            return Err("invalid merge manifest resource".into());
+        }
+        let owner_key = execution_key(&self.coordinator.prefix, &running.target);
+        let permit_key = self.coordinator.permits_key(running);
+        let owner = encode(running);
+        let mut state = self.state.lock().await;
+        for _ in 0..16 {
+            let mut next = state.watermarks.clone();
+            if next
+                .dataset_uri
+                .as_deref()
+                .is_some_and(|uri| uri != self.dataset_uri)
+            {
+                return Err("merge execution cannot write multiple datasets".into());
+            }
+            next.dataset_uri = Some(self.dataset_uri.clone());
+            let watermark = next.versions.entry(resource.into()).or_default();
+            *watermark = (*watermark).max(version);
+            let response = self
+                .coordinator
+                .client
+                .clone()
+                .txn(
+                    Txn::new()
+                        .when(vec![
+                            Compare::value(owner_key.clone(), CompareOp::Equal, owner.clone()),
+                            Compare::mod_revision(
+                                permit_key.clone(),
+                                CompareOp::Equal,
+                                state.revision,
+                            ),
+                        ])
+                        .and_then(vec![TxnOp::put(
+                            permit_key.clone(),
+                            serde_json::to_vec(&next).unwrap(),
+                            None,
+                        )])
+                        .or_else(vec![
+                            TxnOp::get(owner_key.clone(), None),
+                            TxnOp::get(permit_key.clone(), None),
+                        ]),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            if response.succeeded() {
+                // An error or cancellation before this acknowledgement leaves the
+                // old revision intact. The next CAS must reconcile any late write.
+                let revision = response
+                    .header()
+                    .ok_or("commit permit publication missing revision")?
+                    .revision();
+                *state = PermitState {
+                    revision,
+                    watermarks: next,
+                };
+                return Ok(());
+            }
+            let responses = response.op_responses();
+            let [TxnOpResponse::Get(observed_owner), TxnOpResponse::Get(permits)] =
+                responses.as_slice()
+            else {
+                return Err("invalid commit permit publication conflict response".into());
+            };
+            if observed_owner.kvs().first().map(|kv| kv.value()) != Some(owner.as_slice()) {
+                return Err("merge commit ownership revoked for recovery".into());
+            }
+            let previous = permits.kvs().first();
+            let watermarks = previous
+                .map(|kv| serde_json::from_slice(kv.value()).map_err(|e| e.to_string()))
+                .transpose()?
+                .unwrap_or_default();
+            *state = PermitState {
+                revision: previous.map_or(0, |kv| kv.mod_revision()),
+                watermarks,
+            };
+        }
+        Err("merge commit permission contention exceeded limit".into())
+    }
+}
+
 impl Coordinator {
+    pub fn commit_permit_publisher(
+        &self,
+        execution: &Execution,
+        dataset_uri: &str,
+    ) -> CommitPermitPublisher {
+        CommitPermitPublisher {
+            coordinator: self.clone(),
+            execution: execution.clone(),
+            dataset_uri: dataset_uri.into(),
+            state: Default::default(),
+        }
+    }
+
     fn permits_key(&self, execution: &Execution) -> String {
         format!(
             "{}/merge-commit-permits/{}",

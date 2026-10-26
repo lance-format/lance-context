@@ -15,9 +15,8 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::{watch, Mutex, OnceCell};
 
 struct OwnedCommitGuard {
-    coordinator: Coordinator,
+    publisher: lance_context_merge::fencing::CommitPermitPublisher,
     execution: Execution,
-    dataset_uri: String,
 }
 impl std::fmt::Debug for OwnedCommitGuard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -39,8 +38,8 @@ impl lance_context_core::merge_write_scope::CommitAuthorizer for OwnedCommitGuar
         >,
     > {
         Box::pin(async move {
-            self.coordinator
-                .authorize_commit(&self.execution, &self.dataset_uri, resource, version)
+            self.publisher
+                .authorize(resource, version)
                 .await
                 .map_err(lance_context_core::LanceError::io)
         })
@@ -449,9 +448,8 @@ async fn run(
     };
     let write_scope = lance_context_core::merge_write_scope::MergeWriteScope::with_authorizer(
         Arc::new(OwnedCommitGuard {
-            coordinator: coordinator.clone(),
+            publisher: coordinator.commit_permit_publisher(&running, &uri),
             execution: running.clone(),
-            dataset_uri: uri.clone(),
         }),
     );
     // Erase the nested merge future so adding the independent watchdog does

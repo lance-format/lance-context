@@ -229,12 +229,15 @@ jobs:
       # CI already pays to download and start etcd, so restricting this step to a
       # single named test left the other 18 ignored tests — the scheduler,
       # routes, and state etcd paths — completely untested. Run the whole suite.
+      - name: Isolated commit permit contention and response-loss regressions
+        run: python3 scripts/ci/test_commit_permits.py --etcd /tmp/etcd/etcd --output /tmp/commit-permit-rpc
       - name: Run etcd-backed HA test suite
         env:
           ETCD_TEST_ENDPOINTS: http://127.0.0.1:2379
         run: |
           cargo test -p lance-context-master -p lance-context-server -p lance-context-merge -- --ignored \
             --skip first_worker_turn_reuses_failure_read \
+            --skip private_permit_ \
             --skip quiet_execution_bounds_etcd_reads_without_delaying_completion \
             --skip progressing_execution_consumes_watch_without_repeated_reads \
             --skip recovery_enqueue_rechecks_execution_after_dedupe_snapshot \
@@ -396,6 +399,7 @@ jobs:
           cargo llvm-cov --no-report --all-features \
             -p lance-context-master -p lance-context-server -p lance-context-merge -- --ignored \
             --skip first_worker_turn_reuses_failure_read \
+            --skip private_permit_ \
             --skip quiet_execution_bounds_etcd_reads_without_delaying_completion \
             --skip progressing_execution_consumes_watch_without_repeated_reads \
             --skip recovery_enqueue_rechecks_execution_after_dedupe_snapshot \

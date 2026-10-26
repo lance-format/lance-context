@@ -121,9 +121,8 @@ pub(crate) async fn reconcile_previous(
 }
 
 struct Guard {
-    coordinator: Coordinator,
+    publisher: lance_context_merge::fencing::CommitPermitPublisher,
     execution: Execution,
-    uri: String,
 }
 impl std::fmt::Debug for Guard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -139,8 +138,8 @@ impl CommitAuthorizer for Guard {
         version: u64,
     ) -> Pin<Box<dyn Future<Output = lance::Result<()>> + Send + 'a>> {
         Box::pin(async move {
-            self.coordinator
-                .authorize_commit(&self.execution, &self.uri, resource, version)
+            self.publisher
+                .authorize(resource, version)
                 .await
                 .map_err(lance::Error::io)
         })
@@ -412,9 +411,8 @@ where
     // IO as well as logical checkpoints so a long legacy compact/index scan
     // does not look idle merely because Lance has not completed a whole phase.
     let scope = MergeWriteScope::with_preparation_authorizer(Arc::new(Guard {
-        coordinator: coordinator.clone(),
+        publisher: coordinator.commit_permit_publisher(&running, &uri),
         execution: running.clone(),
-        uri: uri.clone(),
     }));
     let executor_id = state.admission.status().executor_id;
     let outcome = std::panic::AssertUnwindSafe(async {
