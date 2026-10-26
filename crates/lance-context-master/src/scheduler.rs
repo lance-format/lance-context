@@ -4859,7 +4859,7 @@ mod tests {
         for (merge_concurrency, resident, claim_merges) in [
             (0, false, true),
             (2, false, true),
-            (0, true, true),
+            (1, true, true),
             (2, true, true),
             (2, true, false),
         ] {
@@ -4870,6 +4870,7 @@ mod tests {
             cfg.merge_wal_concurrency = merge_concurrency;
             if resident {
                 cfg.local_merge.master_local_merge_targets = vec!["exp".into()];
+                cfg.merge_rollout.owned_targets = vec!["exp".into()];
                 cfg.catchup.shards = vec!["writer".into()];
                 cfg.catchup.slice_secs = 2;
                 cfg.catchup.merge_max_bytes = 1024 * 1024;
