@@ -504,11 +504,17 @@ async fn scan_once_inner(
                             .lock()
                             .unwrap()
                             .insert(row.name.clone(), shard_max);
+                        // A positive table must get a publication turn even if
+                        // background zero-WAL observations occupy all slots.
+                        // Also preserve the transition that clears old demand.
+                        let positive_or_clearing = row.pending_wal_generations > 0
+                            || prev.is_some_and(|previous| previous.pending_wal_generations > 0);
                         let result = (row, skipped);
                         operation.observed_table();
                         // Demand reconciliation rides the scan: publish every
-                        // shard's watermark as a scan-sourced event. Detached
-                        // and bounded; the scan never waits on it.
+                        // shard's watermark as a scan-sourced event. Only the
+                        // bounded stream waits for a positive table's fair slot;
+                        // the publisher remains detached and time-bounded.
                         // `entry.name` is already the task target: bare for
                         // rollout, `generic:<name>` for generic stores.
                         let target = entry.name.clone();
@@ -520,7 +526,9 @@ async fn scan_once_inner(
                                 entry.kind,
                                 rollout_options,
                                 generic_options,
-                            );
+                                positive_or_clearing,
+                            )
+                            .await;
                         }
                         (entry.name, Some(result))
                     }
