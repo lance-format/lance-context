@@ -385,6 +385,9 @@ struct MutableBatch<F: FnOnce(Response) + Send> {
     // Queue the batch's backpressure reservation is refunded to once its response
     // is delivered or discarded (see `Response`'s `Drop`).
     io_queue: Arc<IoQueue>,
+    // Retain the submitting operation through every physical IOP and through
+    // response/buffer cleanup, even when its receiving future is discarded.
+    _scope: Option<lance_core::utils::tokio::TaskScopeToken>,
 }
 
 impl<F: FnOnce(Response) + Send> MutableBatch<F> {
@@ -406,6 +409,7 @@ impl<F: FnOnce(Response) + Send> MutableBatch<F> {
             err: None,
             bypass_backpressure,
             io_queue,
+            _scope: lance_core::utils::tokio::retain_task_scope(),
         }
     }
 }

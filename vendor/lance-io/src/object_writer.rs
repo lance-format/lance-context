@@ -368,7 +368,7 @@ impl ObjectWriter {
                             0,
                             mut_self.use_constant_size_upload_parts,
                         );
-                        futures.spawn(Self::put_part(
+                        futures.spawn(lance_core::utils::tokio::scope_task(Self::put_part(
                             upload.as_mut(),
                             data,
                             PartUpload {
@@ -377,7 +377,7 @@ impl ObjectWriter {
                                 parts_in_flight: 1,
                                 part_size,
                             },
-                        ));
+                        )));
 
                         mut_self.state = UploadState::InProgress {
                             part_idx: 1, // We just used 0
@@ -440,9 +440,9 @@ impl Drop for ObjectWriter {
             if let UploadState::InProgress { mut upload, .. } = state
                 && let Ok(handle) = Handle::try_current()
             {
-                handle.spawn(async move {
+                handle.spawn(lance_core::utils::tokio::scope_task(async move {
                     let _ = upload.abort().await;
-                });
+                }));
             }
         }
     }
@@ -509,10 +509,10 @@ impl AsyncWrite for ObjectWriter {
                         parts_in_flight: futures.len() + 1,
                         part_size,
                     };
-                    futures.spawn(
+                    futures.spawn(lance_core::utils::tokio::scope_task(
                         Self::put_part(upload.as_mut(), data, part)
                             .instrument(tracing::Span::current()),
-                    );
+                    ));
                     *part_idx += 1;
                 }
                 _ => {}
@@ -591,10 +591,10 @@ impl AsyncWrite for ObjectWriter {
                         // Counted like every other part so the part total
                         // reported when completing the upload is accurate.
                         *part_idx += 1;
-                        futures.spawn(
+                        futures.spawn(lance_core::utils::tokio::scope_task(
                             Self::put_part(upload.as_mut(), data, part)
                                 .instrument(tracing::Span::current()),
-                        );
+                        ));
                         // We need to go back to beginning of loop to poll the
                         // new feature and get the waker registered on the ctx.
                         continue;
@@ -700,22 +700,23 @@ impl LocalWriter {
         metrics: IoMetricsGuard,
     ) -> Result<WriteResult> {
         let local_path = crate::local::to_local_path(&final_path);
-        let persisted = tokio::task::spawn_blocking(move || -> Result<String> {
-            temp_path.persist(&local_path).map_err(|e| {
-                Error::io(format!(
-                    "failed to persist temp file to {}: {}",
-                    local_path, e.error
-                ))
-            })?;
+        let persisted =
+            lance_core::utils::tokio::spawn_blocking_scoped(move || -> Result<String> {
+                temp_path.persist(&local_path).map_err(|e| {
+                    Error::io(format!(
+                        "failed to persist temp file to {}: {}",
+                        local_path, e.error
+                    ))
+                })?;
 
-            let metadata = std::fs::metadata(&local_path).map_err(|e| {
-                Error::io(format!("failed to read metadata for {}: {}", local_path, e))
-            })?;
-            Ok(get_etag(&metadata))
-        })
-        .await
-        .map_err(|e| Error::io(format!("spawn_blocking failed: {}", e)))
-        .and_then(|e_tag| e_tag);
+                let metadata = std::fs::metadata(&local_path).map_err(|e| {
+                    Error::io(format!("failed to read metadata for {}: {}", local_path, e))
+                })?;
+                Ok(get_etag(&metadata))
+            })
+            .await
+            .map_err(|e| Error::io(format!("spawn_blocking failed: {}", e)))
+            .and_then(|e_tag| e_tag);
 
         metrics.record(&persisted, size as u64);
         let e_tag = persisted?;

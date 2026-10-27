@@ -52,10 +52,17 @@ or panics before its children finish. Scope drain waits for that cleanup before
 acknowledging completion; successful prepared output keeps its own reservation.
 This does not turn the decoded-byte budget into a hard RSS bound.
 
-Qualification is not complete. The CPU patch does not track arbitrary Tokio
-children: Lance's fragment scanner and batch decoder also spawn async tasks.
-V1/V2.0 tables keep encoding in the existing ordered commit path.
-The scanner paths need separate failure/cancellation qualification with representative
-payloads; passing the CPU tests is not evidence that every scanner child joined.
-Keep this option disabled until these checks and the fixed-image Azure comparison
-pass. All performance claims require the representative comparison above.
+The same group propagates through Lance's fragment scanner and batch decoder
+children, including existing abort-on-drop wrappers. Shared blob sources keep
+one token per logical request, and physical schedulers keep tokens until the
+actual request state and response buffers are destroyed. Upload children and
+multipart-abort cleanup are scoped; local blocking IO stays charged until its
+actual closure exits. Cancellation before a child's first poll destroys its
+captured payload before releasing membership. V1/V2.0 tables keep encoding in
+the existing ordered commit path.
+
+Qualification is not complete. Keep this option disabled until all targeted
+failure/cancellation checks, CI, and the fixed-image Azure comparison pass.
+Tests and task tracking do not establish a hard RSS bound or account for all
+shared transport/cache allocations. All performance claims require the
+representative comparison above.

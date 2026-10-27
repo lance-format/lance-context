@@ -9,6 +9,8 @@ on:
       - vendor/raft-engine/**
       - vendor/lance-io/**
       - vendor/lance-core/**
+      - vendor/lance/**
+      - vendor/lance-encoding/**
       - .github/workflows/rust-test.yml
       - Cargo.toml
       - Cargo.lock

@@ -9,6 +9,8 @@ on:
       - vendor/raft-engine/**
       - vendor/lance-io/**
       - vendor/lance-core/**
+      - vendor/lance/**
+      - vendor/lance-encoding/**
       - .typos.toml
       - Cargo.toml
       - Cargo.lock
@@ -37,6 +39,8 @@ jobs:
           cargo fmt --all -- --check
           cargo fmt --manifest-path vendor/lance-io/Cargo.toml -- --check
           rustfmt --edition 2024 --check vendor/lance-core/src/utils/tokio.rs
+          rustfmt --edition 2024 --check vendor/lance/src/dataset/{blob,fragment}.rs vendor/lance/src/io/exec/{scan,take,pushdown_scan,utils,filtered_read}.rs
+          rustfmt --edition 2024 --check vendor/lance-encoding/src/decoder.rs vendor/lance-encoding/src/array_encoding/logical/{list,primitive}.rs vendor/lance-encoding/src/array_encoding/physical/{binary,dictionary,packed_struct}.rs
 
   clippy:
     runs-on: ubuntu-24.04

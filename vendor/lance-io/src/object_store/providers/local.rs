@@ -31,7 +31,7 @@ impl LocalDirOperations for FileSystemDirOperations {
     async fn remove_dir_all(&self, path: &Path) -> Result<()> {
         let local_path = self.local_file_system.path_to_filesystem(path)?;
         let object_store_path = path.to_string();
-        tokio::task::spawn_blocking(move || {
+        lance_core::utils::tokio::spawn_blocking_scoped(move || {
             std::fs::remove_dir_all(local_path).map_err(|error| match error.kind() {
                 ErrorKind::NotFound => Error::not_found(object_store_path),
                 _ => Error::from(error),

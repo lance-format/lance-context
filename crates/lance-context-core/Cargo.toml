@@ -37,7 +37,7 @@ arrow-schema = "58"
 arrow-select = "58"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 datafusion = { version = "54", default-features = false, features = ["nested_expressions"] }
-lance = "13.0.0"
+lance = { version = "13.0.0", path = "../../vendor/lance" }
 lance-context-api = { version = "0.6.7", path = "../lance-context-api" }
 lance-index = "13.0.0"
 lance-namespace = "13.0.0"

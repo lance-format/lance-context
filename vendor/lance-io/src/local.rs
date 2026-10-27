@@ -268,7 +268,7 @@ impl LocalObjectReader {
     ) -> Result<Box<dyn Reader>> {
         let path = path.clone();
         let local_path = to_local_path(&path);
-        tokio::task::spawn_blocking(move || {
+        lance_core::utils::tokio::spawn_blocking_scoped(move || {
             let file = File::open(&local_path).map_err(|e| match e.kind() {
                 ErrorKind::NotFound => Error::not_found(path.to_string()),
                 _ => e.into(),
@@ -309,7 +309,10 @@ impl Reader for LocalObjectReader {
                     // request a cloud reader makes to learn the object size.
                     let metrics = self.io_tracker.begin_io("head");
                     let result =
-                        join_local_io(tokio::task::spawn_blocking(move || file.metadata())).await;
+                        join_local_io(lance_core::utils::tokio::spawn_blocking_scoped(move || {
+                            file.metadata()
+                        }))
+                        .await;
                     metrics.record(&result, 0);
                     Ok(result?.len() as usize)
                 })
@@ -329,19 +332,20 @@ impl Reader for LocalObjectReader {
 
         Box::pin(async move {
             let metrics = io_tracker.begin_io("get");
-            let result = join_local_io(tokio::task::spawn_blocking(move || {
-                let mut buf = BytesMut::with_capacity(range.len());
-                // Safety: `buf` is set with appropriate capacity above. It is
-                // written to below and we check all data is initialized at that point.
-                unsafe { buf.set_len(range.len()) };
-                #[cfg(unix)]
-                file.read_exact_at(buf.as_mut(), range.start as u64)?;
-                #[cfg(windows)]
-                read_exact_at(file, buf.as_mut(), range.start as u64)?;
+            let result =
+                join_local_io(lance_core::utils::tokio::spawn_blocking_scoped(move || {
+                    let mut buf = BytesMut::with_capacity(range.len());
+                    // Safety: `buf` is set with appropriate capacity above. It is
+                    // written to below and we check all data is initialized at that point.
+                    unsafe { buf.set_len(range.len()) };
+                    #[cfg(unix)]
+                    file.read_exact_at(buf.as_mut(), range.start as u64)?;
+                    #[cfg(windows)]
+                    read_exact_at(file, buf.as_mut(), range.start as u64)?;
 
-                Ok(buf.freeze())
-            }))
-            .await;
+                    Ok(buf.freeze())
+                }))
+                .await;
 
             metrics.record(&result, num_bytes);
             if result.is_ok() {
@@ -361,12 +365,13 @@ impl Reader for LocalObjectReader {
             let path = self.path.clone();
 
             let metrics = io_tracker.begin_io("get");
-            let result = join_local_io(tokio::task::spawn_blocking(move || {
-                let mut buf = Vec::new();
-                file.read_to_end(buf.as_mut())?;
-                Ok(Bytes::from(buf))
-            }))
-            .await;
+            let result =
+                join_local_io(lance_core::utils::tokio::spawn_blocking_scoped(move || {
+                    let mut buf = Vec::new();
+                    file.read_to_end(buf.as_mut())?;
+                    Ok(Bytes::from(buf))
+                }))
+                .await;
 
             let num_bytes = result.as_ref().map_or(0, |bytes| bytes.len() as u64);
             metrics.record(&result, num_bytes);

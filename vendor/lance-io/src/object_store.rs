@@ -1003,7 +1003,7 @@ impl ObjectStore {
                     .parent()
                     .expect("file path must have parent")
                     .to_owned();
-                let named_temp = tokio::task::spawn_blocking(move || {
+                let named_temp = lance_core::utils::tokio::spawn_blocking_scoped(move || {
                     #[cfg(unix)]
                     {
                         // NamedTempFile defaults to 0o600. Use ordinary file creation permissions so the published file honors the caller's umask.
@@ -1592,7 +1592,7 @@ impl ObjectStore {
 
         let path = Path::parse(root_path.into())?;
         let metrics = self.io_tracker.begin_io("delete");
-        let result = tokio::task::spawn_blocking(move || {
+        let result = lance_core::utils::tokio::spawn_blocking_scoped(move || {
             super::local::remove_empty_dirs(&path, &retained_dirs, &verified_dirs, unmodified_since)
         })
         .await

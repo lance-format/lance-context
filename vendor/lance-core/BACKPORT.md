@@ -43,3 +43,31 @@ cargo test -p lance-context-core -p lance-context-master --lib merge_budget -- -
 This is a local patch pending upstream review. Remove it when a compatible
 published Lance release supplies equivalent owned CPU lifetime semantics and
 the same regressions pass against that release.
+
+## Async children and shared IO requests
+
+`scope_task` captures membership before an async child is submitted, restores
+the task-local group while it runs, and destroys its future before releasing
+membership even if cancelled before its first poll. `spawn_scoped` uses it with
+Tokio; existing third-party abort-on-drop wrappers use the future directly.
+`join_cpu_tasks` now joins both kinds of children on success, error, or panic.
+
+`retain_task_scope` supports shared services that queue/batch callers from
+independent groups. The blob reader attaches one token to each logical request;
+the standard physical IO scheduler retains one per batch through all physical
+reads and result cleanup; the lite scheduler retains one per task through its
+actual state destruction. Neither a shared scheduler's lifetime nor all future
+requests are attributed to its first caller.
+
+The corresponding exact-version call-site patches are in `../lance` and
+`../lance-encoding`; the existing `../lance-io` patch adds request tokens. They
+are required together. An unmodified arbitrary `tokio::spawn` elsewhere still
+does not inherit task locals. This does not account for every allocator or
+transport buffer and is not a hard RSS bound.
+
+`spawn_blocking_scoped` retains the same ownership through actual local IO
+closures on Tokio's ordinary blocking pool. It preserves that pool and its
+JoinHandle semantics, propagates nested CPU context, and destroys queued
+closure captures before releasing membership. Existing CPU work remains on
+Lance's dedicated CPU pool. Neither wrapper releases ownership merely because
+its receiving handle was dropped.

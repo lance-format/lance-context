@@ -183,6 +183,7 @@ default-features = false
 version = "1.1.0"
 
 [dependencies.lance-core]
+path = "../lance-core"
 version = "=13.0.0"
 
 [dependencies.lance-namespace]
@@ -368,4 +369,5 @@ optional = true
 
 # Match the workspace patch when running this backport's standalone tests.
 [patch.crates-io]
+lance-core = { path = "../lance-core" }
 object_store = { git = "https://github.com/beinan/arrow-rs-object-store", rev = "09b0593d4702ba390bab1710b3e67f86fd7defcb" }

@@ -1,7 +1,7 @@
 [files]
 # Preserve the vendored upstream source; its two-file correction is documented
 # separately instead of mixing unrelated upstream spelling changes into it.
-extend-exclude = ["vendor/raft-engine/**", "vendor/lance-io/**", "vendor/lance-core/**"]
+extend-exclude = ["vendor/raft-engine/**", "vendor/lance-io/**", "vendor/lance-core/**", "vendor/lance/**", "vendor/lance-encoding/**"]
 
 [default.extend-words]
 # Generalized advantage estimation in the rollout schema.

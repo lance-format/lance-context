@@ -13,7 +13,7 @@ members = [
     "python",
 ]
 resolver = "2"
-exclude = ["vendor/raft-engine", "vendor/lance-io", "vendor/lance-core"]
+exclude = ["vendor/raft-engine", "vendor/lance-io", "vendor/lance-core", "vendor/lance", "vendor/lance-encoding"]
 
 [workspace.package]
 edition = "2021"
@@ -27,5 +27,7 @@ license = "Apache-2.0"
 lance-io = { path = "vendor/lance-io" }
 # Scoped encoder lifetime tracking, same Lance 13.0.0; see vendor/lance-core/BACKPORT.md.
 lance-core = { path = "vendor/lance-core" }
+lance = { path = "vendor/lance" }
+lance-encoding = { path = "vendor/lance-encoding" }
 # Azure completion response-loss fix; same object_store 0.14.2, see vendor/lance-io/BACKPORT.md.
 object_store = { git = "https://github.com/beinan/arrow-rs-object-store", rev = "09b0593d4702ba390bab1710b3e67f86fd7defcb" }

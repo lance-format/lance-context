@@ -17,7 +17,7 @@ thread_local! {
     static BLOCKING_CPU_TASK_SCOPE: RefCell<Option<Arc<CpuTaskScope>>> = const { RefCell::new(None) };
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct CpuTaskScope {
     active: atomic::AtomicUsize,
     changed: tokio::sync::Notify,
@@ -37,13 +37,111 @@ impl CpuTaskScope {
     }
 }
 
-struct CpuTaskGuard(Arc<CpuTaskScope>);
-impl Drop for CpuTaskGuard {
+/// A pending operation's membership in the current owned task group. Retain
+/// this on individual requests when a shared service batches multiple callers;
+/// do not attribute an entire shared service to its first caller's group.
+#[derive(Debug)]
+pub struct TaskScopeToken(Arc<CpuTaskScope>);
+impl Drop for TaskScopeToken {
     fn drop(&mut self) {
         if self.0.active.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.0.changed.notify_waiters();
         }
     }
+}
+
+/// Retain the current task group until this token is dropped. Unscoped callers
+/// receive `None` and keep their original lifetime behavior.
+pub fn retain_task_scope() -> Option<TaskScopeToken> {
+    let scope = CPU_TASK_SCOPE
+        .try_with(Arc::clone)
+        .ok()
+        .or_else(|| BLOCKING_CPU_TASK_SCOPE.with(|slot| slot.borrow().clone()))?;
+    scope.active.fetch_add(1, Ordering::AcqRel);
+    Some(TaskScopeToken(scope))
+}
+
+#[pin_project::pin_project]
+struct ScopedTask<F> {
+    // Rust drops fields in declaration order. Even cancellation before the
+    // first poll must destroy captured payloads before releasing membership.
+    #[pin]
+    work: F,
+    _active: Option<TaskScopeToken>,
+}
+
+impl<F: Future> Future for ScopedTask<F> {
+    type Output = F::Output;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        self.project().work.poll(cx)
+    }
+}
+
+/// Capture task ownership before submitting an async child to any executor.
+/// The returned future propagates the task-local group while it is polled and
+/// releases membership only when the actual future finishes or is dropped.
+/// This preserves third-party abort-on-drop task wrappers: requesting abort is
+/// not completion, but actually dropping their future is.
+pub fn scope_task<F: Future>(work: F) -> impl Future<Output = F::Output> {
+    let active = retain_task_scope();
+    let scope = active.as_ref().map(|guard| guard.0.clone());
+    // Construct TaskLocalFuture before submission so its drop also restores
+    // context when a queued child is cancelled before its very first poll.
+    let work = match scope {
+        Some(scope) => futures::future::Either::Left(CPU_TASK_SCOPE.scope(scope, work)),
+        None => futures::future::Either::Right(work),
+    };
+    ScopedTask {
+        work,
+        _active: active,
+    }
+}
+
+/// Spawn a Tokio child with the current group's lifetime and nested context.
+/// With no current group, output, panic, and cancellation behavior are unchanged.
+pub fn spawn_scoped<F>(work: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    tokio::spawn(scope_task(work))
+}
+
+struct ScopedBlocking<F> {
+    // Drop captured payloads before membership if cancelled while still queued.
+    work: Option<F>,
+    active: Option<TaskScopeToken>,
+}
+
+impl<F, R> ScopedBlocking<F>
+where
+    F: FnOnce() -> R,
+{
+    fn run(mut self) -> R {
+        let previous = BLOCKING_CPU_TASK_SCOPE
+            .with(|slot| slot.replace(self.active.as_ref().map(|guard| guard.0.clone())));
+        let _blocking_scope = BlockingScopeGuard(previous);
+        (self.work.take().unwrap())()
+    }
+}
+
+/// Submit blocking IO to the ordinary Tokio pool while retaining its scope
+/// until the actual closure exits. Dropping its JoinHandle cannot stop a
+/// running closure. Pool selection and JoinHandle panic semantics are unchanged.
+pub fn spawn_blocking_scoped<F, R>(work: F) -> tokio::task::JoinHandle<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let task = ScopedBlocking {
+        work: Some(work),
+        active: retain_task_scope(),
+    };
+    tokio::task::spawn_blocking(move || task.run())
 }
 
 struct BlockingScopeGuard(Option<Arc<CpuTaskScope>>);
@@ -53,7 +151,7 @@ impl Drop for BlockingScopeGuard {
     }
 }
 
-/// Join all CPU closures submitted while polling `work`, including children
+/// Join all CPU closures and scoped async tasks submitted while polling `work`, including children
 /// whose handles were discarded on an early error and nested CPU submissions.
 /// The original output or panic is returned only after those closures exit.
 /// Unscoped `spawn_cpu` calls retain their existing behavior.
@@ -61,7 +159,9 @@ impl Drop for BlockingScopeGuard {
 /// This future must itself be driven to completion: cancelling it cannot stop
 /// a blocking closure. Resource owners should run it in a separately owned,
 /// drained task and retain their allocation guard outside `work`. Arbitrary
-/// `tokio::spawn` tasks do not inherit this scope and must be joined separately.
+/// `tokio::spawn` tasks do not inherit this scope: use [`spawn_scoped`] or wrap
+/// the submitted future with [`scope_task`]. Shared services can use one
+/// [`retain_task_scope`] token per request instead of inheriting one caller.
 pub async fn join_cpu_tasks<F: Future>(work: F) -> F::Output {
     let scope = Arc::new(CpuTaskScope::default());
     let result = CPU_TASK_SCOPE
@@ -256,14 +356,7 @@ pub fn spawn_cpu<
 ) -> impl Future<Output = std::result::Result<R, E>> {
     // Propagate the current span into the task
     let span = Span::current();
-    let scope = CPU_TASK_SCOPE
-        .try_with(Arc::clone)
-        .ok()
-        .or_else(|| BLOCKING_CPU_TASK_SCOPE.with(|slot| slot.borrow().clone()));
-    let active = scope.map(|scope| {
-        scope.active.fetch_add(1, Ordering::AcqRel);
-        CpuTaskGuard(scope)
-    });
+    let active = retain_task_scope();
     let handle = global_cpu_runtime().spawn_blocking(move || {
         let _active = active;
         let previous = BLOCKING_CPU_TASK_SCOPE

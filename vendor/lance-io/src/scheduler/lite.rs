@@ -133,6 +133,8 @@ struct IoTask {
     state: TaskState,
     /// When true, the task bypasses backpressure
     bypass_backpressure: bool,
+    // Last: pending/running/result state must be destroyed before membership.
+    _scope: Option<lance_core::utils::tokio::TaskScopeToken>,
 }
 
 impl IoTask {
@@ -594,6 +596,7 @@ impl IoQueue {
                 idle_waker: None,
                 run_fn,
             },
+            _scope: lance_core::utils::tokio::retain_task_scope(),
         };
         self.push(task, state)?;
         Ok(TaskHandle {

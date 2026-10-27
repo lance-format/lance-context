@@ -107,3 +107,22 @@ It checks exhausted 500/read-timeout attempts, 429/503 controls, permission erro
 and unknown conditional-create PUT timeouts. Its injected timeouts establish
 request counts and error classification, not real network timeout durations or
 an explanation of a particular storage latency incident.
+
+## Owned preparation IO lifetime
+
+The scoped task patch described in `../lance-core/BACKPORT.md` adds a request
+token as the last field of the standard scheduler's `MutableBatch` and the lite
+scheduler's `IoTask`. Discarding a response future on a sibling read/encoding
+error does not mean background physical reads have stopped. The standard token
+lasts until all physical callbacks and response/data-buffer cleanup complete;
+the lite token lasts through cancellation/destruction of pending, running, or
+finished task state. Shared scheduling loops remain independent of any caller.
+
+The scoped addition changes `src/scheduler.rs` and `src/scheduler/lite.rs`,
+wraps the existing upload JoinSet futures and multipart-abort child in
+`src/object_writer.rs`, and scopes ordinary blocking IO in that file plus
+`src/local.rs`, `src/object_store.rs`, and `src/object_store/providers/local.rs`.
+Their existing runtimes, abort-on-drop behavior, and error mapping are retained.
+Existing multipart retry and classification fixes are retained. The standalone
+manifest and lockfile select the same path-patched `lance-core 13.0.0` as the
+workspace, including its transitive namespace user. No version is upgraded.

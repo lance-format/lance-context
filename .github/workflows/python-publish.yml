@@ -13,6 +13,8 @@ on:
       - python/pyproject.toml
       - vendor/lance-io/**
       - vendor/lance-core/**
+      - vendor/lance/**
+      - vendor/lance-encoding/**
   workflow_dispatch:
     inputs:
       mode:
@@ -119,7 +121,10 @@ jobs:
               if f"{root}/python/Cargo.lock" in source.getnames():
                   raise SystemExit("Source distribution contains an obsolete nested Cargo.lock")
               for backport in ["vendor/lance-io/src/object_store/throttle.rs",
-                               "vendor/lance-core/src/utils/tokio.rs"]:
+                               "vendor/lance-core/src/utils/tokio.rs",
+                               "vendor/lance/src/io/exec/filtered_read.rs",
+                               "vendor/lance-encoding/src/decoder.rs",
+                               "vendor/lance-io/src/scheduler.rs"]:
                   patched = source.extractfile(f"{root}/{backport}")
                   if patched is None or patched.read() != Path(backport).read_bytes():
                       raise SystemExit(f"Source distribution must preserve {backport}")
