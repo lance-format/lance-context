@@ -4,6 +4,7 @@
 //! Only the executor can publish its terminal outcome. Recovery first cancels
 //! and reconciles the old execution; it never clears a running fence on timeout.
 
+use lance_context_metrics::etcd::{ObserveEtcd, Operation};
 pub mod background;
 pub mod demand;
 pub mod failure;
@@ -210,6 +211,7 @@ impl Coordinator {
             .client
             .clone()
             .get(execution_key(&self.prefix, target), None)
+            .observed(Operation::MergeRead)
             .await
             .map_err(|e| e.to_string())?;
         let revision = response
@@ -257,6 +259,7 @@ impl Coordinator {
             .client
             .clone()
             .get(start, Some(options.with_limit(256)))
+            .observed(Operation::MergeScan)
             .await
             .map_err(|e| e.to_string())?;
         let rows = response
@@ -321,7 +324,8 @@ impl Coordinator {
 
     async fn reserve_record(&self, claim: &ClaimProof, execution: &Execution) -> Result<bool> {
         let key = execution_key(&self.prefix, &execution.target);
-        self.transact(
+        self.transact_observed(
+            Operation::MergeReserve,
             vec![
                 Compare::value(claim.key.as_str(), CompareOp::Equal, claim.token.as_bytes()),
                 Compare::version(key.as_str(), CompareOp::Equal, 0),
@@ -489,12 +493,18 @@ impl Coordinator {
                 Some(etcd_client::PutOptions::new().with_lease(claim.lease_id)),
             ),
         ]);
-        self.transact(compares, operations).await
+        self.transact_observed(Operation::MergeRelease, compares, operations)
+            .await
     }
 
     async fn replace(&self, old: &Execution, new: &Execution) -> Result<bool> {
         let key = execution_key(&self.prefix, &old.target);
-        self.transact(
+        self.transact_observed(
+            if new.phase == Phase::Running {
+                Operation::MergeStart
+            } else {
+                Operation::MergeTerminal
+            },
             vec![Compare::value(key.as_str(), CompareOp::Equal, encode(old))],
             vec![TxnOp::put(key, encode(new), None)],
         )
@@ -506,9 +516,20 @@ impl Coordinator {
         compares: Vec<Compare>,
         operations: Vec<TxnOp>,
     ) -> Result<bool> {
+        self.transact_observed(Operation::MergeOther, compares, operations)
+            .await
+    }
+
+    pub(crate) async fn transact_observed(
+        &self,
+        operation: Operation,
+        compares: Vec<Compare>,
+        operations: Vec<TxnOp>,
+    ) -> Result<bool> {
         self.client
             .clone()
             .txn(Txn::new().when(compares).and_then(operations))
+            .observed(operation)
             .await
             .map(|r| r.succeeded())
             .map_err(|e| e.to_string())

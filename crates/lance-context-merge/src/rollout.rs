@@ -1,6 +1,7 @@
 //! Explicit per-table rollout. Capability deployment alone changes no merge path.
 use crate::{execution_key, Coordinator, Result};
 use etcd_client::{Compare, CompareOp, GetOptions, TxnOp};
+use lance_context_metrics::etcd::{ObserveEtcd, Operation};
 
 #[derive(Clone, Debug, Default, clap::Args, serde::Serialize, serde::Deserialize)]
 pub struct MergeRollout {
@@ -70,6 +71,7 @@ impl Coordinator {
         self.client
             .clone()
             .put(key, target, None)
+            .observed(Operation::DemandPublish)
             .await
             .map_err(|e| e.to_string())?;
         Ok(())
@@ -82,6 +84,7 @@ impl Coordinator {
             .client
             .clone()
             .get(self.request_key(target), None)
+            .observed(Operation::DemandRead)
             .await
             .map_err(|e| e.to_string())?;
         let Some(kv) = response.kvs().first() else {
@@ -114,6 +117,7 @@ impl Coordinator {
             .client
             .clone()
             .get(start, Some(options.with_limit(256)))
+            .observed(Operation::DemandScan)
             .await
             .map_err(|e| e.to_string())?;
         let rows = response

@@ -1,6 +1,7 @@
 //! One leased controller discovers durable merge demand for all executors.
 //! Followers watch only the leader key. The leader lists at one revision, then
 //! maintains bounded state from resumable watches; executing tasks is unchanged.
+use lance_context_metrics::etcd::{ObserveEtcd, Operation};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -361,7 +362,11 @@ async fn list(client: &Client, prefix: &str) -> Result<Cache, String> {
                 options = options.with_revision(revision);
             }
             metrics::counter!("master_demand_controller_list_rpcs_total").increment(1);
-            let response = match client.get(key.clone(), Some(options)).await {
+            let response = match client
+                .get(key.clone(), Some(options))
+                .observed(Operation::DispatchRead)
+                .await
+            {
                 Ok(response) => response,
                 Err(error) if limit > 1 && error.to_string().contains("message length") => {
                     limit = (limit / 2).max(1);
@@ -413,6 +418,7 @@ async fn watch(
     let mut stream = client
         .clone()
         .watch(prefix_key(prefix, RANGES[0]), Some(options(0)))
+        .observed(Operation::DispatchWatch)
         .await
         .map_err(|e| e.to_string())?;
     for (i, range) in RANGES.iter().enumerate().skip(1) {
@@ -618,6 +624,7 @@ pub(crate) async fn wait_for_vacancy(
     let response = client
         .clone()
         .get(key, None)
+        .observed(Operation::DispatchRead)
         .await
         .map_err(|e| e.to_string())?;
     if response.kvs().is_empty()
@@ -635,6 +642,7 @@ pub(crate) async fn wait_for_vacancy(
             key,
             Some(WatchOptions::new().with_start_revision(revision + 1)),
         )
+        .observed(Operation::DispatchWatch)
         .await
         .map_err(|e| e.to_string())?;
     while let Some(response) = stream.message().await.map_err(|e| e.to_string())? {

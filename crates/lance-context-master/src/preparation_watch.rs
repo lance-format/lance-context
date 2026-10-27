@@ -2,6 +2,7 @@
 //! This never grants write permission; promotion still performs its own CAS.
 use super::{etcd_error, TaskClaim, TaskStore};
 use etcd_client::{EventType, Txn, TxnOp, TxnOpResponse, WatchOptions, WatchStream};
+use lance_context_metrics::etcd::{ObserveEtcd, Operation};
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -61,6 +62,7 @@ impl PreparationObserver {
                         .collect::<Vec<_>>(),
                 ),
             )
+            .observed(Operation::TaskReadTxn)
             .await
             .map_err(etcd_error("read preparation ownership"))?;
         let revision = response
@@ -91,6 +93,7 @@ impl PreparationObserver {
             .client
             .clone()
             .watch(self.keys[0].clone(), Some(options.clone()))
+            .observed(Operation::DispatchWatch)
             .await
             .map_err(etcd_error("watch preparation claim"))?;
         stream

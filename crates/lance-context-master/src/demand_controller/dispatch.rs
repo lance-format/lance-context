@@ -11,6 +11,7 @@ use crate::{
 use etcd_client::WatchOptions;
 use lance_context_api::{TaskKind, TaskRecord, TaskState};
 use lance_context_merge::rollout::MergeRollout;
+use lance_context_metrics::etcd::{ObserveEtcd, Operation};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -222,6 +223,7 @@ impl Session {
                 .etcd_client()
                 .clone()
                 .get(offer_key.clone(), None)
+                .observed(Operation::DispatchRead)
                 .await
                 .map_err(|e| lance::Error::io(e.to_string()))?;
             let pending = snapshot
@@ -241,6 +243,7 @@ impl Session {
                     offer_key,
                     Some(WatchOptions::new().with_start_revision(revision + 1)),
                 )
+                .observed(Operation::DispatchWatch)
                 .await
                 .map_err(|e| lance::Error::io(e.to_string()))?;
             Ok::<_, lance::Error>((stream, pending, revision))

@@ -3,6 +3,7 @@
 use super::{etcd_error, TaskClaim, TaskStore};
 use etcd_client::{EventType, GetOptions, Txn, TxnOp, TxnOpResponse, WatchOptions, WatchStream};
 use lance_context_merge::{progress::ExecutionProgress, Execution};
+use lance_context_metrics::etcd::{ObserveEtcd, Operation};
 use std::collections::HashMap;
 
 pub(crate) enum MaintenanceChange {
@@ -148,6 +149,7 @@ impl TaskStore {
                         .collect::<Vec<_>>(),
                 ),
             )
+            .observed(Operation::TaskReadTxn)
             .await
             .map_err(etcd_error("capture maintenance commit wait"))?;
         let revision = response
@@ -190,6 +192,7 @@ impl TaskStore {
                     key.as_str(),
                     Some(GetOptions::new().with_revision(revision)),
                 )
+                .observed(Operation::TaskRead)
                 .await
                 .map_err(etcd_error("capture maintenance wait progress"))?;
             response
@@ -226,6 +229,7 @@ impl MaintenanceSnapshot {
         let mut stream = client
             .clone()
             .watch(self.claim_key.clone(), Some(options.clone()))
+            .observed(Operation::DispatchWatch)
             .await
             .map_err(etcd_error("open maintenance commit watch"))?;
         for key in self

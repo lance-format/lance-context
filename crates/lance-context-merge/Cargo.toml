@@ -6,6 +6,7 @@ license = "Apache-2.0"
 description = "Durable ownership for cancellable WAL merge execution"
 
 [dependencies]
+lance-context-metrics = { version = "0.1.0", path = "../lance-context-metrics" }
 clap = { version = "4", features = ["derive", "env"] }
 etcd-client = { version = "0.19", features = ["tls"] }
 lance-context-api = { version = "0.6.7", path = "../lance-context-api" }
@@ -15,4 +16,6 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false }
 tokio = { version = "1", features = ["test-util"] }

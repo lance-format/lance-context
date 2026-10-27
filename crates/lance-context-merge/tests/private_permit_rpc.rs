@@ -383,3 +383,65 @@ async fn run() {
     )
     .unwrap();
 }
+
+/// The existing private-etcd CI harness runs this serially with the permit
+/// tests, so server method deltas cannot include another test's traffic.
+#[test]
+#[ignore = "requires dedicated private loopback etcd; never use production"]
+fn private_permit_operation_metrics_match_real_rpc_and_rejected_cas() {
+    let endpoint = std::env::var("RK_PRIVATE_ETCD").unwrap();
+    assert!(endpoint.starts_with("http://127.0.0.1:"));
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    metrics::with_local_recorder(&recorder, || {
+        runtime.block_on(async {
+            let result = tokio::time::timeout(Duration::from_secs(30), async {
+                let mut client = Client::connect([endpoint], None).await.unwrap();
+                let prefix = format!("/private-operation-metrics/{}", uuid::Uuid::new_v4());
+                let coordinator = Coordinator::new(client.clone(), prefix.clone());
+                let proof = ClaimProof { key: format!("{prefix}/claim"), token: "owner".into(), lease_id: 0 };
+                client.put(proof.key.as_str(), proof.token.as_str(), None).await.unwrap();
+                client.put(target_lock_key(&prefix, "table"), proof.token.as_str(), None).await.unwrap();
+                let reserved = Execution::new("table", "private", "private", 600);
+                let before = metrics();
+                assert!(coordinator.reserve(&proof, &reserved).await.unwrap());
+                assert!(!coordinator.reserve(&proof, &reserved).await.unwrap());
+                let running = coordinator.start(&reserved).await.unwrap().unwrap();
+                assert!(coordinator.publish_progress(&running, 0).await.unwrap());
+                assert!(coordinator.publish_progress(&running, 1).await.unwrap());
+                assert_eq!(coordinator.progress(&running).await.unwrap().unwrap().sequence, 1);
+                coordinator.commit_permit_publisher(&running, "memory://fixture")
+                    .authorize("base", 1).await.unwrap();
+                assert!(coordinator.finish(&running, Ok(1)).await.unwrap());
+                let terminal = coordinator.get("table").await.unwrap().unwrap();
+                assert!(coordinator.release(&proof, &terminal).await.unwrap());
+                assert!(!coordinator.publish_progress(&running, 2).await.unwrap());
+                let after = metrics();
+                assert_eq!(after["Txn"] - before.get("Txn").copied().unwrap_or(0.), 9.);
+                assert_eq!(after["Range"] - before.get("Range").copied().unwrap_or(0.), 2.);
+                assert_eq!(after["Watch"] - before.get("Watch").copied().unwrap_or(0.), 0.);
+                let text = handle.render();
+                let expected = [
+                    ("merge_reserve", 2), ("merge_start", 1),
+                    ("merge_progress_initial", 1), ("merge_progress_changed", 2),
+                    ("merge_read", 2), ("merge_commit_write", 1),
+                    ("merge_terminal", 1), ("merge_release", 1),
+                ];
+                for (operation, count) in expected {
+                    assert!(text.contains(&format!("etcd_operation_attempts_total{{operation=\"{operation}\"}} {count}")), "{text}");
+                    assert!(text.contains(&format!("etcd_operation_completions_total{{operation=\"{operation}\",outcome=\"ok\"}} {count}")), "{text}");
+                }
+                // Rejected ownership comparisons remain OK transport outcomes.
+                assert!(!text.contains("outcome=\"error\""));
+                assert!(!text.contains("outcome=\"abandoned\""));
+                assert!(!text.contains(&prefix));
+                println!("operation metrics: 9 Txn + 2 Range, including rejected reserve and fenced late progress");
+            }).await;
+            result.expect("private operation accounting deadline");
+        })
+    });
+}

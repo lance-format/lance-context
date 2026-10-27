@@ -2,6 +2,7 @@
 //! manifest versions. Lease expiry and process identity are not storage fences.
 use crate::{encode, execution_key, ClaimProof, Coordinator, Execution, Phase, Result};
 use etcd_client::{Compare, CompareOp, Txn, TxnOp, TxnOpResponse};
+use lance_context_metrics::etcd::{ObserveEtcd, Operation};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -81,6 +82,7 @@ impl CommitPermitPublisher {
                             TxnOp::get(permit_key.clone(), None),
                         ]),
                 )
+                .observed(Operation::MergeCommitWrite)
                 .await
                 .map_err(|e| e.to_string())?;
             if response.succeeded() {
@@ -167,6 +169,7 @@ impl Coordinator {
                 .client
                 .clone()
                 .get(key.clone(), None)
+                .observed(Operation::MergeCommitRead)
                 .await
                 .map_err(|e| e.to_string())?;
             let previous = response.kvs().first();
@@ -185,7 +188,8 @@ impl Coordinator {
             let watermark = watermarks.versions.entry(resource.into()).or_default();
             *watermark = (*watermark).max(version);
             if self
-                .transact(
+                .transact_observed(
+                    Operation::MergeCommitWrite,
                     vec![
                         Compare::value(
                             execution_key(&self.prefix, &running.target),
@@ -254,6 +258,7 @@ impl Coordinator {
             .client
             .clone()
             .get(self.permits_key(frozen), None)
+            .observed(Operation::MergeCommitRead)
             .await
             .map_err(|e| e.to_string())?;
         response

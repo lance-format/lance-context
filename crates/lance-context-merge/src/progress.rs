@@ -2,6 +2,7 @@
 //! unchanged sequence must never extend a no-progress deadline.
 use crate::{encode, execution_key, Coordinator, Execution, Phase, Result};
 use etcd_client::{Compare, CompareOp, Txn, TxnOp, TxnOpResponse, WatchOptions, WatchStream};
+use lance_context_metrics::etcd::{ObserveEtcd, Operation};
 
 /// Exact keys on one stream, owned by the waiting execution. Dropping this
 /// value closes the stream; there is no detached task or fleet-wide subscription.
@@ -131,6 +132,7 @@ impl WorkProgressPublisher {
                             TxnOp::get(progress_key.clone(), None),
                         ]),
                 )
+                .observed(Operation::MergeWorkProgress)
                 .await
                 .map_err(|e| e.to_string())?;
             if response.succeeded() {
@@ -185,6 +187,7 @@ impl Coordinator {
                 execution_key(&self.prefix, target),
                 Some(WatchOptions::new().with_start_revision(revision + 1)),
             )
+            .observed(Operation::MergeOwnerWatch)
             .await
             .map_err(|e| e.to_string())?;
         Ok(ExecutionWatch {
@@ -212,6 +215,7 @@ impl Coordinator {
                 execution_key(&self.prefix, &execution.target),
                 Some(options.clone()),
             )
+            .observed(Operation::MergeProgressWatch)
             .await
             .map_err(|e| e.to_string())?;
         stream
@@ -259,6 +263,7 @@ impl Coordinator {
             .client
             .clone()
             .get(self.work_key(execution), None)
+            .observed(Operation::MergeRead)
             .await
             .map_err(|e| e.to_string())?;
         response
@@ -298,6 +303,7 @@ impl Coordinator {
                             TxnOp::get(self.work_key(&execution), None),
                         ]),
                 )
+                .observed(Operation::MergeRead)
                 .await
                 .map_err(|e| e.to_string())?;
             if !response.succeeded() {
@@ -346,7 +352,12 @@ impl Coordinator {
     }
 
     pub async fn publish_progress(&self, execution: &Execution, sequence: u64) -> Result<bool> {
-        self.transact(
+        self.transact_observed(
+            if sequence == 0 {
+                Operation::MergeProgressInitial
+            } else {
+                Operation::MergeProgressChanged
+            },
             vec![Compare::value(
                 execution_key(&self.prefix, &execution.target),
                 CompareOp::Equal,
@@ -366,6 +377,7 @@ impl Coordinator {
             .client
             .clone()
             .get(self.progress_key(execution), None)
+            .observed(Operation::MergeRead)
             .await
             .map_err(|e| e.to_string())?;
         response

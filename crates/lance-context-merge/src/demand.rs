@@ -12,6 +12,7 @@
 //! claims a shard (`ShardManifest { writer_epoch: next, ..base }`). The epoch
 //! is therefore a writer fence and a tiebreak, never a numbering restart.
 
+use lance_context_metrics::etcd::{ObserveEtcd, Operation};
 use std::collections::BTreeMap;
 
 use etcd_client::{Compare, CompareOp, TxnOp};
@@ -530,7 +531,11 @@ impl Coordinator {
     async fn join_into_store(&self, key: &str, event: &DemandEvent) -> Result<bool> {
         let mut client = self.client.clone();
         for _ in 0..5 {
-            let current = client.get(key, None).await.map_err(|e| e.to_string())?;
+            let current = client
+                .get(key, None)
+                .observed(Operation::DemandRead)
+                .await
+                .map_err(|e| e.to_string())?;
             let stored = stored_event(current.kvs().first())?;
             let Some(next) = join_events(stored.as_ref(), event) else {
                 return Ok(false);
@@ -546,6 +551,7 @@ impl Coordinator {
                         .when(vec![compare])
                         .and_then(vec![TxnOp::put(key, value, None)]),
                 )
+                .observed(Operation::DemandPublish)
                 .await
                 .map_err(|e| e.to_string())?;
             if response.succeeded() {

@@ -22,6 +22,8 @@ use axum::{
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use metrics_process::Collector;
 
+pub mod etcd;
+
 mod recovery_signals;
 mod runtime_resources;
 
@@ -161,6 +163,9 @@ fn describe_metrics() {
         Unit::Seconds,
         "End-to-end HTTP handler latency, including body parsing and admission control."
     );
+
+    describe_counter!("etcd_operation_attempts_total", "Instrumented client method calls, counted on first poll. Static operation labels; excludes uncovered paths and transport-internal retries.");
+    describe_counter!("etcd_operation_completions_total", "Instrumented client call outcomes: ok (including rejected Txn comparisons), error, or abandoned local future with unknown remote outcome.");
 
     // Rollout write path. `rollout_add_request_duration_seconds` is labelled by
     // `flush` because flush is a query param on the add route, so the HTTP

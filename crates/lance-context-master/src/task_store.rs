@@ -7,6 +7,7 @@
 //! after the lease expires — execution is at-least-once, so task
 //! implementations must be idempotent.
 
+use lance_context_metrics::etcd::{ObserveEtcd, Operation};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -387,6 +388,7 @@ impl TaskStore {
                         Some(PutOptions::new().with_lease(b.lease_id)),
                     )]),
             )
+            .observed(Operation::TaskOther)
             .await
             .map(|r| r.succeeded())
             .map_err(etcd_error("request maintenance commit turn"))
@@ -462,6 +464,7 @@ impl TaskStore {
             .client
             .clone()
             .txn(Txn::new().when(compares).and_then(writes))
+            .observed(Operation::TaskClaim)
             .await;
         let accepted = match response {
             Ok(r) => r.succeeded(),
@@ -515,6 +518,7 @@ impl TaskStore {
             .client
             .clone()
             .lease_grant(900, None)
+            .observed(Operation::LeaseGrant)
             .await
             .map_err(etcd_error("compact no-op lease"))?
             .id();
@@ -527,6 +531,7 @@ impl TaskStore {
                 value.to_string(),
                 Some(PutOptions::new().with_lease(lease)),
             )
+            .observed(Operation::TaskOther)
             .await
             .map_err(etcd_error("compact no-op record"))?;
         Ok(())
@@ -549,6 +554,7 @@ impl TaskStore {
             .client
             .clone()
             .get(key, None)
+            .observed(Operation::TaskRead)
             .await
             .map_err(etcd_error("compact no-op read"))?;
         let Some(kv) = response.kvs().first() else {
@@ -742,6 +748,7 @@ impl TaskStore {
                         TxnOp::get(dedupe.as_str(), None),
                     ]),
             )
+            .observed(Operation::TaskEnqueue)
             .await
             .map_err(etcd_error("admit aggregate WAL demand"))?;
         if response.succeeded() {
@@ -771,6 +778,7 @@ impl TaskStore {
             std::str::from_utf8(existing.value()).map_err(|e| lance::Error::io(e.to_string()))?;
         let stored = client
             .get(inner.task_key(id), None)
+            .observed(Operation::TaskRead)
             .await
             .map_err(etcd_error("resolve aggregate WAL dedupe"))?;
         let mut compares = vec![Compare::value(dedupe.as_str(), CompareOp::Equal, id)];
@@ -800,6 +808,7 @@ impl TaskStore {
                     .when(with_publication_fence(compares, Some(fence)))
                     .and_then([TxnOp::delete(dedupe.as_str(), None)]),
             )
+            .observed(Operation::TaskEnqueue)
             .await
             .map_err(etcd_error("clean terminal aggregate WAL dedupe"))?;
         context.record(TaskKind::MergeWal, target, None, Outcome::Superseded);
@@ -853,6 +862,7 @@ impl TaskStore {
                         TxnOp::get(dedupe.as_str(), None),
                     ]),
             )
+            .observed(Operation::TaskEnqueue)
             .await
             .map_err(etcd_error("resolve aggregate admission outcome"))?;
         let observed = response
@@ -1046,6 +1056,7 @@ impl TaskStore {
                     .when(compares)
                     .and_then([TxnOp::delete(request_key, None)]),
             )
+            .observed(Operation::TaskOther)
             .await
             .map(|response| {
                 if response.succeeded() {
@@ -1382,6 +1393,7 @@ impl TaskStore {
                 policy,
                 Some(PutOptions::new().with_lease(lease_id)),
             )
+            .observed(Operation::DispatchWrite)
             .await
             .map_err(etcd_error("register discovery policy"))?;
         Ok(CoordinationGuard {
@@ -1414,6 +1426,7 @@ impl TaskStore {
                 token.as_str(),
                 Some(PutOptions::new().with_lease(lease_id)),
             )
+            .observed(Operation::DispatchWrite)
             .await
             .map_err(etcd_error("register dispatch capacity"))?;
         Ok(CoordinationGuard {
@@ -1455,6 +1468,7 @@ impl TaskStore {
                         Some(PutOptions::new().with_lease(guard.lease_id)),
                     )]),
             )
+            .observed(Operation::DispatchWrite)
             .await
             .map_err(etcd_error("rearm dispatch capacity"))?;
         if !response.succeeded() {
@@ -1515,6 +1529,7 @@ impl TaskStore {
                     options,
                 ),
             ]))
+            .observed(Operation::DispatchWrite)
             .await
             .map_err(etcd_error("offer task to reserved executor capacity"))?;
         Ok(response
@@ -1546,6 +1561,7 @@ impl TaskStore {
                         .collect::<Vec<_>>(),
                 ),
             )
+            .observed(Operation::TaskReadTxn)
             .await
             .map_err(etcd_error("observe dispatch dependencies"))?;
         let snapshot = if revision > 0 {
@@ -1608,6 +1624,7 @@ impl TaskStore {
                         Some(PutOptions::new().with_lease(session.lease_id)),
                     )]),
             )
+            .observed(Operation::DispatchWrite)
             .await
             .map_err(etcd_error("elect discovery leader"))?;
         Ok(response.succeeded())
@@ -1683,6 +1700,7 @@ impl TaskStore {
                         None,
                     )]),
             )
+            .observed(Operation::TaskOther)
             .await
             .map_err(etcd_error("publish backlog metrics"))?;
         if !result.succeeded() {
@@ -1705,6 +1723,7 @@ impl TaskStore {
                 format!("{}/observability/wal-backlog", self.inner.prefix),
                 None,
             )
+            .observed(Operation::TaskRead)
             .await
             .map_err(etcd_error("read backlog metrics"))?;
         let Some(kv) = result.kvs().first() else {
@@ -1779,6 +1798,7 @@ impl TaskStore {
                 .client
                 .clone()
                 .get(start, Some(options))
+                .observed(Operation::TaskScan)
                 .await
                 .map_err(etcd_error("page controller task history"))?;
             if revision == 0 {
@@ -1934,6 +1954,7 @@ impl EtcdTaskStore {
                     ))
                     .and_then([TxnOp::delete(key, None)]),
             )
+            .observed(Operation::TaskOther)
             .await
             .map_err(etcd_error("clean controller dedupe"))?;
         Ok(())
@@ -1974,6 +1995,7 @@ impl EtcdTaskStore {
                                 ))
                                 .and_then([TxnOp::get(dedupe_key.as_str(), None)]),
                         )
+                        .observed(Operation::TaskEnqueue)
                         .await
                         .map_err(etcd_error("read recovery enqueue observation"))?;
                     if !snapshot.succeeded() {
@@ -2023,7 +2045,11 @@ impl EtcdTaskStore {
                         TxnOp::put(dedupe_key.as_str(), task.id.as_bytes(), None),
                     ])
                     .or_else(otherwise);
-                let response = client.txn(txn).await.map_err(etcd_error("enqueue task"))?;
+                let response = client
+                    .txn(txn)
+                    .observed(Operation::TaskEnqueue)
+                    .await
+                    .map_err(etcd_error("enqueue task"))?;
                 if response.succeeded() {
                     context.record(kind, target, Some(&task.id), Outcome::Created);
                     return Ok(Some(task));
@@ -2053,6 +2079,7 @@ impl EtcdTaskStore {
                 TxnOp::put(task_key, value.clone(), None),
                 TxnOp::put(queue_key, value, None),
             ]))
+            .observed(Operation::TaskEnqueue)
             .await
             .map_err(etcd_error("enqueue task"))?;
         context.record(kind, target, Some(&task.id), Outcome::Created);
@@ -2088,6 +2115,7 @@ impl EtcdTaskStore {
                         .when(with_publication_fence(vec![request_matches()], fence))
                         .and_then([TxnOp::get(dedupe_key.as_str(), None)]),
                 )
+                .observed(Operation::TaskEnqueue)
                 .await
                 .map_err(etcd_error("read merge demand admission"))?;
             if !snapshot.succeeded() {
@@ -2106,6 +2134,7 @@ impl EtcdTaskStore {
             if let Some(existing_id) = existing_id {
                 let record = client
                     .get(self.task_key(&existing_id), None)
+                    .observed(Operation::TaskRead)
                     .await
                     .map_err(etcd_error("read merge demand task"))?;
                 if let Some(kv) = record.kvs().first() {
@@ -2143,6 +2172,7 @@ impl EtcdTaskStore {
                                     ))
                                     .and_then([TxnOp::delete(request_key.as_str(), None)]),
                             )
+                            .observed(Operation::TaskEnqueue)
                             .await
                             .map_err(etcd_error("acknowledge queued merge demand"))?;
                         if acknowledged.succeeded() {
@@ -2178,6 +2208,7 @@ impl EtcdTaskStore {
                             TxnOp::delete(request_key.as_str(), None),
                         ]),
                 )
+                .observed(Operation::TaskEnqueue)
                 .await
                 .map_err(etcd_error("admit merge demand"))?;
             if admitted.succeeded() {
@@ -2194,6 +2225,7 @@ impl EtcdTaskStore {
         let mut client = self.client.clone();
         let response = client
             .get(self.task_key(id), None)
+            .observed(Operation::TaskRead)
             .await
             .map_err(etcd_error("read task"))?;
         response
@@ -2207,6 +2239,7 @@ impl EtcdTaskStore {
         let mut client = self.client.clone();
         let response = client
             .get(self.tasks_prefix(), Some(GetOptions::new().with_prefix()))
+            .observed(Operation::TaskScan)
             .await
             .map_err(etcd_error("list tasks"))?;
         response
@@ -2223,6 +2256,7 @@ impl EtcdTaskStore {
                 self.queue_prefix(),
                 Some(GetOptions::new().with_prefix().with_count_only()),
             )
+            .observed(Operation::TaskScan)
             .await
             .map_err(etcd_error("count queued tasks"))?;
         usize::try_from(response.count())
@@ -2429,6 +2463,7 @@ impl EtcdTaskStore {
                                 .with_limit(TASK_POLL_BATCH as i64),
                         ),
                     )
+                    .observed(Operation::TaskScan)
                     .await
                     .map_err(etcd_error("list queued tasks"))?
             };
@@ -2822,6 +2857,7 @@ impl EtcdTaskStore {
                 let mut client = self.client.clone();
                 let response = client
                     .txn(Txn::new().when(compares).and_then(operations))
+                    .observed(Operation::TaskClaim)
                     .await;
                 #[cfg(test)]
                 let response = if self.lose_claim_response.swap(false, Ordering::AcqRel) {
@@ -2948,6 +2984,7 @@ impl EtcdTaskStore {
         let mut client = self.client.clone();
         let completed = client
             .txn(Txn::new().when(compares).and_then(operations))
+            .observed(Operation::TaskFinish)
             .await
             .map(|response| response.succeeded())
             .map_err(etcd_error("complete task"));
@@ -3000,7 +3037,12 @@ impl EtcdTaskStore {
         if let Some(revision) = cursor.revision {
             options = options.with_revision(revision);
         }
-        let response = self.client.clone().get(start, Some(options)).await;
+        let response = self
+            .client
+            .clone()
+            .get(start, Some(options))
+            .observed(Operation::TaskScan)
+            .await;
         let response = match response {
             Ok(response) => response,
             Err(error) => {
@@ -3066,6 +3108,7 @@ impl EtcdTaskStore {
                     start,
                     Some(GetOptions::new().with_range(end.clone()).with_limit(64)),
                 )
+                .observed(Operation::TaskScan)
                 .await
                 .map_err(etcd_error("list running tasks"))?;
             let tasks = page
@@ -3099,6 +3142,7 @@ impl EtcdTaskStore {
                         .collect::<Vec<_>>(),
                 ),
             )
+            .observed(Operation::TaskReadTxn)
             .await
             .map_err(etcd_error("read admission snapshot"))?;
         let responses = response.op_responses();
@@ -3187,6 +3231,7 @@ impl EtcdTaskStore {
             .client
             .clone()
             .txn(txn)
+            .observed(Operation::TaskOther)
             .await
             .map_err(etcd_error("recover orphaned task"))?
             .succeeded())
@@ -3206,6 +3251,7 @@ impl EtcdTaskStore {
         let mut client = self.client.clone();
         if !client
             .txn(txn)
+            .observed(Operation::TaskOther)
             .await
             .map_err(etcd_error("acquire coordination lock"))?
             .succeeded()
@@ -3226,6 +3272,7 @@ impl EtcdTaskStore {
         let mut client = self.client.clone();
         client
             .lease_grant(self.lease_ttl, None)
+            .observed(Operation::LeaseGrant)
             .await
             .map(|response| response.id())
             .map_err(etcd_error("grant lease"))
@@ -3235,11 +3282,15 @@ impl EtcdTaskStore {
         let mut client = self.client.clone();
         let interval = Duration::from_secs((self.lease_ttl / 3).max(1) as u64);
         let ttl = Duration::from_secs(self.lease_ttl as u64);
-        let (mut keeper, mut stream) =
-            tokio::time::timeout(interval, client.lease_keep_alive(lease_id))
-                .await
-                .map_err(|_| lance::Error::io("start lease keepalive timed out"))?
-                .map_err(etcd_error("start lease keepalive"))?;
+        let (mut keeper, mut stream) = tokio::time::timeout(
+            interval,
+            client
+                .lease_keep_alive(lease_id)
+                .observed(Operation::LeaseStreamOpen),
+        )
+        .await
+        .map_err(|_| lance::Error::io("start lease keepalive timed out"))?
+        .map_err(etcd_error("start lease keepalive"))?;
         // etcd-client consumes a positive-TTL response during the handshake.
         let (stop_tx, mut stop_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
@@ -3286,7 +3337,9 @@ impl EtcdTaskStore {
                     }
                     let result = tokio::time::timeout_at(
                         recovery_until.min(reconnect_started + interval),
-                        client.lease_keep_alive(lease_id),
+                        client
+                            .lease_keep_alive(lease_id)
+                            .observed(Operation::LeaseStreamOpen),
                     )
                     .await;
                     if let Ok(Ok((replacement, replacement_stream))) = result {
@@ -3322,7 +3375,11 @@ impl EtcdTaskStore {
 
     async fn revoke_lease(&self, lease_id: i64) -> lance::Result<()> {
         let mut client = self.client.clone();
-        match client.lease_revoke(lease_id).await {
+        match client
+            .lease_revoke(lease_id)
+            .observed(Operation::LeaseRevoke)
+            .await
+        {
             Ok(_) => Ok(()),
             // This is the exact etcd lease RPC error, not a substring search
             // across an arbitrary storage error or request identifier.
@@ -3342,6 +3399,7 @@ impl EtcdTaskStore {
         let mut client = self.client.clone();
         client
             .txn(txn)
+            .observed(Operation::TaskOther)
             .await
             .map(|_| ())
             .map_err(etcd_error("release owned key"))
@@ -3351,6 +3409,7 @@ impl EtcdTaskStore {
         let mut client = self.client.clone();
         let response = client
             .get(key, None)
+            .observed(Operation::TaskRead)
             .await
             .map_err(etcd_error("read etcd key"))?;
         response
@@ -3417,6 +3476,7 @@ impl EtcdTaskStore {
         let mut client = self.client.clone();
         client
             .txn(txn)
+            .observed(Operation::TaskOther)
             .await
             .map(|response| response.succeeded())
             .map_err(etcd_error("fail task with unsuccessful dependency"))
@@ -3439,6 +3499,7 @@ impl EtcdTaskStore {
                         .when(with_publication_fence(Vec::new(), fence))
                         .and_then(operations),
                 )
+                .observed(Operation::TaskOther)
                 .await
                 .map_err(etcd_error("prune task history"))?;
             if !response.succeeded() {
@@ -3538,6 +3599,7 @@ impl EtcdTaskStore {
         let mut client = self.client.clone();
         let response = client
             .get(self.cooldown_key(kind, target), None)
+            .observed(Operation::TaskRead)
             .await
             .map_err(etcd_error("get cooldown"))?;
         response
@@ -3603,6 +3665,7 @@ impl EtcdTaskStore {
             let mut client = self.client.clone();
             let lease = client
                 .lease_grant(policy.max.as_secs().max(1) as i64, None)
+                .observed(Operation::LeaseGrant)
                 .await
                 .map_err(etcd_error("grant cooldown lease"))?
                 .id();
@@ -3622,12 +3685,16 @@ impl EtcdTaskStore {
                             Some(PutOptions::new().with_lease(lease)),
                         )]),
                 )
+                .observed(Operation::TaskOther)
                 .await
                 .map_err(etcd_error("put cooldown"))?
                 .succeeded();
             if !committed {
                 // Someone else bumped it first; re-read and try again.
-                let _ = client.lease_revoke(lease).await;
+                let _ = client
+                    .lease_revoke(lease)
+                    .observed(Operation::LeaseRevoke)
+                    .await;
                 continue;
             }
             if cooling {
@@ -3653,6 +3720,7 @@ impl EtcdTaskStore {
         let mut client = self.client.clone();
         client
             .delete(self.cooldown_key(kind, target), None)
+            .observed(Operation::TaskOther)
             .await
             .map_err(etcd_error("clear cooldown"))?;
         Ok(())
@@ -3665,6 +3733,7 @@ impl EtcdTaskStore {
                 self.cooldown_prefix(),
                 Some(GetOptions::new().with_prefix()),
             )
+            .observed(Operation::TaskScan)
             .await
             .map_err(etcd_error("list cooldowns"))?;
         response
@@ -3686,6 +3755,7 @@ impl EtcdTaskStore {
         let mut client = self.client.clone();
         let lease = client
             .lease_grant(ttl_secs.max(60) as i64, None)
+            .observed(Operation::LeaseGrant)
             .await
             .map_err(etcd_error("grant repair lease"))?
             .id();
@@ -3699,6 +3769,7 @@ impl EtcdTaskStore {
             .map_err(|e| lance::Error::io(format!("encode repair: {e}")))?;
         client
             .put(key, value, Some(PutOptions::new().with_lease(lease)))
+            .observed(Operation::TaskOther)
             .await
             .map_err(etcd_error("put repair"))?;
         Ok(())
@@ -3708,6 +3779,7 @@ impl EtcdTaskStore {
         let mut client = self.client.clone();
         let response = client
             .get(self.repairs_prefix(), Some(GetOptions::new().with_prefix()))
+            .observed(Operation::TaskScan)
             .await
             .map_err(etcd_error("list repairs"))?;
         let mut out = response

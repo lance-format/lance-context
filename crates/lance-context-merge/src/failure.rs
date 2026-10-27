@@ -2,6 +2,7 @@
 use crate::{ClaimProof, Coordinator, Execution, Phase, Result, RESERVED_RECOVERY_REASON};
 use etcd_client::{Compare, CompareOp, GetOptions, TxnOp};
 use lance_context_api::MaintenanceErrorCode;
+use lance_context_metrics::etcd::{ObserveEtcd, Operation};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -257,6 +258,7 @@ impl Coordinator {
             .client
             .clone()
             .get(self.failure_key(target, endpoint), None)
+            .observed(Operation::MergeFailureRead)
             .await
             .map_err(|e| e.to_string())?;
         response
@@ -291,6 +293,7 @@ impl Coordinator {
             .client
             .clone()
             .get(key.clone(), None)
+            .observed(Operation::MergeFailureRead)
             .await
             .map_err(|e| e.to_string())?;
         let previous = response.kvs().first();
@@ -322,6 +325,7 @@ impl Coordinator {
             .client
             .clone()
             .get(key.clone(), None)
+            .observed(Operation::MergeFailureRead)
             .await
             .map_err(|e| e.to_string())?;
         let Some(kv) = response.kvs().first() else {
@@ -361,6 +365,7 @@ impl Coordinator {
             .client
             .clone()
             .get(key.clone(), None)
+            .observed(Operation::MergeFailureRead)
             .await
             .map_err(|e| e.to_string())?;
         let previous = response.kvs().first();
@@ -433,6 +438,7 @@ impl Coordinator {
             .client
             .clone()
             .get(start, Some(options.with_limit(limit.clamp(1, 256))))
+            .observed(Operation::MergeFailureRead)
             .await
             .map_err(|e| e.to_string())?;
         let rows = response
