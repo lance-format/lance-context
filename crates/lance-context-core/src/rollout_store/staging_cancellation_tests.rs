@@ -881,7 +881,8 @@ async fn staged_wal_discarded_scheduler_request_keeps_budget_until_physical_io_e
                             fail: physical_error,
                         }));
                         {
-                            let request = file.submit_request(vec![0..1024 * 1024], 0);
+                            let request =
+                                file.submit_request(std::iter::once(0..1024 * 1024).collect(), 0);
                             tokio::pin!(request);
                             tokio::select! {
                                 _ = &mut request => panic!("physical read must remain blocked"),
