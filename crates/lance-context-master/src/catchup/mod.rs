@@ -79,6 +79,7 @@ pub struct CatchupConfig {
     pub parallel_upsert_io_targets: Vec<String>,
     /// Exact targets opting in to concurrent immutable WAL read/encode staging.
     /// Base commits remain ordered; the process merge byte budget is unchanged.
+    /// A single empty value disables staging, including inherited Job settings.
     #[arg(long, env = "CATCHUP_STAGING_TARGETS", value_delimiter = ',')]
     pub staging_targets: Vec<String>,
     #[arg(long, env = "CATCHUP_STAGING_CONCURRENCY", default_value_t = 2)]
@@ -128,11 +129,16 @@ impl Default for CatchupConfig {
 }
 impl CatchupConfig {
     pub fn validate(&self) -> Result<()> {
+        // Clap represents an explicitly empty environment variable as [""].
+        // Job rendering uses that value to clear an inherited opt-in; it must
+        // remain a valid disabled setting, while empty entries in a nonempty
+        // target list still indicate malformed configuration.
+        let empty_override = self.staging_targets.len() == 1 && self.staging_targets[0].is_empty();
         if !(1..=8).contains(&self.staging_concurrency)
             || self
                 .staging_targets
                 .iter()
-                .any(|target| target.is_empty() || target.contains('*'))
+                .any(|target| (target.is_empty() && !empty_override) || target.contains('*'))
         {
             return Err("invalid immutable WAL staging concurrency or exact targets".into());
         }

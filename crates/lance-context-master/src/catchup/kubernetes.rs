@@ -465,6 +465,82 @@ mod tests {
             json!({"items":[{"status":{"phase":if mock.pods_stopped.load(Ordering::SeqCst) {"Failed"} else {"Running"}}}]}),
         )
     }
+    #[test]
+    fn rendered_staging_target_override_round_trips_through_startup() {
+        let record: Record = serde_json::from_value(json!({
+            "target":"hot", "job":"job", "job_uid":"job-uid", "slot":0,
+            "attempt":1, "active":true, "reason":"test", "pending_at_admission":1000,
+            "created_at_ms":0, "finished_at_ms":null, "consecutive_failures":0,
+            "needs_attention":false, "next_retry_ms":0, "outcome":null
+        }))
+        .unwrap();
+        let mut config = MasterConfig::parse_from(["master"]);
+        for targets in [vec![], vec!["hot".to_string(), "other".to_string()]] {
+            config.catchup.staging_targets = targets.clone();
+            // Explicit override must win over the template's opt-in.
+            let job = render_job(
+                &config,
+                &record,
+                json!({"containers":[{
+                    "name":"executor", "env":[{"name":"CATCHUP_STAGING_TARGETS","value":"inherited"}]
+                }]}),
+            );
+            let env = job["spec"]["template"]["spec"]["containers"][0]["env"]
+                .as_array()
+                .unwrap();
+            let values: Vec<_> = env
+                .iter()
+                .filter(|v| v["name"] == "CATCHUP_STAGING_TARGETS")
+                .collect();
+            assert_eq!(values.len(), 1);
+            let value = values[0]["value"].as_str().unwrap();
+            assert_eq!(value, targets.join(","));
+            // CLI and env values share clap's value parser; no process-global
+            // environment mutation is needed to exercise the generated value.
+            let parsed = MasterConfig::try_parse_from([
+                "master",
+                "--staging-targets",
+                value,
+                "--target",
+                "hot",
+                "--job-name",
+                "job",
+                "--shards",
+                "writer0",
+            ])
+            .unwrap();
+            parsed.catchup.validate().unwrap();
+            assert_eq!(
+                parsed.catchup.staging_targets.iter().any(|t| t == "hot"),
+                !targets.is_empty()
+            );
+            assert!(!parsed
+                .catchup
+                .staging_targets
+                .iter()
+                .any(|t| t == "inherited"));
+        }
+        for value in [",", "hot,", ",hot", "hot,,other", "*", "hot,*"] {
+            let parsed =
+                MasterConfig::try_parse_from(["master", "--staging-targets", value]).unwrap();
+            assert!(
+                parsed.catchup.validate().is_err(),
+                "accepted malformed list {value:?}"
+            );
+        }
+        for width in ["0", "9"] {
+            let parsed = MasterConfig::try_parse_from([
+                "master",
+                "--staging-targets",
+                "",
+                "--staging-concurrency",
+                width,
+            ])
+            .unwrap();
+            assert!(parsed.catchup.validate().is_err());
+        }
+    }
+
     #[tokio::test]
     async fn ambiguous_create_is_adopted_and_terminating_pods_retain_capacity() {
         let mock = Arc::new(Mock {
