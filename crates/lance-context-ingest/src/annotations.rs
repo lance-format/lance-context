@@ -44,6 +44,8 @@ struct Progress {
 }
 
 struct Shared {
+    #[cfg(test)]
+    apply_attempts: std::sync::atomic::AtomicU64,
     staging: AnnotationStaging,
     results: Mutex<checkpoint::Results>,
     window: Mutex<window::Window>,
@@ -104,6 +106,12 @@ pub async fn connect_ingress(
 }
 
 impl Service {
+    #[cfg(test)]
+    pub(crate) fn apply_attempts(&self) -> u64 {
+        self.shared
+            .apply_attempts
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
     pub fn reclamation_observation(&self) -> runtime::reclamation::Observation {
         self.shared.reclamation.lock().unwrap().clone()
     }
@@ -224,6 +232,8 @@ impl Service {
                 source_generations: Arc::new(tokio::sync::Semaphore::new(2)),
                 replay_cut: Mutex::new(None),
                 ordered: tokio::sync::Mutex::new(()),
+                #[cfg(test)]
+                apply_attempts: std::sync::atomic::AtomicU64::new(0),
                 progress,
                 reclamation: Mutex::new(Default::default()),
             }),
@@ -561,6 +571,11 @@ impl Driver {
                 patch: &m.patch,
             })
             .collect();
+        #[cfg(test)]
+        service
+            .shared
+            .apply_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let result = match service
             .shared
             .staging

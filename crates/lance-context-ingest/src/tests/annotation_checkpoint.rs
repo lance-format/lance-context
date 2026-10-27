@@ -7,6 +7,8 @@ use crate::{
 };
 use lance_context_core::annotation_staging::Limits;
 
+mod pressure;
+
 pub(super) async fn prepare(
     c: &network::Cluster,
     frozen: &FrozenCheckpoint,
