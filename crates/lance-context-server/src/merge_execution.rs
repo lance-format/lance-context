@@ -1,6 +1,8 @@
 //! HTTP handlers only admit/cancel work. The owned executor, not the connection,
 //! holds the durable execution fence until the scoped storage future is gone.
 mod background;
+#[cfg(test)]
+mod progress_tests;
 pub(crate) use background::{publish_background_request, spawn_background};
 
 use crate::{
@@ -609,12 +611,32 @@ async fn watch_progress(
     execution: &Execution,
     scope: &lance_context_core::merge_write_scope::MergeWriteScope,
 ) -> String {
+    watch_progress_with(execution, scope, |sequence| {
+        coordinator.publish_progress(execution, sequence)
+    })
+    .await
+}
+
+async fn watch_progress_with<F>(
+    execution: &Execution,
+    scope: &lance_context_core::merge_write_scope::MergeWriteScope,
+    mut publish: impl FnMut(u64) -> F,
+) -> String
+where
+    F: std::future::Future<Output = Result<bool, String>>,
+{
     let mut sequence = 0;
     let mut changed = tokio::time::Instant::now();
     let mut published = 0;
+    // Sample actual work every second, but coalesce continuous progress writes.
+    // Keep several publication opportunities inside even a short idle budget.
+    let publish_every = Duration::from_secs((execution.idle_timeout_secs / 4).clamp(1, 5));
+    let mut next_publication = tokio::time::Instant::now();
+    let mut publication_failed = false;
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
         let current = scope.completed_steps();
+        let resumed = current != sequence && changed.elapsed() >= publish_every;
         if current != sequence {
             sequence = current;
             changed = tokio::time::Instant::now();
@@ -623,10 +645,30 @@ async fn watch_progress(
             return "merge no-progress deadline exceeded".into();
         }
         if current != published {
-            match coordinator.publish_progress(execution, current).await {
-                Ok(true) => published = current,
-                Ok(false) => return "merge ownership revoked during execution".into(),
+            if !publication_failed && !resumed && tokio::time::Instant::now() < next_publication {
+                metrics::counter!("worker_merge_progress_coalesced_samples_total").increment(1);
+                continue;
+            }
+            metrics::counter!("worker_merge_progress_publication_attempts_total").increment(1);
+            match publish(current).await {
+                Ok(true) => {
+                    published = current;
+                    next_publication = tokio::time::Instant::now() + publish_every;
+                    publication_failed = false;
+                    metrics::counter!("worker_merge_progress_publications_total", "result" => "success")
+                        .increment(1);
+                }
+                Ok(false) => {
+                    metrics::counter!("worker_merge_progress_publications_total", "result" => "revoked")
+                        .increment(1);
+                    return "merge ownership revoked during execution".into();
+                }
                 Err(error) => {
+                    // Retry at the existing local tick, using the latest work.
+                    // Neither a retry nor its acknowledgement extends idle time.
+                    publication_failed = true;
+                    metrics::counter!("worker_merge_progress_publications_total", "result" => "error")
+                        .increment(1);
                     tracing::warn!(id = %execution.id, %error, "merge progress publication failed")
                 }
             }
@@ -670,7 +712,7 @@ mod tests {
     use lance_context_merge::{ClaimProof, EtcdConfig};
     use tokio::io::AsyncWriteExt;
 
-    async fn isolated_etcd_rpc_counts() -> (u64, u64) {
+    async fn isolated_etcd_rpc_counts() -> (u64, u64, u64) {
         use tokio::io::AsyncReadExt;
         assert_eq!(std::env::var("ETCD_TEST_EXCLUSIVE").as_deref(), Ok("1"));
         let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
@@ -704,7 +746,7 @@ mod tests {
                 })
                 .sum()
         };
-        (count("Range"), count("Watch"))
+        (count("Range"), count("Watch"), count("Txn"))
     }
 
     #[tokio::test]
@@ -751,7 +793,8 @@ mod tests {
         }
         let after = isolated_etcd_rpc_counts().await;
         assert_eq!(
-            after, baseline,
+            (after.0, after.1),
+            (baseline.0, baseline.1),
             "healthy owner stream must not reread or resubscribe on progress"
         );
         assert_eq!(baseline.0 - initial.0, 1, "one initial owner read");
@@ -766,6 +809,76 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(result.contains("revoked"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires exclusive isolated local ETCD_TEST_ENDPOINTS"]
+    async fn worker_progress_coalesces_real_etcd_writes_and_preserves_owner_watch() {
+        use lance_context_core::merge_write_scope::{checkpoint, MergeWriteScope};
+
+        let (_state, coordinator, proof, _dir) = deadline_fixture().await;
+        let mut execution = Execution::new("hot", "worker", "boot", 600);
+        execution.idle_timeout_secs = 120;
+        assert!(coordinator.reserve(&proof, &execution).await.unwrap());
+        let running = coordinator.start(&execution).await.unwrap().unwrap();
+        let scope = MergeWriteScope::new();
+        let initial = isolated_etcd_rpc_counts().await;
+        let observer = watch_ownership(&coordinator, &running);
+        tokio::pin!(observer);
+        let verify = async {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while isolated_etcd_rpc_counts().await.1 == initial.1 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let baseline = isolated_etcd_rpc_counts().await;
+            let progress = watch_progress(&coordinator, &running, &scope);
+            tokio::pin!(progress);
+            let work = async {
+                // Real local work continues independently of metadata writes.
+                for _ in 0..120 {
+                    scope.run(async { checkpoint() }).await;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                let after = isolated_etcd_rpc_counts().await;
+                assert_eq!((after.0, after.1), (baseline.0, baseline.1));
+                let writes = after.2 - baseline.2;
+                assert!((2..=4).contains(&writes), "progress Txns: {writes}");
+                let published = coordinator.progress(&running).await.unwrap().unwrap();
+                assert!(published.sequence >= 50);
+                assert!(published.sequence <= scope.completed_steps());
+                assert!(
+                    !coordinator.revoke_stalled(&running, Some(0)).await.unwrap(),
+                    "an obsolete progress observation cannot revoke current work"
+                );
+                println!(
+                    "worker progress: {} local steps, {writes} Txns, published sequence {}",
+                    scope.completed_steps(),
+                    published.sequence
+                );
+            };
+            tokio::select! {
+                error = &mut progress => panic!("progress ended during continuous work: {error}"),
+                () = work => {},
+            }
+            let frozen = coordinator.freeze(&proof, &running).await.unwrap().unwrap();
+            assert!(!coordinator
+                .publish_progress(&running, scope.completed_steps() + 1)
+                .await
+                .unwrap());
+            frozen
+        };
+        let (error, frozen) = tokio::time::timeout(Duration::from_secs(20), async {
+            tokio::join!(&mut observer, verify)
+        })
+        .await
+        .unwrap();
+        assert!(error.contains("revoked"));
+        assert!(coordinator.finish_recovery(&proof, &frozen).await.unwrap());
+        let recovered = coordinator.get("hot").await.unwrap().unwrap();
+        assert!(coordinator.release(&proof, &recovered).await.unwrap());
     }
 
     #[tokio::test]

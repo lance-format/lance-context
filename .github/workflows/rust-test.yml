@@ -259,6 +259,7 @@ jobs:
             --skip execution_watch_compaction_requires_fresh_snapshot_then_resumes \
             --skip owner_watch_compaction_requires_refresh_not_fencing \
             --skip ownership_observer_does_not_poll_or_wake_on_own_progress \
+            --skip worker_progress_coalesces_real_etcd_writes_and_preserves_owner_watch \
             --skip task_store::tests::bounded_scheduler_compacted_snapshot_restarts_without_stealing_locks
           cargo test -p lance-context-core registry --lib -- --ignored
           cargo test -p lance-context-ingest --features worker --lib tests::worker -- --ignored
@@ -285,6 +286,9 @@ jobs:
             -- --exact --ignored --test-threads=1
           cargo test -p lance-context-server --bin lance-context-server \
             merge_execution::tests::ownership_observer_does_not_poll_or_wake_on_own_progress \
+            -- --exact --ignored --test-threads=1
+          cargo test -p lance-context-server --bin lance-context-server \
+            merge_execution::tests::worker_progress_coalesces_real_etcd_writes_and_preserves_owner_watch \
             -- --exact --ignored --test-threads=1
           cargo test -p lance-context-master --lib \
             merge_execution::tests::first_worker_turn_reuses_failure_read \
@@ -435,6 +439,7 @@ jobs:
             --skip execution_watch_compaction_requires_fresh_snapshot_then_resumes \
             --skip owner_watch_compaction_requires_refresh_not_fencing \
             --skip ownership_observer_does_not_poll_or_wake_on_own_progress \
+            --skip worker_progress_coalesces_real_etcd_writes_and_preserves_owner_watch \
             --skip task_store::tests::bounded_scheduler_compacted_snapshot_restarts_without_stealing_locks
           bash scripts/ci/run-built-tests.sh "$RUNNER_TEMP/coverage-tests.jsonl" lance-context-core lib registry --ignored
           bash scripts/ci/run-built-tests.sh "$RUNNER_TEMP/coverage-tests.jsonl" lance-context-ingest lib tests::worker --ignored
@@ -456,6 +461,9 @@ jobs:
             --exact --ignored --test-threads=1
           bash scripts/ci/run-built-tests.sh "$RUNNER_TEMP/coverage-tests.jsonl" lance-context-server bin:lance-context-server \
             merge_execution::tests::ownership_observer_does_not_poll_or_wake_on_own_progress \
+            --exact --ignored --test-threads=1
+          bash scripts/ci/run-built-tests.sh "$RUNNER_TEMP/coverage-tests.jsonl" lance-context-server bin:lance-context-server \
+            merge_execution::tests::worker_progress_coalesces_real_etcd_writes_and_preserves_owner_watch \
             --exact --ignored --test-threads=1
           bash scripts/ci/run-built-tests.sh "$RUNNER_TEMP/coverage-tests.jsonl" lance-context-master lib \
             merge_execution::tests::first_worker_turn_reuses_failure_read \
