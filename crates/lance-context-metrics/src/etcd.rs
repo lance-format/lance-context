@@ -43,53 +43,103 @@ pub enum Operation {
     LeaseRevoke,
 }
 
+#[derive(Clone, Copy)]
+enum Outcome {
+    Ok,
+    Error,
+    Abandoned,
+}
+
 impl Operation {
-    fn label(self) -> &'static str {
+    fn record(self, outcome: Option<Outcome>) {
+        // Static keys avoid a label-vector allocation on every call. Register
+        // against the current recorder; caching handles across recorders would
+        // break local recorder isolation.
+        use metrics::{Key, Label, Level, Metadata};
+        static META: Metadata<'static> =
+            Metadata::new(module_path!(), Level::INFO, Some(module_path!()));
+        macro_rules! record {
+            ($label:literal) => {{
+                static ATTEMPT: Key = {
+                    static LABELS: [Label; 1] = [Label::from_static_parts("operation", $label)];
+                    Key::from_static_parts("etcd_operation_attempts_total", &LABELS)
+                };
+                static OK: Key = {
+                    static LABELS: [Label; 2] = [
+                        Label::from_static_parts("operation", $label),
+                        Label::from_static_parts("outcome", "ok"),
+                    ];
+                    Key::from_static_parts("etcd_operation_completions_total", &LABELS)
+                };
+                static ERROR: Key = {
+                    static LABELS: [Label; 2] = [
+                        Label::from_static_parts("operation", $label),
+                        Label::from_static_parts("outcome", "error"),
+                    ];
+                    Key::from_static_parts("etcd_operation_completions_total", &LABELS)
+                };
+                static ABANDONED: Key = {
+                    static LABELS: [Label; 2] = [
+                        Label::from_static_parts("operation", $label),
+                        Label::from_static_parts("outcome", "abandoned"),
+                    ];
+                    Key::from_static_parts("etcd_operation_completions_total", &LABELS)
+                };
+                let key = match outcome {
+                    None => &ATTEMPT,
+                    Some(Outcome::Ok) => &OK,
+                    Some(Outcome::Error) => &ERROR,
+                    Some(Outcome::Abandoned) => &ABANDONED,
+                };
+                metrics::with_recorder(|recorder| {
+                    recorder.register_counter(key, &META).increment(1)
+                });
+            }};
+        }
         match self {
-            Self::MergeRead => "merge_read",
-            Self::MergeScan => "merge_scan",
-            Self::MergeReserve => "merge_reserve",
-            Self::MergeStart => "merge_start",
-            Self::MergeTerminal => "merge_terminal",
-            Self::MergeRelease => "merge_release",
-            Self::MergeProgressInitial => "merge_progress_initial",
-            Self::MergeProgressChanged => "merge_progress_changed",
-            Self::MergeWorkProgress => "merge_work_progress",
-            Self::MergeCommitRead => "merge_commit_read",
-            Self::MergeCommitWrite => "merge_commit_write",
-            Self::MergeFailureRead => "merge_failure_read",
-            Self::MergeOther => "merge_other",
-            Self::MergeOwnerWatch => "merge_owner_watch",
-            Self::MergeProgressWatch => "merge_progress_watch",
-            Self::DemandRead => "demand_read",
-            Self::DemandPublish => "demand_publish",
-            Self::DemandScan => "demand_scan",
-            Self::TaskRead => "task_read",
-            Self::TaskReadTxn => "task_read_txn",
-            Self::TaskScan => "task_scan",
-            Self::TaskEnqueue => "task_enqueue",
-            Self::TaskClaim => "task_claim",
-            Self::TaskFinish => "task_finish",
-            Self::TaskOther => "task_other",
-            Self::DispatchRead => "dispatch_read",
-            Self::DispatchWrite => "dispatch_write",
-            Self::DispatchWatch => "dispatch_watch",
-            Self::LeaseGrant => "lease_grant",
-            Self::LeaseStreamOpen => "lease_stream_open",
-            Self::LeaseRevoke => "lease_revoke",
+            Self::MergeRead => record!("merge_read"),
+            Self::MergeScan => record!("merge_scan"),
+            Self::MergeReserve => record!("merge_reserve"),
+            Self::MergeStart => record!("merge_start"),
+            Self::MergeTerminal => record!("merge_terminal"),
+            Self::MergeRelease => record!("merge_release"),
+            Self::MergeProgressInitial => record!("merge_progress_initial"),
+            Self::MergeProgressChanged => record!("merge_progress_changed"),
+            Self::MergeWorkProgress => record!("merge_work_progress"),
+            Self::MergeCommitRead => record!("merge_commit_read"),
+            Self::MergeCommitWrite => record!("merge_commit_write"),
+            Self::MergeFailureRead => record!("merge_failure_read"),
+            Self::MergeOther => record!("merge_other"),
+            Self::MergeOwnerWatch => record!("merge_owner_watch"),
+            Self::MergeProgressWatch => record!("merge_progress_watch"),
+            Self::DemandRead => record!("demand_read"),
+            Self::DemandPublish => record!("demand_publish"),
+            Self::DemandScan => record!("demand_scan"),
+            Self::TaskRead => record!("task_read"),
+            Self::TaskReadTxn => record!("task_read_txn"),
+            Self::TaskScan => record!("task_scan"),
+            Self::TaskEnqueue => record!("task_enqueue"),
+            Self::TaskClaim => record!("task_claim"),
+            Self::TaskFinish => record!("task_finish"),
+            Self::TaskOther => record!("task_other"),
+            Self::DispatchRead => record!("dispatch_read"),
+            Self::DispatchWrite => record!("dispatch_write"),
+            Self::DispatchWatch => record!("dispatch_watch"),
+            Self::LeaseGrant => record!("lease_grant"),
+            Self::LeaseStreamOpen => record!("lease_stream_open"),
+            Self::LeaseRevoke => record!("lease_revoke"),
         }
     }
 }
 
 struct Attempt {
-    operation: &'static str,
+    operation: Operation,
     finished: bool,
 }
 
 impl Attempt {
     fn start(operation: Operation) -> Self {
-        let operation = operation.label();
-        metrics::counter!("etcd_operation_attempts_total", "operation" => operation).increment(1);
+        operation.record(None);
         Self {
             operation,
             finished: false,
@@ -98,23 +148,20 @@ impl Attempt {
 
     fn finish(mut self, ok: bool) {
         self.finished = true;
-        metrics::counter!("etcd_operation_completions_total",
-            "operation" => self.operation, "outcome" => if ok { "ok" } else { "error" })
-        .increment(1);
+        self.operation
+            .record(Some(if ok { Outcome::Ok } else { Outcome::Error }));
     }
 }
 
 impl Drop for Attempt {
     fn drop(&mut self) {
         if !self.finished {
-            metrics::counter!("etcd_operation_completions_total",
-                "operation" => self.operation, "outcome" => "abandoned")
-            .increment(1);
+            self.operation.record(Some(Outcome::Abandoned));
         }
     }
 }
 
-/// Observe exactly one client future without retries, allocation, spawning,
+/// Observe exactly one client future without boxing, retries, spawning,
 /// timeout changes or error conversion. Unpolled futures emit no metrics.
 pub trait ObserveEtcd<T, E>: Future<Output = Result<T, E>> + Sized {
     fn observed(self, operation: Operation) -> impl Future<Output = Result<T, E>> {

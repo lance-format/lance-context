@@ -7,7 +7,7 @@ The master and worker expose two monotonic counters for instrumented etcd client
 
 `ok` includes a successfully received Txn response whose comparisons rejected the mutation. `abandoned` means the local future was dropped, including an enclosing timeout or cancellation; the remote outcome remains unknown. Neither outcome changes ownership or grants permission to repeat a mutation. Calls still in flight contribute to attempts but not completions. A future dropped before its first poll contributes to neither counter. Each explicit retry is a separate attempt.
 
-Labels come from the finite `lance_context_metrics::etcd::Operation` enum. No key, table, endpoint, execution ID, error string, or other unbounded value is exported. There are no per-operation histograms. The current 31 operations allow at most 124 counter series per process before infrastructure tags; only observed series are registered.
+Labels come from the finite `lance_context_metrics::etcd::Operation` enum. No key, table, endpoint, execution ID, error string, or other unbounded value is exported. Metric keys and labels are static. The wrapper does not box or spawn futures; recorder registration can still allocate counter handles. There are no per-operation histograms. The current 31 operations allow at most 124 counter series per process before infrastructure tags; only observed series are registered.
 
 ## Covered paths
 
