@@ -289,7 +289,7 @@ impl MergeWriteScope {
 /// `work` must only prepare immutable output, never publish it. Its returned
 /// committer is delivered to the caller; if that caller was cancelled, the
 /// result is dropped without polling and therefore cannot publish later.
-pub async fn run_owned_preparation<F, T>(work: F) -> Result<T>
+pub async fn run_owned_preparation<F, T>(hold: crate::MergeReservationHold, work: F) -> Result<T>
 where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
@@ -323,7 +323,12 @@ where
     // the reservation they own. drain() accounts for this child until exit.
     tokio::spawn(async move {
         let _active = active;
-        let result = scope.run(work).await;
+        // The inner writer may return an error after dropping CPU JoinHandles.
+        // Hold the final memory charge outside it until actual closures exit,
+        // even on panic. Drop this hold before declaring preparation drained.
+        let retention = hold;
+        let result = lance_core::utils::tokio::join_cpu_tasks(scope.run(work)).await;
+        drop(retention);
         let _ = send.send(result);
     });
     receive

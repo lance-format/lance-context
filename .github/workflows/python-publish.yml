@@ -12,6 +12,7 @@ on:
       - python/Cargo.lock
       - python/pyproject.toml
       - vendor/lance-io/**
+      - vendor/lance-core/**
   workflow_dispatch:
     inputs:
       mode:
@@ -117,11 +118,12 @@ jobs:
                   raise SystemExit("Source distribution must contain the workspace Cargo.lock")
               if f"{root}/python/Cargo.lock" in source.getnames():
                   raise SystemExit("Source distribution contains an obsolete nested Cargo.lock")
-              backport = "vendor/lance-io/src/object_store/throttle.rs"
-              patched = source.extractfile(f"{root}/{backport}")
-              if patched is None or patched.read() != Path(backport).read_bytes():
-                  raise SystemExit("Source distribution must preserve the multipart retry backport")
-          print("Source distribution preserves the workspace lockfile and multipart retry backport")
+              for backport in ["vendor/lance-io/src/object_store/throttle.rs",
+                               "vendor/lance-core/src/utils/tokio.rs"]:
+                  patched = source.extractfile(f"{root}/{backport}")
+                  if patched is None or patched.read() != Path(backport).read_bytes():
+                      raise SystemExit(f"Source distribution must preserve {backport}")
+          print("Source distribution preserves the workspace lockfile and Lance backports")
           PY
 
       - name: Verify wheel tag

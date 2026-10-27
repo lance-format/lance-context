@@ -1192,12 +1192,14 @@ impl StorageBase {
         if prepared.staged.is_some() || prepared.batches.is_empty() {
             return Ok(());
         }
-        if self.dataset.manifest().data_storage_format.version
-            == lance_file::version::ConcreteFileVersion::V1
-        {
-            return Err(LanceError::invalid_input(
-                "WAL file staging requires Lance V2 files",
-            ));
+        if matches!(
+            self.dataset.manifest().data_storage_format.version,
+            lance_file::version::ConcreteFileVersion::V1
+                | lance_file::version::ConcreteFileVersion::V2_0
+        ) {
+            // Legacy encoders use untracked async tasks rather than spawn_cpu.
+            // Leave their encoding in the existing ordered commit path.
+            return Ok(());
         }
         prepared.staged = Some(
             encode_merge_files(Arc::new(self.dataset.clone()), prepared.batches.clone()).await?,

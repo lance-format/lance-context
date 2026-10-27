@@ -340,11 +340,14 @@ async fn prepare_nonempty_shard_reserved(
         metrics::counter!("master_catchup_empty_shard_probes_total").increment(1);
         return Ok(None);
     }
-    let prepared = if reservation.is_some() {
+    let prepared = if let Some(reservation) = reservation {
         let (state, target, shard) = (state.clone(), target.to_owned(), shard.to_owned());
-        lance_context_core::merge_write_scope::run_owned_preparation(async move {
-            prepare_shard(&state, &target, &shard, session, budget, reservation).await
-        })
+        lance_context_core::merge_write_scope::run_owned_preparation(
+            reservation.retain(),
+            async move {
+                prepare_shard(&state, &target, &shard, session, budget, Some(reservation)).await
+            },
+        )
         .await
         .map_err(|e| e.to_string())??
     } else {

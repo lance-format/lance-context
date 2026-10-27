@@ -194,11 +194,11 @@ async fn staged_wal_cancellation_retains_real_encoder_budget_until_scope_drain()
         let runner_uri = uri.clone();
         let reserve_budget = budget.clone();
         let caller = tokio::spawn(async move {
+            let reservation = reserve_budget.reserve(1024 * 1024).await;
             runner_scope
-                .run(run_owned_preparation(async move {
+                .run(run_owned_preparation(reservation.retain(), async move {
                     let mut store =
                         RolloutStore::open_existing_with_options(&runner_uri, options).await?;
-                    let reservation = reserve_budget.reserve(1024 * 1024).await;
                     let (manifests, manifest, mut prepared) =
                         store.prepare_merge_reserved(reservation).await?.unwrap();
                     store.stage_prepared_merge(&mut prepared).await?;
@@ -278,9 +278,9 @@ async fn staged_wal_cancellation_joins_actual_lance_cpu_child_before_releasing_b
     let (runner_gate, runner_entered, runner_finished) =
         (gate.clone(), entered.clone(), finished.clone());
     let caller = tokio::spawn(async move {
+        let reservation = runner_budget.reserve(2 * 1024 * 1024).await;
         runner_scope
-            .run(run_owned_preparation(async move {
-                let reservation = runner_budget.reserve(2 * 1024 * 1024).await;
+            .run(run_owned_preparation(reservation.retain(), async move {
                 let payload = vec![3u8; 2 * 1024 * 1024];
                 // Exactly the primitive used by Lance's page encoders: dropping
                 // its JoinHandle detaches this blocking child. The owned scope
@@ -334,12 +334,165 @@ async fn staged_wal_preparation_rejects_unowned_or_closed_scope_before_polling_p
     ] {
         scope.drain().await;
         let observed = polled.clone();
+        let reservation = crate::MergeMemoryBudget::new(1).reserve(1).await;
         let result = scope
-            .run(run_owned_preparation(async move {
+            .run(run_owned_preparation(reservation.retain(), async move {
                 observed.store(true, Ordering::SeqCst);
             }))
             .await;
         assert!(result.is_err());
         assert!(!polled.load(Ordering::SeqCst));
     }
+}
+
+/// The writer can discard a CPU handle on an unrelated encoding/IO error. This
+/// is different from cancelling a caller whose writer still awaits the handle.
+#[tokio::test]
+async fn staged_wal_internal_error_or_panic_joins_discarded_cpu_and_retains_budget() {
+    use crate::{merge_write_scope::run_owned_preparation, MergeMemoryBudget};
+    use std::{
+        sync::{Condvar, Mutex},
+        time::Duration,
+    };
+    for panic in [false, true] {
+        let budget = MergeMemoryBudget::new(4 * 1024 * 1024);
+        let reservation = budget.reserve(1024 * 1024).await;
+        let hold = reservation.retain();
+        let scope = MergeWriteScope::with_authorizer(Arc::new(NoCommit));
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        struct Release(Arc<(Mutex<bool>, Condvar)>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                *self.0 .0.lock().unwrap() = true;
+                self.0 .1.notify_all();
+            }
+        }
+        let release = Release(gate.clone());
+        let entered = Arc::new(Notify::new());
+        let failed = Arc::new(Notify::new());
+        let (child_entered, child_failed, runner_scope) =
+            (entered.clone(), failed.clone(), scope.clone());
+        let caller = tokio::spawn(async move {
+            runner_scope
+                .run(run_owned_preparation(hold, async move {
+                    let mut reservation = reservation;
+                    assert!(reservation.try_grow_to(3 * 1024 * 1024));
+                    let payload = vec![3u8; 3 * 1024 * 1024];
+                    // No await: exactly the detached-handle path inside a failed writer.
+                    drop(lance_core::utils::tokio::spawn_cpu(move || {
+                        child_entered.notify_one();
+                        let mut ready = gate.0.lock().unwrap();
+                        while !*ready {
+                            ready = gate.1.wait(ready).unwrap();
+                        }
+                        Ok::<_, lance::Error>(payload.len())
+                    }));
+                    drop(reservation);
+                    child_failed.notify_one();
+                    if panic {
+                        panic!("injected writer panic after CPU submission");
+                    }
+                    Err::<(), _>(lance::Error::io(
+                        "injected writer error after CPU submission",
+                    ))
+                }))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(20), entered.notified())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(20), failed.notified())
+            .await
+            .unwrap();
+        assert_eq!(budget.reserved(), 3 * 1024 * 1024);
+        assert!(budget.try_reserve(2 * 1024 * 1024).is_none());
+        assert!(!caller.is_finished());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), scope.drain())
+                .await
+                .is_err()
+        );
+        drop(release);
+        let result = tokio::time::timeout(Duration::from_secs(20), caller)
+            .await
+            .unwrap()
+            .unwrap();
+        if panic {
+            assert!(result.unwrap_err().to_string().contains("panicked"));
+        } else {
+            assert!(result
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("injected writer error"));
+        }
+        scope.drain().await;
+        assert_eq!(budget.reserved(), 0);
+        drop(budget.try_reserve(4 * 1024 * 1024).unwrap());
+        assert_eq!(budget.reserved(), 0);
+    }
+}
+
+#[tokio::test]
+async fn staged_wal_cpu_scopes_join_nested_work_and_isolate_concurrent_operations() {
+    use lance_core::utils::tokio::{join_cpu_tasks, spawn_cpu};
+    use std::{
+        sync::{Condvar, Mutex},
+        time::Duration,
+    };
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    struct Release(Arc<(Mutex<bool>, Condvar)>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            *self.0 .0.lock().unwrap() = true;
+            self.0 .1.notify_all();
+        }
+    }
+    let release = Release(gate.clone());
+    let entered = Arc::new(Notify::new());
+    let child_entered = entered.clone();
+    let outer = tokio::spawn(join_cpu_tasks(async move {
+        // Parent returns without awaiting the child. Even a single CPU thread
+        // can run this test: only the last nested closure is held by the gate.
+        spawn_cpu(move || {
+            drop(spawn_cpu(move || {
+                child_entered.notify_one();
+                let mut ready = gate.0.lock().unwrap();
+                while !*ready {
+                    ready = gate.1.wait(ready).unwrap();
+                }
+                Ok::<_, lance::Error>(())
+            }));
+            Ok::<_, lance::Error>(())
+        })
+        .await
+        .unwrap();
+    }));
+    tokio::time::timeout(Duration::from_secs(20), entered.notified())
+        .await
+        .unwrap();
+    assert!(
+        !outer.is_finished(),
+        "the parent has exited but its nested child is live"
+    );
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), join_cpu_tasks(async { 42 }))
+            .await
+            .unwrap(),
+        42
+    );
+    drop(release);
+    tokio::time::timeout(Duration::from_secs(20), outer)
+        .await
+        .unwrap()
+        .unwrap();
+    // A panic from an awaited CPU handle must still carry the original payload.
+    let panic = tokio::spawn(join_cpu_tasks(async {
+        spawn_cpu(|| -> std::result::Result<(), std::io::Error> { panic!("original CPU payload") })
+            .await
+    }))
+    .await
+    .unwrap_err()
+    .into_panic();
+    assert_eq!(panic.downcast_ref::<&str>(), Some(&"original CPU payload"));
 }

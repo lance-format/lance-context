@@ -8,6 +8,7 @@ on:
       - crates/**
       - vendor/raft-engine/**
       - vendor/lance-io/**
+      - vendor/lance-core/**
       - .github/workflows/rust-test.yml
       - Cargo.toml
       - Cargo.lock

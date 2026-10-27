@@ -28,7 +28,7 @@
 //! An oversized generation can still proceed when it is the sole holder.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::Semaphore;
 
@@ -53,6 +53,29 @@ pub struct MergeReservation {
     budget: Arc<MergeMemoryBudget>,
     permits: u32,
     bytes: usize,
+    lifetime: Arc<ReservationLifetime>,
+}
+
+/// Keeps the final reservation charged while detached encoder children finish.
+/// It does not duplicate permits or allow concurrent mutation of a reservation.
+#[derive(Debug)]
+pub struct MergeReservationHold {
+    _lifetime: Arc<ReservationLifetime>,
+}
+
+#[derive(Debug)]
+struct ReservationLifetime {
+    budget: Arc<MergeMemoryBudget>,
+    finished: Mutex<Option<(u32, usize)>>,
+}
+
+impl Drop for ReservationLifetime {
+    fn drop(&mut self) {
+        if let Some((permits, bytes)) = self.finished.get_mut().unwrap().take() {
+            self.budget.reserved.fetch_sub(bytes, Ordering::AcqRel);
+            self.budget.permits.add_permits(permits as usize);
+        }
+    }
 }
 
 impl MergeMemoryBudget {
@@ -104,6 +127,10 @@ impl MergeMemoryBudget {
             budget: Arc::clone(self),
             permits,
             bytes,
+            lifetime: Arc::new(ReservationLifetime {
+                budget: self.clone(),
+                finished: Mutex::new(None),
+            }),
         }
     }
 
@@ -118,6 +145,10 @@ impl MergeMemoryBudget {
             budget: self.clone(),
             permits,
             bytes,
+            lifetime: Arc::new(ReservationLifetime {
+                budget: self.clone(),
+                finished: Mutex::new(None),
+            }),
         })
     }
 
@@ -127,6 +158,15 @@ impl MergeMemoryBudget {
 }
 
 impl MergeReservation {
+    /// Delay release on owner drop until this hold is also dropped. Growth and
+    /// shrinkage still belong solely to the owner; the hold retains its final
+    /// accounting, including oversized reservations.
+    pub fn retain(&self) -> MergeReservationHold {
+        MergeReservationHold {
+            _lifetime: self.lifetime.clone(),
+        }
+    }
+
     pub(crate) fn belongs_to(&self, budget: &Arc<MergeMemoryBudget>) -> bool {
         Arc::ptr_eq(&self.budget, budget)
     }
@@ -181,8 +221,7 @@ impl MergeReservation {
 
 impl Drop for MergeReservation {
     fn drop(&mut self) {
-        self.budget.permits.add_permits(self.permits as usize);
-        self.budget.reserved.fetch_sub(self.bytes, Ordering::AcqRel);
+        *self.lifetime.finished.lock().unwrap() = Some((self.permits, self.bytes));
     }
 }
 
@@ -190,6 +229,37 @@ impl Drop for MergeReservation {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn retained_reservation_releases_final_charge_only_after_last_holder() {
+        let mib = PERMIT_BYTES;
+        let budget = MergeMemoryBudget::new(4 * mib);
+        for (start, grown, shrunk) in [(mib, 3 * mib, mib + 1), (10 * mib, 12 * mib, 7 * mib)] {
+            let mut reservation = budget.reserve(start).await;
+            let first = reservation.retain();
+            let second = reservation.retain();
+            assert!(reservation.try_grow_to(grown));
+            reservation.shrink_to(shrunk);
+            let available = budget.permits.available_permits();
+            drop(reservation);
+            assert_eq!(budget.reserved(), shrunk);
+            assert_eq!(budget.permits.available_permits(), available);
+            drop(first);
+            assert_eq!(budget.reserved(), shrunk);
+            drop(second);
+            assert_eq!(budget.reserved(), 0);
+            assert_eq!(budget.permits.available_permits(), 4);
+        }
+        let reservation = budget.reserve(mib).await;
+        drop(reservation.retain());
+        assert_eq!(
+            budget.reserved(),
+            mib,
+            "a returned committer still owns its reservation"
+        );
+        drop(reservation);
+        assert_eq!(budget.reserved(), 0);
+    }
 
     #[tokio::test]
     async fn reservations_release_on_drop() {

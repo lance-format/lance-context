@@ -44,9 +44,18 @@ phase timers or compare unrelated tables as an A/B test. The existing
 `CATCHUP_PARALLEL_UPSERT_IO_TARGETS` option only overlaps one batch's deletion
 and encoding; staging instead overlaps independent shards' read/encode work.
 
-Qualification is not complete. Scope ownership currently protects cancellation
-of the caller, including real Lance blocking CPU tasks. Lance 13 can also drop
-remaining encoder handles on an internal write/encoding error. Joining those
-CPU children before releasing their reservation still requires a scoped CPU
-tracking backport and a failing-write/blocked-CPU regression. Keep this option
-disabled until that check and the fixed-image Azure comparison pass.
+Lance 13 can drop remaining CPU encoder handles on an internal write/encoding
+error. The scoped CPU task join patch in `vendor/lance-core` tracks the actual
+blocking closures, including nested submissions. A separate reservation hold
+retains the writer's final memory charge even when the writer returns an error
+or panics before its children finish. Scope drain waits for that cleanup before
+acknowledging completion; successful prepared output keeps its own reservation.
+This does not turn the decoded-byte budget into a hard RSS bound.
+
+Qualification is not complete. The CPU patch does not track arbitrary Tokio
+children: Lance's fragment scanner and batch decoder also spawn async tasks.
+V1/V2.0 tables keep encoding in the existing ordered commit path.
+The scanner paths need separate failure/cancellation qualification with representative
+payloads; passing the CPU tests is not evidence that every scanner child joined.
+Keep this option disabled until these checks and the fixed-image Azure comparison
+pass. All performance claims require the representative comparison above.
