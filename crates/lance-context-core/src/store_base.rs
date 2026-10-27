@@ -289,6 +289,57 @@ pub struct PreparedMerge {
     reservation: Option<MergeReservation>,
     bulk_key_delete: bool,
     parallel_upsert_io: bool,
+    staged: Option<StagedMergeFiles>,
+}
+
+/// Encoded files have no visible effect until the ordered merge commit.
+struct StagedMergeFiles {
+    uri: String,
+    schema: lance::datatypes::Schema,
+    fragments: Vec<lance_table::format::Fragment>,
+}
+
+impl StagedMergeFiles {
+    fn validate(&self, dataset: &Dataset) -> LanceResult<()> {
+        if self.uri != dataset.uri()
+            || self.schema.fields != dataset.schema().fields
+            || self.schema.metadata != dataset.schema().metadata
+        {
+            return Err(LanceError::io(MaintenanceErrorCode::StalePreparation.tag(
+                "base schema or location changed after WAL encoding; reprepare",
+            )));
+        }
+        Ok(())
+    }
+}
+
+async fn encode_merge_files(
+    snapshot: Arc<Dataset>,
+    batches: Vec<RecordBatch>,
+) -> LanceResult<StagedMergeFiles> {
+    use lance::dataset::transaction::Operation;
+    let _phase = crate::merge_write_scope::work_stage("file_encoding");
+    let uri = snapshot.uri().to_string();
+    let schema = snapshot.schema().clone();
+    let params = WriteParams {
+        mode: WriteMode::Append,
+        write_progress: Some(crate::merge_write_scope::write_progress()),
+        ..Default::default()
+    };
+    let tx = lance::dataset::InsertBuilder::new(snapshot)
+        .with_params(&params)
+        .execute_uncommitted(batches)
+        .await?;
+    match tx.operation {
+        Operation::Append { fragments } => Ok(StagedMergeFiles {
+            uri,
+            schema,
+            fragments,
+        }),
+        _ => Err(LanceError::io(
+            "upsert staging produced a non-append transaction",
+        )),
+    }
 }
 
 impl PreparedMerge {
@@ -987,7 +1038,8 @@ impl StorageBase {
         &self,
         threshold: usize,
     ) -> LanceResult<Option<(ShardManifestStore, ShardManifest, PreparedMerge)>> {
-        self.prepare_merge_if_ready_inner(threshold, false).await
+        self.prepare_merge_if_ready_inner(threshold, false, None)
+            .await
     }
 
     /// The shared-lock half of the *count*-triggered merge: prepare only if the
@@ -1002,7 +1054,7 @@ impl StorageBase {
         if self.merge_after_generations == 0 {
             return Ok(None);
         }
-        self.prepare_merge_if_ready_inner(self.merge_after_generations, false)
+        self.prepare_merge_if_ready_inner(self.merge_after_generations, false, None)
             .await
     }
 
@@ -1058,7 +1110,7 @@ impl StorageBase {
     pub async fn prepare_cleanup_merge(
         &self,
     ) -> LanceResult<Option<(ShardManifestStore, ShardManifest, PreparedMerge)>> {
-        self.prepare_merge_if_ready_inner(1, true).await
+        self.prepare_merge_if_ready_inner(1, true, None).await
     }
 
     /// Recover and seal this instance's durable WAL before preparing cleanup.
@@ -1071,13 +1123,38 @@ impl StorageBase {
         if !self.recover_and_flush_own_wal().await? {
             return Ok(None);
         }
-        self.prepare_merge_if_ready_inner(1, false).await
+        self.prepare_merge_if_ready_inner(1, false, None).await
+    }
+
+    /// Prepare sealed WAL with a reservation acquired before opening readers.
+    /// A native master may admit several shards without waiting while already
+    /// holding prepared results. This method never opens a resident writer.
+    pub async fn prepare_merge_reserved(
+        &self,
+        reservation: MergeReservation,
+    ) -> LanceResult<Option<(ShardManifestStore, ShardManifest, PreparedMerge)>> {
+        let budget = self.merge_budget.as_ref().ok_or_else(|| {
+            LanceError::invalid_input("reserved WAL preparation requires a shared budget")
+        })?;
+        let want = if self.merge_max_bytes == 0 {
+            budget.limit()
+        } else {
+            self.merge_max_bytes.min(budget.limit())
+        };
+        if !reservation.belongs_to(budget) || reservation.bytes() < want {
+            return Err(LanceError::invalid_input(
+                "WAL reservation has the wrong budget or allowance",
+            ));
+        }
+        self.prepare_merge_if_ready_inner(1, false, Some(reservation))
+            .await
     }
 
     async fn prepare_merge_if_ready_inner(
         &self,
         threshold: usize,
         seal_first: bool,
+        reservation: Option<MergeReservation>,
     ) -> LanceResult<Option<(ShardManifestStore, ShardManifest, PreparedMerge)>> {
         // Periodic maintenance must not advance an explicitly selected snapshot.
         if self.is_version_pinned() || self.deleted {
@@ -1101,10 +1178,31 @@ impl StorageBase {
         if pending == 0 || pending < threshold.max(1) {
             return Ok(None);
         }
-        let Some(prepared) = self.prepare_merge(&manifest).await? else {
+        let Some(prepared) = self.prepare_merge(&manifest, reservation).await? else {
             return Ok(None);
         };
         Ok(Some((manifest_store, manifest, prepared)))
+    }
+
+    /// Encode immutable files before the ordered commit. Keep the decoded
+    /// batches and their reservation for key deletion against the latest base.
+    /// No data, deletion masks, or WAL coverage are published here. The caller
+    /// must join this future before releasing its preparation/ownership scope.
+    pub async fn stage_prepared_merge(&self, prepared: &mut PreparedMerge) -> LanceResult<()> {
+        if prepared.staged.is_some() || prepared.batches.is_empty() {
+            return Ok(());
+        }
+        if self.dataset.manifest().data_storage_format.version
+            == lance_file::version::ConcreteFileVersion::V1
+        {
+            return Err(LanceError::invalid_input(
+                "WAL file staging requires Lance V2 files",
+            ));
+        }
+        prepared.staged = Some(
+            encode_merge_files(Arc::new(self.dataset.clone()), prepared.batches.clone()).await?,
+        );
+        Ok(())
     }
 
     /// Commit a merge prepared by [`Self::prepare_merge_if_ready`].
@@ -1135,7 +1233,11 @@ impl StorageBase {
     /// [`ShardManifestStore::commit_update`] only rejects a writer whose epoch is
     /// **older** than the stored one. Reusing the shard's current epoch commits
     /// the drain and leaves the live writer untouched.
-    async fn prepare_merge(&self, manifest: &ShardManifest) -> LanceResult<Option<PreparedMerge>> {
+    async fn prepare_merge(
+        &self,
+        manifest: &ShardManifest,
+        reservation: Option<MergeReservation>,
+    ) -> LanceResult<Option<PreparedMerge>> {
         // A staged append publishes its recovery watermark atomically with its
         // files. Honor it even when returning to the legacy merge implementation.
         let latest = Self::load_with_options(
@@ -1164,8 +1266,10 @@ impl StorageBase {
         // The expensive phase: pull a budgeted prefix of generations out of object
         // storage. Buffered in memory, so this is the part that must not hold an
         // exclusive lock.
-        let (merged_generations, merged_paths, batches, merge_schema, reservation) =
-            observe_phase!("read", self.read_flushed_generations(manifest).await)?;
+        let (merged_generations, merged_paths, batches, merge_schema, reservation) = observe_phase!(
+            "read",
+            self.read_flushed_generations(manifest, reservation).await
+        )?;
 
         Ok(Some(PreparedMerge {
             merged_generations,
@@ -1175,6 +1279,7 @@ impl StorageBase {
             reservation,
             bulk_key_delete: false,
             parallel_upsert_io: false,
+            staged: None,
         }))
     }
 
@@ -1218,6 +1323,7 @@ impl StorageBase {
             reservation,
             bulk_key_delete,
             parallel_upsert_io,
+            staged,
         } = prepared;
 
         // Several sweepers can prepare the same immutable generations under a
@@ -1238,6 +1344,9 @@ impl StorageBase {
         // commit after this handle's future was dropped. Always reopen latest
         // before retrying, including generic stores without schema evolution.
         self.refresh_latest().await?;
+        if let Some(files) = &staged {
+            files.validate(&self.dataset)?;
+        }
         self.ensure_latest_schema().await?;
         if crate::rollout_append::watermarks(&self.dataset)
             .await?
@@ -1264,7 +1373,8 @@ impl StorageBase {
                     merge_schema,
                     watermark,
                     bulk_key_delete,
-                    parallel_upsert_io
+                    parallel_upsert_io,
+                    staged
                 ))
                 .await
             )?;
@@ -1369,6 +1479,7 @@ impl StorageBase {
     async fn read_flushed_generations(
         &self,
         manifest: &ShardManifest,
+        reserved: Option<MergeReservation>,
     ) -> LanceResult<(
         HashSet<u64>,
         Vec<String>,
@@ -1381,8 +1492,9 @@ impl StorageBase {
         // concurrent readers can fill the initial budget (see `merge_budget`).
         // With the count cap disabled and no byte cap, the allowance is the
         // full budget: the merge may read everything pending, alone.
-        let mut reservation = match &self.merge_budget {
-            Some(budget) => {
+        let mut reservation = match (reserved, &self.merge_budget) {
+            (Some(reservation), _) => Some(reservation),
+            (None, Some(budget)) => {
                 let want = if self.merge_max_bytes == 0 {
                     budget.limit()
                 } else {
@@ -1396,7 +1508,7 @@ impl StorageBase {
                 );
                 Some(reservation)
             }
-            None => None,
+            (None, None) => None,
         };
         let base_uri = self.dataset.uri().trim_end_matches('/').to_string();
         let mut merged_generations: HashSet<u64> = HashSet::new();
@@ -1502,6 +1614,7 @@ impl StorageBase {
         watermark: Option<lance_index::mem_wal::CompactedSsTable>,
         bulk_key_delete: bool,
         parallel_upsert_io: bool,
+        staged: Option<StagedMergeFiles>,
     ) -> LanceResult<()> {
         use lance::dataset::{transaction::Operation, CommitBuilder};
 
@@ -1512,6 +1625,9 @@ impl StorageBase {
             return Err(LanceError::invalid_input(
                 "parallel upsert IO requires Lance V2 files",
             ));
+        }
+        if let Some(files) = &staged {
+            files.validate(&self.dataset)?;
         }
         merge_schema.index_of(&self.key_column)?;
         let delete_batches = batches.clone();
@@ -1540,22 +1656,11 @@ impl StorageBase {
         };
         let deleting = delete(snapshot.clone());
         let stage = async move {
-            let _phase = crate::merge_write_scope::work_stage("file_encoding");
-            let params = WriteParams {
-                mode: WriteMode::Append,
-                write_progress: Some(crate::merge_write_scope::write_progress()),
-                ..Default::default()
+            let files = match staged {
+                Some(files) => files,
+                None => encode_merge_files(snapshot.clone(), batches).await?,
             };
-            let tx = lance::dataset::InsertBuilder::new(snapshot)
-                .with_params(&params)
-                .execute_uncommitted(batches)
-                .await?;
-            match tx.operation {
-                Operation::Append { fragments } => Ok(fragments),
-                _ => Err(LanceError::io(
-                    "upsert staging produced a non-append transaction",
-                )),
-            }
+            Ok::<_, LanceError>(files.fragments)
         };
         let (mut deleted, fragments) = if parallel_upsert_io {
             // Join both admitted operations even on failure; retain the decoded

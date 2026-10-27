@@ -4,7 +4,8 @@ use futures::future::BoxFuture;
 use lance_context_api::TaskKind;
 use lance_context_core::rollout_append::SealedWalProbe;
 use lance_context_core::{
-    GenericStore, GenericStoreOptions, MergeMemoryBudget, RolloutStore, RolloutStoreOptions,
+    GenericStore, GenericStoreOptions, MergeMemoryBudget, MergeReservation, RolloutStore,
+    RolloutStoreOptions,
 };
 use lance_context_merge::MaintenanceKind;
 use std::{
@@ -209,7 +210,7 @@ pub(crate) async fn merge_local(
         let selected = activity.select(pass);
         metrics::counter!("master_catchup_empty_shards_skipped_total")
             .increment((config.shards.len() - selected.len()) as u64);
-        let reclaimed = run_pipeline(selected.iter().copied(), config.pipeline_enabled, |index| {
+        let prepare = |index: usize, reservation: Option<MergeReservation>| {
             let shard = &config.shards[index];
             let activity = &activity;
             let probe = &probe;
@@ -226,9 +227,17 @@ pub(crate) async fn merge_local(
                 let read_started = tokio::time::Instant::now();
                 // Keep the existing ordered activity/progress messages for
                 // empty shards as well; only their full store opens disappear.
-                let commit = prepare_nonempty_shard(state, target, shard, probe, session, budget)
-                    .await?
-                    .unwrap_or_else(|| Box::pin(async { Ok(0) }));
+                let commit = prepare_nonempty_shard_reserved(
+                    state,
+                    target,
+                    shard,
+                    probe,
+                    session,
+                    budget,
+                    reservation,
+                )
+                .await?
+                .unwrap_or_else(|| Box::pin(async { Ok(0) }));
                 let prepare_secs = read_started.elapsed().as_secs_f64();
                 Ok(Box::pin(async move {
                     let commit_started = tokio::time::Instant::now();
@@ -249,8 +258,22 @@ pub(crate) async fn merge_local(
                     Ok(reclaimed)
                 }) as BoxFuture<'_, Result<usize>>)
             }
-        })
-        .await?;
+        };
+        let reclaimed = if config.staging_targets.iter().any(|t| t == target) {
+            super::staging::run(
+                selected.iter().copied(),
+                config.staging_concurrency,
+                budget.clone(),
+                config.merge_max_bytes,
+                |index, reservation| prepare(index, Some(reservation)),
+            )
+            .await?
+        } else {
+            run_pipeline(selected.iter().copied(), config.pipeline_enabled, |index| {
+                prepare(index, None)
+            })
+            .await?
+        };
         total += reclaimed;
         // A skipped batch is not evidence of an empty WAL. Join all admitted
         // commits above, then publish continuation below before releasing the
@@ -282,6 +305,7 @@ pub(crate) async fn merge_local(
     Ok(detail(total))
 }
 
+#[cfg(test)]
 async fn prepare_nonempty_shard(
     state: &Arc<MasterState>,
     target: &str,
@@ -289,6 +313,18 @@ async fn prepare_nonempty_shard(
     probe: &SealedWalProbe,
     session: Arc<lance::session::Session>,
     budget: Arc<MergeMemoryBudget>,
+) -> Result<Option<BoxFuture<'static, Result<usize>>>> {
+    prepare_nonempty_shard_reserved(state, target, shard, probe, session, budget, None).await
+}
+
+async fn prepare_nonempty_shard_reserved(
+    state: &Arc<MasterState>,
+    target: &str,
+    shard: &str,
+    probe: &SealedWalProbe,
+    session: Arc<lance::session::Session>,
+    budget: Arc<MergeMemoryBudget>,
+    reservation: Option<MergeReservation>,
 ) -> Result<Option<BoxFuture<'static, Result<usize>>>> {
     let started = tokio::time::Instant::now();
     // Every check refreshes the manifest; an earlier empty result does not hide
@@ -304,20 +340,30 @@ async fn prepare_nonempty_shard(
         metrics::counter!("master_catchup_empty_shard_probes_total").increment(1);
         return Ok(None);
     }
-    prepare_shard(state, target, shard, session, budget)
+    let prepared = if reservation.is_some() {
+        let (state, target, shard) = (state.clone(), target.to_owned(), shard.to_owned());
+        lance_context_core::merge_write_scope::run_owned_preparation(async move {
+            prepare_shard(&state, &target, &shard, session, budget, reservation).await
+        })
         .await
-        .map(Some)
+        .map_err(|e| e.to_string())??
+    } else {
+        prepare_shard(state, target, shard, session, budget, None).await?
+    };
+    Ok(Some(prepared))
 }
 
-/// Read sealed WAL without acquiring a writer epoch. The returned future owns
-/// the prepared data and its memory reservation; it performs no writes until
-/// the single consumer polls it under the existing maintenance write scope.
+/// Read sealed WAL without acquiring a writer epoch. With a pre-admitted
+/// reservation, also encode immutable replacement files. The returned future
+/// owns the data and reservation and publishes only when the ordered consumer
+/// polls it under the existing maintenance write scope.
 async fn prepare_shard(
     state: &Arc<MasterState>,
     target: &str,
     shard: &str,
     session: Arc<lance::session::Session>,
     budget: Arc<MergeMemoryBudget>,
+    reservation: Option<MergeReservation>,
 ) -> Result<BoxFuture<'static, Result<usize>>> {
     if let Some(name) = target.strip_prefix("generic:") {
         let options = GenericStoreOptions {
@@ -335,17 +381,27 @@ async fn prepare_shard(
             .await
             .map_err(|e| e.to_string())?;
         // No resident writer was opened, so cleanup only sees sealed WAL.
-        match store
-            .prepare_cleanup_merge()
-            .await
-            .map_err(|e| e.to_string())?
-        {
-            Some((manifest_store, manifest, prepared)) => Ok(Box::pin(async move {
-                store
-                    .commit_prepared_merge(&manifest_store, &manifest, prepared)
-                    .await
-                    .map_err(|e| e.to_string())
-            })),
+        let staging = reservation.is_some();
+        let prepared = match reservation {
+            Some(reservation) => store.prepare_merge_reserved(reservation).await,
+            None => store.prepare_cleanup_merge().await,
+        }
+        .map_err(|e| e.to_string())?;
+        match prepared {
+            Some((manifest_store, manifest, mut prepared)) => {
+                if staging {
+                    store
+                        .stage_prepared_merge(&mut prepared)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+                Ok(Box::pin(async move {
+                    store
+                        .commit_prepared_merge(&manifest_store, &manifest, prepared)
+                        .await
+                        .map_err(|e| e.to_string())
+                }))
+            }
             None => Ok(Box::pin(async { Ok(0usize) })),
         }
     } else {
@@ -364,11 +420,13 @@ async fn prepare_shard(
             RolloutStore::open_existing_with_options(&state.rollout_uri(target), options)
                 .await
                 .map_err(|e| e.to_string())?;
-        match store
-            .prepare_merge_if_ready(1)
-            .await
-            .map_err(|e| e.to_string())?
-        {
+        let staging = reservation.is_some();
+        let prepared = match reservation {
+            Some(reservation) => store.prepare_merge_reserved(reservation).await,
+            None => store.prepare_merge_if_ready(1).await,
+        }
+        .map_err(|e| e.to_string())?;
+        match prepared {
             Some((manifest_store, manifest, mut prepared)) => {
                 if state
                     .config
@@ -388,6 +446,12 @@ async fn prepare_shard(
                 {
                     prepared.use_parallel_upsert_io();
                 }
+                if staging {
+                    store
+                        .stage_prepared_merge(&mut prepared)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
                 Ok(Box::pin(async move {
                     store
                         .commit_prepared_merge(&manifest_store, &manifest, prepared)
@@ -402,7 +466,8 @@ async fn prepare_shard(
 
 // StorageBase releases the failed generation/reservation before returning this
 // error. A speculative reader can encounter it while the committer holds bytes.
-const MERGE_BUDGET_BUSY: &str = "merge memory budget busy while reading first generation; retry";
+pub(super) const MERGE_BUDGET_BUSY: &str =
+    "merge memory budget busy while reading first generation; retry";
 
 /// At most one commit plus one preparing/queued batch. Reserve queue capacity
 /// BEFORE preparing: otherwise a producer can retain a third batch. Do not use
@@ -595,7 +660,7 @@ mod tests {
                                     .await?
                                     .unwrap_or_else(|| Box::pin(async { Ok(0) })))
                                 } else {
-                                    prepare_shard(state, target, shard, session, budget).await
+                                    prepare_shard(state, target, shard, session, budget, None).await
                                 }
                             }
                         },

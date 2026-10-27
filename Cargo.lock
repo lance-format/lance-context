@@ -4180,6 +4180,7 @@ dependencies = [
  "futures",
  "lance",
  "lance-context-api",
+ "lance-core",
  "lance-file",
  "lance-index",
  "lance-io",

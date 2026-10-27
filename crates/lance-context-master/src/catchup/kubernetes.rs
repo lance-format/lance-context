@@ -340,6 +340,14 @@ pub(super) fn render_job(config: &MasterConfig, record: &Record, mut spec: Value
             "CATCHUP_PARALLEL_UPSERT_IO_TARGETS",
             config.catchup.parallel_upsert_io_targets.join(","),
         ),
+        (
+            "CATCHUP_STAGING_TARGETS",
+            config.catchup.staging_targets.join(","),
+        ),
+        (
+            "CATCHUP_STAGING_CONCURRENCY",
+            config.catchup.staging_concurrency.to_string(),
+        ),
         ("CATCHUP_TARGET", record.target.clone()),
         ("CATCHUP_JOB_NAME", record.job.clone()),
         ("CATCHUP_ATTEMPT_ID", record.attempt.to_string()),

@@ -107,12 +107,30 @@ impl MergeMemoryBudget {
         }
     }
 
+    /// Admit speculative work only if capacity is available now. A caller
+    /// holding prepared batches must never wait for the next reservation.
+    pub fn try_reserve(self: &Arc<Self>, bytes: usize) -> Option<MergeReservation> {
+        let permits = Self::permits_for(bytes).min(self.permits_total());
+        let permit = self.permits.try_acquire_many(permits).ok()?;
+        permit.forget();
+        self.reserved.fetch_add(bytes, Ordering::AcqRel);
+        Some(MergeReservation {
+            budget: self.clone(),
+            permits,
+            bytes,
+        })
+    }
+
     fn permits_total(&self) -> u32 {
         Self::permits_for(self.limit)
     }
 }
 
 impl MergeReservation {
+    pub(crate) fn belongs_to(&self, budget: &Arc<MergeMemoryBudget>) -> bool {
+        Arc::ptr_eq(&self.budget, budget)
+    }
+
     /// Bytes this reservation currently accounts for.
     #[must_use]
     pub fn bytes(&self) -> usize {

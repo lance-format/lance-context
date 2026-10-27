@@ -717,6 +717,20 @@ impl GenericStore {
         self.base.prepare_recovered_cleanup_merge().await
     }
 
+    /// Read sealed WAL using capacity admitted before opening payload readers.
+    pub async fn prepare_merge_reserved(
+        &self,
+        reservation: crate::MergeReservation,
+    ) -> LanceResult<Option<(ShardManifestStore, ShardManifest, PreparedMerge)>> {
+        self.base.prepare_merge_reserved(reservation).await
+    }
+
+    /// Encode immutable replacement files without publishing rows or coverage.
+    /// Retains the prepared batches and reservation until ordered commit.
+    pub async fn stage_prepared_merge(&self, prepared: &mut PreparedMerge) -> LanceResult<()> {
+        self.base.stage_prepared_merge(prepared).await
+    }
+
     /// Commit a merge prepared by [`Self::prepare_cleanup_merge`].
     pub async fn commit_prepared_merge(
         &mut self,

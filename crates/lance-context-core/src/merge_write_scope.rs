@@ -39,6 +39,7 @@ pub(crate) async fn at_initial_version<F: Future>(work: F) -> F::Output {
 struct Progress {
     closed: bool,
     active: usize,
+    preparations: usize,
     uncertain: bool,
 }
 
@@ -260,19 +261,74 @@ impl MergeWriteScope {
     }
 
     /// Call only after dropping/joining the merge future. Prevent new commits
-    /// and join all manifest writes that started before cancellation.
+    /// and join all manifest writes and owned preparation tasks admitted before cancellation.
     pub async fn drain(&self) {
         self.progress.lock().unwrap().closed = true;
         loop {
             let changed = self.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            if self.progress.lock().unwrap().active == 0 {
+            let idle = {
+                let progress = self.progress.lock().unwrap();
+                progress.active == 0 && progress.preparations == 0
+            };
+            if idle {
                 return;
             }
             changed.await;
         }
     }
+}
+
+/// Keep an admitted payload preparation and its memory reservation alive when
+/// the watchdog drops the caller. The owning scope's drain joins the child;
+/// fencing manifest writes does not abort immutable encoders or release their
+/// buffers prematurely. This is only available under durable maintenance
+/// ownership, never an observation-only or unscoped legacy operation.
+///
+/// `work` must only prepare immutable output, never publish it. Its returned
+/// committer is delivered to the caller; if that caller was cancelled, the
+/// result is dropped without polling and therefore cannot publish later.
+pub async fn run_owned_preparation<F, T>(work: F) -> Result<T>
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let scope = CURRENT
+        .try_with(Arc::clone)
+        .map_err(|_| Error::io("immutable staging requires an owned maintenance scope"))?;
+    if scope.observation_only || scope.authorizer.is_none() {
+        return Err(Error::io(
+            "immutable staging requires durable maintenance ownership",
+        ));
+    }
+    {
+        let mut progress = scope.progress.lock().unwrap();
+        if progress.closed {
+            return Err(Error::io("merge cancelled before immutable preparation"));
+        }
+        progress.preparations += 1;
+    }
+    struct Preparation(Arc<MergeWriteScope>);
+    impl Drop for Preparation {
+        fn drop(&mut self) {
+            self.0.progress.lock().unwrap().preparations -= 1;
+            self.0.changed.notify_waiters();
+        }
+    }
+    let active = Preparation(scope.clone());
+    let (send, receive) = oneshot::channel();
+    // Deliberately separate from abortable manifest leaves: even after a
+    // durable version fence, admitted encoders must finish before releasing
+    // the reservation they own. drain() accounts for this child until exit.
+    tokio::spawn(async move {
+        let _active = active;
+        let result = scope.run(work).await;
+        let _ = send.send(result);
+    });
+    receive
+        .await
+        .map_err(|_| Error::io("owned immutable preparation panicked"))
 }
 
 /// Count completed work, never timer ticks or admission attempts. This is a

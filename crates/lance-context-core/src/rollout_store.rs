@@ -736,6 +736,20 @@ impl RolloutStore {
         self.base.prepare_recovered_cleanup_merge().await
     }
 
+    /// Read sealed WAL using capacity admitted before opening payload readers.
+    pub async fn prepare_merge_reserved(
+        &self,
+        reservation: crate::MergeReservation,
+    ) -> LanceResult<Option<(ShardManifestStore, ShardManifest, PreparedMerge)>> {
+        self.base.prepare_merge_reserved(reservation).await
+    }
+
+    /// Encode immutable replacement files without publishing rows or coverage.
+    /// Retains the prepared batches and reservation until ordered commit.
+    pub async fn stage_prepared_merge(&self, prepared: &mut PreparedMerge) -> LanceResult<()> {
+        self.base.stage_prepared_merge(prepared).await
+    }
+
     /// Commit a merge prepared by [`Self::prepare_merge_if_ready`].
     pub async fn commit_prepared_merge(
         &mut self,
@@ -4091,7 +4105,7 @@ mod tests {
         }
     }
 
-    fn artifact_record(id: &str, bytes: &[u8]) -> RolloutRecord {
+    pub(super) fn artifact_record(id: &str, bytes: &[u8]) -> RolloutRecord {
         RolloutRecord {
             id: id.to_string(),
             rollout_id: "rollout-1".to_string(),
@@ -5656,7 +5670,7 @@ mod tests {
 
     #[tokio::test]
     async fn bulk_key_delete_merge_preserves_upserts_blobs_and_later_wal() {
-        for parallel in [false, true] {
+        for (parallel, staged) in [(false, false), (true, false), (false, true)] {
             for index in [
                 None,
                 Some(crate::KeyIndexType::Btree),
@@ -5716,6 +5730,16 @@ mod tests {
                 if parallel {
                     stale.use_parallel_upsert_io();
                 }
+                if staged {
+                    let before_stage = store.base.dataset.version().version;
+                    store.stage_prepared_merge(&mut prepared).await.unwrap();
+                    store.stage_prepared_merge(&mut stale).await.unwrap();
+                    // Encoding has no visible rows, deletions, or WAL coverage.
+                    store.base.refresh_latest().await.unwrap();
+                    assert_eq!(store.base.dataset.version().version, before_stage);
+                    assert_eq!(store.base.dataset.count_rows(None).await.unwrap(), 16);
+                    assert_eq!(flushed_generation_count(&store).await, 2);
+                }
                 assert!(budget.reserved() > 0);
                 let before = store.base.dataset.version().version;
                 store
@@ -5762,6 +5786,9 @@ mod tests {
                 if parallel {
                     next.use_parallel_upsert_io();
                 }
+                if staged {
+                    store.stage_prepared_merge(&mut next).await.unwrap();
+                }
                 assert_eq!(
                     store
                         .commit_prepared_merge(&manifests, &manifest, next)
@@ -5775,6 +5802,134 @@ mod tests {
                 store.close().await.unwrap();
             }
         }
+    }
+
+    #[tokio::test]
+    async fn staged_wal_shards_delete_against_latest_ordered_commit() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let budget = crate::MergeMemoryBudget::new(4 * 1024 * 1024);
+        let options = |shard: &str| RolloutStoreOptions {
+            shard_id: Some(shard.to_owned()),
+            merge_after_generations: Some(0),
+            merge_max_bytes: Some(1024 * 1024),
+            merge_budget: Some(budget.clone()),
+            ..Default::default()
+        };
+        let mut a = RolloutStore::open_with_options(uri, options("staged-a"))
+            .await
+            .unwrap();
+        let original = vec![1; 64 * 1024];
+        let next_a = vec![2; 64 * 1024];
+        let next_b = vec![3; 64 * 1024];
+        a.add(&[
+            artifact_record("shared", &original),
+            artifact_record("untouched", &original),
+        ])
+        .await
+        .unwrap();
+        a.cleanup_own_shard().await.unwrap();
+        let mut b = RolloutStore::open_with_options(uri, options("staged-b"))
+            .await
+            .unwrap();
+        a.add(&[
+            artifact_record("shared", &next_a),
+            artifact_record("a-only", &next_a),
+        ])
+        .await
+        .unwrap();
+        b.add(&[
+            artifact_record("shared", &next_b),
+            artifact_record("b-only", &next_b),
+        ])
+        .await
+        .unwrap();
+        a.flush().await.unwrap();
+        b.flush().await.unwrap();
+        let ra = budget.reserve(1024 * 1024).await;
+        let rb = budget.try_reserve(1024 * 1024).unwrap();
+        let (ma, sa, mut pa) = a.prepare_merge_reserved(ra).await.unwrap().unwrap();
+        let (mb, sb, mut pb) = b.prepare_merge_reserved(rb).await.unwrap().unwrap();
+        let version = a.base.dataset.version().version;
+        let (ea, eb) = tokio::join!(
+            a.stage_prepared_merge(&mut pa),
+            b.stage_prepared_merge(&mut pb)
+        );
+        ea.unwrap();
+        eb.unwrap();
+        a.base.refresh_latest().await.unwrap();
+        assert_eq!(a.base.dataset.version().version, version);
+        assert_eq!(a.base.dataset.count_rows(None).await.unwrap(), 2);
+        assert_eq!(a.commit_prepared_merge(&ma, &sa, pa).await.unwrap(), 1);
+        assert_eq!(b.commit_prepared_merge(&mb, &sb, pb).await.unwrap(), 1);
+        assert_eq!(budget.reserved(), 0);
+        b.base.refresh_latest().await.unwrap();
+        assert_eq!(b.base.dataset.count_rows(None).await.unwrap(), 4);
+        for (id, blob) in [
+            ("shared", &next_b),
+            ("a-only", &next_a),
+            ("b-only", &next_b),
+            ("untouched", &original),
+        ] {
+            assert_eq!(b.get_blob(id).await.unwrap().as_ref(), Some(blob));
+        }
+        assert_eq!(flushed_generation_count(&a).await, 0);
+        assert_eq!(flushed_generation_count(&b).await, 0);
+        a.close().await.unwrap();
+        b.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn staged_wal_rejects_schema_change_without_draining() {
+        let dir = TempDir::new().unwrap();
+        let mut store = RolloutStore::open_with_options(
+            dir.path().to_str().unwrap(),
+            RolloutStoreOptions {
+                merge_after_generations: Some(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let blob = vec![9; 64 * 1024];
+        store
+            .add(&[artifact_record("pending", &blob)])
+            .await
+            .unwrap();
+        store.flush().await.unwrap();
+        let (manifests, manifest, mut prepared) =
+            store.prepare_merge_if_ready(1).await.unwrap().unwrap();
+        store.stage_prepared_merge(&mut prepared).await.unwrap();
+        store
+            .base
+            .dataset
+            .add_columns(
+                lance::dataset::NewColumnTransform::AllNulls(Arc::new(arrow_schema::Schema::new(
+                    vec![arrow_schema::Field::new(
+                        "added_after_staging",
+                        arrow_schema::DataType::Int64,
+                        true,
+                    )],
+                ))),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let version = store.base.dataset.version().version;
+        let err = store
+            .commit_prepared_merge(&manifests, &manifest, prepared)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("changed after WAL encoding"),
+            "{err}"
+        );
+        store.base.refresh_latest().await.unwrap();
+        assert_eq!(store.base.dataset.version().version, version);
+        assert_eq!(store.base.dataset.count_rows(None).await.unwrap(), 0);
+        assert_eq!(flushed_generation_count(&store).await, 1);
+        store.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -9027,3 +9182,7 @@ mod tests {
 
 #[cfg(test)]
 mod reference_validation_tests;
+
+#[cfg(test)]
+#[path = "rollout_store/staging_cancellation_tests.rs"]
+mod staging_cancellation_tests;

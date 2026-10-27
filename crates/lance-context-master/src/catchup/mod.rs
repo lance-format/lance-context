@@ -3,6 +3,7 @@ mod executor;
 mod kubernetes;
 mod outcome;
 mod progress;
+mod staging;
 pub(crate) mod store;
 #[cfg(test)]
 mod tests;
@@ -76,6 +77,12 @@ pub struct CatchupConfig {
         value_delimiter = ','
     )]
     pub parallel_upsert_io_targets: Vec<String>,
+    /// Exact targets opting in to concurrent immutable WAL read/encode staging.
+    /// Base commits remain ordered; the process merge byte budget is unchanged.
+    #[arg(long, env = "CATCHUP_STAGING_TARGETS", value_delimiter = ',')]
+    pub staging_targets: Vec<String>,
+    #[arg(long, env = "CATCHUP_STAGING_CONCURRENCY", default_value_t = 2)]
+    pub staging_concurrency: usize,
     /// Native one-table executor mode; does not start the admin server or scanner.
     #[arg(long, env = "CATCHUP_TARGET", hide = true)]
     pub target: Option<String>,
@@ -109,6 +116,8 @@ impl Default for CatchupConfig {
             pipeline_enabled: true,
             bulk_key_delete_targets: Vec::new(),
             parallel_upsert_io_targets: Vec::new(),
+            staging_targets: Vec::new(),
+            staging_concurrency: 2,
             target: None,
             job_name: None,
             outcome_path: None,
@@ -119,6 +128,15 @@ impl Default for CatchupConfig {
 }
 impl CatchupConfig {
     pub fn validate(&self) -> Result<()> {
+        if !(1..=8).contains(&self.staging_concurrency)
+            || self
+                .staging_targets
+                .iter()
+                .any(|target| target.is_empty() || target.contains('*'))
+        {
+            return Err("invalid immutable WAL staging concurrency or exact targets".into());
+        }
+
         if !self.enabled && self.target.is_none() && self.pod_template.is_none() {
             return Ok(());
         }

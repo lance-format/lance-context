@@ -53,6 +53,8 @@ tracing = "0.1"
 uuid = { version = "1.20.0", features = ["v4", "v5", "v7"] }
 
 [dev-dependencies]
+# Exercise the exact blocking encoder runtime when testing caller cancellation.
+lance-core = "13.0.0"
 # Snapshotting recorder so tests can assert which metric series an operation
 # emitted, without installing a process-global Prometheus exporter.
 metrics-util = { version = "0.19", default-features = false, features = ["debugging"] }

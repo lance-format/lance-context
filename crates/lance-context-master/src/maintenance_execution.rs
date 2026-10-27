@@ -430,8 +430,9 @@ where
     tracing::info!(target = %running.target, execution = %running.id,
         task_id = %claim.task.id, %executor_id, work = ?scope.work(),
         success = outcome.is_ok(), "maintenance work outcome before commit drain");
-    // The work future has been dropped, so no preparation may issue another
-    // commit. The shielded manifest leaves still need acknowledgement or fencing.
+    // The work future has been dropped, so no returned staged committer can
+    // run. Owned preparation children retain their memory until completion;
+    // manifest leaves still need acknowledgement or fencing. Scope drain joins both.
     let drained = tokio::time::timeout(
         Duration::from_secs(config.maintenance_drain_timeout_secs),
         scope.drain(),
@@ -494,8 +495,9 @@ where
 }
 
 // If storage is unavailable, preserve ownership and return the scheduler slot.
-// Only these metadata commit leaves survive cancellation; payload work was
-// dropped. A later successful barrier authorizes aborting the old leaves.
+// Metadata commit leaves and explicitly owned immutable preparations may
+// survive caller cancellation. A barrier permits aborting manifest leaves,
+// while preparations keep their reservations until they finish.
 fn retain_until_fenced(
     coordinator: Coordinator,
     execution: Execution,
