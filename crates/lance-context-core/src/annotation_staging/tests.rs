@@ -14,6 +14,7 @@ mod compaction;
 mod concurrent_reads;
 mod published_values;
 mod reclamation;
+mod registration;
 mod views;
 
 #[tokio::test]

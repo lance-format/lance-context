@@ -40,12 +40,49 @@ The service supplies the quorum/application barriers required for cross-ingress
 reads. The HTTP owner's recovery cut and authority checks are described in
 [annotation HTTP routing](annotation-owner-http.md).
 
+## Registering new turns in the core view
+
+`register_committed` accepts an ordered batch of ID, immutable `rollout_id` and
+initial annotation values. It requires a separate five-column annotation table;
+it cannot append to a table containing turn bodies. All input is validated before
+installation. The first occurrence of an absent ID initializes it. Later valid
+registrations of that ID preserve its current annotation and original grouping
+key, whether found in this batch, active, frozen, the cache or Lance. Re-imports
+of existing IDs create no dirty values. Cold existence lookups project only ID.
+Ordinary point patches still reject missing turns.
+
+A newly staged row retains its grouping key and original apply position within
+the existing byte/entry limits. Frozen preparation compares that position with
+its captured materialized cut: it appends a row only if its first registration
+is still unmaterialized. Thus an active update based on a frozen new row becomes
+an existing-row update after the frozen batch publishes; it cannot reinsert the
+row. This transient metadata can cause backpressure but cannot change a patch's
+permanent rejection result when recovery starts from a later published prefix.
+
+Preparation writes existing annotations with `RewriteColumns` and new narrow
+rows with the native append writer. A mixed batch combines their file descriptors
+in one Lance `Update` transaction; an insert-only batch uses `Append`. Both retain
+the same frozen identity and scoped coverage. Lance assigns stable IDs and row
+version metadata to the new fragments. Original ID-index coverage is preserved;
+new fragments remain uncovered and participate in native filtered reads. A
+result-only batch still uses a metadata checkpoint without creating data files.
+
+This is a core component capability, not a mixed-ingestion service endpoint.
+The current annotation WAL codec and managed-publication validator remain
+update-only. The caller must durably admit the complete turn body, coordinate
+annotation visibility, retain request results and recover both parts before
+offering a complete ingestion ACK. A bare registration result supplies none of
+those guarantees. Tests here cover real Lance preparation/commit/reopen, stable
+IDs and index coverage, re-imports during publication, held readers, pressure,
+atomic rejection and replay of a suffix against a published prefix. Service
+integration and sustained mixed-load qualification remain separate work.
+
 ## Frozen publication
 
 Freezing moves the active map into an immutable generation without copying its
 values. The caller supplies the publication UUID, allowing reconstruction of a
 pending cut with its original identity. Further updates use a new active map.
-Frozen preparation builds narrow
+For existing turns, frozen preparation builds narrow
 Arrow batches and explicitly selects Lance 13 `RewriteColumns`, with automatic
 conflict retries and cleanup disabled. It rejects a result that does not update
 exactly the frozen keys, and records scoped coverage in the native transaction

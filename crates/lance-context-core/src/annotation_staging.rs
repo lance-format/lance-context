@@ -19,10 +19,13 @@ mod compaction;
 mod preserve_id;
 mod publication;
 mod published_values;
+mod registration;
 mod views;
 pub use publication::{
     FrozenAnnotations, PreparedAnnotations, MAX_RESULTS_BYTES, RESULTS_PROPERTY,
 };
+pub use registration::Registration;
+use registration::{Batch, Input, PendingTurn};
 pub use views::ProtectedBases;
 #[cfg(test)]
 mod tests;
@@ -73,6 +76,7 @@ pub struct Scope {
 
 struct Stored {
     value: TurnAnnotation,
+    pending_turn: Option<PendingTurn>,
     _bytes: OwnedSemaphorePermit,
     _entry: Arc<OwnedSemaphorePermit>,
 }
@@ -275,7 +279,10 @@ impl AnnotationStaging {
         through: u64,
         mutations: &[Mutation<'_>],
     ) -> Result<()> {
-        match self.apply_inner(after, through, mutations, false).await? {
+        match self
+            .apply_inner(after, through, Batch::Patches(mutations), false)
+            .await?
+        {
             ApplyOutcome::Applied => Ok(()),
             ApplyOutcome::Rejected(rejection) => Err(invalid(format!(
                 "annotation mutation rejected: {rejection:?}"
@@ -296,7 +303,8 @@ impl AnnotationStaging {
         through: u64,
         mutations: &[Mutation<'_>],
     ) -> Result<ApplyOutcome> {
-        self.apply_inner(after, through, mutations, true).await
+        self.apply_inner(after, through, Batch::Patches(mutations), true)
+            .await
     }
 
     /// Advance through already processed control/unrelated entries. This must
@@ -313,14 +321,14 @@ impl AnnotationStaging {
         &self,
         after: u64,
         through: u64,
-        mutations: &[Mutation<'_>],
+        mutations: Batch<'_, '_>,
         advance_rejection: bool,
     ) -> Result<ApplyOutcome> {
         let _mutation = self.mutation.lock().await;
         let pending = {
             let state = self.state.read().await;
             check_order(&state, after, through)?;
-            self.pending_batch(&state, mutations).await?
+            self.pending_batch(&state, through, mutations).await?
         };
         // The mutation gate keeps the base, values and applied cut unchanged
         // while upgrading. Cancellation before this point installs nothing.
@@ -345,22 +353,31 @@ impl AnnotationStaging {
     async fn pending_batch(
         &self,
         state: &State,
-        mutations: &[Mutation<'_>],
+        through: u64,
+        mutations: Batch<'_, '_>,
     ) -> Result<PendingBatch> {
-        if mutations.is_empty() || mutations.len() > 65_536 {
+        if mutations.len() == 0 || mutations.len() > 65_536 {
             return Ok(reject(0, RejectionReason::BatchTooLarge));
         }
-        for (row, Mutation { turn, patch }) in mutations.iter().enumerate() {
-            if let Err(reason) = self.validate_input(turn, patch) {
+        if matches!(mutations, Batch::Registrations(_)) {
+            registration::validate_target(&state.base)?;
+        }
+        for row in 0..mutations.len() {
+            let input = mutations.row(row);
+            let result = match input {
+                Input::Patch { turn, patch } => self.validate_input(turn, patch),
+                Input::Register(value) => registration::validate(value, self.limits.value_bytes),
+            };
+            if let Err(reason) = result {
                 return Ok(reject(row, reason));
             }
         }
         let mut pending = Values::new();
         let mut batch_bytes = 0;
-        for (chunk_index, chunk) in mutations.chunks(COLD_LOOKUP_KEYS).enumerate() {
-            let mut keys = chunk
-                .iter()
-                .map(|m| m.turn)
+        for start in (0..mutations.len()).step_by(COLD_LOOKUP_KEYS) {
+            let end = (start + COLD_LOOKUP_KEYS).min(mutations.len());
+            let mut keys = (start..end)
+                .map(|row| mutations.row(row).turn())
                 .filter(|turn| {
                     !pending.contains_key(*turn)
                         && !state.active.contains_key(*turn)
@@ -377,42 +394,79 @@ impl AnnotationStaging {
                 }
             }
             keys.retain(|turn| !cached.contains_key(turn));
-            let mut cold = read_bases(&state.base, &keys).await?;
-            for (offset, Mutation { turn, patch }) in chunk.iter().enumerate() {
-                let row = chunk_index * COLD_LOOKUP_KEYS + offset;
+            let cold = match mutations {
+                Batch::Patches(_) => read_bases(&state.base, &keys).await?,
+                Batch::Registrations(_) => read_existing(&state.base, &keys, &["id"]).await?,
+            };
+            for row in start..end {
+                let input = mutations.row(row);
+                let turn = input.turn();
                 let previous = pending
-                    .get(*turn)
+                    .get(turn)
                     .cloned()
-                    .or_else(|| state.active.get(*turn).cloned())
+                    .or_else(|| state.active.get(turn).cloned())
                     .or_else(|| {
                         state
                             .frozen
                             .as_ref()
-                            .and_then(|f| f.values.get(*turn).cloned())
+                            .and_then(|f| f.values.get(turn).cloned())
                     });
-                let mut current = match &previous {
-                    Some(value) => value.value.clone(),
-                    None if cached.contains_key(*turn) => cached[*turn].value.clone(),
-                    None => match cold.remove(*turn) {
-                        Some(batch) => decode_base_row(&batch, 0, turn, self.limits.value_bytes)?,
-                        None => return Ok(reject(row, RejectionReason::MissingTurn)),
-                    },
+                let exists =
+                    previous.is_some() || cached.contains_key(turn) || cold.contains_key(turn);
+                if matches!(input, Input::Register(_)) && exists {
+                    // Re-import must neither reset annotations nor create dirty
+                    // values/files for a turn already visible at this cut.
+                    continue;
+                }
+                let (current, pending_turn) = match input {
+                    Input::Register(value) => (
+                        value.annotation.clone(),
+                        Some(PendingTurn {
+                            rollout_id: value.rollout_id.to_owned(),
+                            through,
+                        }),
+                    ),
+                    Input::Patch { patch, .. } => {
+                        let mut current = match &previous {
+                            Some(value) => value.value.clone(),
+                            None if cached.contains_key(turn) => cached[turn].value.clone(),
+                            None => match cold.get(turn) {
+                                Some(batch) => {
+                                    decode_base_row(batch, 0, turn, self.limits.value_bytes)?
+                                }
+                                None => return Ok(reject(row, RejectionReason::MissingTurn)),
+                            },
+                        };
+                        patch
+                            .apply_to(&mut current)
+                            .map_err(|e| invalid(e.to_string()))?;
+                        let pending_turn = previous
+                            .as_ref()
+                            .and_then(|v| v.pending_turn.as_ref())
+                            .filter(|v| v.through > state.materialized)
+                            .cloned();
+                        (current, pending_turn)
+                    }
                 };
-                patch
-                    .apply_to(&mut current)
-                    .map_err(|e| invalid(e.to_string()))?;
-                let bytes = charge(turn, &current)?;
-                if bytes > self.limits.value_bytes {
+                let value_bytes = charge(turn, &current)?;
+                if value_bytes > self.limits.value_bytes {
                     return Ok(reject(row, RejectionReason::ValueTooLarge));
                 }
-                batch_bytes += bytes;
-                if let Some(old) = pending.get(*turn) {
+                let bytes = registration::retained_charge(value_bytes, pending_turn.as_ref())?;
+                // Patch rejection cannot depend on transient new-row metadata:
+                // publication may retire that metadata before suffix replay.
+                batch_bytes += if matches!(input, Input::Register(_)) {
+                    bytes
+                } else {
+                    value_bytes
+                };
+                if let Some(old) = pending.get(turn) {
                     batch_bytes -= charge(turn, &old.value)?;
                 }
                 // Reject batches that could never fit, even with empty staging.
                 // Leave half the byte budget for an old value held during replace.
                 if batch_bytes > self.limits.retained_bytes / 2
-                    || (!pending.contains_key(*turn)
+                    || (!pending.contains_key(turn)
                         && pending.len() == self.limits.retained_entries)
                 {
                     return Ok(reject(row, RejectionReason::BatchTooLarge));
@@ -420,7 +474,7 @@ impl AnnotationStaging {
                 let Ok(allocation) = self.bytes.clone().try_acquire_many_owned(bytes as u32) else {
                     return Ok(PendingBatch::Backpressure);
                 };
-                let entry = match pending.get(*turn).or_else(|| state.active.get(*turn)) {
+                let entry = match pending.get(turn).or_else(|| state.active.get(turn)) {
                     Some(old) => old._entry.clone(),
                     None => {
                         let Ok(entry) = self.entries.clone().try_acquire_owned() else {
@@ -430,9 +484,10 @@ impl AnnotationStaging {
                     }
                 };
                 pending.insert(
-                    (*turn).to_owned(),
+                    turn.to_owned(),
                     Arc::new(Stored {
                         value: current,
+                        pending_turn,
                         _bytes: allocation,
                         _entry: entry,
                     }),
@@ -598,12 +653,21 @@ async fn read_bases<'a>(
     base: &Dataset,
     turns: &std::collections::BTreeSet<&'a str>,
 ) -> Result<BTreeMap<&'a str, RecordBatch>> {
+    read_existing(base, turns, &["labels", "status", "score", "id"]).await
+}
+
+// Re-import only needs existence; keep annotations out of that projection.
+async fn read_existing<'a>(
+    base: &Dataset,
+    turns: &std::collections::BTreeSet<&'a str>,
+    projection: &[&str],
+) -> Result<BTreeMap<&'a str, RecordBatch>> {
     let mut rows = BTreeMap::new();
     if turns.is_empty() {
         return Ok(rows);
     }
     let mut scan = base.scan();
-    scan.project(&["labels", "status", "score", "id"])?;
+    scan.project(projection)?;
     scan.filter_expr(col("id").in_list(turns.iter().map(|turn| lit(*turn)).collect(), false));
     // A valid table returns at most one row per requested key. One extra row
     // proves a duplicate without retaining an unbounded corrupt result set.
@@ -612,7 +676,8 @@ async fn read_bases<'a>(
     let mut stream = scan.try_into_stream().await?;
     while let Some(batch) = stream.try_next().await? {
         let ids = batch
-            .column(3)
+            .column_by_name("id")
+            .ok_or_else(|| invalid("missing annotation id"))?
             .as_any()
             .downcast_ref::<StringArray>()
             .ok_or_else(|| invalid("invalid annotation id"))?;

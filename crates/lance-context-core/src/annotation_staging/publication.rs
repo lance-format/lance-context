@@ -5,8 +5,10 @@ use arrow_array::{
 };
 use arrow_schema::Schema;
 use lance::dataset::{
-    MergeInsertBuilder, MergeInsertWriteMode, UncommittedMergeInsert, WhenMatched, WhenNotMatched,
+    InsertBuilder, MergeInsertBuilder, MergeInsertWriteMode, UncommittedMergeInsert, WhenMatched,
+    WhenNotMatched, WriteMode, WriteParams,
 };
+use lance_file::writer::FileWriterOptions;
 use lance_table::transaction::{Operation, Transaction};
 use std::collections::HashMap;
 
@@ -19,6 +21,7 @@ pub(super) const METADATA_BUDGET: usize = 8 * MAX_RESULTS_BYTES + 1024;
 pub(super) struct Generation {
     pub values: Values,
     base: Arc<views::Base>,
+    base_cut: u64,
     scope: Scope,
     through: u64,
     id: String,
@@ -103,6 +106,7 @@ impl AnnotationStaging {
         let generation = Arc::new(Generation {
             values: std::mem::take(&mut state.active),
             base: state.base.clone(),
+            base_cut: state.materialized,
             scope: self.scope.clone(),
             through: state.applied,
             id: transaction.to_string(),
@@ -169,8 +173,9 @@ impl FrozenAnnotations {
         self.0.values.len()
     }
 
-    /// Prepare complete narrow values in one native merge, explicitly choosing
-    /// RewriteColumns so the default strategy cannot rewrite turn bodies.
+    /// Prepare existing narrow values with RewriteColumns and append new narrow
+    /// rows. Both file sets belong to one native transaction and one frozen cut.
+    /// Registration is restricted to tables containing no turn body columns.
     /// File upload does not publish a manifest or remove the frozen generation.
     /// A second call shares the first exact preparation, including file paths.
     pub async fn prepare(
@@ -193,8 +198,11 @@ impl FrozenAnnotations {
             .values
             .iter()
             .try_fold(0usize, |n, (key, value)| {
-                n.checked_add(charge(key, &value.value)?)
-                    .ok_or_else(|| invalid("publication size overflow"))
+                n.checked_add(registration::retained_charge(
+                    charge(key, &value.value)?,
+                    value.pending_turn.as_ref(),
+                )?)
+                .ok_or_else(|| invalid("publication size overflow"))
             })?
             .checked_mul(2)
             .and_then(|n| n.checked_add(self.0.results.as_ref().map_or(0, |s| s.len() * 2)))
@@ -208,38 +216,10 @@ impl FrozenAnnotations {
         // RewriteColumns interleaves original rows with updates. Preserve the
         // base's nullability: an additive handoff can leave null label lists in
         // untouched rows even though every update writes a non-null set.
-        let base_schema = Schema::from(self.0.base.schema());
-        let fields = ["id", "labels", "status", "score"]
-            .into_iter()
-            .map(|name| base_schema.field_with_name(name).cloned())
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        let schema = Arc::new(Schema::new(fields));
-        let mut batches = Vec::new();
-        let mut values = self.0.values.iter().peekable();
-        while values.peek().is_some() {
-            let mut ids = StringBuilder::new();
-            let mut labels = ListBuilder::new(StringBuilder::new());
-            let mut status = StringBuilder::new();
-            let mut scores = Vec::new();
-            for (key, stored) in values.by_ref().take(batch_rows) {
-                ids.append_value(key);
-                for label in &stored.value.labels {
-                    labels.values().append_value(label);
-                }
-                labels.append(true);
-                status.append_option(stored.value.status.as_deref());
-                scores.push(stored.value.score);
-            }
-            batches.push(RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(ids.finish()),
-                    Arc::new(labels.finish()),
-                    Arc::new(status.finish()),
-                    Arc::new(Float32Array::from(scores)),
-                ],
-            )?);
-        }
+        let batches = self.batches(batch_rows, false)?;
+        let inserts = self.batches(batch_rows, true)?;
+        let inserted_rows = inserts.iter().map(RecordBatch::num_rows).sum::<usize>();
+        let updated_rows = self.rows() - inserted_rows;
         let mut merge = if batches.is_empty() {
             UncommittedMergeInsert {
                 transaction: Transaction::new_from_version(
@@ -266,7 +246,7 @@ impl FrozenAnnotations {
                 .execute_uncommitted_batches(batches)
                 .await?
         };
-        if merge.stats.num_updated_rows != self.rows() as u64
+        if merge.stats.num_updated_rows != updated_rows as u64
             || merge.stats.num_inserted_rows != 0
             || merge.stats.num_deleted_rows != 0
         {
@@ -274,8 +254,39 @@ impl FrozenAnnotations {
                 "annotation publication did not update exactly the frozen turns",
             ));
         }
-        if self.rows() != 0 {
+        if updated_rows != 0 {
             super::preserve_id::preserve_id(&self.0.base, &mut merge.transaction.operation)?;
+        }
+        if inserted_rows != 0 {
+            registration::validate_target(&self.0.base)?;
+            let buffer = workspace.limit() / 4;
+            let append = InsertBuilder::new(self.0.base.dataset.clone())
+                .with_params(&WriteParams {
+                    mode: WriteMode::Append,
+                    max_bytes_per_file: workspace.limit(),
+                    skip_auto_cleanup: true,
+                    file_writer_options: Some(FileWriterOptions {
+                        data_cache_bytes: Some(buffer as u64),
+                        max_page_bytes: Some(buffer as u64),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+                .execute_uncommitted(inserts)
+                .await?;
+            let Operation::Append { fragments } = append.operation else {
+                return Err(invalid("new annotations did not prepare append fragments"));
+            };
+            if updated_rows == 0 {
+                merge.transaction.operation = Operation::Append { fragments };
+            } else if let Operation::Update { new_fragments, .. } = &mut merge.transaction.operation
+            {
+                // preserve_id already checked the update-only preparation.
+                *new_fragments = fragments;
+            } else {
+                return Err(invalid("unexpected mixed annotation preparation"));
+            }
+            merge.stats.num_inserted_rows = inserted_rows as u64;
         }
         merge.transaction.uuid = self.0.id.clone();
         let cut = serde_json::to_string(&(&self.0.scope, self.0.through))
@@ -294,5 +305,65 @@ impl FrozenAnnotations {
             generation: self.0.clone(),
             prepared: result,
         })
+    }
+
+    fn batches(&self, batch_rows: usize, inserting: bool) -> Result<Vec<RecordBatch>> {
+        let mut values = self
+            .0
+            .values
+            .iter()
+            .filter(|(_, stored)| {
+                stored
+                    .pending_turn
+                    .as_ref()
+                    .is_some_and(|p| p.through > self.0.base_cut)
+                    == inserting
+            })
+            .peekable();
+        if values.peek().is_none() {
+            return Ok(Vec::new());
+        }
+        let base_schema = Schema::from(self.0.base.schema());
+        let names: &[&str] = if inserting {
+            &["id", "rollout_id", "labels", "status", "score"]
+        } else {
+            &["id", "labels", "status", "score"]
+        };
+        let fields = names
+            .iter()
+            .map(|name| base_schema.field_with_name(name).cloned())
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let schema = Arc::new(Schema::new(fields));
+        let mut batches = Vec::new();
+        while values.peek().is_some() {
+            let mut ids = StringBuilder::new();
+            let mut groups = StringBuilder::new();
+            let mut labels = ListBuilder::new(StringBuilder::new());
+            let mut status = StringBuilder::new();
+            let mut scores = Vec::new();
+            for (key, stored) in values.by_ref().take(batch_rows) {
+                ids.append_value(key);
+                if inserting {
+                    groups.append_value(&stored.pending_turn.as_ref().unwrap().rollout_id);
+                }
+                for label in &stored.value.labels {
+                    labels.values().append_value(label);
+                }
+                labels.append(true);
+                status.append_option(stored.value.status.as_deref());
+                scores.push(stored.value.score);
+            }
+            let mut columns: Vec<Arc<dyn Array>> = vec![Arc::new(ids.finish())];
+            if inserting {
+                columns.push(Arc::new(groups.finish()));
+            }
+            columns.extend([
+                Arc::new(labels.finish()) as Arc<dyn Array>,
+                Arc::new(status.finish()),
+                Arc::new(Float32Array::from(scores)),
+            ]);
+            batches.push(RecordBatch::try_new(schema.clone(), columns)?);
+        }
+        Ok(batches)
     }
 }
