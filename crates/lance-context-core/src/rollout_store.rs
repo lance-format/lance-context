@@ -4054,6 +4054,7 @@ mod tests {
         assert_eq!(after.version, before.version + 1);
         assert_eq!(after.sstables, before.sstables);
         assert_eq!(scope.completed_steps(), 0);
+        assert_eq!(scope.work().generations_reclaimed, 0);
         assert!(!scope.has_uncertain_commit());
         store.cleanup_own_shard().await.unwrap();
         assert_eq!(store.base.dataset.count_rows(None).await.unwrap(), 1);
@@ -9186,3 +9187,7 @@ mod reference_validation_tests;
 #[cfg(test)]
 #[path = "rollout_store/staging_cancellation_tests.rs"]
 mod staging_cancellation_tests;
+
+#[cfg(test)]
+#[path = "rollout_store/reclamation_accounting_tests.rs"]
+mod reclamation_accounting_tests;

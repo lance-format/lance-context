@@ -335,7 +335,6 @@ pub(crate) async fn reconcile_shard(dataset: &Dataset, shard: Uuid) -> Result<us
         let phase = crate::merge_write_scope::work_stage("wal_drain");
         crate::merge_write_scope::drain_generations(store, manifest.writer_epoch, generations)
             .await?;
-        crate::merge_write_scope::generations_reclaimed(count);
         drop(phase);
         let object_store = dataset.object_store(None).await?;
         let root = dataset
@@ -1030,40 +1029,48 @@ mod tests {
 
     #[tokio::test]
     async fn work_report_distinguishes_encoding_from_durable_reclamation() {
-        let dir = tempfile::tempdir().unwrap();
-        let uri = dir.path().to_str().unwrap();
-        let store = writer(uri, "a").await;
-        put(&store, "first", 4096).await;
-        let scope = crate::merge_write_scope::MergeWriteScope::new();
-        scope
-            .run(async {
-                let mut coordinator = AppendCoordinator::open(uri, None).await.unwrap();
-                let (mut plans, _) = coordinator
-                    .plan(&["a".into()], 64, 1024 * 1024)
-                    .await
-                    .unwrap();
-                let part = stage(uri, plans.remove(0), budget(), None).await.unwrap();
-                let encoded = scope.work();
-                assert_eq!(encoded.wal_rows_read, 1);
-                assert!(encoded.wal_decoded_bytes >= 4096);
-                assert_eq!(encoded.encoded_rows, 1);
-                assert!(encoded.encoded_bytes > 0);
-                assert!(encoded.encoded_files > 0);
-                assert_eq!(encoded.base_commits, 0);
-                assert_eq!(encoded.generations_reclaimed, 0);
-                assert_eq!(coordinator.commit(vec![part]).await.unwrap(), 1);
-                let committed = scope.work();
-                assert_eq!(committed.base_commits, 1);
-                assert_eq!(committed.generations_reclaimed, 1);
-                assert_eq!(committed.last_completed_stage.as_deref(), Some("wal_drain"));
-                let sequence = scope.completed_steps();
-                tokio::task::yield_now().await;
-                assert_eq!(scope.completed_steps(), sequence);
-                assert_eq!(scope.work(), committed);
-            })
-            .await;
-        scope.drain().await;
-        assert_eq!(rows(uri).await, 1);
+        for scope in [
+            crate::merge_write_scope::MergeWriteScope::new(),
+            crate::merge_write_scope::MergeWriteScope::for_legacy_observation(),
+            crate::merge_write_scope::MergeWriteScope::for_legacy_file_observation(),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let store = writer(uri, "a").await;
+            put(&store, "first", 4096).await;
+            scope
+                .run(async {
+                    let mut coordinator = AppendCoordinator::open(uri, None).await.unwrap();
+                    let (mut plans, _) = coordinator
+                        .plan(&["a".into()], 64, 1024 * 1024)
+                        .await
+                        .unwrap();
+                    // Legacy observation also sees the plan's cutover metadata
+                    // publication; encoding itself must add no base commit.
+                    let planned = scope.work();
+                    let part = stage(uri, plans.remove(0), budget(), None).await.unwrap();
+                    let encoded = scope.work();
+                    assert_eq!(encoded.wal_rows_read, 1);
+                    assert!(encoded.wal_decoded_bytes >= 4096);
+                    assert_eq!(encoded.encoded_rows, 1);
+                    assert!(encoded.encoded_bytes > 0);
+                    assert!(encoded.encoded_files > 0);
+                    assert_eq!(encoded.base_commits, planned.base_commits);
+                    assert_eq!(encoded.generations_reclaimed, 0);
+                    assert_eq!(coordinator.commit(vec![part]).await.unwrap(), 1);
+                    let committed = scope.work();
+                    assert_eq!(committed.base_commits, encoded.base_commits + 1);
+                    assert_eq!(committed.generations_reclaimed, 1);
+                    assert_eq!(committed.last_completed_stage.as_deref(), Some("wal_drain"));
+                    let sequence = scope.completed_steps();
+                    tokio::task::yield_now().await;
+                    assert_eq!(scope.completed_steps(), sequence);
+                    assert_eq!(scope.work(), committed);
+                })
+                .await;
+            scope.drain().await;
+            assert_eq!(rows(uri).await, 1);
+        }
     }
 
     #[derive(Debug)]

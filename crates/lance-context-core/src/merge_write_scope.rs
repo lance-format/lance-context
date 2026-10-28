@@ -156,6 +156,18 @@ impl MergeWriteScope {
     pub fn work(&self) -> MergeWork {
         self.work.lock().unwrap().clone()
     }
+    // Called inside the shielded drain leaf with its captured scope: the caller
+    // may already have been cancelled and Tokio task locals are not inherited.
+    fn record_reclaimed(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let mut work = self.work.lock().unwrap();
+        work.generations_reclaimed = work.generations_reclaimed.saturating_add(count as u64);
+        work.last_completed_stage = Some("wal_drain".into());
+        self.completed_steps.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn completed_steps(&self) -> u64 {
         self.local_io.lock().unwrap().iter().fold(
             self.completed_steps.load(Ordering::Relaxed),
@@ -379,28 +391,6 @@ fn record_base_commit() {
         let mut work = scope.work.lock().unwrap();
         work.base_commits += 1;
         work.last_completed_stage = Some("base_commit".into());
-    });
-    checkpoint();
-}
-
-pub(crate) fn generations_reclaimed(count: usize) {
-    if CURRENT
-        .try_with(|scope| scope.observation_only)
-        .unwrap_or(false)
-    {
-        return;
-    }
-    record_reclaimed(count);
-}
-
-fn record_reclaimed(count: usize) {
-    if count == 0 {
-        return;
-    }
-    let _ = CURRENT.try_with(|scope| {
-        let mut work = scope.work.lock().unwrap();
-        work.generations_reclaimed = work.generations_reclaimed.saturating_add(count as u64);
-        work.last_completed_stage = Some("wal_drain".into());
     });
     checkpoint();
 }
@@ -645,6 +635,13 @@ pub(crate) async fn drain_generations(
         let (next, written) = shield_observed(
             async move {
                 let written = commit_exact_shard(&writer, &next).await;
+                if written.is_ok() {
+                    if let Some(scope) = &scope {
+                        // Count only this successful attempt's actual removals,
+                        // including when the waiting merge task was cancelled.
+                        scope.record_reclaimed(removed);
+                    }
+                }
                 if written
                     .as_ref()
                     .is_err_and(|e| !matches!(e, Error::RetryableCommitConflict { .. }))
@@ -659,15 +656,7 @@ pub(crate) async fn drain_generations(
         )
         .await?;
         match written {
-            Ok(_) => {
-                if CURRENT
-                    .try_with(|scope| scope.observation_only)
-                    .unwrap_or(false)
-                {
-                    record_reclaimed(removed);
-                }
-                return Ok(next);
-            }
+            Ok(_) => return Ok(next),
             Err(Error::RetryableCommitConflict { .. }) => continue,
             Err(error) => return Err(error),
         }
