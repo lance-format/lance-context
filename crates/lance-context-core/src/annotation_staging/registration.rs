@@ -14,6 +14,25 @@ pub struct Registration<'a> {
 pub(super) struct PendingTurn {
     pub rollout_id: String,
     pub through: u64,
+    pub row: u32,
+}
+
+/// First accepted registration for a turn, scoped to this staging shard.
+/// The row ordinal is in the original registration batch, before duplicate
+/// IDs are removed. Replay must preserve that input order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NewTurnSource {
+    pub record_index: u64,
+    pub row: u32,
+}
+
+impl PendingTurn {
+    pub(super) fn source(&self) -> NewTurnSource {
+        NewTurnSource {
+            record_index: self.through,
+            row: self.row,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -65,6 +84,8 @@ impl AnnotationStaging {
     /// result/recovery evidence. This return value alone is not an ingestion ACK.
     /// Only separate narrow annotation tables support registration. Patch calls
     /// remain update-only and still reject missing turns.
+    /// Keep the original source row order, including repeated turn IDs, so body
+    /// materialization and reads can locate the first accepted body exactly.
     pub async fn register_committed(
         &self,
         after: u64,

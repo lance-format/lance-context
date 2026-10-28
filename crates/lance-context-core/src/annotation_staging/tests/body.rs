@@ -10,7 +10,7 @@ use lance::dataset::{transaction::Operation, InsertBuilder, WriteMode};
 
 const BODY_BYTES: usize = 64 << 10;
 
-fn imported(start: usize, count: usize) -> Result<RecordBatch> {
+pub(super) fn imported(start: usize, count: usize) -> Result<RecordBatch> {
     let ids = (start..start + count)
         .map(|n| format!("turn-{n:06}"))
         .collect::<Vec<_>>();
@@ -108,7 +108,7 @@ fn write_params() -> WriteParams {
     }
 }
 
-async fn detached(base: Arc<Dataset>, batch: RecordBatch) -> Result<Arc<Dataset>> {
+pub(super) async fn detached(base: Arc<Dataset>, batch: RecordBatch) -> Result<Arc<Dataset>> {
     let transaction = InsertBuilder::new(base.clone())
         .with_params(&write_params())
         .execute_uncommitted(vec![batch])
@@ -358,7 +358,9 @@ async fn bound_body_reference_survives_publication_suffix_and_reopen() -> Result
     Ok(())
 }
 
-async fn binding_fixture(root: &std::path::Path) -> Result<(AnnotationStaging, BodySnapshot)> {
+pub(super) async fn binding_fixture(
+    root: &std::path::Path,
+) -> Result<(AnnotationStaging, BodySnapshot)> {
     let batch = imported(0, 2)?;
     let body = Dataset::write(
         RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),

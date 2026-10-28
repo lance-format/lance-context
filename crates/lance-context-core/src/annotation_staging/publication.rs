@@ -164,6 +164,18 @@ impl AnnotationStaging {
 }
 
 impl FrozenAnnotations {
+    /// First-create source rows still absent from this generation's base.
+    /// Borrowing this iterator retains the frozen generation; it does not
+    /// independently pin source records or authorize body ingestion.
+    pub fn new_turns(&self) -> impl Iterator<Item = (&str, NewTurnSource)> + '_ {
+        self.0.values.iter().filter_map(|(turn, value)| {
+            value
+                .pending_turn
+                .as_ref()
+                .filter(|pending| pending.through > self.0.base_cut)
+                .map(|pending| (turn.as_str(), pending.source()))
+        })
+    }
     pub fn through(&self) -> u64 {
         self.0.through
     }

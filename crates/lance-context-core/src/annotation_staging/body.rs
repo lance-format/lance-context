@@ -4,6 +4,42 @@ use super::*;
 pub const BODY_SNAPSHOT_PROPERTY: &str = "lance-context.annotation-body";
 const MAX_ENCODED_BYTES: usize = 32 << 10;
 
+/// Locate the body using the same view as the current narrow annotation.
+pub enum TurnBodySource<'a> {
+    /// The caller retains the decoded source frame under its source-window
+    /// gate. This locator by itself neither pins WAL nor prevents source GC.
+    Unmaterialized(NewTurnSource),
+    /// Follow the body snapshot reference in this exact narrow base. Retain the
+    /// TurnRead until the response owns its body data and annotation values.
+    Materialized(&'a Dataset),
+}
+
+pub(super) enum CapturedBody {
+    Staged(NewTurnSource),
+    Base(Arc<views::Base>),
+}
+
+/// A full-turn capture consumes one of the existing reader permits. A staged
+/// annotation can still need a materialized body; that case pins its compatible
+/// base too. Annotation-only PointRead keeps its existing narrower lifetime.
+pub struct TurnRead {
+    pub(super) annotations: PointRead,
+    pub(super) source: CapturedBody,
+}
+
+impl TurnRead {
+    pub fn annotations(&self) -> &PointRead {
+        &self.annotations
+    }
+
+    pub fn body_source(&self) -> TurnBodySource<'_> {
+        match &self.source {
+            CapturedBody::Staged(source) => TurnBodySource::Unmaterialized(*source),
+            CapturedBody::Base(base) => TurnBodySource::Materialized(base),
+        }
+    }
+}
+
 /// Native body snapshot selected together with a narrow annotation cut.
 ///
 /// The publisher supplies the authorized destination and logical table

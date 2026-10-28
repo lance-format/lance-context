@@ -22,12 +22,12 @@ mod publication;
 mod published_values;
 mod registration;
 mod views;
-pub use body::{BodySnapshot, BODY_SNAPSHOT_PROPERTY};
+pub use body::{BodySnapshot, TurnBodySource, TurnRead, BODY_SNAPSHOT_PROPERTY};
 pub use publication::{
     FrozenAnnotations, PreparedAnnotations, MAX_RESULTS_BYTES, RESULTS_PROPERTY,
 };
-pub use registration::Registration;
 use registration::{Batch, Input, PendingTurn};
+pub use registration::{NewTurnSource, Registration};
 pub use views::ProtectedBases;
 #[cfg(test)]
 mod tests;
@@ -426,6 +426,7 @@ impl AnnotationStaging {
                         Some(PendingTurn {
                             rollout_id: value.rollout_id.to_owned(),
                             through,
+                            row: row as u32,
                         }),
                     ),
                     Input::Patch { patch, .. } => {
@@ -533,6 +534,25 @@ impl AnnotationStaging {
     /// even if publication retires frozen before the storage read completes.
     /// This does not establish a distributed read barrier by itself.
     pub async fn capture(&self, turn: &str) -> Result<PointRead> {
+        Ok(self.capture_inner(turn, false).await?.0)
+    }
+
+    /// Capture annotation and body location under the same view lock. The
+    /// service still establishes a read barrier and retains the referenced WAL
+    /// frame before releasing its ordered source-window gate.
+    pub async fn capture_turn(&self, turn: &str) -> Result<TurnRead> {
+        let (annotations, source) = self.capture_inner(turn, true).await?;
+        Ok(TurnRead {
+            annotations,
+            source: source.expect("full capture includes body source"),
+        })
+    }
+
+    async fn capture_inner(
+        &self,
+        turn: &str,
+        body: bool,
+    ) -> Result<(PointRead, Option<body::CapturedBody>)> {
         if turn.is_empty() || turn.len() > self.limits.value_bytes {
             return Err(invalid("invalid annotation turn key"));
         }
@@ -544,21 +564,34 @@ impl AnnotationStaging {
                 .as_ref()
                 .and_then(|f| f.values.get(turn).cloned())
         });
-        Ok(PointRead {
-            applied: state.applied,
-            base_version: state.base.version_id(),
-            source: value.map_or_else(
-                || PointSource::Base {
-                    base: state.base.clone(),
-                    turn: turn.to_owned(),
-                    published: self.published_values.clone(),
-                    materialized: state.materialized,
-                },
-                PointSource::Staged,
-            ),
-            value_bytes: self.limits.value_bytes,
-            _reader: permit,
-        })
+        let body = body.then(|| {
+            value
+                .as_ref()
+                .and_then(|v| v.pending_turn.as_ref())
+                .filter(|p| p.through > state.materialized)
+                .map_or_else(
+                    || body::CapturedBody::Base(state.base.clone()),
+                    |p| body::CapturedBody::Staged(p.source()),
+                )
+        });
+        Ok((
+            PointRead {
+                applied: state.applied,
+                base_version: state.base.version_id(),
+                source: value.map_or_else(
+                    || PointSource::Base {
+                        base: state.base.clone(),
+                        turn: turn.to_owned(),
+                        published: self.published_values.clone(),
+                        materialized: state.materialized,
+                    },
+                    PointSource::Staged,
+                ),
+                value_bytes: self.limits.value_bytes,
+                _reader: permit,
+            },
+            body,
+        ))
     }
 
     pub async fn observation(&self) -> Observation {
