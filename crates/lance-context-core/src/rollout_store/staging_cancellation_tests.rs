@@ -10,6 +10,9 @@ use tokio::sync::Notify;
 
 #[derive(Debug, Default)]
 struct WriteGate {
+    publication_pause: AtomicBool,
+    publication_entered: Notify,
+    publication_release: Notify,
     fail: AtomicBool,
     pause: AtomicBool,
     entered: Notify,
@@ -67,6 +70,7 @@ impl ObjectStore for WriteStore {
         if base_data(path) {
             self.gate.wait().await?;
         }
+        self.gate.wait_publication(path).await;
         self.inner.put_opts(path, payload, opts).await
     }
     async fn put_multipart_opts(
@@ -146,9 +150,11 @@ impl ObjectStore for WriteStore {
         self.inner.list_with_delimiter(prefix).await
     }
     async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> Result<()> {
+        self.gate.wait_publication(to).await;
         self.inner.copy_opts(from, to, opts).await
     }
     async fn rename_opts(&self, from: &Path, to: &Path, opts: RenameOptions) -> Result<()> {
+        self.gate.wait_publication(to).await;
         self.inner.rename_opts(from, to, opts).await
     }
 }
@@ -168,6 +174,15 @@ fn base_data(path: &Path) -> bool {
     path.as_ref().contains("/data/") && !path.as_ref().contains("/_mem_wal/")
 }
 impl WriteGate {
+    async fn wait_publication(&self, path: &Path) {
+        if path.as_ref().contains("/_versions/")
+            && path.as_ref().contains(".manifest")
+            && self.publication_pause.swap(false, Ordering::SeqCst)
+        {
+            self.publication_entered.notify_one();
+            self.publication_release.notified().await;
+        }
+    }
     async fn wait(&self) -> Result<()> {
         if self.pause.swap(false, Ordering::SeqCst) {
             self.entered.notify_one();
@@ -1020,4 +1035,341 @@ async fn staged_wal_real_multipart_writer_error_joins_abort_cleanup_before_budge
     assert_eq!(gate.abort_completed.load(Ordering::SeqCst), 1);
     assert_eq!(budget.reserved(), 0);
     assert!(!scope.has_uncertain_commit());
+}
+
+mod worker_prestage {
+    use super::*;
+    use std::{future::Future, pin::Pin, time::Duration};
+    use tokio::sync::RwLock;
+
+    #[derive(Debug)]
+    struct Allow;
+    impl CommitAuthorizer for Allow {
+        fn authorize<'a>(
+            &'a self,
+            _: &'a str,
+            _: u64,
+        ) -> Pin<Box<dyn Future<Output = lance::Result<()>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    async fn fixture() -> (
+        tempfile::TempDir,
+        String,
+        RolloutStoreOptions,
+        Arc<crate::MergeMemoryBudget>,
+    ) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let uri = format!("file-object-store://{}", dir.path().display());
+        let budget = crate::MergeMemoryBudget::new(8 * 1024 * 1024);
+        let options = RolloutStoreOptions {
+            shard_id: Some("ordinary-worker".into()),
+            merge_after_generations: Some(0),
+            merge_max_bytes: Some(1024 * 1024),
+            merge_budget: Some(budget.clone()),
+            ..Default::default()
+        };
+        let mut writer = RolloutStore::open_with_options(&uri, options.clone())
+            .await
+            .unwrap();
+        writer
+            .add(&[super::super::tests::artifact_record("seed", &[1; 16])])
+            .await
+            .unwrap();
+        writer.cleanup_own_shard().await.unwrap();
+        writer
+            .add(&[super::super::tests::artifact_record(
+                "pending",
+                &vec![7; 2 * 1024 * 1024],
+            )])
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        writer.close().await.unwrap();
+        (dir, uri, options, budget)
+    }
+
+    async fn read(store: &Arc<RwLock<RolloutStore>>) {
+        assert_eq!(
+            store
+                .read()
+                .await
+                .get_by_id("seed")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            "seed"
+        );
+    }
+
+    // Both arms block actual encoded-data IO. The publication gate is a real
+    // manifest write, independent of the authorizer (which always succeeds).
+    #[tokio::test]
+    async fn worker_prestage_encoding_allows_reader_but_publication_still_blocks() {
+        for stage in [false, true] {
+            let (_dir, uri, options, budget) = fixture().await;
+            let (other_dir, other_uri, other_options, _) = fixture().await;
+            let other = Arc::new(RwLock::new(
+                RolloutStore::open_existing_with_options(&other_uri, other_options)
+                    .await
+                    .unwrap(),
+            ));
+            let gate = Arc::new(WriteGate::default());
+            let scope = MergeWriteScope::with_preparation_authorizer_and_io_shim(
+                Arc::new(Allow),
+                Arc::new(Wrapper(gate.clone())),
+            );
+            let store = scope
+                .run(async {
+                    Arc::new(RwLock::new(
+                        RolloutStore::open_existing_with_options(&uri, options)
+                            .await
+                            .unwrap(),
+                    ))
+                })
+                .await;
+            gate.pause.store(true, Ordering::SeqCst);
+            gate.publication_pause.store(true, Ordering::SeqCst);
+            let (task_scope, task_store) = (scope.clone(), store.clone());
+            let merge = tokio::spawn(async move {
+                task_scope
+                    .run(async {
+                        let input = {
+                            let guard = task_store.read().await;
+                            let input = guard.prepare_recovered_cleanup_merge().await.unwrap();
+                            if stage {
+                                guard.stage_owned_prepared_merge(input).await.unwrap()
+                            } else {
+                                input
+                            }
+                        }
+                        .unwrap();
+                        task_store
+                            .write()
+                            .await
+                            .commit_prepared_merge(&input.0, &input.1, input.2)
+                            .await
+                            .unwrap()
+                    })
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(20), gate.entered.notified())
+                .await
+                .unwrap();
+            let mut reader = Box::pin(read(&store));
+            if stage {
+                tokio::time::timeout(Duration::from_secs(5), &mut reader)
+                    .await
+                    .expect("reader must progress during owned encoding");
+            } else {
+                assert!(
+                    futures::poll!(&mut reader).is_pending(),
+                    "old encoding holds the exclusive guard"
+                );
+            }
+            tokio::time::timeout(Duration::from_secs(5), read(&other))
+                .await
+                .unwrap();
+            gate.release.notify_one();
+            tokio::time::timeout(Duration::from_secs(20), gate.publication_entered.notified())
+                .await
+                .unwrap();
+            let mut publication_reader = Box::pin(read(&store));
+            assert!(
+                futures::poll!(&mut publication_reader).is_pending(),
+                "publication still holds the exclusive guard"
+            );
+            tokio::time::timeout(Duration::from_secs(5), read(&other))
+                .await
+                .unwrap();
+            gate.publication_release.notify_one();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(20), merge)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                1
+            );
+            if !stage {
+                tokio::time::timeout(Duration::from_secs(5), &mut reader)
+                    .await
+                    .unwrap();
+            }
+            tokio::time::timeout(Duration::from_secs(5), &mut publication_reader)
+                .await
+                .unwrap();
+            scope.drain().await;
+            assert_eq!(budget.reserved(), 0);
+            assert_eq!(scope.work().base_commits, 1);
+            assert_eq!(scope.work().generations_reclaimed, 1);
+            assert_eq!(
+                store.read().await.pending_wal_generations().await.unwrap(),
+                0
+            );
+            assert_eq!(
+                lance::Dataset::open(&uri)
+                    .await
+                    .unwrap()
+                    .count_rows(None)
+                    .await
+                    .unwrap(),
+                2
+            );
+            drop(other_dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_prestage_cancel_retains_encoding_until_join_then_recovers_once() {
+        let (_dir, uri, options, budget) = fixture().await;
+        let gate = Arc::new(WriteGate::default());
+        let scope = MergeWriteScope::with_preparation_authorizer_and_io_shim(
+            Arc::new(Allow),
+            Arc::new(Wrapper(gate.clone())),
+        );
+        let store = scope
+            .run(async {
+                Arc::new(RwLock::new(
+                    RolloutStore::open_existing_with_options(&uri, options.clone())
+                        .await
+                        .unwrap(),
+                ))
+            })
+            .await;
+        let before = store.read().await.version();
+        gate.pause.store(true, Ordering::SeqCst);
+        let (task_scope, task_store) = (scope.clone(), store.clone());
+        let caller = tokio::spawn(async move {
+            task_scope
+                .run(async {
+                    let guard = task_store.read().await;
+                    let input = guard.prepare_recovered_cleanup_merge().await.unwrap();
+                    guard.stage_owned_prepared_merge(input).await.unwrap()
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(20), gate.entered.notified())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), read(&store))
+            .await
+            .unwrap();
+        caller.abort();
+        assert!(matches!(caller.await, Err(error) if error.is_cancelled())); // actual caller joined
+        assert!(budget.reserved() >= 2 * 1024 * 1024);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), scope.drain())
+                .await
+                .is_err()
+        );
+        assert!(budget.try_reserve(budget.limit()).is_none());
+        gate.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(20), scope.drain())
+            .await
+            .unwrap();
+        assert_eq!(budget.reserved(), 0);
+        assert_eq!(scope.work().base_commits, 0);
+        assert_eq!(scope.work().generations_reclaimed, 0);
+        assert_eq!(store.read().await.version(), before);
+        assert_eq!(
+            store.read().await.pending_wal_generations().await.unwrap(),
+            1
+        );
+        assert_eq!(
+            lance::Dataset::open(&uri)
+                .await
+                .unwrap()
+                .count_rows(None)
+                .await
+                .unwrap(),
+            1
+        );
+        let recovery = MergeWriteScope::with_pinned_authorizer(Arc::new(Allow));
+        recovery
+            .run(async {
+                let mut fresh = RolloutStore::open_existing_with_options(&uri, options)
+                    .await
+                    .unwrap();
+                let input = fresh.prepare_recovered_cleanup_merge().await.unwrap();
+                let (ms, manifest, prepared) = fresh
+                    .stage_owned_prepared_merge(input)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    fresh
+                        .commit_prepared_merge(&ms, &manifest, prepared)
+                        .await
+                        .unwrap(),
+                    1
+                );
+                assert_eq!(fresh.cleanup_own_shard().await.unwrap(), 0);
+                assert_eq!(
+                    fresh.get_blob("pending").await.unwrap().unwrap(),
+                    vec![7; 2 * 1024 * 1024]
+                );
+                assert_eq!(fresh.pending_wal_generations().await.unwrap(), 0);
+            })
+            .await;
+        recovery.drain().await;
+        assert_eq!(recovery.work().base_commits, 1);
+        assert_eq!(recovery.work().generations_reclaimed, 1);
+        assert_eq!(budget.reserved(), 0);
+        assert_eq!(
+            lance::Dataset::open(&uri)
+                .await
+                .unwrap()
+                .count_rows(None)
+                .await
+                .unwrap(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_prestage_does_not_transfer_preparation_authority() {
+        let (_dir, uri, options, budget) = fixture().await;
+        let store = RolloutStore::open_existing_with_options(&uri, options)
+            .await
+            .unwrap();
+        let first = MergeWriteScope::with_authorizer(Arc::new(Allow));
+        let second = MergeWriteScope::with_authorizer(Arc::new(Allow));
+        let input = first
+            .run(store.prepare_recovered_cleanup_merge())
+            .await
+            .unwrap();
+        let err = second
+            .run(store.stage_owned_prepared_merge(input))
+            .await
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("owner changed or closed"));
+        assert_eq!(budget.reserved(), 0);
+        let input = first
+            .run(store.prepare_recovered_cleanup_merge())
+            .await
+            .unwrap();
+        first.drain().await;
+        assert!(first
+            .run(store.stage_owned_prepared_merge(input))
+            .await
+            .is_err());
+        let input = store.prepare_recovered_cleanup_merge().await.unwrap();
+        let result = second
+            .run(store.stage_owned_prepared_merge(input))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            second.work().encoded_files,
+            0,
+            "unowned input must retain legacy behavior"
+        );
+        drop(result);
+        second.drain().await;
+        assert_eq!(budget.reserved(), 0);
+        assert_eq!(store.pending_wal_generations().await.unwrap(), 1);
+    }
 }

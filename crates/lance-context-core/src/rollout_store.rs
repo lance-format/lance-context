@@ -750,6 +750,16 @@ impl RolloutStore {
         self.base.stage_prepared_merge(prepared).await
     }
 
+    /// Stage a budgeted worker merge under its existing durable owner. Call
+    /// under the shared store guard; publication still needs the exclusive guard.
+    /// Unowned legacy operations keep their original serial behavior.
+    pub async fn stage_owned_prepared_merge(
+        &self,
+        input: Option<crate::store_base::PreparedMergeInput>,
+    ) -> LanceResult<Option<crate::store_base::PreparedMergeInput>> {
+        self.base.stage_owned_prepared_merge(input).await
+    }
+
     /// Commit a merge prepared by [`Self::prepare_merge_if_ready`].
     pub async fn commit_prepared_merge(
         &mut self,

@@ -279,6 +279,7 @@ pub enum ListSource {
 ///
 /// [`RolloutStore`]: crate::RolloutStore
 pub struct PreparedMerge {
+    shard_id: Uuid,
     merged_generations: HashSet<u64>,
     merged_paths: Vec<String>,
     batches: Vec<RecordBatch>,
@@ -290,7 +291,12 @@ pub struct PreparedMerge {
     bulk_key_delete: bool,
     parallel_upsert_io: bool,
     staged: Option<StagedMergeFiles>,
+    preparation_owner: Option<crate::merge_write_scope::PreparationOwner>,
 }
+
+/// One prepared shard, including its durable manifest and held byte reservation.
+/// This names the existing public prepare/commit tuple; it grants no ownership.
+pub type PreparedMergeInput = (ShardManifestStore, ShardManifest, PreparedMerge);
 
 /// Encoded files have no visible effect until the ordered merge commit.
 struct StagedMergeFiles {
@@ -1207,6 +1213,51 @@ impl StorageBase {
         Ok(())
     }
 
+    /// Stage worker output while the caller still holds only a shared store
+    /// guard. The original owner and reservation follow every admitted encoder
+    /// until actual IO/CPU exit, including when the request is cancelled.
+    /// Legacy/unbudgeted operations retain their existing serial commit path.
+    /// This does not publish or acquire an ingestion writer epoch.
+    pub async fn stage_owned_prepared_merge(
+        &self,
+        input: Option<PreparedMergeInput>,
+    ) -> LanceResult<Option<PreparedMergeInput>> {
+        let Some((manifests, manifest, mut prepared)) = input else {
+            return Ok(None);
+        };
+        if prepared.preparation_owner.is_some()
+            && !crate::merge_write_scope::same_preparation_owner(
+                &prepared.preparation_owner,
+                &crate::merge_write_scope::preparation_owner(),
+            )
+        {
+            return Err(LanceError::io("worker staging owner changed or closed"));
+        }
+        if prepared.preparation_owner.is_none()
+            || prepared.reservation.is_none()
+            || prepared.staged.is_some()
+            || prepared.batches.is_empty()
+            || matches!(
+                self.dataset.manifest().data_storage_format.version,
+                lance_file::version::ConcreteFileVersion::V1
+                    | lance_file::version::ConcreteFileVersion::V2_0
+            )
+        {
+            return Ok(Some((manifests, manifest, prepared)));
+        }
+        if prepared.shard_id != self.write_shard || manifests.shard_id() != self.write_shard {
+            return Err(LanceError::invalid_input("worker staging shard differs"));
+        }
+        let snapshot = Arc::new(self.dataset.clone());
+        let hold = prepared.reservation.as_ref().unwrap().retain();
+        let prepared = crate::merge_write_scope::run_owned_preparation(hold, async move {
+            prepared.staged = Some(encode_merge_files(snapshot, prepared.batches.clone()).await?);
+            Ok::<_, LanceError>(prepared)
+        })
+        .await??;
+        Ok(Some((manifests, manifest, prepared)))
+    }
+
     /// Commit a merge prepared by [`Self::prepare_merge_if_ready`].
     pub async fn commit_prepared_merge(
         &mut self,
@@ -1274,6 +1325,7 @@ impl StorageBase {
         )?;
 
         Ok(Some(PreparedMerge {
+            shard_id: self.write_shard,
             merged_generations,
             merged_paths,
             batches,
@@ -1282,6 +1334,7 @@ impl StorageBase {
             bulk_key_delete: false,
             parallel_upsert_io: false,
             staged: None,
+            preparation_owner: crate::merge_write_scope::preparation_owner(),
         }))
     }
 
@@ -1318,6 +1371,7 @@ impl StorageBase {
             return Ok(false);
         }
         let PreparedMerge {
+            shard_id: _,
             merged_generations,
             merged_paths,
             batches,
@@ -1326,6 +1380,7 @@ impl StorageBase {
             bulk_key_delete,
             parallel_upsert_io,
             staged,
+            preparation_owner: _,
         } = prepared;
 
         // Several sweepers can prepare the same immutable generations under a

@@ -737,16 +737,20 @@ pub(crate) async fn merge_wal_owned(
     let store_lock = state.get_or_open_rollout_store(&name).await?;
     let merge_gate = { store_lock.read().await.merge_preparation_gate() };
     let _merge = merge_gate.lock().await;
-    // Split by lock scope: seal + read every flushed generation under the
-    // *read* lock so ingest on this store keeps running, then take the write
-    // lock only for the short commit. Holding the write lock across the whole
-    // merge is what used to stall every concurrent append for its duration.
+    // Prepare and encode owned, budgeted merges under the shared guard.
+    // Publication, key deletion and manifest drain still require the exclusive
+    // guard and can wait on storage; their duration is not bounded here.
     let lock_start = std::time::Instant::now();
     let prepared = {
         let store = store_lock.read().await;
         ::metrics::histogram!("rollout_wal_merge_lock_wait_seconds")
             .record(lock_start.elapsed().as_secs_f64());
-        match store.prepare_recovered_cleanup_merge().await {
+        let preparation = async {
+            let prepared = store.prepare_recovered_cleanup_merge().await?;
+            store.stage_owned_prepared_merge(prepared).await
+        }
+        .await;
+        match preparation {
             Ok(prepared) => prepared,
             Err(e) => {
                 ::metrics::counter!("rollout_wal_cleanup_total", "result" => "failed").increment(1);
@@ -805,6 +809,106 @@ mod tests {
 
     use super::*;
     use crate::state::AppState;
+
+    #[tokio::test]
+    async fn worker_prestage_cached_writer_supports_successive_owned_http_and_sweeper_merges() {
+        use crate::sweeper::Sweepable;
+        use lance_context_core::merge_write_scope::{CommitAuthorizer, MergeWriteScope};
+        use std::{
+            future::Future,
+            pin::Pin,
+            sync::atomic::{AtomicUsize, Ordering},
+        };
+        #[derive(Debug, Default)]
+        struct Authorizer(AtomicUsize);
+        impl CommitAuthorizer for Authorizer {
+            fn authorize<'a>(
+                &'a self,
+                _: &'a str,
+                _: u64,
+            ) -> Pin<Box<dyn Future<Output = lance::Result<()>> + Send + 'a>> {
+                Box::pin(async move {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            }
+        }
+        for mode in ["http", "count", "cleanup"] {
+            let dir = TempDir::new().unwrap();
+            let mut state = AppState::new_for_test(dir.path().to_path_buf()).await;
+            let budget = lance_context_core::MergeMemoryBudget::new(4 * 1024 * 1024);
+            state.merge_budget = Some(budget.clone());
+            state.rollout_merge_max_bytes = 1024 * 1024;
+            state.rollout_merge_after_generations = 1;
+            let state = Arc::new(state);
+            let _ = create_rollout_store(
+                State(state.clone()),
+                Json(CreateRolloutStoreRequest {
+                    name: "rl".into(),
+                    storage_options: None,
+                }),
+            )
+            .await
+            .unwrap();
+            // Exactly the production cache lifetime: opened before either owner.
+            let cached = state.get_or_open_rollout_store("rl").await.unwrap();
+            for i in 0..2 {
+                let id = format!("row-{i}");
+                let row = rollout_record_from_add_request(&record_with_size(&id, None));
+                cached.read().await.add(&[row]).await.unwrap();
+                cached.read().await.flush().await.unwrap();
+                assert_eq!(
+                    cached.read().await.pending_wal_generations().await.unwrap(),
+                    1
+                );
+                let authorizer = Arc::new(Authorizer::default());
+                let scope = MergeWriteScope::with_authorizer(authorizer.clone());
+                let count = scope
+                    .run(async {
+                        match mode {
+                            "http" => {
+                                merge_wal_owned(State(state.clone()), Path("rl".into()))
+                                    .await
+                                    .unwrap()
+                                    .0
+                                    .reclaimed
+                            }
+                            "count" => cached.merge_if_due().await.unwrap(),
+                            _ => cached.merge_wal().await.unwrap(),
+                        }
+                    })
+                    .await;
+                scope.drain().await;
+                assert_eq!(count, 1);
+                assert_eq!(scope.work().encoded_files, 1);
+                assert_eq!(scope.work().base_commits, 1);
+                assert_eq!(scope.work().generations_reclaimed, 1);
+                assert!(authorizer.0.load(Ordering::SeqCst) > 0);
+                assert_eq!(budget.reserved(), 0);
+                assert_eq!(
+                    cached.read().await.pending_wal_generations().await.unwrap(),
+                    0
+                );
+                assert_eq!(
+                    cached
+                        .read()
+                        .await
+                        .get_by_id(&id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .id,
+                    id
+                );
+                assert!(Arc::ptr_eq(
+                    &cached,
+                    &state.get_or_open_rollout_store("rl").await.unwrap()
+                ));
+            }
+            assert_eq!(cached.read().await.list(None, None).await.unwrap().len(), 2);
+            cached.write().await.close().await.unwrap();
+        }
+    }
 
     #[tokio::test]
     async fn legacy_compaction_cannot_bypass_owned_or_draining_admission() {
