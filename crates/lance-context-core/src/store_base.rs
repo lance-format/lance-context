@@ -1785,9 +1785,9 @@ impl StorageBase {
                 .await
             };
             match result {
-                Ok(_) => {
+                Ok(committed) => {
                     crate::merge_write_scope::base_committed();
-                    self.dataset.checkout_latest().await?;
+                    self.dataset = committed;
                     return Ok(());
                 }
                 Err(LanceError::CommitConflict { .. }) if attempt < 10 => {

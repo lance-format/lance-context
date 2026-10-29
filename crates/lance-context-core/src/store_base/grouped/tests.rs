@@ -649,6 +649,97 @@ async fn conflict_on_nonfirst_shard_coverage_rejects_old_group_without_replay() 
     second.close().await.unwrap();
 }
 
+#[derive(Debug, Default)]
+struct RejectPostCommitLookup {
+    committed: std::sync::atomic::AtomicBool,
+    rejected: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl lance_table::io::commit::CommitHandler for RejectPostCommitLookup {
+    async fn resolve_latest_location(
+        &self,
+        path: &object_store::path::Path,
+        store: &lance_io::object_store::ObjectStore,
+    ) -> LanceResult<lance_table::io::commit::ManifestLocation> {
+        use std::sync::atomic::Ordering;
+        if self.committed.load(Ordering::SeqCst) {
+            self.rejected.fetch_add(1, Ordering::SeqCst);
+            return Err(LanceError::io("injected post-commit latest lookup failure"));
+        }
+        lance_table::io::commit::RenameCommitHandler
+            .resolve_latest_location(path, store)
+            .await
+    }
+
+    async fn commit(
+        &self,
+        manifest: &mut lance_table::format::Manifest,
+        indices: Option<Vec<lance_table::format::IndexMetadata>>,
+        path: &object_store::path::Path,
+        store: &lance_io::object_store::ObjectStore,
+        writer: lance_table::io::commit::ManifestWriter,
+        naming: lance_table::io::commit::ManifestNamingScheme,
+        transaction: Option<lance_table::format::Transaction>,
+    ) -> Result<lance_table::io::commit::ManifestLocation, lance_table::io::commit::CommitError>
+    {
+        let location = lance_table::io::commit::RenameCommitHandler
+            .commit(manifest, indices, path, store, writer, naming, transaction)
+            .await?;
+        self.committed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(location)
+    }
+}
+
+#[tokio::test]
+async fn successful_commit_retains_its_snapshot_without_another_latest_lookup() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("base.lance").to_str().unwrap().to_owned();
+    let budget = MergeMemoryBudget::new(8 * MIB);
+    let mut first = open(&uri, "first", budget.clone()).await;
+    let mut second = open(&uri, "second", budget.clone()).await;
+    put(&first, &[("shared", b"first"), ("only-first", b"one")]).await;
+    put(&second, &[("shared", b"second")]).await;
+    let a = prepare(&first, &budget).await;
+    let b = prepare(&second, &budget).await;
+    let before = Dataset::open(&uri).await.unwrap().version().version;
+    let injected = Arc::new(RejectPostCommitLookup::default());
+    first.dataset = lance::dataset::builder::DatasetBuilder::from_uri(&uri)
+        .with_commit_handler(Arc::new(crate::merge_write_scope::GuardedCommit::new(
+            injected.clone(),
+        )))
+        .load()
+        .await
+        .unwrap();
+
+    assert_eq!(commit(&mut first, vec![a, b], MIB).await.unwrap(), 2);
+    assert_eq!(first.version(), before + 1);
+    assert_eq!(
+        injected.rejected.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    let coverage = crate::rollout_append::watermarks(&first.dataset)
+        .await
+        .unwrap();
+    assert!(coverage.contains_key(&first.write_shard));
+    assert!(coverage.contains_key(&second.write_shard));
+    assert_eq!(
+        values(&uri).await,
+        HashMap::from([
+            ("shared".into(), b"second".to_vec()),
+            ("only-first".into(), b"one".to_vec()),
+        ])
+    );
+    assert_eq!(first.pending_wal_generations().await.unwrap(), 0);
+    assert_eq!(budget.reserved(), 0);
+    injected
+        .committed
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    first.close().await.unwrap();
+    second.close().await.unwrap();
+}
+
 /// Publish the real manifest, then lose the response. The caller must never
 /// interpret an IO error as permission to replay the prepared group.
 #[derive(Debug, Default)]
