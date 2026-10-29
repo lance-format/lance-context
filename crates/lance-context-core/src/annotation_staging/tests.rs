@@ -14,6 +14,7 @@ mod compaction;
 mod concurrent_reads;
 mod published_values;
 mod reclamation;
+mod registration;
 mod views;
 
 #[tokio::test]
@@ -104,6 +105,16 @@ async fn cold_lookup_projects_narrow_rows_and_rejects_duplicate_keys() -> Result
     let keys = BTreeSet::from(["o'hara", "U", "T", "missing"]);
     let rows = read_bases(&base, &keys).await?;
     assert_eq!(rows.len(), 3);
+    let existing = read_existing(&base, &keys, &["id"]).await?;
+    assert_eq!(
+        existing.keys().collect::<Vec<_>>(),
+        rows.keys().collect::<Vec<_>>()
+    );
+    for row in existing.values() {
+        assert_eq!(row.num_rows(), 1);
+        assert_eq!(row.num_columns(), 1);
+        assert_eq!(row.schema().field(0).name(), "id");
+    }
     for key in ["T", "U", "o'hara"] {
         let row = &rows[key];
         assert_eq!(row.num_rows(), 1);
@@ -135,6 +146,7 @@ async fn cold_lookup_projects_narrow_rows_and_rejects_duplicate_keys() -> Result
         )
         .await?,
     );
+    assert!(read_existing(&duplicate, &keys, &["id"]).await.is_err());
     let staging = AnnotationStaging::new(duplicate, scope(), 0, Limits::default())?;
     assert!(staging.capture("T").await?.resolve().await.is_err());
     let before = staging.observation().await;
@@ -1085,3 +1097,6 @@ async fn repeated_narrow_publication_drains_staging_without_growing_retained_his
     }
     Ok(())
 }
+
+mod body;
+mod body_origin;

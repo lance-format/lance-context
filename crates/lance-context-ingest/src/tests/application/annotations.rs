@@ -166,6 +166,7 @@ async fn annotation_executable_two_ingresses_restart_owner_and_fence_lost_lease(
         apply_memory_bytes: 8 << 20,
         staging: limits.clone(),
         source: Some(source),
+        projection: None,
         exclusive_reclamation: None,
     });
     let encoded = serde_json::to_value(config.annotations.as_ref().unwrap())?;

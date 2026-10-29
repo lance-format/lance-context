@@ -138,7 +138,7 @@ async fn annotation_owner_collects_abandoned_preparation_and_continuously_drains
         let value = service.get("T", Duration::from_secs(30)).await?.unwrap();
         assert_eq!(value.status.as_deref(), Some(status.as_str()));
         assert_eq!(value.score, Some(sequence as f32));
-        drained(&service, completed.index).await?;
+        drained(&c, &service, completed.index).await?;
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 if files(&path)?.len() == 3 && metadata_files(&path)?.len() == 4 {

@@ -124,12 +124,16 @@ impl Sweepable for Arc<RwLock<RolloutStore>> {
         let _merge = merge_gate.lock().await;
         let prepared = {
             let guard = self.read().await;
-            guard
+            let prepared = guard
                 .prepare_count_merge()
+                .await
+                .map_err(|e| e.to_string())?;
+            guard
+                .stage_owned_prepared_merge(prepared)
                 .await
                 .map_err(|e| e.to_string())?
         };
-        // Only now take the write lock, and only for the short commit.
+        // Publication, key deletion and drain retain the exclusive store guard.
         let Some((manifest_store, manifest, prepared)) = prepared else {
             return Ok(0);
         };
@@ -145,12 +149,16 @@ impl Sweepable for Arc<RwLock<RolloutStore>> {
         let _merge = merge_gate.lock().await;
         let prepared = {
             let guard = self.read().await;
-            guard
+            let prepared = guard
                 .prepare_recovered_cleanup_merge()
+                .await
+                .map_err(|e| e.to_string())?;
+            guard
+                .stage_owned_prepared_merge(prepared)
                 .await
                 .map_err(|e| e.to_string())?
         };
-        // Only now take the write lock, and only for the short commit.
+        // Publication, key deletion and drain retain the exclusive store guard.
         let Some((manifest_store, manifest, prepared)) = prepared else {
             return Ok(0);
         };

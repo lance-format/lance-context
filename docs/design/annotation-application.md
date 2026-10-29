@@ -33,6 +33,67 @@ selects subsequent publications, so a plain canonical Lance open is not the
 annotation read path. Keep old writers stopped. Combining new ingestion with
 point updates remains separate work.
 
+### Separate narrow annotation table
+
+For a fragmented body table, the same `annotation-bootstrap` command can create
+a separate narrow destination before handing it to the owner. Configure
+`tables[0].uri` as a fresh annotation URI and replace `annotations.source` with:
+
+```json
+"projection": {
+  "uri": "s3://example/body-table.lance",
+  "storage_options": {},
+  "snapshot": {
+    "version": 42,
+    "transaction": "00000000-0000-0000-0000-000000000042"
+  }
+}
+```
+
+The source must be a quiesced, unmanaged rollout table with unique, non-null
+UTF8 `id` values and a non-null UTF8 `rollout_id` grouping key. Stop and drain its
+old writer before starting one bootstrap process. Persist the exact source native transaction UUID, both
+URIs, the target table/incarnation and complete bootstrap identity before the
+first attempt. Source credentials remain in configuration and are excluded from
+the persisted provenance. Source and destination may have different storage
+options; use a separate, exclusively owned destination root.
+
+Projection reads only `id`, `rollout_id`, `labels`, `status` and `score`, preserving
+existing annotations and filling missing annotation columns with null. It leaves
+every source file and its manifest unchanged. The immutable `rollout_id` is the
+real grouping key; it also leaves an unchanged column for Lance 13's narrow
+`RewriteColumns` operation. The target receives stable row IDs and an ID B-tree
+before the existing fenced handoff selects version 3.
+
+Rows flow directly from the native projected scanner into the native writer;
+there is no whole-table batch collection or body copying. Scanner I/O, output
+batches and writer buffering use slices of `materializer_memory_bytes` (at least
+1 MiB). Up to four source fragments overlap their I/O through the shared scan
+buffer; oversized output batches fail instead of accumulating. Existing decode
+settings are retained. For plain Lance 13 v2 scans, `batch_readahead(1)` alone
+does not enforce single-batch decoding: the native path uses the compute-thread
+and execution-partition limits. File size uses
+the workspace as a soft target. Native decode, manifest metadata, index-building
+memory and process RSS are not hard-bounded by these buffer settings. In
+particular, this is not a large-scale index-build or recovery-cost qualification.
+
+On an interrupted or unknown result, rerun the original configuration. A
+completed projection or index is checked and reused; a completed handoff resolves
+through the current managed catalog without reimporting original annotations.
+Changed source snapshots, identities, foreign destinations and unexpected native
+versions are rejected. Uncommitted files from an interrupted native write may
+remain; the command does not erase the destination to retry. Once the normal
+exclusive collector is enabled, it uses the usual protection and retirement
+protocol. No source body files are eligible for the annotation collector.
+
+Annotation reads must use the owner/ingress path. Existing body-table reads still
+contain the original annotation columns and do not automatically join current
+annotations. The source body table and its snapshot remain under their existing
+reader/retention contract; this command neither maintains nor collects them.
+Unified body-plus-annotation reads, online migration, new-body ingestion and
+re-import synchronization require subsequent integration. Do not resume the old
+annotation writer or route current annotation reads to the source after handoff.
+
 On an uncertain result, repeat the same command/configuration. It checks the
 original source transaction, persisted handoff marker, exact output transaction,
 and managed bootstrap identity. An interrupted schema commit can be registered
@@ -103,6 +164,16 @@ token authorizes the table; an edge proxy remains responsible for TLS and any
 narrower end-user permissions. `GET /api/v1/health` uses the same authentication.
 Owner health checks the running runtime and catalog epoch; each point read still
 waits for its apply barrier. Frontend health checks local draining state.
+
+Annotation forwarding uses HTTP/2 to the owner, including cleartext HTTP/2 for
+an `http://` owner URL. An early admission refusal can cancel one upload stream
+without closing a connection while the ingress is still writing its body.
+Owners and forwarding ingress listeners continue accepting HTTP/1 clients.
+Upgrade owners before forwarding ingresses; any proxy at `owner_url` must support
+HTTP/2. There is no automatic HTTP/1 fallback or mutation replay after a transport
+failure. Such failures still report an unknown outcome and retain the original
+request identity for explicit resolution. Forwarding shares Arrow body frames
+without decoding or coalescing the complete upload.
 
 Graceful shutdown closes admission, lets admitted requests finish while the
 applier runs, then joins the listener and runtime before releasing the claim.

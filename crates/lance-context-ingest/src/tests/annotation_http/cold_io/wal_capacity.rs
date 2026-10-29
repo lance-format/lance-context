@@ -75,7 +75,7 @@ async fn exercise() -> Result<()> {
     assert_eq!(current.score, None);
 
     publication.release();
-    annotation_runtime::drained(&service, accepted.completion.index).await?;
+    annotation_runtime::drained(&c, &service, accepted.completion.index).await?;
     // Wait for the existing source-closure protocol, not just local staging
     // retirement, before deliberately resubmitting the rejected original bytes.
     tokio::time::timeout(Duration::from_secs(30), async {
@@ -106,7 +106,7 @@ async fn exercise() -> Result<()> {
     let current = point(&client, &b).await?.unwrap();
     assert_eq!(current.status.as_deref(), Some("reviewed"));
     assert_eq!(current.score, Some(0.9));
-    annotation_runtime::drained(&service, next.completion.index).await?;
+    annotation_runtime::drained(&c, &service, next.completion.index).await?;
 
     ga.shutdown().await;
     gb.shutdown().await;

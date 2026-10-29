@@ -170,9 +170,14 @@ impl Producer {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppendFailure {
-    Sequence { expected: u64 },
+    Sequence {
+        expected: u64,
+    },
     Capacity,
     ProducerFenced,
+    /// Only this attempt was refused before proposal. Keep the original request
+    /// identity and bytes, including when reconciling an earlier unknown reply.
+    DiskBudgetNotSubmitted,
     Unknown,
 }
 impl std::fmt::Display for AppendFailure {
@@ -183,6 +188,9 @@ impl std::fmt::Display for AppendFailure {
             }
             Self::Capacity => f.write_str("WAL capacity exhausted"),
             Self::ProducerFenced => f.write_str("producer fenced"),
+            Self::DiskBudgetNotSubmitted => {
+                f.write_str("WAL disk admission refused this append before submission")
+            }
             Self::Unknown => {
                 f.write_str("append outcome unknown; retain exact producer sequence and bytes")
             }
@@ -449,6 +457,9 @@ impl Ingress {
             .await
             .map_err(|error| anyhow::Error::new(AppendFailure::Unknown).context(error))?;
         let index = match response.reply {
+            Reply::AppendNotSubmittedDiskBudget => {
+                return Err(AppendFailure::DiskBudgetNotSubmitted.into())
+            }
             Reply::Commit(Outcome::Committed(Applied::Accepted { index })) => index,
             Reply::Commit(Outcome::Committed(Applied::Rejected { expected_sequence })) => {
                 return Err(AppendFailure::Sequence {

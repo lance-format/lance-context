@@ -13,10 +13,6 @@ pub async fn provision(config: &Config) -> Result<()> {
         .annotations
         .as_ref()
         .context("annotation configuration missing")?;
-    let source = a
-        .source
-        .clone()
-        .context("annotation handoff requires a persisted source snapshot")?;
     let table = &config.tables[0];
     let storage = Storage::resolve(
         table.uri.clone(),
@@ -24,6 +20,24 @@ pub async fn provision(config: &Config) -> Result<()> {
         Arc::new(lance::session::Session::default()),
     )
     .await?;
+    if let Some(source) = &a.projection {
+        bootstrap::annotations::projection::provision(
+            config.client()?,
+            Arc::new(config.layout.clone()),
+            table.binding.clone(),
+            storage,
+            table.bootstrap.clone(),
+            source,
+            a.staging.clone(),
+            config.materializer_memory_bytes,
+        )
+        .await?;
+        return Ok(());
+    }
+    let source = a
+        .source
+        .clone()
+        .context("annotation handoff requires a persisted source snapshot")?;
     bootstrap::annotations::provision(
         config.client()?,
         Arc::new(config.layout.clone()),

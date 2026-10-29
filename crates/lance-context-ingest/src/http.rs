@@ -427,6 +427,9 @@ async fn append_body(inner: &Inner, ingress: &Ingress, request: Request) -> Http
         .map_err(|_| Failure::bad("invalid_rollout_ipc"))?;
     let accepted = ingress.append(&prepared).await.map_err(|error| {
         match error.downcast_ref::<AppendFailure>() {
+            Some(AppendFailure::DiskBudgetNotSubmitted) => {
+                Failure::unavailable("wal_disk_capacity", "not_submitted")
+            }
             Some(AppendFailure::Sequence { .. } | AppendFailure::ProducerFenced) => Failure {
                 status: StatusCode::CONFLICT,
                 code: "producer_sequence_rejected",

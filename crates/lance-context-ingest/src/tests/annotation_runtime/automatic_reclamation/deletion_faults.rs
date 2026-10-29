@@ -197,7 +197,7 @@ async fn annotation_collector_slow_pass_leaves_a_full_publication_cooldown() -> 
     let released = tokio::time::Instant::now();
     resume.send(()).unwrap();
     faults.finish_remote().await?;
-    drained(&service, suffix_result.index).await?;
+    drained(&c, &service, suffix_result.index).await?;
     tokio::time::timeout(Duration::from_secs(30), async {
         while faults.collection_starts.lock().unwrap().len() < 2 {
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -263,7 +263,7 @@ async fn annotation_collector_delayed_delete_survives_owner_takeover() -> Result
     )
     .await?;
     let suffix_result = service.submit(&suffix, Duration::from_secs(30)).await?;
-    drained(&service, suffix_result.index).await?;
+    drained(&c, &service, suffix_result.index).await?;
     let live = files(&path)?;
     resume.send(()).unwrap();
     faults.finish_remote().await?;
@@ -354,7 +354,7 @@ async fn annotation_collector_partial_delete_restarts_without_losing_values_or_r
         service.submit(&first, Duration::from_secs(30)).await?,
         completed
     );
-    drained(&service, completed.index).await?;
+    drained(&c, &service, completed.index).await?;
     wait_files(&path, 3).await?;
     assert!(abandoned.iter().all(|p| !p.exists()));
     let current = service.get("T", Duration::from_secs(30)).await?.unwrap();
@@ -486,7 +486,7 @@ async fn annotation_collector_recovers_after_delete_sigkill() -> Result<()> {
         service.submit(&request, Duration::from_secs(30)).await?,
         expected
     );
-    drained(&service, expected.index).await?;
+    drained(&c, &service, expected.index).await?;
     wait_files(&path, 3).await?;
     assert!(abandoned.iter().all(|p| !p.exists()));
     let current = service.get("T", Duration::from_secs(30)).await?.unwrap();

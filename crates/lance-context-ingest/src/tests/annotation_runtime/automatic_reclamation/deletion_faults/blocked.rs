@@ -95,7 +95,7 @@ async fn failed_sealed_deletes_bound_publication_keep_acks_readable_and_resume()
     blocked.store(false, Ordering::SeqCst);
     let result = service.submit(&waiting, Duration::from_secs(30)).await?;
     assert_eq!(result.index, accepted.position.index);
-    drained(&service, result.index).await?;
+    drained(&c, &service, result.index).await?;
     wait_files(&path, 3).await?;
     assert_eq!(service.reclamation_observation().pending_objects, 0);
     assert!(abandoned.iter().all(|p| !p.exists()));

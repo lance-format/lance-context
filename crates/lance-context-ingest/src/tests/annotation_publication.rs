@@ -821,7 +821,7 @@ fn rejects_foreign_preparation(
         }
         assert!(annotations::transaction(base, descriptors, &changed).is_err());
     }
-    for case in 0..9 {
+    for case in 0..10 {
         let mut changed = original.clone();
         match case {
             0 => changed.uuid = Uuid::new_v4().to_string(),
@@ -849,6 +849,21 @@ fn rejects_foreign_preparation(
                 {
                     new_fragments.push(base.manifest().fragments[0].clone());
                 }
+            }
+            9 => {
+                use lance_context_core::annotation_staging::{
+                    BodySnapshot, BODY_SNAPSHOT_PROPERTY,
+                };
+                let reference = BodySnapshot {
+                    table_instance: selection.incarnation.to_string(),
+                    uri: "memory://body.lance".into(),
+                    version: 1,
+                    transaction: Uuid::new_v4().to_string(),
+                };
+                Arc::make_mut(changed.transaction_properties.as_mut().unwrap()).insert(
+                    BODY_SNAPSHOT_PROPERTY.into(),
+                    serde_json::to_string(&reference)?,
+                );
             }
             _ => {
                 if let lance_table::transaction::Operation::Update {

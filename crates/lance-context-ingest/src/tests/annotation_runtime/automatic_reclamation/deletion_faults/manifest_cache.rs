@@ -121,7 +121,7 @@ async fn annotation_collector_protects_a_retired_base_until_its_reader_releases(
     )
     .await?;
     let first_result = service.submit(&first, Duration::from_secs(30)).await?;
-    drained(&service, first_result.index).await?;
+    drained(&c, &service, first_result.index).await?;
     let held = service.capture_read_for_test("T").await?;
     let old_columns: Vec<_> = files(&path)?.difference(&original).cloned().collect();
     assert_eq!(old_columns.len(), 1);
@@ -134,7 +134,7 @@ async fn annotation_collector_protects_a_retired_base_until_its_reader_releases(
         )
         .await?;
         let result = service.submit(&update, Duration::from_secs(30)).await?;
-        drained(&service, result.index).await?;
+        drained(&c, &service, result.index).await?;
         // Wait for physical collection to leave exactly the current narrow
         // file, the held old narrow file, and the two original body files.
         wait_files(&path, original.len() + 2).await?;

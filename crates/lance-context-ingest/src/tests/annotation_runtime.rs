@@ -60,7 +60,7 @@ async fn owner_with_wait(
     .await
 }
 
-pub(super) async fn drained(service: &Service, through: u64) -> Result<()> {
+pub(super) async fn drained(c: &network::Cluster, service: &Service, through: u64) -> Result<()> {
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let (observed, pressured) = service.observation().await;
@@ -70,12 +70,20 @@ pub(super) async fn drained(service: &Service, through: u64) -> Result<()> {
                 && !pressured
                 && service.source_observation().records == 0
             {
-                return;
+                // Releasing installed staging no longer waits for Close/Advance.
+                // Tests that stop the owner or plan maintenance need the durable
+                // publication boundary too, not just an empty local read view.
+                let view = annotation_publication::state(c).await?;
+                if view.progress.pending.is_none()
+                    && view.progress.checkpoint.get(&10).copied().unwrap_or(0) >= through
+                {
+                    return Ok::<_, anyhow::Error>(());
+                }
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
-    .await?;
+    .await??;
     Ok(())
 }
 
@@ -202,7 +210,7 @@ async fn resume(stage: u8) -> Result<()> {
     let current = service.get("T", Duration::from_secs(30)).await?.unwrap();
     assert_eq!(current.status.as_deref(), Some("reviewed"));
     assert_eq!(current.score, Some(0.9));
-    drained(&service, suffix_result.index).await?;
+    drained(&c, &service, suffix_result.index).await?;
     if let Some(original) = original {
         let selected = annotation_publication::read(&c, &storage, Some(2)).await?;
         assert_eq!(
@@ -221,7 +229,7 @@ async fn resume(stage: u8) -> Result<()> {
     .await?;
     let rejection = service.submit(&rejected, Duration::from_secs(30)).await?;
     assert!(matches!(rejection.result, MutationResult::Rejected(_)));
-    drained(&service, rejection.index).await?;
+    drained(&c, &service, rejection.index).await?;
     assert_eq!(
         service.get("T", Duration::from_secs(30)).await?.unwrap(),
         current
@@ -262,7 +270,7 @@ async fn resume(stage: u8) -> Result<()> {
         let read = service.get("T", Duration::from_secs(30)).await?.unwrap();
         assert_eq!(read.status.as_deref(), Some(status.as_str()));
         assert_eq!(read.score, Some(score));
-        drained(&service, status_result.index.max(score_result.index)).await?;
+        drained(&c, &service, status_result.index.max(score_result.index)).await?;
         last = Some((
             status_request,
             status_result,

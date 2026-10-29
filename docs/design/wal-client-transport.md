@@ -27,6 +27,18 @@ queueing a command or sending bytes cannot produce an accepted ACK. A failed or
 cancelled exchange discards its connection. Keep the original producer sequence
 and payload for explicit reconciliation; errors do not prove non-commit.
 
+A disk-budget refusal before `Raft::step` returns
+`AppendNotSubmittedDiskBudget`. Only this attempt is known not to have been
+submitted; a prior attempt with the same identity may already have committed.
+Retain the original identity and bytes. The client returns the refusal without
+automatically replaying it. Other execution errors, cancellation and lost replies
+retain the unknown outcome.
+
+This reply is appended to the existing RPC enum; existing messages and persisted
+WAL records are unchanged. Upgrade WAL clients before replicas. An older client
+cannot decode the new reply and conservatively sees a transport error/unknown
+outcome; it must not treat that error as a successful append or definite rejection.
+
 Routing follows only configured-voter hints returned before command submission.
 A cached hint is never treated as an ACK. Unknown outcomes are returned to the
 caller instead of automatically advancing/reissuing logical operations. The

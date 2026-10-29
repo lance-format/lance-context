@@ -194,6 +194,12 @@ pub async fn selected_cut(
 
 fn validate(base: &Dataset, transaction: &Transaction, selection: &Selection) -> Result<()> {
     ensure!(
+        !transaction.transaction_properties.as_ref().is_some_and(
+            |p| p.contains_key(lance_context_core::annotation_staging::BODY_SNAPSHOT_PROPERTY)
+        ),
+        "paired body metadata requires a mixed-ingestion publication contract"
+    );
+    ensure!(
         transaction.read_version == base.version_id()
             && transaction.read_version == selection.pending.plan.read_version
             && transaction.uuid == selection.pending.plan.transaction.to_string()

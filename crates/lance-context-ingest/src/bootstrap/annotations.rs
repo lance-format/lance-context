@@ -17,6 +17,8 @@ use object_store::path::Path;
 
 const HANDOFF: &str = "lance-context.annotation-handoff.v1";
 
+pub mod projection;
+
 // Lance can rebase even on its first attempt with max_retries=0. Check the
 // target immediately before the conditional write, not only after publication.
 #[derive(Debug)]

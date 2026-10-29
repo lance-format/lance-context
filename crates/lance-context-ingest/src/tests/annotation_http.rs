@@ -18,6 +18,7 @@ mod batches;
 mod cold_io;
 mod pressure;
 mod read_cut;
+mod transport;
 
 struct Server {
     address: std::net::SocketAddr,
@@ -250,7 +251,7 @@ async fn annotation_http_two_ingresses_keep_values_and_exact_retries_through_own
         )
         .meta
     );
-    annotation_runtime::drained(&service, updated.completion.index).await?;
+    annotation_runtime::drained(&c, &service, updated.completion.index).await?;
     let current = point(&client, &b).await?.unwrap();
     assert_eq!(current.status.as_deref(), Some("after-upload"));
     assert_eq!(current.score, Some(0.9));
@@ -311,7 +312,7 @@ async fn annotation_http_two_ingresses_keep_values_and_exact_retries_through_own
     let cleared = point(&client, &a).await?.unwrap();
     assert_eq!((cleared.status, cleared.score), (None, None));
     assert_eq!(cleared.labels, current.labels);
-    annotation_runtime::drained(&new_service, latest.completion.index).await?;
+    annotation_runtime::drained(&c, &new_service, latest.completion.index).await?;
     let closed = post(&client, &a, "close")
         .json(&http::CloseRequest {
             producer: producer.producer,

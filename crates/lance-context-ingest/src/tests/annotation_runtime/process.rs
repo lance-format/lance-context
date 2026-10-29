@@ -21,7 +21,7 @@ async fn annotation_process_role() -> Result<()> {
         let request = request(&service, &producer, sequence, body).await?;
         let result = service.submit(&request, Duration::from_secs(30)).await?;
         if sequence == 2 {
-            drained(&service, result.index).await?;
+            drained(&c, &service, result.index).await?;
         }
     }
     let body = wire(&limits, &["T"], 1, Some("acknowledged-suffix"), 0, None)?;
@@ -119,7 +119,7 @@ async fn annotation_runtime_recovers_after_sigkill() -> Result<()> {
     let current = service.get("T", Duration::from_secs(30)).await?.unwrap();
     assert_eq!(current.status.as_deref(), Some("acknowledged-suffix"));
     assert_eq!(current.score, Some(0.9));
-    drained(&service, expected.index).await?;
+    drained(&c, &service, expected.index).await?;
     stop.send(()).unwrap();
     task.await??;
     c.shutdown().await

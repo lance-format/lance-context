@@ -148,7 +148,7 @@ async fn annotation_handoff_preserves_real_rollout_data_and_resumes_after_schema
             let request = requests::request(&service, &producer, sequence, bytes).await?;
             let receipt = service.submit(&request, Duration::from_secs(30)).await?;
             if sequence == 2 {
-                annotation_runtime::drained(&service, receipt.index).await?;
+                annotation_runtime::drained(&c, &service, receipt.index).await?;
             }
         }
         let current = service.get("T", Duration::from_secs(30)).await?.unwrap();

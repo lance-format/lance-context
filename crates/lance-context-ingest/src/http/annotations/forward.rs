@@ -59,6 +59,12 @@ impl Forwarder {
             ingresses.insert(name, ingress);
         }
         let client = reqwest::Client::builder()
+            // An owner can reject before consuming a streamed upload. HTTP/2
+            // cancels that stream without closing a connection while another
+            // request body is being written. Owners accept HTTP/1 and HTTP/2;
+            // forwarding ingresses require an HTTP/2-capable owner endpoint.
+            .http2_prior_knowledge()
+            .retry(reqwest::retry::never())
             .timeout(options.body_total_timeout)
             .connect_timeout(options.admission_timeout)
             .redirect(reqwest::redirect::Policy::none())
@@ -191,6 +197,7 @@ impl Forwarder {
             .await
             .map_err(|_| Failure::unavailable("annotation_owner_unavailable", "unknown"))?;
         let status = upstream.status();
+        let retry_after = upstream.headers().get(header::RETRY_AFTER).cloned();
         let is_empty = status == StatusCode::NO_CONTENT;
         if !is_empty
             && upstream
@@ -218,7 +225,7 @@ impl Forwarder {
             }
             bytes.extend_from_slice(&chunk);
         }
-        let response = if is_empty {
+        let mut response = if is_empty {
             status.into_response()
         } else {
             (
@@ -228,6 +235,9 @@ impl Forwarder {
             )
                 .into_response()
         };
+        if let Some(delay) = retry_after {
+            response.headers_mut().insert(header::RETRY_AFTER, delay);
+        }
         Ok((response, reservation))
     }
 }

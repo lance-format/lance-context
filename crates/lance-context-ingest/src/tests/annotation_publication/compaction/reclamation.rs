@@ -105,7 +105,7 @@ async fn collect_bootstrap(hold_reader: bool) -> Result<()> {
         )?;
         let request = request(&service, &producer, sequence, body.clone()).await?;
         let completed = service.submit(&request, Duration::from_secs(30)).await?;
-        runtime::drained(&service, completed.index).await?;
+        runtime::drained(&c, &service, completed.index).await?;
         if sequence == 1 {
             tokio::time::timeout(Duration::from_secs(30), async {
                 loop {

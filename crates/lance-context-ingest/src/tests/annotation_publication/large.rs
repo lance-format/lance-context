@@ -330,7 +330,7 @@ async fn recover_inner(
             // that valid ordering without depending on listing speed.
             let (before, runtime) = owner(&c, &storage, &limits).await?;
             let (stop, task) = runtime::run_owner(runtime);
-            runtime::drained(&before, suffix_result.index).await?;
+            runtime::drained(&c, &before, suffix_result.index).await?;
             assert_eq!(
                 before.submit(&suffix, Duration::from_secs(30)).await?,
                 suffix_result
@@ -433,7 +433,7 @@ async fn recover_inner(
             .unwrap(),
         current
     );
-    runtime::drained(&service, suffix_result.index).await?;
+    runtime::drained(&c, &service, suffix_result.index).await?;
     if collect {
         collected_metadata(&storage, &base).await?;
         assert_eq!(
@@ -505,7 +505,7 @@ async fn recover_inner(
                 assert!(service.observation().await.0.retained_bytes <= limits.retained_bytes);
             }
         }
-        runtime::drained(&service, through).await?;
+        runtime::drained(&c, &service, through).await?;
         let selected = read(&c, &storage, None).await?;
         assert_eq!(
             selected

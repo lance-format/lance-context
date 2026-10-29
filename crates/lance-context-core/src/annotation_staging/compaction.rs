@@ -48,7 +48,11 @@ impl AnnotationStaging {
         if scope != self.scope || through != materialized {
             return Err(invalid("compaction base annotation cut differs"));
         }
-        for key in ["lance-context.annotation-cut", RESULTS_PROPERTY] {
+        for key in [
+            "lance-context.annotation-cut",
+            RESULTS_PROPERTY,
+            BODY_SNAPSHOT_PROPERTY,
+        ] {
             if properties.and_then(|p| p.get(key))
                 != transaction
                     .transaction_properties
@@ -56,7 +60,7 @@ impl AnnotationStaging {
                     .and_then(|p| p.get(key))
             {
                 return Err(invalid(
-                    "compaction changed annotation cut or request results",
+                    "compaction changed annotation cut, request results or body reference",
                 ));
             }
         }

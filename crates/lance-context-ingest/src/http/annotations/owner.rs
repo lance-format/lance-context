@@ -107,6 +107,9 @@ impl Owner {
                 .submit(&prepared, options.body_total_timeout)
                 .await
                 .map_err(|error| match error.downcast_ref::<AppendFailure>() {
+                    Some(AppendFailure::DiskBudgetNotSubmitted) => {
+                        Failure::unavailable("wal_disk_capacity", "not_submitted")
+                    }
                     // This is a committed WAL decision, not a local capacity
                     // guess or an ambiguous transport failure. Exact retained
                     // requests resolve before the WAL checks capacity.

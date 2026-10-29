@@ -9,6 +9,7 @@ use tokio::time::sleep;
 mod deadline;
 mod observation;
 mod reconnect;
+mod routing;
 
 struct RpcCluster {
     net: Cluster,

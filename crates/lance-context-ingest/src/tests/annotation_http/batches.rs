@@ -384,8 +384,12 @@ async fn annotation_http_batch_load_preserves_values_and_drains() -> Result<()> 
     let maximum = observed?;
     let elapsed = started.elapsed();
     let drain = Instant::now();
-    annotation_runtime::drained(&service, loads.iter().map(|s| s.last_index).max().unwrap())
-        .await?;
+    annotation_runtime::drained(
+        &c,
+        &service,
+        loads.iter().map(|s| s.last_index).max().unwrap(),
+    )
+    .await?;
     let drain_ms = drain.elapsed().as_millis();
     let selected = annotation_publication::read(&c, &storage, None).await?;
     let actual = selected

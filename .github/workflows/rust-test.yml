@@ -327,6 +327,7 @@ jobs:
           mkdir -p "$INGEST_TEST_ARTIFACTS"
           cargo build -p lance-context-ingest --features service,http-client --bin lance-context-ingest
           cargo clippy -p lance-context-ingest --features service,http-client --all-targets -- -D warnings
+          cargo test -p lance-context-ingest --features service,http-client --lib tests::annotation_http -- --test-threads=2
           cargo test -p lance-context-ingest --features service,http-client --lib tests::reader
           cargo test -p lance-context-ingest --features service,http-client --lib tests::materializer::compaction::process::compaction_survives_sigkill
           cargo test -p lance-context-ingest --features service,http-client --lib tests::application -- --ignored

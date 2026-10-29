@@ -76,7 +76,7 @@ async fn pending_listing(partial: bool, burst: bool) -> Result<()> {
             ensure!(current.status.as_deref() == Some("acknowledged"));
             ensure!(current.score == score);
             if !burst || sequence == 4 {
-                tokio::time::timeout(Duration::from_secs(5), drained(&service, last))
+                tokio::time::timeout(Duration::from_secs(5), drained(&c, &service, last))
                     .await
                     .context("publication remained blocked on the held listing")??;
             }
@@ -99,7 +99,7 @@ async fn pending_listing(partial: bool, burst: bool) -> Result<()> {
     // Release and shut down even on the negative control, preserving a complete
     // fixture rather than abandoning the pending response or background tasks.
     let original_response_retained = resume.send(()).is_ok();
-    drained(&service, last).await?;
+    drained(&c, &service, last).await?;
     wait_files(&path, 3).await?;
     assert_eq!(
         service.submit(&first, Duration::from_secs(30)).await?,

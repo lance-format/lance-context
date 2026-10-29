@@ -13,6 +13,14 @@ resolves the selected manifest, installs the compatible base/staging view, and
 uses the existing confirmation, source closure and checkpoint advancement flow.
 Result-only batches follow the same lifecycle without writing data files.
 
+After confirmed publication and installation of the compatible read view, the
+publisher releases its frozen/prepared handles before awaiting source retirement.
+Their dirty-value and workspace permits must not keep the next update waiting
+on a slow closure RPC. Other held readers or handles keep their own charges.
+WAL reclamation still requires the existing durable closure authorization and
+advancement proofs. An unknown retirement result still stops the owner; recovery
+uses the selected value/result checkpoint and retained WAL suffix.
+
 The upload, apply and publication budgets are independent. Publication admission
 must accommodate a fully occupied dirty-value generation and result metadata;
 waiting uploads cannot consume its workspace. There is at most one publishing

@@ -1,8 +1,7 @@
 use super::*;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn append_diagnostics_distinguish_admission_failures_without_changing_replies() -> Result<()>
-{
+async fn append_diagnostics_distinguish_disk_refusals_from_unknown_outcomes() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let c = RpcCluster::open(dir.path(), Options::default()).await?;
     let leader = c.leader().await?;
@@ -58,7 +57,7 @@ async fn append_diagnostics_distinguish_admission_failures_without_changing_repl
     handle.disk.as_ref().unwrap().limit_data(1)?;
     assert!(matches!(
         c.client.request(leader, request).await?.reply,
-        Reply::Unknown
+        Reply::AppendNotSubmittedDiskBudget
     ));
     let observed = handle.append_observation();
     assert_eq!(observed["disk_budget"], 1);
@@ -67,6 +66,56 @@ async fn append_diagnostics_distinguish_admission_failures_without_changing_repl
     assert_eq!(observed["execution_other"], 0);
     assert_eq!(observed["cancelled"], 0);
     assert_eq!(observed.values().sum::<u64>(), 2 * observed["started"]);
+    c.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn disk_refused_append_keeps_identity_and_does_not_resolve_a_prior_commit() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let c = RpcCluster::open(dir.path(), Options::default()).await?;
+    let leader = c.leader().await?;
+    let handle = &c.net.nodes[&leader].handle;
+    let budget = handle.disk.as_ref().unwrap();
+    let request = Request::Append {
+        group: 10,
+        batch: batch(1),
+    };
+    let reserve = || {
+        let view = budget.snapshot();
+        // Use the separate control headroom to tolerate concurrent heartbeat
+        // accounting while occupying the complete producer admission window.
+        budget.reserve(
+            (view.data_limit - view.accounted_disk_bytes) as usize,
+            false,
+        )
+    };
+    let held = reserve()?;
+    assert!(matches!(
+        c.client.request_routed(request.clone()).await?.reply,
+        Reply::AppendNotSubmittedDiskBudget
+    ));
+    assert_eq!(handle.observation(10)?.status.accepted_records, 0);
+    assert_eq!(producer(&c.client, leader, &batch(1)).await?, None);
+    drop(held);
+
+    // Explicitly submit the identical request after the reservation releases.
+    let first = c.client.request_routed(request.clone()).await?;
+    let index = accepted(&first);
+    drop(first);
+    let held = reserve()?;
+    assert!(matches!(
+        c.client.request_routed(request.clone()).await?.reply,
+        Reply::AppendNotSubmittedDiskBudget
+    ));
+    // This later refusal cannot undo or deny the first durable acceptance.
+    assert_eq!(producer(&c.client, leader, &batch(1)).await?, Some(index));
+    drop(held);
+    let retried = c.client.request_routed(request).await?;
+    assert_eq!(accepted(&retried), index);
+    drop(retried);
+    assert_eq!(handle.observation(10)?.status.accepted_records, 1);
+    assert_eq!(handle.append_observation()["disk_budget"], 2);
+    assert_eq!(handle.append_observation()["started"], 4);
     c.shutdown().await
 }
 

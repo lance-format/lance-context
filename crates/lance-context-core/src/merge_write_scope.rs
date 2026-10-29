@@ -24,6 +24,33 @@ tokio::task_local! { static CURRENT: Arc<MergeWriteScope>; }
 tokio::task_local! { static EXPECTED_BASE_VERSION: u64; }
 tokio::task_local! { static INITIAL_DATASET_CREATE: (); }
 
+/// Identity of one durable maintenance execution, not transferable authority.
+/// Owned immutable staging is restricted to the same execution.
+#[derive(Clone)]
+pub(crate) struct PreparationOwner(Arc<MergeWriteScope>);
+
+pub(crate) fn preparation_owner() -> Option<PreparationOwner> {
+    CURRENT
+        .try_with(|scope| {
+            (!scope.observation_only && scope.authorizer.is_some())
+                .then(|| PreparationOwner(scope.clone()))
+        })
+        .ok()
+        .flatten()
+}
+
+pub(crate) fn same_preparation_owner(
+    left: &Option<PreparationOwner>,
+    right: &Option<PreparationOwner>,
+) -> bool {
+    let (Some(left), Some(right), Some(current)) = (left, right, preparation_owner()) else {
+        return false;
+    };
+    Arc::ptr_eq(&left.0, &right.0)
+        && Arc::ptr_eq(&left.0, &current.0)
+        && !current.0.progress.lock().unwrap().closed
+}
+
 /// Pin the next publication without replacing a dataset's captured owner guard.
 pub(crate) async fn at_base_version<F: Future>(version: u64, work: F) -> F::Output {
     EXPECTED_BASE_VERSION.scope(version, work).await

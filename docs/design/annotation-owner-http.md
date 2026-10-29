@@ -57,6 +57,14 @@ Transport failures and apply timeouts remain unknown outcomes; the server does
 not automatically retry either case. This distinction does not eliminate waits
 for updates already accepted while native publication is stalled.
 
+Local WAL disk admission is a separate boundary. A proven refusal before Raft
+proposal returns HTTP 503 with `error=wal_disk_capacity` and
+`operation_outcome=not_submitted`. This describes this attempt only, including
+when it is an exact retry of a previously committed request. Keep the same
+identity and bytes after capacity becomes available; never replace an unresolved
+request with a new sequence. The transport does not automatically retry it, and
+the disk/control headroom limits remain unchanged.
+
 The RF3/Lance integration test uses two independent forwarding listeners and one
 owner listener. It checks cross-ingress visibility, original Arrow payload
 identity, control traffic during a partial upload, definite overload rejection,

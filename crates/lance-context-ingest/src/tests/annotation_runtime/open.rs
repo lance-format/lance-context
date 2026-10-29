@@ -102,7 +102,7 @@ async fn annotation_owner_validates_then_fences_before_opening_lance() -> Result
     let current = service.get("T", Duration::from_secs(30)).await?.unwrap();
     assert_eq!(current.status.as_deref(), Some("reviewed"));
     assert_eq!(current.score, Some(0.9));
-    drained(&service, completed.index).await?;
+    drained(&c, &service, completed.index).await?;
     assert_eq!(
         service.submit(&update, Duration::from_secs(30)).await?,
         completed

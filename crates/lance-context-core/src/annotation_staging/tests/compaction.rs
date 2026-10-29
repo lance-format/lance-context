@@ -31,7 +31,7 @@ async fn initialized(path: &std::path::Path) -> Result<(AnnotationStaging, Arc<D
     Ok((staging, base))
 }
 
-async fn compact(base: &Dataset) -> Result<Transaction> {
+pub(super) async fn compact(base: &Dataset) -> Result<Transaction> {
     let task = CompactionTask {
         task: TaskData {
             fragments: base.manifest().fragments.as_ref().clone(),
@@ -71,7 +71,7 @@ async fn compact(base: &Dataset) -> Result<Transaction> {
     Ok(transaction)
 }
 
-async fn select(base: Arc<Dataset>, transaction: &Transaction) -> Result<Arc<Dataset>> {
+pub(super) async fn select(base: Arc<Dataset>, transaction: &Transaction) -> Result<Arc<Dataset>> {
     Ok(Arc::new(
         CommitBuilder::new(base)
             .with_max_retries(0)

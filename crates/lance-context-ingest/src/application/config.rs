@@ -92,6 +92,10 @@ pub struct Annotations {
     /// Fixed, quiesced source snapshot for the explicit annotation-bootstrap role.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<bootstrap::annotations::Snapshot>,
+    /// Create a separate narrow table from a quiesced source. Mutually exclusive
+    /// with the same-table `source` handoff; only annotation-bootstrap uses it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection: Option<bootstrap::annotations::projection::Source>,
     /// Opt into physical collection for a table served exclusively by its
     /// annotation owner. Raw Dataset readers, other writers, tags, branches and
     /// URI reuse are outside this contract. Forwarders never run collection.
@@ -215,6 +219,10 @@ impl Config {
             );
             if let Some(reclamation) = &a.exclusive_reclamation {
                 reclamation.validate(self.materializer_memory_bytes)?;
+            }
+            if let Some(projection) = &a.projection {
+                ensure!(a.source.is_none(), "choose source or projection, not both");
+                projection.validate(self.materializer_memory_bytes)?;
             }
         }
         let (mut names, mut ids, mut destinations) =

@@ -2,6 +2,7 @@
 use super::*;
 use std::sync::atomic::Ordering;
 
+mod close;
 mod proxy;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -166,7 +167,7 @@ async fn exercise() -> Result<()> {
         "the first read after recovery must include the acknowledged suffix"
     );
     let through = score_result.index.max(status_result.index);
-    drained(&service, through)
+    drained(&c, &service, through)
         .await
         .context("drain the acknowledged suffix after recovery")?;
     let selected = annotation_publication::read(&c, &storage, Some(target))
@@ -215,7 +216,7 @@ async fn exercise() -> Result<()> {
     )
     .await?;
     let next_result = service.submit(&next, Duration::from_secs(30)).await?;
-    drained(&service, next_result.index).await?;
+    drained(&c, &service, next_result.index).await?;
     assert_eq!(
         service.submit(&first, Duration::from_secs(30)).await?,
         first_result

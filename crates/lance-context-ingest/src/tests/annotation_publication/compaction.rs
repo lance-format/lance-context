@@ -158,7 +158,7 @@ async fn recover_at(stage: u8, root: &Path, crash_boundary: bool) -> Result<()> 
         rejected_result.result,
         MutationResult::Rejected(_)
     ));
-    runtime::drained(&service, rejected_result.index).await?;
+    runtime::drained(&c, &service, rejected_result.index).await?;
     stop.send(()).unwrap();
     task.await??;
     drop(service);
@@ -347,7 +347,7 @@ async fn verify_recovery(root: &Path, expected: Expected) -> Result<()> {
         service.get("t00000000", Duration::from_secs(30)).await?,
         Some(current.clone())
     );
-    runtime::drained(&service, suffix_result.index)
+    runtime::drained(&c, &service, suffix_result.index)
         .await
         .context("draining the recovered suffix")?;
     let selected = read(&c, &storage, None).await?;
@@ -376,7 +376,7 @@ async fn verify_recovery(root: &Path, expected: Expected) -> Result<()> {
         )
         .await?;
         let result = service.submit(&req, Duration::from_secs(30)).await?;
-        runtime::drained(&service, result.index).await?;
+        runtime::drained(&c, &service, result.index).await?;
         assert_eq!(
             service
                 .get("t00000000", Duration::from_secs(30))

@@ -197,7 +197,7 @@ async fn exercise() -> Result<()> {
     let resolved = service.submit(&waiting, Duration::from_secs(30)).await?;
     assert_eq!(resolved.index, accepted.position.index);
     assert_eq!(resolved.result, annotations::MutationResult::Applied);
-    annotation_runtime::drained(&service, resolved.index).await?;
+    annotation_runtime::drained(&c, &service, resolved.index).await?;
     for (request, result) in &acknowledged {
         assert_eq!(
             &service.submit(request, Duration::from_secs(30)).await?,

@@ -198,8 +198,12 @@ async fn annotation_http_sustained_pressure_preserves_acked_reads_and_drains() -
     let loads = [one?, two?];
     let (max_entries, max_bytes, pressured_samples) = observed?;
     let drain_started = Instant::now();
-    annotation_runtime::drained(&service, loads.iter().map(|s| s.last_index).max().unwrap())
-        .await?;
+    annotation_runtime::drained(
+        &c,
+        &service,
+        loads.iter().map(|s| s.last_index).max().unwrap(),
+    )
+    .await?;
     let final_view = service.observation().await.0;
     ensure!(
         final_view.retained_bytes == 0 && service.source_observation().records == 0,

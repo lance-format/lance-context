@@ -345,6 +345,11 @@ impl Publisher {
         let ready = self.catalog.state().await?;
         let selected = self.resolve_prepared(&ready).await?;
         self.service.install_published(&prepared, selected).await?;
+        // The confirmed selected base now owns recovery and read visibility.
+        // Release this publisher's dirty-value/workspace permits before waiting
+        // on source retirement RPCs; held readers retain their own references.
+        drop(prepared);
+        drop(frozen);
         self.catalog.finish_pending().await?;
         Ok(())
     }

@@ -1,5 +1,5 @@
 //! Test-only TLS proxy: forward the actual command, read its quorum result,
-//! hold one successful Prepare reply until the test releases it, then disconnect.
+//! hold one successful Prepare or Close reply until released, then disconnect.
 use super::*;
 use bincode::Options as _;
 use std::path::Path as FsPath;
@@ -50,6 +50,12 @@ struct Frame {
     fixed: [u8; 24],
     meta: Vec<u8>,
 }
+
+#[derive(Clone, Copy)]
+enum Point {
+    Prepare,
+    Close,
+}
 impl Frame {
     async fn read(io: &mut (impl AsyncRead + Unpin)) -> Result<Option<Self>> {
         let mut fixed = [0; 24];
@@ -76,7 +82,7 @@ impl Frame {
         io.flush().await?;
         Ok(())
     }
-    fn prepare(&self) -> Result<bool> {
+    fn matches_command(&self, point: Point) -> Result<bool> {
         // The fixed-int wire enum's control discriminant is 1. Decode all of
         // that command, forwarding original bytes without re-encoding them.
         let (_, kind): (WireScope, u32) = codec().allow_trailing_bytes().deserialize(&self.meta)?;
@@ -85,22 +91,41 @@ impl Frame {
         }
         let (_, _, command): (WireScope, u32, Command) =
             codec().reject_trailing_bytes().deserialize(&self.meta)?;
-        Ok(matches!(command, Command::Prepare(_)))
+        Ok(matches!(
+            (point, command),
+            (Point::Prepare, Command::Prepare(_)) | (Point::Close, Command::Close(_))
+        ))
     }
-    fn successful_prepare(&self) -> Result<bool> {
+    fn successful_reply(&self, point: Point) -> Result<bool> {
         let (_, reply): (WireScope, Reply) =
             codec().reject_trailing_bytes().deserialize(&self.meta)?;
         Ok(matches!(
-            reply,
-            Reply::Commit(Outcome::Committed(Applied::Publisher(
-                p::Reply::Prepared { .. }
-            )))
+            (point, reply),
+            (
+                Point::Prepare,
+                Reply::Commit(Outcome::Committed(Applied::Publisher(
+                    p::Reply::Prepared { .. }
+                )))
+            ) | (
+                Point::Close,
+                Reply::Commit(Outcome::Committed(Applied::Source(
+                    lance_context_wal::replication::source::Reply::Closed { .. }
+                )))
+            )
         ))
     }
 }
 
 impl Proxy {
     pub async fn open(c: &network::Cluster, root: &FsPath) -> Result<Self> {
+        Self::open_at(c, root, Point::Prepare).await
+    }
+
+    pub async fn open_close(c: &network::Cluster, root: &FsPath) -> Result<Self> {
+        Self::open_at(c, root, Point::Close).await
+    }
+
+    async fn open_at(c: &network::Cluster, root: &FsPath, point: Point) -> Result<Self> {
         let mut roots = RootCertStore::empty();
         for cert in certificates(&root.join("roots.pem"))? {
             roots.add(cert)?;
@@ -163,11 +188,11 @@ impl Proxy {
                                 let mut downstream = acceptor.accept(socket).await?;
                                 let mut upstream = connector.connect(name, TcpStream::connect(address).await?).await?;
                                 while let Some(request) = Frame::read(&mut downstream).await? {
-                                    let prepare = request.prepare()?;
+                                    let hold = request.matches_command(point)?;
                                     request.write(&mut upstream).await?;
                                     let response = Frame::read(&mut upstream).await?.context("upstream response missing")?;
                                     ensure!(response.fixed[8..16] == request.fixed[8..16], "proxy response ID changed");
-                                    if prepare && response.successful_prepare()? && armed.swap(false, Ordering::SeqCst) {
+                                    if hold && response.successful_reply(point)? && armed.swap(false, Ordering::SeqCst) {
                                         committed.notify_one();
                                         release.notified().await;
                                         dropped.fetch_add(1, Ordering::SeqCst);
