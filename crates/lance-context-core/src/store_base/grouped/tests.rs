@@ -270,8 +270,8 @@ impl crate::merge_write_scope::CommitAuthorizer for RejectDrain {
 
 #[tokio::test]
 async fn interrupted_drain_reconciles_all_watermarks_without_replaying_over_newer_data() {
-    // Fail before either drain, then after one successful drain. Both cases
-    // must preserve the atomic publication and reconcile only manifest state.
+    // Reject either shard drain. The admitted sibling must finish before the
+    // error returns; both cases preserve publication and reconcile only metadata.
     for reject_second in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().join("base.lance").to_str().unwrap().to_owned();
@@ -317,7 +317,7 @@ async fn interrupted_drain_reconciles_all_watermarks_without_replaying_over_newe
                 .unwrap()
                 .unwrap()
                 .pending_generations,
-            1
+            if reject_second { 1 } else { 0 }
         );
         assert_eq!(values(&uri).await["shared"], b"second");
         assert_eq!(budget.reserved(), 0);
@@ -781,5 +781,92 @@ async fn maximum_width_group_publishes_one_version_and_all_32_watermarks() {
     assert_eq!(budget.reserved(), 0);
     for mut writer in writers {
         writer.close().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn shard_drains_overlap_with_a_bounded_wave_after_atomic_publication() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
+    use tokio::sync::Notify;
+
+    #[derive(Debug, Default)]
+    struct DrainGate {
+        entered: AtomicUsize,
+        ready: Notify,
+        open: AtomicBool,
+        release: Notify,
+    }
+    impl crate::merge_write_scope::CommitAuthorizer for DrainGate {
+        fn authorize<'a>(
+            &'a self,
+            resource: &'a str,
+            _: u64,
+        ) -> futures::future::BoxFuture<'a, LanceResult<()>> {
+            Box::pin(async move {
+                if resource.starts_with("shard:") {
+                    if self.entered.fetch_add(1, Ordering::SeqCst) + 1 == 8 {
+                        self.ready.notify_one();
+                    }
+                    while !self.open.load(Ordering::SeqCst) {
+                        self.release.notified().await;
+                    }
+                }
+                Ok(())
+            })
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("base.lance").to_str().unwrap().to_owned();
+    let budget = MergeMemoryBudget::new(32 * MIB);
+    let mut stores = Vec::new();
+    let mut prepared = Vec::new();
+    for index in 0..9 {
+        let name = format!("shard-{index}");
+        let store = open(&uri, &name, budget.clone()).await;
+        put(&store, &[("shared", name.as_bytes())]).await;
+        prepared.push(prepare(&store, &budget).await);
+        stores.push(store);
+    }
+    let before = Dataset::open(&uri).await.unwrap().version().version;
+    let gate = Arc::new(DrainGate::default());
+    let scope = crate::merge_write_scope::MergeWriteScope::with_authorizer(gate.clone());
+    let reclaimed = {
+        let operation = scope.run(stores[0].commit_prepared_group(prepared, MIB));
+        tokio::pin!(operation);
+        tokio::select! {
+            result = &mut operation => panic!("drains must wait for the test gate: {result:?}"),
+            ready = tokio::time::timeout(Duration::from_secs(5), gate.ready.notified()) => ready.unwrap(),
+        }
+        assert_eq!(
+            gate.entered.load(Ordering::SeqCst),
+            8,
+            "the ninth drain must not be admitted"
+        );
+        assert_eq!(
+            budget.reserved(),
+            0,
+            "metadata drainage retains no payload charge"
+        );
+        assert_eq!(
+            Dataset::open(&uri).await.unwrap().version().version,
+            before + 1
+        );
+        assert_eq!(values(&uri).await["shared"], b"shard-8");
+        gate.open.store(true, Ordering::SeqCst);
+        gate.release.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(5), operation)
+            .await
+            .unwrap()
+            .unwrap()
+    };
+    scope.drain().await;
+    assert_eq!(reclaimed, 9);
+    assert_eq!(gate.entered.load(Ordering::SeqCst), 9);
+    assert_eq!(scope.work().base_commits, 1);
+    assert_eq!(scope.work().generations_reclaimed, 9);
+    assert_eq!(stores[0].pending_wal_generations().await.unwrap(), 0);
+    for mut store in stores {
+        store.close().await.unwrap();
     }
 }

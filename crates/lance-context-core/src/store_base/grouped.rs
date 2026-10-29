@@ -5,6 +5,9 @@
 //! Generation numbers are local to a shard and must not order different shards.
 use super::*;
 
+// Only independent shard metadata operations overlap; base publication stays atomic.
+const METADATA_CONCURRENCY: usize = 8;
+
 /// An opaque, budgeted shard preparation bound to its source table.
 pub struct PreparedShardMerge {
     uri: String,
@@ -142,20 +145,33 @@ impl StorageBase {
                         "grouped merge requires unstaged preparations from the same budget",
                     ));
                 }
-                let current = shard.manifest_store.refresh_latest().await?;
-                let Some(current) = current else {
-                    return Err(stale("grouped shard manifest disappeared; reprepare"));
-                };
-                if current.writer_epoch != shard.manifest.writer_epoch
-                    || !shard.prepared.merged_generations.iter().all(|generation| {
-                        current.sstables.iter().any(|s| s.generation == *generation)
-                    })
-                {
-                    return Err(stale(
-                        "grouped shard epoch or membership changed; reprepare",
-                    ));
+            }
+            let validation_started = timer_start!();
+            for wave in shards.chunks(METADATA_CONCURRENCY) {
+                let results = futures::future::join_all(wave.iter().map(|shard| async move {
+                    let current = shard.manifest_store.refresh_latest().await?;
+                    let Some(current) = current else {
+                        return Err(stale("grouped shard manifest disappeared; reprepare"));
+                    };
+                    if current.writer_epoch != shard.manifest.writer_epoch
+                        || !shard.prepared.merged_generations.iter().all(|generation| {
+                            current.sstables.iter().any(|s| s.generation == *generation)
+                        })
+                    {
+                        return Err(stale(
+                            "grouped shard epoch or membership changed; reprepare",
+                        ));
+                    }
+                    Ok(())
+                }))
+                .await;
+                // Join every admitted read before returning the first input-order error.
+                for result in results {
+                    result?;
                 }
             }
+            observe_duration!(crate::metrics::ROLLOUT_WAL_MERGE_DURATION,
+                timer_elapsed!(validation_started), "phase" => "grouped_validate");
 
             self.refresh_latest().await?;
             self.ensure_latest_schema().await?;
@@ -233,10 +249,14 @@ impl StorageBase {
                     .retain();
                 let snapshot = Arc::new(self.dataset.clone());
                 let encoding = batches.clone();
+                let encoding_started = timer_start!();
                 let staged = crate::merge_write_scope::run_owned_preparation(hold, async move {
                     encode_merge_files(snapshot, encoding).await
                 })
                 .await??;
+                observe_duration!(crate::metrics::ROLLOUT_WAL_MERGE_DURATION,
+                    timer_elapsed!(encoding_started), "phase" => "grouped_encode");
+                let publication_started = timer_start!();
                 self.merge_prepared_batches(
                     batches,
                     schema,
@@ -246,6 +266,8 @@ impl StorageBase {
                     Some(staged),
                 )
                 .await?;
+                observe_duration!(crate::metrics::ROLLOUT_WAL_MERGE_DURATION,
+                    timer_elapsed!(publication_started), "phase" => "grouped_publish");
                 self.pinned_version = None;
             }
             // Decoded buffers have been consumed; drainage retains only metadata.
@@ -253,28 +275,47 @@ impl StorageBase {
             for shard in &mut shards {
                 drop(shard.prepared.reservation.take());
             }
+            let drain_started = timer_start!();
             let mut reclaimed = 0;
-            for shard in shards {
-                let count = shard.generation_count();
-                let drain_store = ShardManifestStore::new(
-                    self.dataset.object_store(None).await?,
-                    &self.dataset.branch_location().path,
-                    shard.manifest.shard_id,
-                    DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
-                );
-                crate::merge_write_scope::drain_generations(
-                    drain_store,
-                    shard.manifest.writer_epoch,
-                    shard.prepared.merged_generations,
-                )
-                .await?;
-                self.delete_shard_generation_dirs(
-                    shard.manifest.shard_id,
-                    &shard.prepared.merged_paths,
-                )
-                .await?;
-                reclaimed += count;
+            let publisher = &*self;
+            let mut remaining = shards.into_iter();
+            loop {
+                let wave: Vec<_> = remaining.by_ref().take(METADATA_CONCURRENCY).collect();
+                if wave.is_empty() {
+                    break;
+                }
+                let results = futures::future::join_all(wave.into_iter().map(|shard| async move {
+                    let count = shard.generation_count();
+                    let drain_store = ShardManifestStore::new(
+                        publisher.dataset.object_store(None).await?,
+                        &publisher.dataset.branch_location().path,
+                        shard.manifest.shard_id,
+                        DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
+                    );
+                    crate::merge_write_scope::drain_generations(
+                        drain_store,
+                        shard.manifest.writer_epoch,
+                        shard.prepared.merged_generations,
+                    )
+                    .await?;
+                    publisher
+                        .delete_shard_generation_dirs(
+                            shard.manifest.shard_id,
+                            &shard.prepared.merged_paths,
+                        )
+                        .await?;
+                    Ok::<_, LanceError>(count)
+                }))
+                .await;
+                // Publication already covers every shard. A failed drain must join
+                // its admitted siblings; later waves remain for watermark recovery.
+                // Each write retains the existing fenced, observed commit scope.
+                for result in results {
+                    reclaimed += result?;
+                }
             }
+            observe_duration!(crate::metrics::ROLLOUT_WAL_MERGE_DURATION,
+                timer_elapsed!(drain_started), "phase" => "grouped_drain");
             Ok(reclaimed)
         })
     }
