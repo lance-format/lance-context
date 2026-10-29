@@ -196,9 +196,12 @@ pub(crate) async fn merge_local(
         Some(name) => state.generic_uri(name),
         None => state.rollout_uri(target),
     };
-    let probe = SealedWalProbe::open(&uri, Some(session.clone()))
-        .await
-        .map_err(|e| e.to_string())?;
+    let probe = super::observe_stage(
+        "root_probe",
+        SealedWalProbe::open(&uri, Some(session.clone())),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     let started = tokio::time::Instant::now();
     // This is only an admission time slice. A progressing operation already
     // admitted may run beyond it; cancellation is based on lack of progress.

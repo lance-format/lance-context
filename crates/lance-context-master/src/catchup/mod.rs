@@ -23,6 +23,17 @@ use store::{Inventory, Record};
 
 type Result<T> = std::result::Result<T, String>;
 
+/// Time completed awaits, including returned errors, without spawning or
+/// changing cancellation. Phases are fixed labels; concurrent shard durations
+/// overlap and must not be added to the enclosing wave's wall time.
+async fn observe_stage<T>(phase: &'static str, work: impl std::future::Future<Output = T>) -> T {
+    let started = tokio::time::Instant::now();
+    let result = work.await;
+    metrics::histogram!("master_catchup_stage_seconds", "phase" => phase)
+        .record(started.elapsed().as_secs_f64());
+    result
+}
+
 #[derive(Clone, Debug, clap::Args)]
 pub struct CatchupConfig {
     /// Enable autonomous admission. Manual requests use the same policy.

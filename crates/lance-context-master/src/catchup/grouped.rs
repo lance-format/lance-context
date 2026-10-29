@@ -30,8 +30,7 @@ async fn prepare(
     reservation: MergeReservation,
 ) -> Result<Option<Part>> {
     let shard = state.config.catchup.shards[index].clone();
-    if !probe
-        .has_sealed_wal(&shard)
+    if !super::observe_stage("grouped_shard_probe", probe.has_sealed_wal(&shard))
         .await
         .map_err(|e| e.to_string())?
     {
@@ -44,40 +43,54 @@ async fn prepare(
         PreparedShardMerge::prepare_owned(reservation, async move |reservation| {
             let config = &state.config.catchup;
             let (store, prepared) = if let Some(name) = target.strip_prefix("generic:") {
-                let store = GenericStore::open_existing(
-                    &state.generic_uri(name),
-                    GenericStoreOptions {
-                        shard_id: Some(shard),
-                        merge_after_generations: Some(0),
-                        merge_max_generations: Some(config.merge_max_generations),
-                        merge_max_bytes: Some(config.merge_max_bytes),
-                        key_index_type: state.config.key_index_type,
-                        merge_budget: Some(budget),
-                        session: Some(session),
-                        pending_generations_max: Some(0),
-                        ..Default::default()
-                    },
+                let store = super::observe_stage(
+                    "grouped_store_open",
+                    GenericStore::open_existing(
+                        &state.generic_uri(name),
+                        GenericStoreOptions {
+                            shard_id: Some(shard),
+                            merge_after_generations: Some(0),
+                            merge_max_generations: Some(config.merge_max_generations),
+                            merge_max_bytes: Some(config.merge_max_bytes),
+                            key_index_type: state.config.key_index_type,
+                            merge_budget: Some(budget),
+                            session: Some(session),
+                            pending_generations_max: Some(0),
+                            ..Default::default()
+                        },
+                    ),
                 )
                 .await?;
-                let prepared = store.prepare_grouped_merge_reserved(reservation).await?;
+                let prepared = super::observe_stage(
+                    "grouped_wal_prepare",
+                    store.prepare_grouped_merge_reserved(reservation),
+                )
+                .await?;
                 (Store::Generic(store), prepared)
             } else {
-                let store = RolloutStore::open_existing_with_options(
-                    &state.rollout_uri(&target),
-                    RolloutStoreOptions {
-                        shard_id: Some(shard),
-                        merge_after_generations: Some(0),
-                        merge_max_generations: Some(config.merge_max_generations),
-                        merge_max_bytes: Some(config.merge_max_bytes),
-                        key_index_type: state.config.key_index_type,
-                        merge_budget: Some(budget),
-                        session: Some(session),
-                        pending_generations_max: Some(0),
-                        ..Default::default()
-                    },
+                let store = super::observe_stage(
+                    "grouped_store_open",
+                    RolloutStore::open_existing_with_options(
+                        &state.rollout_uri(&target),
+                        RolloutStoreOptions {
+                            shard_id: Some(shard),
+                            merge_after_generations: Some(0),
+                            merge_max_generations: Some(config.merge_max_generations),
+                            merge_max_bytes: Some(config.merge_max_bytes),
+                            key_index_type: state.config.key_index_type,
+                            merge_budget: Some(budget),
+                            session: Some(session),
+                            pending_generations_max: Some(0),
+                            ..Default::default()
+                        },
+                    ),
                 )
                 .await?;
-                let prepared = store.prepare_grouped_merge_reserved(reservation).await?;
+                let prepared = super::observe_stage(
+                    "grouped_wal_prepare",
+                    store.prepare_grouped_merge_reserved(reservation),
+                )
+                .await?;
                 (Store::Rollout(store), prepared)
             };
             Ok((store, prepared))
@@ -153,7 +166,8 @@ pub(super) async fn run(
             break;
         }
         // No previous wave holds decoded buffers at this blocking admission.
-        let reservation = budget.reserve(allowance).await;
+        let reservation =
+            super::observe_stage("grouped_budget_wait", budget.reserve(allowance)).await;
         if Instant::now() >= deadline || crate::local_merge::drain_requested(state, target) {
             break;
         }
@@ -174,17 +188,20 @@ pub(super) async fn run(
             // Join every admitted read, including on failure. Successful reads
             // release unused decode allowance only after native children exit.
             results.extend(
-                join_all(wave.drain(..).map(|(index, reservation)| {
-                    prepare(
-                        state,
-                        target,
-                        index,
-                        probe,
-                        session.clone(),
-                        budget.clone(),
-                        reservation,
-                    )
-                }))
+                super::observe_stage(
+                    "grouped_prepare_wave",
+                    join_all(wave.drain(..).map(|(index, reservation)| {
+                        prepare(
+                            state,
+                            target,
+                            index,
+                            probe,
+                            session.clone(),
+                            budget.clone(),
+                            reservation,
+                        )
+                    })),
+                )
                 .await,
             );
             if results.iter().any(Result::is_err)
@@ -223,7 +240,8 @@ pub(super) async fn run(
                         return Err(error.clone());
                     }
                 }
-                let reservation = budget.reserve(allowance).await;
+                let reservation =
+                    super::observe_stage("grouped_budget_wait", budget.reserve(allowance)).await;
                 match prepare(
                     state,
                     target,
