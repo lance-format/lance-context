@@ -60,6 +60,17 @@ impl PreparedShardMerge {
     pub fn generation_count(&self) -> usize {
         self.prepared.generation_count()
     }
+
+    /// Generations in this preparation's manifest snapshot that were not read.
+    /// An ordered publisher must finish this suffix before publishing a later
+    /// shard. New ingestion is not included in this fixed continuation bound.
+    pub fn unprepared_generation_count(&self) -> usize {
+        self.manifest
+            .sstables
+            .iter()
+            .filter(|table| !self.prepared.merged_generations.contains(&table.generation))
+            .count()
+    }
 }
 
 fn stale(message: &str) -> LanceError {

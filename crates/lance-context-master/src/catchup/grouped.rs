@@ -148,6 +148,122 @@ async fn commit(
     Ok(outcomes)
 }
 
+struct OrderedPart {
+    index: usize,
+    generations_remaining: usize,
+    prepared: Option<Part>,
+}
+
+fn release_preparations(pending: &mut VecDeque<OrderedPart>) -> bool {
+    let mut released = false;
+    for entry in pending {
+        released |= entry.prepared.take().is_some();
+    }
+    if released {
+        metrics::counter!("master_catchup_grouped_memory_retries_total").increment(1);
+    }
+    released
+}
+
+async fn commit_ordered(
+    state: &Arc<MasterState>,
+    target: &str,
+    parts: Vec<Part>,
+    probe: &SealedWalProbe,
+    session: Arc<lance::session::Session>,
+    budget: Arc<MergeMemoryBudget>,
+    deadline: Instant,
+) -> Result<Vec<(usize, usize)>> {
+    let allowance = state
+        .config
+        .catchup
+        .grouped_prepare_byte_cap()
+        .min(budget.limit());
+    let mut pending: VecDeque<_> = parts
+        .into_iter()
+        .map(|part| OrderedPart {
+            index: part.index,
+            generations_remaining: part.prepared.generation_count()
+                + part.prepared.unprepared_generation_count(),
+            prepared: Some(part),
+        })
+        .collect();
+    let mut outcomes = Vec::new();
+    while !pending.is_empty() {
+        if pending[0].prepared.is_none() {
+            // Later immutable preparations may remain charged, but never block
+            // on admission while retaining them. Only new reads obey the slice
+            // boundary; an admitted publication always finishes and joins.
+            if Instant::now() >= deadline || crate::local_merge::drain_requested(state, target) {
+                break;
+            }
+            let reservation = match budget.try_reserve(allowance) {
+                Some(reservation) => reservation,
+                None => {
+                    release_preparations(&mut pending);
+                    super::observe_stage("grouped_budget_wait", budget.reserve(allowance)).await
+                }
+            };
+            if Instant::now() >= deadline || crate::local_merge::drain_requested(state, target) {
+                break;
+            }
+            let index = pending[0].index;
+            let prepared = prepare(
+                state,
+                target,
+                index,
+                probe,
+                session.clone(),
+                budget.clone(),
+                reservation,
+            )
+            .await;
+            let part = match prepared {
+                Err(error) if error.contains(MERGE_BUDGET_BUSY) => {
+                    if release_preparations(&mut pending) {
+                        continue;
+                    }
+                    return Err(error);
+                }
+                result => result?,
+            };
+            match part {
+                Some(part) => pending[0].prepared = Some(part),
+                None => {
+                    pending.pop_front();
+                    outcomes.push((index, 0));
+                    continue;
+                }
+            }
+        }
+        let mut group = Vec::new();
+        let mut continuation = None;
+        while pending
+            .front()
+            .is_some_and(|entry| entry.prepared.is_some())
+        {
+            let mut entry = pending.pop_front().unwrap();
+            let part = entry.prepared.take().unwrap();
+            let count = part.prepared.generation_count();
+            if count < entry.generations_remaining {
+                entry.generations_remaining -= count;
+                continuation = Some(entry);
+            }
+            group.push(part);
+            if continuation.is_some() {
+                break;
+            }
+        }
+        outcomes.extend(commit(state, target, group).await?);
+        if let Some(entry) = continuation {
+            // Finish this shard's captured suffix before any later shard. The
+            // fixed count bounds work even if ingestion keeps appending WAL.
+            pending.push_front(entry);
+        }
+    }
+    Ok(outcomes)
+}
+
 pub(super) async fn run(
     state: &Arc<MasterState>,
     target: &str,
@@ -255,7 +371,18 @@ pub(super) async fn run(
                 )
                 .await?
                 {
-                    Some(part) => outcomes.extend(commit(state, target, vec![part]).await?),
+                    Some(part) => outcomes.extend(
+                        commit_ordered(
+                            state,
+                            target,
+                            vec![part],
+                            probe,
+                            session.clone(),
+                            budget.clone(),
+                            deadline,
+                        )
+                        .await?,
+                    ),
                     None => outcomes.push((index, 0)),
                 }
             }
@@ -274,7 +401,18 @@ pub(super) async fn run(
             }
             // Preserve ordered error delivery: preceding prepared shards may
             // finish; later preparations drop without publication.
-            outcomes.extend(commit(state, target, parts).await?);
+            outcomes.extend(
+                commit_ordered(
+                    state,
+                    target,
+                    parts,
+                    probe,
+                    session.clone(),
+                    budget.clone(),
+                    deadline,
+                )
+                .await?,
+            );
             if let Some(error) = failed {
                 return Err(error);
             }
@@ -420,6 +558,174 @@ mod integration_tests {
         ColumnSpec, ColumnType, GenericStore, GenericStoreOptions, SchemaSpec,
     };
     use serde_json::json;
+
+    #[tokio::test]
+    #[ignore = "requires isolated loopback ETCD_TEST_ENDPOINTS"]
+    async fn grouped_partial_shards_preserve_later_head_over_earlier_tail() {
+        let endpoints = std::env::var("ETCD_TEST_ENDPOINTS").expect("isolated etcd required");
+        assert!(endpoints
+            .split(',')
+            .all(|e| e.starts_with("http://127.0.0.1:")));
+        for (prepare_cap, budget_bytes, tail_bytes, split_slice) in [
+            (0, 32 << 20, 256 << 10, false),
+            (128 << 10, 32 << 20, 256 << 10, false),
+            // This tail fits alone but cannot grow while retaining a later head.
+            (128 << 10, 1 << 20, 900 << 10, false),
+            (128 << 10, 32 << 20, 256 << 10, true),
+        ] {
+            let (_dir, state) = fixture().await.unwrap();
+            let target = "generic:hot";
+            let uri = state.generic_uri("hot");
+            let schema = SchemaSpec::new(vec![
+                (
+                    "id".into(),
+                    ColumnSpec::required(ColumnType::String { large: false }),
+                ),
+                (
+                    "text".into(),
+                    ColumnSpec::new(ColumnType::String { large: true }),
+                ),
+            ]);
+            let mut writers = Vec::new();
+            for shard in [0, 19] {
+                let writer = GenericStore::open(
+                    &uri,
+                    schema.clone(),
+                    GenericStoreOptions {
+                        shard_id: Some(format!("worker-{shard}")),
+                        merge_after_generations: Some(0),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+                for generation in 0..2 {
+                    let mut rows = vec![json!({
+                        "id": format!("only-{shard}-{generation}"),
+                        "text": "x".repeat(if (shard, generation) == (0, 1) {
+                            tail_bytes
+                        } else {
+                            256 << 10
+                        }),
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone()];
+                    // The later shard's tail deliberately does not touch this
+                    // key: a shared key in every generation masks round-order bugs.
+                    if (shard, generation) == (0, 1) || (shard, generation) == (19, 0) {
+                        rows.push(
+                            json!({
+                                "id": "overlap",
+                                "text": if shard == 0 { "earlier-tail" } else { "later-head" },
+                            })
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                        );
+                    }
+                    writer.add(&rows).await.unwrap();
+                    writer.flush().await.unwrap();
+                }
+                writers.push(writer);
+            }
+            let mut cfg = state.config.clone();
+            cfg.catchup.enabled = false;
+            cfg.catchup.shards = (0..20).map(|i| format!("worker-{i}")).collect();
+            cfg.catchup.grouped_targets = vec![target.into()];
+            cfg.catchup.grouped_shards = 20;
+            cfg.catchup.merge_max_bytes = (8 << 20).min(budget_bytes);
+            cfg.catchup.grouped_prepare_max_bytes = prepare_cap;
+            cfg.catchup.merge_memory_bytes = budget_bytes;
+            cfg.merge_rollout.owned_targets.push(target.into());
+            cfg.catchup.target = Some(target.into());
+            cfg.catchup.job_name = Inventory::new(&state)
+                .reserve(target, "grouped-partial-order", 4, 100)
+                .await
+                .unwrap()
+                .job;
+            if split_slice {
+                use lance_context_core::{
+                    merge_write_scope::MergeWriteScope, rollout_append::SealedWalProbe,
+                    MergeMemoryBudget, RolloutStore,
+                };
+                use std::sync::Arc;
+                let state = crate::state::MasterState::new(cfg.clone()).await.unwrap();
+                let budget = MergeMemoryBudget::new(budget_bytes);
+                let session = RolloutStore::build_session(1 << 20, 1 << 20);
+                let probe = SealedWalProbe::open(&uri, Some(session.clone()))
+                    .await
+                    .unwrap();
+                let scope = MergeWriteScope::with_authorizer(Arc::new(Allow));
+                let outcomes = scope
+                    .run(async {
+                        let mut parts = Vec::new();
+                        for index in [0, 19] {
+                            let reservation = budget.reserve(prepare_cap).await;
+                            let part = super::prepare(
+                                &state,
+                                target,
+                                index,
+                                &probe,
+                                session.clone(),
+                                budget.clone(),
+                                reservation,
+                            )
+                            .await
+                            .unwrap()
+                            .unwrap();
+                            assert_eq!(part.prepared.unprepared_generation_count(), 1);
+                            parts.push(part);
+                        }
+                        // Finish admitted work after the slice, but defer the
+                        // later head behind the unprepared earlier suffix.
+                        super::commit_ordered(
+                            &state,
+                            target,
+                            parts,
+                            &probe,
+                            session,
+                            budget.clone(),
+                            tokio::time::Instant::now(),
+                        )
+                        .await
+                        .unwrap()
+                    })
+                    .await;
+                scope.drain().await;
+                assert_eq!(outcomes, vec![(0, 1)]);
+                assert_eq!(budget.reserved(), 0);
+                assert_eq!(
+                    writers[1]
+                        .own_shard_watermark()
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .pending_generations,
+                    2
+                );
+            }
+            assert_eq!(
+                tokio::time::timeout(std::time::Duration::from_secs(30), execute(cfg, target))
+                    .await
+                    .expect("ordered continuation must not wait on retained buffers")
+                    .unwrap(),
+                ExecuteOutcome::Completed
+            );
+            let reader = GenericStore::open_existing(&uri, GenericStoreOptions::default())
+                .await
+                .unwrap();
+            assert_eq!(reader.pending_wal_generations().await.unwrap(), 0);
+            let rows = reader.list(None, None).await.unwrap();
+            assert_eq!(rows.len(), 5);
+            assert_eq!(
+                rows.iter().find(|r| r["id"] == "overlap").unwrap()["text"],
+                "later-head",
+                "preparation cap {prepare_cap} changed cross-shard upsert precedence"
+            );
+            drop(writers);
+        }
+    }
 
     #[tokio::test]
     #[ignore = "requires isolated loopback ETCD_TEST_ENDPOINTS"]

@@ -81,7 +81,13 @@ uses the aggregate cap for each preparation, preserving existing behavior. A
 nonzero value must not exceed the aggregate cap. Smaller preparations can admit
 more shards within the same `CATCHUP_MERGE_MEMORY_BYTES` budget; they may also
 require more passes for a large shard. Indivisible generations still use the
-existing nonblocking reservation growth and ordered retry path. The limit is
+existing nonblocking reservation growth and ordered retry path. Within each
+prepared group, a shard's captured unread suffix finishes before later shards
+publish, so a later round cannot overwrite those shards with an earlier tail.
+Later preparations remain charged while that suffix drains; insufficient
+headroom releases them for ordered rereading instead of waiting with buffers
+held. An expired slice defers unpublished later preparations without changing
+the existing Job continuation policy. The limit is
 not a total RSS guarantee. Qualify oversized generations before activation.
 Jobs receive this setting explicitly, including `0` to clear template values.
 Controllers using a nonzero value must agree on it in the durable catch-up policy;
