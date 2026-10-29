@@ -102,6 +102,85 @@ async fn values(uri: &str) -> HashMap<String, Vec<u8>> {
 }
 
 #[tokio::test]
+async fn owned_group_preparation_releases_allowance_only_after_native_readers_join() {
+    use crate::merge_write_scope::MergeWriteScope;
+    use std::time::Duration;
+
+    for cancel in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().join("base.lance").to_str().unwrap().to_owned();
+        let budget = MergeMemoryBudget::new(4 * MIB);
+        let store = open(&uri, "first", budget.clone()).await;
+        put(&store, &[("one", b"payload")]).await;
+        let reservation = budget.reserve(4 * MIB).await;
+        let (release, wait) = std::sync::mpsc::channel();
+        let (returned, ready) = tokio::sync::oneshot::channel();
+        let scope = MergeWriteScope::with_authorizer(Arc::new(Allow));
+        let child_scope = scope.clone();
+        let mut preparation = tokio::spawn(async move {
+            child_scope
+                .run(PreparedShardMerge::prepare_owned(
+                    reservation,
+                    move |reservation| async move {
+                        let shard = store.prepare_grouped_merge_reserved(reservation).await?;
+                        // Simulate a reader which returned its result but left
+                        // native decode scratch alive in a detached CPU child.
+                        let scratch = vec![0u8; 2 * MIB];
+                        drop(lance_core::utils::tokio::spawn_cpu(move || {
+                            wait.recv_timeout(Duration::from_secs(5)).unwrap();
+                            drop(scratch);
+                            Ok::<_, LanceError>(())
+                        }));
+                        returned.send(()).unwrap();
+                        Ok((store, shard))
+                    },
+                ))
+                .await
+        });
+        ready.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut preparation)
+                .await
+                .is_err()
+        );
+        assert_eq!(budget.reserved(), 4 * MIB);
+        assert!(budget.try_reserve(MIB).is_none());
+        if cancel {
+            preparation.abort();
+            assert!(preparation.await.err().unwrap().is_cancelled());
+            assert_eq!(budget.reserved(), 4 * MIB);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), scope.drain())
+                    .await
+                    .is_err()
+            );
+            release.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), scope.drain())
+                .await
+                .unwrap();
+            assert_eq!(budget.reserved(), 0);
+        } else {
+            release.send(()).unwrap();
+            let (mut store, shard) = preparation.await.unwrap().unwrap();
+            let shard = shard.unwrap();
+            assert_eq!(budget.reserved(), shard.decoded_bytes());
+            assert!(budget.try_reserve(3 * MIB).is_some());
+            assert_eq!(
+                scope
+                    .run(store.commit_prepared_group(vec![shard], MIB))
+                    .await
+                    .unwrap(),
+                1
+            );
+            scope.drain().await;
+            assert_eq!(values(&uri).await["one"], b"payload");
+            assert_eq!(budget.reserved(), 0);
+            store.close().await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
 async fn ordered_group_updates_repeated_keys_and_publishes_all_watermarks_once() {
     for reversed in [false, true] {
         let dir = tempfile::tempdir().unwrap();

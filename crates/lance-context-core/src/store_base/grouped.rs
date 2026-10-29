@@ -18,6 +18,36 @@ pub struct PreparedShardMerge {
 }
 
 impl PreparedShardMerge {
+    /// Prepare immutable shard data under durable maintenance ownership, join
+    /// its native readers, then retain only the resulting Arrow buffer charge.
+    /// The callback must perform all reads inside this scope and must not
+    /// publish. The returned context typically owns the publishing store.
+    /// Cancellation retains the full reservation until the owned child joins;
+    /// unused decode allowance is never released by an unjoined preparation.
+    pub async fn prepare_owned<T, F, Fut>(
+        reservation: MergeReservation,
+        prepare: F,
+    ) -> LanceResult<(T, Option<Self>)>
+    where
+        T: Send + 'static,
+        F: FnOnce(MergeReservation) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = LanceResult<(T, Option<Self>)>> + Send + 'static,
+    {
+        let hold = reservation.retain();
+        let (context, mut shard) =
+            crate::merge_write_scope::run_owned_preparation(hold, async move {
+                prepare(reservation).await
+            })
+            .await??;
+        if let Some(shard) = &mut shard {
+            let bytes = shard.decoded_bytes();
+            if let Some(reservation) = &mut shard.prepared.reservation {
+                reservation.shrink_to(bytes);
+            }
+        }
+        Ok((context, shard))
+    }
+
     /// Resident Arrow buffers, including blob payloads, before group reduction.
     pub fn decoded_bytes(&self) -> usize {
         self.prepared

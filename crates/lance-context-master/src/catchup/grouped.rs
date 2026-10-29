@@ -40,61 +40,55 @@ async fn prepare(
     }
     let state = state.clone();
     let target = target.to_owned();
-    lance_context_core::merge_write_scope::run_owned_preparation(reservation.retain(), async move {
-        let config = &state.config.catchup;
-        let (store, prepared) = if let Some(name) = target.strip_prefix("generic:") {
-            let store = GenericStore::open_existing(
-                &state.generic_uri(name),
-                GenericStoreOptions {
-                    shard_id: Some(shard),
-                    merge_after_generations: Some(0),
-                    merge_max_generations: Some(config.merge_max_generations),
-                    merge_max_bytes: Some(config.merge_max_bytes),
-                    key_index_type: state.config.key_index_type,
-                    merge_budget: Some(budget),
-                    session: Some(session),
-                    pending_generations_max: Some(0),
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-            let prepared = store
-                .prepare_grouped_merge_reserved(reservation)
-                .await
-                .map_err(|e| e.to_string())?;
-            (Store::Generic(store), prepared)
-        } else {
-            let store = RolloutStore::open_existing_with_options(
-                &state.rollout_uri(&target),
-                RolloutStoreOptions {
-                    shard_id: Some(shard),
-                    merge_after_generations: Some(0),
-                    merge_max_generations: Some(config.merge_max_generations),
-                    merge_max_bytes: Some(config.merge_max_bytes),
-                    key_index_type: state.config.key_index_type,
-                    merge_budget: Some(budget),
-                    session: Some(session),
-                    pending_generations_max: Some(0),
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-            let prepared = store
-                .prepare_grouped_merge_reserved(reservation)
-                .await
-                .map_err(|e| e.to_string())?;
-            (Store::Rollout(store), prepared)
-        };
-        Ok::<_, String>(prepared.map(|prepared| Part {
-            index,
-            store,
-            prepared,
-        }))
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    let (store, prepared) =
+        PreparedShardMerge::prepare_owned(reservation, async move |reservation| {
+            let config = &state.config.catchup;
+            let (store, prepared) = if let Some(name) = target.strip_prefix("generic:") {
+                let store = GenericStore::open_existing(
+                    &state.generic_uri(name),
+                    GenericStoreOptions {
+                        shard_id: Some(shard),
+                        merge_after_generations: Some(0),
+                        merge_max_generations: Some(config.merge_max_generations),
+                        merge_max_bytes: Some(config.merge_max_bytes),
+                        key_index_type: state.config.key_index_type,
+                        merge_budget: Some(budget),
+                        session: Some(session),
+                        pending_generations_max: Some(0),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+                let prepared = store.prepare_grouped_merge_reserved(reservation).await?;
+                (Store::Generic(store), prepared)
+            } else {
+                let store = RolloutStore::open_existing_with_options(
+                    &state.rollout_uri(&target),
+                    RolloutStoreOptions {
+                        shard_id: Some(shard),
+                        merge_after_generations: Some(0),
+                        merge_max_generations: Some(config.merge_max_generations),
+                        merge_max_bytes: Some(config.merge_max_bytes),
+                        key_index_type: state.config.key_index_type,
+                        merge_budget: Some(budget),
+                        session: Some(session),
+                        pending_generations_max: Some(0),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+                let prepared = store.prepare_grouped_merge_reserved(reservation).await?;
+                (Store::Rollout(store), prepared)
+            };
+            Ok((store, prepared))
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(prepared.map(|prepared| Part {
+        index,
+        store,
+        prepared,
+    }))
 }
 
 async fn commit(
@@ -164,27 +158,45 @@ pub(super) async fn run(
             break;
         }
         let mut wave = vec![(first, reservation)];
-        while wave.len() < config.grouped_shards && !remaining.is_empty() {
-            let Some(reservation) = budget.try_reserve(allowance) else {
+        let mut indices = Vec::new();
+        let mut results = Vec::new();
+        loop {
+            while indices.len() + wave.len() < config.grouped_shards && !remaining.is_empty() {
+                let Some(reservation) = budget.try_reserve(allowance) else {
+                    break;
+                };
+                wave.push((remaining.pop_front().unwrap(), reservation));
+            }
+            if wave.is_empty() {
                 break;
-            };
-            wave.push((remaining.pop_front().unwrap(), reservation));
+            }
+            indices.extend(wave.iter().map(|(index, _)| *index));
+            // Join every admitted read, including on failure. Successful reads
+            // release unused decode allowance only after native children exit.
+            results.extend(
+                join_all(wave.drain(..).map(|(index, reservation)| {
+                    prepare(
+                        state,
+                        target,
+                        index,
+                        probe,
+                        session.clone(),
+                        budget.clone(),
+                        reservation,
+                    )
+                }))
+                .await,
+            );
+            if results.iter().any(Result::is_err)
+                || Instant::now() >= deadline
+                || crate::local_merge::drain_requested(state, target)
+            {
+                break;
+            }
+            // Refill using only immediately available capacity. This lets small
+            // joined results share one publication even if their original
+            // reservations could not all coexist. Never wait with results held.
         }
-        let indices: Vec<_> = wave.iter().map(|(index, _)| *index).collect();
-        // All admitted reads join on failure too. Owned preparation retains its
-        // memory charge even if a cancelled parent leaves native IO finishing.
-        let results = join_all(wave.into_iter().map(|(index, reservation)| {
-            prepare(
-                state,
-                target,
-                index,
-                probe,
-                session.clone(),
-                budget.clone(),
-                reservation,
-            )
-        }))
-        .await;
         let first_storage_error = results.iter().enumerate().find_map(|(index, result)| {
             result
                 .as_ref()
@@ -374,10 +386,14 @@ mod integration_tests {
         assert!(endpoints
             .split(',')
             .all(|e| e.starts_with("http://127.0.0.1:")));
-        for (budget_bytes, payload_bytes, expected_commits) in [
-            (32 << 20, 64, 2),
-            (1 << 20, 64, 3),
-            (4 << 20, 1536 << 10, 3),
+        for (budget_bytes, payload_bytes, expected_commits, cap, width, all_shards) in [
+            (32 << 20, 64, 2, 1 << 20, 4, false),
+            (1 << 20, 64, 3, 1 << 20, 4, false),
+            (4 << 20, 1536 << 10, 3, 1 << 20, 4, false),
+            // Sixteen initial 8-MiB reservations exactly fill 128 MiB.
+            // Joined reads must free scratch and admit the last four shards,
+            // allowing all twenty to publish once without reducing headroom.
+            (128 << 20, 64, 1, 8 << 20, 20, true),
         ] {
             let (_dir, state) = fixture().await.unwrap();
             let target = "generic:hot";
@@ -393,9 +409,13 @@ mod integration_tests {
                 ),
             ]);
             let mut writers = Vec::new();
-            // A later input shard must win a repeated key in both grouped and
-            // serial fallback modes. Most configured shards remain empty.
-            for shard in [0, 1, 19] {
+            // A later input shard must win in grouped and serial fallback modes.
+            let active_shards: Vec<_> = if all_shards {
+                (0..20).collect()
+            } else {
+                vec![0, 1, 19]
+            };
+            for &shard in &active_shards {
                 let writer = GenericStore::open(
                     &uri,
                     schema.clone(),
@@ -426,8 +446,8 @@ mod integration_tests {
             cfg.catchup.enabled = false;
             cfg.catchup.shards = (0..20).map(|i| format!("worker-{i}")).collect();
             cfg.catchup.grouped_targets = vec![target.into()];
-            cfg.catchup.grouped_shards = 4;
-            cfg.catchup.merge_max_bytes = 1 << 20;
+            cfg.catchup.grouped_shards = width;
+            cfg.catchup.merge_max_bytes = cap;
             cfg.catchup.merge_memory_bytes = budget_bytes;
             cfg.merge_rollout.owned_targets.push(target.into());
             cfg.catchup.target = Some(target.into());
@@ -446,13 +466,16 @@ mod integration_tests {
             assert_eq!(reader.pending_wal_generations().await.unwrap(), 0);
             let base = lance::Dataset::open(&uri).await.unwrap();
             assert_eq!(base.version().version, before + expected_commits);
-            assert_eq!(base.count_rows(None).await.unwrap(), 4);
+            assert_eq!(
+                base.count_rows(None).await.unwrap(),
+                active_shards.len() + 1
+            );
             let rows = reader.list(None, None).await.unwrap();
             assert_eq!(
                 rows.iter().find(|r| r["id"] == "shared").unwrap()["text"],
                 "shard-19"
             );
-            for shard in [0, 1, 19] {
+            for &shard in &active_shards {
                 assert_eq!(
                     rows.iter()
                         .find(|r| r["id"] == format!("only-{shard}"))
@@ -485,7 +508,10 @@ mod integration_tests {
                 .await
                 .unwrap();
             assert_eq!(reader.pending_wal_generations().await.unwrap(), 0);
-            assert_eq!(reader.list(None, None).await.unwrap().len(), 5);
+            assert_eq!(
+                reader.list(None, None).await.unwrap().len(),
+                active_shards.len() + 2
+            );
         }
     }
 
