@@ -561,17 +561,21 @@ mod integration_tests {
 
     #[tokio::test]
     #[ignore = "requires isolated loopback ETCD_TEST_ENDPOINTS"]
-    async fn grouped_partial_shards_preserve_later_head_over_earlier_tail() {
+    async fn grouped_partial_shards_preserve_configured_order_across_continuations() {
         let endpoints = std::env::var("ETCD_TEST_ENDPOINTS").expect("isolated etcd required");
         assert!(endpoints
             .split(',')
             .all(|e| e.starts_with("http://127.0.0.1:")));
-        for (prepare_cap, budget_bytes, tail_bytes, split_slice) in [
-            (0, 32 << 20, 256 << 10, false),
-            (128 << 10, 32 << 20, 256 << 10, false),
+        for (prepare_cap, budget_bytes, tail_bytes, split_slice, rotated_job) in [
+            (0, 32 << 20, 256 << 10, false, false),
+            (128 << 10, 32 << 20, 256 << 10, false, false),
             // This tail fits alone but cannot grow while retaining a later head.
-            (128 << 10, 1 << 20, 900 << 10, false),
-            (128 << 10, 32 << 20, 256 << 10, true),
+            (128 << 10, 1 << 20, 900 << 10, false, false),
+            (128 << 10, 32 << 20, 256 << 10, true, false),
+            // Both continuations start with identical remaining WAL, then use
+            // the next durable attempt's rendered order with different caps.
+            (0, 32 << 20, 256 << 10, true, true),
+            (128 << 10, 32 << 20, 256 << 10, true, true),
         ] {
             let (_dir, state) = fixture().await.unwrap();
             let target = "generic:hot";
@@ -650,7 +654,12 @@ mod integration_tests {
                     MergeMemoryBudget, RolloutStore,
                 };
                 use std::sync::Arc;
-                let state = crate::state::MasterState::new(cfg.clone()).await.unwrap();
+                let mut slice_cfg = cfg.clone();
+                if rotated_job {
+                    slice_cfg.catchup.grouped_prepare_max_bytes = 128 << 10;
+                }
+                let slice_prepare_cap = slice_cfg.catchup.grouped_prepare_max_bytes;
+                let state = crate::state::MasterState::new(slice_cfg).await.unwrap();
                 let budget = MergeMemoryBudget::new(budget_bytes);
                 let session = RolloutStore::build_session(1 << 20, 1 << 20);
                 let probe = SealedWalProbe::open(&uri, Some(session.clone()))
@@ -661,7 +670,7 @@ mod integration_tests {
                     .run(async {
                         let mut parts = Vec::new();
                         for index in [0, 19] {
-                            let reservation = budget.reserve(prepare_cap).await;
+                            let reservation = budget.reserve(slice_prepare_cap).await;
                             let part = super::prepare(
                                 &state,
                                 target,
@@ -705,6 +714,44 @@ mod integration_tests {
                     2
                 );
             }
+            if rotated_job {
+                let inventory = Inventory::new(&state);
+                let first = inventory.get(target).await.unwrap().unwrap();
+                assert_eq!(first.attempt, 1);
+                inventory
+                    .complete(&first, super::super::outcome::JobOutcome::Succeeded, 101)
+                    .await
+                    .unwrap();
+                // Advance the supplied admission clock beyond the normal
+                // successful-attempt cooldown; do not clear failure debt.
+                cfg.catchup.job_name = inventory
+                    .reserve(target, "grouped-rotated-continuation", 3, 60_102)
+                    .await
+                    .unwrap()
+                    .job;
+                let second = inventory.get(target).await.unwrap().unwrap();
+                assert_eq!(second.attempt, 2);
+                assert_ne!(first.job, second.job);
+                let job = super::super::kubernetes::render_job(
+                    &cfg,
+                    &second,
+                    json!({"containers":[{"name":"executor", "env":[]}]}),
+                );
+                let env = job["spec"]["template"]["spec"]["containers"][0]["env"]
+                    .as_array()
+                    .unwrap();
+                cfg.catchup.shards = env
+                    .iter()
+                    .find(|entry| entry["name"] == "CATCHUP_SHARDS")
+                    .unwrap()["value"]
+                    .as_str()
+                    .unwrap()
+                    .split(',')
+                    .map(str::to_owned)
+                    .collect();
+                assert_eq!(cfg.catchup.shards.first().unwrap(), "worker-1");
+                assert_eq!(cfg.catchup.shards.last().unwrap(), "worker-0");
+            }
             assert_eq!(
                 tokio::time::timeout(std::time::Duration::from_secs(30), execute(cfg, target))
                     .await
@@ -718,11 +765,22 @@ mod integration_tests {
             assert_eq!(reader.pending_wal_generations().await.unwrap(), 0);
             let rows = reader.list(None, None).await.unwrap();
             assert_eq!(rows.len(), 5);
-            assert_eq!(
-                rows.iter().find(|r| r["id"] == "overlap").unwrap()["text"],
-                "later-head",
-                "preparation cap {prepare_cap} changed cross-shard upsert precedence"
-            );
+            if rotated_job {
+                // Rotation deliberately puts worker-0 last. Matching this
+                // existing per-attempt contract does not establish a stable
+                // cross-attempt or global event-time winner.
+                assert_eq!(
+                    rows.iter().find(|r| r["id"] == "overlap").unwrap()["text"],
+                    "earlier-tail",
+                    "preparation cap {prepare_cap} changed rendered attempt order"
+                );
+            } else {
+                assert_eq!(
+                    rows.iter().find(|r| r["id"] == "overlap").unwrap()["text"],
+                    "later-head",
+                    "preparation cap {prepare_cap} changed cross-shard upsert precedence"
+                );
+            }
             drop(writers);
         }
     }

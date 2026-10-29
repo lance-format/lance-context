@@ -72,7 +72,9 @@ operation may finish beyond that slice while making progress. No Job or Pod
 runtime deadline is installed at creation. Each
 Job rotates the starting shard using a durable attempt number, including after
 failures, so a slow first shard cannot always hide the rest. Further fresh
-pressure can request another slice.
+pressure can request another slice. Duplicate keys across shards follow the
+configured publication order for that attempt. Rotation can therefore change
+which shard wins; it does not establish a global event-time order.
 
 For targets explicitly enabled in `CATCHUP_GROUPED_TARGETS`,
 `CATCHUP_GROUPED_PREPARE_MAX_BYTES` can limit each shard's preparation separately
