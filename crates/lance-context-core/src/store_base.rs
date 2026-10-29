@@ -73,6 +73,9 @@ use crate::metrics::{
 };
 use crate::store::{CompactionConfig, CompactionStats, DroppedFragment, RepairReport};
 
+mod grouped;
+pub use grouped::PreparedShardMerge;
+
 /// Number of shard manifest files to scan per batch when discovering the latest
 /// shard state.
 pub(crate) const DEFAULT_MANIFEST_SCAN_BATCH_SIZE: usize = 16;
@@ -1366,7 +1369,9 @@ impl StorageBase {
         let watermark = merged_generations
             .iter()
             .max()
-            .map(|high| lance_index::mem_wal::CompactedSsTable::new(self.write_shard, *high));
+            .map(|high| (self.write_shard, *high))
+            .into_iter()
+            .collect();
         if !batches.is_empty() {
             observe_phase!(
                 "append",
@@ -1428,9 +1433,17 @@ impl StorageBase {
     /// they are removed concurrently. Best-effort by contract: a failure is
     /// logged and the directory stays until reclaimed.
     async fn delete_merged_generation_dirs(&self, merged_paths: &[String]) -> LanceResult<()> {
+        self.delete_shard_generation_dirs(self.write_shard, merged_paths)
+            .await
+    }
+
+    async fn delete_shard_generation_dirs(
+        &self,
+        shard: Uuid,
+        merged_paths: &[String],
+    ) -> LanceResult<()> {
         let object_store = self.dataset.object_store(None).await?;
         let branch_path = self.dataset.branch_location().path.clone();
-        let shard = self.write_shard;
         let dirs: Vec<_> = merged_paths
             .iter()
             .map(|path| {
@@ -1613,7 +1626,7 @@ impl StorageBase {
         &mut self,
         batches: Vec<RecordBatch>,
         merge_schema: Arc<Schema>,
-        watermark: Option<lance_index::mem_wal::CompactedSsTable>,
+        watermarks: Vec<(Uuid, u64)>,
         bulk_key_delete: bool,
         parallel_upsert_io: bool,
         staged: Option<StagedMergeFiles>,
@@ -1635,10 +1648,11 @@ impl StorageBase {
         let delete_batches = batches.clone();
         let snapshot = Arc::new(self.dataset.clone());
         let schema = self.dataset.schema().clone();
-        let initial_coverage = crate::rollout_append::watermarks(&self.dataset)
-            .await?
-            .get(&self.write_shard)
-            .copied();
+        let coverage = crate::rollout_append::watermarks(&self.dataset).await?;
+        let initial_coverage: Vec<_> = watermarks
+            .iter()
+            .map(|(shard, _)| (*shard, coverage.get(shard).copied()))
+            .collect();
         let key_column = self.key_column.clone();
         let delete = |snapshot| {
             let batches = delete_batches.clone();
@@ -1692,7 +1706,9 @@ impl StorageBase {
                 ));
             }
             *new_fragments = fragments.clone();
-            compacted_sstables.extend(watermark.clone());
+            compacted_sstables.extend(watermarks.iter().map(|(shard, high)| {
+                lance_index::mem_wal::CompactedSsTable::new(*shard, *high)
+            }));
             let version = self.dataset.version().version;
             if deleted.transaction.read_version != version {
                 return Err(LanceError::io(
@@ -1730,11 +1746,10 @@ impl StorageBase {
                     // we staged files. Replaying our old keys over its newer
                     // values would undo that progress, even if the files are
                     // reusable. Let the caller reconcile and prepare again.
-                    if crate::rollout_append::watermarks(&self.dataset)
-                        .await?
-                        .get(&self.write_shard)
-                        .copied()
-                        != initial_coverage
+                    let coverage = crate::rollout_append::watermarks(&self.dataset).await?;
+                    if initial_coverage
+                        .iter()
+                        .any(|(shard, initial)| coverage.get(shard).copied() != *initial)
                     {
                         return Err(LanceError::io(
                             MaintenanceErrorCode::StalePreparation

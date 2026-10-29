@@ -1021,3 +1021,118 @@ async fn staged_wal_real_multipart_writer_error_joins_abort_cleanup_before_budge
     assert_eq!(budget.reserved(), 0);
     assert!(!scope.has_uncertain_commit());
 }
+
+#[tokio::test]
+async fn grouped_wal_cancellation_retains_real_encoding_until_drain_without_publication() {
+    use crate::MergeMemoryBudget;
+    use std::time::Duration;
+    #[derive(Debug, Default)]
+    struct RejectPublication(AtomicUsize);
+    impl CommitAuthorizer for RejectPublication {
+        fn authorize<'a>(
+            &'a self,
+            _: &'a str,
+            _: u64,
+        ) -> futures::future::BoxFuture<'a, lance::Result<()>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Err(lance::Error::io("unexpected publication attempt")) })
+        }
+    }
+    for fail in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let uri = format!("file-object-store://{}", dir.path().display());
+        let budget = MergeMemoryBudget::new(8 * 1024 * 1024);
+        let options = |shard: &str| RolloutStoreOptions {
+            shard_id: Some(shard.into()),
+            merge_after_generations: Some(0),
+            merge_max_bytes: Some(1024 * 1024),
+            merge_budget: Some(budget.clone()),
+            ..Default::default()
+        };
+        let first_options = options("group-first");
+        let second_options = options("group-second");
+        for (id, options) in [
+            ("first", first_options.clone()),
+            ("second", second_options.clone()),
+        ] {
+            let mut writer = RolloutStore::open_with_options(&uri, options)
+                .await
+                .unwrap();
+            writer
+                .add(&[super::tests::artifact_record(id, &vec![7; 64 * 1024])])
+                .await
+                .unwrap();
+            writer.flush().await.unwrap();
+            writer.close().await.unwrap();
+        }
+        let before = lance::Dataset::open(&uri).await.unwrap().version().version;
+        let gate = Arc::new(WriteGate::default());
+        gate.pause.store(true, Ordering::SeqCst);
+        gate.fail.store(fail, Ordering::SeqCst);
+        let authorizer = Arc::new(RejectPublication::default());
+        let scope = MergeWriteScope::with_preparation_authorizer_and_io_shim(
+            authorizer.clone(),
+            Arc::new(Wrapper(gate.clone())),
+        );
+        let runner_scope = scope.clone();
+        let runner_uri = uri.clone();
+        let reserve_budget = budget.clone();
+        let caller = tokio::spawn(async move {
+            runner_scope
+                .run(async move {
+                    let mut first =
+                        RolloutStore::open_existing_with_options(&runner_uri, first_options)
+                            .await?;
+                    let second =
+                        RolloutStore::open_existing_with_options(&runner_uri, second_options)
+                            .await?;
+                    let a = first
+                        .prepare_grouped_merge_reserved(reserve_budget.reserve(1024 * 1024).await)
+                        .await?
+                        .unwrap();
+                    let b = second
+                        .prepare_grouped_merge_reserved(reserve_budget.reserve(1024 * 1024).await)
+                        .await?
+                        .unwrap();
+                    first.commit_prepared_group(vec![a, b], 1024 * 1024).await
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(20), gate.entered.notified())
+            .await
+            .unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        assert!(
+            budget.reserved() >= 128 * 1024,
+            "the real grouped encoder still owns both payloads"
+        );
+        assert!(budget.try_reserve(budget.limit()).is_none());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), scope.drain())
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), scope.abort_fenced_leaves())
+                .await
+                .is_err()
+        );
+        assert!(budget.reserved() >= 128 * 1024);
+        gate.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(20), scope.drain())
+            .await
+            .unwrap();
+        assert_eq!(budget.reserved(), 0);
+        assert_eq!(gate.completed.load(Ordering::SeqCst), 1);
+        let base = lance::Dataset::open(&uri).await.unwrap();
+        assert_eq!(base.version().version, before);
+        assert_eq!(base.count_rows(None).await.unwrap(), 0);
+        let observer = RolloutStore::open_existing_with_options(&uri, Default::default())
+            .await
+            .unwrap();
+        assert_eq!(observer.pending_wal_generations().await.unwrap(), 2);
+        assert_eq!(authorizer.0.load(Ordering::SeqCst), 0);
+        assert!(!scope.has_uncertain_commit());
+    }
+}

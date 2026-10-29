@@ -1,5 +1,6 @@
 //! Master-owned, bounded Kubernetes catch-up jobs. No payload reads in admission.
 mod executor;
+mod grouped;
 mod kubernetes;
 mod outcome;
 mod progress;
@@ -84,6 +85,12 @@ pub struct CatchupConfig {
     pub staging_targets: Vec<String>,
     #[arg(long, env = "CATCHUP_STAGING_CONCURRENCY", default_value_t = 2)]
     pub staging_concurrency: usize,
+    /// Exact targets opting in to bounded cross-shard base commits.
+    #[arg(long, env = "CATCHUP_GROUPED_TARGETS", value_delimiter = ',')]
+    pub grouped_targets: Vec<String>,
+    /// Maximum concurrent preparations and shards per group; bytes remain capped.
+    #[arg(long, env = "CATCHUP_GROUPED_SHARDS", default_value_t = 4)]
+    pub grouped_shards: usize,
     /// Native one-table executor mode; does not start the admin server or scanner.
     #[arg(long, env = "CATCHUP_TARGET", hide = true)]
     pub target: Option<String>,
@@ -119,6 +126,8 @@ impl Default for CatchupConfig {
             parallel_upsert_io_targets: Vec::new(),
             staging_targets: Vec::new(),
             staging_concurrency: 2,
+            grouped_targets: Vec::new(),
+            grouped_shards: 4,
             target: None,
             job_name: None,
             outcome_path: None,
@@ -129,6 +138,22 @@ impl Default for CatchupConfig {
 }
 impl CatchupConfig {
     pub fn validate(&self) -> Result<()> {
+        let grouped_disabled = self.grouped_targets.is_empty()
+            || self.grouped_targets == [String::new()];
+        if !(1..=32).contains(&self.grouped_shards)
+            || (!grouped_disabled
+                && (self.merge_max_bytes == 0
+                    || self.merge_memory_bytes < self.merge_max_bytes
+                    || self.grouped_targets.iter().any(|target| {
+                        target.is_empty()
+                            || target.contains('*')
+                            || self.staging_targets.contains(target)
+                            || self.bulk_key_delete_targets.contains(target)
+                            || self.parallel_upsert_io_targets.contains(target)
+                    })))
+        {
+            return Err("invalid grouped WAL targets, bounds or conflicting opt-ins".into());
+        }
         // Clap represents an explicitly empty environment variable as [""].
         // Job rendering uses that value to clear an inherited opt-in; it must
         // remain a valid disabled setting, while empty entries in a nonempty

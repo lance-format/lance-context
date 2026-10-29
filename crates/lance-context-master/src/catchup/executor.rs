@@ -259,7 +259,25 @@ pub(crate) async fn merge_local(
                 }) as BoxFuture<'_, Result<usize>>)
             }
         };
-        let reclaimed = if config.staging_targets.iter().any(|t| t == target) {
+        let reclaimed = if config.grouped_targets.iter().any(|t| t == target) {
+            let outcomes = super::grouped::run(
+                state,
+                target,
+                &selected,
+                &probe,
+                session.clone(),
+                budget.clone(),
+                started + admit_for,
+            )
+            .await?;
+            outcomes
+                .into_iter()
+                .map(|(index, reclaimed)| {
+                    activity.record(index, reclaimed);
+                    reclaimed
+                })
+                .sum()
+        } else if config.staging_targets.iter().any(|t| t == target) {
             super::staging::run(
                 selected.iter().copied(),
                 config.staging_concurrency,
