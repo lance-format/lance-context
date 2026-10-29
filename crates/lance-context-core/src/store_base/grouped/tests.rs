@@ -400,6 +400,72 @@ async fn aggregate_byte_cap_falls_back_without_rereading_or_losing_order() {
 }
 
 #[tokio::test]
+async fn oversized_waves_keep_small_neighbours_grouped_and_preserve_key_order() {
+    for oversized_middle in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().join("base.lance").to_str().unwrap().to_owned();
+        let budget = MergeMemoryBudget::new(16 * MIB);
+        let count = if oversized_middle { 5 } else { 6 };
+        let mut stores = Vec::new();
+        let mut prepared = Vec::new();
+        let mut expected = HashMap::new();
+        for index in 0..count {
+            let shard = format!("shard-{index}");
+            let store = open(&uri, &shard, budget.clone()).await;
+            let key = format!("only-{index}");
+            let size = if oversized_middle && index == 2 {
+                128 * 1024
+            } else {
+                1024
+            };
+            let payload = vec![index as u8; size];
+            put(&store, &[("shared", &payload), (&key, &payload)]).await;
+            expected.insert("shared".into(), payload.clone());
+            expected.insert(key, payload);
+            prepared.push(prepare(&store, &budget).await);
+            stores.push(store);
+        }
+        let cap = prepared[0].decoded_bytes() + prepared[1].decoded_bytes();
+        assert!(
+            prepared
+                .iter()
+                .map(PreparedShardMerge::decoded_bytes)
+                .sum::<usize>()
+                > cap
+        );
+        if oversized_middle {
+            assert!(prepared[2].decoded_bytes() > cap);
+        }
+        let before = Dataset::open(&uri).await.unwrap().version().version;
+        let scope = crate::merge_write_scope::MergeWriteScope::with_authorizer(Arc::new(Allow));
+        assert_eq!(
+            scope
+                .run(stores[0].commit_prepared_group(prepared, cap))
+                .await
+                .unwrap(),
+            count
+        );
+        scope.drain().await;
+        assert_eq!(
+            scope.work().wal_batches_read,
+            0,
+            "reuse prepared Arrow data"
+        );
+        assert_eq!(scope.work().base_commits, 3);
+        assert_eq!(
+            Dataset::open(&uri).await.unwrap().version().version,
+            before + 3
+        );
+        assert_eq!(values(&uri).await, expected);
+        assert_eq!(stores[0].pending_wal_generations().await.unwrap(), 0);
+        assert_eq!(budget.reserved(), 0);
+        for store in &mut stores {
+            store.close().await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
 async fn changed_writer_epoch_rejects_group_before_any_publication() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().join("base.lance").to_str().unwrap().to_owned();
@@ -507,7 +573,7 @@ async fn conflict_on_nonfirst_shard_coverage_rejects_old_group_without_replay() 
 /// Publish the real manifest, then lose the response. The caller must never
 /// interpret an IO error as permission to replay the prepared group.
 #[derive(Debug, Default)]
-struct LostCommitReply(std::sync::atomic::AtomicUsize);
+struct LostCommitReply(std::sync::atomic::AtomicUsize, usize);
 #[async_trait::async_trait]
 impl lance_table::io::commit::CommitHandler for LostCommitReply {
     async fn commit(
@@ -522,13 +588,17 @@ impl lance_table::io::commit::CommitHandler for LostCommitReply {
     ) -> Result<lance_table::io::commit::ManifestLocation, lance_table::io::commit::CommitError>
     {
         use lance_table::io::commit::{CommitError, RenameCommitHandler};
-        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        RenameCommitHandler
+        let attempt = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let location = RenameCommitHandler
             .commit(manifest, indices, path, store, writer, naming, transaction)
             .await?;
-        Err(CommitError::OtherError(LanceError::io(
-            "injected lost commit response",
-        )))
+        if attempt >= self.1.max(1) {
+            Err(CommitError::OtherError(LanceError::io(
+                "injected lost commit response",
+            )))
+        } else {
+            Ok(location)
+        }
     }
 }
 
@@ -613,6 +683,94 @@ async fn lost_commit_response_does_not_retry_or_drain_and_recovers_all_shards() 
     first.close().await.unwrap();
     second.close().await.unwrap();
     later.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn lost_reply_in_second_split_group_stops_later_groups_and_retains_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("base.lance").to_str().unwrap().to_owned();
+    let budget = MergeMemoryBudget::new(16 * MIB);
+    let mut stores = Vec::new();
+    let mut prepared = Vec::new();
+    for index in 0..6 {
+        let store = open(&uri, &format!("shard-{index}"), budget.clone()).await;
+        put(&store, &[("shared", &[index as u8; 1024])]).await;
+        prepared.push(prepare(&store, &budget).await);
+        stores.push(store);
+    }
+    let cap = prepared[0].decoded_bytes() + prepared[1].decoded_bytes();
+    let before = Dataset::open(&uri).await.unwrap().version().version;
+    let injected = Arc::new(LostCommitReply(Default::default(), 2));
+    stores[0].dataset = lance::dataset::builder::DatasetBuilder::from_uri(&uri)
+        .with_commit_handler(Arc::new(crate::merge_write_scope::GuardedCommit::new(
+            injected.clone(),
+        )))
+        .load()
+        .await
+        .unwrap();
+    let scope = crate::merge_write_scope::MergeWriteScope::with_authorizer(Arc::new(Allow));
+    let error = scope
+        .run(stores[0].commit_prepared_group(prepared, cap))
+        .await
+        .unwrap_err();
+    scope.drain().await;
+    assert!(
+        error.to_string().contains("injected lost commit response"),
+        "{error}"
+    );
+    assert_eq!(injected.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert!(scope.has_uncertain_commit());
+    assert_eq!(
+        Dataset::open(&uri).await.unwrap().version().version,
+        before + 2
+    );
+    assert_eq!(values(&uri).await["shared"], vec![3; 1024]);
+    assert_eq!(budget.reserved(), 0);
+    for (index, store) in stores.iter().enumerate() {
+        assert_eq!(
+            store
+                .own_shard_watermark()
+                .await
+                .unwrap()
+                .unwrap()
+                .pending_generations,
+            if index < 2 { 0 } else { 1 }
+        );
+    }
+    // Acknowledge the uncertain group's already-published watermarks without
+    // replaying it; later uncommitted groups remain available for normal recovery.
+    let recovery = crate::merge_write_scope::MergeWriteScope::with_authorizer(Arc::new(Allow));
+    let mut remaining = Vec::new();
+    for (index, store) in stores.iter().enumerate() {
+        let part = recovery
+            .run(store.prepare_grouped_merge_reserved(budget.reserve(MIB).await))
+            .await
+            .unwrap();
+        if index < 4 {
+            assert!(part.is_none());
+        } else {
+            remaining.push(part.unwrap());
+        }
+    }
+    assert_eq!(
+        recovery
+            .run(stores[4].commit_prepared_group(remaining, cap))
+            .await
+            .unwrap(),
+        2
+    );
+    recovery.drain().await;
+    assert_eq!(
+        Dataset::open(&uri).await.unwrap().version().version,
+        before + 3
+    );
+    assert_eq!(values(&uri).await["shared"], vec![5; 1024]);
+    assert_eq!(stores[0].pending_wal_generations().await.unwrap(), 0);
+    assert_eq!(budget.reserved(), 0);
+    assert_eq!(injected.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+    for store in &mut stores {
+        store.close().await.unwrap();
+    }
 }
 
 #[tokio::test]

@@ -95,8 +95,9 @@ impl StorageBase {
     /// The caller must hold the existing table maintenance ownership scope.
     /// This method does not claim writer epochs, release leases or retry an
     /// unknown publication result. An oversized generation is supported alone;
-    /// otherwise-large groups and workspace contention fall back to ordered
-    /// single-shard commits of the already prepared data, without waiting.
+    /// otherwise-large groups split into consecutive byte-bounded groups.
+    /// Workspace contention falls back to ordered single-shard commits of the
+    /// already prepared data, without waiting.
     pub fn commit_prepared_group(
         &mut self,
         mut shards: Vec<PreparedShardMerge>,
@@ -207,12 +208,53 @@ impl StorageBase {
                 }
             }
 
+            if shards.len() > 1 && bytes > max_bytes {
+                count!(crate::metrics::ROLLOUT_WAL_GROUP_SPLITS,
+                    "reason" => "aggregate_byte_cap");
+                // Preserve input order, including across group boundaries. An
+                // indivisible oversized shard runs alone; smaller neighbours
+                // can still share publications. All preparations remain charged.
+                let mut remaining = shards.into_iter().peekable();
+                let mut reclaimed = 0;
+                while let Some(first) = remaining.next() {
+                    let mut group_bytes = first.decoded_bytes();
+                    let mut group = vec![first];
+                    while let Some(next) = remaining.peek() {
+                        let next_bytes = next.decoded_bytes();
+                        // The complete group's checked sum above also bounds
+                        // every consecutive subset, including an oversized one.
+                        if group_bytes + next_bytes > max_bytes {
+                            break;
+                        }
+                        group_bytes += next_bytes;
+                        group.push(remaining.next().unwrap());
+                    }
+                    // Revalidate each subset against the latest committed base.
+                    // An unknown outcome stops here: never run a later group.
+                    reclaimed += self.commit_prepared_group(group, max_bytes).await?;
+                }
+                return Ok(reclaimed);
+            }
+
             // Account for output buffers, owned keys, hash-table reallocation
             // and row indices before reduction. Never wait while holding the
             // preparations. A single shard is already duplicate-free.
-            let scratch = if shards.len() > 1 && bytes <= max_bytes {
-                reduction_workspace(&shards, &self.key_column)
-                    .and_then(|workspace| budget.try_reserve(workspace))
+            let scratch = if shards.len() > 1 {
+                match reduction_workspace(&shards, &self.key_column) {
+                    Some(workspace) => {
+                        let reservation = budget.try_reserve(workspace);
+                        if reservation.is_none() {
+                            count!(crate::metrics::ROLLOUT_WAL_GROUP_SPLITS,
+                                "reason" => "workspace_unavailable");
+                        }
+                        reservation
+                    }
+                    None => {
+                        count!(crate::metrics::ROLLOUT_WAL_GROUP_SPLITS,
+                            "reason" => "workspace_unbounded");
+                        None
+                    }
+                }
             } else {
                 None
             };
