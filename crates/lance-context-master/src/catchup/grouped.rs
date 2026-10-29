@@ -125,6 +125,11 @@ async fn commit(
     }
     let started = Instant::now();
     let cap = state.config.catchup.merge_max_bytes;
+    if state.config.catchup.grouped_parallel_encoding {
+        for shard in &mut group {
+            shard.use_parallel_group_encoding();
+        }
+    }
     let reclaimed = match &mut store {
         Store::Rollout(store) => store.commit_prepared_group(group, cap).await,
         Store::Generic(store) => store.commit_prepared_group(group, cap).await,
@@ -430,6 +435,9 @@ mod tests {
         let mut config = CatchupConfig::default();
         assert!(config.grouped_targets.is_empty());
         assert!(config.validate().is_ok());
+        config.grouped_parallel_encoding = true;
+        assert!(config.validate().is_err());
+        config.grouped_parallel_encoding = false;
         config.grouped_targets = vec!["bench".into()];
         for width in [0, 33] {
             config.grouped_shards = width;
@@ -494,13 +502,15 @@ mod tests {
             config.catchup.grouped_targets = targets.clone();
             config.catchup.grouped_shards = 3;
             config.catchup.grouped_prepare_max_bytes = prepare_cap;
+            config.catchup.grouped_parallel_encoding = !targets.is_empty();
             let job = super::super::kubernetes::render_job(
                 &config,
                 &record,
                 json!({"containers":[{"name":"executor", "env":[
                     {"name":"CATCHUP_GROUPED_TARGETS", "value":"inherited"},
                     {"name":"CATCHUP_GROUPED_SHARDS", "value":"32"},
-                    {"name":"CATCHUP_GROUPED_PREPARE_MAX_BYTES", "value":"999999999"}
+                    {"name":"CATCHUP_GROUPED_PREPARE_MAX_BYTES", "value":"999999999"},
+                    {"name":"CATCHUP_GROUPED_PARALLEL_ENCODING", "value":"true"}
                 ]}]}),
             );
             let env = job["spec"]["template"]["spec"]["containers"][0]["env"]
@@ -510,12 +520,16 @@ mod tests {
             let rendered_targets = entries("CATCHUP_GROUPED_TARGETS");
             let rendered_shards = entries("CATCHUP_GROUPED_SHARDS");
             let rendered_prepare = entries("CATCHUP_GROUPED_PREPARE_MAX_BYTES");
+            let rendered_encoding = entries("CATCHUP_GROUPED_PARALLEL_ENCODING");
             assert_eq!(rendered_targets.len(), 1);
             assert_eq!(rendered_shards.len(), 1);
             assert_eq!(rendered_prepare.len(), 1);
+            assert_eq!(rendered_encoding.len(), 1);
             let target_value = rendered_targets[0]["value"].as_str().unwrap();
             let shard_value = rendered_shards[0]["value"].as_str().unwrap();
             let prepare_value = rendered_prepare[0]["value"].as_str().unwrap();
+            let encoding_value = rendered_encoding[0]["value"].as_str().unwrap();
+            assert_eq!(encoding_value, (!targets.is_empty()).to_string());
             assert_eq!(target_value, targets.join(","));
             assert_eq!(shard_value, "3");
             assert_eq!(prepare_value, prepare_cap.to_string());
@@ -527,6 +541,8 @@ mod tests {
                 shard_value,
                 "--grouped-prepare-max-bytes",
                 prepare_value,
+                "--grouped-parallel-encoding",
+                encoding_value,
                 "--target",
                 "hot",
                 "--job-name",
@@ -538,6 +554,10 @@ mod tests {
             parsed.catchup.validate().unwrap();
             assert_eq!(parsed.catchup.grouped_shards, 3);
             assert_eq!(parsed.catchup.grouped_prepare_max_bytes, prepare_cap);
+            assert_eq!(
+                parsed.catchup.grouped_parallel_encoding,
+                !targets.is_empty()
+            );
             assert_eq!(
                 parsed.catchup.grouped_targets.iter().any(|v| v == "hot"),
                 !targets.is_empty()
@@ -792,19 +812,32 @@ mod integration_tests {
         assert!(endpoints
             .split(',')
             .all(|e| e.starts_with("http://127.0.0.1:")));
-        for (budget_bytes, payload_bytes, expected_commits, cap, width, all_shards, prepare_cap) in [
-            (32 << 20, 64, 2, 1 << 20, 4, false, 0),
-            (1 << 20, 64, 3, 1 << 20, 4, false, 0),
-            (4 << 20, 1536 << 10, 3, 1 << 20, 4, false, 0),
+        for (
+            budget_bytes,
+            payload_bytes,
+            expected_commits,
+            cap,
+            width,
+            all_shards,
+            prepare_cap,
+            parallel,
+        ) in [
+            (32 << 20, 64, 2, 1 << 20, 4, false, 0, false),
+            (1 << 20, 64, 3, 1 << 20, 4, false, 0, false),
+            (4 << 20, 1536 << 10, 3, 1 << 20, 4, false, 0, false),
             // Sixteen initial 8-MiB reservations exactly fill 128 MiB.
             // Joined reads must free scratch and admit the last four shards,
             // allowing all twenty to publish once without reducing headroom.
-            (128 << 20, 64, 1, 8 << 20, 20, true, 0),
+            (128 << 20, 64, 1, 8 << 20, 20, true, 0, false),
             // Smaller reads still combine all twenty shards under the larger
             // publication cap. Indivisible generations can grow or retry in
             // order under the same total budget, without dropping any rows.
-            (32 << 20, 64, 1, 8 << 20, 20, true, 1 << 20),
-            (4 << 20, 1536 << 10, 3, 1 << 20, 4, false, 128 << 10),
+            (32 << 20, 64, 1, 8 << 20, 20, true, 1 << 20, false),
+            (4 << 20, 1536 << 10, 3, 1 << 20, 4, false, 128 << 10, false),
+            // The same native owner and one publication, with two encoded files.
+            (256 << 20, 64, 1, 8 << 20, 20, true, 0, true),
+            // A requested second encoder must not block a full budget.
+            (4 << 20, 1536 << 10, 3, 1 << 20, 4, false, 128 << 10, true),
         ] {
             let (_dir, state) = fixture().await.unwrap();
             let target = "generic:hot";
@@ -858,6 +891,7 @@ mod integration_tests {
             cfg.catchup.shards = (0..20).map(|i| format!("worker-{i}")).collect();
             cfg.catchup.grouped_targets = vec![target.into()];
             cfg.catchup.grouped_shards = width;
+            cfg.catchup.grouped_parallel_encoding = parallel;
             cfg.catchup.merge_max_bytes = cap;
             cfg.catchup.grouped_prepare_max_bytes = prepare_cap;
             cfg.catchup.merge_memory_bytes = budget_bytes;
@@ -878,6 +912,9 @@ mod integration_tests {
             assert_eq!(reader.pending_wal_generations().await.unwrap(), 0);
             let base = lance::Dataset::open(&uri).await.unwrap();
             assert_eq!(base.version().version, before + expected_commits);
+            if parallel && all_shards {
+                assert_eq!(base.manifest().fragments.len(), 2);
+            }
             assert_eq!(
                 base.count_rows(None).await.unwrap(),
                 active_shards.len() + 1

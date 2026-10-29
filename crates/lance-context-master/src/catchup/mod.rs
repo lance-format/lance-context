@@ -106,6 +106,9 @@ pub struct CatchupConfig {
     /// Zero retains the aggregate cap for each preparation. Total budget is unchanged.
     #[arg(long, env = "CATCHUP_GROUPED_PREPARE_MAX_BYTES", default_value_t = 0)]
     pub grouped_prepare_max_bytes: usize,
+    /// Two budgeted immutable encoders per group; base publication stays ordered.
+    #[arg(long, env = "CATCHUP_GROUPED_PARALLEL_ENCODING", default_value_t = false, action = clap::ArgAction::Set)]
+    pub grouped_parallel_encoding: bool,
     /// Native one-table executor mode; does not start the admin server or scanner.
     #[arg(long, env = "CATCHUP_TARGET", hide = true)]
     pub target: Option<String>,
@@ -144,6 +147,7 @@ impl Default for CatchupConfig {
             grouped_targets: Vec::new(),
             grouped_shards: 4,
             grouped_prepare_max_bytes: 0,
+            grouped_parallel_encoding: false,
             target: None,
             job_name: None,
             outcome_path: None,
@@ -165,6 +169,7 @@ impl CatchupConfig {
         let grouped_disabled =
             self.grouped_targets.is_empty() || self.grouped_targets == [String::new()];
         if !(1..=32).contains(&self.grouped_shards)
+            || (grouped_disabled && self.grouped_parallel_encoding)
             || (!grouped_disabled
                 && (self.merge_max_bytes == 0
                     || self.merge_memory_bytes < self.merge_max_bytes

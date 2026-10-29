@@ -360,6 +360,10 @@ pub(super) fn render_job(config: &MasterConfig, record: &Record, mut spec: Value
             "CATCHUP_GROUPED_PREPARE_MAX_BYTES",
             config.catchup.grouped_prepare_max_bytes.to_string(),
         ),
+        (
+            "CATCHUP_GROUPED_PARALLEL_ENCODING",
+            config.catchup.grouped_parallel_encoding.to_string(),
+        ),
         ("CATCHUP_TARGET", record.target.clone()),
         ("CATCHUP_JOB_NAME", record.job.clone()),
         ("CATCHUP_ATTEMPT_ID", record.attempt.to_string()),

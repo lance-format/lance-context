@@ -403,6 +403,10 @@ async fn policy_disagreement_cannot_expand_the_cluster_budget() {
         other = config.clone();
         other.catchup.grouped_prepare_max_bytes = if prepare_cap == 0 { 1 << 20 } else { 0 };
         assert!(inventory.ensure_policy(&other).await.is_err());
+        assert!(policy.get("grouped_parallel_encoding").is_none());
+        other = config.clone();
+        other.catchup.grouped_parallel_encoding = true;
+        assert!(inventory.ensure_policy(&other).await.is_err());
         inventory.ensure_policy(&config).await.unwrap();
     }
 }

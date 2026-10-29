@@ -18,6 +18,8 @@ struct WriteGate {
     entered: Notify,
     release: Notify,
     completed: AtomicUsize,
+    encoding_calls: AtomicUsize,
+    fail_unpaused_encoding: AtomicBool,
     read_enabled: AtomicBool,
     read_fail_first: AtomicBool,
     read_fail_path: std::sync::Mutex<Option<String>>,
@@ -184,6 +186,7 @@ impl WriteGate {
         }
     }
     async fn wait(&self) -> Result<()> {
+        self.encoding_calls.fetch_add(1, Ordering::SeqCst);
         if self.pause.swap(false, Ordering::SeqCst) {
             self.entered.notify_one();
             self.release.notified().await;
@@ -194,8 +197,111 @@ impl WriteGate {
                     source: std::io::Error::other("injected encoded data failure").into(),
                 });
             }
+        } else if self.fail_unpaused_encoding.load(Ordering::SeqCst) {
+            return Err(Error::Generic {
+                store: "parallel-encoding-test",
+                source: std::io::Error::other("injected sibling encoder failure").into(),
+            });
         }
         Ok(())
+    }
+}
+
+#[tokio::test]
+async fn parallel_group_encoding_joins_blocked_sibling_and_retains_workspace() {
+    use crate::MergeMemoryBudget;
+    use std::time::Duration;
+    const MIB: usize = 1024 * 1024;
+    for cancel in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let uri = format!("file-object-store://{}", dir.path().display());
+        let budget = MergeMemoryBudget::new(256 * MIB);
+        let options = RolloutStoreOptions {
+            shard_id: Some("parallel-group".into()),
+            merge_after_generations: Some(0),
+            merge_max_bytes: Some(MIB),
+            merge_budget: Some(budget.clone()),
+            ..Default::default()
+        };
+        let mut writer = RolloutStore::open_with_options(&uri, options.clone())
+            .await
+            .unwrap();
+        writer
+            .add(&[
+                super::tests::artifact_record("one", &[1; 1024]),
+                super::tests::artifact_record("two", &[2; 1024]),
+            ])
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        writer.close().await.unwrap();
+        let before = Dataset::open(&uri).await.unwrap().version().version;
+        let gate = Arc::new(WriteGate::default());
+        gate.pause.store(true, Ordering::SeqCst);
+        gate.fail_unpaused_encoding.store(!cancel, Ordering::SeqCst);
+        let scope = MergeWriteScope::with_preparation_authorizer_and_io_shim(
+            Arc::new(NoCommit),
+            Arc::new(Wrapper(gate.clone())),
+        );
+        let child_scope = scope.clone();
+        let child_uri = uri.clone();
+        let child_budget = budget.clone();
+        let mut caller = tokio::spawn(async move {
+            child_scope
+                .run(async move {
+                    let mut store =
+                        RolloutStore::open_existing_with_options(&child_uri, options).await?;
+                    let mut shard = store
+                        .prepare_grouped_merge_reserved(child_budget.reserve(MIB).await)
+                        .await?
+                        .unwrap();
+                    shard.use_parallel_group_encoding();
+                    store.commit_prepared_group(vec![shard], MIB).await
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while gate.encoding_calls.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut caller)
+                .await
+                .is_err(),
+            "a failed sibling must not abandon the blocked encoder"
+        );
+        assert!(budget.reserved() >= 128 * MIB);
+        assert!(budget.try_reserve(budget.limit()).is_none());
+        if cancel {
+            caller.abort();
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), scope.drain())
+                .await
+                .is_err()
+        );
+        assert!(budget.reserved() >= 128 * MIB);
+        gate.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(20), scope.drain())
+            .await
+            .unwrap();
+        let result = caller.await;
+        if cancel {
+            assert!(result.unwrap_err().is_cancelled());
+        } else {
+            assert!(result
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("injected sibling encoder failure"));
+        }
+        assert_eq!(budget.reserved(), 0);
+        assert_eq!(Dataset::open(&uri).await.unwrap().version().version, before);
+        assert_eq!(writer.pending_wal_generations().await.unwrap(), 1);
+        assert!(!scope.has_uncertain_commit());
     }
 }
 #[derive(Debug)]

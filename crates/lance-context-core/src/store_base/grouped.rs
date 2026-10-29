@@ -15,9 +15,16 @@ pub struct PreparedShardMerge {
     manifest_store: ShardManifestStore,
     manifest: ShardManifest,
     prepared: PreparedMerge,
+    parallel_encoding: bool,
 }
 
 impl PreparedShardMerge {
+    /// Opt in to two immutable encoders after group-wide key reduction.
+    /// Publication remains atomic; insufficient workspace retains serial encoding.
+    pub fn use_parallel_group_encoding(&mut self) {
+        self.parallel_encoding = true;
+    }
+
     /// Prepare immutable shard data under durable maintenance ownership, join
     /// its native readers, then retain only the resulting Arrow buffer charge.
     /// The callback must perform all reads inside this scope and must not
@@ -127,6 +134,7 @@ impl StorageBase {
             manifest_store,
             manifest,
             prepared,
+            parallel_encoding: false,
         }))
     }
 
@@ -163,6 +171,7 @@ impl StorageBase {
                     .ok_or_else(|| LanceError::invalid_input("grouped merge byte count overflow"))
             })?;
             let mut ids = HashSet::new();
+            let parallel_encoding = shards.iter().all(|shard| shard.parallel_encoding);
             for shard in &shards {
                 if shard.uri != self.uri() || shard.key_column != self.key_column {
                     return Err(LanceError::invalid_input(
@@ -332,9 +341,29 @@ impl StorageBase {
                     .retain();
                 let snapshot = Arc::new(self.dataset.clone());
                 let encoding = batches.clone();
+                // Never wait for workspace while retaining decoded preparations.
+                // The extra encoder is only admitted for the qualified upload
+                // settings and a separate, conservative buffer allowance.
+                let encoding_workspace = parallel_encoding
+                    .then(|| parallel_encoding_workspace(&encoding))
+                    .flatten()
+                    .and_then(|bytes| budget.try_reserve(bytes));
                 let encoding_started = timer_start!();
                 let staged = crate::merge_write_scope::run_owned_preparation(hold, async move {
-                    encode_merge_files(snapshot, encoding).await
+                    if let Some(workspace) = encoding_workspace {
+                        // Keep both the input hold (outer scope) and the extra
+                        // workspace charged until every native encoder joins,
+                        // including cancellation, panic and partial failure.
+                        let staged = crate::merge_write_scope::run_owned_preparation(
+                            workspace.retain(),
+                            encode_group_files(snapshot, encoding),
+                        )
+                        .await;
+                        drop(workspace);
+                        staged?
+                    } else {
+                        encode_merge_files(snapshot, encoding).await
+                    }
                 })
                 .await??;
                 observe_duration!(crate::metrics::ROLLOUT_WAL_MERGE_DURATION,
@@ -402,6 +431,58 @@ impl StorageBase {
             Ok(reclaimed)
         })
     }
+}
+
+fn parallel_encoding_workspace(batches: &[RecordBatch]) -> Option<usize> {
+    // Larger process-wide upload buffers need independent qualification.
+    let setting = |name: &str, default| match std::env::var(name) {
+        Ok(value) => value.parse::<usize>().ok(),
+        Err(std::env::VarError::NotPresent) => Some(default),
+        Err(_) => None,
+    };
+    if setting("LANCE_INITIAL_UPLOAD_SIZE", 5 << 20)? > 5 << 20
+        || !(1..=10).contains(&setting("LANCE_UPLOAD_CONCURRENCY", 10)?)
+        || batches.iter().map(RecordBatch::num_rows).sum::<usize>() < 2
+    {
+        return None;
+    }
+    batches.iter().try_fold(128usize << 20, |bytes, batch| {
+        bytes.checked_add(batch.get_array_memory_size().checked_mul(2)?)
+    })
+}
+
+/// Keys are already unique across all batches. Splitting rows cannot alter
+/// last-writer order, and neither immutable encoder can publish a base version.
+async fn encode_group_files(
+    snapshot: Arc<Dataset>,
+    batches: Vec<RecordBatch>,
+) -> LanceResult<StagedMergeFiles> {
+    let mut left_rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>() / 2;
+    let mut left = Vec::new();
+    let mut right = Vec::new();
+    for batch in batches {
+        let take = left_rows.min(batch.num_rows());
+        if take > 0 {
+            left.push(batch.slice(0, take));
+        }
+        if take < batch.num_rows() {
+            right.push(batch.slice(take, batch.num_rows() - take));
+        }
+        left_rows -= take;
+    }
+    // join! waits for both results even if one encoder fails. The owning
+    // preparation additionally joins Lance's native CPU tasks before release.
+    let (left, right) = tokio::join!(
+        encode_merge_files(snapshot.clone(), left),
+        encode_merge_files(snapshot, right),
+    );
+    let mut left = left?;
+    let right = right?;
+    if left.uri != right.uri || left.schema != right.schema {
+        return Err(stale("parallel encoders produced different base schemas"));
+    }
+    left.fragments.extend(right.fragments);
+    Ok(left)
 }
 
 #[cfg(test)]

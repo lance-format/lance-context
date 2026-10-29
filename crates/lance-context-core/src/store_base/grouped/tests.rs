@@ -182,10 +182,16 @@ async fn owned_group_preparation_releases_allowance_only_after_native_readers_jo
 
 #[tokio::test]
 async fn ordered_group_updates_repeated_keys_and_publishes_all_watermarks_once() {
-    for reversed in [false, true] {
+    for (reversed, parallel, workspace) in [
+        (false, false, false),
+        (true, false, false),
+        (false, true, true),
+        (true, true, true),
+        (false, true, false),
+    ] {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().join("base.lance").to_str().unwrap().to_owned();
-        let budget = MergeMemoryBudget::new(16 * MIB);
+        let budget = MergeMemoryBudget::new(if workspace { 256 * MIB } else { 16 * MIB });
         let mut seed = open(&uri, "seed", budget.clone()).await;
         let untouched = vec![7; 64 * 1024];
         put(&seed, &[("shared", b"base"), ("untouched", &untouched)]).await;
@@ -207,10 +213,19 @@ async fn ordered_group_updates_repeated_keys_and_publishes_all_watermarks_once()
             })
             .collect();
         let before = Dataset::open(&uri).await.unwrap().version().version;
-        let group = if reversed { vec![b, a] } else { vec![a, b] };
+        let mut group = if reversed { vec![b, a] } else { vec![a, b] };
+        if parallel {
+            for shard in &mut group {
+                shard.use_parallel_group_encoding();
+            }
+        }
         assert_eq!(commit(&mut first, group, MIB).await.unwrap(), 3);
         let after = Dataset::open(&uri).await.unwrap();
         assert_eq!(after.version().version, before + 1);
+        assert_eq!(
+            after.manifest().fragments.len(),
+            if parallel && workspace { 3 } else { 2 }
+        );
         let coverage = crate::rollout_append::watermarks(&after).await.unwrap();
         for (shard, high) in marks {
             assert_eq!(coverage.get(&shard), Some(&high));
