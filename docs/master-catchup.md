@@ -74,6 +74,19 @@ Job rotates the starting shard using a durable attempt number, including after
 failures, so a slow first shard cannot always hide the rest. Further fresh
 pressure can request another slice.
 
+For targets explicitly enabled in `CATCHUP_GROUPED_TARGETS`,
+`CATCHUP_GROUPED_PREPARE_MAX_BYTES` can limit each shard's preparation separately
+from the aggregate `CATCHUP_MERGE_MAX_BYTES` publication cap. Its default of `0`
+uses the aggregate cap for each preparation, preserving existing behavior. A
+nonzero value must not exceed the aggregate cap. Smaller preparations can admit
+more shards within the same `CATCHUP_MERGE_MEMORY_BYTES` budget; they may also
+require more passes for a large shard. Indivisible generations still use the
+existing nonblocking reservation growth and ordered retry path. The limit is
+not a total RSS guarantee. Qualify oversized generations before activation.
+Jobs receive this setting explicitly, including `0` to clear template values.
+Controllers using a nonzero value must agree on it in the durable catch-up policy;
+use the policy-change procedure above before changing an active controller fleet.
+
 ## Agent/API contract
 
 These are internal admin endpoints with the same network/authentication boundary

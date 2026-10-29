@@ -51,7 +51,7 @@ async fn prepare(
                             shard_id: Some(shard),
                             merge_after_generations: Some(0),
                             merge_max_generations: Some(config.merge_max_generations),
-                            merge_max_bytes: Some(config.merge_max_bytes),
+                            merge_max_bytes: Some(config.grouped_prepare_byte_cap()),
                             key_index_type: state.config.key_index_type,
                             merge_budget: Some(budget),
                             session: Some(session),
@@ -76,7 +76,7 @@ async fn prepare(
                             shard_id: Some(shard),
                             merge_after_generations: Some(0),
                             merge_max_generations: Some(config.merge_max_generations),
-                            merge_max_bytes: Some(config.merge_max_bytes),
+                            merge_max_bytes: Some(config.grouped_prepare_byte_cap()),
                             key_index_type: state.config.key_index_type,
                             merge_budget: Some(budget),
                             session: Some(session),
@@ -158,7 +158,9 @@ pub(super) async fn run(
     deadline: Instant,
 ) -> Result<Vec<(usize, usize)>> {
     let config = &state.config.catchup;
-    let allowance = config.merge_max_bytes.min(budget.limit());
+    // Admission and the store's read cap must agree: the core requires the full
+    // allowance before opening readers. Publication keeps the aggregate cap.
+    let allowance = config.grouped_prepare_byte_cap().min(budget.limit());
     let mut remaining: VecDeque<_> = selected.iter().copied().collect();
     let mut outcomes = Vec::new();
     while let Some(first) = remaining.pop_front() {
@@ -317,6 +319,14 @@ mod tests {
         assert!(config.validate().is_err());
         config.merge_memory_bytes = 1024;
         assert!(config.validate().is_ok());
+        assert_eq!(config.grouped_prepare_byte_cap(), 1024);
+        config.grouped_prepare_max_bytes = 256;
+        assert!(config.validate().is_ok());
+        assert_eq!(config.grouped_prepare_byte_cap(), 256);
+        config.grouped_prepare_max_bytes = 1025;
+        assert!(config.validate().is_err());
+        config.grouped_prepare_max_bytes = 0;
+        assert_eq!(config.grouped_prepare_byte_cap(), 1024);
         config.grouped_targets = vec![String::new()];
         assert!(
             config.validate().is_ok(),
@@ -336,16 +346,23 @@ mod tests {
             "needs_attention":false, "next_retry_ms":0, "outcome":null
         }))
         .unwrap();
-        for targets in [vec![], vec!["hot".to_owned(), "generic:other".to_owned()]] {
+        for (targets, prepare_cap) in [
+            (vec![], 0),
+            (vec!["hot".to_owned(), "generic:other".to_owned()], 0),
+            (vec![], 1 << 20),
+            (vec!["hot".to_owned(), "generic:other".to_owned()], 1 << 20),
+        ] {
             let mut config = MasterConfig::parse_from(["master"]);
             config.catchup.grouped_targets = targets.clone();
             config.catchup.grouped_shards = 3;
+            config.catchup.grouped_prepare_max_bytes = prepare_cap;
             let job = super::super::kubernetes::render_job(
                 &config,
                 &record,
                 json!({"containers":[{"name":"executor", "env":[
                     {"name":"CATCHUP_GROUPED_TARGETS", "value":"inherited"},
-                    {"name":"CATCHUP_GROUPED_SHARDS", "value":"32"}
+                    {"name":"CATCHUP_GROUPED_SHARDS", "value":"32"},
+                    {"name":"CATCHUP_GROUPED_PREPARE_MAX_BYTES", "value":"999999999"}
                 ]}]}),
             );
             let env = job["spec"]["template"]["spec"]["containers"][0]["env"]
@@ -354,18 +371,24 @@ mod tests {
             let entries = |name: &str| env.iter().filter(|v| v["name"] == name).collect::<Vec<_>>();
             let rendered_targets = entries("CATCHUP_GROUPED_TARGETS");
             let rendered_shards = entries("CATCHUP_GROUPED_SHARDS");
+            let rendered_prepare = entries("CATCHUP_GROUPED_PREPARE_MAX_BYTES");
             assert_eq!(rendered_targets.len(), 1);
             assert_eq!(rendered_shards.len(), 1);
+            assert_eq!(rendered_prepare.len(), 1);
             let target_value = rendered_targets[0]["value"].as_str().unwrap();
             let shard_value = rendered_shards[0]["value"].as_str().unwrap();
+            let prepare_value = rendered_prepare[0]["value"].as_str().unwrap();
             assert_eq!(target_value, targets.join(","));
             assert_eq!(shard_value, "3");
+            assert_eq!(prepare_value, prepare_cap.to_string());
             let parsed = MasterConfig::try_parse_from([
                 "master",
                 "--grouped-targets",
                 target_value,
                 "--grouped-shards",
                 shard_value,
+                "--grouped-prepare-max-bytes",
+                prepare_value,
                 "--target",
                 "hot",
                 "--job-name",
@@ -376,6 +399,7 @@ mod tests {
             .unwrap();
             parsed.catchup.validate().unwrap();
             assert_eq!(parsed.catchup.grouped_shards, 3);
+            assert_eq!(parsed.catchup.grouped_prepare_max_bytes, prepare_cap);
             assert_eq!(
                 parsed.catchup.grouped_targets.iter().any(|v| v == "hot"),
                 !targets.is_empty()
@@ -404,14 +428,19 @@ mod integration_tests {
         assert!(endpoints
             .split(',')
             .all(|e| e.starts_with("http://127.0.0.1:")));
-        for (budget_bytes, payload_bytes, expected_commits, cap, width, all_shards) in [
-            (32 << 20, 64, 2, 1 << 20, 4, false),
-            (1 << 20, 64, 3, 1 << 20, 4, false),
-            (4 << 20, 1536 << 10, 3, 1 << 20, 4, false),
+        for (budget_bytes, payload_bytes, expected_commits, cap, width, all_shards, prepare_cap) in [
+            (32 << 20, 64, 2, 1 << 20, 4, false, 0),
+            (1 << 20, 64, 3, 1 << 20, 4, false, 0),
+            (4 << 20, 1536 << 10, 3, 1 << 20, 4, false, 0),
             // Sixteen initial 8-MiB reservations exactly fill 128 MiB.
             // Joined reads must free scratch and admit the last four shards,
             // allowing all twenty to publish once without reducing headroom.
-            (128 << 20, 64, 1, 8 << 20, 20, true),
+            (128 << 20, 64, 1, 8 << 20, 20, true, 0),
+            // Smaller reads still combine all twenty shards under the larger
+            // publication cap. Indivisible generations can grow or retry in
+            // order under the same total budget, without dropping any rows.
+            (32 << 20, 64, 1, 8 << 20, 20, true, 1 << 20),
+            (4 << 20, 1536 << 10, 3, 1 << 20, 4, false, 128 << 10),
         ] {
             let (_dir, state) = fixture().await.unwrap();
             let target = "generic:hot";
@@ -466,6 +495,7 @@ mod integration_tests {
             cfg.catchup.grouped_targets = vec![target.into()];
             cfg.catchup.grouped_shards = width;
             cfg.catchup.merge_max_bytes = cap;
+            cfg.catchup.grouped_prepare_max_bytes = prepare_cap;
             cfg.catchup.merge_memory_bytes = budget_bytes;
             cfg.merge_rollout.owned_targets.push(target.into());
             cfg.catchup.target = Some(target.into());
@@ -557,7 +587,9 @@ mod integration_tests {
         assert!(endpoints
             .split(',')
             .all(|e| e.starts_with("http://127.0.0.1:")));
-        for payload_bytes in [64, 7 << 19] {
+        for (payload_bytes, prepare_cap) in
+            [(64, 0), (7 << 19, 0), (64, 128 << 10), (7 << 19, 128 << 10)]
+        {
             let (_dir, initial) = fixture().await.unwrap();
             let target = "generic:hot";
             let uri = initial.generic_uri("hot");
@@ -604,6 +636,7 @@ mod integration_tests {
             cfg.catchup.grouped_targets = vec![target.into()];
             cfg.catchup.grouped_shards = 3;
             cfg.catchup.merge_max_bytes = 1 << 20;
+            cfg.catchup.grouped_prepare_max_bytes = prepare_cap;
             cfg.catchup.merge_memory_bytes = 4 << 20;
             let state = crate::state::MasterState::new(cfg).await.unwrap();
             let budget = MergeMemoryBudget::new(4 << 20);

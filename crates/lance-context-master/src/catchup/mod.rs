@@ -102,6 +102,10 @@ pub struct CatchupConfig {
     /// Maximum concurrent preparations and shards per group; bytes remain capped.
     #[arg(long, env = "CATCHUP_GROUPED_SHARDS", default_value_t = 4)]
     pub grouped_shards: usize,
+    /// Optional per-shard read cap for grouping, bounded by the aggregate byte cap.
+    /// Zero retains the aggregate cap for each preparation. Total budget is unchanged.
+    #[arg(long, env = "CATCHUP_GROUPED_PREPARE_MAX_BYTES", default_value_t = 0)]
+    pub grouped_prepare_max_bytes: usize,
     /// Native one-table executor mode; does not start the admin server or scanner.
     #[arg(long, env = "CATCHUP_TARGET", hide = true)]
     pub target: Option<String>,
@@ -139,6 +143,7 @@ impl Default for CatchupConfig {
             staging_concurrency: 2,
             grouped_targets: Vec::new(),
             grouped_shards: 4,
+            grouped_prepare_max_bytes: 0,
             target: None,
             job_name: None,
             outcome_path: None,
@@ -148,6 +153,14 @@ impl Default for CatchupConfig {
     }
 }
 impl CatchupConfig {
+    pub(super) fn grouped_prepare_byte_cap(&self) -> usize {
+        if self.grouped_prepare_max_bytes == 0 {
+            self.merge_max_bytes
+        } else {
+            self.grouped_prepare_max_bytes
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         let grouped_disabled =
             self.grouped_targets.is_empty() || self.grouped_targets == [String::new()];
@@ -155,6 +168,7 @@ impl CatchupConfig {
             || (!grouped_disabled
                 && (self.merge_max_bytes == 0
                     || self.merge_memory_bytes < self.merge_max_bytes
+                    || self.grouped_prepare_max_bytes > self.merge_max_bytes
                     || self.grouped_targets.iter().any(|target| {
                         target.is_empty()
                             || target.contains('*')

@@ -376,14 +376,35 @@ async fn running_native_task_prevents_provisioning_empty_waiters() {
 #[tokio::test]
 #[ignore = "requires ETCD_TEST_ENDPOINTS"]
 async fn policy_disagreement_cannot_expand_the_cluster_budget() {
-    let Some((_dir, state)) = fixture().await else {
-        return;
-    };
-    let inventory = Inventory::new(&state);
-    inventory.ensure_policy(&state.config).await.unwrap();
-    let mut other = state.config.clone();
-    other.catchup.max_jobs += 1;
-    assert!(inventory.ensure_policy(&other).await.is_err());
+    for prepare_cap in [0, 1 << 20] {
+        let Some((_dir, state)) = fixture().await else {
+            return;
+        };
+        let inventory = Inventory::new(&state);
+        let mut config = state.config.clone();
+        config.catchup.grouped_prepare_max_bytes = prepare_cap;
+        inventory.ensure_policy(&config).await.unwrap();
+        let stored = state
+            .task_store
+            .etcd_client()
+            .clone()
+            .get(format!("{}/catchup-policy", config.etcd.etcd_prefix), None)
+            .await
+            .unwrap();
+        let policy: serde_json::Value = serde_json::from_slice(stored.kvs()[0].value()).unwrap();
+        if prepare_cap == 0 {
+            assert!(policy.get("grouped_prepare_max_bytes").is_none());
+        } else {
+            assert_eq!(policy["grouped_prepare_max_bytes"], prepare_cap);
+        }
+        let mut other = config.clone();
+        other.catchup.max_jobs += 1;
+        assert!(inventory.ensure_policy(&other).await.is_err());
+        other = config.clone();
+        other.catchup.grouped_prepare_max_bytes = if prepare_cap == 0 { 1 << 20 } else { 0 };
+        assert!(inventory.ensure_policy(&other).await.is_err());
+        inventory.ensure_policy(&config).await.unwrap();
+    }
 }
 
 #[tokio::test]
