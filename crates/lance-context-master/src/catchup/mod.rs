@@ -138,8 +138,8 @@ impl Default for CatchupConfig {
 }
 impl CatchupConfig {
     pub fn validate(&self) -> Result<()> {
-        let grouped_disabled = self.grouped_targets.is_empty()
-            || self.grouped_targets == [String::new()];
+        let grouped_disabled =
+            self.grouped_targets.is_empty() || self.grouped_targets == [String::new()];
         if !(1..=32).contains(&self.grouped_shards)
             || (!grouped_disabled
                 && (self.merge_max_bytes == 0

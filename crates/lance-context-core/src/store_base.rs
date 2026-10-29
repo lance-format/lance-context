@@ -1761,9 +1761,11 @@ impl StorageBase {
                 ));
             }
             *new_fragments = fragments.clone();
-            compacted_sstables.extend(watermarks.iter().map(|(shard, high)| {
-                lance_index::mem_wal::CompactedSsTable::new(*shard, *high)
-            }));
+            compacted_sstables.extend(
+                watermarks.iter().map(|(shard, high)| {
+                    lance_index::mem_wal::CompactedSsTable::new(*shard, *high)
+                }),
+            );
             let version = self.dataset.version().version;
             if deleted.transaction.read_version != version {
                 return Err(LanceError::io(
