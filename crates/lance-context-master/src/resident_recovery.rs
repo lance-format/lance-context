@@ -2,7 +2,7 @@
 //! A durable fleet cursor bounds metadata reads even when masters are scaled up.
 use crate::{config::MasterConfig, state::MasterState, stats_store::StatRow};
 use etcd_client::{Compare, CompareOp, Txn, TxnOp};
-use futures::{stream, StreamExt};
+use futures::{stream, StreamExt, TryStreamExt};
 use lance_context_api::TaskKind;
 use lance_context_core::rollout_append::has_sealed_wal;
 use serde::{Deserialize, Serialize};
@@ -132,7 +132,12 @@ impl Policy {
                     && self.append.iter().any(|t| t == "*" || t == target)))
     }
 
-    fn candidates(&self, snapshot: &[StatRow], after: Option<&str>) -> Vec<String> {
+    fn candidates(
+        &self,
+        snapshot: &[StatRow],
+        known: &[String],
+        after: Option<&str>,
+    ) -> Vec<String> {
         let mut names: Vec<_> = self
             .owned
             .iter()
@@ -140,6 +145,7 @@ impl Policy {
             .chain(&self.local)
             .map(String::as_str)
             .chain(snapshot.iter().map(|r| r.name.as_str()))
+            .chain(known.iter().map(String::as_str))
             .filter(|name| *name != "*" && self.selected(name) && after.is_none_or(|a| *name > a))
             .map(str::to_owned)
             .collect();
@@ -150,6 +156,68 @@ impl Policy {
     }
 }
 
+/// A leader need not be the stats scanner. Restore names from the persisted
+/// stats dataset using a bounded name-only projection, never cached WAL counts.
+/// Keep one root at a time; ordinary repeated ticks use this local view.
+#[derive(Default)]
+struct Catalog {
+    root: String,
+    checked: Option<tokio::time::Instant>,
+    names: Vec<String>,
+}
+
+impl Catalog {
+    async fn refresh(&mut self, policy: &Policy) -> Result<(), String> {
+        if self.root != policy.root {
+            self.root = policy.root.clone();
+            self.checked = None;
+            self.names.clear();
+        }
+        if !policy.automatic
+            || self
+                .checked
+                .is_some_and(|at| at.elapsed() < Duration::from_secs(300))
+        {
+            return Ok(());
+        }
+        self.checked = Some(tokio::time::Instant::now());
+        let result = tokio::time::timeout(PROBE_TIMEOUT, catalog_names(&policy.root))
+            .await
+            .map_err(|_| "resident catalog read timed out".to_string())?;
+        self.names = result?;
+        Ok(())
+    }
+}
+
+async fn catalog_names(root: &str) -> Result<Vec<String>, String> {
+    let uri = format!("{}/_stats.rollout.lance", root.trim_end_matches('/'));
+    let dataset = lance::Dataset::open(&uri)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut scan = dataset.scan();
+    scan.project(&["name"]).map_err(|e| e.to_string())?;
+    scan.batch_size(256);
+    let mut batches = scan.try_into_stream().await.map_err(|e| e.to_string())?;
+    let mut names = std::collections::BTreeSet::new();
+    let mut bytes = 0usize;
+    while let Some(batch) = batches.try_next().await.map_err(|e| e.to_string())? {
+        let column = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .ok_or("invalid resident catalog name column")?;
+        for name in column.iter().flatten() {
+            if names.insert(name.to_string()) {
+                bytes = bytes.saturating_add(name.len());
+            }
+            if names.len() > 100_000 || bytes > 8 * 1024 * 1024 {
+                return Err("resident catalog name budget exceeded".into());
+            }
+        }
+    }
+    Ok(names.into_iter().collect())
+}
+
 /// Runs inside the demand leader's lifetime, concurrently with dispatch. Slow
 /// object storage must not block task placement or consumption of watch events.
 pub(crate) async fn run(
@@ -158,16 +226,21 @@ pub(crate) async fn run(
     mut policies: tokio::sync::watch::Receiver<Vec<Policy>>,
 ) {
     let mut next = 0usize;
+    let mut catalog = Catalog::default();
     loop {
         let current = policies.borrow_and_update().clone();
         if !current.is_empty() {
             next %= current.len();
             let policy = &current[next];
+            if let Err(error) = catalog.refresh(policy).await {
+                tracing::warn!(%error, "resident catalog refresh failed; retaining known names");
+            }
             match tokio::time::timeout(
                 Duration::from_secs(25),
                 tick_policy(
                     state,
                     policy,
+                    &catalog.names,
                     Some(owner),
                     chrono::Utc::now().timestamp_millis(),
                 ),
@@ -194,7 +267,7 @@ async fn tick(state: &Arc<MasterState>, now: i64) -> Result<usize, String> {
     let Some(policy) = Policy::from_config(&state.config) else {
         return Ok(0);
     };
-    tick_policy(state, &policy, None, now)
+    tick_policy(state, &policy, &[], None, now)
         .await
         .map(|result| result.unwrap_or(0))
 }
@@ -202,6 +275,7 @@ async fn tick(state: &Arc<MasterState>, now: i64) -> Result<usize, String> {
 async fn tick_policy(
     state: &Arc<MasterState>,
     policy: &Policy,
+    known: &[String],
     owner: Option<&crate::task_store::CoordinationGuard>,
     now: i64,
 ) -> Result<Option<usize>, String> {
@@ -238,10 +312,15 @@ async fn tick_policy(
         .map_err(|e| e.to_string())?
         .unwrap_or_default();
     let snapshot = state.stats_cache.read().await.clone();
-    if policy.candidates(&snapshot, None).is_empty() {
+    let rows = if policy.root.trim_end_matches('/') == state.base_uri.trim_end_matches('/') {
+        snapshot.as_slice()
+    } else {
+        &[]
+    };
+    if policy.candidates(rows, known, None).is_empty() {
         return Ok(Some(0));
     }
-    let mut names = policy.candidates(&snapshot, cursor.after.as_deref());
+    let mut names = policy.candidates(rows, known, cursor.after.as_deref());
     if names.is_empty() && cursor.after.is_none() {
         return Ok(Some(0));
     }
@@ -1322,6 +1401,56 @@ mod tests {
         config.merge_wal_interval_secs = 0;
         assert!(!enabled(&config));
     }
+    #[tokio::test]
+    async fn wildcard_catalog_recovers_names_without_a_local_stats_scanner() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let mut stats = crate::stats_store::StatsStore::open_or_create(
+            &format!("{root}/_stats.rollout.lance"),
+            None,
+        )
+        .await
+        .unwrap();
+        let row = |name: &str| StatRow {
+            name: name.into(),
+            uri: "unused".into(),
+            row_count: 0,
+            fragment_count: 0,
+            last_updated: 0,
+            pending_wal_generations: 0,
+            last_compaction: -1,
+            total_compactions: 0,
+            scanned_at: 0,
+            version: -1,
+        };
+        stats
+            .write_snapshot(&[row("cold"), row("generic:cold")])
+            .await
+            .unwrap();
+        let mut cfg = MasterConfig::parse_from(["test"]);
+        cfg.data_dir = root.into();
+        cfg.merge_wal_interval_secs = 30;
+        cfg.local_merge.master_local_merge_auto = true;
+        cfg.local_merge.master_local_merge_targets = vec!["*".into()];
+        cfg.merge_rollout.fence_legacy = true;
+        let policy = Policy::from_config(&cfg).unwrap();
+        let mut catalog = Catalog::default();
+        catalog.refresh(&policy).await.unwrap();
+        assert_eq!(
+            policy.candidates(&[], &catalog.names, None),
+            ["cold", "generic:cold"]
+        );
+        stats.write_snapshot(&[row("new")]).await.unwrap();
+        catalog.refresh(&policy).await.unwrap();
+        assert!(
+            !catalog.names.iter().any(|name| name == "new"),
+            "ordinary ticks use cached names"
+        );
+        catalog.checked = None;
+        catalog.refresh(&policy).await.unwrap();
+        assert!(catalog.names.iter().any(|name| name == "new"));
+    }
+
     #[test]
     fn advertised_policy_preserves_selection_and_deduplicates_reordered_members() {
         for automatic in [false, true] {
@@ -1353,7 +1482,10 @@ mod tests {
                         "{name}"
                     );
                 }
-                assert_eq!(policy.candidates(&[], None), candidates(&config, &[], None));
+                assert_eq!(
+                    policy.candidates(&[], &[], None),
+                    candidates(&config, &[], None)
+                );
                 config.merge_rollout.owned_targets.reverse();
                 assert_eq!(Some(policy), Policy::from_config(&config));
             }
@@ -1377,7 +1509,7 @@ mod tests {
         assert!(store.elect_discovery_leader(&owner).await.unwrap());
         let now = chrono::Utc::now().timestamp_millis();
         assert_eq!(
-            tick_policy(&leader, &policy, Some(&owner), now)
+            tick_policy(&leader, &policy, &[], Some(&owner), now)
                 .await
                 .unwrap(),
             Some(1)
@@ -1413,7 +1545,7 @@ mod tests {
         let successor = store.discovery_session(b"{}".to_vec()).await.unwrap();
         assert!(store.elect_discovery_leader(&successor).await.unwrap());
         assert_eq!(
-            tick_policy(&leader, &policy, Some(&owner), now + 31_000)
+            tick_policy(&leader, &policy, &[], Some(&owner), now + 31_000)
                 .await
                 .unwrap(),
             Some(0)
@@ -1444,7 +1576,7 @@ mod tests {
             .unwrap()
             .is_some());
         assert_eq!(
-            tick_policy(&leader, &policy, Some(&successor), now + 31_000)
+            tick_policy(&leader, &policy, &[], Some(&successor), now + 31_000)
                 .await
                 .unwrap(),
             Some(1)

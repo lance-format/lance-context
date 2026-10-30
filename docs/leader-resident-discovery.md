@@ -20,8 +20,10 @@ covers this discovery path only, not total etcd traffic or timeout reduction.
   snapshot/Watch; there is no additional membership scanner or watcher.
 * Equivalent policies are deduplicated. Explicit targets are discoverable even
   when the leader itself cannot execute resident merges. Wildcard discovery
-  continues to use known table names; observed stats counts are never treated
-  as evidence of actual pending WAL.
+  restores known table names from the persisted stats dataset even when the
+  leader's scanner is disabled. A name-only projection is bounded to 100,000
+  names / 8 MiB of name bytes, cached for five minutes and kept for one root
+  at a time. Observed stats counts are never evidence of actual pending WAL.
 * The existing persisted per-scope cursor and shared fleet gate remain compatible
   with older replicas. The cursor-reservation transaction now also compares the
   leader token. Losing leadership cannot advance the cursor.

@@ -319,17 +319,19 @@ impl Cache {
             .and_then(|key| self.entries.get(key))
     }
 
-    fn resident_policies(
-        &self,
-        prefix: &str,
-    ) -> Result<Vec<crate::resident_recovery::Policy>, String> {
-        Ok(self
-            .policies(prefix)?
-            .into_iter()
-            .filter_map(|p| p.resident.clone())
+    fn resident_policies(&self, prefix: &str) -> Vec<crate::resident_recovery::Policy> {
+        let prefix = prefix_key(prefix, "demand-controller/members");
+        // A malformed member must not stop task placement or suppress valid
+        // members. It contributes no discovery authority until corrected.
+        self.entries
+            .range(prefix.as_bytes().to_vec()..)
+            .take_while(|(key, _)| key.starts_with(prefix.as_bytes()))
+            .filter_map(|(_, entry)| entry.policy.as_ref()?.as_ref().ok())
+            .filter(|policy| policy.v == 1)
+            .filter_map(|policy| policy.resident.clone())
             .collect::<BTreeSet<_>>()
             .into_iter()
-            .collect())
+            .collect()
     }
 
     fn policies(&self, prefix: &str) -> Result<Vec<&Policy>, String> {
@@ -683,7 +685,7 @@ async fn lead(state: &Arc<MasterState>, session: &CoordinationGuard) -> Result<(
     let client = store.etcd_client();
     let mut cache = list(client, prefix).await?;
     let (resident_policies, resident_rx) =
-        tokio::sync::watch::channel(cache.resident_policies(prefix)?);
+        tokio::sync::watch::channel(cache.resident_policies(prefix));
     let resident = crate::resident_recovery::run(state, session, resident_rx);
     tokio::pin!(resident);
     let mut place_more = true;
@@ -710,7 +712,7 @@ async fn lead(state: &Arc<MasterState>, session: &CoordinationGuard) -> Result<(
                                 event.kv().is_some_and(|kv| kv.key().starts_with(prefix_key(prefix, "demand-controller/members").as_bytes())));
                             if let Err(error) = apply_response(&mut cache, &response) { break error; }
                             if membership_changed {
-                                let policies = cache.resident_policies(prefix)?;
+                                let policies = cache.resident_policies(prefix);
                                 resident_policies.send_if_modified(|old| {
                                     if *old == policies { false } else { *old = policies; true }
                                 });
@@ -770,7 +772,7 @@ async fn lead(state: &Arc<MasterState>, session: &CoordinationGuard) -> Result<(
         tokio::time::sleep(RECONNECT).await;
         if failure == "compacted" || failure.contains("message length") {
             cache = list(client, prefix).await?;
-            resident_policies.send_replace(cache.resident_policies(prefix)?);
+            resident_policies.send_replace(cache.resident_policies(prefix));
             place_more = true;
         }
         // An oversized historical response also needs a bounded fresh List;
@@ -935,7 +937,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        assert_eq!(cache.resident_policies(prefix).unwrap().len(), 1);
+        assert_eq!(cache.resident_policies(prefix).len(), 1);
         let key = format!("{prefix}/demand-controller/members/other");
         cfg.merge_rollout.owned_targets = vec!["b".into()];
         cache
@@ -945,9 +947,9 @@ mod tests {
                 2,
             )
             .unwrap();
-        assert_eq!(cache.resident_policies(prefix).unwrap().len(), 2);
+        assert_eq!(cache.resident_policies(prefix).len(), 2);
         cache.apply(key.as_bytes(), None, 3).unwrap();
-        assert_eq!(cache.resident_policies(prefix).unwrap().len(), 1);
+        assert_eq!(cache.resident_policies(prefix).len(), 1);
         let mut legacy = serde_json::to_value(first).unwrap();
         legacy.as_object_mut().unwrap().remove("resident");
         cache
@@ -957,7 +959,15 @@ mod tests {
                 4,
             )
             .unwrap();
-        assert_eq!(cache.resident_policies(prefix).unwrap().len(), 1);
+        assert_eq!(cache.resident_policies(prefix).len(), 1);
+        cache
+            .apply(
+                format!("{prefix}/demand-controller/members/broken").as_bytes(),
+                Some(b"not-json"),
+                5,
+            )
+            .unwrap();
+        assert_eq!(cache.resident_policies(prefix).len(), 1);
     }
 
     #[test]
