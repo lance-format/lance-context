@@ -414,8 +414,8 @@ pub(super) struct Placement {
     more_dependencies: bool,
 }
 
-/// Derived only from the leader's existing ticket snapshot/watch. An exact
-/// resident scope must not disappear behind an unrelated raw-ticket page.
+/// Derived only from the leader's existing ticket snapshot/watch. Resident
+/// capacity must not disappear behind an unrelated raw-ticket page.
 #[derive(Default)]
 struct TargetTickets {
     keys: BTreeSet<Arc<[u8]>>,
@@ -498,12 +498,11 @@ impl Placement {
             let Some(resident) = ticket.resident_targets else {
                 return Vec::new();
             };
-            let scope = if ticket.wal_claim_targets.is_empty() {
+            if ticket.wal_claim_targets.is_empty() {
                 resident
             } else {
                 ticket.wal_claim_targets
-            };
-            scope.into_iter().filter(|target| target != "*").collect()
+            }
         };
         for target in targets(before) {
             if let Some(index) = self.target_tickets.get_mut(&target) {
@@ -695,17 +694,24 @@ pub(super) async fn place(
         {
             continue;
         }
-        // Prefer an exact resident scope across the whole cached inventory.
-        // Each target probe is bounded and rotates; malformed, draining, busy
-        // or otherwise ineligible capacity falls back in this same call. This
-        // never reads etcd or reserves work for an unavailable executor.
+        // Prefer exact resident scope, then unrestricted resident capacity,
+        // across the cached inventory. Each scope probe is bounded and rotates;
+        // malformed, draining, busy or otherwise ineligible capacity falls back
+        // in this same call. This never reads etcd or reserves work for an
+        // unavailable executor.
         let preferred_keys = if task.kind == TaskKind::MergeWal {
-            cache
+            let mut keys = cache
                 .placement
                 .target_tickets
                 .get_mut(&task.target)
                 .map(TargetTickets::page)
-                .unwrap_or_default()
+                .unwrap_or_default();
+            if task.target != "*" {
+                if let Some(wildcard) = cache.placement.target_tickets.get_mut("*") {
+                    keys.extend(wildcard.page());
+                }
+            }
+            keys
         } else {
             Vec::new()
         };
@@ -819,37 +825,45 @@ mod tests {
     use etcd_client::GetOptions;
 
     #[test]
-    fn exact_target_index_tracks_watch_updates_without_stale_members_or_unbounded_probe() {
+    fn resident_index_tracks_watch_updates_without_stale_members_or_unbounded_probe() {
         use clap::Parser;
-        let mut cfg = MasterConfig::try_parse_from(["master"]).unwrap();
-        cfg.local_merge.master_local_merge_targets = vec!["*".into()];
-        cfg.maintenance.wal_claim_targets = vec!["hot".into()];
-        let mut ticket = Ticket::new(
-            &cfg,
-            "executor",
-            "resident_merge",
-            TaskKinds::MERGE_WAL,
-            true,
-        );
-        let key = b"/test/demand-controller/tickets/one";
-        let mut cache = Cache::new();
-        let original = serde_json::to_vec(&ticket).unwrap();
-        cache.apply(key, Some(&original), 1).unwrap();
-        assert!(cache.placement.target_tickets["hot"]
-            .keys
-            .contains(key.as_slice()));
-        ticket.wal_claim_targets = vec!["other".into()];
-        cache
-            .apply(key, Some(&serde_json::to_vec(&ticket).unwrap()), 3)
-            .unwrap();
-        cache.apply(key, Some(&original), 2).unwrap();
-        assert!(!cache.placement.target_tickets.contains_key("hot"));
-        assert!(cache.placement.target_tickets.contains_key("other"));
-        cache.apply(key, Some(b"malformed"), 4).unwrap();
-        assert!(cache.placement.target_tickets.is_empty());
-        cache.apply(key, Some(&original), 5).unwrap();
-        cache.apply(key, None, 6).unwrap();
-        assert!(cache.placement.target_tickets.is_empty());
+        for scope in ["hot", "*"] {
+            let mut cfg = MasterConfig::try_parse_from(["master"]).unwrap();
+            cfg.local_merge.master_local_merge_auto = true;
+            cfg.local_merge.master_local_merge_targets = vec!["*".into()];
+            cfg.merge_rollout.fence_legacy = true;
+            cfg.maintenance.fence_legacy_maintenance = true;
+            cfg.maintenance.wal_claim_targets.clear();
+            if scope != "*" {
+                cfg.maintenance.wal_claim_targets = vec![scope.into()];
+            }
+            let mut ticket = Ticket::new(
+                &cfg,
+                "executor",
+                "resident_merge",
+                TaskKinds::MERGE_WAL,
+                true,
+            );
+            let key = b"/test/demand-controller/tickets/one";
+            let mut cache = Cache::new();
+            let original = serde_json::to_vec(&ticket).unwrap();
+            cache.apply(key, Some(&original), 1).unwrap();
+            assert!(cache.placement.target_tickets[scope]
+                .keys
+                .contains(key.as_slice()));
+            ticket.wal_claim_targets = vec!["other".into()];
+            cache
+                .apply(key, Some(&serde_json::to_vec(&ticket).unwrap()), 3)
+                .unwrap();
+            cache.apply(key, Some(&original), 2).unwrap();
+            assert!(!cache.placement.target_tickets.contains_key(scope));
+            assert!(cache.placement.target_tickets.contains_key("other"));
+            cache.apply(key, Some(b"malformed"), 4).unwrap();
+            assert!(cache.placement.target_tickets.is_empty());
+            cache.apply(key, Some(&original), 5).unwrap();
+            cache.apply(key, None, 6).unwrap();
+            assert!(cache.placement.target_tickets.is_empty());
+        }
 
         let mut many = TargetTickets::default();
         for i in 0..130 {
@@ -909,14 +923,25 @@ mod tests {
         // The older ordinary ticket wins before resident preference is applied.
         // Local scope, draining and kind exclusions must still fall back without
         // reserving the task for an executor that cannot run it.
-        for (exclusion, paged) in [
-            ("none", false),
-            ("target", false),
-            ("draining", false),
-            ("kind", false),
-            ("none", true),
-            ("draining", true),
+        for (exclusion, paged, exact_scope) in [
+            ("none", false, false),
+            ("target", false, false),
+            ("draining", false, false),
+            ("kind", false, false),
+            ("none", true, true),
+            ("draining", true, true),
+            // Unrestricted wildcard residents must retain preference even
+            // outside the raw ticket page, with the same immediate fallback.
+            ("none", true, false),
+            ("target", true, false),
+            ("draining", true, false),
+            ("kind", true, false),
+            ("occupied", true, false),
+            ("unleased", true, false),
         ] {
+            eprintln!(
+                "resident scenario: exclusion={exclusion}, paged={paged}, exact={exact_scope}"
+            );
             let (_dir, cfg, store, leader) = setup().await;
             let wanted = store
                 .enqueue(TaskKind::MergeWal, "wanted", vec![])
@@ -959,7 +984,7 @@ mod tests {
             local_cfg.local_merge.master_local_merge_auto = true;
             local_cfg.local_merge.master_local_merge_targets = vec!["*".into()];
             local_cfg.maintenance.fence_legacy_maintenance = true;
-            if paged {
+            if exact_scope {
                 local_cfg.maintenance.wal_claim_targets = vec!["wanted".into()];
             }
             if exclusion == "target" {
@@ -973,6 +998,26 @@ mod tests {
             } else {
                 TaskKinds::MERGE_WAL
             };
+            if exact_scope && exclusion == "none" {
+                // Exact capacity must win even over an older wildcard resident.
+                let mut wildcard_cfg = local_cfg.clone();
+                wildcard_cfg.maintenance.wal_claim_targets.clear();
+                fillers.push(
+                    store
+                        .create_dispatch_ticket(
+                            serde_json::to_vec(&Ticket::new(
+                                &wildcard_cfg,
+                                "wildcard",
+                                "resident_merge",
+                                TaskKinds::MERGE_WAL,
+                                true,
+                            ))
+                            .unwrap(),
+                        )
+                        .await
+                        .unwrap(),
+                );
+            }
             let local = store
                 .create_dispatch_ticket(
                     serde_json::to_vec(&Ticket::new(
@@ -987,6 +1032,35 @@ mod tests {
                 .await
                 .unwrap();
             assert!(ordinary.key() < local.key());
+            let mut occupied_offer = None;
+            if exclusion == "occupied" {
+                let mut client = store.etcd_client().clone();
+                let response = client.get(local.key(), None).await.unwrap();
+                let value = serde_json::to_vec(&Offer {
+                    v: 1,
+                    task_id: "already-offered".into(),
+                    target: "another".into(),
+                    nonce: "existing-offer".into(),
+                })
+                .unwrap();
+                client
+                    .put(
+                        local.key().replace("/tickets/", "/offers/"),
+                        value.clone(),
+                        Some(etcd_client::PutOptions::new().with_lease(response.kvs()[0].lease())),
+                    )
+                    .await
+                    .unwrap();
+                occupied_offer = Some(value);
+            }
+            if exclusion == "unleased" {
+                store
+                    .etcd_client()
+                    .clone()
+                    .put(local.key(), local.token(), None)
+                    .await
+                    .unwrap();
+            }
             let publisher = store.discovery_publisher(&leader);
             let mut cache = list(store.etcd_client(), cfg.etcd.prefix()).await.unwrap();
             for _ in 0..8 {
@@ -1004,17 +1078,18 @@ mod tests {
             };
             let offer = offer_for(&store, &cfg, chosen).await;
             assert_eq!(offer.task_id, wanted.id, "{exclusion}");
-            assert!(
-                store
-                    .etcd_client()
-                    .clone()
-                    .get(rejected.key().replace("/tickets/", "/offers/"), None)
-                    .await
-                    .unwrap()
-                    .kvs()
-                    .is_empty(),
-                "{exclusion}"
-            );
+            let rejected_offer = store
+                .etcd_client()
+                .clone()
+                .get(rejected.key().replace("/tickets/", "/offers/"), None)
+                .await
+                .unwrap();
+            if let Some(expected) = occupied_offer {
+                assert_eq!(rejected_offer.kvs().len(), 1);
+                assert_eq!(rejected_offer.kvs()[0].value(), expected);
+            } else {
+                assert!(rejected_offer.kvs().is_empty(), "{exclusion}");
+            }
             // A preferred offer remains advisory. An owner appearing after
             // placement must defeat the canonical claim on either route.
             store
