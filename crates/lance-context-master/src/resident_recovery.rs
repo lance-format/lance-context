@@ -48,6 +48,7 @@ fn enabled(config: &MasterConfig) -> bool {
         && config.merge_wal_interval_secs > 0
 }
 
+#[cfg(test)]
 fn candidates(config: &MasterConfig, snapshot: &[StatRow], after: Option<&str>) -> Vec<String> {
     // Explicitly owned tables do not depend on scanner freshness or existence.
     // Wildcard installations additionally use known names from the stats cache;
@@ -73,43 +74,145 @@ fn candidates(config: &MasterConfig, snapshot: &[StatRow], after: Option<&str>) 
     names
 }
 
-pub(crate) fn spawn(state: &Arc<MasterState>) {
-    if !enabled(&state.config) {
-        return;
+/// Discovery policy carried by the existing leased controller membership.
+/// Executors advertise it once; only the elected controller probes WAL metadata.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct Policy {
+    root: String,
+    owned: Vec<String>,
+    draining: Vec<String>,
+    append: Vec<String>,
+    local: Vec<String>,
+    automatic: bool,
+    shards: Vec<String>,
+    interval_secs: u64,
+    cursor: u64,
+}
+
+impl Policy {
+    pub(crate) fn from_config(config: &MasterConfig) -> Option<Self> {
+        let sorted = |values: &[String]| {
+            let mut values = values.to_vec();
+            values.sort_unstable();
+            values.dedup();
+            values
+        };
+        enabled(config).then(|| Self {
+            root: config.data_dir.clone(),
+            owned: sorted(&config.merge_rollout.owned_targets),
+            draining: sorted(&config.merge_rollout.drain_targets),
+            append: if config.append.rollout_append_local {
+                sorted(&config.append.rollout_append_targets)
+            } else {
+                Vec::new()
+            },
+            local: sorted(&config.local_merge.master_local_merge_targets),
+            automatic: config.local_merge.master_local_merge_auto
+                && config.merge_rollout.fence_legacy,
+            shards: sorted(&config.catchup.shards),
+            interval_secs: config
+                .append
+                .rollout_append_reconcile_interval_secs
+                .clamp(30, 86_400),
+            cursor: scope(config),
+        })
     }
-    let weak = Arc::downgrade(state);
-    tokio::spawn(async move {
-        loop {
-            let Some(state) = weak.upgrade() else { return };
-            // Also bound etcd waits. Dropping this read-only discovery never
-            // cancels a writer or authorizes a replacement execution.
+
+    fn selected(&self, target: &str) -> bool {
+        let dynamic = self.automatic
+            && !target.starts_with("datagen:")
+            && lance_context_core::validate_store_name(
+                target.strip_prefix("generic:").unwrap_or(target),
+            )
+            .is_ok();
+        (self.owned.iter().any(|t| t == target) || dynamic)
+            && !self.draining.iter().any(|t| t == target)
+            && (self.local.iter().any(|t| t == "*" || t == target)
+                || (!target.starts_with("generic:")
+                    && self.append.iter().any(|t| t == "*" || t == target)))
+    }
+
+    fn candidates(&self, snapshot: &[StatRow], after: Option<&str>) -> Vec<String> {
+        let mut names: Vec<_> = self
+            .owned
+            .iter()
+            .chain(&self.append)
+            .chain(&self.local)
+            .map(String::as_str)
+            .chain(snapshot.iter().map(|r| r.name.as_str()))
+            .filter(|name| *name != "*" && self.selected(name) && after.is_none_or(|a| *name > a))
+            .map(str::to_owned)
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        names.truncate(BATCH + 1);
+        names
+    }
+}
+
+/// Runs inside the demand leader's lifetime, concurrently with dispatch. Slow
+/// object storage must not block task placement or consumption of watch events.
+pub(crate) async fn run(
+    state: &Arc<MasterState>,
+    owner: &crate::task_store::CoordinationGuard,
+    mut policies: tokio::sync::watch::Receiver<Vec<Policy>>,
+) {
+    let mut next = 0usize;
+    loop {
+        let current = policies.borrow_and_update().clone();
+        if !current.is_empty() {
+            next %= current.len();
+            let policy = &current[next];
             match tokio::time::timeout(
                 Duration::from_secs(25),
-                tick(&state, chrono::Utc::now().timestamp_millis()),
+                tick_policy(
+                    state,
+                    policy,
+                    Some(owner),
+                    chrono::Utc::now().timestamp_millis(),
+                ),
             )
             .await
             {
-                Ok(Ok(_)) => {}
-                outcome => tracing::warn!(?outcome, "resident WAL demand discovery incomplete"),
+                Ok(Ok(Some(_))) => next += 1,
+                Ok(Ok(None)) => {} // The fleet gate is not due; preserve policy fairness.
+                outcome => {
+                    next += 1;
+                    tracing::warn!(?outcome, "leader resident WAL discovery incomplete");
+                }
             }
-            drop(state);
-            tokio::time::sleep(Duration::from_secs(5)).await;
         }
-    });
+        tokio::select! {
+            changed = policies.changed() => if changed.is_err() { return; },
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {},
+        }
+    }
 }
 
+#[cfg(test)]
 async fn tick(state: &Arc<MasterState>, now: i64) -> Result<usize, String> {
-    if !enabled(&state.config) {
+    let Some(policy) = Policy::from_config(&state.config) else {
         return Ok(0);
-    }
+    };
+    tick_policy(state, &policy, None, now)
+        .await
+        .map(|result| result.unwrap_or(0))
+}
+
+async fn tick_policy(
+    state: &Arc<MasterState>,
+    policy: &Policy,
+    owner: Option<&crate::task_store::CoordinationGuard>,
+    now: i64,
+) -> Result<Option<usize>, String> {
     let Some(_admission) = state.admission.try_admit_named("resident_discovery") else {
-        return Ok(0);
+        return Ok(Some(0));
     };
     let key = format!(
         "{}/resident-wal-discovery",
         state.config.etcd.etcd_prefix.trim_end_matches('/')
     );
-    let cursor_key = format!("{key}/cursor/{:016x}", scope(&state.config));
+    let cursor_key = format!("{key}/cursor/{:016x}", policy.cursor);
     let mut client = state.task_store.etcd_client().clone();
     let prior = client
         .get(key.as_str(), None)
@@ -122,7 +225,7 @@ async fn tick(state: &Arc<MasterState>, now: i64) -> Result<usize, String> {
         .map_err(|e| e.to_string())?
         .unwrap_or_default();
     if next_batch_ms > now {
-        return Ok(0);
+        return Ok(None);
     }
     let previous_cursor = client
         .get(cursor_key.as_str(), None)
@@ -135,25 +238,18 @@ async fn tick(state: &Arc<MasterState>, now: i64) -> Result<usize, String> {
         .map_err(|e| e.to_string())?
         .unwrap_or_default();
     let snapshot = state.stats_cache.read().await.clone();
-    if candidates(&state.config, &snapshot, None).is_empty() {
-        return Ok(0);
+    if policy.candidates(&snapshot, None).is_empty() {
+        return Ok(Some(0));
     }
-    let mut names = candidates(&state.config, &snapshot, cursor.after.as_deref());
+    let mut names = policy.candidates(&snapshot, cursor.after.as_deref());
     if names.is_empty() && cursor.after.is_none() {
-        return Ok(0);
+        return Ok(Some(0));
     }
     let more = names.len() > BATCH;
     names.truncate(BATCH);
     let next = Cursor {
         after: if more { names.last().cloned() } else { None },
-        next_batch_ms: now.saturating_add(
-            state
-                .config
-                .append
-                .rollout_append_reconcile_interval_secs
-                .clamp(30, 86_400) as i64
-                * 1000,
-        ),
+        next_batch_ms: now.saturating_add(policy.interval_secs as i64 * 1000),
     };
     // Reserve before object-store reads. Lost responses/crashes defer one page;
     // other replicas cannot duplicate its probes. No lease expiry enables writes.
@@ -165,8 +261,12 @@ async fn tick(state: &Arc<MasterState>, now: i64) -> Result<usize, String> {
         || Compare::version(cursor_key.as_str(), CompareOp::Equal, 0),
         |kv| Compare::mod_revision(cursor_key.as_str(), CompareOp::Equal, kv.mod_revision()),
     );
+    let mut compares = vec![compare, compare_cursor];
+    if let Some(owner) = owner {
+        compares.push(Compare::value(owner.key(), CompareOp::Equal, owner.token()));
+    }
     if !client
-        .txn(Txn::new().when([compare, compare_cursor]).and_then([
+        .txn(Txn::new().when(compares).and_then([
             TxnOp::put(
                 key.as_str(),
                 serde_json::to_vec(&next.next_batch_ms).map_err(|e| e.to_string())?,
@@ -182,10 +282,12 @@ async fn tick(state: &Arc<MasterState>, now: i64) -> Result<usize, String> {
         .map_err(|e| e.to_string())?
         .succeeded()
     {
-        return Ok(0);
+        return Ok(Some(0));
     }
+    let publisher = owner.map(|o| state.task_store.discovery_publisher(o));
+    let publisher = publisher.as_ref().unwrap_or(&state.task_store);
     let mut probes = stream::iter(names.into_iter().map(|target| async move {
-        let outcome = tokio::time::timeout(PROBE_TIMEOUT, probe(state, &target)).await;
+        let outcome = tokio::time::timeout(PROBE_TIMEOUT, probe_with_policy(state, policy, publisher, &target)).await;
         match outcome {
             Ok(Ok(requested)) => requested,
             outcome => {
@@ -199,10 +301,21 @@ async fn tick(state: &Arc<MasterState>, now: i64) -> Result<usize, String> {
     while let Some(true_or_false) = probes.next().await {
         requested += usize::from(true_or_false);
     }
-    Ok(requested)
+    Ok(Some(requested))
 }
 
+#[cfg(test)]
 async fn probe(state: &Arc<MasterState>, target: &str) -> Result<bool, String> {
+    let policy = Policy::from_config(&state.config).expect("resident policy");
+    probe_with_policy(state, &policy, &state.task_store, target).await
+}
+
+async fn probe_with_policy(
+    state: &Arc<MasterState>,
+    policy: &Policy,
+    publisher: &crate::task_store::TaskStore,
+    target: &str,
+) -> Result<bool, String> {
     if state
         .task_store
         .get_active_id(TaskKind::MergeWal, target)
@@ -239,16 +352,18 @@ async fn probe(state: &Arc<MasterState>, target: &str) -> Result<bool, String> {
     {
         return Ok(false);
     }
-    let uri = target
-        .strip_prefix("generic:")
-        .map_or_else(|| state.rollout_uri(target), |name| state.generic_uri(name));
+    let suffix = target.strip_prefix("generic:").map_or_else(
+        || format!("{target}.rollout.lance"),
+        |name| format!("{name}.generic.lance"),
+    );
+    let uri = format!("{}/{}", policy.root.trim_end_matches('/'), suffix);
     let pending = has_sealed_wal(
         &uri,
         state
             .local_append
             .as_ref()
             .map(|local| local.session.clone()),
-        &state.config.catchup.shards,
+        &policy.shards,
     )
     .await
     .map_err(|e| e.to_string())?;
@@ -260,7 +375,10 @@ async fn probe(state: &Arc<MasterState>, target: &str) -> Result<bool, String> {
         // next 15-second tick only adds idle time before an available executor.
         coordinator.request_merge(target).await?;
         if let Some(request) = coordinator.get_merge_request(target).await? {
-            crate::scheduler::enqueue_merge_request(state, &coordinator, &request).await?;
+            publisher
+                .enqueue_merge_request(&request)
+                .await
+                .map_err(|e| e.to_string())?;
         }
     }
     metrics::counter!("master_resident_wal_probes_total", "result" => if pending { "requested" } else { "empty" }).increment(1);
@@ -1203,5 +1321,133 @@ mod tests {
         assert_eq!(candidates(&config, &[], Some("e")), ["f"]);
         config.merge_wal_interval_secs = 0;
         assert!(!enabled(&config));
+    }
+    #[test]
+    fn advertised_policy_preserves_selection_and_deduplicates_reordered_members() {
+        for automatic in [false, true] {
+            for append in [false, true] {
+                let mut config = MasterConfig::parse_from(["test"]);
+                config.merge_wal_interval_secs = 30;
+                config.append.rollout_append_local = append;
+                config.append.rollout_append_targets = vec!["*".into()];
+                config.local_merge.master_local_merge_targets = vec!["*".into()];
+                config.local_merge.master_local_merge_auto = automatic;
+                config.merge_rollout.fence_legacy = automatic;
+                config.merge_rollout.owned_targets =
+                    vec!["b".into(), "a".into(), "generic:g".into()];
+                config.merge_rollout.drain_targets = vec!["drained".into()];
+                let policy = Policy::from_config(&config).unwrap();
+                for name in [
+                    "a",
+                    "b",
+                    "unknown",
+                    "generic:g",
+                    "generic:unknown",
+                    "datagen:d",
+                    "drained",
+                    "../bad",
+                ] {
+                    assert_eq!(
+                        policy.selected(name),
+                        crate::local_merge::selected(&config, name),
+                        "{name}"
+                    );
+                }
+                assert_eq!(policy.candidates(&[], None), candidates(&config, &[], None));
+                config.merge_rollout.owned_targets.reverse();
+                assert_eq!(Some(policy), Policy::from_config(&config));
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated ETCD_TEST_ENDPOINTS"]
+    async fn leader_probes_member_policy_and_successor_resumes_fenced_cursor() {
+        let (_dir, member) = fixture().await;
+        let _b = write(&member, "b", 1).await;
+        let _e = write(&member, "e", 1).await;
+        let policy = Policy::from_config(&member.config).unwrap();
+        let mut cfg = member.config.clone();
+        cfg.append.rollout_append_local = false;
+        cfg.merge_rollout.owned_targets.clear();
+        let leader = MasterState::new(cfg).await.unwrap();
+        assert!(Policy::from_config(&leader.config).is_none());
+        let store = &leader.task_store;
+        let owner = store.discovery_session(b"{}".to_vec()).await.unwrap();
+        assert!(store.elect_discovery_leader(&owner).await.unwrap());
+        let now = chrono::Utc::now().timestamp_millis();
+        assert_eq!(
+            tick_policy(&leader, &policy, Some(&owner), now)
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        let first = store
+            .get_active_id(TaskKind::MergeWal, "b")
+            .await
+            .unwrap()
+            .unwrap();
+        let gate = format!("{}/resident-wal-discovery", leader.config.etcd.prefix());
+        let cursor_key = format!("{gate}/cursor/{:016x}", policy.cursor);
+        let cursor = store
+            .etcd_client()
+            .clone()
+            .get(cursor_key.clone(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Cursor>(cursor.kvs()[0].value())
+                .unwrap()
+                .after
+                .as_deref(),
+            Some("d")
+        );
+        // Replace leadership while retaining the old guard/keepalive: no old
+        // timer or lease liveness observation may authorize cursor advancement.
+        store
+            .etcd_client()
+            .clone()
+            .delete(owner.key(), None)
+            .await
+            .unwrap();
+        let successor = store.discovery_session(b"{}".to_vec()).await.unwrap();
+        assert!(store.elect_discovery_leader(&successor).await.unwrap());
+        assert_eq!(
+            tick_policy(&leader, &policy, Some(&owner), now + 31_000)
+                .await
+                .unwrap(),
+            Some(0)
+        );
+        let unchanged = store
+            .etcd_client()
+            .clone()
+            .get(cursor_key, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            unchanged.kvs()[0].mod_revision(),
+            cursor.kvs()[0].mod_revision()
+        );
+        assert_eq!(
+            tick_policy(&leader, &policy, Some(&successor), now + 31_000)
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        assert!(store
+            .get_active_id(TaskKind::MergeWal, "e")
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            store
+                .get_active_id(TaskKind::MergeWal, "b")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(first.as_str())
+        );
+        store.release_coordination_lock(owner).await.unwrap();
+        store.release_coordination_lock(successor).await.unwrap();
     }
 }
