@@ -1428,6 +1428,21 @@ mod tests {
             unchanged.kvs()[0].mod_revision(),
             cursor.kvs()[0].mod_revision()
         );
+        let stale_publisher = store.discovery_publisher(&owner);
+        assert!(probe_with_policy(&leader, &policy, &stale_publisher, "e")
+            .await
+            .unwrap());
+        assert!(store
+            .get_active_id(TaskKind::MergeWal, "e")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store
+            .merge_coordinator()
+            .get_merge_request("e")
+            .await
+            .unwrap()
+            .is_some());
         assert_eq!(
             tick_policy(&leader, &policy, Some(&successor), now + 31_000)
                 .await
@@ -1449,5 +1464,60 @@ mod tests {
         );
         store.release_coordination_lock(owner).await.unwrap();
         store.release_coordination_lock(successor).await.unwrap();
+    }
+    #[tokio::test]
+    #[ignore = "requires isolated ETCD_TEST_ENDPOINTS"]
+    async fn running_leader_discovers_new_member_scope_without_becoming_executor() {
+        let (_dir, member) = fixture().await;
+        let _b = write(&member, "b", 1).await;
+        let mut cfg = member.config.clone();
+        cfg.append.rollout_append_local = false;
+        cfg.merge_rollout.owned_targets.clear();
+        let leader = MasterState::new(cfg).await.unwrap();
+        let store = &leader.task_store;
+        let key = format!(
+            "{}/demand-controller/leader-v2",
+            leader.config.etcd.prefix()
+        );
+        let first = crate::demand_controller::spawn(&leader);
+        let original = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let response = store
+                    .etcd_client()
+                    .clone()
+                    .get(key.clone(), None)
+                    .await
+                    .unwrap();
+                if let Some(kv) = response.kvs().first() {
+                    break kv.value().to_vec();
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let follower = crate::demand_controller::spawn(&member);
+        let discovered = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if store
+                    .get_active_id(TaskKind::MergeWal, "b")
+                    .await
+                    .unwrap()
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await;
+        let current = store.etcd_client().clone().get(key, None).await.unwrap();
+        first.abort();
+        follower.abort();
+        let _ = first.await;
+        let _ = follower.await;
+        discovered.unwrap();
+        assert_eq!(current.kvs()[0].value(), original);
+        assert!(!crate::local_merge::enabled(&leader.config));
     }
 }
