@@ -61,6 +61,21 @@ During a mixed-version rollout, scoped thresholds are advertised separately and
 the legacy threshold fields are disabled for that member. Older aggregate
 leaders therefore ignore its scoped thresholds instead of applying them globally;
 their other policies and the member's execution capacity remain available.
-Upgrade the elected aggregate controller before relying on scoped watermark
-admission. Verify its actual member policy and selected/unselected behavior in
-an isolated, already-fenced environment before enabling it in production.
+Members with a nonempty scope and automatic merging enabled also elect one
+independent scoped watermark controller per etcd prefix. This controller admits
+the union of live scoped policies without replacing the global dispatch leader
+or waiting for persisted statistics. Identical and different scopes share this
+one additional informer, rather than starting a fleet watch per table or policy.
+It uses the same durable admission frontiers and task deduplication as the global
+controller, with publication fenced by its own election lease. All-table
+outstanding work still counts against its observed admission allowance. This is
+the existing soft queue bound, not an atomic credit limit across independent
+producers. Its live cache gauges use `master_scoped_aggregate_wal_*` names so a
+global controller in the same process cannot overwrite them. Admission/error
+counters include both controllers.
+
+Verify actual member policies, selected/unselected behavior, concurrent global
+admission, and scoped-owner failover in an isolated, already-fenced environment
+before enabling the new image in production. Older images without the scoped
+controller still require a new global leader for watermark admission; their
+scoped periodic sweep alone depends on persisted statistics freshness.
