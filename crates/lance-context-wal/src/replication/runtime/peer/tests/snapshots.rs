@@ -400,6 +400,129 @@ fn image_files(root: &Path) -> Result<usize> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tls_snapshots_wait_for_checkpoint_and_sibling_receiver_without_reconnect() -> Result<()> {
+    use crate::replication::checkpoint::{Part, CHUNK_BYTES};
+    let root = tempfile::tempdir()?;
+    let mut c = Images::open(root.path()).await?;
+    c.net.nodes[&1].handle.campaign(10)?.await?;
+    assert_eq!(c.net.leader(10).await?, 1);
+    c.net.nodes[&2].handle.campaign(20)?.await?;
+    assert_eq!(c.net.leader(20).await?, 2);
+    let (initial, _) = append(&c.net.nodes[&1].handle, 10, 1).await?;
+    wait_for(|| {
+        c.net.nodes[&3]
+            .handle
+            .observation(10)
+            .unwrap()
+            .status
+            .applied
+            >= initial
+    })
+    .await?;
+    // Keep real TLS snapshot reception and durable Raft workers, but prevent
+    // automatic peer traffic from racing these two deliberate upload streams.
+    let Running {
+        network,
+        runtime,
+        handle,
+    } = c.net.nodes.remove(&3).unwrap();
+    network.shutdown().await?;
+    let capture = handle.prepare_checkpoint(10, uuid::Uuid::new_v4())?.await?;
+    let mut expected = Vec::new();
+    let mut images = Vec::new();
+    let mut packets = Vec::new();
+    for (group, leader_id, sequence) in [(10, 1, 2), (20, 2, 1)] {
+        let leader = &c.net.nodes[&leader_id].handle;
+        let (index, batch) = append(leader, group, sequence).await?;
+        let image = checkpoint(leader, group).await?;
+        packets.push(Packet {
+            cluster: leader.cluster,
+            layout: leader.layout,
+            policy: leader.policy,
+            group,
+            message: Message {
+                from: leader_id,
+                to: 3,
+                term: leader.observation(group)?.status.term,
+                msg_type: MessageType::MsgSnapshot,
+                snapshot: Some(image.snapshot()?).into(),
+                ..Default::default()
+            },
+        });
+        images.push(image);
+        expected.push((group, index, batch));
+    }
+    let path = root.path().join("3");
+    let before = image_files(&path)?;
+    let mut first = upload_header(&c, &packets[0]).await?;
+    assert!(
+        timeout(Duration::from_millis(150), first.read_u8())
+            .await
+            .is_err(),
+        "busy checkpoint must leave the admitted snapshot connected and waiting"
+    );
+    assert_eq!(image_files(&path)?, before);
+    drop(capture);
+    assert_eq!(timeout(Duration::from_secs(5), first.read_u8()).await??, 1);
+    let mut second = upload_header(&c, &packets[1]).await?;
+    let during_first = image_files(&path)?;
+    assert!(
+        timeout(Duration::from_millis(150), second.read_u8())
+            .await
+            .is_err(),
+        "a sibling snapshot must wait on its original connection"
+    );
+    assert_eq!(image_files(&path)?, during_first);
+    // Waiting for the physical image slot must not block either Raft owner or
+    // prevent the two healthy replicas from acknowledging new client appends.
+    append(&c.net.nodes[&1].handle, 10, 3).await?;
+    append(&c.net.nodes[&2].handle, 20, 2).await?;
+    for (stream, image) in [(&mut first, &images[0]), (&mut second, &images[1])] {
+        if image.identity().0 == 20 {
+            assert_eq!(timeout(Duration::from_secs(5), stream.read_u8()).await??, 1);
+        }
+        for part in [Part::Metadata, Part::Payload] {
+            let mut offset = 0;
+            while offset < image.bytes(part) {
+                let chunk = image.chunk(
+                    part,
+                    offset,
+                    (image.bytes(part) - offset).min(CHUNK_BYTES as u64) as usize,
+                )?;
+                stream.write_all(&chunk).await?;
+                offset += chunk.len() as u64;
+            }
+        }
+        stream.flush().await?;
+        let mut ack = [0; 8];
+        timeout(Duration::from_secs(5), stream.read_exact(&mut ack)).await??;
+        assert_eq!(&ack, b"LCWSYNC1");
+    }
+    wait_for(|| {
+        c.services[&3]
+            .statistics()
+            .installed
+            .load(Ordering::Acquire)
+            == 2
+    })
+    .await?;
+    assert_eq!(
+        c.services[&3].statistics().failed.load(Ordering::Acquire),
+        0
+    );
+    drop(first);
+    drop(second);
+    drop(images);
+    c.shutdown().await?;
+    runtime.shutdown().await?;
+    let node = Node::open(&path, layout(), 3, Limits::default())?;
+    for (group, index, batch) in expected {
+        assert_eq!(node.read_accepted(group, index)?, Some(batch));
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tls_snapshot_denial_and_interruption_never_install_or_release_disk_charges() -> Result<()>
 {
     use crate::replication::checkpoint::{Part, CHUNK_BYTES};
