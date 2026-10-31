@@ -108,10 +108,10 @@ impl Owner {
         }
     }
 
-    // Called only by admitted snapshot connections, under their existing whole
-    // transfer deadline. Waiting owns no control credit, file or disk charge.
+    // Used by admitted snapshot connections and the single maintenance task.
+    // Waiting owns no control credit, file worker or disk charge.
     #[cfg(feature = "peer-transport")]
-    pub(super) async fn acquire_snapshot(self: &Arc<Self>) -> Result<Permit> {
+    pub(super) async fn acquire_queued(self: &Arc<Self>) -> Result<Permit> {
         let slot = self
             .slot
             .clone()
@@ -267,28 +267,43 @@ pub(super) fn read_log_body(
 
 impl Node {
     pub fn prepare_checkpoint(&self, group: u64, id: Uuid) -> Result<CheckpointTask> {
+        self.prepare_checkpoint_admitted(group, id, self.images.acquire()?)?
+            .context("no new committed state to checkpoint")
+    }
+
+    pub(super) fn prepare_checkpoint_admitted(
+        &self,
+        group: u64,
+        id: Uuid,
+        permit: Permit,
+    ) -> Result<Option<CheckpointTask>> {
         self.healthy()?;
+        ensure!(
+            Arc::ptr_eq(&permit.0, &self.images),
+            "foreign node image worker"
+        );
         ensure!(!id.is_nil(), "nil application image id");
         let g = self.groups.get(&group).context("unhosted group")?;
+        // A snapshot received while admission waited may already cover the
+        // observed cut. Inspect the current owner state after gaining the slot.
+        if g.state.applied < g.raw.store().first_index()? {
+            return Ok(None);
+        }
         let cut = Cut {
             group,
             id,
             index: g.state.applied,
             term: g.raw.store().term(g.state.applied)?,
         };
-        ensure!(
-            cut.index >= g.raw.store().first_index()?,
-            "no new committed state to checkpoint"
-        );
-        Ok(CheckpointTask {
-            permit: self.images.acquire()?,
+        Ok(Some(CheckpointTask {
+            permit,
             store: g.raw.store().clone(),
             previous: g.image.clone(),
             layout: self.layout.clone(),
             limits: self.limits.clone(),
             cut,
             state: g.state.clone(),
-        })
+        }))
     }
 
     /// Install a completed local build. Inputs after the captured cut remain in

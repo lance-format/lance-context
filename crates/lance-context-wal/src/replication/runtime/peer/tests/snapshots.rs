@@ -429,12 +429,15 @@ async fn tls_snapshots_wait_for_checkpoint_and_sibling_receiver_without_reconnec
     let root = tempfile::tempdir()?;
     let mut c = Images::open(root.path()).await?;
     c.net.nodes[&1].handle.campaign(10)?.await?;
-    assert_eq!(c.net.leader(10).await?, 1);
+    let first_leader = c.net.leader(10).await?;
     c.net.nodes[&2].handle.campaign(20)?.await?;
-    assert_eq!(c.net.leader(20).await?, 2);
-    let (initial, _) = append(&c.net.nodes[&1].handle, 10, 1).await?;
+    let second_leader = c.net.leader(20).await?;
+    let follower = (1..=3)
+        .find(|id| *id != first_leader && *id != second_leader)
+        .unwrap();
+    let (initial, _) = append(&c.net.nodes[&first_leader].handle, 10, 1).await?;
     wait_for(|| {
-        c.net.nodes[&3]
+        c.net.nodes[&follower]
             .handle
             .observation(10)
             .unwrap()
@@ -449,13 +452,13 @@ async fn tls_snapshots_wait_for_checkpoint_and_sibling_receiver_without_reconnec
         network,
         runtime,
         handle,
-    } = c.net.nodes.remove(&3).unwrap();
+    } = c.net.nodes.remove(&follower).unwrap();
     network.shutdown().await?;
     let capture = handle.prepare_checkpoint(10, uuid::Uuid::new_v4())?.await?;
     let mut expected = Vec::new();
     let mut images = Vec::new();
     let mut packets = Vec::new();
-    for (group, leader_id, sequence) in [(10, 1, 2), (20, 2, 1)] {
+    for (group, leader_id, sequence) in [(10, first_leader, 2), (20, second_leader, 1)] {
         let leader = &c.net.nodes[&leader_id].handle;
         let (index, batch) = append(leader, group, sequence).await?;
         let image = checkpoint(leader, group).await?;
@@ -466,7 +469,7 @@ async fn tls_snapshots_wait_for_checkpoint_and_sibling_receiver_without_reconnec
             group,
             message: Message {
                 from: leader_id,
-                to: 3,
+                to: follower,
                 term: leader.observation(group)?.status.term,
                 msg_type: MessageType::MsgSnapshot,
                 snapshot: Some(image.snapshot()?).into(),
@@ -476,7 +479,7 @@ async fn tls_snapshots_wait_for_checkpoint_and_sibling_receiver_without_reconnec
         images.push(image);
         expected.push((group, index, batch));
     }
-    let path = root.path().join("3");
+    let path = root.path().join(follower.to_string());
     let before = image_files(&path)?;
     let mut first = upload_header(&c, &packets[0]).await?;
     assert!(
@@ -499,8 +502,8 @@ async fn tls_snapshots_wait_for_checkpoint_and_sibling_receiver_without_reconnec
     assert_eq!(image_files(&path)?, during_first);
     // Waiting for the physical image slot must not block either Raft owner or
     // prevent the two healthy replicas from acknowledging new client appends.
-    append(&c.net.nodes[&1].handle, 10, 3).await?;
-    append(&c.net.nodes[&2].handle, 20, 2).await?;
+    append(&c.net.nodes[&first_leader].handle, 10, 3).await?;
+    append(&c.net.nodes[&second_leader].handle, 20, 2).await?;
     for (stream, image) in [(&mut first, &images[0]), (&mut second, &images[1])] {
         if image.identity().0 == 20 {
             assert_eq!(timeout(Duration::from_secs(5), stream.read_u8()).await??, 1);
@@ -523,7 +526,7 @@ async fn tls_snapshots_wait_for_checkpoint_and_sibling_receiver_without_reconnec
         assert_eq!(&ack, b"LCWSYNC1");
     }
     wait_for(|| {
-        c.services[&3]
+        c.services[&follower]
             .statistics()
             .installed
             .load(Ordering::Acquire)
@@ -531,7 +534,10 @@ async fn tls_snapshots_wait_for_checkpoint_and_sibling_receiver_without_reconnec
     })
     .await?;
     assert_eq!(
-        c.services[&3].statistics().failed.load(Ordering::Acquire),
+        c.services[&follower]
+            .statistics()
+            .failed
+            .load(Ordering::Acquire),
         0
     );
     drop(first);
@@ -539,7 +545,7 @@ async fn tls_snapshots_wait_for_checkpoint_and_sibling_receiver_without_reconnec
     drop(images);
     c.shutdown().await?;
     runtime.shutdown().await?;
-    let node = Node::open(&path, layout(), 3, Limits::default())?;
+    let node = Node::open(&path, layout(), follower, Limits::default())?;
     for (group, index, batch) in expected {
         assert_eq!(node.read_accepted(group, index)?, Some(batch));
     }
@@ -647,10 +653,13 @@ async fn tls_snapshot_slot_wait_obeys_deadline_and_shutdown_without_creating_fil
     )
     .await?;
     c.net.nodes[&1].handle.campaign(10)?.await?;
-    assert_eq!(c.net.leader(10).await?, 1);
-    let (index, expected) = append(&c.net.nodes[&1].handle, 10, 1).await?;
+    // A concurrent election may select another node before this campaign wins.
+    // Bind the deliberate upload to the observed leader and a distinct receiver.
+    let leader_id = c.net.leader(10).await?;
+    let follower = (1..=3).rfind(|id| *id != leader_id).unwrap();
+    let (index, expected) = append(&c.net.nodes[&leader_id].handle, 10, 1).await?;
     wait_for(|| {
-        c.net.nodes[&3]
+        c.net.nodes[&follower]
             .handle
             .observation(10)
             .unwrap()
@@ -663,10 +672,10 @@ async fn tls_snapshot_slot_wait_obeys_deadline_and_shutdown_without_creating_fil
         network,
         runtime,
         handle,
-    } = c.net.nodes.remove(&3).unwrap();
+    } = c.net.nodes.remove(&follower).unwrap();
     network.shutdown().await?;
     let capture = handle.prepare_checkpoint(10, uuid::Uuid::new_v4())?.await?;
-    let leader = &c.net.nodes[&1].handle;
+    let leader = &c.net.nodes[&leader_id].handle;
     append(leader, 10, 2).await?;
     let image = checkpoint(leader, 10).await?;
     let packet = Packet {
@@ -675,24 +684,31 @@ async fn tls_snapshot_slot_wait_obeys_deadline_and_shutdown_without_creating_fil
         policy: leader.policy,
         group: 10,
         message: Message {
-            from: 1,
-            to: 3,
+            from: leader_id,
+            to: follower,
             term: leader.observation(10)?.status.term,
             msg_type: MessageType::MsgSnapshot,
             snapshot: Some(image.snapshot()?).into(),
             ..Default::default()
         },
     };
-    let path = root.path().join("3");
+    let path = root.path().join(follower.to_string());
     let before = image_files(&path)?;
     let mut expired = upload_header(&c, &packet).await?;
     assert!(timeout(Duration::from_millis(100), expired.read_u8())
         .await
         .is_err());
     no_response(&mut expired).await?;
-    wait_for(|| c.services[&3].statistics().failed.load(Ordering::Acquire) == 1).await?;
+    wait_for(|| {
+        c.services[&follower]
+            .statistics()
+            .failed
+            .load(Ordering::Acquire)
+            == 1
+    })
+    .await?;
     assert_eq!(image_files(&path)?, before);
-    assert_eq!(c.quotas[&3].used.load(Ordering::Acquire), 0);
+    assert_eq!(c.quotas[&follower].used.load(Ordering::Acquire), 0);
     assert_eq!(handle.observation(10)?.status.applied, index);
     drop(expired);
 
@@ -702,12 +718,12 @@ async fn tls_snapshot_slot_wait_obeys_deadline_and_shutdown_without_creating_fil
         .is_err());
     timeout(
         Duration::from_secs(2),
-        c.services.remove(&3).unwrap().shutdown(),
+        c.services.remove(&follower).unwrap().shutdown(),
     )
     .await??;
     no_response(&mut stopping).await?;
     assert_eq!(image_files(&path)?, before);
-    assert_eq!(c.quotas[&3].used.load(Ordering::Acquire), 0);
+    assert_eq!(c.quotas[&follower].used.load(Ordering::Acquire), 0);
     drop(stopping);
     drop(capture);
     // Cancelled waiters must not consume the next permit or keep the physical
@@ -716,7 +732,7 @@ async fn tls_snapshot_slot_wait_obeys_deadline_and_shutdown_without_creating_fil
     drop(image);
     c.shutdown().await?;
     runtime.shutdown().await?;
-    let node = Node::open(&path, layout(), 3, Limits::default())?;
+    let node = Node::open(&path, layout(), follower, Limits::default())?;
     assert_eq!(node.read_accepted(10, index)?, Some(expected));
     Ok(())
 }

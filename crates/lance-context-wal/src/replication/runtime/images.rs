@@ -164,6 +164,26 @@ impl Handle {
         self.local(group, move |node| node.prepare_checkpoint(group, id))
     }
 
+    /// Queue the service's single maintenance task behind other image owners.
+    /// No worker, control credit or captured cut is retained during admission.
+    #[cfg(feature = "service")]
+    pub(crate) async fn prepare_checkpoint_wait(
+        &self,
+        group: u64,
+        id: uuid::Uuid,
+    ) -> Result<Pending<Option<CheckpointTask>>> {
+        self.route(group)?;
+        let permit = self
+            .images
+            .upgrade()
+            .context("node image owner stopped")?
+            .acquire_queued()
+            .await?;
+        self.local(group, move |node| {
+            node.prepare_checkpoint_admitted(group, id, permit)
+        })
+    }
+
     /// Install a completed local image and logically compact its prefix. The
     /// completion follows persistence. Later suffix entries stay in the log.
     pub fn install_checkpoint(&self, image: PreparedCheckpoint) -> Result<Pending<()>> {
@@ -224,6 +244,20 @@ impl Handle {
     pub fn prepare_image_collection(&self) -> Result<Pending<ImageCollection>> {
         self.local(self.physical_group()?, |node| {
             node.prepare_image_collection()
+        })
+    }
+
+    #[cfg(feature = "service")]
+    pub(crate) async fn prepare_image_collection_wait(&self) -> Result<Pending<ImageCollection>> {
+        let group = self.physical_group()?;
+        let permit = self
+            .images
+            .upgrade()
+            .context("node image owner stopped")?
+            .acquire_queued()
+            .await?;
+        self.local(group, move |node| {
+            node.prepare_image_collection_admitted(permit)
         })
     }
 
