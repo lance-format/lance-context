@@ -1462,6 +1462,7 @@ pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
     crate::planner::spawn(state);
     crate::executors::spawn(state);
     crate::demand_controller::spawn(state);
+    crate::demand_controller::spawn_scoped(state);
     crate::periodic_sweep::spawn(state);
 
     let concurrency = state.config.task_concurrency.max(1);

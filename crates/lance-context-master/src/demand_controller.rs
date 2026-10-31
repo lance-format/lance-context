@@ -848,6 +848,72 @@ async fn become_leader(
     }
 }
 
+/// Old global leaders deliberately ignore scoped thresholds. Elect one extra
+/// informer across ALL scoped policies so fresh writer events can still admit
+/// selected tables during a rolling upgrade. It never dispatches or executes
+/// tasks, and uses the same durable frontier/dedupe as the global informer.
+pub(crate) fn spawn_scoped(state: &Arc<MasterState>) -> Option<tokio::task::JoinHandle<()>> {
+    if state.config.merge_wal_interval_secs == 0
+        || state.config.merge_wal_admission_targets.is_empty()
+    {
+        return None;
+    }
+    let state = state.clone();
+    Some(tokio::spawn(async move {
+        let name = "scoped-wal-discovery-v1";
+        let key = state.task_store.coordination_key(name);
+        loop {
+            if !state.admission.is_accepting() {
+                return;
+            }
+            let election = async {
+                wait_for_vacancy(state.task_store.etcd_client(), &key, None).await?;
+                state
+                    .task_store
+                    .try_coordination_lock(name)
+                    .await
+                    .map_err(|e| e.to_string())
+            };
+            let owner = tokio::select! {
+                _ = state.admission.wait_closed() => return,
+                result = election => result,
+            };
+            match owner {
+                Ok(Some(owner)) => {
+                    metrics::gauge!("master_scoped_wal_controller_leader").set(1.0);
+                    let lease_lost = async {
+                        while owner.is_live() {
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                    };
+                    tokio::select! {
+                        _ = state.admission.wait_closed() => {},
+                        _ = lease_lost => {},
+                        _ = aggregate::run_scoped(&state, &owner) => {},
+                        result = wait_for_vacancy(state.task_store.etcd_client(), &key, Some(owner.token())) => {
+                            if let Err(error) = result {
+                                tracing::warn!(%error, "scoped WAL owner watch ended");
+                            }
+                        },
+                    }
+                    metrics::gauge!("master_scoped_wal_controller_leader").set(0.0);
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(2),
+                        state.task_store.release_coordination_lock(owner),
+                    )
+                    .await;
+                }
+                Ok(None) => continue,
+                Err(error) => tracing::warn!(%error, "scoped WAL election deferred"),
+            }
+            tokio::select! {
+                _ = state.admission.wait_closed() => return,
+                _ = tokio::time::sleep(RECONNECT) => {},
+            }
+        }
+    }))
+}
+
 pub(crate) fn spawn(state: &Arc<MasterState>) -> tokio::task::JoinHandle<()> {
     let state = state.clone();
     tokio::spawn(async move {
