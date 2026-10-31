@@ -161,6 +161,10 @@ async fn run_cluster(f: &Fixture) -> Result<()> {
     }
     let lagging = *(1..=3).find(|n| *n != first_leader).as_ref().unwrap();
     let before_disconnect = f.status(first_leader).await?;
+    let poll = &before_disconnect["groups"]["10"]["durable_poll"];
+    assert!(poll["completed"].as_u64().unwrap() > 0);
+    assert_eq!(poll["failed"], 0);
+    assert!(poll["engine"]["sync_micros"].as_u64().unwrap() > 0);
     for field in [
         "peer_dropped_outbound",
         "peer_failed_exchanges",
