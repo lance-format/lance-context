@@ -12,6 +12,14 @@ small-file compaction. Preference rotates from the selected version, so owner
 replacement does not reset scheduling. New updates continue through active
 staging and do not wait for an index to become current.
 
+When a data batch is ready, a status-only build below `min_rows` (65,536 by
+default) yields to that batch. A tail with 128 uncovered fragments remains
+eligible. Native index merges, ID index work, and body or narrow compaction can
+still take a maintenance turn; this threshold does not delay an already retained
+plan. The deferral is not cached as no work for the selected version, so an idle
+owner still catches up a smaller tail without another write. Setting `min_rows`
+to 1 preserves immediate eligibility during sustained writes.
+
 Merge admission uses the physical sizes recorded in native index metadata,
 including old values outside a segment's current coverage. Four similarly sized
 segments may merge within `max_merge_bytes` (64 MiB by default). These are bounds
