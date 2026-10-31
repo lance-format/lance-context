@@ -227,11 +227,12 @@ impl Cache {
                     && p.admits_request(target, None)
             })
             .filter_map(|p| {
-                let threshold = p.aggregate_min_generations?.max(1) as u64;
+                let (minimum, tail_interval) = p.automatic_thresholds(target)?;
+                let threshold = minimum.max(1) as u64;
                 if table.pending() >= threshold {
                     Some(Duration::ZERO)
-                } else if p.aggregate_tail_interval_secs > 0 {
-                    table.tail_delay(p.aggregate_tail_interval_secs, now_ms)
+                } else if tail_interval > 0 {
+                    table.tail_delay(tail_interval, now_ms)
                 } else {
                     None
                 }
@@ -1087,6 +1088,86 @@ mod tests {
             .members
             .insert(b"m".to_vec(), Policy::from_config(&config));
         cache
+    }
+
+    #[test]
+    fn scoped_wal_admission_is_independent_of_fencing_and_baseline_thresholds() {
+        let mut cache = tail_cache();
+        let mut cfg = MasterConfig::parse_from(["test"]);
+        cfg.merge_rollout.fence_legacy = true;
+        cfg.merge_wal_min_generations = 1;
+        cfg.merge_wal_admission_targets = vec!["a".into(), "b".into()];
+        cfg.wal_tail.wal_tail_interval_secs = 30;
+        let scoped = Policy::from_config(&cfg);
+        assert!(scoped.admits_request("c", None)); // Safety recovery stays global.
+        cache.members.insert(b"scoped".to_vec(), scoped);
+        for name in ["a", "b", "c", "d"] {
+            publish(&mut cache, name, "s", 1, None, 1);
+        }
+        for name in ["a", "b"] {
+            assert_eq!(cache.admission_delay(name, 1), Some(Duration::ZERO));
+        }
+        for name in ["c", "d"] {
+            assert_eq!(
+                cache.admission_delay(name, 30_001),
+                Some(Duration::from_secs(570))
+            );
+        }
+        publish(&mut cache, "c", "s", 8, None, 2);
+        assert_eq!(cache.admission_delay("c", 30_001), Some(Duration::ZERO));
+        cache.members.remove(b"scoped".as_slice());
+        assert_eq!(
+            cache.admission_delay("a", 30_001),
+            Some(Duration::from_secs(570))
+        );
+    }
+
+    #[test]
+    fn scoped_wal_admission_cannot_leak_through_an_old_leader() {
+        let mut cfg = MasterConfig::parse_from(["test"]);
+        cfg.merge_rollout.fence_legacy = true;
+        cfg.merge_wal_min_generations = 1;
+        cfg.merge_wal_admission_targets = vec!["a".into()];
+        cfg.wal_tail.wal_tail_interval_secs = 30;
+        let policy = Policy::from_config(&cfg);
+        assert_eq!(policy.automatic_thresholds("a"), Some((1, 30)));
+        assert_eq!(policy.automatic_thresholds("other"), None);
+        // Previous binaries ignore unknown JSON fields. They must see no low
+        // threshold at all, while still seeing this executor's capacity/fences.
+        let mut wire = serde_json::to_value(&policy).unwrap();
+        wire.as_object_mut()
+            .unwrap()
+            .remove("scoped_automatic_admission");
+        let old: Policy = serde_json::from_value(wire).unwrap();
+        assert!(old.admits_request("other", None));
+        assert_eq!(old.aggregate_merge_slots, policy.aggregate_merge_slots);
+        assert_eq!(old.aggregate_min_generations, None);
+        assert_eq!(old.aggregate_tail_interval_secs, 0);
+        let mut cache = tail_cache();
+        cache.members.insert(b"old-view".to_vec(), old);
+        publish(&mut cache, "other", "s", 1, None, 1);
+        assert_eq!(
+            cache.admission_delay("other", 30_001),
+            Some(Duration::from_secs(570))
+        );
+    }
+
+    #[test]
+    fn scoped_wal_admission_applies_tail_deadlines_only_to_selected_targets() {
+        let mut cache = Cache::new();
+        let mut cfg = MasterConfig::parse_from(["test"]);
+        cfg.merge_rollout.fence_legacy = true;
+        cfg.merge_wal_min_generations = 4;
+        cfg.merge_wal_admission_targets = vec!["a".into()];
+        cfg.wal_tail.wal_tail_interval_secs = 30;
+        cache
+            .members
+            .insert(b"scoped".to_vec(), Policy::from_config(&cfg));
+        publish(&mut cache, "a", "s", 1, None, 1);
+        publish(&mut cache, "b", "s", 8, None, 1);
+        assert_eq!(cache.admission_delay("a", 1), Some(Duration::from_secs(30)));
+        assert_eq!(cache.admission_delay("a", 30_001), Some(Duration::ZERO));
+        assert_eq!(cache.admission_delay("b", 30_001), None);
     }
 
     #[test]

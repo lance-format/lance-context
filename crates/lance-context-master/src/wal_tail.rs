@@ -12,7 +12,7 @@ pub struct WalTailConfig {
     /// Requires automatic WAL merge and either workers or resident local append.
     #[arg(long, env = "MERGE_WAL_TAIL_INTERVAL_SECS", default_value_t = 0)]
     pub wal_tail_interval_secs: u64,
-    /// At most this many candidates per fleet-wide 30-second batch (hard cap 64).
+    /// At most this many candidates per shared scope per 30-second batch (hard cap 64).
     #[arg(long, env = "MERGE_WAL_TAIL_BATCH_SIZE", default_value_t = 16)]
     pub wal_tail_batch_size: usize,
     #[arg(long, env = "MERGE_WAL_TAIL_STATS_MAX_AGE_SECS", default_value_t = 900)]
@@ -53,6 +53,7 @@ fn candidates(
         .iter()
         .filter(|row| {
             row.pending_wal_generations > 0
+                && config.admits_automatic_wal(&row.name)
                 && row.pending_wal_generations < config.merge_wal_min_generations
                 && row.scanned_at <= now
                 && now.saturating_sub(row.scanned_at) <= age
@@ -88,6 +89,25 @@ pub(crate) fn spawn(state: &Arc<MasterState>) {
     });
 }
 
+fn cursor_key(config: &MasterConfig) -> String {
+    let key = format!(
+        "{}/wal-tail-cursor",
+        config.etcd.etcd_prefix.trim_end_matches('/')
+    );
+    if config.merge_wal_admission_targets.is_empty() {
+        return key;
+    }
+    let mut targets = config.merge_wal_admission_targets.clone();
+    targets.sort_unstable();
+    targets.dedup();
+    // A scoped replica must not advance or reset the unrestricted rotation.
+    // Exact JSON is stable across replica/order changes and avoids hash collisions.
+    format!(
+        "{key}/scoped/{}",
+        serde_json::to_string(&targets).expect("string targets")
+    )
+}
+
 async fn tick(state: &Arc<MasterState>, now: i64) -> Result<usize, String> {
     if !enabled(&state.config) {
         return Ok(0);
@@ -95,10 +115,7 @@ async fn tick(state: &Arc<MasterState>, now: i64) -> Result<usize, String> {
     let Some(_operation) = state.admission.try_admit_named("wal_tail") else {
         return Ok(0);
     };
-    let key = format!(
-        "{}/wal-tail-cursor",
-        state.config.etcd.etcd_prefix.trim_end_matches('/')
-    );
+    let key = cursor_key(&state.config);
     let mut client = state.task_store.etcd_client().clone();
     let prior = client
         .get(key.as_str(), None)
@@ -254,6 +271,46 @@ mod tests {
             scanned_at: at,
             version: -1,
         }
+    }
+
+    #[test]
+    fn scoped_wal_admission_keeps_rotation_cursors_separate_and_stable() {
+        let mut cfg = config();
+        cfg.etcd.etcd_prefix = "/p/".into();
+        assert_eq!(cursor_key(&cfg), "/p/wal-tail-cursor");
+        cfg.merge_wal_admission_targets = vec!["b".into(), "a".into(), "a".into()];
+        let first = cursor_key(&cfg);
+        assert_ne!(first, "/p/wal-tail-cursor");
+        cfg.merge_wal_admission_targets = vec!["a".into(), "b".into()];
+        assert_eq!(first, cursor_key(&cfg));
+        cfg.merge_wal_admission_targets = vec!["other".into()];
+        assert_ne!(first, cursor_key(&cfg));
+    }
+
+    #[test]
+    fn scoped_wal_admission_filters_tail_candidates_under_global_fencing() {
+        let mut cfg = config();
+        cfg.merge_rollout.fence_legacy = true;
+        cfg.merge_wal_admission_targets = vec!["selected".into()];
+        assert_eq!(
+            candidates(
+                &cfg,
+                &[row("other", 1, 100), row("selected", 1, 100)],
+                None,
+                100
+            ),
+            vec!["selected"]
+        );
+        cfg.merge_wal_admission_targets.clear();
+        assert_eq!(
+            candidates(
+                &cfg,
+                &[row("other", 1, 100), row("selected", 1, 100)],
+                None,
+                100
+            ),
+            vec!["other", "selected"]
+        );
     }
 
     #[test]

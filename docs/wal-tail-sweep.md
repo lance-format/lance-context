@@ -19,7 +19,9 @@ Only positive counts below `MERGE_WAL_MIN_GENERATIONS` enter this rotation; hot
 work keeps the normal sweep. An ingestion/write/read hot path gains no new I/O.
 
 An etcd CAS reserves at most `MERGE_WAL_TAIL_BATCH_SIZE=16` candidates per
-fleet-wide 30-second batch, hard capped at 64. The durable name cursor prevents
+shared 30-second batch, hard capped at 64. The default unrestricted policy
+shares one fleet-wide rotation; each explicitly selected target scope has its
+own rotation and batch bound. The durable name cursor prevents
 busy early targets from hiding later targets and survives master replacement.
 The interval applies after the last page of a rotation; it is not an exact age
 measurement or a guaranteed completion deadline for every table. Existing task
@@ -39,3 +41,26 @@ This sweep covers low-count ordinary-worker WAL tails. It deliberately leaves
 externally registered persistent publisher lifecycle to its current owner; those
 tables need the separate desired-coverage migration before external babysitting
 can be retired. Bounded rolling metadata coverage remains required.
+
+## Selecting automatic admission targets
+
+`MERGE_WAL_ADMISSION_TARGETS=a,generic:b` restricts this master's count and tail
+admission thresholds to those exact targets. The default empty list preserves
+existing behavior. The selection applies to aggregate watermarks, early scan
+admission, periodic sweeps, and the stats-based tail rotation. Scans still observe
+other tables. Scoped tail rotations have separate durable cursors; scoped periodic
+policies elect separate owners. Target order and duplicates do not create new
+rotation or periodic-owner identities.
+
+This setting is independent of `MERGE_OWNED_TARGETS` and the durable legacy
+fencing mode. It does not change execution ownership, manual tasks, or recovery
+of already-published merge requests. Other masters' admission policies continue
+to apply, so this is not a fleet-wide deny list.
+
+During a mixed-version rollout, scoped thresholds are advertised separately and
+the legacy threshold fields are disabled for that member. Older aggregate
+leaders therefore ignore its scoped thresholds instead of applying them globally;
+their other policies and the member's execution capacity remain available.
+Upgrade the elected aggregate controller before relying on scoped watermark
+admission. Verify its actual member policy and selected/unselected behavior in
+an isolated, already-fenced environment before enabling it in production.
