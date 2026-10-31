@@ -43,6 +43,11 @@ impl DeferredFallbacks {
         self.wakes.first().map(|(at, _)| *at)
     }
 
+    pub(super) fn retain(&mut self, still_queued: impl Fn(&str) -> bool) {
+        self.deadlines.retain(|id, _| still_queued(id));
+        self.wakes.retain(|(_, id)| self.deadlines.contains_key(id));
+    }
+
     /// Bound a scheduler step even when many deadlines expire together. Keep
     /// the remembered deadline until queue deletion: unrelated Watch traffic
     /// or an unsuccessful offer must never restart the grace period.

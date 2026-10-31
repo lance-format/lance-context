@@ -168,6 +168,19 @@ struct Cache {
 }
 
 impl Cache {
+    fn replace_after_relist(&mut self, mut fresh: Self, prefix: &str) {
+        // A compacted Watch rebuilds the informer, not a queued task's grace.
+        // Preserve deadlines only for entries still present in the new List.
+        let queue = prefix_key(prefix, "queue");
+        let entries = &fresh.entries;
+        fresh
+            .placement
+            .inherit_fallbacks(&mut self.placement, |id| {
+                entries.contains_key(format!("{queue}{id}").as_bytes())
+            });
+        *self = fresh;
+    }
+
     fn new() -> Self {
         Self {
             entries: BTreeMap::new(),
@@ -780,8 +793,7 @@ async fn lead(state: &Arc<MasterState>, session: &CoordinationGuard) -> Result<(
         tracing::warn!(%failure, "demand watch reconnecting");
         tokio::time::sleep(RECONNECT).await;
         if failure == "compacted" || failure.contains("message length") {
-            cache = list(client, prefix).await?;
-            cache.placement.set_fallback_grace(fallback_grace);
+            cache.replace_after_relist(list(client, prefix).await?, prefix);
             resident_policies.send_replace(cache.resident_policies(prefix));
             place_more = true;
         }

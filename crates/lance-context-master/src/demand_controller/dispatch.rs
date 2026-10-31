@@ -484,6 +484,15 @@ impl Placement {
         self.fallback = fallback::DeferredFallbacks::new(grace);
     }
 
+    pub(super) fn inherit_fallbacks(
+        &mut self,
+        previous: &mut Self,
+        still_queued: impl Fn(&str) -> bool,
+    ) {
+        self.fallback = std::mem::take(&mut previous.fallback);
+        self.fallback.retain(still_queued);
+    }
+
     pub(super) fn next_fallback(&self) -> Option<tokio::time::Instant> {
         self.fallback.next_deadline().map(Into::into)
     }
@@ -861,6 +870,68 @@ pub(super) async fn recover(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    #[ignore = "requires isolated ETCD_TEST_ENDPOINTS"]
+    async fn relisting_preserves_fallback_deadlines_and_prunes_deleted_tasks() {
+        let (_dir, cfg, store, leader) = setup().await;
+        let publisher = store.discovery_publisher(&leader);
+        let keep = store
+            .enqueue(TaskKind::MergeWal, "keep", vec![])
+            .await
+            .unwrap();
+        let deleted = store
+            .enqueue(TaskKind::MergeWal, "deleted", vec![])
+            .await
+            .unwrap();
+        let ticket = store
+            .create_dispatch_ticket(
+                serde_json::to_vec(&Ticket::new(
+                    &cfg,
+                    "ordinary",
+                    "merge",
+                    TaskKinds::MERGE_WAL,
+                    false,
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let prefix = cfg.etcd.prefix();
+        let mut cache = list(store.etcd_client(), prefix).await.unwrap();
+        cache
+            .placement
+            .set_fallback_grace(Duration::from_millis(500));
+        assert!(!place(&publisher, prefix, &mut cache).await.unwrap());
+        let due = cache
+            .placement
+            .next_fallback()
+            .expect("deferred merge wake");
+        store
+            .etcd_client()
+            .clone()
+            .delete(
+                format!("{}{}", prefix_key(prefix, "queue"), deleted.id),
+                None,
+            )
+            .await
+            .unwrap();
+        // Use the real paged List and the same replacement path as a compacted
+        // Watch. Repeated rebuilds must not restart this queue entry's grace.
+        for _ in 0..3 {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            cache.replace_after_relist(list(store.etcd_client(), prefix).await.unwrap(), prefix);
+            assert_eq!(cache.placement.next_fallback(), Some(due));
+            assert!(!place(&publisher, prefix, &mut cache).await.unwrap());
+        }
+        tokio::time::sleep_until(due + Duration::from_millis(1)).await;
+        cache.placement.wake_fallbacks();
+        assert!(place(&publisher, prefix, &mut cache).await.unwrap());
+        assert_eq!(offer_for(&store, &cfg, &ticket).await.task_id, keep.id);
+        assert_eq!(cache.placement.next_fallback(), None);
+        store.release_coordination_lock(ticket).await.unwrap();
+        store.release_coordination_lock(leader).await.unwrap();
+    }
+
     #[tokio::test]
     #[ignore = "requires isolated ETCD_TEST_ENDPOINTS"]
     async fn grace_timer_falls_back_without_watch_writes_and_keeps_maintenance_moving() {
