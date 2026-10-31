@@ -21,7 +21,7 @@ use tokio::sync::Semaphore;
 use crate::scanner::ScanKind;
 use crate::state::MasterState;
 
-/// Manifest reads for every shard plus one etcd put per shard.
+/// Manifest reads, bounded batches of etcd reads, and per-changed-shard CAS.
 const SCAN_PUBLISH_TIMEOUT: Duration = Duration::from_secs(15);
 
 static SCAN_PUBLISH_SLOTS: std::sync::LazyLock<Arc<Semaphore>> =
@@ -88,9 +88,9 @@ pub(crate) async fn spawn_scan_demand(
             };
             let coordinator = state.task_store.merge_coordinator();
             let now_ms = chrono::Utc::now().timestamp_millis();
-            let mut written = 0usize;
-            for mark in marks {
-                let event = DemandEvent {
+            let events: Vec<_> = marks
+                .into_iter()
+                .map(|mark| DemandEvent {
                     v: SCHEMA_VERSION,
                     shard: mark.shard_id.to_string(),
                     sealed_through: mark.sealed_through,
@@ -101,12 +101,9 @@ pub(crate) async fn spawn_scan_demand(
                     source: EventSource::Scan,
                     merged_epoch: None,
                     sealed_times: Default::default(),
-                };
-                if coordinator.publish_demand_event(&target, &event).await? {
-                    written += 1;
-                }
-            }
-            Ok::<usize, String>(written)
+                })
+                .collect();
+            coordinator.publish_demand_events(&target, &events).await
         })
         .await;
         let label = match result {
