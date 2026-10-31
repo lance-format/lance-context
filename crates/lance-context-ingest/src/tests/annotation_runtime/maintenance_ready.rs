@@ -2,6 +2,8 @@ use super::*;
 use lance::index::DatasetIndexExt;
 use std::collections::BTreeSet;
 
+mod status_batching;
+
 async fn apply(
     runtime: &mut Runtime,
     service: &Service,

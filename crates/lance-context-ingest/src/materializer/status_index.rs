@@ -10,6 +10,9 @@ const FAN_IN: usize = 4;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct StatusIndex {
+    /// Defer smaller status-only builds while an annotation batch is ready.
+    /// Idle owners still index a smaller tail without another write.
+    pub min_rows: usize,
     /// Physical input bytes per native merge, including masked old values.
     /// This bounds admitted I/O, not native allocator use or total index size.
     pub max_merge_bytes: u64,
@@ -18,6 +21,7 @@ pub struct StatusIndex {
 impl Default for StatusIndex {
     fn default() -> Self {
         Self {
+            min_rows: 64 << 10,
             max_merge_bytes: 64 << 20,
         }
     }
@@ -26,7 +30,8 @@ impl Default for StatusIndex {
 impl StatusIndex {
     pub(super) fn validate(&self, budget: usize) -> Result<()> {
         ensure!(
-            (1 << 20..=1 << 30).contains(&self.max_merge_bytes)
+            (1..=turn_id_index::MAX_BUILD_ROWS).contains(&self.min_rows)
+                && (1 << 20..=1 << 30).contains(&self.max_merge_bytes)
                 && budget >= session_index::WORKSPACE,
             "invalid status index merge budget or insufficient workspace"
         );
@@ -64,7 +69,7 @@ impl StatusIndex {
         Ok(None)
     }
 
-    async fn action(&self, dataset: &Dataset) -> Result<Option<Action>> {
+    async fn action(&self, dataset: &Dataset, min_rows: usize) -> Result<Option<Action>> {
         TurnIdIndex::validate_base(dataset)?;
         let fragments: BTreeMap<_, _> = dataset
             .fragments()
@@ -117,7 +122,7 @@ impl StatusIndex {
         // Even a single idle update must catch up without another write to
         // invalidate the owner's cached no-work decision for this version.
         Ok(
-            (!selected.is_empty()).then_some(if empty_sources.is_empty() {
+            (rows >= min_rows || selected.len() == 128).then_some(if empty_sources.is_empty() {
                 Action::Build(selected)
             } else {
                 Action::BuildReplacingEmpty {
@@ -130,11 +135,26 @@ impl StatusIndex {
 }
 
 pub(crate) async fn has_work(publisher: &Publisher, version: u64) -> Result<bool> {
+    has_work_with_minimum(publisher, version, false).await
+}
+
+pub(super) async fn has_batched_work(publisher: &Publisher, version: u64) -> Result<bool> {
+    has_work_with_minimum(publisher, version, true).await
+}
+
+async fn has_work_with_minimum(
+    publisher: &Publisher,
+    version: u64,
+    batching: bool,
+) -> Result<bool> {
     let Some(options) = &publisher.options.status_index else {
         return Ok(false);
     };
     let dataset = compaction::read_compaction_base(publisher, version).await?;
-    Ok(options.action(&dataset).await?.is_some())
+    Ok(options
+        .action(&dataset, if batching { options.min_rows } else { 1 })
+        .await?
+        .is_some())
 }
 
 pub(super) async fn plan(publisher: &Publisher, view: &p::Table) -> Result<Option<p::Plan>> {
@@ -156,7 +176,7 @@ pub(super) async fn prepare(
         return Ok(None);
     };
     let dataset = compaction::read_compaction_base(publisher, pending.plan.read_version).await?;
-    let Some(action) = options.action(&dataset).await? else {
+    let Some(action) = options.action(&dataset, 1).await? else {
         return Ok(None);
     };
     Ok(Some(
@@ -194,6 +214,7 @@ mod tests {
     fn status_merge_charges_masked_physical_files_and_rejects_unknown_costs() -> Result<()> {
         let options = StatusIndex {
             max_merge_bytes: 1 << 20,
+            ..Default::default()
         };
         let large = segment(1, 8 << 20);
         let small = (2..=5).map(|id| segment(id, 64 << 10)).collect::<Vec<_>>();

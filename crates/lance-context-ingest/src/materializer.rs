@@ -474,6 +474,12 @@ impl Publisher {
             || status_index::has_work(self, version).await?)
     }
 
+    pub(crate) async fn has_ready_annotation_maintenance_work(&self, version: u64) -> Result<bool> {
+        Ok(turn_id_index::has_work(self, version).await?
+            || status_index::has_batched_work(self, version).await?
+            || compaction::has_work(self, version).await?)
+    }
+
     pub(crate) fn compaction_first(read_version: u64) -> bool {
         // During backlog, each append/maintenance pair advances two versions.
         // Rotate from durable state so takeover cannot reset the preference.
