@@ -55,7 +55,8 @@ async fn observe(pressure: Pressure) -> Result<()> {
                     group,
                     message: message.clone(),
                 },
-                _credit: Some(credits.reserve(charge)?),
+                // Runtime admission adds its own per-frame overhead.
+                _credit: Some(credits.reserve(message.compute_size() as usize)?),
                 image: None,
                 snapshot_feedback: None,
             })
