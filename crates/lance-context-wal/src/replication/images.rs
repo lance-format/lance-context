@@ -1,21 +1,25 @@
 use super::*;
 use checkpoint::{Cut, Image, Loaded, Part};
 use raft_proto::eraftpb::Snapshot;
+#[cfg(not(feature = "runtime"))]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Mutex, Weak,
-    },
+    sync::{Mutex, Weak},
 };
+#[cfg(feature = "runtime")]
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 mod collection;
 pub use collection::{ImageCollection, ImageCollectionProgress};
 
 pub(super) struct Owner {
     directory: PathBuf,
+    #[cfg(not(feature = "runtime"))]
     busy: AtomicBool,
+    #[cfg(feature = "runtime")]
+    slot: Arc<Semaphore>,
     groups: BTreeSet<u64>,
     registry: Mutex<Registry>,
     // Images keep this owner alive. Its engine lock excludes a new incarnation
@@ -44,7 +48,10 @@ impl Owner {
     pub fn new(directory: &Path, groups: BTreeSet<u64>, store: GroupLog) -> Result<Arc<Self>> {
         Ok(Arc::new(Self {
             directory: directory.canonicalize()?,
+            #[cfg(not(feature = "runtime"))]
             busy: AtomicBool::new(false),
+            #[cfg(feature = "runtime")]
+            slot: Arc::new(Semaphore::new(1)),
             groups,
             registry: Mutex::new(Registry::default()),
             store,
@@ -83,13 +90,44 @@ impl Owner {
         Ok(())
     }
     fn acquire(self: &Arc<Self>) -> Result<Permit> {
-        self.busy
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| anyhow::anyhow!("node image builder/receiver busy"))?;
-        Ok(Permit(self.clone()))
+        #[cfg(feature = "runtime")]
+        {
+            let slot = self
+                .slot
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| anyhow::anyhow!("node image builder/receiver busy"))?;
+            Ok(Permit(self.clone(), slot))
+        }
+        #[cfg(not(feature = "runtime"))]
+        {
+            self.busy
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .map_err(|_| anyhow::anyhow!("node image builder/receiver busy"))?;
+            Ok(Permit(self.clone()))
+        }
+    }
+
+    // Called only by admitted snapshot connections, under their existing whole
+    // transfer deadline. Waiting owns no control credit, file or disk charge.
+    #[cfg(feature = "peer-transport")]
+    pub(super) async fn acquire_snapshot(self: &Arc<Self>) -> Result<Permit> {
+        let slot = self
+            .slot
+            .clone()
+            .acquire_owned()
+            .await
+            .context("node image slot closed")?;
+        Ok(Permit(self.clone(), slot))
     }
 }
-struct Permit(Arc<Owner>);
+pub(super) struct Permit(
+    Arc<Owner>,
+    #[cfg(feature = "runtime")]
+    #[allow(dead_code)]
+    OwnedSemaphorePermit,
+);
+#[cfg(not(feature = "runtime"))]
 impl Drop for Permit {
     fn drop(&mut self) {
         self.0.busy.store(false, Ordering::Release);
@@ -328,8 +366,21 @@ impl Node {
     }
 
     pub fn receive_snapshot(&self, packet: Packet, local_id: Uuid) -> Result<SnapshotReceiver> {
-        let sizes = self.snapshot_sizes(&packet)?;
         let permit = self.images.acquire()?;
+        self.receive_snapshot_admitted(packet, local_id, permit)
+    }
+
+    pub(super) fn receive_snapshot_admitted(
+        &self,
+        packet: Packet,
+        local_id: Uuid,
+        permit: Permit,
+    ) -> Result<SnapshotReceiver> {
+        ensure!(
+            Arc::ptr_eq(&permit.0, &self.images),
+            "foreign node image worker"
+        );
+        let sizes = self.snapshot_sizes(&packet)?;
         let disk = self
             .images
             .store
