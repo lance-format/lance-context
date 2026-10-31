@@ -100,6 +100,13 @@ pub struct Statistics {
     pub sent_frames: AtomicU64,
     pub received_frames: AtomicU64,
     pub dropped_outbound: AtomicU64,
+    /// Normal peer frames rejected at enqueue, excluding snapshot routing,
+    /// exchange failures and packets discarded during reconnect. These relaxed
+    /// counters are sampled independently of the aggregate drop counter.
+    pub enqueue_not_ready: AtomicU64,
+    pub enqueue_byte_capacity: AtomicU64,
+    pub enqueue_queue_full: AtomicU64,
+    pub enqueue_queue_closed: AtomicU64,
     pub rejected_connections: AtomicU64,
     pub failed_exchanges: AtomicU64,
     pub rejected_packets: AtomicU64,
@@ -264,20 +271,36 @@ struct Route {
     bytes: Arc<Semaphore>,
 }
 impl Route {
-    fn enqueue(&self, packet: Outbound) -> bool {
+    fn enqueue(&self, packet: Outbound, statistics: &Statistics) -> bool {
         if !self.ready.load(Ordering::Acquire) {
+            statistics.enqueue_not_ready.fetch_add(1, Ordering::Relaxed);
             return false;
         }
         let size = packet.packet().message.compute_size().saturating_add(256);
         let Ok(bytes) = self.bytes.clone().try_acquire_many_owned(size) else {
+            statistics
+                .enqueue_byte_capacity
+                .fetch_add(1, Ordering::Relaxed);
             return false;
         };
-        self.send
-            .try_send(Queued {
-                packet,
-                _bytes: bytes,
-            })
-            .is_ok()
+        match self.send.try_send(Queued {
+            packet,
+            _bytes: bytes,
+        }) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                statistics
+                    .enqueue_queue_full
+                    .fetch_add(1, Ordering::Relaxed);
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                statistics
+                    .enqueue_queue_closed
+                    .fetch_add(1, Ordering::Relaxed);
+                false
+            }
+        }
     }
 }
 
@@ -297,7 +320,7 @@ async fn dispatch(
                     snapshots.get().is_some_and(|route| route.enqueue(packet))
                 } else {
                     routes.get(&packet.packet().message.to)
-                        .is_some_and(|route| route.enqueue(packet))
+                        .is_some_and(|route| route.enqueue(packet, &statistics))
                 };
                 if !sent { statistics.dropped_outbound.fetch_add(1, Ordering::Relaxed); }
             }

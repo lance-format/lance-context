@@ -167,6 +167,10 @@ async fn run_cluster(f: &Fixture) -> Result<()> {
     assert!(poll["engine"]["sync_micros"].as_u64().unwrap() > 0);
     for field in [
         "peer_dropped_outbound",
+        "peer_enqueue_not_ready",
+        "peer_enqueue_byte_capacity",
+        "peer_enqueue_queue_full",
+        "peer_enqueue_queue_closed",
         "peer_failed_exchanges",
         "peer_rejected_connections",
         "peer_rejected_packets",
