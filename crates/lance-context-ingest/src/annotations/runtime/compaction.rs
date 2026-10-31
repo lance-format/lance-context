@@ -13,11 +13,15 @@ impl Publisher {
                 return Ok(false);
             }
         } else {
+            let source = self.service.source_observation();
             // The first annotation publication installs the durable cut/result
             // checkpoint. Spend at most the existing batch-wait window starting
             // further rewrites between publications. This reduces the fragment
             // fanout of subsequent narrow updates without an unbounded burst.
             // A retained plan always resolves above; idle maintenance may drain.
+            // After one maintenance turn, a ready or pressured source batch
+            // takes the next turn. The first maintenance after a data publication
+            // remains eligible, so continuous writes still advance maintenance.
             if (self.options.compaction.is_none()
                 && self.options.turn_id_index.is_none()
                 && self.options.status_index.is_none())
@@ -28,15 +32,19 @@ impl Publisher {
                     .copied()
                     .unwrap_or(0)
                     == 0
-                || (self.service.source_observation().records != 0
+                || (source.records != 0
                     && !view
                         .progress
                         .advanced
                         .as_ref()
                         .is_some_and(|a| !a.sources.is_empty())
-                    && self.compaction_started.is_none_or(|started| {
-                        started.elapsed() >= self.options.max_batch_wait.min(Duration::from_secs(1))
-                    }))
+                    && (source.bytes >= self.options.min_source_bytes as u64
+                        || source.records >= self.options.max_records
+                        || self.service.apply_backpressure().is_some()
+                        || self.compaction_started.is_none_or(|started| {
+                            started.elapsed()
+                                >= self.options.max_batch_wait.min(Duration::from_secs(1))
+                        })))
             {
                 return Ok(false);
             }

@@ -17,6 +17,7 @@ mod lost_advance;
 mod lost_plan;
 #[cfg(feature = "service")]
 pub(super) mod lost_prepare;
+mod maintenance_ready;
 mod open;
 
 #[cfg(unix)]

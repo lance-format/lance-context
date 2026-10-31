@@ -42,6 +42,16 @@ struct Publisher {
 }
 
 impl Runtime {
+    #[cfg(test)]
+    pub(crate) async fn apply_once_for_test(&mut self) -> Result<()> {
+        self.driver.step_for_test().await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn publish_once_for_test(&mut self) -> Result<()> {
+        self.publisher.publish_next().await
+    }
+
     /// Enable data/manifest/transaction collection for an exclusively owned, unbranched
     /// table (both destinations for mixed ingestion). Readers must check ownership after materializing their response,
     /// as the annotation HTTP Owner does. Independently served Services, raw
