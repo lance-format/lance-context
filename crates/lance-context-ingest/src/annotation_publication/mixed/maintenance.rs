@@ -83,12 +83,15 @@ pub(super) async fn validate(
     let (scope, through): (Scope, u64) = serde_json::from_str(cut)?;
     ensure!(
         scope.table_instance == selection.incarnation.to_string()
-            && scope.source_group == selection.pending.plan.next_group
-            && scope.shard == 0
+            && scope.source_group > 0
+            && scope.shard < 65_536
             && through > 0
             && through < u64::MAX,
         "foreign body maintenance cut"
     );
+    // Only the body reference may change. The selected base's source group,
+    // bucket, cut and request results remain identical. next_group is a plan
+    // scheduling cursor and may differ in an already retained maintenance plan.
     crate::annotations::checkpoint::Snapshot::decode(
         properties
             .get(RESULTS_PROPERTY)

@@ -28,7 +28,7 @@ pub(super) async fn verify(
         annotations::resolve_transaction(base, &inline, &selection, storage).await?,
         expected
     );
-    for alteration in 0..5 {
+    for alteration in 0..8 {
         let mut changed = expected.clone();
         match alteration {
             0 => changed.uuid = Uuid::new_v4().to_string(),
@@ -37,6 +37,20 @@ pub(super) async fn verify(
             3 => {
                 Arc::make_mut(changed.transaction_properties.as_mut().unwrap())
                     .remove(lance_context_core::annotation_staging::RESULTS_PROPERTY);
+            }
+            4..=6 => {
+                let properties = Arc::make_mut(changed.transaction_properties.as_mut().unwrap());
+                let (mut scope, through): (AnnotationScope, u64) =
+                    serde_json::from_str(&properties["lance-context.annotation-cut"])?;
+                match alteration {
+                    4 => scope.shard += 1,
+                    5 => scope.source_group += 1,
+                    _ => scope.table_instance = Uuid::new_v4().to_string(),
+                }
+                properties.insert(
+                    "lance-context.annotation-cut".into(),
+                    serde_json::to_string(&(scope, through))?,
+                );
             }
             _ => {
                 changed.operation = lance::dataset::transaction::Operation::Append {

@@ -175,7 +175,7 @@ pub(crate) async fn plan(publisher: &Publisher, view: &p::Table) -> Result<Optio
         transaction: Uuid::new_v4(),
         read_version: version,
         sources: BTreeMap::new(),
-        next_group: *publisher.ingress.layout.groups.keys().next().unwrap(),
+        next_group: publisher.maintenance_group()?,
     }))
 }
 

@@ -182,6 +182,7 @@ pub(super) async fn plan(publisher: &Publisher, view: &p::Table) -> Result<Optio
         return Ok(None);
     };
     let version = view.progress.minimum_read_version;
+    let next_group = publisher.maintenance_group()?;
     let dataset = publisher.read_dataset(Some(version)).await?;
     if options.action(&dataset).await?.is_none() {
         return Ok(None);
@@ -190,7 +191,7 @@ pub(super) async fn plan(publisher: &Publisher, view: &p::Table) -> Result<Optio
         transaction: Uuid::new_v4(),
         read_version: version,
         sources: BTreeMap::new(),
-        next_group: *publisher.ingress.layout.groups.keys().next().unwrap(),
+        next_group,
     }))
 }
 

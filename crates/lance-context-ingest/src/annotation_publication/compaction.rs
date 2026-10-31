@@ -64,12 +64,15 @@ pub(super) async fn validate(
     )?;
     ensure!(
         scope.table_instance == selection.incarnation.to_string()
-            && scope.source_group == selection.pending.plan.next_group
-            && scope.shard == 0
+            && scope.source_group > 0
+            && scope.shard < 65_536
             && through > 0
             && through < u64::MAX,
         "foreign narrow maintenance cut"
     );
+    // The exact selected base properties above bind the source group and bucket.
+    // An empty-source plan's next_group is a scheduling cursor, not the cut's
+    // identity; retained plans may have the layout's first group as that cursor.
     crate::annotations::checkpoint::Snapshot::decode(
         old.get(RESULTS_PROPERTY)
             .context("narrow maintenance dropped request results")?,

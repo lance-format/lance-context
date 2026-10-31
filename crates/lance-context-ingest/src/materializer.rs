@@ -421,6 +421,25 @@ impl Publisher {
         );
         Ok(self.state().await?.progress.prepared)
     }
+    fn maintenance_group(&self) -> Result<u64> {
+        if matches!(
+            self.ingress.scope.contract.policy,
+            WritePolicy::TurnAnnotations | WritePolicy::TurnIngestion
+        ) {
+            let bucket = crate::annotations::Shard::from_ingress(&self.ingress)?
+                .map_or(0, |shard| shard.bucket);
+            self.ingress.group(bucket)
+        } else {
+            self.ingress
+                .layout
+                .groups
+                .keys()
+                .next()
+                .copied()
+                .context("maintenance layout has no source group")
+        }
+    }
+
     pub(crate) async fn maintenance_plan(&self, view: &p::Table) -> Result<Option<p::Plan>> {
         if Self::compaction_first(view.progress.minimum_read_version) {
             if let Some(plan) = compaction::plan(self, view).await? {
