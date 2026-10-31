@@ -105,6 +105,15 @@ can overlap runtime rejection counters. These counters are sampled independently
 on process restart. They describe transport events, so they cannot be added to
 HTTP retry counts or interpreted as lost acknowledged records.
 
+Normal peer-frame enqueue failures additionally report the first failed gate:
+`peer_enqueue_not_ready`, `peer_enqueue_byte_capacity`, `peer_enqueue_queue_full`
+or `peer_enqueue_queue_closed`. Destination byte credits cover both queued and
+actively transmitting frames. These counters distinguish byte pressure from
+message-count pressure; they exclude snapshot dispatch, failed exchanges and
+queued frames discarded on reconnect. Each rejected enqueue also contributes to
+`peer_dropped_outbound`, but independently sampled counters are not an atomic
+partition of that broader total.
+
 The `appends` counters distinguish disk-budget refusal, runtime request/byte
 credits, queue unavailability, pending-proposal capacity, leadership changes,
 committed capacity/sequence rejections, and stopped workers. They use typed
