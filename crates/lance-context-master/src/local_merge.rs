@@ -4,6 +4,12 @@ use std::sync::Arc;
 
 #[derive(Clone, Debug, Default, clap::Args)]
 pub struct LocalMergeConfig {
+    /// Briefly defer ordinary merge offers so resident capacity can rearm.
+    /// Zero preserves immediate fallback. Does not reserve capacity or delay
+    /// an eligible resident offer, compaction, or indexing.
+    #[arg(long, env = "RESIDENT_OFFER_GRACE_MS", default_value_t = 0,
+          value_parser = clap::value_parser!(u64).range(0..=1000))]
+    pub resident_offer_grace_ms: u64,
     /// Route new rollout/generic demand to resident masters without a static
     /// table allowlist. Enable only after every legacy writer/helper has drained
     /// and all participants use persistent fenced admission. This flag is not
