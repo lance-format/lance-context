@@ -14,6 +14,8 @@ use crate::{
 
 const DEADLINE: Duration = Duration::from_secs(30);
 
+mod compaction;
+
 pub(super) struct Physical {
     pub(super) shard: Shard,
     pub(super) binding: TableBinding,
@@ -28,8 +30,17 @@ impl Physical {
         root: &std::path::Path,
         bucket: u32,
     ) -> Result<Self> {
+        Self::provision_with_binding(c, layout, root, bucket, binding()).await
+    }
+
+    async fn provision_with_binding(
+        c: &network::Cluster,
+        layout: &Arc<Layout>,
+        root: &std::path::Path,
+        bucket: u32,
+        mut binding: TableBinding,
+    ) -> Result<Self> {
         let shard = Shard { bucket };
-        let mut binding = binding();
         binding.table = Uuid::new_v4();
         binding.incarnation = Uuid::new_v4();
         binding.destination.dataset = format!("shard-{bucket}.lance");

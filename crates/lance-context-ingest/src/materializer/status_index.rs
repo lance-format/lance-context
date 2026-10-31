@@ -139,11 +139,12 @@ pub(crate) async fn has_work(publisher: &Publisher, version: u64) -> Result<bool
 
 pub(super) async fn plan(publisher: &Publisher, view: &p::Table) -> Result<Option<p::Plan>> {
     let version = view.progress.minimum_read_version;
+    let next_group = publisher.maintenance_group()?;
     Ok(has_work(publisher, version).await?.then(|| p::Plan {
         transaction: Uuid::new_v4(),
         read_version: version,
         sources: BTreeMap::new(),
-        next_group: *publisher.ingress.layout.groups.keys().next().unwrap(),
+        next_group,
     }))
 }
 
