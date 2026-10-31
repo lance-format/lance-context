@@ -77,6 +77,21 @@ async fn resume(stage: u8) -> Result<()> {
             .prepare_mixed(&MergeMemoryBudget::new(8 << 20), 8192)
             .await?;
         assert_eq!(repeated.annotations().merge().transaction, transaction);
+        // Reusing a frozen preparation must not write or commit its body again.
+        // These observations come from real native Lance operations above.
+        for (name, count) in [
+            ("annotation_body_prepare", 1),
+            ("annotation_body_write", 1),
+            ("annotation_body_commit", 1),
+            ("annotation_narrow_prepare", 2),
+        ] {
+            let observations = a.phase_observation();
+            let phase = observations.iter().find(|p| p.phase == name).unwrap();
+            assert_eq!(phase.started, count, "{name}");
+            assert_eq!(phase.completed, count, "{name}");
+            assert_eq!(phase.failed, 0, "{name}");
+            assert_eq!(phase.cancelled, 0, "{name}");
+        }
         let descriptors = crate::annotation_publication::mixed::persist_descriptors(
             prepared.annotations(),
             &selection,

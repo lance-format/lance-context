@@ -82,7 +82,11 @@ async fn exercise() -> Result<()> {
     let (ga, a) = frontend(&c, &limits, &server.uri()).await?;
     let (gb, b) = frontend(&c, &limits, &server.uri()).await?;
     let client = reqwest::Client::builder()
-        .http1_only()
+        // Preserve an early refusal while the upload is still in flight on
+        // both hops. HTTP/1 can close before delivering that response, which
+        // is an unknown transport outcome, not a lost forwarding header.
+        .http2_prior_knowledge()
+        .retry(reqwest::retry::never())
         .timeout(Duration::from_secs(30))
         .build()?;
     let p = open(&client, &a, 1).await?;

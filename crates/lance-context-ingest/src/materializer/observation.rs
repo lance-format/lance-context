@@ -54,8 +54,16 @@ pub enum Phase {
     AnnotationCommitSelect,
     /// Durably confirming the already selected target in the WAL catalog.
     AnnotationCommitConfirm,
+    /// Preparing the immutable body branch, including its workspace and snapshot.
+    AnnotationBodyPrepare,
+    /// Writing native body fragments inside mixed publication preparation.
+    AnnotationBodyWrite,
+    /// Committing the private detached body branch before narrow publication.
+    AnnotationBodyCommit,
+    /// Preparing the frozen narrow annotations against that body snapshot.
+    AnnotationNarrowPrepare,
 }
-const NAMES: [&str; 31] = [
+const NAMES: [&str; 35] = [
     "claim",
     "acquire",
     "state",
@@ -87,6 +95,10 @@ const NAMES: [&str; 31] = [
     "annotation_commit_publish",
     "annotation_commit_select",
     "annotation_commit_confirm",
+    "annotation_body_prepare",
+    "annotation_body_write",
+    "annotation_body_commit",
+    "annotation_narrow_prepare",
 ];
 pub const PHASE_COUNT: usize = NAMES.len();
 
@@ -100,8 +112,13 @@ struct Counter {
     max_elapsed_micros: AtomicU64,
 }
 
-#[derive(Default)]
 pub struct Counters([Counter; PHASE_COUNT]);
+
+impl Default for Counters {
+    fn default() -> Self {
+        Self(std::array::from_fn(|_| Counter::default()))
+    }
+}
 
 /// Each field is sampled independently. Parent phases contain child phases;
 /// concurrent phase times overlap and must not be summed into elapsed or CPU time.
@@ -116,6 +133,15 @@ pub struct Observation {
     pub elapsed_micros: u64,
     /// Longest finished interval, including failed/cancelled work.
     pub max_elapsed_micros: u64,
+}
+
+// Serde implements fixed arrays only through length 32. Serialize the bounded
+// observation array as a slice without allocating or changing its JSON shape.
+pub fn serialize_observations<S: serde::Serializer>(
+    observations: &[Observation; PHASE_COUNT],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    observations.as_slice().serialize(serializer)
 }
 
 impl Counters {
