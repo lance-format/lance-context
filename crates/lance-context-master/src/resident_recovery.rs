@@ -2,7 +2,7 @@
 //! A durable fleet cursor bounds metadata reads even when masters are scaled up.
 use crate::{config::MasterConfig, state::MasterState, stats_store::StatRow};
 use etcd_client::{Compare, CompareOp, Txn, TxnOp};
-use futures::{stream, StreamExt};
+use futures::{stream, StreamExt, TryStreamExt};
 use lance_context_api::TaskKind;
 use lance_context_core::rollout_append::has_sealed_wal;
 use serde::{Deserialize, Serialize};
@@ -48,6 +48,7 @@ fn enabled(config: &MasterConfig) -> bool {
         && config.merge_wal_interval_secs > 0
 }
 
+#[cfg(test)]
 fn candidates(config: &MasterConfig, snapshot: &[StatRow], after: Option<&str>) -> Vec<String> {
     // Explicitly owned tables do not depend on scanner freshness or existence.
     // Wildcard installations additionally use known names from the stats cache;
@@ -73,43 +74,219 @@ fn candidates(config: &MasterConfig, snapshot: &[StatRow], after: Option<&str>) 
     names
 }
 
-pub(crate) fn spawn(state: &Arc<MasterState>) {
-    if !enabled(&state.config) {
-        return;
+/// Discovery policy carried by the existing leased controller membership.
+/// Executors advertise it once; only the elected controller probes WAL metadata.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct Policy {
+    root: String,
+    owned: Vec<String>,
+    draining: Vec<String>,
+    append: Vec<String>,
+    local: Vec<String>,
+    automatic: bool,
+    shards: Vec<String>,
+    interval_secs: u64,
+    cursor: u64,
+}
+
+impl Policy {
+    pub(crate) fn from_config(config: &MasterConfig) -> Option<Self> {
+        let sorted = |values: &[String]| {
+            let mut values = values.to_vec();
+            values.sort_unstable();
+            values.dedup();
+            values
+        };
+        enabled(config).then(|| Self {
+            root: config.data_dir.clone(),
+            owned: sorted(&config.merge_rollout.owned_targets),
+            draining: sorted(&config.merge_rollout.drain_targets),
+            append: if config.append.rollout_append_local {
+                sorted(&config.append.rollout_append_targets)
+            } else {
+                Vec::new()
+            },
+            local: sorted(&config.local_merge.master_local_merge_targets),
+            automatic: config.local_merge.master_local_merge_auto
+                && config.merge_rollout.fence_legacy,
+            shards: sorted(&config.catchup.shards),
+            interval_secs: config
+                .append
+                .rollout_append_reconcile_interval_secs
+                .clamp(30, 86_400),
+            cursor: scope(config),
+        })
     }
-    let weak = Arc::downgrade(state);
-    tokio::spawn(async move {
-        loop {
-            let Some(state) = weak.upgrade() else { return };
-            // Also bound etcd waits. Dropping this read-only discovery never
-            // cancels a writer or authorizes a replacement execution.
+
+    fn selected(&self, target: &str) -> bool {
+        let dynamic = self.automatic
+            && !target.starts_with("datagen:")
+            && lance_context_core::validate_store_name(
+                target.strip_prefix("generic:").unwrap_or(target),
+            )
+            .is_ok();
+        (self.owned.iter().any(|t| t == target) || dynamic)
+            && !self.draining.iter().any(|t| t == target)
+            && (self.local.iter().any(|t| t == "*" || t == target)
+                || (!target.starts_with("generic:")
+                    && self.append.iter().any(|t| t == "*" || t == target)))
+    }
+
+    fn candidates(
+        &self,
+        snapshot: &[StatRow],
+        known: &[String],
+        after: Option<&str>,
+    ) -> Vec<String> {
+        let mut names: Vec<_> = self
+            .owned
+            .iter()
+            .chain(&self.append)
+            .chain(&self.local)
+            .map(String::as_str)
+            .chain(snapshot.iter().map(|r| r.name.as_str()))
+            .chain(known.iter().map(String::as_str))
+            .filter(|name| *name != "*" && self.selected(name) && after.is_none_or(|a| *name > a))
+            .map(str::to_owned)
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        names.truncate(BATCH + 1);
+        names
+    }
+}
+
+/// A leader need not be the stats scanner. Restore names from the persisted
+/// stats dataset using a bounded name-only projection, never cached WAL counts.
+/// Keep one root at a time; ordinary repeated ticks use this local view.
+#[derive(Default)]
+struct Catalog {
+    root: String,
+    checked: Option<tokio::time::Instant>,
+    names: Vec<String>,
+}
+
+impl Catalog {
+    async fn refresh(&mut self, policy: &Policy) -> Result<(), String> {
+        if self.root != policy.root {
+            self.root = policy.root.clone();
+            self.checked = None;
+            self.names.clear();
+        }
+        if !policy.automatic
+            || self
+                .checked
+                .is_some_and(|at| at.elapsed() < Duration::from_secs(300))
+        {
+            return Ok(());
+        }
+        self.checked = Some(tokio::time::Instant::now());
+        let result = tokio::time::timeout(PROBE_TIMEOUT, catalog_names(&policy.root))
+            .await
+            .map_err(|_| "resident catalog read timed out".to_string())?;
+        self.names = result?;
+        Ok(())
+    }
+}
+
+async fn catalog_names(root: &str) -> Result<Vec<String>, String> {
+    let uri = format!("{}/_stats.rollout.lance", root.trim_end_matches('/'));
+    let dataset = lance::Dataset::open(&uri)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut scan = dataset.scan();
+    scan.project(&["name"]).map_err(|e| e.to_string())?;
+    scan.batch_size(256);
+    let mut batches = scan.try_into_stream().await.map_err(|e| e.to_string())?;
+    let mut names = std::collections::BTreeSet::new();
+    let mut bytes = 0usize;
+    while let Some(batch) = batches.try_next().await.map_err(|e| e.to_string())? {
+        let column = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .ok_or("invalid resident catalog name column")?;
+        for name in column.iter().flatten() {
+            if names.insert(name.to_string()) {
+                bytes = bytes.saturating_add(name.len());
+            }
+            if names.len() > 100_000 || bytes > 8 * 1024 * 1024 {
+                return Err("resident catalog name budget exceeded".into());
+            }
+        }
+    }
+    Ok(names.into_iter().collect())
+}
+
+/// Runs inside the demand leader's lifetime, concurrently with dispatch. Slow
+/// object storage must not block task placement or consumption of watch events.
+pub(crate) async fn run(
+    state: &Arc<MasterState>,
+    owner: &crate::task_store::CoordinationGuard,
+    mut policies: tokio::sync::watch::Receiver<Vec<Policy>>,
+) {
+    let mut next = 0usize;
+    let mut catalog = Catalog::default();
+    loop {
+        let current = policies.borrow_and_update().clone();
+        if !current.is_empty() {
+            next %= current.len();
+            let policy = &current[next];
+            if let Err(error) = catalog.refresh(policy).await {
+                tracing::warn!(%error, "resident catalog refresh failed; retaining known names");
+            }
             match tokio::time::timeout(
                 Duration::from_secs(25),
-                tick(&state, chrono::Utc::now().timestamp_millis()),
+                tick_policy(
+                    state,
+                    policy,
+                    &catalog.names,
+                    Some(owner),
+                    chrono::Utc::now().timestamp_millis(),
+                ),
             )
             .await
             {
-                Ok(Ok(_)) => {}
-                outcome => tracing::warn!(?outcome, "resident WAL demand discovery incomplete"),
+                Ok(Ok(Some(_))) => next += 1,
+                Ok(Ok(None)) => {} // The fleet gate is not due; preserve policy fairness.
+                outcome => {
+                    next += 1;
+                    tracing::warn!(?outcome, "leader resident WAL discovery incomplete");
+                }
             }
-            drop(state);
-            tokio::time::sleep(Duration::from_secs(5)).await;
         }
-    });
+        tokio::select! {
+            changed = policies.changed() => if changed.is_err() { return; },
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {},
+        }
+    }
 }
 
+#[cfg(test)]
 async fn tick(state: &Arc<MasterState>, now: i64) -> Result<usize, String> {
-    if !enabled(&state.config) {
+    let Some(policy) = Policy::from_config(&state.config) else {
         return Ok(0);
-    }
+    };
+    tick_policy(state, &policy, &[], None, now)
+        .await
+        .map(|result| result.unwrap_or(0))
+}
+
+async fn tick_policy(
+    state: &Arc<MasterState>,
+    policy: &Policy,
+    known: &[String],
+    owner: Option<&crate::task_store::CoordinationGuard>,
+    now: i64,
+) -> Result<Option<usize>, String> {
     let Some(_admission) = state.admission.try_admit_named("resident_discovery") else {
-        return Ok(0);
+        return Ok(Some(0));
     };
     let key = format!(
         "{}/resident-wal-discovery",
         state.config.etcd.etcd_prefix.trim_end_matches('/')
     );
-    let cursor_key = format!("{key}/cursor/{:016x}", scope(&state.config));
+    let cursor_key = format!("{key}/cursor/{:016x}", policy.cursor);
     let mut client = state.task_store.etcd_client().clone();
     let prior = client
         .get(key.as_str(), None)
@@ -122,7 +299,7 @@ async fn tick(state: &Arc<MasterState>, now: i64) -> Result<usize, String> {
         .map_err(|e| e.to_string())?
         .unwrap_or_default();
     if next_batch_ms > now {
-        return Ok(0);
+        return Ok(None);
     }
     let previous_cursor = client
         .get(cursor_key.as_str(), None)
@@ -135,25 +312,23 @@ async fn tick(state: &Arc<MasterState>, now: i64) -> Result<usize, String> {
         .map_err(|e| e.to_string())?
         .unwrap_or_default();
     let snapshot = state.stats_cache.read().await.clone();
-    if candidates(&state.config, &snapshot, None).is_empty() {
-        return Ok(0);
+    let rows = if policy.root.trim_end_matches('/') == state.base_uri.trim_end_matches('/') {
+        snapshot.as_slice()
+    } else {
+        &[]
+    };
+    if policy.candidates(rows, known, None).is_empty() {
+        return Ok(Some(0));
     }
-    let mut names = candidates(&state.config, &snapshot, cursor.after.as_deref());
+    let mut names = policy.candidates(rows, known, cursor.after.as_deref());
     if names.is_empty() && cursor.after.is_none() {
-        return Ok(0);
+        return Ok(Some(0));
     }
     let more = names.len() > BATCH;
     names.truncate(BATCH);
     let next = Cursor {
         after: if more { names.last().cloned() } else { None },
-        next_batch_ms: now.saturating_add(
-            state
-                .config
-                .append
-                .rollout_append_reconcile_interval_secs
-                .clamp(30, 86_400) as i64
-                * 1000,
-        ),
+        next_batch_ms: now.saturating_add(policy.interval_secs as i64 * 1000),
     };
     // Reserve before object-store reads. Lost responses/crashes defer one page;
     // other replicas cannot duplicate its probes. No lease expiry enables writes.
@@ -165,8 +340,12 @@ async fn tick(state: &Arc<MasterState>, now: i64) -> Result<usize, String> {
         || Compare::version(cursor_key.as_str(), CompareOp::Equal, 0),
         |kv| Compare::mod_revision(cursor_key.as_str(), CompareOp::Equal, kv.mod_revision()),
     );
+    let mut compares = vec![compare, compare_cursor];
+    if let Some(owner) = owner {
+        compares.push(Compare::value(owner.key(), CompareOp::Equal, owner.token()));
+    }
     if !client
-        .txn(Txn::new().when([compare, compare_cursor]).and_then([
+        .txn(Txn::new().when(compares).and_then([
             TxnOp::put(
                 key.as_str(),
                 serde_json::to_vec(&next.next_batch_ms).map_err(|e| e.to_string())?,
@@ -182,10 +361,12 @@ async fn tick(state: &Arc<MasterState>, now: i64) -> Result<usize, String> {
         .map_err(|e| e.to_string())?
         .succeeded()
     {
-        return Ok(0);
+        return Ok(Some(0));
     }
+    let publisher = owner.map(|o| state.task_store.discovery_publisher(o));
+    let publisher = publisher.as_ref().unwrap_or(&state.task_store);
     let mut probes = stream::iter(names.into_iter().map(|target| async move {
-        let outcome = tokio::time::timeout(PROBE_TIMEOUT, probe(state, &target)).await;
+        let outcome = tokio::time::timeout(PROBE_TIMEOUT, probe_with_policy(state, policy, publisher, &target)).await;
         match outcome {
             Ok(Ok(requested)) => requested,
             outcome => {
@@ -199,10 +380,21 @@ async fn tick(state: &Arc<MasterState>, now: i64) -> Result<usize, String> {
     while let Some(true_or_false) = probes.next().await {
         requested += usize::from(true_or_false);
     }
-    Ok(requested)
+    Ok(Some(requested))
 }
 
+#[cfg(test)]
 async fn probe(state: &Arc<MasterState>, target: &str) -> Result<bool, String> {
+    let policy = Policy::from_config(&state.config).expect("resident policy");
+    probe_with_policy(state, &policy, &state.task_store, target).await
+}
+
+async fn probe_with_policy(
+    state: &Arc<MasterState>,
+    policy: &Policy,
+    publisher: &crate::task_store::TaskStore,
+    target: &str,
+) -> Result<bool, String> {
     if state
         .task_store
         .get_active_id(TaskKind::MergeWal, target)
@@ -239,16 +431,18 @@ async fn probe(state: &Arc<MasterState>, target: &str) -> Result<bool, String> {
     {
         return Ok(false);
     }
-    let uri = target
-        .strip_prefix("generic:")
-        .map_or_else(|| state.rollout_uri(target), |name| state.generic_uri(name));
+    let suffix = target.strip_prefix("generic:").map_or_else(
+        || format!("{target}.rollout.lance"),
+        |name| format!("{name}.generic.lance"),
+    );
+    let uri = format!("{}/{}", policy.root.trim_end_matches('/'), suffix);
     let pending = has_sealed_wal(
         &uri,
         state
             .local_append
             .as_ref()
             .map(|local| local.session.clone()),
-        &state.config.catchup.shards,
+        &policy.shards,
     )
     .await
     .map_err(|e| e.to_string())?;
@@ -260,7 +454,10 @@ async fn probe(state: &Arc<MasterState>, target: &str) -> Result<bool, String> {
         // next 15-second tick only adds idle time before an available executor.
         coordinator.request_merge(target).await?;
         if let Some(request) = coordinator.get_merge_request(target).await? {
-            crate::scheduler::enqueue_merge_request(state, &coordinator, &request).await?;
+            publisher
+                .enqueue_merge_request(&request)
+                .await
+                .map_err(|e| e.to_string())?;
         }
     }
     metrics::counter!("master_resident_wal_probes_total", "result" => if pending { "requested" } else { "empty" }).increment(1);
@@ -1203,5 +1400,256 @@ mod tests {
         assert_eq!(candidates(&config, &[], Some("e")), ["f"]);
         config.merge_wal_interval_secs = 0;
         assert!(!enabled(&config));
+    }
+    #[tokio::test]
+    async fn wildcard_catalog_recovers_names_without_a_local_stats_scanner() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let mut stats = crate::stats_store::StatsStore::open_or_create(
+            &format!("{root}/_stats.rollout.lance"),
+            None,
+        )
+        .await
+        .unwrap();
+        let row = |name: &str| StatRow {
+            name: name.into(),
+            uri: "unused".into(),
+            row_count: 0,
+            fragment_count: 0,
+            last_updated: 0,
+            pending_wal_generations: 0,
+            last_compaction: -1,
+            total_compactions: 0,
+            scanned_at: 0,
+            version: -1,
+        };
+        stats
+            .write_snapshot(&[row("cold"), row("generic:cold")])
+            .await
+            .unwrap();
+        let mut cfg = MasterConfig::parse_from(["test"]);
+        cfg.data_dir = root.into();
+        cfg.merge_wal_interval_secs = 30;
+        cfg.local_merge.master_local_merge_auto = true;
+        cfg.local_merge.master_local_merge_targets = vec!["*".into()];
+        cfg.merge_rollout.fence_legacy = true;
+        let policy = Policy::from_config(&cfg).unwrap();
+        let mut catalog = Catalog::default();
+        catalog.refresh(&policy).await.unwrap();
+        assert_eq!(
+            policy.candidates(&[], &catalog.names, None),
+            ["cold", "generic:cold"]
+        );
+        stats.write_snapshot(&[row("new")]).await.unwrap();
+        catalog.refresh(&policy).await.unwrap();
+        assert!(
+            !catalog.names.iter().any(|name| name == "new"),
+            "ordinary ticks use cached names"
+        );
+        catalog.checked = None;
+        catalog.refresh(&policy).await.unwrap();
+        assert!(catalog.names.iter().any(|name| name == "new"));
+    }
+
+    #[test]
+    fn advertised_policy_preserves_selection_and_deduplicates_reordered_members() {
+        for automatic in [false, true] {
+            for append in [false, true] {
+                let mut config = MasterConfig::parse_from(["test"]);
+                config.merge_wal_interval_secs = 30;
+                config.append.rollout_append_local = append;
+                config.append.rollout_append_targets = vec!["*".into()];
+                config.local_merge.master_local_merge_targets = vec!["*".into()];
+                config.local_merge.master_local_merge_auto = automatic;
+                config.merge_rollout.fence_legacy = automatic;
+                config.merge_rollout.owned_targets =
+                    vec!["b".into(), "a".into(), "generic:g".into()];
+                config.merge_rollout.drain_targets = vec!["drained".into()];
+                let policy = Policy::from_config(&config).unwrap();
+                for name in [
+                    "a",
+                    "b",
+                    "unknown",
+                    "generic:g",
+                    "generic:unknown",
+                    "datagen:d",
+                    "drained",
+                    "../bad",
+                ] {
+                    assert_eq!(
+                        policy.selected(name),
+                        crate::local_merge::selected(&config, name),
+                        "{name}"
+                    );
+                }
+                assert_eq!(
+                    policy.candidates(&[], &[], None),
+                    candidates(&config, &[], None)
+                );
+                config.merge_rollout.owned_targets.reverse();
+                assert_eq!(Some(policy), Policy::from_config(&config));
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated ETCD_TEST_ENDPOINTS"]
+    async fn leader_probes_member_policy_and_successor_resumes_fenced_cursor() {
+        let (_dir, member) = fixture().await;
+        let _b = write(&member, "b", 1).await;
+        let _e = write(&member, "e", 1).await;
+        let policy = Policy::from_config(&member.config).unwrap();
+        let mut cfg = member.config.clone();
+        cfg.append.rollout_append_local = false;
+        cfg.merge_rollout.owned_targets.clear();
+        let leader = MasterState::new(cfg).await.unwrap();
+        assert!(Policy::from_config(&leader.config).is_none());
+        let store = &leader.task_store;
+        let owner = store.discovery_session(b"{}".to_vec()).await.unwrap();
+        assert!(store.elect_discovery_leader(&owner).await.unwrap());
+        let now = chrono::Utc::now().timestamp_millis();
+        assert_eq!(
+            tick_policy(&leader, &policy, &[], Some(&owner), now)
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        let first = store
+            .get_active_id(TaskKind::MergeWal, "b")
+            .await
+            .unwrap()
+            .unwrap();
+        let gate = format!("{}/resident-wal-discovery", leader.config.etcd.prefix());
+        let cursor_key = format!("{gate}/cursor/{:016x}", policy.cursor);
+        let cursor = store
+            .etcd_client()
+            .clone()
+            .get(cursor_key.clone(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Cursor>(cursor.kvs()[0].value())
+                .unwrap()
+                .after
+                .as_deref(),
+            Some("d")
+        );
+        // Replace leadership while retaining the old guard/keepalive: no old
+        // timer or lease liveness observation may authorize cursor advancement.
+        store
+            .etcd_client()
+            .clone()
+            .delete(owner.key(), None)
+            .await
+            .unwrap();
+        let successor = store.discovery_session(b"{}".to_vec()).await.unwrap();
+        assert!(store.elect_discovery_leader(&successor).await.unwrap());
+        assert_eq!(
+            tick_policy(&leader, &policy, &[], Some(&owner), now + 31_000)
+                .await
+                .unwrap(),
+            Some(0)
+        );
+        let unchanged = store
+            .etcd_client()
+            .clone()
+            .get(cursor_key, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            unchanged.kvs()[0].mod_revision(),
+            cursor.kvs()[0].mod_revision()
+        );
+        let stale_publisher = store.discovery_publisher(&owner);
+        assert!(probe_with_policy(&leader, &policy, &stale_publisher, "e")
+            .await
+            .unwrap());
+        assert!(store
+            .get_active_id(TaskKind::MergeWal, "e")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store
+            .merge_coordinator()
+            .get_merge_request("e")
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            tick_policy(&leader, &policy, &[], Some(&successor), now + 31_000)
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        assert!(store
+            .get_active_id(TaskKind::MergeWal, "e")
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            store
+                .get_active_id(TaskKind::MergeWal, "b")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(first.as_str())
+        );
+        store.release_coordination_lock(owner).await.unwrap();
+        store.release_coordination_lock(successor).await.unwrap();
+    }
+    #[tokio::test]
+    #[ignore = "requires isolated ETCD_TEST_ENDPOINTS"]
+    async fn running_leader_discovers_new_member_scope_without_becoming_executor() {
+        let (_dir, member) = fixture().await;
+        let _b = write(&member, "b", 1).await;
+        let mut cfg = member.config.clone();
+        cfg.append.rollout_append_local = false;
+        cfg.merge_rollout.owned_targets.clear();
+        let leader = MasterState::new(cfg).await.unwrap();
+        let store = &leader.task_store;
+        let key = format!(
+            "{}/demand-controller/leader-v2",
+            leader.config.etcd.prefix()
+        );
+        let first = crate::demand_controller::spawn(&leader);
+        let original = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let response = store
+                    .etcd_client()
+                    .clone()
+                    .get(key.clone(), None)
+                    .await
+                    .unwrap();
+                if let Some(kv) = response.kvs().first() {
+                    break kv.value().to_vec();
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let follower = crate::demand_controller::spawn(&member);
+        let discovered = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if store
+                    .get_active_id(TaskKind::MergeWal, "b")
+                    .await
+                    .unwrap()
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await;
+        let current = store.etcd_client().clone().get(key, None).await.unwrap();
+        first.abort();
+        follower.abort();
+        let _ = first.await;
+        let _ = follower.await;
+        discovered.unwrap();
+        assert_eq!(current.kvs()[0].value(), original);
+        assert!(!crate::local_merge::enabled(&leader.config));
     }
 }

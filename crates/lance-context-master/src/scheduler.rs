@@ -1456,7 +1456,6 @@ async fn enqueue_buffered_merge_request(
 /// the independent WAL and resident pools still run when enabled.
 pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
     crate::wal_tail::spawn(state);
-    crate::resident_recovery::spawn(state);
     crate::planner::spawn(state);
     crate::executors::spawn(state);
     crate::demand_controller::spawn(state);
