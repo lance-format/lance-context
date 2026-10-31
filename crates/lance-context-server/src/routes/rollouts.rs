@@ -506,6 +506,120 @@ pub struct RolloutListParams {
     pub filters: Option<String>,
 }
 
+const LIST_READ_STAGES: [&str; 4] = ["resolve_store", "store_lock", "list_records", "record_dto"];
+
+/// Handler work only: excludes JSON serialization and response-body transfer.
+/// Drop also reports interrupted requests without retaining records or filters.
+struct ListReadTrace<'a> {
+    target: &'a str,
+    limit: Option<usize>,
+    offset: Option<usize>,
+    filtered: bool,
+    started: tokio::time::Instant,
+    stage_started: tokio::time::Instant,
+    stage: usize,
+    elapsed: [std::time::Duration; 4],
+    error_category: Option<&'static str>,
+    rows: Option<usize>,
+}
+
+impl<'a> ListReadTrace<'a> {
+    fn new(target: &'a str, params: &RolloutListParams) -> Self {
+        let started = tokio::time::Instant::now();
+        Self {
+            target,
+            limit: params.limit,
+            offset: params.offset,
+            filtered: params.filters.is_some(),
+            started,
+            stage_started: started,
+            stage: 0,
+            elapsed: [std::time::Duration::ZERO; 4],
+            error_category: None,
+            rows: None,
+        }
+    }
+
+    fn advance(&mut self) {
+        let now = tokio::time::Instant::now();
+        self.elapsed[self.stage] = now.duration_since(self.stage_started);
+        self.stage += 1;
+        self.stage_started = now;
+    }
+
+    fn open_error(&mut self, error: &AppError) {
+        self.error_category = Some(match error {
+            AppError::NotFound(_) => "not_found",
+            AppError::AlreadyExists(_) => "already_exists",
+            AppError::InvalidRequest(_) => "invalid_request",
+            AppError::Internal(_) => "internal",
+            AppError::CompactionInProgress => "compaction_in_progress",
+            AppError::Overloaded(_) => "overloaded",
+        });
+    }
+
+    fn list_error(&mut self, error: &lance_context_core::LanceError) {
+        use lance_context_core::LanceError;
+        self.error_category = Some(match error {
+            LanceError::DatasetNotFound { .. } => "dataset_not_found",
+            LanceError::NotFound { .. } => "not_found",
+            LanceError::InvalidInput { .. } | LanceError::SchemaMismatch { .. } => {
+                "invalid_request"
+            }
+            LanceError::IO { .. } => "storage_io",
+            LanceError::Execution { .. } => "execution",
+            LanceError::Internal { .. } => "internal",
+            _ => "other_lance",
+        });
+    }
+}
+
+impl Drop for ListReadTrace<'_> {
+    fn drop(&mut self) {
+        let total = self.started.elapsed();
+        let complete = self.stage == LIST_READ_STAGES.len();
+        if !complete {
+            self.elapsed[self.stage] = self.stage_started.elapsed();
+        }
+        let outcome = if self.error_category.is_some() {
+            "error"
+        } else if complete {
+            "success"
+        } else {
+            "incomplete"
+        };
+        // Fixed labels only: table names, pagination and filters are not metrics labels.
+        for (index, stage) in LIST_READ_STAGES.iter().enumerate().take(self.stage + 1) {
+            metrics::histogram!("rollout_list_stage_duration_seconds", "stage" => *stage, "outcome" => outcome)
+                .record(self.elapsed[index].as_secs_f64());
+        }
+        metrics::histogram!("rollout_list_handler_duration_seconds", "outcome" => outcome)
+            .record(total.as_secs_f64());
+        let actionable_error = self.error_category.is_some_and(|kind| {
+            !matches!(kind, "not_found" | "dataset_not_found" | "invalid_request")
+        });
+        if total >= std::time::Duration::from_secs(5) || actionable_error {
+            tracing::warn!(
+                target: "lance_context_server::rollout_list",
+                table = %self.target.chars().take(256).collect::<String>(),
+                limit = ?self.limit,
+                offset = ?self.offset,
+                filtered = self.filtered,
+                outcome,
+                phase = LIST_READ_STAGES.get(self.stage).copied().unwrap_or("complete"),
+                error_category = self.error_category.unwrap_or("none"),
+                rows = ?self.rows,
+                handler_ms = total.as_millis() as u64,
+                resolve_store_ms = self.elapsed[0].as_millis() as u64,
+                store_lock_ms = self.elapsed[1].as_millis() as u64,
+                list_records_ms = self.elapsed[2].as_millis() as u64,
+                record_dto_ms = self.elapsed[3].as_millis() as u64,
+                "rollout records list handler diagnostic"
+            );
+        }
+    }
+}
+
 pub async fn list_rollouts(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -522,17 +636,30 @@ pub async fn list_rollouts(
         })
         .transpose()?;
 
-    let store_lock = state.get_or_open_rollout_store(&name).await?;
+    let mut trace = ListReadTrace::new(&name, &params);
+    let store_lock = state
+        .get_or_open_rollout_store(&name)
+        .await
+        .inspect_err(|error| trace.open_error(error))?;
+    trace.advance();
 
     let store = store_lock.read().await;
+    trace.advance();
     let records = store
         .list_with_filters(params.limit, params.offset, filters.as_ref())
         .await
-        .map_err(AppError::from_lance)?;
+        .map_err(|error| {
+            trace.list_error(&error);
+            AppError::from_lance(error)
+        })?;
+    trace.advance();
+    trace.rows = Some(records.len());
 
-    Ok(Json(ListRolloutsResponse {
+    let response = Json(ListRolloutsResponse {
         records: records.into_iter().map(rollout_record_to_dto).collect(),
-    }))
+    });
+    trace.advance();
+    Ok(response)
 }
 
 /// Core point reads refresh cloned snapshots around WAL fallback. A stale-base
@@ -2002,6 +2129,179 @@ mod tests {
         assert!(matches!(err, AppError::NotFound(_)));
         let Json(listed) = list_rollout_stores(State(state.clone())).await.unwrap();
         assert!(listed.stores.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_rollouts_diagnostics_attribute_lock_wait_and_cancellation_without_data() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use std::{io, sync::Mutex, time::Duration};
+
+        // Isolate tracing callsite caches from concurrently running route tests.
+        const ISOLATED: &str = "LANCE_CONTEXT_LIST_DIAGNOSTIC_TEST";
+        if std::env::var_os(ISOLATED).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "routes::rollouts::tests::list_rollouts_diagnostics_attribute_lock_wait_and_cancellation_without_data",
+                    "--nocapture",
+                ])
+                .env(ISOLATED, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        #[derive(Clone)]
+        struct Log(Arc<Mutex<Vec<u8>>>);
+        impl io::Write for Log {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (state, _dir) = rollout_state().await;
+        let cached = state.get_or_open_rollout_store("rl").await.unwrap();
+        let record = filtered_record("private-row-id", "private-filter-value", true);
+        cached
+            .read()
+            .await
+            .add(&[rollout_record_from_add_request(&record)])
+            .await
+            .unwrap();
+        flush_store(&state, "rl").await;
+        let params = || RolloutListParams {
+            limit: Some(1),
+            offset: Some(0),
+            filters: Some(
+                serde_json::json!({"policy_version": "private-filter-value"}).to_string(),
+            ),
+        };
+        let Json(expected) =
+            list_rollouts(State(state.clone()), Path("rl".into()), Query(params()))
+                .await
+                .unwrap();
+        let log = Log(Arc::default());
+        let sink = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_target(true)
+            .with_writer(move || sink.clone())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+
+        let held = cached.write().await;
+        let mut request = Box::pin(list_rollouts(
+            State(state.clone()),
+            Path("rl".into()),
+            Query(params()),
+        ));
+        tokio::time::pause();
+        assert!(futures::poll!(&mut request).is_pending());
+        tokio::time::advance(Duration::from_secs(6)).await;
+        drop(held);
+        // Resume before storage I/O: only the deliberate lock wait is simulated.
+        tokio::time::resume();
+        let Json(actual) = request.await.unwrap();
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+
+        let held = cached.write().await;
+        let mut cancelled = Box::pin(list_rollouts(
+            State(state.clone()),
+            Path("rl".into()),
+            Query(params()),
+        ));
+        tokio::time::pause();
+        assert!(futures::poll!(&mut cancelled).is_pending());
+        tokio::time::advance(Duration::from_secs(7)).await;
+        drop(cancelled);
+        tokio::time::resume();
+        drop(held);
+
+        // Raw storage errors and arbitrarily long names must not enter diagnostics.
+        let name = format!("{}private-name-suffix", "x".repeat(256));
+        let mut error = ListReadTrace::new(&name, &params());
+        error.advance();
+        error.advance();
+        error.list_error(&lance_context_core::LanceError::io("private-error-payload"));
+        drop(error);
+
+        let output = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        let diagnostics: Vec<_> = output
+            .lines()
+            .filter(|line| line.contains("rollout records list handler diagnostic"))
+            .collect();
+        assert_eq!(diagnostics.len(), 3, "{output}");
+        assert!(
+            diagnostics[0].contains("outcome=\"success\"")
+                && diagnostics[0].contains("phase=\"complete\""),
+            "{output}"
+        );
+        assert!(
+            diagnostics[1].contains("outcome=\"incomplete\"")
+                && diagnostics[1].contains("phase=\"store_lock\""),
+            "{output}"
+        );
+        assert!(
+            diagnostics[2].contains("error_category=\"storage_io\"")
+                && diagnostics[2].contains("phase=\"list_records\""),
+            "{output}"
+        );
+        for line in diagnostics {
+            assert!(!line.contains("private-"), "{line}");
+        }
+        let series = snapshotter.snapshot().into_vec();
+        for (outcome, minimum, maximum, expected_stages) in
+            [("success", 6.0, 7.0, 4), ("incomplete", 7.0, 8.0, 2)]
+        {
+            let stages: Vec<_> = series
+                .iter()
+                .filter(|(key, _, _, _)| {
+                    key.key().name() == "rollout_list_stage_duration_seconds"
+                        && key
+                            .key()
+                            .labels()
+                            .any(|label| label.key() == "outcome" && label.value() == outcome)
+                })
+                .collect();
+            assert_eq!(stages.len(), expected_stages);
+            for (key, _, _, value) in stages {
+                assert_eq!(key.key().labels().count(), 2);
+                let DebugValue::Histogram(values) = value else {
+                    panic!("expected histogram")
+                };
+                assert_eq!(values.len(), 1);
+                let seconds = values[0].into_inner();
+                if key
+                    .key()
+                    .labels()
+                    .any(|label| label.key() == "stage" && label.value() == "store_lock")
+                {
+                    assert!(
+                        (minimum..maximum).contains(&seconds),
+                        "{outcome}: {seconds}"
+                    );
+                } else {
+                    assert!(seconds < 1.0, "{key:?}: {seconds}");
+                }
+            }
+        }
+        cached.write().await.close().await.unwrap();
     }
 
     #[tokio::test]
