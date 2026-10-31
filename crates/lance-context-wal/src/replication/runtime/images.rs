@@ -129,7 +129,7 @@ impl Handle {
     // Only these typed library operations can access the owner. Their result is
     // held until the next successful durable poll; an error/panic drops the
     // completion as uncertain. Heavy image work stays in the returned task.
-    fn local<T: Send + 'static>(
+    pub(super) fn local<T: Send + 'static>(
         &self,
         group: u64,
         operation: impl FnOnce(&mut Node) -> Result<T> + Send + 'static,
