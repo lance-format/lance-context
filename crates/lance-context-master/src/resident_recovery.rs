@@ -932,6 +932,356 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires isolated ETCD_TEST_ENDPOINTS"]
+    async fn empty_merge_demand_requires_fresh_complete_empty_manifests() {
+        for mode in ["normal", "staging", "grouped", "disabled"] {
+            let (_dir, initial) = generic_fixture_with_auto(true).await;
+            let mut cfg = initial.config.clone();
+            cfg.catchup.shards = (0..19).map(|i| format!("empty-{i}")).collect();
+            cfg.catchup.shards.push("writer".into());
+            if mode != "disabled" {
+                cfg.local_merge.master_local_merge_empty_demand_targets = vec!["generic:a".into()];
+            }
+            if mode == "staging" {
+                cfg.catchup.staging_targets = vec!["generic:a".into()];
+            }
+            if mode == "grouped" {
+                cfg.catchup.grouped_targets = vec!["generic:a".into()];
+            }
+            let state = MasterState::new(cfg).await.unwrap();
+            let writer = generic_writer(&state, "a").await;
+            generic_write(&writer, "first", "value").await;
+            let c = state.task_store.merge_coordinator();
+            state
+                .task_store
+                .enqueue(TaskKind::MergeWal, "generic:a", vec![])
+                .await
+                .unwrap();
+            let claim = state
+                .task_store
+                .claim_resident_merge(&crate::local_merge::targets(&state.config))
+                .await
+                .unwrap()
+                .unwrap();
+            c.request_merge("generic:a").await.unwrap();
+            let request = c.get_merge_request("generic:a").await.unwrap().unwrap();
+            crate::local_merge::acknowledge_empty_demand(&state, &claim).await;
+            assert_eq!(
+                c.get_merge_request("generic:a")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .revision,
+                request.revision,
+                "the final shard's pending WAL must survive empty earlier shards"
+            );
+            let result = crate::merge_execution::run_merge_wal(&state, &claim).await;
+            assert_eq!(
+                result.as_ref().unwrap(),
+                "local WAL merge reclaimed 1 generations",
+                "{mode}"
+            );
+            assert_eq!(
+                c.get_merge_request("generic:a").await.unwrap().is_some(),
+                mode == "disabled",
+                "{mode}"
+            );
+            generic_write(&writer, "late", "preserved").await;
+            c.request_merge("generic:a").await.unwrap();
+            assert!(
+                !state
+                    .task_store
+                    .acknowledge_empty_merge_request(&claim, &request)
+                    .await
+                    .unwrap(),
+                "a new flush/request after empty observation must survive"
+            );
+            crate::local_merge::acknowledge_empty_demand(&state, &claim).await;
+            assert!(c.get_merge_request("generic:a").await.unwrap().is_some());
+            state.task_store.finish(claim, result).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated ETCD_TEST_ENDPOINTS"]
+    async fn empty_merge_demand_flush_during_observation_survives_and_drains() {
+        use crate::local_merge::demand_testing::{Pause, PAUSE};
+        // Pause after the first batch and after the final batch respectively.
+        // The writer's shard was already observed empty in both cases.
+        for last_shard in ["empty-2", "empty-18"] {
+            let (_dir, initial) = generic_fixture_with_auto(true).await;
+            let mut cfg = initial.config.clone();
+            cfg.catchup.shards = vec!["writer".into()];
+            cfg.catchup
+                .shards
+                .extend((0..19).map(|i| format!("empty-{i}")));
+            cfg.local_merge.master_local_merge_empty_demand_targets = vec!["generic:a".into()];
+            let state = MasterState::new(cfg).await.unwrap();
+            let writer = generic_writer(&state, "a").await;
+            state
+                .task_store
+                .enqueue(TaskKind::MergeWal, "generic:a", vec![])
+                .await
+                .unwrap();
+            let claim = state
+                .task_store
+                .claim_resident_merge(&crate::local_merge::targets(&state.config))
+                .await
+                .unwrap()
+                .unwrap();
+            let coordinator = state.task_store.merge_coordinator();
+            coordinator.request_merge("generic:a").await.unwrap();
+            let before = coordinator
+                .get_merge_request("generic:a")
+                .await
+                .unwrap()
+                .unwrap();
+            let pause = Pause {
+                last_shard: last_shard.into(),
+                reached: Arc::new(tokio::sync::Notify::new()),
+                resume: Arc::new(tokio::sync::Notify::new()),
+            };
+            let run = PAUSE.scope(
+                pause.clone(),
+                crate::merge_execution::run_merge_wal(&state, &claim),
+            );
+            let late_flush = async {
+                tokio::time::timeout(Duration::from_secs(5), pause.reached.notified())
+                    .await
+                    .expect("actual empty observation must reach the requested batch");
+                generic_write(&writer, "late", "preserved").await;
+                coordinator.request_merge("generic:a").await.unwrap();
+                let revision = coordinator
+                    .get_merge_request("generic:a")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .revision;
+                pause.resume.notify_one();
+                revision
+            };
+            let (result, late_revision) = tokio::join!(run, late_flush);
+            assert_eq!(
+                result.as_ref().unwrap(),
+                "local WAL merge reclaimed 0 generations"
+            );
+            assert!(late_revision > before.revision);
+            let remaining = coordinator
+                .get_merge_request("generic:a")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(remaining.revision, late_revision, "{last_shard}");
+            let probe = lance_context_core::rollout_append::SealedWalProbe::open(
+                &state.generic_uri("a"),
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(probe.has_sealed_wal("writer").await.unwrap());
+            state.task_store.finish(claim, result).await.unwrap();
+            crate::scheduler::enqueue_merge_request(&state, &coordinator, &remaining)
+                .await
+                .unwrap();
+            let next = state
+                .task_store
+                .claim_resident_merge(&crate::local_merge::targets(&state.config))
+                .await
+                .unwrap()
+                .unwrap();
+            let result = crate::merge_execution::run_merge_wal(&state, &next).await;
+            assert_eq!(
+                result.as_ref().unwrap(),
+                "local WAL merge reclaimed 1 generations"
+            );
+            state.task_store.finish(next, result).await.unwrap();
+            assert!(!probe.has_sealed_wal("writer").await.unwrap());
+            let dataset = lance::Dataset::open(&state.generic_uri("a")).await.unwrap();
+            assert_eq!(dataset.count_rows(None).await.unwrap(), 1);
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated ETCD_TEST_ENDPOINTS"]
+    async fn empty_merge_demand_preserves_bounded_pass_tail_until_successor_commits() {
+        let (_dir, initial) = generic_fixture_with_auto(true).await;
+        let mut cfg = initial.config.clone();
+        cfg.local_merge.master_local_merge_empty_demand_targets = vec!["generic:a".into()];
+        let state = MasterState::new(cfg).await.unwrap();
+        let writer = generic_writer(&state, "a").await;
+        // The native executor admits at most sixteen passes, one generation
+        // per pass in this fixture. Successful work still leaves a real tail.
+        for generation in 0..17 {
+            generic_write(&writer, &format!("row-{generation}"), "preserved").await;
+        }
+        state
+            .task_store
+            .enqueue(TaskKind::MergeWal, "generic:a", vec![])
+            .await
+            .unwrap();
+        let claim = state
+            .task_store
+            .claim_resident_merge(&crate::local_merge::targets(&state.config))
+            .await
+            .unwrap()
+            .unwrap();
+        let result = crate::merge_execution::run_merge_wal(&state, &claim).await;
+        assert_eq!(
+            result.as_ref().unwrap(),
+            "local WAL merge reclaimed 16 generations"
+        );
+        let coordinator = state.task_store.merge_coordinator();
+        let request = coordinator
+            .get_merge_request("generic:a")
+            .await
+            .unwrap()
+            .expect("a successful partial pass must retain durable demand");
+        let probe =
+            lance_context_core::rollout_append::SealedWalProbe::open(&state.generic_uri("a"), None)
+                .await
+                .unwrap();
+        assert!(probe.has_sealed_wal("writer").await.unwrap());
+        state.task_store.finish(claim, result).await.unwrap();
+        crate::scheduler::enqueue_merge_request(&state, &coordinator, &request)
+            .await
+            .unwrap();
+        let next = state
+            .task_store
+            .claim_resident_merge(&crate::local_merge::targets(&state.config))
+            .await
+            .unwrap()
+            .unwrap();
+        let result = crate::merge_execution::run_merge_wal(&state, &next).await;
+        assert_eq!(
+            result.as_ref().unwrap(),
+            "local WAL merge reclaimed 1 generations"
+        );
+        state.task_store.finish(next, result).await.unwrap();
+        assert!(!probe.has_sealed_wal("writer").await.unwrap());
+        assert!(coordinator
+            .get_merge_request("generic:a")
+            .await
+            .unwrap()
+            .is_none());
+        let dataset = lance::Dataset::open(&state.generic_uri("a")).await.unwrap();
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 17);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated ETCD_TEST_ENDPOINTS"]
+    async fn empty_merge_demand_retains_metadata_errors_and_drain() {
+        let (_dir, initial) = generic_fixture_with_auto(true).await;
+        let mut cfg = initial.config.clone();
+        cfg.local_merge.master_local_merge_empty_demand_targets = vec!["*".into()];
+        let state = MasterState::new(cfg).await.unwrap();
+        let c = state.task_store.merge_coordinator();
+        for name in ["missing", "draining"] {
+            let target = format!("generic:{name}");
+            if name == "draining" {
+                let _writer = generic_writer(&state, name).await;
+            }
+            state
+                .task_store
+                .enqueue(TaskKind::MergeWal, &target, vec![])
+                .await
+                .unwrap();
+            let claim = state
+                .task_store
+                .claim_resident_merge(&crate::local_merge::targets(&state.config))
+                .await
+                .unwrap()
+                .unwrap();
+            c.request_merge(&target).await.unwrap();
+            let request = c.get_merge_request(&target).await.unwrap().unwrap();
+            if name == "draining" {
+                state.admission.begin_drain();
+            }
+            crate::local_merge::acknowledge_empty_demand(&state, &claim).await;
+            assert_eq!(
+                c.get_merge_request(&target)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .revision,
+                request.revision
+            );
+            state
+                .task_store
+                .finish(claim, Ok("fixture complete".into()))
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated loopback ETCD_TEST_ENDPOINTS"]
+    async fn empty_merge_demand_read_deadline_preserves_request_and_task_success() {
+        let (_dir, initial) = generic_fixture_with_auto(true).await;
+        let upstream = initial.config.etcd.etcd_endpoints[0].clone();
+        let proxy = crate::task_store::tests::LeaseTestProxy::start(&upstream).await;
+        let mut cfg = initial.config.clone();
+        cfg.etcd.etcd_endpoints = vec![proxy.endpoint.clone()];
+        cfg.local_merge.master_local_merge_empty_demand_targets = vec!["*".into()];
+        let state = MasterState::new(cfg).await.unwrap();
+        let _writer = generic_writer(&state, "empty").await;
+        state
+            .task_store
+            .enqueue(TaskKind::MergeWal, "generic:empty", vec![])
+            .await
+            .unwrap();
+        let claim = state
+            .task_store
+            .claim_resident_merge(&crate::local_merge::targets(&state.config))
+            .await
+            .unwrap()
+            .unwrap();
+        let id = claim.task.id.clone();
+        let coordinator = lance_context_merge::Coordinator::new(
+            etcd_client::Client::connect([upstream], None)
+                .await
+                .unwrap(),
+            state.config.etcd.etcd_prefix.clone(),
+        );
+        coordinator.request_merge("generic:empty").await.unwrap();
+        let before = coordinator
+            .get_merge_request("generic:empty")
+            .await
+            .unwrap()
+            .unwrap();
+        proxy.responses.send(false).unwrap();
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::local_merge::acknowledge_empty_demand(&state, &claim),
+        )
+        .await
+        .expect("optional read deadline must not wait for the full etcd RPC deadline");
+        assert!(
+            started.elapsed() >= Duration::from_secs(1),
+            "the enabled observer actually waited for the unavailable read"
+        );
+        proxy.responses.send(true).unwrap();
+        assert_eq!(
+            coordinator
+                .get_merge_request("generic:empty")
+                .await
+                .unwrap()
+                .unwrap()
+                .revision,
+            before.revision
+        );
+        state
+            .task_store
+            .finish(claim, Ok("storage already completed".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            state.task_store.get(&id).await.unwrap().unwrap().state,
+            lance_context_api::TaskState::Done
+        );
+    }
+
+    #[tokio::test]
     #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn empty_native_preflight_preserves_racing_flush_and_successor_catchup() {
         let (_dir, initial) = generic_fixture_with_auto(true).await;

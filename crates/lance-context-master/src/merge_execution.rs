@@ -194,7 +194,9 @@ pub(crate) async fn run_merge_wal(
                 recover_execution(state, &coordinator, &proof, old).await?;
             }
         }
-        return crate::maintenance_execution::run_as(
+        let native_merge =
+            !(state.config.merge_rollout.owned(target) && state.config.append.enabled(target));
+        let result = crate::maintenance_execution::run_as(
             state,
             claim,
             lance_context_merge::MaintenanceKind::Catchup,
@@ -207,6 +209,13 @@ pub(crate) async fn run_merge_wal(
             },
         )
         .await;
+        if native_merge && result.is_ok() {
+            // run_as has joined storage work and released its durable execution
+            // back to this task's leased target lock. Optimization failure must
+            // never turn successfully completed storage work into a failed task.
+            crate::local_merge::acknowledge_empty_demand(state, claim).await;
+        }
+        return result;
     }
     // Reconcile/fence before any other table mutation. One retry of the fan-out
     // after a completed barrier lets healthy shards progress in this task.

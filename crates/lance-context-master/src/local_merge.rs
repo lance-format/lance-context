@@ -2,8 +2,23 @@
 use crate::{config::MasterConfig, state::MasterState};
 use std::sync::Arc;
 
+#[path = "local_merge_demand.rs"]
+mod demand;
+pub(crate) use demand::acknowledge_empty_demand;
+#[cfg(test)]
+pub(crate) use demand::testing as demand_testing;
+
 #[derive(Clone, Debug, Default, clap::Args)]
 pub struct LocalMergeConfig {
+    /// After a successful resident merge, acknowledge unchanged demand only
+    /// after a new complete empty-manifest observation. Empty disables this
+    /// optional optimization; use an explicit canary target before '*'.
+    #[arg(
+        long,
+        env = "MASTER_LOCAL_MERGE_EMPTY_DEMAND_TARGETS",
+        value_delimiter = ','
+    )]
+    pub master_local_merge_empty_demand_targets: Vec<String>,
     /// Briefly defer ordinary merge offers so resident capacity can rearm.
     /// Zero preserves immediate fallback. Does not reserve capacity or delay
     /// an eligible resident offer, compaction, or indexing.
