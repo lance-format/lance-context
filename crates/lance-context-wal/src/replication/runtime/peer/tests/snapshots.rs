@@ -647,10 +647,13 @@ async fn tls_snapshot_slot_wait_obeys_deadline_and_shutdown_without_creating_fil
     )
     .await?;
     c.net.nodes[&1].handle.campaign(10)?.await?;
-    assert_eq!(c.net.leader(10).await?, 1);
-    let (index, expected) = append(&c.net.nodes[&1].handle, 10, 1).await?;
+    // A concurrent election may select another node before this campaign wins.
+    // Bind the deliberate upload to the observed leader and a distinct receiver.
+    let leader_id = c.net.leader(10).await?;
+    let follower = (1..=3).rfind(|id| *id != leader_id).unwrap();
+    let (index, expected) = append(&c.net.nodes[&leader_id].handle, 10, 1).await?;
     wait_for(|| {
-        c.net.nodes[&3]
+        c.net.nodes[&follower]
             .handle
             .observation(10)
             .unwrap()
@@ -663,10 +666,10 @@ async fn tls_snapshot_slot_wait_obeys_deadline_and_shutdown_without_creating_fil
         network,
         runtime,
         handle,
-    } = c.net.nodes.remove(&3).unwrap();
+    } = c.net.nodes.remove(&follower).unwrap();
     network.shutdown().await?;
     let capture = handle.prepare_checkpoint(10, uuid::Uuid::new_v4())?.await?;
-    let leader = &c.net.nodes[&1].handle;
+    let leader = &c.net.nodes[&leader_id].handle;
     append(leader, 10, 2).await?;
     let image = checkpoint(leader, 10).await?;
     let packet = Packet {
@@ -675,24 +678,31 @@ async fn tls_snapshot_slot_wait_obeys_deadline_and_shutdown_without_creating_fil
         policy: leader.policy,
         group: 10,
         message: Message {
-            from: 1,
-            to: 3,
+            from: leader_id,
+            to: follower,
             term: leader.observation(10)?.status.term,
             msg_type: MessageType::MsgSnapshot,
             snapshot: Some(image.snapshot()?).into(),
             ..Default::default()
         },
     };
-    let path = root.path().join("3");
+    let path = root.path().join(follower.to_string());
     let before = image_files(&path)?;
     let mut expired = upload_header(&c, &packet).await?;
     assert!(timeout(Duration::from_millis(100), expired.read_u8())
         .await
         .is_err());
     no_response(&mut expired).await?;
-    wait_for(|| c.services[&3].statistics().failed.load(Ordering::Acquire) == 1).await?;
+    wait_for(|| {
+        c.services[&follower]
+            .statistics()
+            .failed
+            .load(Ordering::Acquire)
+            == 1
+    })
+    .await?;
     assert_eq!(image_files(&path)?, before);
-    assert_eq!(c.quotas[&3].used.load(Ordering::Acquire), 0);
+    assert_eq!(c.quotas[&follower].used.load(Ordering::Acquire), 0);
     assert_eq!(handle.observation(10)?.status.applied, index);
     drop(expired);
 
@@ -702,12 +712,12 @@ async fn tls_snapshot_slot_wait_obeys_deadline_and_shutdown_without_creating_fil
         .is_err());
     timeout(
         Duration::from_secs(2),
-        c.services.remove(&3).unwrap().shutdown(),
+        c.services.remove(&follower).unwrap().shutdown(),
     )
     .await??;
     no_response(&mut stopping).await?;
     assert_eq!(image_files(&path)?, before);
-    assert_eq!(c.quotas[&3].used.load(Ordering::Acquire), 0);
+    assert_eq!(c.quotas[&follower].used.load(Ordering::Acquire), 0);
     drop(stopping);
     drop(capture);
     // Cancelled waiters must not consume the next permit or keep the physical
@@ -716,7 +726,7 @@ async fn tls_snapshot_slot_wait_obeys_deadline_and_shutdown_without_creating_fil
     drop(image);
     c.shutdown().await?;
     runtime.shutdown().await?;
-    let node = Node::open(&path, layout(), 3, Limits::default())?;
+    let node = Node::open(&path, layout(), follower, Limits::default())?;
     assert_eq!(node.read_accepted(10, index)?, Some(expected));
     Ok(())
 }
