@@ -15,7 +15,7 @@
 use lance_context_metrics::etcd::{ObserveEtcd, Operation};
 use std::collections::BTreeMap;
 
-use etcd_client::{Compare, CompareOp, TxnOp};
+use etcd_client::{Compare, CompareOp, GetResponse, TxnOp, TxnOpResponse};
 use serde::{Deserialize, Serialize};
 
 use crate::{Coordinator, Result};
@@ -28,6 +28,10 @@ fn chrono_now_ms() -> i64 {
 }
 
 pub const SCHEMA_VERSION: u32 = 1;
+
+// Bound both the response allocation and transaction op count. Only reads are
+// batched: writes retain independent revision comparisons and retry budgets.
+const DEMAND_READ_BATCH_SIZE: usize = 32;
 
 /// How many `(generation, flushed_at)` pairs a shard record keeps for age
 /// tracking. Only the lowest unmerged generations matter for "oldest
@@ -530,12 +534,31 @@ impl Coordinator {
     /// publisher's progress is lost to another's. Never deletes.
     async fn join_into_store(&self, key: &str, event: &DemandEvent) -> Result<bool> {
         let mut client = self.client.clone();
-        for _ in 0..5 {
-            let current = client
-                .get(key, None)
-                .observed(Operation::DemandRead)
-                .await
-                .map_err(|e| e.to_string())?;
+        let current = client
+            .get(key, None)
+            .observed(Operation::DemandRead)
+            .await
+            .map_err(|e| e.to_string())?;
+        self.join_from_read(key, event, current).await
+    }
+
+    async fn join_from_read(
+        &self,
+        key: &str,
+        event: &DemandEvent,
+        mut current: GetResponse,
+    ) -> Result<bool> {
+        let mut client = self.client.clone();
+        for attempt in 0..5 {
+            if attempt > 0 {
+                // A stale batch read is only a starting point. On conflict,
+                // re-read this key and re-join, preserving concurrent progress.
+                current = client
+                    .get(key, None)
+                    .observed(Operation::DemandRead)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
             let stored = stored_event(current.kvs().first())?;
             let Some(next) = join_events(stored.as_ref(), event) else {
                 return Ok(false);
@@ -569,6 +592,55 @@ impl Coordinator {
         TableDemand::check_version(event.v).map_err(|e| format!("{e:?}"))?;
         let key = self.demand_event_key(target, &event.shard);
         self.join_into_store(&key, event).await
+    }
+
+    /// Publish scan observations with bounded, read-only batches. Each changed
+    /// shard still gets its own CAS and conflict retries; unchanged shards need
+    /// no write. Duplicates are processed in input order and stale observations
+    /// re-join on conflict. Like single-event publication, an error may follow
+    /// successful writes; callers can safely replay the observations.
+    pub async fn publish_demand_events(
+        &self,
+        target: &str,
+        events: &[DemandEvent],
+    ) -> Result<usize> {
+        for event in events {
+            TableDemand::check_version(event.v).map_err(|e| format!("{e:?}"))?;
+        }
+        let mut written = 0;
+        let mut client = self.client.clone();
+        for chunk in events.chunks(DEMAND_READ_BATCH_SIZE) {
+            if chunk.len() == 1 {
+                written += usize::from(self.publish_demand_event(target, &chunk[0]).await?);
+                continue;
+            }
+            let keys: Vec<_> = chunk
+                .iter()
+                .map(|event| self.demand_event_key(target, &event.shard))
+                .collect();
+            let response = client
+                .txn(
+                    etcd_client::Txn::new().and_then(
+                        keys.iter()
+                            .map(|key| TxnOp::get(key.as_str(), None))
+                            .collect::<Vec<_>>(),
+                    ),
+                )
+                .observed(Operation::DemandRead)
+                .await
+                .map_err(|e| e.to_string())?;
+            let reads = response.op_responses();
+            if reads.len() != chunk.len() {
+                return Err("demand batch read returned an unexpected response count".into());
+            }
+            for ((key, event), read) in keys.iter().zip(chunk).zip(reads) {
+                let TxnOpResponse::Get(current) = read else {
+                    return Err("demand batch read returned a non-Get response".into());
+                };
+                written += usize::from(self.join_from_read(key, event, current).await?);
+            }
+        }
+        Ok(written)
     }
 
     /// Publish one shard's merged watermark from an executor. Only `merged`
@@ -1148,6 +1220,267 @@ mod tests {
         assert_eq!(minimal.merged_through, None);
         assert_eq!(minimal.merged_epoch, None);
         assert!(minimal.sealed_times.is_empty());
+    }
+
+    async fn batch_test_coordinator() -> Coordinator {
+        let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+        let client = etcd_client::Client::connect([endpoint], None)
+            .await
+            .unwrap();
+        Coordinator::new(client, format!("/demand-batch/{}", uuid::Uuid::new_v4()))
+    }
+
+    fn operation_count(
+        handle: &metrics_exporter_prometheus::PrometheusHandle,
+        operation: &str,
+    ) -> u64 {
+        let prefix = format!("etcd_operation_attempts_total{{operation=\"{operation}\"}} ");
+        handle
+            .render()
+            .lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .map(|value| value.parse().unwrap())
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn batch_scan_bounds_reads_and_unchanged_scans_do_not_write() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let coordinator = batch_test_coordinator().await;
+        let events: Vec<_> = (0..97)
+            .map(|i| ev(&format!("s{i}"), 10, Some(4), 1, EventSource::Scan))
+            .collect();
+        assert_eq!(
+            coordinator
+                .publish_demand_events("t", &events)
+                .await
+                .unwrap(),
+            97
+        );
+        assert_eq!(operation_count(&handle, "demand_read"), 4);
+        assert_eq!(operation_count(&handle, "demand_publish"), 97);
+        let prefix = format!("{}/demand-events/", coordinator.prefix);
+        let before = coordinator
+            .client
+            .clone()
+            .get(
+                prefix.as_str(),
+                Some(etcd_client::GetOptions::new().with_prefix()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(before.kvs().len(), 97);
+        assert_eq!(
+            coordinator
+                .publish_demand_events("t", &events)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(operation_count(&handle, "demand_read"), 8);
+        assert_eq!(operation_count(&handle, "demand_publish"), 97);
+        let after = coordinator
+            .client
+            .clone()
+            .get(
+                prefix.as_str(),
+                Some(etcd_client::GetOptions::new().with_prefix()),
+            )
+            .await
+            .unwrap();
+        for (old, new) in before.kvs().iter().zip(after.kvs()) {
+            assert_eq!(old.key(), new.key());
+            assert_eq!(old.mod_revision(), new.mod_revision());
+        }
+        assert_eq!(
+            coordinator.publish_demand_events("t", &[]).await.unwrap(),
+            0
+        );
+        assert_eq!(operation_count(&handle, "demand_read"), 8);
+        assert_eq!(
+            coordinator
+                .publish_demand_events("t", &events[..1])
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(operation_count(&handle, "demand_read"), 9);
+        println!(
+            "97 unchanged shard observations: 4 read calls, 0 writes; single event: 1 read call"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn batch_stale_read_rejoins_writer_and_executor_progress() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let coordinator = batch_test_coordinator().await;
+        coordinator
+            .publish_demand_event("t", &ev("s", 10, None, 1, EventSource::Writer))
+            .await
+            .unwrap();
+        let key = coordinator.demand_event_key("t", "s");
+        let stale = coordinator
+            .client
+            .clone()
+            .get(key.as_str(), None)
+            .await
+            .unwrap();
+        // Both publishers win after the scan snapshot, before its CAS.
+        coordinator
+            .publish_demand_event("t", &ev("s", 30, None, 2, EventSource::Writer))
+            .await
+            .unwrap();
+        coordinator
+            .publish_merged_watermark(
+                "t",
+                &ShardMerged {
+                    shard: "s".into(),
+                    merged_through: 15,
+                },
+            )
+            .await
+            .unwrap();
+        let reads_before = operation_count(&handle, "demand_read");
+        assert!(coordinator
+            .join_from_read(&key, &ev("s", 20, Some(18), 1, EventSource::Scan), stale)
+            .await
+            .unwrap());
+        assert_eq!(
+            operation_count(&handle, "demand_read") - reads_before,
+            1,
+            "only the conflicted key is reread"
+        );
+        let current = coordinator
+            .client
+            .clone()
+            .get(key.as_str(), None)
+            .await
+            .unwrap();
+        let stored = stored_event(current.kvs().first()).unwrap().unwrap();
+        assert_eq!(stored.sealed_through, 30);
+        assert_eq!(stored.writer_epoch, 2);
+        assert_eq!(stored.sealed_bytes_through, 30_000);
+        assert_eq!(stored.merged_through, Some(18));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn batch_duplicate_shards_and_create_race_preserve_both_advancements() {
+        let coordinator = batch_test_coordinator().await;
+        let events = [
+            ev("s", 20, None, 1, EventSource::Writer),
+            ev("s", 20, Some(10), 1, EventSource::Scan),
+            ev("other", 8, None, 1, EventSource::Scan),
+        ];
+        assert_eq!(
+            coordinator
+                .publish_demand_events("t", &events)
+                .await
+                .unwrap(),
+            3
+        );
+        let key = coordinator.demand_event_key("t", "s");
+        let current = coordinator
+            .client
+            .clone()
+            .get(key.as_str(), None)
+            .await
+            .unwrap();
+        let stored = stored_event(current.kvs().first()).unwrap().unwrap();
+        assert_eq!(
+            (stored.sealed_through, stored.merged_through),
+            (20, Some(10))
+        );
+        assert_eq!(
+            coordinator
+                .publish_demand_events("t", &events)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(
+            coordinator
+                .client
+                .clone()
+                .get(coordinator.demand_event_key("t", "other"), None)
+                .await
+                .unwrap()
+                .kvs()
+                .len()
+                == 1
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn batch_rejects_future_schema_in_snapshot_and_after_conflict() {
+        let coordinator = batch_test_coordinator().await;
+        let key = coordinator.demand_event_key("t", "s");
+        let stale_absent = coordinator
+            .client
+            .clone()
+            .get(key.as_str(), None)
+            .await
+            .unwrap();
+        let mut future = ev("s", 5, None, 1, EventSource::Writer);
+        future.v = SCHEMA_VERSION + 1;
+        coordinator
+            .client
+            .clone()
+            .put(key.as_str(), serde_json::to_vec(&future).unwrap(), None)
+            .await
+            .unwrap();
+        let before = coordinator
+            .client
+            .clone()
+            .get(key.as_str(), None)
+            .await
+            .unwrap();
+        let event = ev("s", 50, None, 1, EventSource::Scan);
+        let error = coordinator
+            .join_from_read(&key, &event, stale_absent)
+            .await
+            .unwrap_err();
+        assert!(error.contains("unsupported version"), "{error}");
+        let error = coordinator
+            .publish_demand_events("t", &[event, ev("other", 1, None, 1, EventSource::Scan)])
+            .await
+            .unwrap_err();
+        assert!(error.contains("unsupported version"), "{error}");
+        let after = coordinator
+            .client
+            .clone()
+            .get(key.as_str(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            before.kvs()[0].mod_revision(),
+            after.kvs()[0].mod_revision()
+        );
+        assert_eq!(before.kvs()[0].value(), after.kvs()[0].value());
+        // Validate every input before publishing even the first chunk.
+        let error = coordinator
+            .publish_demand_events(
+                "other-target",
+                &[ev("ok", 1, None, 1, EventSource::Scan), future],
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("Version"), "{error}");
+        assert!(coordinator
+            .client
+            .clone()
+            .get(coordinator.demand_event_key("other-target", "ok"), None)
+            .await
+            .unwrap()
+            .kvs()
+            .is_empty());
     }
 
     #[tokio::test]
