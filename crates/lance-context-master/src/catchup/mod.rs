@@ -1,5 +1,6 @@
 //! Master-owned, bounded Kubernetes catch-up jobs. No payload reads in admission.
 mod executor;
+mod grouped;
 mod kubernetes;
 mod outcome;
 mod progress;
@@ -21,6 +22,17 @@ use std::{sync::Arc, time::Duration};
 use store::{Inventory, Record};
 
 type Result<T> = std::result::Result<T, String>;
+
+/// Time completed awaits, including returned errors, without spawning or
+/// changing cancellation. Phases are fixed labels; concurrent shard durations
+/// overlap and must not be added to the enclosing wave's wall time.
+async fn observe_stage<T>(phase: &'static str, work: impl std::future::Future<Output = T>) -> T {
+    let started = tokio::time::Instant::now();
+    let result = work.await;
+    metrics::histogram!("master_catchup_stage_seconds", "phase" => phase)
+        .record(started.elapsed().as_secs_f64());
+    result
+}
 
 #[derive(Clone, Debug, clap::Args)]
 pub struct CatchupConfig {
@@ -84,6 +96,19 @@ pub struct CatchupConfig {
     pub staging_targets: Vec<String>,
     #[arg(long, env = "CATCHUP_STAGING_CONCURRENCY", default_value_t = 2)]
     pub staging_concurrency: usize,
+    /// Exact targets opting in to bounded cross-shard base commits.
+    #[arg(long, env = "CATCHUP_GROUPED_TARGETS", value_delimiter = ',')]
+    pub grouped_targets: Vec<String>,
+    /// Maximum concurrent preparations and shards per group; bytes remain capped.
+    #[arg(long, env = "CATCHUP_GROUPED_SHARDS", default_value_t = 4)]
+    pub grouped_shards: usize,
+    /// Optional per-shard read cap for grouping, bounded by the aggregate byte cap.
+    /// Zero retains the aggregate cap for each preparation. Total budget is unchanged.
+    #[arg(long, env = "CATCHUP_GROUPED_PREPARE_MAX_BYTES", default_value_t = 0)]
+    pub grouped_prepare_max_bytes: usize,
+    /// Two budgeted immutable encoders per group; base publication stays ordered.
+    #[arg(long, env = "CATCHUP_GROUPED_PARALLEL_ENCODING", default_value_t = false, action = clap::ArgAction::Set)]
+    pub grouped_parallel_encoding: bool,
     /// Native one-table executor mode; does not start the admin server or scanner.
     #[arg(long, env = "CATCHUP_TARGET", hide = true)]
     pub target: Option<String>,
@@ -119,6 +144,10 @@ impl Default for CatchupConfig {
             parallel_upsert_io_targets: Vec::new(),
             staging_targets: Vec::new(),
             staging_concurrency: 2,
+            grouped_targets: Vec::new(),
+            grouped_shards: 4,
+            grouped_prepare_max_bytes: 0,
+            grouped_parallel_encoding: false,
             target: None,
             job_name: None,
             outcome_path: None,
@@ -128,7 +157,33 @@ impl Default for CatchupConfig {
     }
 }
 impl CatchupConfig {
+    pub(super) fn grouped_prepare_byte_cap(&self) -> usize {
+        if self.grouped_prepare_max_bytes == 0 {
+            self.merge_max_bytes
+        } else {
+            self.grouped_prepare_max_bytes
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
+        let grouped_disabled =
+            self.grouped_targets.is_empty() || self.grouped_targets == [String::new()];
+        if !(1..=32).contains(&self.grouped_shards)
+            || (grouped_disabled && self.grouped_parallel_encoding)
+            || (!grouped_disabled
+                && (self.merge_max_bytes == 0
+                    || self.merge_memory_bytes < self.merge_max_bytes
+                    || self.grouped_prepare_max_bytes > self.merge_max_bytes
+                    || self.grouped_targets.iter().any(|target| {
+                        target.is_empty()
+                            || target.contains('*')
+                            || self.staging_targets.contains(target)
+                            || self.bulk_key_delete_targets.contains(target)
+                            || self.parallel_upsert_io_targets.contains(target)
+                    })))
+        {
+            return Err("invalid grouped WAL targets, bounds or conflicting opt-ins".into());
+        }
         // Clap represents an explicitly empty environment variable as [""].
         // Job rendering uses that value to clear an inherited opt-in; it must
         // remain a valid disabled setting, while empty entries in a nonempty

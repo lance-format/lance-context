@@ -72,7 +72,28 @@ operation may finish beyond that slice while making progress. No Job or Pod
 runtime deadline is installed at creation. Each
 Job rotates the starting shard using a durable attempt number, including after
 failures, so a slow first shard cannot always hide the rest. Further fresh
-pressure can request another slice.
+pressure can request another slice. Duplicate keys across shards follow the
+configured publication order for that attempt. Rotation can therefore change
+which shard wins; it does not establish a global event-time order.
+
+For targets explicitly enabled in `CATCHUP_GROUPED_TARGETS`,
+`CATCHUP_GROUPED_PREPARE_MAX_BYTES` can limit each shard's preparation separately
+from the aggregate `CATCHUP_MERGE_MAX_BYTES` publication cap. Its default of `0`
+uses the aggregate cap for each preparation, preserving existing behavior. A
+nonzero value must not exceed the aggregate cap. Smaller preparations can admit
+more shards within the same `CATCHUP_MERGE_MEMORY_BYTES` budget; they may also
+require more passes for a large shard. Indivisible generations still use the
+existing nonblocking reservation growth and ordered retry path. Within each
+prepared group, a shard's captured unread suffix finishes before later shards
+publish, so a later round cannot overwrite those shards with an earlier tail.
+Later preparations remain charged while that suffix drains; insufficient
+headroom releases them for ordered rereading instead of waiting with buffers
+held. An expired slice defers unpublished later preparations without changing
+the existing Job continuation policy. The limit is
+not a total RSS guarantee. Qualify oversized generations before activation.
+Jobs receive this setting explicitly, including `0` to clear template values.
+Controllers using a nonzero value must agree on it in the durable catch-up policy;
+use the policy-change procedure above before changing an active controller fleet.
 
 ## Agent/API contract
 

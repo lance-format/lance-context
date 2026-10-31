@@ -74,6 +74,15 @@ impl Inventory {
             targets.dedup();
             policy["continuous_targets"] = serde_json::json!(targets);
         }
+        // Default-off preserves existing policy bytes. Controllers opting in
+        // must agree on the per-shard admission bound before creating Jobs.
+        if config.grouped_prepare_max_bytes != 0 {
+            policy["grouped_prepare_max_bytes"] =
+                serde_json::json!(config.grouped_prepare_max_bytes);
+        }
+        if config.grouped_parallel_encoding {
+            policy["grouped_parallel_encoding"] = serde_json::json!(true);
+        }
         let policy = policy.to_string();
         let key = format!("{}/catchup-policy", self.prefix);
         let mut client = self.client.clone();
