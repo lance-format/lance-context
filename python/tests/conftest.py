@@ -7,6 +7,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -37,8 +38,8 @@ def _wait_for_health(base_url: str, timeout: float = 30.0) -> None:
     raise RuntimeError(f"server did not become healthy at {url}")
 
 
-@pytest.fixture()
-def server() -> Iterator[str]:
+@contextmanager
+def _run_server(flush_interval_seconds: int) -> Iterator[str]:
     """Run a real HTTP server with an isolated dataset directory."""
     if not _SERVER_BIN.exists():
         # Locally a missing binary is a fair reason to skip. In CI it is not:
@@ -50,11 +51,12 @@ def server() -> Iterator[str]:
         pytest.skip(msg)
     port = _free_port()
     with tempfile.TemporaryDirectory() as data_dir:
-        # Rows are durable on `add` but only become visible when the server's
-        # sweeper seals the memtable. The 30s production default would make
-        # every write-then-assert below hang; 1s keeps the tests honest about
-        # the async-visibility contract without waiting on it.
-        env = {**os.environ, "ROLLOUT_FLUSH_INTERVAL_SECS": "1"}
+        # Disable cleanup so another sweeper cannot make flush-on-add tests pass.
+        env = {
+            **os.environ,
+            "ROLLOUT_CLEANUP_INTERVAL_SECS": "0",
+            "ROLLOUT_FLUSH_INTERVAL_SECS": str(flush_interval_seconds),
+        }
         with tempfile.TemporaryFile() as log:
             proc = subprocess.Popen(
                 [
@@ -90,3 +92,15 @@ def server() -> Iterator[str]:
                         "server did not handle SIGTERM gracefully "
                         f"(exit code {proc.returncode})"
                     )
+
+
+@pytest.fixture()
+def server() -> Iterator[str]:
+    with _run_server(flush_interval_seconds=1) as base_url:
+        yield base_url
+
+
+@pytest.fixture()
+def server_without_sweeps() -> Iterator[str]:
+    with _run_server(flush_interval_seconds=0) as base_url:
+        yield base_url
