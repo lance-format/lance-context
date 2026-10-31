@@ -548,11 +548,22 @@ async fn receive_image<S: AsyncRead + AsyncWrite + Unpin>(
         incoming.bytes()? <= options.max_image_bytes,
         "snapshot exceeds receive budget"
     );
+    // Keep an admitted stream connected while a checkpoint or sibling snapshot
+    // owns the physical image slot. The connection limit and whole-transfer
+    // deadline bound this wait; no file worker or Raft owner is blocked.
+    let permit = handle
+        .images
+        .upgrade()
+        .context("node image owner stopped")?
+        .acquire_snapshot()
+        .await?;
     let reservation = files
         .run(move || admission.map(|a| a.reserve(&incoming)).transpose())
         .await?;
     let mut receiver = handle
-        .receive_snapshot(packet, uuid::Uuid::new_v4())?
+        .local(packet.group, move |node| {
+            node.receive_snapshot_admitted(packet, uuid::Uuid::new_v4(), permit)
+        })?
         .await?;
     stream.write_u8(1).await?;
     stream.flush().await?;

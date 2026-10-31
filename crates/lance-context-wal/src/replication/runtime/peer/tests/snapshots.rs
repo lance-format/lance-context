@@ -52,6 +52,16 @@ struct Images {
 }
 impl Images {
     async fn open(root: &Path) -> Result<Self> {
+        Self::open_with_options(
+            root,
+            snapshot::Options {
+                transfer_timeout: Duration::from_secs(60),
+                ..Default::default()
+            },
+        )
+        .await
+    }
+    async fn open_with_options(root: &Path, options: snapshot::Options) -> Result<Self> {
         let net = Cluster::open(root).await?;
         let mut listeners = BTreeMap::new();
         let mut addresses = BTreeMap::new();
@@ -70,7 +80,7 @@ impl Images {
             quotas,
         };
         for id in 1..=3 {
-            c.attach(id, c.listener(id)?)?;
+            c.attach_options(id, c.listener(id)?, c.quotas[&id].clone(), options.clone())?;
         }
         Ok(c)
     }
@@ -85,6 +95,23 @@ impl Images {
         id: u64,
         listener: TcpListener,
         admission: Arc<dyn snapshot::Admission>,
+    ) -> Result<()> {
+        self.attach_options(
+            id,
+            listener,
+            admission,
+            snapshot::Options {
+                transfer_timeout: Duration::from_secs(60),
+                ..Default::default()
+            },
+        )
+    }
+    fn attach_options(
+        &mut self,
+        id: u64,
+        listener: TcpListener,
+        admission: Arc<dyn snapshot::Admission>,
+        options: snapshot::Options,
     ) -> Result<()> {
         let (client_tls, server_tls) = image_tls(&self.net.tls[&id]);
         let peers = self
@@ -109,10 +136,7 @@ impl Images {
                 peers,
                 client_tls,
                 server_tls,
-                options: snapshot::Options {
-                    transfer_timeout: Duration::from_secs(60),
-                    ..Default::default()
-                },
+                options,
                 admission: Some(admission),
             },
         )?;
@@ -400,6 +424,129 @@ fn image_files(root: &Path) -> Result<usize> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tls_snapshots_wait_for_checkpoint_and_sibling_receiver_without_reconnect() -> Result<()> {
+    use crate::replication::checkpoint::{Part, CHUNK_BYTES};
+    let root = tempfile::tempdir()?;
+    let mut c = Images::open(root.path()).await?;
+    c.net.nodes[&1].handle.campaign(10)?.await?;
+    assert_eq!(c.net.leader(10).await?, 1);
+    c.net.nodes[&2].handle.campaign(20)?.await?;
+    assert_eq!(c.net.leader(20).await?, 2);
+    let (initial, _) = append(&c.net.nodes[&1].handle, 10, 1).await?;
+    wait_for(|| {
+        c.net.nodes[&3]
+            .handle
+            .observation(10)
+            .unwrap()
+            .status
+            .applied
+            >= initial
+    })
+    .await?;
+    // Keep real TLS snapshot reception and durable Raft workers, but prevent
+    // automatic peer traffic from racing these two deliberate upload streams.
+    let Running {
+        network,
+        runtime,
+        handle,
+    } = c.net.nodes.remove(&3).unwrap();
+    network.shutdown().await?;
+    let capture = handle.prepare_checkpoint(10, uuid::Uuid::new_v4())?.await?;
+    let mut expected = Vec::new();
+    let mut images = Vec::new();
+    let mut packets = Vec::new();
+    for (group, leader_id, sequence) in [(10, 1, 2), (20, 2, 1)] {
+        let leader = &c.net.nodes[&leader_id].handle;
+        let (index, batch) = append(leader, group, sequence).await?;
+        let image = checkpoint(leader, group).await?;
+        packets.push(Packet {
+            cluster: leader.cluster,
+            layout: leader.layout,
+            policy: leader.policy,
+            group,
+            message: Message {
+                from: leader_id,
+                to: 3,
+                term: leader.observation(group)?.status.term,
+                msg_type: MessageType::MsgSnapshot,
+                snapshot: Some(image.snapshot()?).into(),
+                ..Default::default()
+            },
+        });
+        images.push(image);
+        expected.push((group, index, batch));
+    }
+    let path = root.path().join("3");
+    let before = image_files(&path)?;
+    let mut first = upload_header(&c, &packets[0]).await?;
+    assert!(
+        timeout(Duration::from_millis(150), first.read_u8())
+            .await
+            .is_err(),
+        "busy checkpoint must leave the admitted snapshot connected and waiting"
+    );
+    assert_eq!(image_files(&path)?, before);
+    drop(capture);
+    assert_eq!(timeout(Duration::from_secs(5), first.read_u8()).await??, 1);
+    let mut second = upload_header(&c, &packets[1]).await?;
+    let during_first = image_files(&path)?;
+    assert!(
+        timeout(Duration::from_millis(150), second.read_u8())
+            .await
+            .is_err(),
+        "a sibling snapshot must wait on its original connection"
+    );
+    assert_eq!(image_files(&path)?, during_first);
+    // Waiting for the physical image slot must not block either Raft owner or
+    // prevent the two healthy replicas from acknowledging new client appends.
+    append(&c.net.nodes[&1].handle, 10, 3).await?;
+    append(&c.net.nodes[&2].handle, 20, 2).await?;
+    for (stream, image) in [(&mut first, &images[0]), (&mut second, &images[1])] {
+        if image.identity().0 == 20 {
+            assert_eq!(timeout(Duration::from_secs(5), stream.read_u8()).await??, 1);
+        }
+        for part in [Part::Metadata, Part::Payload] {
+            let mut offset = 0;
+            while offset < image.bytes(part) {
+                let chunk = image.chunk(
+                    part,
+                    offset,
+                    (image.bytes(part) - offset).min(CHUNK_BYTES as u64) as usize,
+                )?;
+                stream.write_all(&chunk).await?;
+                offset += chunk.len() as u64;
+            }
+        }
+        stream.flush().await?;
+        let mut ack = [0; 8];
+        timeout(Duration::from_secs(5), stream.read_exact(&mut ack)).await??;
+        assert_eq!(&ack, b"LCWSYNC1");
+    }
+    wait_for(|| {
+        c.services[&3]
+            .statistics()
+            .installed
+            .load(Ordering::Acquire)
+            == 2
+    })
+    .await?;
+    assert_eq!(
+        c.services[&3].statistics().failed.load(Ordering::Acquire),
+        0
+    );
+    drop(first);
+    drop(second);
+    drop(images);
+    c.shutdown().await?;
+    runtime.shutdown().await?;
+    let node = Node::open(&path, layout(), 3, Limits::default())?;
+    for (group, index, batch) in expected {
+        assert_eq!(node.read_accepted(group, index)?, Some(batch));
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tls_snapshot_denial_and_interruption_never_install_or_release_disk_charges() -> Result<()>
 {
     use crate::replication::checkpoint::{Part, CHUNK_BYTES};
@@ -484,6 +631,92 @@ async fn tls_snapshot_denial_and_interruption_never_install_or_release_disk_char
     c.shutdown().await?;
     runtime.shutdown().await?;
     let node = Node::open(&path, layout(), follower, Limits::default())?;
+    assert_eq!(node.read_accepted(10, index)?, Some(expected));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tls_snapshot_slot_wait_obeys_deadline_and_shutdown_without_creating_files() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let mut c = Images::open_with_options(
+        root.path(),
+        snapshot::Options {
+            transfer_timeout: Duration::from_millis(500),
+            ..Default::default()
+        },
+    )
+    .await?;
+    c.net.nodes[&1].handle.campaign(10)?.await?;
+    assert_eq!(c.net.leader(10).await?, 1);
+    let (index, expected) = append(&c.net.nodes[&1].handle, 10, 1).await?;
+    wait_for(|| {
+        c.net.nodes[&3]
+            .handle
+            .observation(10)
+            .unwrap()
+            .status
+            .applied
+            >= index
+    })
+    .await?;
+    let Running {
+        network,
+        runtime,
+        handle,
+    } = c.net.nodes.remove(&3).unwrap();
+    network.shutdown().await?;
+    let capture = handle.prepare_checkpoint(10, uuid::Uuid::new_v4())?.await?;
+    let leader = &c.net.nodes[&1].handle;
+    append(leader, 10, 2).await?;
+    let image = checkpoint(leader, 10).await?;
+    let packet = Packet {
+        cluster: leader.cluster,
+        layout: leader.layout,
+        policy: leader.policy,
+        group: 10,
+        message: Message {
+            from: 1,
+            to: 3,
+            term: leader.observation(10)?.status.term,
+            msg_type: MessageType::MsgSnapshot,
+            snapshot: Some(image.snapshot()?).into(),
+            ..Default::default()
+        },
+    };
+    let path = root.path().join("3");
+    let before = image_files(&path)?;
+    let mut expired = upload_header(&c, &packet).await?;
+    assert!(timeout(Duration::from_millis(100), expired.read_u8())
+        .await
+        .is_err());
+    no_response(&mut expired).await?;
+    wait_for(|| c.services[&3].statistics().failed.load(Ordering::Acquire) == 1).await?;
+    assert_eq!(image_files(&path)?, before);
+    assert_eq!(c.quotas[&3].used.load(Ordering::Acquire), 0);
+    assert_eq!(handle.observation(10)?.status.applied, index);
+    drop(expired);
+
+    let mut stopping = upload_header(&c, &packet).await?;
+    assert!(timeout(Duration::from_millis(100), stopping.read_u8())
+        .await
+        .is_err());
+    timeout(
+        Duration::from_secs(2),
+        c.services.remove(&3).unwrap().shutdown(),
+    )
+    .await??;
+    no_response(&mut stopping).await?;
+    assert_eq!(image_files(&path)?, before);
+    assert_eq!(c.quotas[&3].used.load(Ordering::Acquire), 0);
+    drop(stopping);
+    drop(capture);
+    // Cancelled waiters must not consume the next permit or keep the physical
+    // engine locked after the real runtime shuts down, even with a live Handle.
+    drop(handle.prepare_checkpoint(10, uuid::Uuid::new_v4())?.await?);
+    drop(image);
+    c.shutdown().await?;
+    runtime.shutdown().await?;
+    let node = Node::open(&path, layout(), 3, Limits::default())?;
     assert_eq!(node.read_accepted(10, index)?, Some(expected));
     Ok(())
 }
