@@ -198,6 +198,16 @@ async fn durable_group_workers_preserve_payloads_and_exact_retries_after_reopen(
         })
     })
     .await?;
+    for handle in c.handles.values() {
+        for group in [10, 20] {
+            let poll = handle.observation(group)?.durable_poll;
+            assert!(poll.completed > 0);
+            assert_eq!(poll.failed, 0);
+            assert!(poll.elapsed_micros >= poll.max_elapsed_micros);
+            assert!(poll.engine.write_micros > 0);
+            assert!(poll.engine.sync_micros > 0);
+        }
+    }
     c.shutdown().await?;
     // Reopen all three original engines and read the full bytes, not only a
     // counter or receipt. No in-memory worker survives these opens.
@@ -489,6 +499,10 @@ async fn failed_durable_poll_stops_sibling_workers_and_releases_no_peer_response
     .await?
     .is_err());
     wait_for(|| h.observation(10).unwrap().stopped && h.observation(20).unwrap().stopped).await?;
+    let poll = h.observation(10)?.durable_poll;
+    assert!(poll.completed > 0);
+    assert_eq!(poll.failed, 1);
+    assert!(poll.elapsed_micros >= poll.max_elapsed_micros);
     assert!(h.campaign(20).is_err());
     assert!(
         outbox.try_recv().is_err(),

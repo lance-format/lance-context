@@ -26,6 +26,7 @@ struct Group {
     polling: bool,
     stopped: bool,
     fetch: runtime::FetchObservation,
+    durable_poll: runtime::PollObservation,
 }
 #[derive(Serialize)]
 struct View {
@@ -65,6 +66,7 @@ impl State {
                     polling: o.polling,
                     stopped: o.stopped,
                     fetch: o.fetch,
+                    durable_poll: o.durable_poll,
                 },
             );
         }

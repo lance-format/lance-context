@@ -31,6 +31,8 @@ use tokio::sync::{mpsc as async_mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 #[cfg(feature = "peer-transport")]
 pub mod client;
 mod images;
+mod poll_observation;
+pub use poll_observation::{EngineWriteObservation, PollObservation};
 #[cfg(feature = "peer-transport")]
 pub mod peer;
 
@@ -330,6 +332,8 @@ pub struct Observation {
     pub failure: Option<String>,
     /// Completed local fetch work. Excludes RPC admission and reply transport.
     pub fetch: FetchObservation,
+    /// Completed durable polls and native write timings on this worker thread.
+    pub durable_poll: PollObservation,
 }
 
 /// Bounded cumulative timings for serviced local fetch requests, including
@@ -639,6 +643,7 @@ impl Runtime {
         for (node, group, status, checkpoint_index) in nodes {
             let observation = Arc::new(Mutex::new(Observation {
                 fetch: FetchObservation::default(),
+                durable_poll: PollObservation::default(),
                 status,
                 checkpoint_index,
                 observed_at: Instant::now(),
@@ -846,6 +851,7 @@ impl Worker {
             }
             if activity {
                 self.observation.lock().unwrap().polling = true;
+                let poll_started = Instant::now();
                 let events = if self.options.pipeline_replication {
                     let shared = &self.shared;
                     let outbox = &self.outbox;
@@ -868,10 +874,17 @@ impl Worker {
                             }
                         }
                         shared.dropped_outgoing.fetch_add(1, Ordering::Relaxed);
-                    })?
+                    })
                 } else {
-                    self.node.poll()?
+                    self.node.poll()
                 };
+                let elapsed = poll_started.elapsed();
+                self.observation
+                    .lock()
+                    .unwrap()
+                    .durable_poll
+                    .record(elapsed, events.is_ok());
+                let events = events?;
                 for done in events.completions {
                     let pending = self
                         .writes
