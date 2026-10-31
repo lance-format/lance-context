@@ -502,6 +502,62 @@ impl TaskStore {
         }
     }
 
+    /// The caller must read this exact request BEFORE a fresh, complete empty
+    /// observation of every configured shard. Use only after local maintenance
+    /// released its execution back to this still-running task's leased lock.
+    /// New requests, lost claims, or a new execution all preserve the demand.
+    pub(crate) async fn acknowledge_empty_merge_request(
+        &self,
+        claim: &TaskClaim,
+        request: &lance_context_merge::rollout::MergeRequest,
+    ) -> lance::Result<bool> {
+        let b = &claim.backend;
+        let Some(target_key) = &b.target_key else {
+            return Ok(false);
+        };
+        if request.revision <= 0
+            || request.target != claim.task.target
+            || claim.task.kind != TaskKind::MergeWal
+            || claim.task.state != TaskState::Running
+            || b.lease_id <= 0
+        {
+            return Ok(false);
+        }
+        let execution_key = lance_context_merge::execution_key(&self.inner.prefix, &request.target);
+        let request_key = execution_key.replace("/merge-executions/", "/merge-requests/");
+        let merge_claim_key = execution_key.replace("/merge-executions/", "/merge-claims/");
+        let compares = with_publication_fence(
+            vec![
+                Compare::mod_revision(request_key.as_str(), CompareOp::Equal, request.revision),
+                Compare::value(
+                    request_key.as_str(),
+                    CompareOp::Equal,
+                    request.target.as_str(),
+                ),
+                Compare::value(b.claim_key.as_str(), CompareOp::Equal, b.token.as_str()),
+                Compare::lease(b.claim_key.as_str(), CompareOp::Equal, b.lease_id),
+                Compare::value(target_key.as_str(), CompareOp::Equal, b.token.as_str()),
+                Compare::lease(target_key.as_str(), CompareOp::Equal, b.lease_id),
+                Compare::value(merge_claim_key.as_str(), CompareOp::Equal, b.token.as_str()),
+                Compare::lease(merge_claim_key.as_str(), CompareOp::Equal, b.lease_id),
+                Compare::version(execution_key, CompareOp::Equal, 0),
+            ],
+            self.publication_fence.as_ref(),
+        );
+        self.inner
+            .client
+            .clone()
+            .txn(
+                Txn::new()
+                    .when(compares)
+                    .and_then([TxnOp::delete(request_key, None)]),
+            )
+            .observed(Operation::TaskOther)
+            .await
+            .map(|response| response.succeeded())
+            .map_err(etcd_error("acknowledge proven empty merge demand"))
+    }
+
     /// A successful no-op is tied to the exact observed version and options.
     /// Expiry also bounds suppression when stats are stale or a URI is reused.
     pub(crate) async fn record_compact_noop(
@@ -3988,6 +4044,125 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires isolated ETCD_TEST_ENDPOINTS"]
+    async fn empty_merge_demand_cas_preserves_races_and_changed_ownership() {
+        // WAL_CLAIM_TARGETS is an exact allowlist; empty means unrestricted.
+        let (_dir, store) = bounded_scheduler_store(vec![]).await;
+        let c = store.merge_coordinator();
+        let mut client = store.inner.client.clone();
+        for race in [
+            "none",
+            "request",
+            "claim",
+            "claim_lease",
+            "target",
+            "target_lease",
+            "merge_claim",
+            "merge_claim_lease",
+            "execution",
+        ] {
+            let target = format!("empty-demand-{race}");
+            store
+                .enqueue(TaskKind::MergeWal, &target, vec![])
+                .await
+                .unwrap();
+            let claim = store
+                .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(claim.task.target, target);
+            c.request_merge(&target).await.unwrap();
+            let observed = c.get_merge_request(&target).await.unwrap().unwrap();
+            let b = &claim.backend;
+            match race {
+                "request" => c.request_merge(&target).await.unwrap(),
+                "claim" => {
+                    client
+                        .put(b.claim_key.clone(), "replacement", None)
+                        .await
+                        .unwrap();
+                }
+                "claim_lease" => {
+                    client
+                        .put(b.claim_key.clone(), b.token.clone(), None)
+                        .await
+                        .unwrap();
+                }
+                "target" => {
+                    client
+                        .put(b.target_key.clone().unwrap(), "replacement", None)
+                        .await
+                        .unwrap();
+                }
+                "target_lease" => {
+                    client
+                        .put(b.target_key.clone().unwrap(), b.token.clone(), None)
+                        .await
+                        .unwrap();
+                }
+                "merge_claim" | "merge_claim_lease" => {
+                    let key = lance_context_merge::execution_key(&store.inner.prefix, &target)
+                        .replace("/merge-executions/", "/merge-claims/");
+                    let value = if race == "merge_claim" {
+                        "replacement"
+                    } else {
+                        &b.token
+                    };
+                    client.put(key, value, None).await.unwrap();
+                }
+                "execution" => {
+                    client
+                        .put(
+                            lance_context_merge::execution_key(&store.inner.prefix, &target),
+                            "new-execution",
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                }
+                "none" => {}
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                store
+                    .acknowledge_empty_merge_request(&claim, &observed)
+                    .await
+                    .unwrap(),
+                race == "none",
+                "{race}"
+            );
+            assert_eq!(
+                c.get_merge_request(&target).await.unwrap().is_some(),
+                race != "none",
+                "{race}"
+            );
+            if race == "none" {
+                assert!(
+                    store
+                        .enqueue_merge_request(&observed)
+                        .await
+                        .unwrap()
+                        .is_none(),
+                    "a stale demand page cannot recreate the acknowledged request"
+                );
+                c.request_merge(&target).await.unwrap();
+                assert!(!store
+                    .acknowledge_empty_merge_request(&claim, &observed)
+                    .await
+                    .unwrap());
+                assert!(
+                    c.get_merge_request(&target).await.unwrap().is_some(),
+                    "a late flush survives an older successful acknowledgement"
+                );
+            }
+            // Fixture keys are deliberately left in this unique local prefix;
+            // a malformed execution must not be passed to normal finish/recovery.
+            drop(claim);
+        }
+    }
+
+    #[tokio::test]
     #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn failure_recovery_observation_preserves_new_budget_and_writer_demand() {
         use lance_context_merge::failure::{failure_key, FailureClass, ShardFailure};
@@ -4505,7 +4680,7 @@ pub(crate) mod tests {
     pub(crate) struct LeaseTestProxy {
         pub(crate) endpoint: String,
         pub(crate) online: tokio::sync::watch::Sender<bool>,
-        responses: tokio::sync::watch::Sender<bool>,
+        pub(crate) responses: tokio::sync::watch::Sender<bool>,
         task: JoinHandle<()>,
     }
 
@@ -4594,6 +4769,75 @@ pub(crate) mod tests {
         cfg.etcd_lease_ttl_secs = 6;
         let store = TaskStore::open(&cfg).await.unwrap();
         (dir, proxy, store, observer)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated loopback ETCD_TEST_ENDPOINTS"]
+    async fn empty_merge_demand_lost_ack_response_preserves_later_request() {
+        let upstream = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+        let proxy = LeaseTestProxy::start(&upstream).await;
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.etcd.etcd_endpoints = vec![proxy.endpoint.clone()];
+        cfg.etcd.etcd_prefix = format!("/empty-demand-lost-reply/{}", generate_id());
+        cfg.etcd_lease_ttl_secs = 30;
+        cfg.maintenance.wal_claim_targets = vec!["empty".into()];
+        let store = TaskStore::open(&cfg).await.unwrap();
+        let mut observer = Client::connect([upstream], None).await.unwrap();
+        store
+            .enqueue(TaskKind::MergeWal, "empty", vec![])
+            .await
+            .unwrap();
+        let claim = store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        let coordinator = store.merge_coordinator();
+        coordinator.request_merge("empty").await.unwrap();
+        let request = coordinator
+            .get_merge_request("empty")
+            .await
+            .unwrap()
+            .unwrap();
+        let key = lance_context_merge::execution_key(&store.inner.prefix, "empty")
+            .replace("/merge-executions/", "/merge-requests/");
+        proxy.responses.send(false).unwrap();
+        let acknowledge = store.acknowledge_empty_merge_request(&claim, &request);
+        let late_request = async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !observer
+                    .get(key.clone(), None)
+                    .await
+                    .unwrap()
+                    .kvs()
+                    .is_empty()
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the acknowledgement reached etcd while its response was withheld");
+            observer
+                .put(key.clone(), "empty", None)
+                .await
+                .unwrap()
+                .header()
+                .unwrap()
+                .revision()
+        };
+        // Let the real client's RPC deadline deliver uncertainty. Do not retry
+        // the transaction or synthesize a failed compare from a missing reply.
+        let (result, late_revision) = tokio::join!(acknowledge, late_request);
+        assert!(result.is_err());
+        proxy.responses.send(true).unwrap();
+        let current = observer.get(key, None).await.unwrap();
+        assert_eq!(current.kvs()[0].mod_revision(), late_revision);
+        assert!(late_revision > request.revision);
+        store
+            .finish(claim, Ok("storage already completed".into()))
+            .await
+            .unwrap();
     }
 
     async fn bounded_scheduler_store(targets: Vec<String>) -> (TempDir, TaskStore) {

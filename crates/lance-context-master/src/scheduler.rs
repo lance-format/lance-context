@@ -2866,6 +2866,178 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires isolated ETCD_TEST_ENDPOINTS"]
+    async fn empty_merge_demand_suppresses_only_satisfied_successors() {
+        // Poll-scoped accounting avoids a process-global recorder that would
+        // interfere with other tests. It counts instrumented foreground calls,
+        // not spawned background work or transport-internal wire retries.
+        #[derive(Default)]
+        struct Count(std::sync::atomic::AtomicU64);
+        impl metrics::CounterFn for Count {
+            fn increment(&self, n: u64) {
+                self.0.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+            }
+            fn absolute(&self, n: u64) {
+                self.0.fetch_max(n, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        struct Capture(Arc<Count>);
+        impl metrics::Recorder for Capture {
+            fn describe_counter(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn describe_gauge(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn describe_histogram(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn register_counter(
+                &self,
+                key: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Counter {
+                if key.name() == "etcd_operation_attempts_total" {
+                    metrics::Counter::from_arc(self.0.clone())
+                } else {
+                    metrics::Counter::noop()
+                }
+            }
+            fn register_gauge(
+                &self,
+                _: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Gauge {
+                metrics::Gauge::noop()
+            }
+            fn register_histogram(
+                &self,
+                _: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Histogram {
+                metrics::Histogram::noop()
+            }
+        }
+        async fn flush(writer: &lance_context_core::RolloutStore, id: &str) {
+            let dto = serde_json::from_value(serde_json::json!({
+                "id": id, "rollout_id": "r", "content": "preserved"
+            }))
+            .unwrap();
+            writer
+                .add(&[lance_context_core::rollout_record_from_add_request(&dto)])
+                .await
+                .unwrap();
+            writer.flush().await.unwrap();
+        }
+        for enabled in [false, true] {
+            for late_flush in [false, true] {
+                let capture = Capture(Arc::new(Count::default()));
+                let started = std::time::Instant::now();
+                let scenario = async {
+                    let dir = TempDir::new().unwrap();
+                    let mut cfg = config(&dir);
+                    cfg.local_merge.master_local_merge_targets = vec!["exp".into()];
+                    cfg.catchup.shards = (0..19).map(|i| format!("empty-{i}")).collect();
+                    cfg.catchup.shards.push("writer".into());
+                    if enabled {
+                        cfg.local_merge.master_local_merge_empty_demand_targets =
+                            vec!["exp".into()];
+                    }
+                    let state = MasterState::new(cfg).await.unwrap();
+                    let writer = lance_context_core::RolloutStore::open_with_options(
+                        &state.rollout_uri("exp"),
+                        lance_context_core::RolloutStoreOptions {
+                            shard_id: Some("writer".into()),
+                            merge_after_generations: Some(0),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    flush(&writer, "first").await;
+                    let coordinator = state.task_store.merge_coordinator();
+                    enqueue(&state, TaskKind::MergeWal, "exp").await.unwrap();
+                    let claim = state.task_store.claim_next().await.unwrap().unwrap();
+                    coordinator.request_merge("exp").await.unwrap();
+                    let result = crate::merge_execution::run_merge_wal(&state, &claim).await;
+                    assert_eq!(
+                        result.as_ref().unwrap(),
+                        "local WAL merge reclaimed 1 generations"
+                    );
+                    if late_flush {
+                        flush(&writer, "late").await;
+                        coordinator.request_merge("exp").await.unwrap();
+                    }
+                    finish_task(&state, claim, result).await.unwrap();
+                    let next = state
+                        .task_store
+                        .get_active_id(TaskKind::MergeWal, "exp")
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        next.is_some(),
+                        !enabled || late_flush,
+                        "enabled={enabled}, late_flush={late_flush}"
+                    );
+                    if let Some(id) = next {
+                        let claim = state.task_store.claim_next().await.unwrap().unwrap();
+                        assert_eq!(claim.task.id, id);
+                        let result = crate::merge_execution::run_merge_wal(&state, &claim).await;
+                        assert_eq!(
+                            result.as_ref().unwrap(),
+                            &format!(
+                                "local WAL merge reclaimed {} generations",
+                                usize::from(late_flush)
+                            )
+                        );
+                        finish_task(&state, claim, result).await.unwrap();
+                    }
+                    assert!(state
+                        .task_store
+                        .get_active_id(TaskKind::MergeWal, "exp")
+                        .await
+                        .unwrap()
+                        .is_none());
+                    let probe = lance_context_core::rollout_append::SealedWalProbe::open(
+                        &state.rollout_uri("exp"),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                    assert!(!probe.has_sealed_wal("writer").await.unwrap());
+                };
+                let mut scenario = std::pin::pin!(scenario);
+                futures::future::poll_fn(|cx| {
+                    use std::future::Future;
+                    metrics::with_local_recorder(&capture, || scenario.as_mut().poll(cx))
+                })
+                .await;
+                eprintln!(
+                    "empty_demand_measurement {}",
+                    serde_json::json!({
+                        "enabled": enabled, "late_flush": late_flush, "shards": 20,
+                        "foreground_etcd_calls": capture.0.0.load(std::sync::atomic::Ordering::Relaxed),
+                        "elapsed_seconds": started.elapsed().as_secs_f64(),
+                        "scope": "Single local filesystem fixture; foreground instrumented calls only; includes fixture setup. Not production throughput or total wire I/O."
+                    })
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn resident_completion_does_not_fast_retry_failures_or_legacy_work() {
         for resident in [false, true] {
