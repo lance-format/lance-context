@@ -52,6 +52,16 @@ struct Images {
 }
 impl Images {
     async fn open(root: &Path) -> Result<Self> {
+        Self::open_with_options(
+            root,
+            snapshot::Options {
+                transfer_timeout: Duration::from_secs(60),
+                ..Default::default()
+            },
+        )
+        .await
+    }
+    async fn open_with_options(root: &Path, options: snapshot::Options) -> Result<Self> {
         let net = Cluster::open(root).await?;
         let mut listeners = BTreeMap::new();
         let mut addresses = BTreeMap::new();
@@ -70,7 +80,7 @@ impl Images {
             quotas,
         };
         for id in 1..=3 {
-            c.attach(id, c.listener(id)?)?;
+            c.attach_options(id, c.listener(id)?, c.quotas[&id].clone(), options.clone())?;
         }
         Ok(c)
     }
@@ -628,7 +638,14 @@ async fn tls_snapshot_denial_and_interruption_never_install_or_release_disk_char
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tls_snapshot_slot_wait_obeys_deadline_and_shutdown_without_creating_files() -> Result<()> {
     let root = tempfile::tempdir()?;
-    let mut c = Images::open(root.path()).await?;
+    let mut c = Images::open_with_options(
+        root.path(),
+        snapshot::Options {
+            transfer_timeout: Duration::from_millis(500),
+            ..Default::default()
+        },
+    )
+    .await?;
     c.net.nodes[&1].handle.campaign(10)?.await?;
     assert_eq!(c.net.leader(10).await?, 1);
     let (index, expected) = append(&c.net.nodes[&1].handle, 10, 1).await?;
@@ -642,16 +659,6 @@ async fn tls_snapshot_slot_wait_obeys_deadline_and_shutdown_without_creating_fil
             >= index
     })
     .await?;
-    c.services.remove(&3).unwrap().shutdown().await?;
-    c.attach_options(
-        3,
-        c.listener(3)?,
-        c.quotas[&3].clone(),
-        snapshot::Options {
-            transfer_timeout: Duration::from_millis(500),
-            ..Default::default()
-        },
-    )?;
     let Running {
         network,
         runtime,
