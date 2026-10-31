@@ -44,6 +44,7 @@ pub struct Observation {
     pub completed: u64,
     pub failed: u64,
     pub draining: bool,
+    #[serde(serialize_with = "crate::materializer::observation::serialize_observations")]
     pub phases: [crate::materializer::observation::Observation;
         crate::materializer::observation::PHASE_COUNT],
 }

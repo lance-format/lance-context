@@ -96,6 +96,7 @@ impl Counters {
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct Observation {
+    #[serde(serialize_with = "crate::materializer::observation::serialize_observations")]
     pub phases: [crate::materializer::observation::Observation;
         crate::materializer::observation::PHASE_COUNT],
     pub running: bool,

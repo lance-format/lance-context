@@ -263,6 +263,15 @@ resolution. The shared catalog also reports `state`, `prepare`, and `retire`
 work. This distinguishes a full source window waiting on maintenance from one
 waiting on native preparation or publication without logging individual turns.
 
+Mixed preparation reports `annotation_body_prepare` for the body branch,
+including base loading, workspace admission, row selection and snapshot capture.
+Its nested `annotation_body_write` and `annotation_body_commit` phases measure
+native fragment writing and the private detached commit. The following
+`annotation_narrow_prepare` measures narrow annotation preparation. Reusing an
+already prepared body does not repeat its body phases. Native writer observations
+remain with the admitted task if its caller is cancelled. These overlapping
+intervals are not additive and do not by themselves identify storage saturation.
+
 Annotation commit resolution reports four nested phases.
 `annotation_commit_base` loads the fixed predecessor;
 `annotation_commit_publish` validates and publishes the prepared target when it
