@@ -1173,6 +1173,9 @@ async fn sweep_merge_wal_inner(
     let mut deduped = 0;
     let mut refresh = crate::wal_sweep_refresh::Refresh::new();
     for row in rows {
+        if !state.config.admits_automatic_wal(&row.name) {
+            continue;
+        }
         if queued >= MAX_SWEEP_ENQUEUE {
             break;
         }
@@ -1459,6 +1462,7 @@ pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
     crate::planner::spawn(state);
     crate::executors::spawn(state);
     crate::demand_controller::spawn(state);
+    crate::demand_controller::spawn_scoped(state);
     crate::periodic_sweep::spawn(state);
 
     let concurrency = state.config.task_concurrency.max(1);
@@ -1718,6 +1722,7 @@ mod tests {
             compaction_max_bytes_per_file: 1024 * 1024 * 1024,
             merge_wal_interval_secs: 0,
             merge_wal_min_generations: 2,
+            merge_wal_admission_targets: vec![],
             worker_endpoints: vec![],
             task_concurrency: 4,
             merge_wal_concurrency: 4,
@@ -6346,6 +6351,60 @@ mod tests {
         // controller's five-second reconnect delay during shutdown.
         controller.abort();
         let _ = controller.await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated ETCD_TEST_ENDPOINTS"]
+    async fn scoped_wal_admission_preserves_distinct_periodic_policy_owners() {
+        let dir = TempDir::new().unwrap();
+        let original = periodic_test_state(&dir).await;
+        let mut other = original
+            .stats
+            .lock()
+            .await
+            .get("exp")
+            .await
+            .unwrap()
+            .unwrap();
+        other.name = "other".into();
+        other.uri = original.rollout_uri("other");
+        original.stats.lock().await.upsert(&other).await.unwrap();
+        let mut config = original.config.clone();
+        config.merge_rollout.fence_legacy = true;
+        config.merge_wal_admission_targets = vec!["exp".into()];
+        let first = MasterState::new(config.clone()).await.unwrap();
+        let first_handles = crate::periodic_sweep::spawn(&first);
+        let claim = periodic_wait_claim(&first).await;
+        assert_eq!(claim.task.target, "exp");
+        assert!(first
+            .task_store
+            .get_active_id(TaskKind::MergeWal, "other")
+            .await
+            .unwrap()
+            .is_none());
+        first
+            .task_store
+            .finish(claim, Ok("done".into()))
+            .await
+            .unwrap();
+        config.merge_wal_admission_targets = vec!["other".into()];
+        let second = MasterState::new(config).await.unwrap();
+        let second_handles = crate::periodic_sweep::spawn(&second);
+        let claim = periodic_wait_claim(&second).await;
+        assert_eq!(claim.task.target, "other");
+        second
+            .task_store
+            .finish(claim, Ok("done".into()))
+            .await
+            .unwrap();
+        first.admission.begin_drain();
+        second.admission.begin_drain();
+        for handle in first_handles.into_iter().chain(second_handles) {
+            tokio::time::timeout(Duration::from_secs(5), handle)
+                .await
+                .unwrap()
+                .unwrap();
+        }
     }
 
     #[tokio::test]

@@ -63,6 +63,10 @@ struct Policy {
     /// Older members advertise no tail policy during a mixed-version rollout.
     #[serde(default)]
     aggregate_tail_interval_secs: u64,
+    /// Scoped thresholds are carried separately so older leaders cannot apply
+    /// them globally while ignoring the new target selector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scoped_automatic_admission: Option<ScopedAutomaticAdmission>,
     #[serde(default)]
     aggregate_merge_slots: usize,
     endpoints: Vec<String>,
@@ -75,18 +79,32 @@ struct Policy {
     resident: Option<crate::resident_recovery::Policy>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ScopedAutomaticAdmission {
+    targets: Vec<String>,
+    min_generations: i64,
+    tail_interval_secs: u64,
+}
+
 impl Policy {
     fn from_config(config: &MasterConfig) -> Self {
+        let tail_interval_secs = if config.wal_tail.wal_tail_stats_max_age_secs > 0 {
+            config.wal_tail.wal_tail_interval_secs
+        } else {
+            0
+        };
+        let scoped = !config.merge_wal_admission_targets.is_empty();
         Self {
             v: 1,
             resident: crate::resident_recovery::Policy::from_config(config),
             automatic: config.merge_wal_interval_secs > 0,
-            aggregate_min_generations: Some(config.merge_wal_min_generations),
-            aggregate_tail_interval_secs: if config.wal_tail.wal_tail_stats_max_age_secs > 0 {
-                config.wal_tail.wal_tail_interval_secs
-            } else {
-                0
-            },
+            aggregate_min_generations: (!scoped).then_some(config.merge_wal_min_generations),
+            aggregate_tail_interval_secs: if scoped { 0 } else { tail_interval_secs },
+            scoped_automatic_admission: scoped.then(|| ScopedAutomaticAdmission {
+                targets: config.merge_wal_admission_targets.clone(),
+                min_generations: config.merge_wal_min_generations,
+                tail_interval_secs,
+            }),
             aggregate_merge_slots: if !config.maintenance.claim_wal_merges {
                 0
             } else if config.merge_wal_concurrency > 0 {
@@ -108,6 +126,19 @@ impl Policy {
             // Validated automatic local routing requires wildcard local targets.
             local_auto: config.local_merge.master_local_merge_auto
                 && config.merge_rollout.fence_legacy,
+        }
+    }
+
+    fn automatic_thresholds(&self, target: &str) -> Option<(i64, u64)> {
+        match &self.scoped_automatic_admission {
+            Some(policy) => policy
+                .targets
+                .iter()
+                .any(|name| name == target)
+                .then_some((policy.min_generations, policy.tail_interval_secs)),
+            None => self
+                .aggregate_min_generations
+                .map(|minimum| (minimum, self.aggregate_tail_interval_secs)),
         }
     }
 
@@ -815,6 +846,72 @@ async fn become_leader(
             return Ok(());
         }
     }
+}
+
+/// Old global leaders deliberately ignore scoped thresholds. Elect one extra
+/// informer across ALL scoped policies so fresh writer events can still admit
+/// selected tables during a rolling upgrade. It never dispatches or executes
+/// tasks, and uses the same durable frontier/dedupe as the global informer.
+pub(crate) fn spawn_scoped(state: &Arc<MasterState>) -> Option<tokio::task::JoinHandle<()>> {
+    if state.config.merge_wal_interval_secs == 0
+        || state.config.merge_wal_admission_targets.is_empty()
+    {
+        return None;
+    }
+    let state = state.clone();
+    Some(tokio::spawn(async move {
+        let name = "scoped-wal-discovery-v1";
+        let key = state.task_store.coordination_key(name);
+        loop {
+            if !state.admission.is_accepting() {
+                return;
+            }
+            let election = async {
+                wait_for_vacancy(state.task_store.etcd_client(), &key, None).await?;
+                state
+                    .task_store
+                    .try_coordination_lock(name)
+                    .await
+                    .map_err(|e| e.to_string())
+            };
+            let owner = tokio::select! {
+                _ = state.admission.wait_closed() => return,
+                result = election => result,
+            };
+            match owner {
+                Ok(Some(owner)) => {
+                    metrics::gauge!("master_scoped_wal_controller_leader").set(1.0);
+                    let lease_lost = async {
+                        while owner.is_live() {
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                    };
+                    tokio::select! {
+                        _ = state.admission.wait_closed() => {},
+                        _ = lease_lost => {},
+                        _ = aggregate::run_scoped(&state, &owner) => {},
+                        result = wait_for_vacancy(state.task_store.etcd_client(), &key, Some(owner.token())) => {
+                            if let Err(error) = result {
+                                tracing::warn!(%error, "scoped WAL owner watch ended");
+                            }
+                        },
+                    }
+                    metrics::gauge!("master_scoped_wal_controller_leader").set(0.0);
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(2),
+                        state.task_store.release_coordination_lock(owner),
+                    )
+                    .await;
+                }
+                Ok(None) => continue,
+                Err(error) => tracing::warn!(%error, "scoped WAL election deferred"),
+            }
+            tokio::select! {
+                _ = state.admission.wait_closed() => return,
+                _ = tokio::time::sleep(RECONNECT) => {},
+            }
+        }
+    }))
 }
 
 pub(crate) fn spawn(state: &Arc<MasterState>) -> tokio::task::JoinHandle<()> {

@@ -76,6 +76,7 @@ impl ScanMergeAdmission {
             || self.time_left.is_zero()
             || row.pending_wal_generations <= 0
             || row.pending_wal_generations < state.config.merge_wal_min_generations
+            || !state.config.admits_automatic_wal(&row.name)
         {
             return;
         }
@@ -1498,6 +1499,37 @@ mod early_merge_tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn scoped_wal_admission_limits_scan_without_hiding_observations() {
+        let (_dir, original) = fixture(true).await;
+        let mut config = original.config.clone();
+        config.merge_rollout.fence_legacy = true;
+        config.merge_wal_admission_targets = vec!["selected".into()];
+        let state = MasterState::new(config).await.unwrap();
+        let observations = collect_observations(
+            &state,
+            stream::iter(vec![
+                ("other".into(), Some((row("other", 80), false))),
+                ("selected".into(), Some((row("selected", 80), false))),
+            ]),
+        )
+        .await;
+        assert_eq!(observations.len(), 2);
+        assert!(state
+            .task_store
+            .get_active_id(TaskKind::MergeWal, "other")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(state
+            .task_store
+            .get_active_id(TaskKind::MergeWal, "selected")
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]

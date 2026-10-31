@@ -1,5 +1,6 @@
-//! Table-wide WAL admission from existing writer watermarks. Only the elected
-//! demand controller runs this loop. Its streaming snapshot is independent of
+//! Table-wide WAL admission from existing writer watermarks. The elected global
+//! controller runs this loop; an independent scoped owner can run a restricted
+//! instance during mixed-version upgrades. Streaming snapshots do not block
 //! task dispatch. Retained values omit payloads and keep only one conservative
 //! observation time per shard, rather than per-generation timestamp maps.
 //!
@@ -173,6 +174,9 @@ impl Table {
 }
 
 struct Cache {
+    // The independently elected scoped controller shares all durable capacity
+    // observations, but only scoped members authorize its automatic decisions.
+    scoped_only: bool,
     tables: BTreeMap<String, Table>,
     members: BTreeMap<Vec<u8>, Policy>,
     member_bytes: BTreeMap<Vec<u8>, usize>,
@@ -197,6 +201,7 @@ struct Attempt {
 impl Cache {
     fn new() -> Self {
         Self {
+            scoped_only: false,
             tables: BTreeMap::new(),
             members: BTreeMap::new(),
             member_bytes: BTreeMap::new(),
@@ -223,15 +228,17 @@ impl Cache {
             .values()
             .filter(|p| {
                 p.automatic
+                    && (!self.scoped_only || p.scoped_automatic_admission.is_some())
                     && !p.draining.iter().any(|t| t == target)
                     && p.admits_request(target, None)
             })
             .filter_map(|p| {
-                let threshold = p.aggregate_min_generations?.max(1) as u64;
+                let (minimum, tail_interval) = p.automatic_thresholds(target)?;
+                let threshold = minimum.max(1) as u64;
                 if table.pending() >= threshold {
                     Some(Duration::ZERO)
-                } else if p.aggregate_tail_interval_secs > 0 {
-                    table.tail_delay(p.aggregate_tail_interval_secs, now_ms)
+                } else if tail_interval > 0 {
+                    table.tail_delay(tail_interval, now_ms)
                 } else {
                     None
                 }
@@ -298,6 +305,24 @@ impl Cache {
     }
 
     fn mark(&mut self, target: &str, delay: Duration) {
+        // Keep resolving an uncertain enqueue even if its policy disappears.
+        // Other targets need no local timers in the scoped informer. Membership
+        // updates revisit every retained table, including newly selected ones.
+        if self.scoped_only
+            && !self.pending.as_ref().is_some_and(|p| p.target == target)
+            && !self.members.values().any(|p| {
+                p.automatic
+                    && p.scoped_automatic_admission
+                        .as_ref()
+                        .is_some_and(|scope| scope.targets.iter().any(|name| name == target))
+            })
+        {
+            if let Some(old) = self.due.remove(target) {
+                self.ready.remove(&(old, target.to_string()));
+            }
+            self.waiting.remove(target);
+            return;
+        }
         if self.waiting.contains_key(target) {
             self.wait_capacity(target);
             return;
@@ -692,8 +717,16 @@ async fn resolve_pending(
     Ok(())
 }
 
+#[cfg(test)]
 async fn snapshot(client: &Client, prefix: &str) -> Result<Cache, String> {
-    let mut cache = Cache::new();
+    snapshot_mode(client, prefix, false).await
+}
+
+async fn snapshot_mode(client: &Client, prefix: &str, scoped_only: bool) -> Result<Cache, String> {
+    let mut cache = Cache {
+        scoped_only,
+        ..Cache::new()
+    };
     let mut client = client.clone();
     let mut revision = 0;
     for (index, range) in RANGES.iter().enumerate() {
@@ -922,28 +955,71 @@ async fn reconcile_table(
     Ok(())
 }
 
-/// Shares the dispatch leader's lease/fence, but never delays its snapshot,
-/// offers or task recovery while bootstrapping 13k tables of writer hints.
-struct MetricsGuard;
+/// Keep global and scoped live gauges separate when both controllers run in
+/// one process. Cumulative admission/error counters intentionally include both.
+struct MetricsGuard([&'static str; 6]);
+
+impl MetricsGuard {
+    fn new(scoped_only: bool) -> Self {
+        Self(if scoped_only {
+            [
+                "master_scoped_aggregate_wal_cache_tables",
+                "master_scoped_aggregate_wal_cache_shards",
+                "master_scoped_aggregate_wal_cache_bytes",
+                "master_scoped_aggregate_wal_outstanding",
+                "master_scoped_aggregate_wal_waiting",
+                "master_scoped_aggregate_wal_capacity",
+            ]
+        } else {
+            [
+                "master_aggregate_wal_cache_tables",
+                "master_aggregate_wal_cache_shards",
+                "master_aggregate_wal_cache_bytes",
+                "master_aggregate_wal_outstanding",
+                "master_aggregate_wal_waiting",
+                "master_aggregate_wal_capacity",
+            ]
+        })
+    }
+
+    fn observe(&self, cache: &Cache) {
+        for (name, value) in self.0.iter().zip([
+            cache.tables.len(),
+            cache.shards,
+            cache.bytes,
+            cache.outstanding.len(),
+            cache.waiting.len(),
+            cache.capacity(),
+        ]) {
+            metrics::gauge!(*name).set(value as f64);
+        }
+    }
+}
+
 impl Drop for MetricsGuard {
     fn drop(&mut self) {
-        metrics::gauge!("master_aggregate_wal_cache_tables").set(0.0);
-        metrics::gauge!("master_aggregate_wal_cache_shards").set(0.0);
-        metrics::gauge!("master_aggregate_wal_cache_bytes").set(0.0);
-        metrics::gauge!("master_aggregate_wal_outstanding").set(0.0);
-        metrics::gauge!("master_aggregate_wal_waiting").set(0.0);
-        metrics::gauge!("master_aggregate_wal_capacity").set(0.0);
+        for name in self.0 {
+            metrics::gauge!(name).set(0.0);
+        }
     }
 }
 
 pub(super) async fn run(state: &Arc<MasterState>, session: &CoordinationGuard) {
-    let _metrics_guard = MetricsGuard;
+    run_mode(state, session, false).await;
+}
+
+pub(super) async fn run_scoped(state: &Arc<MasterState>, session: &CoordinationGuard) {
+    run_mode(state, session, true).await;
+}
+
+async fn run_mode(state: &Arc<MasterState>, session: &CoordinationGuard, scoped_only: bool) {
+    let metrics = MetricsGuard::new(scoped_only);
     let prefix = state.config.etcd.prefix().trim_end_matches('/');
     let publisher = state.task_store.discovery_publisher(session);
     let client = state.task_store.etcd_client();
     let mut bootstrap_failures = 0u32;
     loop {
-        let mut cache = match snapshot(client, prefix).await {
+        let mut cache = match snapshot_mode(client, prefix, scoped_only).await {
             Ok(cache) => cache,
             Err(error) => {
                 metrics::counter!("master_aggregate_wal_errors_total", "phase" => "snapshot")
@@ -988,13 +1064,7 @@ pub(super) async fn run(state: &Arc<MasterState>, session: &CoordinationGuard) {
                         }
                     }
                 }
-                metrics::gauge!("master_aggregate_wal_cache_tables").set(cache.tables.len() as f64);
-                metrics::gauge!("master_aggregate_wal_cache_shards").set(cache.shards as f64);
-                metrics::gauge!("master_aggregate_wal_cache_bytes").set(cache.bytes as f64);
-                metrics::gauge!("master_aggregate_wal_outstanding")
-                    .set(cache.outstanding.len() as f64);
-                metrics::gauge!("master_aggregate_wal_waiting").set(cache.waiting.len() as f64);
-                metrics::gauge!("master_aggregate_wal_capacity").set(cache.capacity() as f64);
+                metrics.observe(&cache);
             };
             metrics::counter!("master_aggregate_wal_errors_total", "phase" => "watch").increment(1);
             tracing::warn!(%failure, "aggregate WAL watch reconnecting; task dispatch continues");
@@ -1087,6 +1157,377 @@ mod tests {
             .members
             .insert(b"m".to_vec(), Policy::from_config(&config));
         cache
+    }
+
+    #[test]
+    fn scoped_wal_admission_informer_restricts_policy_but_keeps_global_capacity() {
+        let mut cache = tail_cache();
+        cache.scoped_only = true;
+        let mut cfg = MasterConfig::parse_from(["test"]);
+        cfg.merge_rollout.fence_legacy = true;
+        cfg.merge_wal_interval_secs = 30;
+        cfg.merge_wal_min_generations = 1;
+        cfg.merge_wal_admission_targets = vec!["selected".into()];
+        cfg.maintenance.claim_wal_merges = false;
+        cache
+            .members
+            .insert(b"scoped".to_vec(), Policy::from_config(&cfg));
+        publish(&mut cache, "selected", "s", 1, None, 1);
+        publish(&mut cache, "other", "s", 100, None, 2);
+        assert_eq!(cache.admission_delay("selected", 1), Some(Duration::ZERO));
+        assert_eq!(cache.admission_delay("other", 1), None);
+        assert!(!cache.due.contains_key("other"));
+        let capacity = cache.capacity();
+        assert!(capacity > 0);
+        // An unselected table still consumes the shared observed capacity.
+        let table = cache.tables.get_mut("other").unwrap();
+        table.frontier_task = Some("global-task".into());
+        table.dedupe_id = Some("global-task".into());
+        cache.refresh_outstanding("other");
+        assert!(cache.outstanding.contains("other"));
+        assert_eq!(cache.capacity(), capacity);
+        cache.members.remove(b"scoped".as_slice());
+        cache.mark("selected", Duration::ZERO);
+        assert!(!cache.due.contains_key("selected"));
+        // Losing a policy cannot discard an uncertain committed admission.
+        cache.pending = Some(Attempt {
+            target: "selected".into(),
+            revision: 1,
+            previous: vec![],
+            retry_at: Instant::now(),
+        });
+        cache.mark("selected", Duration::ZERO);
+        assert!(cache.due.contains_key("selected"));
+    }
+
+    async fn scoped_until(mut predicate: impl AsyncFnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while !predicate().await {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated ETCD_TEST_ENDPOINTS"]
+    async fn scoped_wal_admission_live_informer_preserves_global_leader_and_new_seals() {
+        let (_dir, mut cfg, store) = super::super::tests::fixture().await;
+        cfg.merge_wal_interval_secs = 600;
+        cfg.merge_wal_min_generations = 4;
+        let global = store
+            .discovery_session(serde_json::to_vec(&Policy::from_config(&cfg)).unwrap())
+            .await
+            .unwrap();
+        assert!(store.elect_discovery_leader(&global).await.unwrap());
+        let prefix = cfg.etcd.prefix().to_string();
+        let global_key = format!("{prefix}/demand-controller/leader-v2");
+        let scoped_key = store.coordination_key("scoped-wal-discovery-v1");
+        let mut client = store.etcd_client().clone();
+        let global_token = client.get(global_key.clone(), None).await.unwrap().kvs()[0]
+            .value()
+            .to_vec();
+        cfg.merge_wal_admission_targets = vec!["a".into()];
+        cfg.merge_wal_min_generations = 1;
+        cfg.maintenance.claim_wal_merges = false;
+        cfg.stats_scan_interval_secs = 0;
+        cfg.compaction_interval_secs = 0;
+        let member = store
+            .discovery_session(serde_json::to_vec(&Policy::from_config(&cfg)).unwrap())
+            .await
+            .unwrap();
+        let first = MasterState::new(cfg.clone()).await.unwrap();
+        let second = MasterState::new(cfg).await.unwrap();
+        let leader = super::super::spawn_scoped(&first).unwrap();
+        for encoded in ["61", "62"] {
+            client
+                .put(
+                    format!("{prefix}/demand-events/{encoded}/s"),
+                    event("s", 1, None),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        scoped_until(async || store.list().await.unwrap().len() == 1).await;
+        assert_eq!(store.list().await.unwrap()[0].target, "a");
+        let old_owner = client.get(scoped_key.clone(), None).await.unwrap().kvs()[0]
+            .value()
+            .to_vec();
+        let follower = super::super::spawn_scoped(&second).unwrap();
+        let claim = store
+            .claim_next_of_kinds(crate::task_store::TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.task.target, "a");
+        client
+            .put(
+                format!("{prefix}/demand-events/61/s"),
+                event("s", 2, None),
+                None,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            store.list().await.unwrap().len(),
+            1,
+            "running task must retain new seals"
+        );
+        store.finish(claim, Ok("first pass".into())).await.unwrap();
+        scoped_until(async || store.list().await.unwrap().len() == 2).await;
+        assert!(store.list().await.unwrap().iter().all(|t| t.target == "a"));
+        assert_eq!(
+            client.get(scoped_key.clone(), None).await.unwrap().kvs()[0].value(),
+            old_owner
+        );
+
+        // Kill only the independent owner; the global leader is untouched.
+        leader.abort();
+        assert!(leader.await.unwrap_err().is_cancelled());
+        scoped_until(async || {
+            let value = client.get(scoped_key.clone(), None).await.unwrap();
+            value
+                .kvs()
+                .first()
+                .is_some_and(|kv| kv.value() != old_owner)
+        })
+        .await;
+        let claim = store
+            .claim_next_of_kinds(crate::task_store::TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        client
+            .put(
+                format!("{prefix}/demand-events/61/s"),
+                event("s", 3, None),
+                None,
+            )
+            .await
+            .unwrap();
+        store.finish(claim, Ok("second pass".into())).await.unwrap();
+        scoped_until(async || store.list().await.unwrap().len() == 3).await;
+        assert!(store.list().await.unwrap().iter().all(|t| t.target == "a"));
+        assert_eq!(
+            client.get(global_key, None).await.unwrap().kvs()[0].value(),
+            global_token
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            store.list().await.unwrap().len(),
+            3,
+            "no idle duplicates after failover"
+        );
+        second.admission.begin_drain();
+        tokio::time::timeout(Duration::from_secs(5), follower)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(client.get(scoped_key, None).await.unwrap().kvs().is_empty());
+        store.release_coordination_lock(member).await.unwrap();
+        store.release_coordination_lock(global).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated ETCD_TEST_ENDPOINTS"]
+    async fn scoped_wal_admission_concurrent_publishers_share_frontier_and_observed_capacity() {
+        let (_dir, mut cfg, store) = super::super::tests::fixture().await;
+        cfg.merge_wal_interval_secs = 600;
+        cfg.merge_wal_min_generations = 4;
+        cfg.merge_wal_concurrency = 1;
+        let global = store
+            .discovery_session(serde_json::to_vec(&Policy::from_config(&cfg)).unwrap())
+            .await
+            .unwrap();
+        assert!(store.elect_discovery_leader(&global).await.unwrap());
+        cfg.merge_wal_admission_targets = vec!["a".into(), "c".into()];
+        cfg.merge_wal_min_generations = 1;
+        cfg.maintenance.claim_wal_merges = false;
+        let member = store
+            .discovery_session(serde_json::to_vec(&Policy::from_config(&cfg)).unwrap())
+            .await
+            .unwrap();
+        let owner = store
+            .try_coordination_lock("scoped-wal-discovery-v1")
+            .await
+            .unwrap()
+            .unwrap();
+        let global_publisher = store.discovery_publisher(&global);
+        let scoped_publisher = store.discovery_publisher(&owner);
+        let prefix = cfg.etcd.prefix();
+        let mut client = store.etcd_client().clone();
+        for encoded in ["61", "62", "63"] {
+            client
+                .put(
+                    format!("{prefix}/demand-events/{encoded}/s"),
+                    event("s", 4, None),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let mut broad = snapshot(&client, prefix).await.unwrap();
+        // Model the old leader's wire semantics: scoped thresholds are absent.
+        broad
+            .members
+            .retain(|_, policy| policy.scoped_automatic_admission.is_none());
+        let mut scoped = snapshot_mode(&client, prefix, true).await.unwrap();
+        let (one, two) = tokio::join!(
+            reconcile(&global_publisher, prefix, &mut broad, "a"),
+            reconcile(&scoped_publisher, prefix, &mut scoped, "a"),
+        );
+        one.unwrap();
+        two.unwrap();
+        assert_eq!(
+            store.list().await.unwrap().len(),
+            1,
+            "same seals must have one durable task"
+        );
+        reconcile(&scoped_publisher, prefix, &mut scoped, "b")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.list().await.unwrap().len(),
+            1,
+            "global baseline cannot broaden scoped controller"
+        );
+        reconcile(&global_publisher, prefix, &mut broad, "b")
+            .await
+            .unwrap();
+        assert_eq!(store.list().await.unwrap().len(), 2);
+
+        // Capacity is the existing observed queue allowance, not a new atomic
+        // credit protocol. The scoped snapshot must count GLOBAL outstanding
+        // tasks too; periodic/manual producers already share this soft bound.
+        let mut scoped = snapshot_mode(&client, prefix, true).await.unwrap();
+        assert_eq!(scoped.capacity(), 2);
+        assert_eq!(scoped.outstanding.len(), 2);
+        reconcile(&scoped_publisher, prefix, &mut scoped, "c")
+            .await
+            .unwrap();
+        assert!(scoped.waiting.contains_key("c"));
+        assert_eq!(store.list().await.unwrap().len(), 2);
+        let claim = store
+            .claim_next_of_kinds(crate::task_store::TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .finish(claim, Ok("free one observed credit".into()))
+            .await
+            .unwrap();
+        let mut scoped = snapshot_mode(&client, prefix, true).await.unwrap();
+        reconcile(&scoped_publisher, prefix, &mut scoped, "c")
+            .await
+            .unwrap();
+        assert_eq!(store.list().await.unwrap().len(), 3);
+
+        store.release_coordination_lock(owner).await.unwrap();
+        let value = serde_json::to_vec(&Frontier {
+            v: 1,
+            shards: BTreeMap::from([("s".into(), 1)]),
+            task: None,
+        })
+        .unwrap();
+        assert!(matches!(
+            scoped_publisher
+                .enqueue_aggregate_wal("after-loss", 0, &value)
+                .await
+                .unwrap(),
+            Admission::Changed
+        ));
+        assert!(client
+            .get(frontier_key(prefix, "after-loss"), None)
+            .await
+            .unwrap()
+            .kvs()
+            .is_empty());
+        assert_eq!(store.list().await.unwrap().len(), 3);
+        store.release_coordination_lock(member).await.unwrap();
+        store.release_coordination_lock(global).await.unwrap();
+    }
+
+    #[test]
+    fn scoped_wal_admission_is_independent_of_fencing_and_baseline_thresholds() {
+        let mut cache = tail_cache();
+        let mut cfg = MasterConfig::parse_from(["test"]);
+        cfg.merge_rollout.fence_legacy = true;
+        cfg.merge_wal_min_generations = 1;
+        cfg.merge_wal_admission_targets = vec!["a".into(), "b".into()];
+        cfg.wal_tail.wal_tail_interval_secs = 30;
+        let scoped = Policy::from_config(&cfg);
+        assert!(scoped.admits_request("c", None)); // Safety recovery stays global.
+        cache.members.insert(b"scoped".to_vec(), scoped);
+        for name in ["a", "b", "c", "d"] {
+            publish(&mut cache, name, "s", 1, None, 1);
+        }
+        for name in ["a", "b"] {
+            assert_eq!(cache.admission_delay(name, 1), Some(Duration::ZERO));
+        }
+        for name in ["c", "d"] {
+            assert_eq!(
+                cache.admission_delay(name, 30_001),
+                Some(Duration::from_secs(570))
+            );
+        }
+        publish(&mut cache, "c", "s", 8, None, 2);
+        assert_eq!(cache.admission_delay("c", 30_001), Some(Duration::ZERO));
+        cache.members.remove(b"scoped".as_slice());
+        assert_eq!(
+            cache.admission_delay("a", 30_001),
+            Some(Duration::from_secs(570))
+        );
+    }
+
+    #[test]
+    fn scoped_wal_admission_cannot_leak_through_an_old_leader() {
+        let mut cfg = MasterConfig::parse_from(["test"]);
+        cfg.merge_rollout.fence_legacy = true;
+        cfg.merge_wal_min_generations = 1;
+        cfg.merge_wal_admission_targets = vec!["a".into()];
+        cfg.wal_tail.wal_tail_interval_secs = 30;
+        let policy = Policy::from_config(&cfg);
+        assert_eq!(policy.automatic_thresholds("a"), Some((1, 30)));
+        assert_eq!(policy.automatic_thresholds("other"), None);
+        // Previous binaries ignore unknown JSON fields. They must see no low
+        // threshold at all, while still seeing this executor's capacity/fences.
+        let mut wire = serde_json::to_value(&policy).unwrap();
+        wire.as_object_mut()
+            .unwrap()
+            .remove("scoped_automatic_admission");
+        let old: Policy = serde_json::from_value(wire).unwrap();
+        assert!(old.admits_request("other", None));
+        assert_eq!(old.aggregate_merge_slots, policy.aggregate_merge_slots);
+        assert_eq!(old.aggregate_min_generations, None);
+        assert_eq!(old.aggregate_tail_interval_secs, 0);
+        let mut cache = tail_cache();
+        cache.members.insert(b"old-view".to_vec(), old);
+        publish(&mut cache, "other", "s", 1, None, 1);
+        assert_eq!(
+            cache.admission_delay("other", 30_001),
+            Some(Duration::from_secs(570))
+        );
+    }
+
+    #[test]
+    fn scoped_wal_admission_applies_tail_deadlines_only_to_selected_targets() {
+        let mut cache = Cache::new();
+        let mut cfg = MasterConfig::parse_from(["test"]);
+        cfg.merge_rollout.fence_legacy = true;
+        cfg.merge_wal_min_generations = 4;
+        cfg.merge_wal_admission_targets = vec!["a".into()];
+        cfg.wal_tail.wal_tail_interval_secs = 30;
+        cache
+            .members
+            .insert(b"scoped".to_vec(), Policy::from_config(&cfg));
+        publish(&mut cache, "a", "s", 1, None, 1);
+        publish(&mut cache, "b", "s", 8, None, 1);
+        assert_eq!(cache.admission_delay("a", 1), Some(Duration::from_secs(30)));
+        assert_eq!(cache.admission_delay("a", 30_001), Some(Duration::ZERO));
+        assert_eq!(cache.admission_delay("b", 30_001), None);
     }
 
     #[test]
