@@ -1103,6 +1103,124 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires isolated ETCD_TEST_ENDPOINTS"]
+    async fn empty_merge_demand_crash_recovery_with_disabled_peer_preserves_new_wal() {
+        use crate::local_merge::demand_testing::{Pause, PAUSE};
+        for acknowledged_before_crash in [false, true] {
+            let (_dir, initial) = generic_fixture_with_auto(true).await;
+            let mut cfg = initial.config.clone();
+            cfg.local_merge.master_local_merge_empty_demand_targets = vec!["generic:a".into()];
+            let state = MasterState::new(cfg).await.unwrap();
+            let writer = generic_writer(&state, "a").await;
+            state
+                .task_store
+                .enqueue(TaskKind::MergeWal, "generic:a", vec![])
+                .await
+                .unwrap();
+            let claim = state
+                .task_store
+                .claim_resident_merge(&crate::local_merge::targets(&state.config))
+                .await
+                .unwrap()
+                .unwrap();
+            let original_id = claim.task.id.clone();
+            let coordinator = state.task_store.merge_coordinator();
+            coordinator.request_merge("generic:a").await.unwrap();
+            if acknowledged_before_crash {
+                let result = crate::merge_execution::run_merge_wal(&state, &claim).await;
+                assert_eq!(result.unwrap(), "local WAL merge reclaimed 0 generations");
+                assert!(coordinator
+                    .get_merge_request("generic:a")
+                    .await
+                    .unwrap()
+                    .is_none());
+            } else {
+                let pause = Pause {
+                    last_shard: "writer".into(),
+                    reached: Arc::new(tokio::sync::Notify::new()),
+                    resume: Arc::new(tokio::sync::Notify::new()),
+                };
+                let mut run = Box::pin(PAUSE.scope(
+                    pause.clone(),
+                    crate::merge_execution::run_merge_wal(&state, &claim),
+                ));
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    tokio::select! {
+                        _ = pause.reached.notified() => {},
+                        result = &mut run => panic!("expected observation barrier, got {result:?}"),
+                    }
+                })
+                .await
+                .unwrap();
+                // This barrier is after joined storage work, in read-only
+                // observation; no mutating RPC is cancelled by this drop.
+                drop(run);
+                assert!(coordinator
+                    .get_merge_request("generic:a")
+                    .await
+                    .unwrap()
+                    .is_some());
+            }
+            assert!(coordinator.get("generic:a").await.unwrap().is_none());
+            // Existing test utility models the keys left by process death and
+            // lease expiry without sleeping out the production TTL.
+            state
+                .task_store
+                .abandon_claim_for_test(claim)
+                .await
+                .unwrap();
+            generic_write(&writer, "after-crash", "preserved").await;
+            coordinator.request_merge("generic:a").await.unwrap();
+            let mut peer_cfg = state.config.clone();
+            peer_cfg
+                .local_merge
+                .master_local_merge_empty_demand_targets
+                .clear();
+            let peer = MasterState::new(peer_cfg).await.unwrap();
+            let recovered = peer
+                .task_store
+                .claim_resident_merge(&crate::local_merge::targets(&peer.config))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                recovered.task.id, original_id,
+                "recover the canonical orphan"
+            );
+            let result = crate::merge_execution::run_merge_wal(&peer, &recovered).await;
+            assert_eq!(
+                result.as_ref().unwrap(),
+                "local WAL merge reclaimed 1 generations"
+            );
+            peer.task_store.finish(recovered, result).await.unwrap();
+            assert_eq!(
+                peer.task_store
+                    .get(&original_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                lance_context_api::TaskState::Done
+            );
+            let probe = lance_context_core::rollout_append::SealedWalProbe::open(
+                &peer.generic_uri("a"),
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(!probe.has_sealed_wal("writer").await.unwrap());
+            let dataset = lance::Dataset::open(&peer.generic_uri("a")).await.unwrap();
+            assert_eq!(dataset.count_rows(None).await.unwrap(), 1);
+            // Disabled peers preserve their pre-optimization request behavior.
+            assert!(coordinator
+                .get_merge_request("generic:a")
+                .await
+                .unwrap()
+                .is_some());
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated ETCD_TEST_ENDPOINTS"]
     async fn empty_merge_demand_preserves_bounded_pass_tail_until_successor_commits() {
         let (_dir, initial) = generic_fixture_with_auto(true).await;
         let mut cfg = initial.config.clone();
