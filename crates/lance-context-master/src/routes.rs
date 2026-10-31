@@ -1126,6 +1126,7 @@ mod tests {
             compaction_max_bytes_per_file: 1024 * 1024 * 1024,
             merge_wal_interval_secs: 0,
             merge_wal_min_generations: 8,
+            merge_wal_admission_targets: vec![],
             worker_endpoints: vec![],
             task_concurrency: 4,
             merge_wal_concurrency: 4,
