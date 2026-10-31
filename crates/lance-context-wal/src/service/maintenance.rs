@@ -70,18 +70,32 @@ pub(crate) async fn run(
     mut stop: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     let mut checkpoints: BTreeMap<_, _> = groups.iter().map(|&g| (g, Instant::now())).collect();
-    let mut last_log = Instant::now();
-    let mut suggested = BTreeSet::new();
     let mut tick = tokio::time::interval(Duration::from_millis(options.interval_ms));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut background = Background {
+        handle: &handle,
+        groups: &groups,
+        options: &options,
+        progress: &progress,
+        stop: &mut stop,
+        tick,
+        last_log: Instant::now(),
+        suggested: BTreeSet::new(),
+    };
     loop {
-        tokio::select! { _ = stop.changed() => return Ok(()), _ = tick.tick() => {} }
-        if *stop.borrow() {
+        tokio::select! { _ = background.stop.changed() => return Ok(()), _ = background.tick.tick() => {} }
+        if *background.stop.borrow() {
             return Ok(());
         }
         // Preserve the scan cursor across bounded batches. Do not repeatedly
         // restart at the first directory entry and starve later orphan files.
-        match handle.prepare_image_collection() {
+        let Some(prepared) = background
+            .admit(handle.prepare_image_collection_wait())
+            .await
+        else {
+            return Ok(());
+        };
+        match prepared {
             Ok(pending) => match pending.await {
                 Ok(mut collection) => loop {
                     let count = options.scan_entries;
@@ -98,7 +112,7 @@ pub(crate) async fn run(
                                 p.collected_files.saturating_add(batch.removed_files);
                             p.collected_bytes =
                                 p.collected_bytes.saturating_add(batch.removed_bytes);
-                            if batch.finished || *stop.borrow() {
+                            if batch.finished || *background.stop.borrow() {
                                 break;
                             }
                         }
@@ -113,7 +127,7 @@ pub(crate) async fn run(
             },
             Err(e) => error(&progress, e),
         }
-        if *stop.borrow() {
+        if *background.stop.borrow() {
             return Ok(());
         }
         for &group in &groups {
@@ -127,7 +141,7 @@ pub(crate) async fn run(
                 .applied
                 .saturating_sub(observed.checkpoint_index);
             if new == 0
-                || (!suggested.contains(&group)
+                || (!background.suggested.contains(&group)
                     && new < options.checkpoint_entries
                     && checkpoints[&group].elapsed()
                         < Duration::from_millis(options.checkpoint_interval_ms))
@@ -135,60 +149,111 @@ pub(crate) async fn run(
                 continue;
             }
             let start = Instant::now();
-            let result: Result<()> = async {
-                let capture = handle
-                    .prepare_checkpoint(group, uuid::Uuid::new_v4())?
-                    .await?;
+            let Some(prepared) = background
+                .admit(handle.prepare_checkpoint_wait(group, uuid::Uuid::new_v4()))
+                .await
+            else {
+                return Ok(());
+            };
+            let result: Result<bool> = async {
+                let Some(capture) = prepared?.await? else {
+                    return Ok(false);
+                };
                 let built = tokio::task::spawn_blocking(move || capture.run()).await??;
                 handle.install_checkpoint(built)?.await?;
-                Ok(())
+                Ok(true)
             }
             .await;
             match result {
-                Ok(()) => {
+                Ok(built) => {
+                    // A received snapshot may already have covered this cut.
                     // A failed attempt leaves this cut overdue. Retry on the
                     // next scheduler tick instead of extending log retention.
                     checkpoints.insert(group, Instant::now());
-                    suggested.remove(&group);
-                    let mut p = progress.lock().unwrap();
-                    p.checkpoints = p.checkpoints.saturating_add(1);
-                    p.checkpoint_micros = p.checkpoint_micros.saturating_add(micros(start));
+                    background.suggested.remove(&group);
+                    if built {
+                        let mut p = progress.lock().unwrap();
+                        p.checkpoints = p.checkpoints.saturating_add(1);
+                        p.checkpoint_micros = p.checkpoint_micros.saturating_add(micros(start));
+                    }
                 }
                 Err(e) => error(&progress, e),
             }
-            if *stop.borrow() {
+            if *background.stop.borrow() {
                 return Ok(());
             }
         }
-        if last_log.elapsed() >= Duration::from_millis(options.log_interval_ms) {
+        background.maintain().await;
+    }
+}
+
+// Image admission can wait for a slow receiver. While queued, continue the
+// independent engine purge and disk accounting on the same blocking-job lane.
+// Once admitted, the image operation runs to completion before another local
+// blocking job starts. Keep the admission future pinned across scheduler ticks
+// so periodic work cannot cancel and lose our place in the fair semaphore queue.
+struct Background<'a> {
+    handle: &'a runtime::Handle,
+    groups: &'a [u64],
+    options: &'a Options,
+    progress: &'a Shared,
+    stop: &'a mut tokio::sync::watch::Receiver<bool>,
+    tick: tokio::time::Interval,
+    last_log: Instant,
+    suggested: BTreeSet<u64>,
+}
+impl Background<'_> {
+    async fn admit<T>(
+        &mut self,
+        admission: impl std::future::Future<Output = Result<T>>,
+    ) -> Option<Result<T>> {
+        tokio::pin!(admission);
+        loop {
+            if *self.stop.borrow() {
+                return None;
+            }
+            tokio::select! {
+                _ = self.stop.changed() => return None,
+                result = &mut admission => return Some(result),
+                _ = self.tick.tick() => self.maintain().await,
+            }
+        }
+    }
+
+    async fn maintain(&mut self) {
+        if *self.stop.borrow() {
+            return;
+        }
+        if self.last_log.elapsed() >= Duration::from_millis(self.options.log_interval_ms) {
             let start = Instant::now();
             let result: Result<Vec<u64>> = async {
-                let task = handle.prepare_log_maintenance()?.await?;
+                let task = self.handle.prepare_log_maintenance()?.await?;
                 tokio::task::spawn_blocking(move || task.run()).await?
             }
             .await;
             match result {
                 Ok(next) => {
-                    last_log = Instant::now();
-                    suggested.extend(next.into_iter().filter(|group| groups.contains(group)));
-                    let mut p = progress.lock().unwrap();
+                    self.last_log = Instant::now();
+                    self.suggested
+                        .extend(next.into_iter().filter(|group| self.groups.contains(group)));
+                    let mut p = self.progress.lock().unwrap();
                     p.log_passes = p.log_passes.saturating_add(1);
                     p.log_micros = p.log_micros.saturating_add(micros(start));
                 }
-                Err(e) => error(&progress, e),
+                Err(e) => error(self.progress, e),
             }
         }
-        if *stop.borrow() {
-            return Ok(());
+        if *self.stop.borrow() {
+            return;
         }
         let result: Result<()> = async {
-            let task = handle.prepare_disk_measurement()?.await?;
+            let task = self.handle.prepare_disk_measurement()?.await?;
             tokio::task::spawn_blocking(move || task.run()).await??;
             Ok(())
         }
         .await;
         if let Err(e) = result {
-            error(&progress, e);
+            error(self.progress, e);
         }
     }
 }

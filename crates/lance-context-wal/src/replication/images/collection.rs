@@ -114,8 +114,18 @@ impl Node {
     /// of sibling group owners returned by `into_groups`. This does not collect
     /// Raft-engine segments or Lance objects and does not enforce a disk quota.
     pub fn prepare_image_collection(&self) -> Result<ImageCollection> {
+        self.prepare_image_collection_admitted(self.images.acquire()?)
+    }
+
+    pub(in crate::replication) fn prepare_image_collection_admitted(
+        &self,
+        permit: Permit,
+    ) -> Result<ImageCollection> {
         self.healthy()?;
-        let permit = self.images.acquire()?;
+        ensure!(
+            Arc::ptr_eq(&permit.0, &self.images),
+            "foreign node image worker"
+        );
         let protected = {
             let mut registry = self
                 .images

@@ -555,7 +555,7 @@ async fn receive_image<S: AsyncRead + AsyncWrite + Unpin>(
         .images
         .upgrade()
         .context("node image owner stopped")?
-        .acquire_snapshot()
+        .acquire_queued()
         .await?;
     let reservation = files
         .run(move || admission.map(|a| a.reserve(&incoming)).transpose())
