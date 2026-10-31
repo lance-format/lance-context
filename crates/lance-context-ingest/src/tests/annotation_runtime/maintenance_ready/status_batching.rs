@@ -94,14 +94,15 @@ async fn scenario(min_rows: usize, expect_maintenance: bool) -> Result<()> {
         runtime.publish_once_for_test().await?;
     }
     assert_eq!(service.observation().await.0.materialized, second.index);
+    assert_eq!(service.source_observation().records, 0);
+    // Point reads also need the applier to advance their quorum read barrier.
+    let (stop, task) = run_owner(runtime);
     let current = service.get("T", Duration::from_secs(30)).await?.unwrap();
     assert_eq!(current.status.as_deref(), Some("reviewed"));
     assert_eq!(current.score, Some(0.9));
-    assert_eq!(service.source_observation().records, 0);
 
     // The earlier deferral must not suppress maintenance on an idle version.
     // A real native index covers both original turns, including the updated T.
-    let (stop, task) = run_owner(runtime);
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let base = annotation_publication::read(&c, &storage, None).await?;
