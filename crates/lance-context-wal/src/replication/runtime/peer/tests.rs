@@ -17,6 +17,7 @@ use std::{net::SocketAddr, path::Path};
 mod enqueue;
 mod process;
 mod snapshots;
+mod timing;
 
 pub(crate) struct Tls {
     pub(crate) client: Arc<rustls::ClientConfig>,

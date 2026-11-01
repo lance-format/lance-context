@@ -114,6 +114,16 @@ queued frames discarded on reconnect. Each rejected enqueue also contributes to
 `peer_dropped_outbound`, but independently sampled counters are not an atomic
 partition of that broader total.
 
+`peer_destinations` reports queue residence and send intervals per configured
+destination node. Queue intervals are recorded only when dequeued; pending or
+purged frames are absent. Send intervals cover frame encoding, writes and flush,
+including errors and cancellations but excluding connection setup and unfinished
+intervals. Successful sends separately count frames and Raft entry payload bytes;
+these include retransmissions, exclude framing/TLS bytes, and do not prove remote
+receipt or persistence. Fields are independently sampled cumulative counters.
+Intervals for different destinations overlap, so they are not additive CPU or
+disk time. No table, session, or request identifiers appear in these observations.
+
 The `appends` counters distinguish disk-budget refusal, runtime request/byte
 credits, queue unavailability, pending-proposal capacity, leadership changes,
 committed capacity/sequence rejections, and stopped workers. They use typed

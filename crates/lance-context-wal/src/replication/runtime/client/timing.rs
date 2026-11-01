@@ -3,11 +3,11 @@
 use serde::Serialize;
 use std::{
     sync::atomic::{AtomicU64, Ordering},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 #[derive(Default)]
-pub(super) struct Counter {
+pub(in crate::replication::runtime) struct Counter {
     started: AtomicU64,
     finished: AtomicU64,
     elapsed_micros: AtomicU64,
@@ -25,7 +25,7 @@ pub struct Observation {
 }
 
 impl Counter {
-    pub(super) fn start(&self) -> Guard<'_> {
+    pub(in crate::replication::runtime) fn start(&self) -> Guard<'_> {
         self.started.fetch_add(1, Ordering::Relaxed);
         Guard {
             counter: self,
@@ -33,7 +33,21 @@ impl Counter {
         }
     }
 
-    pub(super) fn snapshot(&self) -> Observation {
+    /// Record an already completed interval, such as residence in a queue.
+    /// Pending intervals are absent from both counts for this kind of sample.
+    pub(in crate::replication::runtime) fn record(&self, elapsed: Duration) {
+        self.started.fetch_add(1, Ordering::Relaxed);
+        self.finish(elapsed);
+    }
+
+    fn finish(&self, elapsed: Duration) {
+        let micros = elapsed.as_micros().min(u64::MAX as u128) as u64;
+        self.elapsed_micros.fetch_add(micros, Ordering::Relaxed);
+        self.max_elapsed_micros.fetch_max(micros, Ordering::Relaxed);
+        self.finished.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(in crate::replication::runtime) fn snapshot(&self) -> Observation {
         Observation {
             started: self.started.load(Ordering::Relaxed),
             finished: self.finished.load(Ordering::Relaxed),
@@ -43,20 +57,13 @@ impl Counter {
     }
 }
 
-pub(super) struct Guard<'a> {
+pub(in crate::replication::runtime) struct Guard<'a> {
     counter: &'a Counter,
     start: Instant,
 }
 
 impl Drop for Guard<'_> {
     fn drop(&mut self) {
-        let micros = self.start.elapsed().as_micros().min(u64::MAX as u128) as u64;
-        self.counter
-            .elapsed_micros
-            .fetch_add(micros, Ordering::Relaxed);
-        self.counter
-            .max_elapsed_micros
-            .fetch_max(micros, Ordering::Relaxed);
-        self.counter.finished.fetch_add(1, Ordering::Relaxed);
+        self.counter.finish(self.start.elapsed());
     }
 }
