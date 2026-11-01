@@ -7,6 +7,7 @@ pub(in crate::tests) mod fault_store;
 mod listing;
 mod manifest_cache;
 mod protected_page;
+mod source_stall;
 use fault_store::{Action, Faults};
 
 fn limits() -> Limits {

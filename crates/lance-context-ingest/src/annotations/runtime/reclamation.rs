@@ -6,6 +6,7 @@
 use super::*;
 use futures::{stream, stream::BoxStream, StreamExt, TryStreamExt};
 use object_store::{path::Path, ObjectMeta};
+use std::{future::Future, pin::Pin, sync::Mutex, task::Poll};
 
 mod deletion;
 mod indices;
@@ -92,8 +93,12 @@ struct SealedPage {
     store: Arc<dyn object_store::ObjectStore>,
     paths: Vec<(Path, u64)>,
     batch_size: usize,
+    failed: bool,
     _workspace: MergeReservation,
 }
+
+type DeleteOutcomes = Vec<(Vec<(Path, u64)>, Vec<object_store::Result<u64>>)>;
+type DeleteJob = Pin<Box<dyn Future<Output = Result<DeleteOutcomes>> + Send>>;
 
 pub(super) struct Collector {
     options: Options,
@@ -102,6 +107,7 @@ pub(super) struct Collector {
     listing: Option<BoxStream<'static, object_store::Result<ObjectMeta>>>,
     deferred: Option<(Path, u64)>,
     sealed: Option<SealedPage>,
+    deleting: Mutex<Option<DeleteJob>>,
     listing_blocked: bool,
     // At most one retained SDK stream/deferred object per destination, but only
     // one candidate/sealed page in total. Alternate resolved pages so a large
@@ -131,6 +137,7 @@ impl Collector {
             listing: None,
             deferred: None,
             sealed: None,
+            deleting: Mutex::new(None),
             listing_blocked: false,
             other_listing: None,
             other_deferred: None,
@@ -145,10 +152,18 @@ impl Collector {
         storage: &Storage,
         budget: &Arc<MergeMemoryBudget>,
     ) -> Result<bool> {
-        if tokio::time::Instant::now() < self.next_run {
-            return Ok(self.sealed.is_none());
+        // A sealed page cannot gain paths. Its protection/fence completed before
+        // any native preparation resumes; future publications use protected live
+        // inputs and fresh immutable outputs. Poll the same DELETE future while
+        // the serial publisher drains its bounded source window. No new listing
+        // or protection pass starts while this one charged page is outstanding.
+        if self.deleting.get_mut().unwrap().is_some() {
+            self.poll_pending_delete(service).await?;
+            return Ok(self.may_publish());
         }
-        let result = if self.sealed.is_some() {
+        let result = if tokio::time::Instant::now() < self.next_run {
+            return Ok(self.sealed.is_none());
+        } else if self.sealed.is_some() {
             // Reissue only unresolved immutable DELETE requests from the original,
             // successfully fenced page. Never relist or add paths here.
             service.check_owner(catalog.authority()).await?;
@@ -157,6 +172,9 @@ impl Collector {
         } else {
             self.collect_page(service, catalog, storage, budget).await
         };
+        if self.deleting.get_mut().unwrap().is_some() {
+            return Ok(self.may_publish());
+        }
         // LIST/protection/DELETE can take longer than the configured interval.
         // Starting the clock before that I/O makes every following publisher
         // iteration eligible for another pass, starving materialization.
@@ -189,6 +207,33 @@ impl Collector {
             self.body = !self.body;
         }
         result.map(|()| self.sealed.is_none())
+    }
+
+    fn may_publish(&self) -> bool {
+        // A slow first response is not a failed deletion. Once the page has an
+        // actual failed outcome, retain the existing publication backpressure
+        // through its retry attempts; otherwise a persistent outage could keep
+        // producing obsolete files every time another request becomes pending.
+        self.sealed.as_ref().is_none_or(|page| !page.failed)
+    }
+
+    pub(super) fn has_pending_delete(&self) -> bool {
+        self.deleting.lock().unwrap().is_some()
+    }
+
+    // Also called while the publisher awaits its own workspace or native I/O.
+    // Completing this same request releases the sealed page's reservation;
+    // publication must not deadlock waiting for memory retained by unpolled GC.
+    pub(super) async fn poll_pending_delete(&mut self, service: &Service) -> Result<()> {
+        if self.delete_page(service).await? {
+            self.next_run = tokio::time::Instant::now() + self.options.interval;
+            if self.sealed.is_none() && !self.listing_blocked && service.shared.body.is_some() {
+                std::mem::swap(&mut self.listing, &mut self.other_listing);
+                std::mem::swap(&mut self.deferred, &mut self.other_deferred);
+                self.body = !self.body;
+            }
+        }
+        Ok(())
     }
 
     async fn collect_page(
@@ -479,34 +524,59 @@ impl Collector {
             store,
             paths: candidates.into_iter().collect(),
             batch_size,
+            failed: false,
             _workspace: workspace,
         });
         self.delete_page(service).await?;
         Ok(())
     }
 
-    async fn delete_page(&mut self, service: &Service) -> Result<()> {
-        service
-            .shared
-            .phases
-            .measure(Phase::CollectDelete, self.delete_sealed_page(service))
-            .await
-    }
-
-    async fn delete_sealed_page(&mut self, service: &Service) -> Result<()> {
+    /// Returns true only after the original request's complete outcomes arrive.
+    /// A pending request stays in this collector; dropping the owner cancels its
+    /// local future, while the existing sealed-page protocol covers remote I/O
+    /// that outlives that owner. This does not spawn a detached worker or resend.
+    async fn delete_page(&mut self, service: &Service) -> Result<bool> {
+        if self.deleting.get_mut().unwrap().is_none() {
+            let page = self.sealed.as_mut().unwrap();
+            let paths = std::mem::take(&mut page.paths);
+            let store = page.store.clone();
+            let batch_size = page.batch_size;
+            let parallelism = self.options.delete_parallelism;
+            let phases = service.shared.phases.clone();
+            *self.deleting.get_mut().unwrap() = Some(Box::pin(async move {
+                phases
+                    .measure(Phase::CollectDelete, async move {
+                        let outcomes = stream::iter(paths)
+                            .chunks(batch_size)
+                            .map(move |batch| {
+                                let store = store.clone();
+                                async move {
+                                    let results = deletion::delete_batch(store, &batch).await;
+                                    (batch, results)
+                                }
+                            })
+                            .buffer_unordered(parallelism)
+                            .collect::<Vec<_>>()
+                            .await;
+                        if outcomes.iter().any(|(_, results)| {
+                            results
+                                .iter()
+                                .any(|result| result.as_ref().err().is_some_and(deletion::invalid))
+                        }) {
+                            bail!("invalid sealed annotation deletion response");
+                        }
+                        Ok(outcomes)
+                    })
+                    .await
+            }));
+        }
+        let outcomes =
+            match futures::poll!(self.deleting.get_mut().unwrap().as_mut().unwrap().as_mut()) {
+                Poll::Pending => return Ok(false),
+                Poll::Ready(outcomes) => outcomes?,
+            };
+        *self.deleting.get_mut().unwrap() = None;
         let page = self.sealed.as_mut().unwrap();
-        let outcomes = stream::iter(std::mem::take(&mut page.paths))
-            .chunks(page.batch_size)
-            .map(|batch| {
-                let store = page.store.clone();
-                async move {
-                    let results = deletion::delete_batch(store, &batch).await;
-                    (batch, results)
-                }
-            })
-            .buffer_unordered(self.options.delete_parallelism)
-            .collect::<Vec<_>>()
-            .await;
         // Locally detected response corruption remains a protocol failure.
         // It must not be treated like an unresolved storage DELETE.
         if outcomes.iter().any(|(_, results)| {
@@ -544,12 +614,13 @@ impl Collector {
         observed.pending_objects = page.paths.len();
         observed.pending_bytes = page.paths.iter().map(|(_, bytes)| bytes).sum();
         if let Some(error) = first_error {
+            page.failed = true;
             eprintln!("sealed annotation deletion remains pending: {error}");
         }
         if page.paths.is_empty() {
             self.sealed = None;
         }
-        Ok(())
+        Ok(true)
     }
 }
 
