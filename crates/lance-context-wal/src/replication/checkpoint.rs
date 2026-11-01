@@ -8,6 +8,7 @@ use super::*;
 use bincode::Options;
 use bytes::Bytes;
 use raft_proto::eraftpb::{ConfState, Snapshot};
+use ring::digest::{Context as DigestContext, SHA256};
 use std::{
     fs::{File, OpenOptions},
     io::{BufReader, BufWriter, Read, Write},
@@ -306,7 +307,7 @@ pub(super) struct Cut {
 
 struct Writer {
     file: BufWriter<File>,
-    digest: Sha256,
+    digest: DigestContext,
     bytes: u64,
     limit: u64,
     failed: bool,
@@ -315,7 +316,7 @@ impl Writer {
     fn new(path: &Path, limit: u64) -> Result<Self> {
         Ok(Self {
             file: BufWriter::new(OpenOptions::new().create_new(true).write(true).open(path)?),
-            digest: Sha256::new(),
+            digest: DigestContext::new(&SHA256),
             bytes: 0,
             limit,
             failed: false,
@@ -325,7 +326,9 @@ impl Writer {
         ensure!(!self.failed, "image writer failed; abandon this candidate");
         self.file.flush()?;
         self.file.get_ref().sync_all()?;
-        Ok((self.bytes, self.digest.finalize().into()))
+        let mut digest = [0; 32];
+        digest.copy_from_slice(self.digest.finish().as_ref());
+        Ok((self.bytes, digest))
     }
 }
 impl Write for Writer {
@@ -358,7 +361,7 @@ impl Write for Writer {
 
 struct Reader {
     file: BufReader<File>,
-    digest: Sha256,
+    digest: DigestContext,
     bytes: u64,
 }
 impl Reader {
@@ -370,7 +373,7 @@ impl Reader {
         );
         Ok(Self {
             file: BufReader::new(file),
-            digest: Sha256::new(),
+            digest: DigestContext::new(&SHA256),
             bytes: 0,
         })
     }
@@ -381,7 +384,7 @@ impl Reader {
             "trailing image bytes"
         );
         ensure!(
-            <[u8; 32]>::from(self.digest.finalize()) == digest,
+            self.digest.finish().as_ref() == digest,
             "image file checksum mismatch"
         );
         Ok(self.file.into_inner())
@@ -745,7 +748,7 @@ pub(super) fn load(
     let mut scratch = [0; 64 * 1024];
     for location in locations.values() {
         let mut remaining = location.bytes;
-        let mut hash = Sha256::new();
+        let mut hash = DigestContext::new(&SHA256);
         while remaining > 0 {
             let n = remaining.min(scratch.len());
             pack.read_exact(&mut scratch[..n])?;
@@ -753,7 +756,7 @@ pub(super) fn load(
             remaining -= n;
         }
         ensure!(
-            <[u8; 32]>::from(hash.finalize()) == location.digest,
+            hash.finish().as_ref() == location.digest,
             "image record checksum mismatch"
         );
     }
