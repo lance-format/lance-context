@@ -136,7 +136,7 @@ async fn publisher_binding_response_timeout_finishes_timing() -> Result<()> {
     c.shutdown().await
 }
 
-async fn receive_binding(stream: &mut Stream) -> Result<u64> {
+async fn receive_binding<R: AsyncRead + Unpin>(stream: &mut R) -> Result<u64> {
     let (id, meta, body) = prefix(stream, 0).await?;
     assert_eq!(body, 0);
     let metadata = receive(stream, meta).await?;
