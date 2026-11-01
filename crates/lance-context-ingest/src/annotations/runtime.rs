@@ -298,7 +298,7 @@ impl Runtime {
     /// read barriers. Restart reconciles durable plan/preparation/selection state.
     /// An in-flight sealed DELETE retains one bounded page while publication
     /// continues. Failed outcomes pause new publication until that sealed page
-    /// clears; applied values remain readable. Only immutable DELETEs repeat;
+    /// clears; applied values remain readable. Only immutable DELETE requests repeat;
     /// this loop never invents a request or blindly retries failed mutations.
     pub async fn run(mut self, shutdown: impl Future<Output = ()>) -> Result<()> {
         tokio::pin!(shutdown);
