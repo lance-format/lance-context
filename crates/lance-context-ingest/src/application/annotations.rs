@@ -4,7 +4,16 @@ use crate::{
     annotations::{self, runtime},
     http::annotations::{Forwarder, Owner},
 };
+use axum::serve::ListenerExt;
 use tokio::{sync::oneshot, task::JoinSet};
+
+fn configure_http_stream(stream: &mut tokio::net::TcpStream) {
+    // Send small acknowledgments and point responses without waiting for more
+    // application data. Client sockets already disable Nagle's algorithm.
+    if let Err(error) = stream.set_nodelay(true) {
+        eprintln!("annotation HTTP TCP_NODELAY could not be enabled: {error}");
+    }
+}
 
 /// Explicit offline handoff; normal owner/ingress startup never calls this.
 pub async fn provision(config: &Config) -> Result<()> {
@@ -166,7 +175,7 @@ pub async fn serve_ingress(
         .router()
         .layer(middleware::from_fn_with_state(auth, authorize));
     let draining = gateway.clone();
-    let result = axum::serve(listener, app)
+    let result = axum::serve(listener.tap_io(configure_http_stream), app)
         .with_graceful_shutdown(async move {
             shutdown.await;
             draining.shutdown().await;
@@ -254,7 +263,7 @@ pub async fn serve_owner(
         // JoinSet also aborts both role tasks if the parent is cancelled/panics.
         let mut tasks = JoinSet::new();
         tasks.spawn(async move {
-            axum::serve(listener, app).with_graceful_shutdown(async {
+            axum::serve(listener.tap_io(configure_http_stream), app).with_graceful_shutdown(async {
                 let _ = stopped_http.await;
             }).await.context("annotation owner listener failed")
         });
