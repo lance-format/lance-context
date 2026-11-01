@@ -242,7 +242,7 @@ impl Owner {
                             eprintln!("annotation status filter failed: {error:#}");
                             Failure::unavailable("status_filter_unavailable", "not_submitted")
                         })?
-                        .ok_or_else(|| Failure::unavailable("memory_capacity", "not_submitted"))?;
+                        .ok_or_else(|| self.gate.status_memory_refusal())?;
                     reservation = Some(held);
                     Json(result).into_response()
                 }

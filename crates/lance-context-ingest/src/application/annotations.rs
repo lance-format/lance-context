@@ -280,6 +280,7 @@ pub async fn serve_owner(
                     "source_bytes": source.bytes, "backpressured": pressure.is_some(),
                     "backpressure_reason": pressure,
                     "reclamation": service.reclamation_observation(),
+                    "http": owner.observation(),
                     "phases": service.phase_observation().as_slice(),
                     "append_rpc": ingress.client.append_timings(),
                 }}));

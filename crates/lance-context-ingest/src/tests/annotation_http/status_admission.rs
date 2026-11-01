@@ -42,6 +42,8 @@ async fn status_filter_reports_owner_memory_pressure_without_masking_query_failu
     };
     // Let recovery finish before deliberately occupying only the owner's budget.
     let initial: serde_json::Value = query().await?.error_for_status()?.json().await?;
+    assert_eq!(owner.observation().local_status_memory_refusals, 0);
+    assert_eq!(gateway.observation().local_status_memory_refusals, 0);
     let expected = std::collections::BTreeSet::from(["T".to_owned(), "U".to_owned()]);
     assert_eq!(
         serde_json::from_value::<std::collections::BTreeSet<String>>(initial["ids"].clone())?,
@@ -75,6 +77,10 @@ async fn status_filter_reports_owner_memory_pressure_without_masking_query_failu
     assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
     let failure: serde_json::Value = unavailable.json().await?;
     assert_eq!(failure["error"], "status_filter_unavailable");
+    // Neither the forwarded rejection nor the later query failure is another
+    // local memory refusal. These counters identify the admission layer.
+    assert_eq!(owner.observation().local_status_memory_refusals, 1);
+    assert_eq!(gateway.observation().local_status_memory_refusals, 0);
     assert_eq!(budget.reserved(), 0);
     assert_eq!(service.observation().await.0.readers, 0);
     Ok(())
@@ -154,5 +160,7 @@ async fn status_filter_refuses_full_ingress_budget_without_waiting_for_admission
     assert_eq!(refusal["error"], "memory_capacity");
     assert_eq!(refusal["operation_outcome"], "not_submitted");
     assert_eq!(budget.reserved(), 0);
+    assert_eq!(gateway.observation().local_status_memory_refusals, 1);
+    assert_eq!(owner.observation().local_status_memory_refusals, 0);
     Ok(())
 }
