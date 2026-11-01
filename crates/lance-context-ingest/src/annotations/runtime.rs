@@ -44,7 +44,7 @@ struct Publisher {
 impl Runtime {
     #[cfg(test)]
     pub(crate) async fn apply_once_for_test(&mut self) -> Result<()> {
-        self.driver.step_for_test().await
+        self.driver.step_for_test().await.map(|_| ())
     }
 
     #[cfg(test)]

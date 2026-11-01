@@ -684,12 +684,17 @@ impl Driver {
     pub async fn run(mut self, shutdown: impl Future<Output = ()>) -> Result<()> {
         tokio::pin!(shutdown);
         let result = loop {
-            let before = self.service.shared.progress.borrow().through;
-            tokio::select! {
+            let applied = tokio::select! {
                 _ = &mut shutdown => break Ok(()),
-                outcome = self.step() => if let Err(error) = outcome { break Err(error); }
-            }
-            if self.service.shared.progress.borrow().through == before {
+                outcome = self.step() => match outcome {
+                    Ok(applied) => applied,
+                    Err(error) => break Err(error),
+                }
+            };
+            // A shared Raft group can advance solely for another shard or a
+            // control record. That still satisfies read barriers, but is not
+            // local data work that warrants another immediate quorum poll.
+            if !applied {
                 tokio::select! {
                     _ = &mut shutdown => break Ok(()),
                     _ = tokio::time::sleep(Duration::from_millis(5)) => {}
@@ -704,17 +709,19 @@ impl Driver {
     }
 
     #[cfg(test)]
-    pub(crate) async fn step_for_test(&mut self) -> Result<()> {
+    pub(crate) async fn step_for_test(&mut self) -> Result<bool> {
         self.step().await
     }
 
-    async fn step(&mut self) -> Result<()> {
+    /// True only when this shard consumed a data record, including a rejected
+    /// mutation whose outcome must still become visible to its caller.
+    async fn step(&mut self) -> Result<bool> {
         let service = &self.service;
         let ingress = &service.ingress;
         let after = service.shared.progress.borrow().through;
         let replay_cut = *service.shared.replay_cut.lock().unwrap();
         if replay_cut.is_some_and(|cut| after >= cut) {
-            return Ok(());
+            return Ok(false);
         }
         if self.pending.is_none() {
             if self
@@ -801,7 +808,7 @@ impl Driver {
                         .shared
                         .progress
                         .send_modify(|p| p.backpressure = Some(ApplyBackpressure::ApplyMemory));
-                    return Ok(());
+                    return Ok(false);
                 };
                 let body = match service.shared.local_payloads.body(producer_slot, &meta) {
                     Some(body) => body,
@@ -882,7 +889,7 @@ impl Driver {
                         .send_modify(|p| p.through = page.through);
                 }
                 self.source_page = None;
-                return Ok(());
+                return Ok(false);
             }
         }
         let pending = self.pending.as_ref().unwrap();
@@ -892,7 +899,7 @@ impl Driver {
                 .shared
                 .progress
                 .send_modify(|p| p.backpressure = Some(ApplyBackpressure::SourceWindow));
-            return Ok(());
+            return Ok(false);
         }
         let observed = service.shared.staging.observation().await;
         let capacity = (
@@ -907,7 +914,7 @@ impl Driver {
         // Reader/old-handle release also changes these counters, independently
         // of publication, so it can unblock the same pending batch.
         if self.staging_pressure == Some(capacity) {
-            return Ok(());
+            return Ok(false);
         }
         #[cfg(test)]
         service
@@ -967,7 +974,7 @@ impl Driver {
                     .shared
                     .progress
                     .send_modify(|p| p.backpressure = Some(ApplyBackpressure::Staging));
-                return Ok(());
+                return Ok(false);
             }
         };
         // No await between applying the batch, retaining its outcome, and
@@ -1000,7 +1007,7 @@ impl Driver {
             stopped: false,
             backpressure: None,
         });
-        Ok(())
+        Ok(true)
     }
 }
 
