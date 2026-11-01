@@ -573,9 +573,12 @@ impl Collector {
         let outcomes =
             match futures::poll!(self.deleting.get_mut().unwrap().as_mut().unwrap().as_mut()) {
                 Poll::Pending => return Ok(false),
-                Poll::Ready(outcomes) => outcomes?,
+                Poll::Ready(outcomes) => outcomes,
             };
+        // Retire a completed future before propagating its error. The first
+        // poll can already fail; it must not appear pending to step().
         *self.deleting.get_mut().unwrap() = None;
+        let outcomes = outcomes?;
         let page = self.sealed.as_mut().unwrap();
         // Locally detected response corruption remains a protocol failure.
         // It must not be treated like an unresolved storage DELETE.
