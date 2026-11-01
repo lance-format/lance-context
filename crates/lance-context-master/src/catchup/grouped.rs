@@ -130,18 +130,24 @@ async fn commit(
             shard.use_parallel_group_encoding();
         }
     }
-    let reclaimed = match &mut store {
-        Store::Rollout(store) => store.commit_prepared_group(group, cap).await,
-        Store::Generic(store) => store.commit_prepared_group(group, cap).await,
-    }
-    .map_err(|e| e.to_string())?;
-    if reclaimed != outcomes.iter().map(|(_, count)| count).sum::<usize>() {
-        return Err("grouped merge returned an unexpected reclamation count".into());
-    }
+    let demand =
+        crate::demand_publish::CommittedMergeDemand::prepare_group(state, target, &group);
+    let reclaimed = crate::demand_publish::CommittedMergeDemand::observe(demand, async {
+        let reclaimed = match &mut store {
+            Store::Rollout(store) => store.commit_prepared_group(group, cap).await,
+            Store::Generic(store) => store.commit_prepared_group(group, cap).await,
+        }
+        .map_err(|e| e.to_string())?;
+        if reclaimed != outcomes.iter().map(|(_, count)| count).sum::<usize>() {
+            return Err("grouped merge returned an unexpected reclamation count".into());
+        }
+        Ok(reclaimed)
+    })
+    .await?;
     metrics::counter!("master_catchup_generations_reclaimed_total").increment(reclaimed as u64);
     metrics::histogram!("master_catchup_grouped_shards").record(outcomes.len() as f64);
     tracing::info!(%target, reclaimed, shards = outcomes.len(),
-        commit_secs = started.elapsed().as_secs_f64(), "grouped WAL publication finished");
+    commit_secs = started.elapsed().as_secs_f64(), "grouped WAL publication finished");
     for (index, reclaimed) in &outcomes {
         let shard = &state.config.catchup.shards[*index];
         if state.config.catchup.target.is_some() {

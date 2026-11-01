@@ -371,6 +371,18 @@ impl PreparedMerge {
     pub fn generation_count(&self) -> usize {
         self.merged_generations.len()
     }
+
+    /// Shard and highest generation represented by this prepared merge.
+    /// This describes preparation, not committed progress. A caller may publish
+    /// it as merged only after this exact preparation's commit and WAL drain
+    /// have acknowledged success; cancellation or an error is not proof.
+    #[must_use]
+    pub fn prepared_watermark(&self) -> Option<(Uuid, u64)> {
+        self.merged_generations
+            .iter()
+            .max()
+            .map(|generation| (self.shard_id, *generation))
+    }
 }
 
 /// Configuration for opening a [`StorageBase`].
