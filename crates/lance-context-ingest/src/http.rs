@@ -10,7 +10,13 @@ use axum::{
     Json, Router,
 };
 use receipt::ReceiptKeys;
-use std::{collections::BTreeMap, sync::Mutex};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex,
+    },
+};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 #[cfg(feature = "materializer")]
@@ -58,6 +64,7 @@ struct Inner {
     control: Arc<Semaphore>,
     lifecycle: Mutex<Lifecycle>,
     idle: Notify,
+    local_status_memory_refusals: AtomicU64,
 }
 struct Guard {
     inner: Arc<Inner>,
@@ -79,6 +86,9 @@ pub struct Observation {
     pub data_inflight: usize,
     pub control_inflight: usize,
     pub draining: bool,
+    /// Status queries refused by this gateway's own memory admission. A
+    /// forwarded refusal is counted only by the owner that made the decision.
+    pub local_status_memory_refusals: u64,
 }
 impl Gateway {
     /// Table bindings must be resolved and authorized before construction.
@@ -118,6 +128,7 @@ impl Gateway {
             options,
             lifecycle: Mutex::new(Lifecycle::default()),
             idle: Notify::new(),
+            local_status_memory_refusals: AtomicU64::new(0),
         })))
     }
     pub fn router(&self) -> Router {
@@ -142,7 +153,18 @@ impl Gateway {
             data_inflight: self.0.options.data_requests - self.0.data.available_permits(),
             control_inflight: self.0.options.control_requests - self.0.control.available_permits(),
             draining: self.0.lifecycle.lock().unwrap().closed,
+            local_status_memory_refusals: self
+                .0
+                .local_status_memory_refusals
+                .load(Ordering::Relaxed),
         }
+    }
+    #[cfg(feature = "materializer")]
+    fn status_memory_refusal(&self) -> Failure {
+        self.0
+            .local_status_memory_refusals
+            .fetch_add(1, Ordering::Relaxed);
+        Failure::unavailable("memory_capacity", "not_submitted")
     }
     /// Stop admission and join every admitted handler, including handlers whose
     /// HTTP client disconnected. Body reads have total/idle deadlines; WAL RPCs

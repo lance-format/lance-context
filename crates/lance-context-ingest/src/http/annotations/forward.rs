@@ -155,7 +155,7 @@ impl Forwarder {
             ingress
                 .budget
                 .try_reserve(length + maximum_reply)
-                .ok_or_else(|| Failure::unavailable("memory_capacity", "not_submitted"))?
+                .ok_or_else(|| self.gate.status_memory_refusal())?
         } else {
             tokio::time::timeout(
                 options.admission_timeout,
