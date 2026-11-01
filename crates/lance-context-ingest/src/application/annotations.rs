@@ -292,6 +292,7 @@ pub async fn serve_owner(
                     "http": owner.observation(),
                     "phases": service.phase_observation().as_slice(),
                     "append_rpc": ingress.client.append_timings(),
+                    "publisher_binding_rpc": ingress.client.publisher_binding_timings(),
                 }}));
             }
         };
