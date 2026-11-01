@@ -602,8 +602,7 @@ impl Node {
             g.pending.len() + g.reads.len() < self.limits.max_pending as usize,
             "pending request capacity"
         );
-        let context = g.reads.enqueue(request, g.raw.raft.term, query)?;
-        g.raw.read_index(context);
+        g.reads.enqueue(request, g.raw.raft.term, query)?;
         Ok(())
     }
 
@@ -919,6 +918,13 @@ impl Node {
     fn drive(&mut self, mut early: Option<&mut dyn FnMut(Packet)>) -> Result<Events> {
         let mut events = Events::default();
         for (id, group) in &mut self.groups {
+            // Every member arrived before this fresh quorum barrier. Seal the
+            // batch before sending: later arrivals cannot reuse its responses.
+            if group.raw.raft.state == StateRole::Leader {
+                if let Some(context) = group.reads.take_barrier(group.raw.raft.term) {
+                    group.raw.read_index(context);
+                }
+            }
             let mut outbound = Vec::new();
             while group.raw.has_ready() {
                 let mut ready = group.raw.ready();

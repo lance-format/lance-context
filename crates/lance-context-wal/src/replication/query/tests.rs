@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "tests/batching.rs"]
+mod batching;
+
 fn nodes(limits: Limits) -> Result<(tempfile::TempDir, Vec<Node>)> {
     let root = tempfile::tempdir()?;
     let nodes = (1..=3)
@@ -418,7 +421,8 @@ fn reads_share_capacity_and_tokens_with_appends_and_never_use_a_local_lease() ->
 fn read_contexts_do_not_cross_request_reuse_reopen_or_unapplied_cuts() -> Result<()> {
     let mut tracker = Tracker::default();
     let query = Query::Accepted { after: 0, limit: 1 };
-    let context = tracker.enqueue(10, 2, query.clone())?;
+    tracker.enqueue(10, 2, query.clone())?;
+    let context = tracker.take_barrier(2).unwrap();
     let mut state = State {
         applied: 4,
         ..Default::default()
@@ -441,7 +445,8 @@ fn read_contexts_do_not_cross_request_reuse_reopen_or_unapplied_cuts() -> Result
         tracker.finish(cut.clone(), &state, true, evaluate)?.len(),
         1
     );
-    let next = tracker.enqueue(10, 2, query.clone())?;
+    tracker.enqueue(10, 2, query.clone())?;
+    let next = tracker.take_barrier(2).unwrap();
     assert_ne!(next, context);
     tracker.confirm(&context, 5)?;
     assert!(tracker
@@ -453,7 +458,8 @@ fn read_contexts_do_not_cross_request_reuse_reopen_or_unapplied_cuts() -> Result
         Outcome::Unknown
     );
     let mut reopened = Tracker::default();
-    assert_ne!(reopened.enqueue(10, 3, query)?, context);
+    reopened.enqueue(10, 3, query)?;
+    assert_ne!(reopened.take_barrier(3).unwrap(), context);
     reopened.confirm(&context, 5)?;
     assert!(reopened
         .finish(cut.clone(), &state, true, evaluate)?
