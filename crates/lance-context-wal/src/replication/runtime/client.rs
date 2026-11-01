@@ -618,6 +618,7 @@ pub struct Client {
     catalog: u64,
     leaders: Mutex<BTreeMap<u64, u64>>,
     append_timings: [timing::Counter; 4],
+    publisher_binding_timings: [timing::Counter; 4],
 }
 impl Client {
     /// Per-exchange append phases, including redirected, failed and cancelled
@@ -628,6 +629,17 @@ impl Client {
         ["admission", "connection", "send", "response"]
             .into_iter()
             .zip(&self.append_timings)
+            .map(|(name, counter)| (name, counter.snapshot()))
+            .collect()
+    }
+    /// PublisherBinding query phases, using the same boundaries as append.
+    /// Admission is per exchange; connection/send/response include any existing
+    /// read-only reconnect attempt. Errors and cancellations finish intervals.
+    /// These queries serve ownership checks for multiple callers, not just reads.
+    pub fn publisher_binding_timings(&self) -> BTreeMap<&'static str, timing::Observation> {
+        ["admission", "connection", "send", "response"]
+            .into_iter()
+            .zip(&self.publisher_binding_timings)
             .map(|(name, counter)| (name, counter.snapshot()))
             .collect()
     }
@@ -708,6 +720,7 @@ impl Client {
             catalog: super::p::control_group(layout),
             leaders: Mutex::new(BTreeMap::new()),
             append_timings: Default::default(),
+            publisher_binding_timings: Default::default(),
         })
     }
     /// A failure/cancellation is an unknown outcome. Retain and reconcile the
@@ -849,6 +862,14 @@ impl Client {
         );
         let fetch = matches!(wire, WireRequest::Fetch { .. });
         let append = matches!(wire, WireRequest::Append { .. });
+        let timings = match &wire {
+            WireRequest::Append { .. } => Some(&self.append_timings),
+            WireRequest::Query {
+                query: query::Query::PublisherBinding { .. },
+                ..
+            } => Some(&self.publisher_binding_timings),
+            _ => None,
+        };
         let reply_kind = match &wire {
             WireRequest::Append { .. } | WireRequest::Control(_) => 0,
             WireRequest::Query { .. } => 1,
@@ -863,7 +884,7 @@ impl Client {
         };
         let size = usize::try_from(codec().serialized_size(&(&expected, &wire))?)?;
         ensure!(size <= MAX_META, "client metadata too large");
-        let admission = append.then(|| self.append_timings[0].start());
+        let admission = timings.map(|c| c[0].start());
         let credit = self
             .budgets
             .reserve(
@@ -874,7 +895,7 @@ impl Client {
         drop(admission);
         let metadata = codec().serialize(&(&expected, wire))?;
         let pool = if data { &pools.data } else { &pools.control };
-        let mut connection = append.then(|| self.append_timings[1].start());
+        let mut connection = timings.map(|c| c[1].start());
         let _slot = pool.slots.clone().acquire_owned().await?;
         let mut idle = pool.take_idle().await?;
         let mut reconnect_read = read_only && idle.is_some();
@@ -909,14 +930,14 @@ impl Client {
             drop(connection.take());
             let mut stage = "send";
             let response: Result<(Reply, Bytes)> = async {
-                let sending = append.then(|| self.append_timings[2].start());
+                let sending = timings.map(|c| c[2].start());
                 let id = self
                     .next
                     .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
                     .map_err(|_| anyhow::anyhow!("client request ids exhausted"))?;
                 send(&mut stream, id, &metadata, &body).await?;
                 drop(sending);
-                let _receiving = append.then(|| self.append_timings[3].start());
+                let _receiving = timings.map(|c| c[3].start());
                 stage = "response_prefix";
                 let (received_id, meta_len, body_len) =
                     prefix(&mut stream, if fetch { self.max_record } else { 0 }).await?;
@@ -959,6 +980,7 @@ impl Client {
                     // Keep the same byte/connection credits; reconnect authenticates
                     // normally, and fresh-stream failures and invalid replies escape.
                     reconnect_read = false;
+                    connection = timings.map(|c| c[1].start());
                     continue;
                 }
                 Err(error) => {

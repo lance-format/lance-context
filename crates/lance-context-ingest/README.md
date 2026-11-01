@@ -35,3 +35,11 @@ largest finished interval. Errors and cancellations finish intervals too; use
 the existing WAL outcome counters to distinguish outcomes. Observations are
 independent samples, phases can overlap across requests, and neither means nor
 maxima are p99 latency. An append redirected between nodes has multiple exchanges.
+
+`publisher_binding_rpc` reports the same four phases for the compact
+`PublisherBinding` ownership query. It includes ownership checks from writes,
+reads and maintenance, not only point reads. Admission is counted once per
+exchange; connection, send and response also include attempts made by the
+existing read-only reconnect path. Other query kinds have separate behavior and
+are excluded. Response time includes network, server scheduling and quorum work;
+it is not a measurement of Raft execution alone.
