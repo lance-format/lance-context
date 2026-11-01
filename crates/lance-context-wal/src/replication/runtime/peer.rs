@@ -369,6 +369,10 @@ async fn dispatch(
                         .is_some_and(|route| route.enqueue(packet, &statistics))
                 };
                 if !sent { statistics.dropped_outbound.fetch_add(1, Ordering::Relaxed); }
+                // A continuously ready outbox can otherwise consume an entire
+                // cooperative budget before destination writers get to drain
+                // their bounded queues, dropping even small control bursts.
+                tokio::task::yield_now().await;
             }
         }
     }
