@@ -52,6 +52,7 @@ struct View {
     peer_failed_exchanges: u64,
     peer_rejected_connections: u64,
     peer_rejected_packets: u64,
+    peer_destinations: BTreeMap<u64, peer::DestinationObservation>,
 }
 impl State {
     fn view(&self) -> Result<View> {
@@ -101,6 +102,7 @@ impl State {
             peer_failed_exchanges: self.peers.failed_exchanges.load(Ordering::Relaxed),
             peer_rejected_connections: self.peers.rejected_connections.load(Ordering::Relaxed),
             peer_rejected_packets: self.peers.rejected_packets.load(Ordering::Relaxed),
+            peer_destinations: self.peers.destination_observations(),
         })
     }
 }

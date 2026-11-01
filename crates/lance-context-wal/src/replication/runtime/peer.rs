@@ -6,7 +6,7 @@
 //! rustls configurations with mutual authentication and the required ALPN.
 //! Optional snapshots use a separate listener and bounded transfer workers.
 //! No client ingestion is exposed here.
-use super::{Handle, Outbound, Packet};
+use super::{client::timing, Handle, Outbound, Packet};
 use anyhow::{ensure, Context, Result};
 use bytes::{Bytes, BytesMut};
 use protobuf::Message as _;
@@ -16,7 +16,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, OnceLock,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -110,6 +110,44 @@ pub struct Statistics {
     pub rejected_connections: AtomicU64,
     pub failed_exchanges: AtomicU64,
     pub rejected_packets: AtomicU64,
+    destinations: BTreeMap<u64, Arc<DestinationStatistics>>,
+}
+
+#[derive(Default)]
+struct DestinationStatistics {
+    queue_wait: timing::Counter,
+    send: timing::Counter,
+    sent_frames: AtomicU64,
+    sent_payload_bytes: AtomicU64,
+}
+
+/// Local transport intervals, not remote receive or durable commit latency.
+#[derive(serde::Serialize)]
+pub struct DestinationObservation {
+    pub queue_wait: timing::Observation,
+    pub send: timing::Observation,
+    pub sent_frames: u64,
+    pub sent_payload_bytes: u64,
+}
+
+impl Statistics {
+    /// Keys are limited to configured destination nodes, never groups or tables.
+    pub fn destination_observations(&self) -> BTreeMap<u64, DestinationObservation> {
+        self.destinations
+            .iter()
+            .map(|(&id, s)| {
+                (
+                    id,
+                    DestinationObservation {
+                        queue_wait: s.queue_wait.snapshot(),
+                        send: s.send.snapshot(),
+                        sent_frames: s.sent_frames.load(Ordering::Relaxed),
+                        sent_payload_bytes: s.sent_payload_bytes.load(Ordering::Relaxed),
+                    },
+                )
+            })
+            .collect()
+    }
 }
 
 pub struct Transport {
@@ -170,7 +208,13 @@ impl Transport {
             "missing WAL peer ALPN"
         );
         let (stop, shutdown) = watch::channel(false);
-        let statistics = Arc::new(Statistics::default());
+        let statistics = Arc::new(Statistics {
+            destinations: peers
+                .keys()
+                .map(|&id| (id, Arc::new(DestinationStatistics::default())))
+                .collect(),
+            ..Statistics::default()
+        });
         let snapshots = Arc::new(OnceLock::new());
         let owner = handle.shared.clone();
         let mut tasks = Vec::new();
@@ -193,7 +237,7 @@ impl Transport {
                 TlsConnector::from(client_tls.clone()),
                 options.clone(),
                 shutdown.clone(),
-                statistics.clone(),
+                (statistics.clone(), statistics.destinations[&id].clone()),
             )));
         }
         tasks.push(tokio::spawn(dispatch(
@@ -264,6 +308,7 @@ impl Drop for Transport {
 struct Queued {
     packet: Outbound,
     _bytes: OwnedSemaphorePermit,
+    enqueued: Instant,
 }
 struct Route {
     send: mpsc::Sender<Queued>,
@@ -286,6 +331,7 @@ impl Route {
         match self.send.try_send(Queued {
             packet,
             _bytes: bytes,
+            enqueued: Instant::now(),
         }) {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -344,8 +390,9 @@ async fn send_loop(
     connector: TlsConnector,
     options: Options,
     mut stop: watch::Receiver<bool>,
-    statistics: Arc<Statistics>,
+    statistics: (Arc<Statistics>, Arc<DestinationStatistics>),
 ) -> Result<()> {
+    let (statistics, timing) = statistics;
     let mut connection = None;
     loop {
         if connection.is_none() {
@@ -393,7 +440,7 @@ async fn send_loop(
             packet = receive.recv() => match packet { Some(p) => p, None => return Ok(()) },
         };
         // Retain both physical-runtime and per-destination credits through send.
-        let exchange = write_packet(connection.as_mut().unwrap(), packet.packet.packet());
+        let exchange = send_queued(connection.as_mut().unwrap(), &packet, &timing);
         let outcome = tokio::select! {
             _ = stop.changed() => return Ok(()),
             result = timeout(options.io_timeout, exchange) => result,
@@ -415,6 +462,30 @@ async fn send_loop(
             }
         }
     }
+}
+
+async fn send_queued<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    queued: &Queued,
+    statistics: &DestinationStatistics,
+) -> Result<()> {
+    // Only dequeued frames contribute queue intervals. Reconnect purges and
+    // rejected enqueues remain in the existing drop counters.
+    statistics.queue_wait.record(queued.enqueued.elapsed());
+    let _send = statistics.send.start();
+    let packet = queued.packet.packet();
+    write_packet(writer, packet).await?;
+    statistics.sent_frames.fetch_add(1, Ordering::Relaxed);
+    let payload: u64 = packet
+        .message
+        .entries
+        .iter()
+        .map(|e| e.data.len() as u64)
+        .sum();
+    statistics
+        .sent_payload_bytes
+        .fetch_add(payload, Ordering::Relaxed);
+    Ok(())
 }
 
 async fn listen(

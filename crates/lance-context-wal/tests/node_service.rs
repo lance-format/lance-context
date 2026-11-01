@@ -181,6 +181,26 @@ async fn run_cluster(f: &Fixture) -> Result<()> {
         );
     }
     let failed_exchanges = before_disconnect["peer_failed_exchanges"].as_u64().unwrap();
+    let destinations = before_disconnect["peer_destinations"].as_object().unwrap();
+    assert_eq!(destinations.len(), 2);
+    assert!(destinations
+        .values()
+        .any(|d| d["sent_frames"].as_u64().unwrap() > 0));
+    for (node, timing) in destinations {
+        assert_ne!(node.parse::<u64>()?, first_leader);
+        for phase in ["queue_wait", "send"] {
+            for field in [
+                "started",
+                "finished",
+                "elapsed_micros",
+                "max_elapsed_micros",
+            ] {
+                assert!(timing[phase][field].is_u64());
+            }
+        }
+        assert!(timing["sent_frames"].is_u64());
+        assert!(timing["sent_payload_bytes"].is_u64());
+    }
     children.get_mut(&lagging).unwrap().kill()?;
     let mut expected = BTreeMap::new();
     let mut tails = BTreeMap::new();
