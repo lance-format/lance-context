@@ -362,15 +362,22 @@ impl Query {
 
 struct Pending {
     request: u64,
-    term: u64,
     query: Query,
+}
+
+struct ReadBatch {
+    term: u64,
     confirmed: Option<u64>,
+    requests: Vec<Pending>,
 }
 
 pub(super) struct Tracker {
     incarnation: Uuid,
     next: u64,
-    pending: BTreeMap<[u8; 32], Pending>,
+    pending: BTreeMap<[u8; 32], ReadBatch>,
+    /// Only queries admitted before the next poll can join this batch.
+    queued: Option<[u8; 32]>,
+    requests: usize,
 }
 
 impl Default for Tracker {
@@ -379,18 +386,29 @@ impl Default for Tracker {
             incarnation: Uuid::new_v4(),
             next: 0,
             pending: BTreeMap::new(),
+            queued: None,
+            requests: 0,
         }
     }
 }
 
 impl Tracker {
     pub fn len(&self) -> usize {
-        self.pending.len()
+        self.requests
     }
     pub fn contains(&self, request: u64) -> bool {
-        self.pending.values().any(|p| p.request == request)
+        self.pending
+            .values()
+            .any(|b| b.requests.iter().any(|p| p.request == request))
     }
-    pub fn enqueue(&mut self, request: u64, term: u64, query: Query) -> Result<Vec<u8>> {
+    pub fn enqueue(&mut self, request: u64, term: u64, query: Query) -> Result<()> {
+        if let Some(batch) = self.queued.and_then(|key| self.pending.get_mut(&key)) {
+            if batch.term == term {
+                batch.requests.push(Pending { request, query });
+                self.requests += 1;
+                return Ok(());
+            }
+        }
         self.next = self.next.checked_add(1).context("read context exhausted")?;
         let mut context = [0; 32];
         context[..8].copy_from_slice(b"LCREAD01");
@@ -400,22 +418,30 @@ impl Tracker {
             self.pending
                 .insert(
                     context,
-                    Pending {
-                        request,
+                    ReadBatch {
                         term,
-                        query,
-                        confirmed: None
+                        confirmed: None,
+                        requests: vec![Pending { request, query }],
                     }
                 )
                 .is_none(),
             "reused read context"
         );
-        Ok(context.to_vec())
+        self.queued = Some(context);
+        self.requests += 1;
+        Ok(())
+    }
+    pub fn take_barrier(&mut self, term: u64) -> Option<Vec<u8>> {
+        let context = self.queued.take()?;
+        (self.pending[&context].term == term).then(|| context.to_vec())
     }
     pub fn confirm(&mut self, context: &[u8], index: u64) -> Result<()> {
         let Ok(key) = <[u8; 32]>::try_from(context) else {
             return Ok(());
         };
+        if self.queued == Some(key) {
+            return Ok(()); // A not-yet-issued barrier cannot confirm reads.
+        }
         let Some(pending) = self.pending.get_mut(&key) else {
             return Ok(());
         };
@@ -447,27 +473,37 @@ impl Tracker {
                 .then_some(*key)
             })
             .collect();
-        let mut results = Vec::with_capacity(done.len());
+        let count = done
+            .iter()
+            .map(|key| self.pending[key].requests.len())
+            .sum();
+        let mut results = Vec::with_capacity(count);
         for key in done {
-            let p = self.pending.remove(&key).expect("selected pending read");
-            let outcome = if !leader || p.term != cut.term {
-                Outcome::Unknown
-            } else {
-                let observed_cut = Cut {
-                    quorum_index: p.confirmed.expect("confirmed completed read"),
-                    ..cut.clone()
+            let batch = self.pending.remove(&key).expect("selected pending reads");
+            if self.queued == Some(key) {
+                self.queued = None;
+            }
+            self.requests -= batch.requests.len();
+            for p in batch.requests {
+                let outcome = if !leader || batch.term != cut.term {
+                    Outcome::Unknown
+                } else {
+                    let observed_cut = Cut {
+                        quorum_index: batch.confirmed.expect("confirmed completed read"),
+                        ..cut.clone()
+                    };
+                    let value = evaluate(&p.query, &observed_cut, state)?;
+                    Outcome::Observed {
+                        cut: observed_cut,
+                        value,
+                    }
                 };
-                let value = evaluate(&p.query, &observed_cut, state)?;
-                Outcome::Observed {
-                    cut: observed_cut,
-                    value,
-                }
-            };
-            results.push(Completion {
-                group: cut.group,
-                request: p.request,
-                outcome,
-            });
+                results.push(Completion {
+                    group: cut.group,
+                    request: p.request,
+                    outcome,
+                });
+            }
         }
         Ok(results)
     }
