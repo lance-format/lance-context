@@ -145,8 +145,13 @@ async fn stalled_snapshot_allows_log_maintenance_and_cancellable_image_wait() ->
     ));
     wait_for(|| progress.lock().unwrap().log_passes >= 2).await?;
     assert_eq!(progress.lock().unwrap().attempts_failed, 0);
+    // The leader and stalled snapshot receiver can still form a quorum while
+    // the other replica is behind. A quorum ACK does not imply all replicas
+    // are ready for the all-node reopen assertion below.
+    c.isolated.store(2, Ordering::Release);
     let next = commit(&c.handles[&1], 10, batch(2)).await?;
     wait_for(|| c.handles[&3].observation(10).unwrap().status.applied >= next).await?;
+    assert!(c.handles[&2].observation(10)?.status.applied < next);
     stop.send(true)?;
     timeout(Duration::from_secs(2), task)
         .await
@@ -154,6 +159,13 @@ async fn stalled_snapshot_allows_log_maintenance_and_cancellable_image_wait() ->
     assert_eq!(progress.lock().unwrap().checkpoints, 0);
     drop(receiver);
     drop(image);
+    c.isolated.store(0, Ordering::Release);
+    wait_for(|| {
+        c.handles
+            .values()
+            .all(|handle| handle.observation(10).unwrap().status.applied >= next)
+    })
+    .await?;
     c.shutdown().await?;
     verify_reopened(root.path(), index)?;
     for id in 1..=3 {
