@@ -398,6 +398,15 @@ async fn annotation_delete_process_role() -> Result<()> {
 
 #[tokio::test]
 async fn annotation_collector_corrupt_delete_reply_stops_without_reissuing() -> Result<()> {
+    corrupt_delete_reply_stops_without_reissuing(false).await
+}
+
+#[tokio::test]
+async fn annotation_collector_ready_corrupt_delete_reply_stops_without_reissuing() -> Result<()> {
+    corrupt_delete_reply_stops_without_reissuing(true).await
+}
+
+async fn corrupt_delete_reply_stops_without_reissuing(ready: bool) -> Result<()> {
     let root = root()?;
     let path = root.path().join("turns.lance");
     let c = network::Cluster::open_signed(root.path(), annotation_publication::one_shard()).await?;
@@ -410,7 +419,14 @@ async fn annotation_collector_corrupt_delete_reply_stops_without_reissuing() -> 
     let (listed, _listing_entered) = oneshot::channel();
     let (_release_listing, resume) = oneshot::channel();
     faults.pause_listing(&path, Some(&abandoned[0]), listed, resume)?;
-    faults.arm(&abandoned[0], Action::WrongReply)?;
+    faults.arm(
+        &abandoned[0],
+        if ready {
+            Action::WrongReplyReady
+        } else {
+            Action::WrongReply
+        },
+    )?;
     let (_, runtime) = owned(&c, &storage, &limits()).await?;
     let error = tokio::time::timeout(
         Duration::from_secs(30),
@@ -423,7 +439,7 @@ async fn annotation_collector_corrupt_delete_reply_stops_without_reissuing() -> 
         faults.calls.lock().unwrap().as_slice(),
         &[object_store::path::Path::from_absolute_path(&abandoned[0])?]
     );
-    assert!(!abandoned[0].exists());
+    assert_eq!(abandoned[0].exists(), ready);
     assert!(abandoned[1].exists());
     c.shutdown().await
 }

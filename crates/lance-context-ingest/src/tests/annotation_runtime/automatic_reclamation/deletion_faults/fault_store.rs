@@ -23,6 +23,7 @@ pub(in crate::tests) enum Action {
     },
     FailBefore,
     WrongReply,
+    WrongReplyReady,
     #[cfg(feature = "http")]
     FailWhile(Arc<std::sync::atomic::AtomicBool>),
     LoseReply,
@@ -381,6 +382,11 @@ impl ObjectStore for FaultStore {
                         Some(Action::FailBefore) => return Err(failure()),
                         Some(Action::WrongReply) => {
                             inner.delete(&path).await?;
+                            return Ok(path.join("unexpected"));
+                        }
+                        Some(Action::WrongReplyReady) => {
+                            // No asynchronous storage call: the corrupt reply
+                            // completes during the collector's first poll.
                             return Ok(path.join("unexpected"));
                         }
                         #[cfg(feature = "http")]
