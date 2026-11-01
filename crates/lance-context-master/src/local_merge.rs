@@ -21,6 +21,14 @@ pub struct LocalMergeConfig {
     /// Neither setting certifies that historical legacy writers have drained.
     #[arg(long, env = "MASTER_LOCAL_MERGE_TARGETS", value_delimiter = ',')]
     pub master_local_merge_targets: Vec<String>,
+    /// Publish confirmed native upsert-merge progress without rereading storage.
+    /// Exact opt-in targets only; detached fallback reconciliation remains enabled.
+    #[arg(
+        long,
+        env = "MASTER_LOCAL_MERGE_COMMITTED_DEMAND_TARGETS",
+        value_delimiter = ','
+    )]
+    pub master_local_merge_committed_demand_targets: Vec<String>,
 }
 
 impl LocalMergeConfig {
@@ -62,6 +70,16 @@ pub(crate) fn targets(config: &MasterConfig) -> Vec<String> {
 }
 
 pub(crate) fn validate(config: &MasterConfig) -> Result<(), String> {
+    for target in &config
+        .local_merge
+        .master_local_merge_committed_demand_targets
+    {
+        if target == "*" || !selected(config, target) || config.append.enabled(target) {
+            return Err(format!(
+                "committed demand requires an exact selected native upsert target: {target}"
+            ));
+        }
+    }
     if config.local_merge.master_local_merge_auto
         && (!config.merge_rollout.fence_legacy
             || config.local_merge.master_local_merge_targets != ["*"]

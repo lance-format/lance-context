@@ -68,6 +68,13 @@ impl PreparedShardMerge {
         self.prepared.generation_count()
     }
 
+    /// Prepared shard progress, not commit proof. Publish only after the
+    /// entire group and its WAL drains have acknowledged success.
+    #[must_use]
+    pub fn prepared_watermark(&self) -> Option<(Uuid, u64)> {
+        self.prepared.prepared_watermark()
+    }
+
     /// Generations in this preparation's manifest snapshot that were not read.
     /// An ordered publisher must finish this suffix before publishing a later
     /// shard. New ingestion is not included in this fixed continuation bound.

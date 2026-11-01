@@ -465,7 +465,11 @@ async fn probe_with_policy(
 }
 
 #[cfg(test)]
-mod tests {
+#[path = "committed_demand_storage_tests.rs"]
+mod committed_demand_storage_tests;
+
+#[cfg(test)]
+pub(crate) mod tests {
     use super::*;
     use clap::Parser;
     use lance_context_core::{RolloutStore, RolloutStoreOptions};
@@ -865,7 +869,9 @@ mod tests {
         generic_fixture_with_auto(false).await
     }
 
-    async fn generic_fixture_with_auto(auto: bool) -> (tempfile::TempDir, Arc<MasterState>) {
+    pub(crate) async fn generic_fixture_with_auto(
+        auto: bool,
+    ) -> (tempfile::TempDir, Arc<MasterState>) {
         let dir = tempfile::tempdir().unwrap();
         let mut config = MasterConfig::parse_from(["test"]);
         config.data_dir = dir.path().to_string_lossy().into();
@@ -894,7 +900,10 @@ mod tests {
         (dir, MasterState::new(config).await.unwrap())
     }
 
-    async fn generic_writer(state: &MasterState, name: &str) -> lance_context_core::GenericStore {
+    pub(crate) async fn generic_writer(
+        state: &MasterState,
+        name: &str,
+    ) -> lance_context_core::GenericStore {
         use lance_context_core::{
             ColumnSpec, ColumnType, GenericStore, GenericStoreOptions, SchemaSpec,
         };
@@ -920,7 +929,11 @@ mod tests {
         .unwrap()
     }
 
-    async fn generic_write(writer: &lance_context_core::GenericStore, id: &str, text: &str) {
+    pub(crate) async fn generic_write(
+        writer: &lance_context_core::GenericStore,
+        id: &str,
+        text: &str,
+    ) {
         writer
             .add(&[serde_json::json!({"id":id, "text":text})
                 .as_object()
@@ -929,6 +942,145 @@ mod tests {
             .await
             .unwrap();
         writer.flush().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated loopback ETCD_TEST_ENDPOINTS and ETCD_TEST_EXCLUSIVE=1"]
+    async fn committed_demand_publishes_actual_drain_before_release_and_retains_late_flush() {
+        use lance_context_merge::demand::{DemandEvent, EventSource, SCHEMA_VERSION};
+        assert_eq!(std::env::var("ETCD_TEST_EXCLUSIVE").unwrap(), "1");
+        let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+        assert!(endpoint.starts_with("http://127.0.0.1:") && !endpoint.contains(','));
+        for enabled in [false, true] {
+            let (_dir, initial) = generic_fixture_with_auto(true).await;
+            let mut cfg = initial.config.clone();
+            cfg.local_merge.master_local_merge_committed_demand_targets = if enabled {
+                vec!["generic:a".into()]
+            } else {
+                vec![]
+            };
+            let state = MasterState::new(cfg).await.unwrap();
+            let writer = generic_writer(&state, "a").await;
+            generic_write(&writer, "first", "before admission").await;
+            let first = writer.own_shard_watermark().await.unwrap().unwrap();
+            let coordinator = state.task_store.merge_coordinator();
+            let event = |watermark: lance_context_core::ShardWatermark| DemandEvent {
+                v: SCHEMA_VERSION,
+                shard: watermark.shard_id.to_string(),
+                sealed_through: watermark.sealed_through,
+                sealed_bytes_through: 0,
+                merged_through: None,
+                flushed_at_ms: chrono::Utc::now().timestamp_millis(),
+                writer_epoch: watermark.writer_epoch,
+                source: EventSource::Writer,
+                merged_epoch: None,
+                sealed_times: Default::default(),
+            };
+            coordinator
+                .publish_demand_event("generic:a", &event(first))
+                .await
+                .unwrap();
+            state
+                .task_store
+                .enqueue(lance_context_api::TaskKind::MergeWal, "generic:a", vec![])
+                .await
+                .unwrap();
+            let claim = state
+                .task_store
+                .claim_resident_merge(&crate::local_merge::targets(&state.config))
+                .await
+                .unwrap()
+                .unwrap();
+            let mut client = etcd_client::Client::connect([endpoint.as_str()], None)
+                .await
+                .unwrap();
+            let key = format!(
+                "{}/demand-events/67656e657269633a61/{}",
+                state.config.etcd.etcd_prefix, first.shard_id
+            );
+            let result = crate::maintenance_execution::run_as(
+                &state,
+                &claim,
+                lance_context_merge::MaintenanceKind::Catchup,
+                async {
+                    // This seal arrives after the task has been admitted and claimed.
+                    generic_write(&writer, "during", "after admission").await;
+                    let second = writer.own_shard_watermark().await.unwrap().unwrap();
+                    coordinator
+                        .publish_demand_event("generic:a", &event(second))
+                        .await
+                        .unwrap();
+                    let result = crate::local_merge::run(&state, "generic:a").await?;
+                    assert_eq!(result, "local WAL merge reclaimed 2 generations");
+                    // Still inside maintenance work: the post-release publisher
+                    // cannot mask a missing early acknowledgement in this assertion.
+                    if enabled {
+                        tokio::time::timeout(Duration::from_secs(5), async {
+                            loop {
+                                let reply = client.get(key.as_str(), None).await.unwrap();
+                                let row: DemandEvent =
+                                    serde_json::from_slice(reply.kvs()[0].value()).unwrap();
+                                if row.merged_through == Some(second.sealed_through) {
+                                    break;
+                                }
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
+                        })
+                        .await
+                        .unwrap();
+                    } else {
+                        let reply = client.get(key.as_str(), None).await.unwrap();
+                        let row: DemandEvent =
+                            serde_json::from_slice(reply.kvs()[0].value()).unwrap();
+                        assert_eq!(
+                            row.merged_through, None,
+                            "default-off must retain the original behavior"
+                        );
+                    }
+                    generic_write(&writer, "late", "after shard visited").await;
+                    let late = writer.own_shard_watermark().await.unwrap().unwrap();
+                    coordinator
+                        .publish_demand_event("generic:a", &event(late))
+                        .await
+                        .unwrap();
+                    let reply = client.get(key.as_str(), None).await.unwrap();
+                    let row: DemandEvent = serde_json::from_slice(reply.kvs()[0].value()).unwrap();
+                    assert_eq!(row.sealed_through, late.sealed_through);
+                    assert_eq!(row.merged_through, enabled.then_some(second.sealed_through));
+                    assert!(row.sealed_through > row.merged_through.unwrap_or(0));
+                    Ok(result)
+                },
+            )
+            .await;
+            state.task_store.finish(claim, result).await.unwrap();
+            let probe = lance_context_core::rollout_append::SealedWalProbe::open(
+                &state.generic_uri("a"),
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(probe.has_sealed_wal("writer").await.unwrap());
+            state
+                .task_store
+                .enqueue(lance_context_api::TaskKind::MergeWal, "generic:a", vec![])
+                .await
+                .unwrap();
+            let next = state
+                .task_store
+                .claim_resident_merge(&crate::local_merge::targets(&state.config))
+                .await
+                .unwrap()
+                .unwrap();
+            let result = crate::merge_execution::run_merge_wal(&state, &next).await;
+            assert_eq!(
+                result.as_ref().unwrap(),
+                "local WAL merge reclaimed 1 generations"
+            );
+            state.task_store.finish(next, result).await.unwrap();
+            assert!(!probe.has_sealed_wal("writer").await.unwrap());
+            let dataset = lance::Dataset::open(&state.generic_uri("a")).await.unwrap();
+            assert_eq!(dataset.count_rows(None).await.unwrap(), 3);
+        }
     }
 
     #[tokio::test]

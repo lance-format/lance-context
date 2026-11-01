@@ -1601,6 +1601,179 @@ mod tests {
         store.release_coordination_lock(session).await.unwrap();
     }
 
+    #[tokio::test]
+    #[ignore = "requires isolated loopback ETCD_TEST_ENDPOINTS and ETCD_TEST_EXCLUSIVE=1"]
+    async fn committed_demand_suppresses_consumed_seals_but_admits_unvisited_wal() {
+        use crate::resident_recovery::tests::{
+            generic_fixture_with_auto, generic_write, generic_writer,
+        };
+        assert_eq!(std::env::var("ETCD_TEST_EXCLUSIVE").as_deref(), Ok("1"));
+        let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+        assert!(endpoint.starts_with("http://127.0.0.1:") && !endpoint.contains(','));
+        for grouped in [false, true] {
+            for enabled in [false, true] {
+                for late_flush in [false, true] {
+                    let (_dir, initial) = generic_fixture_with_auto(true).await;
+                    let mut cfg = initial.config.clone();
+                    cfg.merge_wal_min_generations = 1;
+                    if grouped {
+                        cfg.catchup.grouped_targets = vec!["generic:a".into()];
+                        cfg.catchup.grouped_shards = 1;
+                    }
+                    cfg.local_merge.master_local_merge_committed_demand_targets = if enabled {
+                        vec!["generic:a".into()]
+                    } else {
+                        vec![]
+                    };
+                    let state = MasterState::new(cfg).await.unwrap();
+                    let store = &state.task_store;
+                    let session = store
+                        .discovery_session(
+                            serde_json::to_vec(&Policy::from_config(&state.config)).unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert!(store.elect_discovery_leader(&session).await.unwrap());
+                    let publisher = store.discovery_publisher(&session);
+                    let prefix = state.config.etcd.prefix();
+                    let client = store.etcd_client();
+                    let coordinator = store.merge_coordinator();
+                    let writer = generic_writer(&state, "a").await;
+                    let demand = |mark: lance_context_core::ShardWatermark| DemandEvent {
+                        v: 1,
+                        shard: mark.shard_id.to_string(),
+                        sealed_through: mark.sealed_through,
+                        sealed_bytes_through: 0,
+                        merged_through: None,
+                        merged_epoch: None,
+                        flushed_at_ms: chrono::Utc::now().timestamp_millis(),
+                        writer_epoch: mark.writer_epoch,
+                        source: EventSource::Writer,
+                        sealed_times: BTreeMap::new(),
+                    };
+                    generic_write(&writer, "first", "before admission").await;
+                    let first = writer.own_shard_watermark().await.unwrap().unwrap();
+                    coordinator
+                        .publish_demand_event("generic:a", &demand(first))
+                        .await
+                        .unwrap();
+                    let mut cache = snapshot(client, prefix).await.unwrap();
+                    assert_eq!(cache.tables["generic:a"].pending(), 1);
+                    reconcile(&publisher, prefix, &mut cache, "generic:a")
+                        .await
+                        .unwrap();
+                    assert_eq!(store.list().await.unwrap().len(), 1);
+                    let claim = store
+                        .claim_resident_merge(&crate::local_merge::targets(&state.config))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    // This generation was not in the atomic admission frontier,
+                    // but the running native merge will actually consume it.
+                    generic_write(&writer, "during", "after admission").await;
+                    let second = writer.own_shard_watermark().await.unwrap().unwrap();
+                    coordinator
+                        .publish_demand_event("generic:a", &demand(second))
+                        .await
+                        .unwrap();
+                    cache = snapshot(client, prefix).await.unwrap();
+                    assert_eq!(cache.tables["generic:a"].pending(), 1);
+                    let mut stream = watch(client, prefix, &cache).await.unwrap();
+                    let mut fallback_hold = None;
+                    let result = crate::maintenance_execution::run_as(
+                        &state,
+                        &claim,
+                        lance_context_merge::MaintenanceKind::Catchup,
+                        async {
+                            let result = crate::local_merge::run(&state, "generic:a").await?;
+                            assert_eq!(result, "local WAL merge reclaimed 2 generations");
+                            if enabled {
+                                // Observe the actual executor publication through the
+                                // aggregate watch, before any post-release fallback.
+                                tokio::time::timeout(Duration::from_secs(5), async {
+                                    while cache.tables["generic:a"].pending() != 0 {
+                                        let response = stream.message().await.unwrap().unwrap();
+                                        apply_response(&mut cache, prefix, &response).unwrap();
+                                    }
+                                })
+                                .await
+                                .unwrap();
+                            }
+                            // Model saturation of the unchanged detached fallback.
+                            // Acquire only after the actual early publication above,
+                            // so this cannot manufacture candidate progress. Without
+                            // this hold, fallback IO races the baseline assertion.
+                            fallback_hold = Some(
+                                crate::demand_publish::hold_merged_publications_for_test().await,
+                            );
+                            if late_flush {
+                                generic_write(&writer, "late", "after merge visited shard").await;
+                                let late = writer.own_shard_watermark().await.unwrap().unwrap();
+                                coordinator
+                                    .publish_demand_event("generic:a", &demand(late))
+                                    .await
+                                    .unwrap();
+                            }
+                            Ok(result)
+                        },
+                    )
+                    .await;
+                    store.finish(claim, result).await.unwrap();
+                    // Relist tests durable recovery as well as the live watch path.
+                    // The normal release did invoke the fallback, but its shared
+                    // publication slots are full until these assertions complete.
+                    cache = snapshot(client, prefix).await.unwrap();
+                    let expected_pending = u64::from(!enabled) + u64::from(late_flush);
+                    assert_eq!(cache.tables["generic:a"].pending(), expected_pending);
+                    reconcile(&publisher, prefix, &mut cache, "generic:a")
+                        .await
+                        .unwrap();
+                    let should_enqueue = !enabled || late_flush;
+                    assert_eq!(
+                        store.list().await.unwrap().len(),
+                        1 + usize::from(should_enqueue)
+                    );
+                    let probe = lance_context_core::rollout_append::SealedWalProbe::open(
+                        &state.generic_uri("a"),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(probe.has_sealed_wal("writer").await.unwrap(), late_flush);
+                    drop(fallback_hold);
+                    if should_enqueue {
+                        let next = store
+                            .claim_resident_merge(&crate::local_merge::targets(&state.config))
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        let result = crate::merge_execution::run_merge_wal(&state, &next).await;
+                        if late_flush {
+                            assert_eq!(
+                                result.as_ref().unwrap(),
+                                "local WAL merge reclaimed 1 generations"
+                            );
+                        } else {
+                            assert!(
+                                result.is_ok(),
+                                "baseline redundant task must remain harmless"
+                            );
+                        }
+                        store.finish(next, result).await.unwrap();
+                    }
+                    assert!(!probe.has_sealed_wal("writer").await.unwrap());
+                    let dataset = lance::Dataset::open(&state.generic_uri("a")).await.unwrap();
+                    assert_eq!(
+                        dataset.count_rows(None).await.unwrap(),
+                        2 + usize::from(late_flush)
+                    );
+                    store.release_coordination_lock(session).await.unwrap();
+                    println!("committed_demand aggregate verified: grouped={grouped} enabled={enabled} late_flush={late_flush} queued_successor={should_enqueue}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn invalid_watermark_isolated_to_one_table_and_recovers_on_valid_update() {
         let mut cache = Cache::new();

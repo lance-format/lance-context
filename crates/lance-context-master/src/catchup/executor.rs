@@ -419,11 +419,16 @@ async fn prepare_shard(
                         .await
                         .map_err(|e| e.to_string())?;
                 }
+                let demand =
+                    crate::demand_publish::CommittedMergeDemand::prepare(state, target, &prepared);
                 Ok(Box::pin(async move {
-                    store
-                        .commit_prepared_merge(&manifest_store, &manifest, prepared)
-                        .await
-                        .map_err(|e| e.to_string())
+                    crate::demand_publish::CommittedMergeDemand::observe(demand, async {
+                        store
+                            .commit_prepared_merge(&manifest_store, &manifest, prepared)
+                            .await
+                            .map_err(|e| e.to_string())
+                    })
+                    .await
                 }))
             }
             None => Ok(Box::pin(async { Ok(0usize) })),
@@ -476,11 +481,16 @@ async fn prepare_shard(
                         .await
                         .map_err(|e| e.to_string())?;
                 }
+                let demand =
+                    crate::demand_publish::CommittedMergeDemand::prepare(state, target, &prepared);
                 Ok(Box::pin(async move {
-                    store
-                        .commit_prepared_merge(&manifest_store, &manifest, prepared)
-                        .await
-                        .map_err(|e| e.to_string())
+                    crate::demand_publish::CommittedMergeDemand::observe(demand, async {
+                        store
+                            .commit_prepared_merge(&manifest_store, &manifest, prepared)
+                            .await
+                            .map_err(|e| e.to_string())
+                    })
+                    .await
                 }))
             }
             None => Ok(Box::pin(async { Ok(0usize) })),
