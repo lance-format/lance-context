@@ -869,7 +869,9 @@ pub(crate) mod tests {
         generic_fixture_with_auto(false).await
     }
 
-    pub(crate) async fn generic_fixture_with_auto(auto: bool) -> (tempfile::TempDir, Arc<MasterState>) {
+    pub(crate) async fn generic_fixture_with_auto(
+        auto: bool,
+    ) -> (tempfile::TempDir, Arc<MasterState>) {
         let dir = tempfile::tempdir().unwrap();
         let mut config = MasterConfig::parse_from(["test"]);
         config.data_dir = dir.path().to_string_lossy().into();
@@ -898,7 +900,10 @@ pub(crate) mod tests {
         (dir, MasterState::new(config).await.unwrap())
     }
 
-    pub(crate) async fn generic_writer(state: &MasterState, name: &str) -> lance_context_core::GenericStore {
+    pub(crate) async fn generic_writer(
+        state: &MasterState,
+        name: &str,
+    ) -> lance_context_core::GenericStore {
         use lance_context_core::{
             ColumnSpec, ColumnType, GenericStore, GenericStoreOptions, SchemaSpec,
         };
@@ -924,7 +929,11 @@ pub(crate) mod tests {
         .unwrap()
     }
 
-    pub(crate) async fn generic_write(writer: &lance_context_core::GenericStore, id: &str, text: &str) {
+    pub(crate) async fn generic_write(
+        writer: &lance_context_core::GenericStore,
+        id: &str,
+        text: &str,
+    ) {
         writer
             .add(&[serde_json::json!({"id":id, "text":text})
                 .as_object()

@@ -130,8 +130,7 @@ async fn commit(
             shard.use_parallel_group_encoding();
         }
     }
-    let demand =
-        crate::demand_publish::CommittedMergeDemand::prepare_group(state, target, &group);
+    let demand = crate::demand_publish::CommittedMergeDemand::prepare_group(state, target, &group);
     let reclaimed = crate::demand_publish::CommittedMergeDemand::observe(demand, async {
         let reclaimed = match &mut store {
             Store::Rollout(store) => store.commit_prepared_group(group, cap).await,

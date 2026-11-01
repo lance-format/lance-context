@@ -130,7 +130,11 @@ static MERGED_PUBLISH_SLOTS: std::sync::LazyLock<Arc<Semaphore>> =
 
 #[cfg(test)]
 pub(crate) async fn hold_merged_publications_for_test() -> tokio::sync::OwnedSemaphorePermit {
-    MERGED_PUBLISH_SLOTS.clone().acquire_many_owned(4).await.unwrap()
+    MERGED_PUBLISH_SLOTS
+        .clone()
+        .acquire_many_owned(4)
+        .await
+        .unwrap()
 }
 
 /// Prepared metadata remains inert until the exact commit future acknowledges
@@ -214,7 +218,7 @@ impl CommittedMergeDemand {
         // Share the existing process-wide bound; never queue unbounded work.
         let Ok(permit) = MERGED_PUBLISH_SLOTS.clone().try_acquire_owned() else {
             metrics::counter!("master_demand_committed_watermarks_total", "result" => "dropped")
-            .increment(1);
+                .increment(1);
             return;
         };
         tokio::spawn(async move {
