@@ -21,6 +21,9 @@ async fn publisher_binding_timings_separate_control_admission_and_connection() -
     )
     .await?;
     let leader = c.leader().await?;
+    // Include a real follower redirect in the append's exchange counters.
+    let follower = *c.net.nodes.keys().find(|&&node| node != leader).unwrap();
+    c.client.leaders.lock().unwrap().insert(10, follower);
     let appended = c
         .client
         .request_routed(Request::Append {
@@ -32,6 +35,11 @@ async fn publisher_binding_timings_separate_control_admission_and_connection() -
     drop(appended);
     // Neither append nor another quorum query belongs to the binding counters.
     assert_eq!(producer(&c.client, leader, &batch(1)).await?, Some(index));
+    let append_before = c.client.append_timings();
+    for phase in append_before.values() {
+        assert!(phase.started >= 2);
+        assert_eq!(phase.finished, phase.started);
+    }
     for phase in c.client.publisher_binding_timings().values() {
         assert_eq!(phase.started, 0);
     }
@@ -87,9 +95,12 @@ async fn publisher_binding_timings_separate_control_admission_and_connection() -
         assert_eq!(phase.finished, 1);
     }
     assert!(observed["connection"].elapsed_micros >= 20_000);
-    for phase in c.client.append_timings().values() {
-        assert_eq!(phase.started, 1);
-        assert_eq!(phase.finished, 1);
+    for (name, phase) in c.client.append_timings() {
+        let before = &append_before[name];
+        assert_eq!(phase.started, before.started);
+        assert_eq!(phase.finished, before.finished);
+        assert_eq!(phase.elapsed_micros, before.elapsed_micros);
+        assert_eq!(phase.max_elapsed_micros, before.max_elapsed_micros);
     }
     c.shutdown().await
 }

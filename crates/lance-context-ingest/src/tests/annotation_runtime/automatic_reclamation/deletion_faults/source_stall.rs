@@ -18,9 +18,24 @@ async fn delayed_delete_allows_the_bounded_source_window_to_drain() -> Result<()
             resume: held,
         },
     )?;
+    let (listing_entered, listing_reached) = oneshot::channel();
+    let (listing_release, listing_held) = oneshot::channel();
+    faults.pause_listing(&path, None, listing_entered, listing_held)?;
     let (service, runtime) = owned(&c, &storage, &limits()).await?;
     let (stop, task) = run_owner(whole_page(runtime)?);
+    tokio::time::timeout(Duration::from_secs(30), listing_reached).await??;
+    // A slow initial LIST can span multiple collection slices before any
+    // DELETE starts. Exercise that ordering without depending on machine load.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while faults.collection_starts.lock().unwrap().len() < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
+    listing_release.send(()).unwrap();
     tokio::time::timeout(Duration::from_secs(30), reached).await??;
+    let collections_at_pause = faults.collection_starts.lock().unwrap().len();
+    assert!(collections_at_pause >= 2);
     let producer = producer(&service, 2).await?;
     let mut last = completed.index;
     let mut score = None;
@@ -57,9 +72,12 @@ async fn delayed_delete_allows_the_bounded_source_window_to_drain() -> Result<()
                 == 1,
             "pending DELETE was reissued"
         );
+        let collections_after_updates = faults.collection_starts.lock().unwrap().len();
         ensure!(
-            faults.collection_starts.lock().unwrap().len() == 1,
-            "started another page while the original DELETE was pending"
+            collections_after_updates == collections_at_pause,
+            "started another page while the original DELETE was pending: at_pause={}, after_updates={}",
+            collections_at_pause,
+            collections_after_updates
         );
         Ok::<_, anyhow::Error>(())
     }
