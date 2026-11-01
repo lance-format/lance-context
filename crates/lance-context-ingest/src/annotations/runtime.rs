@@ -296,8 +296,9 @@ impl Runtime {
 
     /// No detached tasks. Publication/protocol failures stop this owner and its
     /// read barriers. Restart reconciles durable plan/preparation/selection state.
-    /// Sealed DELETE failures retain one bounded page and pause publication while
-    /// keeping applied values readable. Only immutable DELETE requests are repeated;
+    /// An in-flight sealed DELETE retains one bounded page while publication
+    /// continues. Failed outcomes pause new publication until that sealed page
+    /// clears; applied values remain readable. Only immutable DELETE requests repeat;
     /// this loop never invents a request or blindly retries failed mutations.
     pub async fn run(mut self, shutdown: impl Future<Output = ()>) -> Result<()> {
         tokio::pin!(shutdown);
@@ -320,8 +321,10 @@ impl Publisher {
 
     async fn run(&mut self) -> Result<()> {
         let phases = self.service.shared.phases.clone();
+        let service = self.service.clone();
+        let mut reclamation = self.reclamation.take();
         loop {
-            if let Some(collector) = &mut self.reclamation {
+            if let Some(collector) = &mut reclamation {
                 let cleared = phases
                     .measure(
                         Phase::Collect,
@@ -337,7 +340,23 @@ impl Publisher {
                     continue;
                 }
             }
-            self.publish_next().await?;
+            if let Some(collector) = reclamation.as_mut().filter(|c| c.has_pending_delete()) {
+                // Only an already fenced immutable DELETE overlaps publication.
+                // Keep driving its original future even if preparation awaits
+                // workspace held by the charged deletion page. No detached tasks.
+                let publication = self.publish_next();
+                tokio::pin!(publication);
+                loop {
+                    tokio::select! {
+                        result = &mut publication => { result?; break; }
+                        _ = tokio::time::sleep(Duration::from_millis(5)), if collector.has_pending_delete() => {
+                            collector.poll_pending_delete(&service).await?;
+                        }
+                    }
+                }
+            } else {
+                self.publish_next().await?;
+            }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }

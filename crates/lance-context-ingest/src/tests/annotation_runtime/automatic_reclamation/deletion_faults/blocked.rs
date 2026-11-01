@@ -39,18 +39,27 @@ async fn failed_sealed_deletes_bound_publication_keep_acks_readable_and_resume()
     assert!(!abandoned[0].exists());
     assert!(abandoned[1].exists());
     let producer = producer(&service, 2).await?;
-    let suffix = request(
-        &service,
-        &producer,
-        1,
-        wire(&limits(), &["T"], 0, None, 1, Some(0.9))?,
-    )
-    .await?;
-    let suffix_result = service.submit(&suffix, Duration::from_secs(30)).await?;
+    // The first pending DELETE may have allowed the original ACK to publish
+    // before its failure became known. Fill the remaining bounded window, then
+    // prove repeated failed attempts cannot create any more data or metadata.
+    let remaining = 2 - service.source_observation().records;
+    assert!(remaining > 0);
+    let mut suffix_result = None;
+    for sequence in 1..=remaining as u64 {
+        let suffix = request(
+            &service,
+            &producer,
+            sequence,
+            wire(&limits(), &["T"], 0, None, 1, Some(0.9))?,
+        )
+        .await?;
+        suffix_result = Some(service.submit(&suffix, Duration::from_secs(30)).await?);
+    }
+    let suffix_result = suffix_result.unwrap();
     let waiting = request(
         &service,
         &producer,
-        2,
+        remaining as u64 + 1,
         wire(&limits(), &["T"], 0, None, 1, Some(0.8))?,
     )
     .await?;
