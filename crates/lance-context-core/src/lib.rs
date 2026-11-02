@@ -30,7 +30,9 @@ mod storage;
 mod store;
 mod store_base;
 mod wal_gc;
-pub use wal_gc::wal_collection_enabled;
+pub use wal_gc::{
+    discover_retired_wal_at_uri, discover_retired_wal_under_root, wal_collection_enabled,
+};
 pub mod wal_presence;
 mod wal_read_lifetime;
 mod wal_retirement;
