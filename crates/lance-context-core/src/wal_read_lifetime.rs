@@ -913,3 +913,7 @@ mod tests {
             .contains("expired before returning data"));
     }
 }
+
+#[cfg(test)]
+#[path = "wal_read_lifetime_azure_tests.rs"]
+mod azure_tests;
