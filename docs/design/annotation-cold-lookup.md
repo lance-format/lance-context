@@ -31,6 +31,28 @@ scanner buffers and Lance I/O workspace remain separate from staging charges;
 row limits and shared slices do not establish a total RSS bound. This change
 adds no WAL format, request identity, read barrier, or publication protocol.
 
+## Sharing registration lookups between requests
+
+`prepare_registration_lookup` captures a bounded ID-only lookup for callers
+that already have several admitted registration requests. The temporary result
+owns at most one lookup window, charges the caller's apply workspace, and holds
+one read-view permit. Admission returns `None` when the window or available
+budget cannot accommodate it; callers can continue ordinary ordered application.
+The helper does not wait for workspace or consume publication metadata reserves.
+
+Each original request is still applied separately with
+`register_committed_with_lookup`. Active and frozen values take precedence.
+Only explicitly queried keys from the same staging instance and exact base
+generation can skip a native query. A publication or a different staging instance
+invalidates the entire lookup; unqueried keys also use the ordinary query path.
+The captured base participates in local GC protection until the lookup is dropped.
+The result carries no applied cursor, request outcome, or permission to ACK.
+
+These helpers do not themselves add driver prefetch, change ingestion defaults,
+or establish an end-to-end throughput improvement. A driver integrating them
+must bound its admitted payload prefix, release it on cancellation, and continue
+to advance results and source progress one original request at a time.
+
 Query windows are independent of scanner vectors, which remain 128 rows. The
 original implementation used that vector size as the key-window size too: a
 2048-row cold mutation batch could issue 16 sequential Lance queries while
