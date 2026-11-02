@@ -433,6 +433,17 @@ pub struct RolloutStore {
     point_read_pause: std::sync::Mutex<Option<Arc<PointReadPause>>>,
     #[cfg(test)]
     observation_pause: std::sync::Mutex<Option<Arc<PointReadPause>>>,
+    #[cfg(test)]
+    selected_list_pause: std::sync::Mutex<Option<Arc<SelectedListPause>>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct SelectedListPause {
+    reached: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+    before_materialization: bool,
+    calls: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(test)]
@@ -553,6 +564,8 @@ impl RolloutStore {
             point_read_pause: Default::default(),
             #[cfg(test)]
             observation_pause: Default::default(),
+            #[cfg(test)]
+            selected_list_pause: Default::default(),
         })
     }
     /// URI of the underlying Lance dataset.
@@ -996,6 +1009,15 @@ impl RolloutStore {
         offset: Option<usize>,
         filters: Option<&RolloutFilters>,
     ) -> LanceResult<Vec<RolloutRecord>> {
+        #[cfg(test)]
+        let selected_pause = self.selected_list_pause.lock().unwrap().clone();
+        #[cfg(test)]
+        let first_attempt = selected_pause.as_ref().is_some_and(|pause| {
+            pause
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                == 0
+        });
         // Required decoder fields plus the exact-match filter columns. Text,
         // token arrays, JSON metadata and artifact bytes never enter this scan.
         let selection_columns = Arc::new(
@@ -1027,6 +1049,15 @@ impl RolloutStore {
                 let uri = self.flushed_generation_uri(snapshot.shard_id, &generation.path);
                 sources.push(self.open_flushed_dataset(&uri).await?);
             }
+        }
+
+        #[cfg(test)]
+        if let Some(pause) = selected_pause
+            .as_ref()
+            .filter(|pause| first_attempt && !pause.before_materialization)
+        {
+            pause.reached.notify_one();
+            pause.resume.notified().await;
         }
 
         let mut positions = HashMap::new();
@@ -1091,6 +1122,14 @@ impl RolloutStore {
             count += 1;
         }
         let mut results = vec![None; count];
+        #[cfg(test)]
+        if let Some(pause) = selected_pause
+            .as_ref()
+            .filter(|pause| first_attempt && pause.before_materialization)
+        {
+            pause.reached.notify_one();
+            pause.resume.notified().await;
+        }
         for (dataset, rows) in sources.iter().zip(per_source) {
             // Bound individual wide-row takes, including unbounded filtered
             // callers. Allocate from observed rows, never from a client limit.
@@ -3557,6 +3596,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn consistent_read_retries_wrapped_missing_payload_but_propagates_capture_failure() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = TempDir::new().unwrap();
+        let mut store = RolloutStore::open(dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let missing =
+            || LanceError::io_source(Box::new(LanceError::not_found("synthetic-generation")));
+        assert!(is_not_found_error(&missing()));
+        let attempts = AtomicUsize::new(0);
+        let rows = store
+            .base
+            .read_consistent(ListSource::All, |_, _| {
+                let first = attempts.fetch_add(1, Ordering::SeqCst) == 0;
+                async move {
+                    if first {
+                        Err(missing())
+                    } else {
+                        Ok(42)
+                    }
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows, 42);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+        // A metadata-capture error currently exits before the payload retry
+        // loop. The new diagnostics must identify this without changing it.
+        let captures = AtomicUsize::new(0);
+        attempts.store(0, Ordering::SeqCst);
+        let result = store
+            .base
+            .read_consistent_with_snapshots(
+                ListSource::All,
+                || {
+                    captures.fetch_add(1, Ordering::SeqCst);
+                    async { Err(missing()) }
+                },
+                |_, _| {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    async { Ok::<_, LanceError>(42) }
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(LanceError::IO { .. })));
+        assert_eq!(captures.load(Ordering::SeqCst), 1);
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn consistent_read_bounds_missing_generation_retries() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let dir = tempfile::tempdir().unwrap();
@@ -4190,6 +4281,8 @@ mod tests {
             point_read_pause: Default::default(),
             #[cfg(test)]
             observation_pause: Default::default(),
+            #[cfg(test)]
+            selected_list_pause: Default::default(),
             base: StorageBase::open(
                 &uri,
                 StorageBaseOptions {
@@ -4649,6 +4742,81 @@ mod tests {
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, "reclaimed");
+    }
+
+    #[tokio::test]
+    async fn selected_list_survives_reclamation_after_open_and_selection() {
+        for before_materialization in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let mut writer = RolloutStore::open(uri).await.unwrap();
+            let mut records = vec![
+                assistant_record("a"),
+                assistant_record("b"),
+                assistant_record("c"),
+            ];
+            // This column is excluded from selection and fetched for the page.
+            records[1].content = Some("page-payload".repeat(16_384));
+            writer.add(&records).await.unwrap();
+            writer.flush().await.unwrap();
+            let reader = Arc::new(RolloutStore::open(uri).await.unwrap());
+            let original_version = reader.version();
+            let snapshots = reader.wal_shard_snapshots().await.unwrap();
+            let mut paths = Vec::new();
+            for snapshot in &snapshots {
+                for generation in &snapshot.sstables {
+                    paths.push(reader.flushed_generation_uri(snapshot.shard_id, &generation.path));
+                }
+            }
+            assert_eq!(paths.len(), 1);
+            assert!(paths.iter().all(|path| std::path::Path::new(path).exists()));
+            let pause = Arc::new(SelectedListPause {
+                before_materialization,
+                ..Default::default()
+            });
+            *reader.selected_list_pause.lock().unwrap() = Some(pause.clone());
+            let reading = {
+                let reader = reader.clone();
+                tokio::spawn(async move {
+                    let filters = RolloutFilters {
+                        role: Some(ROLE_ASSISTANT.into()),
+                        ..Default::default()
+                    };
+                    reader
+                        .list_with_filters(Some(1), Some(1), Some(&filters))
+                        .await
+                })
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(30), pause.reached.notified())
+                .await
+                .unwrap();
+            assert!(!reading.is_finished());
+            assert_eq!(writer.cleanup_own_shard().await.unwrap(), 1);
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                while paths.iter().any(|path| std::path::Path::new(path).exists()) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(flushed_generation_count(&writer).await, 0);
+            pause.resume.notify_one();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(30), reading)
+                .await
+                .unwrap()
+                .unwrap();
+            eprintln!(
+                "before_materialization={before_materialization} attempts={} error={:?}",
+                pause.calls.load(std::sync::atomic::Ordering::SeqCst),
+                result.as_ref().err()
+            );
+            let rows = result.expect("a committed row must survive concurrent WAL reclamation");
+            assert_eq!(pause.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+            assert_eq!(rows.len(), 1);
+            assert_records_eq(&rows[0], &records[1]);
+            assert_eq!(reader.version(), original_version);
+            writer.close().await.unwrap();
+        }
     }
 
     #[tokio::test]
