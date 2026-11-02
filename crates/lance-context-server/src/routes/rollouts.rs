@@ -508,6 +508,59 @@ pub struct RolloutListParams {
 
 const LIST_READ_STAGES: [&str; 4] = ["resolve_store", "store_lock", "list_records", "record_dto"];
 
+fn list_read_error_category(error: &lance_context_core::LanceError) -> &'static str {
+    use lance_context_core::LanceError;
+    match error {
+        LanceError::DatasetNotFound { .. } => "dataset_not_found",
+        LanceError::NotFound { .. } => "not_found",
+        LanceError::InvalidInput { .. } | LanceError::SchemaMismatch { .. } => "invalid_request",
+        LanceError::IO { .. } => "storage_io",
+        LanceError::Execution { .. } => "execution",
+        LanceError::Internal { .. } => "internal",
+        LanceError::Wrapped { .. } => "wrapped",
+        LanceError::Cloned { .. } => "cloned",
+        LanceError::Timeout { .. } => "timeout",
+        LanceError::Arrow { .. } => "arrow",
+        LanceError::Schema { .. } => "schema",
+        LanceError::Index { .. } => "index",
+        LanceError::IndexNotFound { .. } => "index_not_found",
+        LanceError::CorruptFile { .. } => "corrupt_file",
+        LanceError::PrerequisiteFailed { .. } => "prerequisite_failed",
+        _ => "other_lance",
+    }
+}
+
+/// Inspect typed causes only. Never format errors, which may contain records,
+/// filters, storage URLs or credentials. Bound traversal even for cyclic sources.
+fn list_read_error_source(error: &lance_context_core::LanceError) -> (&'static str, bool) {
+    use std::error::Error;
+    let mut source = error.source();
+    let mut category = if source.is_some() {
+        "unclassified"
+    } else {
+        "none"
+    };
+    for _ in 0..8 {
+        let Some(current) = source else {
+            return (category, false);
+        };
+        if let Some(lance) = current.downcast_ref::<lance_context_core::LanceError>() {
+            category = list_read_error_category(lance);
+        } else if let Some(io) = current.downcast_ref::<std::io::Error>() {
+            category = match io.kind() {
+                std::io::ErrorKind::NotFound => "io_not_found",
+                std::io::ErrorKind::TimedOut => "io_timeout",
+                std::io::ErrorKind::ConnectionReset => "io_connection_reset",
+                std::io::ErrorKind::ConnectionAborted => "io_connection_aborted",
+                std::io::ErrorKind::Interrupted => "io_interrupted",
+                _ => "io_other",
+            };
+        }
+        source = current.source();
+    }
+    (category, source.is_some())
+}
+
 /// Handler work only: excludes JSON serialization and response-body transfer.
 /// Drop also reports interrupted requests without retaining records or filters.
 struct ListReadTrace<'a> {
@@ -520,6 +573,8 @@ struct ListReadTrace<'a> {
     stage: usize,
     elapsed: [std::time::Duration; 4],
     error_category: Option<&'static str>,
+    error_source_category: &'static str,
+    error_source_truncated: bool,
     rows: Option<usize>,
 }
 
@@ -536,6 +591,8 @@ impl<'a> ListReadTrace<'a> {
             stage: 0,
             elapsed: [std::time::Duration::ZERO; 4],
             error_category: None,
+            error_source_category: "none",
+            error_source_truncated: false,
             rows: None,
         }
     }
@@ -559,18 +616,8 @@ impl<'a> ListReadTrace<'a> {
     }
 
     fn list_error(&mut self, error: &lance_context_core::LanceError) {
-        use lance_context_core::LanceError;
-        self.error_category = Some(match error {
-            LanceError::DatasetNotFound { .. } => "dataset_not_found",
-            LanceError::NotFound { .. } => "not_found",
-            LanceError::InvalidInput { .. } | LanceError::SchemaMismatch { .. } => {
-                "invalid_request"
-            }
-            LanceError::IO { .. } => "storage_io",
-            LanceError::Execution { .. } => "execution",
-            LanceError::Internal { .. } => "internal",
-            _ => "other_lance",
-        });
+        self.error_category = Some(list_read_error_category(error));
+        (self.error_source_category, self.error_source_truncated) = list_read_error_source(error);
     }
 }
 
@@ -608,6 +655,8 @@ impl Drop for ListReadTrace<'_> {
                 outcome,
                 phase = LIST_READ_STAGES.get(self.stage).copied().unwrap_or("complete"),
                 error_category = self.error_category.unwrap_or("none"),
+                error_source_category = self.error_source_category,
+                error_source_truncated = self.error_source_truncated,
                 rows = ?self.rows,
                 handler_ms = total.as_millis() as u64,
                 resolve_store_ms = self.elapsed[0].as_millis() as u64,
@@ -2131,6 +2180,53 @@ mod tests {
         assert!(listed.stores.is_empty());
     }
 
+    #[test]
+    fn list_rollouts_diagnostics_classify_typed_sources_without_formatting() {
+        use lance_context_core::LanceError;
+        use std::{
+            error::Error,
+            fmt, io,
+            sync::atomic::{AtomicUsize, Ordering},
+        };
+
+        let nested = LanceError::wrapped(Box::new(LanceError::wrapped(Box::new(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "private-storage-url",
+        )))));
+        assert_eq!(list_read_error_category(&nested), "wrapped");
+        assert_eq!(list_read_error_source(&nested), ("io_timeout", false));
+        let cloned = LanceError::cloned("private-message-not-found");
+        assert_eq!(list_read_error_category(&cloned), "cloned");
+        // A message is not structured evidence of a source or error kind.
+        assert_eq!(list_read_error_source(&cloned), ("none", false));
+
+        #[derive(Debug)]
+        struct Cycle(AtomicUsize);
+        impl fmt::Display for Cycle {
+            fn fmt(&self, _: &mut fmt::Formatter<'_>) -> fmt::Result {
+                panic!("diagnostics must not format source errors")
+            }
+        }
+        impl Error for Cycle {
+            fn source(&self) -> Option<&(dyn Error + 'static)> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Some(self)
+            }
+        }
+        let cycle = LanceError::wrapped(Box::new(Cycle(AtomicUsize::new(0))));
+        assert_eq!(list_read_error_source(&cycle), ("unclassified", true));
+        assert_eq!(
+            cycle
+                .source()
+                .unwrap()
+                .downcast_ref::<Cycle>()
+                .unwrap()
+                .0
+                .load(Ordering::Relaxed),
+            8
+        );
+    }
+
     #[tokio::test]
     async fn list_rollouts_diagnostics_attribute_lock_wait_and_cancellation_without_data() {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
@@ -2241,12 +2337,20 @@ mod tests {
         error.list_error(&lance_context_core::LanceError::io("private-error-payload"));
         drop(error);
 
+        let mut wrapped = ListReadTrace::new(&name, &params());
+        wrapped.advance();
+        wrapped.advance();
+        wrapped.list_error(&lance_context_core::LanceError::wrapped(Box::new(
+            io::Error::new(io::ErrorKind::TimedOut, "private-source-payload"),
+        )));
+        drop(wrapped);
+
         let output = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
         let diagnostics: Vec<_> = output
             .lines()
             .filter(|line| line.contains("rollout records list handler diagnostic"))
             .collect();
-        assert_eq!(diagnostics.len(), 3, "{output}");
+        assert_eq!(diagnostics.len(), 4, "{output}");
         assert!(
             diagnostics[0].contains("outcome=\"success\"")
                 && diagnostics[0].contains("phase=\"complete\""),
@@ -2260,6 +2364,12 @@ mod tests {
         assert!(
             diagnostics[2].contains("error_category=\"storage_io\"")
                 && diagnostics[2].contains("phase=\"list_records\""),
+            "{output}"
+        );
+        assert!(
+            diagnostics[3].contains("error_category=\"wrapped\"")
+                && diagnostics[3].contains("error_source_category=\"io_timeout\"")
+                && diagnostics[3].contains("error_source_truncated=false"),
             "{output}"
         );
         for line in diagnostics {
