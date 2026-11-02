@@ -38,6 +38,7 @@ struct Publisher {
     batch_started: Option<tokio::time::Instant>,
     compaction_started: Option<tokio::time::Instant>,
     compaction_checked_version: Option<u64>,
+    maintenance_deferred_for_pressure: bool,
     reclamation: Option<reclamation::Collector>,
 }
 
@@ -230,6 +231,7 @@ impl Runtime {
             batch_started: None,
             compaction_started: None,
             compaction_checked_version: None,
+            maintenance_deferred_for_pressure: false,
             reclamation: None,
         };
         let mut view = publisher.catalog.state().await?;

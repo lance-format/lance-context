@@ -27,6 +27,14 @@ waiting uploads cannot consume its workspace. There is at most one publishing
 generation. Further source/value pressure pauses application rather than creating
 additional frozen generations or acknowledging an unapplied mutation.
 
+When application is backpressured and a source batch can publish, the owner may
+defer one new eligible maintenance turn to release source/staging capacity. That
+deferral survives data publications within the owner: the next eligible index or
+compaction operation must run even under continued pressure. Completing maintenance
+or finding no candidate clears the deferral. An already recorded maintenance plan
+always resolves first. This scheduling hint is local to the owner; it changes no
+durable publication, recovery or memory-budget contract.
+
 Startup handles the durable states explicitly:
 
 - **Plan without preparation:** replay only to the original cut, freeze exactly
