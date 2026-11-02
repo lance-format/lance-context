@@ -785,7 +785,9 @@ pub(super) struct Receiver {
     descriptor: Descriptor,
     layout: Arc<Layout>,
     limits: Limits,
-    writers: [Writer; 2],
+    writers: [BufWriter<File>; 2],
+    written: [u64; 2],
+    failed: bool,
 }
 impl Receiver {
     pub fn new(
@@ -803,48 +805,73 @@ impl Receiver {
         );
         descriptor.id = local_id;
         let paths = descriptor.paths(directory);
-        let writers = [
-            Writer::new(&paths[0], descriptor.metadata_bytes)?,
-            Writer::new(&paths[1], descriptor.payload_bytes)?,
-        ];
+        let create = |path: &Path| -> std::io::Result<BufWriter<File>> {
+            Ok(BufWriter::new(
+                OpenOptions::new().create_new(true).write(true).open(path)?,
+            ))
+        };
+        let writers = [create(&paths[0])?, create(&paths[1])?];
         Ok(Self {
             directory: directory.to_path_buf(),
             descriptor,
             layout,
             limits,
             writers,
+            written: [0; 2],
+            failed: false,
         })
     }
 
     pub fn write(&mut self, part: Part, offset: u64, bytes: &[u8]) -> Result<()> {
         ensure!(
+            !self.failed,
+            "image receiver failed; abandon this candidate"
+        );
+        ensure!(
             !bytes.is_empty() && bytes.len() <= CHUNK_BYTES,
             "invalid received image chunk size"
         );
-        let writer = &mut self.writers[part.slot()];
-        ensure!(offset == writer.bytes, "noncontiguous received image chunk");
-        writer.write_all(bytes)?;
+        let slot = part.slot();
+        ensure!(
+            offset == self.written[slot],
+            "noncontiguous received image chunk"
+        );
+        let limit = match part {
+            Part::Metadata => self.descriptor.metadata_bytes,
+            Part::Payload => self.descriptor.payload_bytes,
+        };
+        ensure!(
+            offset
+                .checked_add(bytes.len() as u64)
+                .is_some_and(|end| end <= limit),
+            "received image file exceeds bound"
+        );
+        if let Err(error) = self.writers[slot].write_all(bytes) {
+            self.failed = true;
+            return Err(error.into());
+        }
+        self.written[slot] += bytes.len() as u64;
         Ok(())
     }
 
     pub fn finish(self) -> Result<Loaded> {
+        ensure!(
+            !self.failed,
+            "image receiver failed; abandon this candidate"
+        );
         let expected = [
-            (
-                self.descriptor.metadata_bytes,
-                self.descriptor.metadata_digest,
-            ),
-            (
-                self.descriptor.payload_bytes,
-                self.descriptor.payload_digest,
-            ),
+            self.descriptor.metadata_bytes,
+            self.descriptor.payload_bytes,
         ];
-        for (writer, expected) in self.writers.into_iter().zip(expected) {
-            ensure!(
-                writer.finish()? == expected,
-                "incomplete or corrupt received image"
-            );
+        ensure!(self.written == expected, "incomplete received image");
+        for mut writer in self.writers {
+            writer.flush()?;
+            writer.get_ref().sync_all()?;
         }
         File::open(&self.directory)?.sync_all()?;
+        // Validate the persisted files once before they become installable.
+        // load checks lengths, both file digests, every record digest and the
+        // metadata binding; hashing the incoming stream repeats that work.
         load(
             &self.directory,
             &self.descriptor.snapshot()?,

@@ -157,12 +157,76 @@ fn received_images_reject_partial_corrupt_and_out_of_order_bytes() -> Result<()>
         "wrong payload hash became installable"
     );
     let mut good = receive(114)?;
+    let oversized = vec![0; built.image.bytes(Part::Payload) as usize + 1];
+    assert!(oversized.len() <= CHUNK_BYTES);
+    assert!(good.write(Part::Payload, 0, &oversized).is_err());
     copy(&built.image, &mut good)?;
     assert_eq!(good.finish()?.state, built.state);
     assert!(
         receive(114).is_err(),
         "interrupted or existing files overwritten"
     );
+    Ok(())
+}
+
+#[test]
+fn received_images_check_both_file_digests_before_installation() -> Result<()> {
+    let source = tempfile::tempdir()?;
+    let target = tempfile::tempdir()?;
+    let built = create(source.path(), 151)?;
+    for (slot, part) in [Part::Metadata, Part::Payload].into_iter().enumerate() {
+        let mut descriptor = built.image.descriptor.clone();
+        match part {
+            Part::Metadata => descriptor.metadata_digest[0] ^= 1,
+            Part::Payload => descriptor.payload_digest[0] ^= 1,
+        }
+        let mut receiver = Receiver::new(
+            target.path(),
+            &descriptor.snapshot()?,
+            layout(),
+            Limits::default(),
+            10,
+            Uuid::from_u128(152 + slot as u128),
+        )?;
+        copy(&built.image, &mut receiver)?;
+        assert!(
+            receiver.finish().is_err(),
+            "image with a mismatched {part:?} digest became installable"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn received_image_write_failure_requires_abandoning_the_candidate() -> Result<()> {
+    let source = tempfile::tempdir()?;
+    let target = tempfile::tempdir()?;
+    let built = create(source.path(), 161)?;
+    let mut receiver = Receiver::new(
+        target.path(),
+        &built.image.snapshot()?,
+        layout(),
+        Limits::default(),
+        10,
+        Uuid::from_u128(162),
+    )?;
+    let metadata = built.image.chunk(
+        Part::Metadata,
+        0,
+        built.image.bytes(Part::Metadata) as usize,
+    )?;
+    receiver.write(Part::Metadata, 0, &metadata)?;
+    let payload = built
+        .image
+        .chunk(Part::Payload, 0, built.image.bytes(Part::Payload) as usize)?;
+    let pack = receiver.descriptor.paths(target.path())[1].clone();
+    // A read-only descriptor forces a real write error without changing process
+    // limits or filesystem permissions. No buffering may defer the error.
+    receiver.writers[1] = BufWriter::with_capacity(0, File::open(&pack)?);
+    assert!(receiver.write(Part::Payload, 0, &payload).is_err());
+    receiver.writers[1] = BufWriter::new(OpenOptions::new().write(true).open(&pack)?);
+    assert!(receiver.write(Part::Payload, 0, &payload).is_err());
+    assert!(receiver.finish().is_err());
     Ok(())
 }
 
