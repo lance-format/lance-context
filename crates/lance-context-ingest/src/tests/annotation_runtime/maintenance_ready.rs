@@ -2,6 +2,7 @@ use super::*;
 use lance::index::DatasetIndexExt;
 use std::collections::BTreeSet;
 
+mod pressure;
 mod status_batching;
 
 async fn apply(
