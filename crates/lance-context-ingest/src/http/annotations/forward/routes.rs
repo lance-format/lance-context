@@ -38,11 +38,21 @@ impl Routes {
             let mut contract = ingress.scope.contract.clone();
             contract.schema = a.scope.contract.schema;
             ensure!(
-                ingress.scope.cluster == a.scope.cluster && ingress.scope.layout == a.scope.layout
+                ingress.layout.buckets.len() == a.layout.buckets.len()
                     && contract == a.scope.contract
                     && Shard::same_wire_family(&ingress.schema, &a.schema)
                     && Arc::ptr_eq(&ingress.budget, &a.budget),
-                "annotation routes require the same layout, wire contract and shared ingress budget"
+                "annotation routes require the same bucket count, wire contract and shared ingress budget"
+            );
+            // Key routing depends on the logical contract and bucket count,
+            // not cluster placement. Keep each cluster's immutable layout and
+            // every producer's complete scope; this does not migrate a shard.
+            ensure!(
+                self.owners.values().all(|route| {
+                    route.ingress.scope.cluster != ingress.scope.cluster
+                        || route.ingress.scope.layout == ingress.scope.layout
+                }),
+                "conflicting layouts within annotation cluster"
             );
             ensure!(
                 self.owners
