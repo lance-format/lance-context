@@ -1,6 +1,7 @@
 use super::*;
 use crate::tests::{annotation_shards::Physical, mixed_annotations as fixture};
 mod application;
+mod clusters;
 mod status_filter;
 
 async fn routes(
