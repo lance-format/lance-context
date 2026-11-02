@@ -885,6 +885,12 @@ impl RolloutStore {
         self.base.pending_wal_generations().await
     }
 
+    /// Admit durable WAL retirement discovery to the bounded background collector.
+    /// This may wait for capacity and must not run inside read/pending probes.
+    pub async fn discover_retired_wal(&self) -> LanceResult<()> {
+        self.base.discover_retired_wal().await
+    }
+
     /// Total and largest per-shard pending counts from one manifest pass.
     pub async fn pending_wal_generation_counts(&self) -> LanceResult<(usize, usize)> {
         self.base.pending_wal_generation_counts().await
@@ -1538,31 +1544,40 @@ impl RolloutStore {
     pub async fn query_sql(&self, sql: &str) -> LanceResult<SqlQueryResult> {
         ensure_select_only(sql)?;
 
-        // Materialize the merged (base ∪ WAL) non-blob rows, bounded.
-        let shard_snapshots = self.wal_shard_snapshots().await?;
-        let columns = self.non_blob_columns();
-        let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
-        let scanner = self
-            .lsm_scanner_for_source(ListSource::All, shard_snapshots)
-            .project(&refs)?;
-        let mut stream = scanner.try_into_stream().await?;
+        let (batches, table_schema) = self
+            .base
+            .read_consistent(ListSource::All, |dataset, shard_snapshots| async move {
+                // Materialize the merged (base ∪ WAL) non-blob rows, bounded.
+                let columns = self.non_blob_columns();
+                let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+                let scanner = StorageBase::lsm_scanner_for_dataset(
+                    &dataset,
+                    "id",
+                    ListSource::All,
+                    shard_snapshots,
+                )
+                .project(&refs)?;
+                let mut stream = scanner.try_into_stream().await?;
 
-        let mut batches: Vec<RecordBatch> = Vec::new();
-        let mut scanned_rows = 0usize;
-        let mut table_schema: Option<Arc<Schema>> = None;
-        while let Some(batch) = stream.try_next().await? {
-            if table_schema.is_none() {
-                table_schema = Some(batch.schema());
-            }
-            scanned_rows += batch.num_rows();
-            if scanned_rows > SQL_MAX_SCAN_ROWS {
-                return Err(LanceError::invalid_input(format!(
+                let mut batches: Vec<RecordBatch> = Vec::new();
+                let mut scanned_rows = 0usize;
+                let mut table_schema: Option<Arc<Schema>> = None;
+                while let Some(batch) = stream.try_next().await? {
+                    if table_schema.is_none() {
+                        table_schema = Some(batch.schema());
+                    }
+                    scanned_rows += batch.num_rows();
+                    if scanned_rows > SQL_MAX_SCAN_ROWS {
+                        return Err(LanceError::invalid_input(format!(
                     "experiment has more than {SQL_MAX_SCAN_ROWS} rows, which is too large \
                      for ad-hoc SQL; use the record browser filters instead"
                 )));
-            }
-            batches.push(batch);
-        }
+                    }
+                    batches.push(batch);
+                }
+                Ok((batches, table_schema))
+            })
+            .await?;
 
         // Empty experiment: fall back to the projected dataset schema so
         // `SELECT`s still resolve column names against an empty `records` table.
@@ -1871,65 +1886,69 @@ impl RolloutStore {
             }
         }
 
-        // Base miss: fall back to the flushed generations. Open them with
-        // bounded concurrency and take the first hit; tolerate a generation that
-        // was concurrently merged away (NotFound) instead of failing the request.
-        let snapshots = self.wal_shard_snapshots().await?;
-        let uris: Vec<String> = snapshots
-            .iter()
-            .flat_map(|snapshot| {
-                snapshot.sstables.iter().map(|generation| {
-                    self.flushed_generation_uri(snapshot.shard_id, &generation.path)
-                })
-            })
-            .collect();
+        self.base
+            .protect_wal_read(ListSource::All, async {
+                // Base miss: fall back to the flushed generations. Open them with
+                // bounded concurrency and take the first hit; tolerate a generation that
+                // was concurrently merged away (NotFound) instead of failing the request.
+                let snapshots = self.wal_shard_snapshots().await?;
+                let uris: Vec<String> = snapshots
+                    .iter()
+                    .flat_map(|snapshot| {
+                        snapshot.sstables.iter().map(|generation| {
+                            self.flushed_generation_uri(snapshot.shard_id, &generation.path)
+                        })
+                    })
+                    .collect();
 
-        let mut hits = stream::iter(uris)
-            .map(|uri| async move {
-                match self.open_flushed_dataset(&uri).await {
-                    Ok(dataset) => {
-                        #[cfg(test)]
-                        {
-                            let pause = self.blob_read_pause.lock().unwrap().take();
-                            if let Some(pause) = pause {
-                                pause.opened.notify_one();
-                                pause.resume.notified().await;
+                let mut hits = stream::iter(uris)
+                    .map(|uri| async move {
+                        match self.open_flushed_dataset(&uri).await {
+                            Ok(dataset) => {
+                                #[cfg(test)]
+                                {
+                                    let pause = self.blob_read_pause.lock().unwrap().take();
+                                    if let Some(pause) = pause {
+                                        pause.opened.notify_one();
+                                        pause.resume.notified().await;
+                                    }
+                                }
+                                Self::get_blob_from_dataset(&dataset, id).await
                             }
+                            // A generation drained + deleted by a concurrent merge
+                            // between snapshot and open: its rows are in a committed
+                            // base version, covered by the final base check below.
+                            Err(err) if is_not_found_error(&err) => Ok(None),
+                            Err(err) => Err(err),
                         }
-                        Self::get_blob_from_dataset(&dataset, id).await
+                    })
+                    .buffer_unordered(DEFAULT_OBSERVE_CONCURRENCY);
+
+                while let Some(result) = hits.next().await {
+                    if let Some(payload) = result? {
+                        // Outer Some = row found in this generation; inner is
+                        // payload-or-null. Return the inner value directly.
+                        return Ok(payload);
                     }
-                    // A generation drained + deleted by a concurrent merge
-                    // between snapshot and open: its rows are in a committed
-                    // base version, covered by the final base check below.
-                    Err(err) if is_not_found_error(&err) => Ok(None),
-                    Err(err) => Err(err),
                 }
+
+                if !self.base.is_version_pinned() {
+                    let checked_version = latest.manifest.version;
+                    latest.checkout_latest().await?;
+                    if latest.manifest.version != checked_version {
+                        // Any generation already drained during the completed WAL
+                        // scan was committed before this checkout. A final base check
+                        // therefore covers it without an exclusive resident refresh or
+                        // waiting for merging to stop. Concurrent newer appends need
+                        // not be part of this read's captured view.
+                        return Self::get_blob_from_dataset(&latest, id)
+                            .await
+                            .map(Option::flatten);
+                    }
+                }
+                Ok(None)
             })
-            .buffer_unordered(DEFAULT_OBSERVE_CONCURRENCY);
-
-        while let Some(result) = hits.next().await {
-            if let Some(payload) = result? {
-                // Outer Some = row found in this generation; inner is
-                // payload-or-null. Return the inner value directly.
-                return Ok(payload);
-            }
-        }
-
-        if !self.base.is_version_pinned() {
-            let checked_version = latest.manifest.version;
-            latest.checkout_latest().await?;
-            if latest.manifest.version != checked_version {
-                // Any generation already drained during the completed WAL
-                // scan was committed before this checkout. A final base check
-                // therefore covers it without an exclusive resident refresh or
-                // waiting for merging to stop. Concurrent newer appends need
-                // not be part of this read's captured view.
-                return Self::get_blob_from_dataset(&latest, id)
-                    .await
-                    .map(Option::flatten);
-            }
-        }
-        Ok(None)
+            .await
     }
 
     /// Locate `id` without projecting payload bytes, then take only the
@@ -2669,6 +2688,164 @@ fn optional_i8_list(array: Option<&ListArray>, row: usize) -> LanceResult<Option
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn wal_lifetime_registration_failure_is_not_an_absent_blob() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let writer = RolloutStore::open(uri).await.unwrap();
+        writer
+            .add(&[artifact_record("protected", b"protected-payload")])
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        let reader = RolloutStore::open(uri).await.unwrap();
+        std::fs::write(dir.path().join("_wal_readers_v1"), b"unavailable").unwrap();
+        assert!(reader.get_blob("protected").await.is_err());
+        assert!(reader.query_sql("SELECT id FROM records").await.is_err());
+        assert!(matches!(
+            reader.query_sql("DELETE FROM records").await,
+            Err(LanceError::InvalidInput { .. })
+        ));
+        assert_eq!(reader.pending_wal_generations().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn wal_lifetime_covers_sql_and_blob_reads() {
+        for blob in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let mut writer = RolloutStore::open(uri).await.unwrap();
+            writer
+                .add(&[artifact_record("protected", b"protected-payload")])
+                .await
+                .unwrap();
+            writer.flush().await.unwrap();
+            let reader = RolloutStore::open(uri).await.unwrap();
+            let read = async {
+                if blob {
+                    Ok(reader.get_blob("protected").await?.as_deref()
+                        == Some(b"protected-payload".as_slice()))
+                } else {
+                    let result = reader.query_sql("SELECT id FROM records").await?;
+                    Ok(result.rows == vec![vec![serde_json::json!("protected")]])
+                }
+            };
+            assert!(
+                crate::wal_read_lifetime::assert_read_survives_merge(
+                    &reader.base,
+                    &mut writer.base,
+                    read,
+                )
+                .await
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn wal_snapshot_after_drain_sql_and_blob_reads() {
+        for blob in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let mut writer = RolloutStore::open(uri).await.unwrap();
+            writer
+                .add(&[artifact_record("protected", b"protected-payload")])
+                .await
+                .unwrap();
+            writer.flush().await.unwrap();
+            let reader = RolloutStore::open(uri).await.unwrap();
+            let read = async {
+                if blob {
+                    Ok(reader.get_blob("protected").await?.as_deref()
+                        == Some(b"protected-payload".as_slice()))
+                } else {
+                    let result = reader.query_sql("SELECT id FROM records").await?;
+                    Ok(result.rows == vec![vec![serde_json::json!("protected")]])
+                }
+            };
+            assert!(
+                crate::wal_read_lifetime::assert_read_after_merge(
+                    &reader.base,
+                    &mut writer.base,
+                    read,
+                )
+                .await
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cold_reopen_lifecycle_discovers_retirement_with_zero_pending() {
+        use object_store::ObjectStoreExt;
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut original = RolloutStore::open(uri).await.unwrap();
+        let store = original.base.dataset.object_store(None).await.unwrap();
+        let root = original.base.dataset.branch_location().path.clone();
+        let shard = uuid::Uuid::new_v4();
+        let manifests =
+            lance::dataset::mem_wal::ShardManifestStore::new(store.clone(), &root, shard, 16);
+        manifests
+            .initialize_shard(0, Default::default())
+            .await
+            .unwrap();
+        manifests
+            .commit_update(0, |current| {
+                let mut next = current.clone();
+                next.version += 1;
+                next.current_generation = 2;
+                next
+            })
+            .await
+            .unwrap();
+        let keys = crate::wal_retirement::record(
+            store.clone(),
+            &root,
+            shard,
+            vec![crate::rollout_append::Generation {
+                number: 1,
+                path: "abcdef12_gen_1".into(),
+            }],
+        )
+        .await
+        .unwrap();
+        let payload = root
+            .clone()
+            .join("_mem_wal")
+            .join(shard.to_string())
+            .join("abcdef12_gen_1")
+            .join("data")
+            .join("payload");
+        store.put(&payload, b"retired").await.unwrap();
+        original.close().await.unwrap();
+        drop(original);
+        let mut reopened = RolloutStore::open_existing_with_options(uri, Default::default())
+            .await
+            .unwrap();
+        assert_eq!(reopened.pending_wal_generations().await.unwrap(), 0);
+        assert!(store.inner.head(&keys[0]).await.is_ok());
+        assert!(store.inner.head(&payload).await.is_ok());
+        reopened.discover_retired_wal().await.unwrap();
+        assert!(store.inner.head(&payload).await.is_ok());
+        reopened.base.wal_collection = crate::wal_gc::Mode::Collect;
+        reopened.discover_retired_wal().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match store.inner.head(&keys[0]).await {
+                    Err(object_store::Error::NotFound { .. }) => break,
+                    Ok(_) => tokio::time::sleep(std::time::Duration::from_millis(5)).await,
+                    Err(error) => panic!("retirement observation failed: {error}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            store.inner.head(&payload).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+        reopened.close().await.unwrap();
+    }
     use super::*;
 
     use std::collections::HashSet;
@@ -4737,9 +4914,11 @@ mod tests {
             .unwrap();
         writer.add(&[assistant_record("reclaimed")]).await.unwrap();
         writer.flush().await.unwrap();
-        let reader = RolloutStore::open(dir.path().to_str().unwrap())
+        writer.base.wal_collection = crate::wal_gc::Mode::Collect;
+        let mut reader = RolloutStore::open(dir.path().to_str().unwrap())
             .await
             .unwrap();
+        reader.base.wal_read_protection = false; // Historical unregistered reader.
         let writer = tokio::sync::Mutex::new(&mut writer);
         let attempts = std::sync::atomic::AtomicUsize::new(0);
         let rows = reader
@@ -4750,7 +4929,28 @@ mod tests {
                 let attempts = &attempts;
                 async move {
                     if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                        let paths: Vec<_> = snapshots
+                            .iter()
+                            .flat_map(|snapshot| {
+                                snapshot.sstables.iter().map(|generation| {
+                                    reader
+                                        .flushed_generation_uri(snapshot.shard_id, &generation.path)
+                                })
+                            })
+                            .collect();
+                        assert_eq!(paths.len(), 1);
                         writer.lock().await.cleanup_own_shard().await.unwrap();
+                        // Merge completion publishes the base and drains the
+                        // manifest; durable physical reclamation runs later.
+                        // Force the stale-snapshot read after that deletion so
+                        // this regression actually exercises the retry path.
+                        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                            while paths.iter().any(|path| std::path::Path::new(path).exists()) {
+                                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                            }
+                        })
+                        .await
+                        .unwrap();
                     }
                     reader
                         .list_selected_snapshot(dataset, snapshots, Some(1), None, None)
@@ -4765,11 +4965,270 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn selected_list_upgrade_retains_old_reader_then_collects_after_cold_reopen() {
+        for grouped in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let mut writer = RolloutStore::open_with_options(
+                uri,
+                RolloutStoreOptions {
+                    shard_id: Some("upgrade-reader".into()),
+                    merge_after_generations: Some(0),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(writer.base.wal_collection, crate::wal_gc::Mode::Retain);
+            writer.add(&[assistant_record("old-reader")]).await.unwrap();
+            writer.flush().await.unwrap();
+            let mut reader = RolloutStore::open(uri).await.unwrap();
+            // Model a still-running old binary. Retain must not depend on a
+            // registration from this reader, or on its request duration.
+            reader.base.wal_read_protection = false;
+            let reader = Arc::new(reader);
+            let pause = Arc::new(SelectedListPause {
+                before_materialization: true,
+                ..Default::default()
+            });
+            *reader.selected_list_pause.lock().unwrap() = Some(pause.clone());
+            let reading = {
+                let reader = reader.clone();
+                tokio::spawn(async move {
+                    reader
+                        .list_with_filters(
+                            Some(4),
+                            None,
+                            Some(&RolloutFilters {
+                                role: Some(ROLE_ASSISTANT.into()),
+                                ..Default::default()
+                            }),
+                        )
+                        .await
+                })
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(30), pause.reached.notified())
+                .await
+                .unwrap();
+            let paths: Vec<_> = writer
+                .wal_shard_snapshots()
+                .await
+                .unwrap()
+                .into_iter()
+                .flat_map(|snapshot| {
+                    snapshot
+                        .sstables
+                        .into_iter()
+                        .map(move |generation| (snapshot.shard_id, generation.path))
+                })
+                .map(|(shard, path)| writer.flushed_generation_uri(shard, &path))
+                .collect();
+            assert_eq!(paths.len(), 1);
+            if grouped {
+                let mut coordinator = crate::rollout_append::AppendCoordinator::open(uri, None)
+                    .await
+                    .unwrap();
+                assert_eq!(coordinator.wal_collection, crate::wal_gc::Mode::Retain);
+                let (plans, _) = coordinator
+                    .plan(&["upgrade-reader".into()], 64, 8 * 1024 * 1024)
+                    .await
+                    .unwrap();
+                assert_eq!(plans.len(), 1);
+                let staged = crate::rollout_append::stage(
+                    uri,
+                    plans.into_iter().next().unwrap(),
+                    crate::MergeMemoryBudget::new(32 * 1024 * 1024),
+                    None,
+                )
+                .await
+                .unwrap();
+                assert_eq!(coordinator.commit(vec![staged]).await.unwrap(), 1);
+            } else {
+                assert_eq!(writer.cleanup_own_shard().await.unwrap(), 1);
+            }
+            assert_eq!(flushed_generation_count(&writer).await, 0);
+            writer.discover_retired_wal().await.unwrap();
+            writer.close().await.unwrap();
+            drop(writer);
+            let mut reopened = RolloutStore::open_existing_with_options(uri, Default::default())
+                .await
+                .unwrap();
+            reopened.discover_retired_wal().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            assert!(paths.iter().all(|path| std::path::Path::new(path).exists()));
+            assert!(!reading.is_finished());
+            pause.resume.notify_one();
+            let rows = tokio::time::timeout(std::time::Duration::from_secs(30), reading)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].id, "old-reader");
+            assert_eq!(pause.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            drop(reader);
+            // The test has now joined every old reader. Production must prove
+            // that barrier for the whole fleet before configuring Collect.
+            reopened.base.wal_collection = crate::wal_gc::Mode::Collect;
+            reopened.discover_retired_wal().await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                while paths.iter().any(|path| std::path::Path::new(path).exists()) {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(reopened.pending_wal_generations().await.unwrap(), 0);
+            let rows = reopened
+                .list_with_filters(
+                    Some(4),
+                    None,
+                    Some(&RolloutFilters {
+                        role: Some(ROLE_ASSISTANT.into()),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].id, "old-reader");
+        }
+    }
+
+    #[tokio::test]
+    async fn selected_list_protection_keeps_captured_files_while_merges_continue() {
+        for (grouped, before_materialization) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let dir = TempDir::new().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let mut writer = RolloutStore::open_with_options(
+                uri,
+                RolloutStoreOptions {
+                    shard_id: Some("read-lifetime".into()),
+                    merge_after_generations: Some(0),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            writer.base.wal_collection = crate::wal_gc::Mode::Collect;
+            let mut records = vec![
+                assistant_record("a"),
+                assistant_record("b"),
+                assistant_record("c"),
+            ];
+            for record in &mut records {
+                record.content = Some("protected-page-payload".repeat(16_384));
+            }
+            writer.add(&records).await.unwrap();
+            writer.flush().await.unwrap();
+            let reader = RolloutStore::open(uri).await.unwrap();
+            assert!(reader.base.wal_read_protection);
+            let reader = Arc::new(reader);
+            let pause = Arc::new(SelectedListPause {
+                before_materialization,
+                ..Default::default()
+            });
+            *reader.selected_list_pause.lock().unwrap() = Some(pause.clone());
+            let reading = {
+                let reader = reader.clone();
+                tokio::spawn(async move {
+                    let filters = RolloutFilters {
+                        role: Some(ROLE_ASSISTANT.into()),
+                        ..Default::default()
+                    };
+                    reader
+                        .list_with_filters(Some(4), None, Some(&filters))
+                        .await
+                })
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(30), pause.reached.notified())
+                .await
+                .unwrap();
+            let mut paths = Vec::new();
+            // Three actual merge/drain cycles must finish while the old read
+            // retains its original WAL snapshot. Only physical GC waits.
+            for next_id in [None, Some("d"), Some("e")] {
+                if let Some(id) = next_id {
+                    writer.add(&[assistant_record(id)]).await.unwrap();
+                    writer.flush().await.unwrap();
+                }
+                for snapshot in writer.wal_shard_snapshots().await.unwrap() {
+                    for generation in snapshot.sstables {
+                        paths.push(
+                            writer.flushed_generation_uri(snapshot.shard_id, &generation.path),
+                        );
+                    }
+                }
+                if grouped {
+                    let mut coordinator = crate::rollout_append::AppendCoordinator::open(uri, None)
+                        .await
+                        .unwrap();
+                    coordinator.wal_collection = crate::wal_gc::Mode::Collect;
+                    let (plans, _) = coordinator
+                        .plan(&["read-lifetime".into()], 64, 8 * 1024 * 1024)
+                        .await
+                        .unwrap();
+                    assert_eq!(plans.len(), 1);
+                    let prepared = crate::rollout_append::stage(
+                        uri,
+                        plans.into_iter().next().unwrap(),
+                        crate::MergeMemoryBudget::new(32 * 1024 * 1024),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(coordinator.commit(vec![prepared]).await.unwrap(), 1);
+                } else {
+                    assert_eq!(writer.cleanup_own_shard().await.unwrap(), 1);
+                }
+                assert_eq!(flushed_generation_count(&writer).await, 0);
+            }
+            assert_eq!(paths.len(), 3);
+            tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+            assert!(paths.iter().all(|path| std::path::Path::new(path).exists()));
+            let later_reader = RolloutStore::open(uri).await.unwrap();
+            assert!(later_reader.base.wal_read_protection);
+            let filters = RolloutFilters {
+                role: Some(ROLE_ASSISTANT.into()),
+                ..Default::default()
+            };
+            let later = later_reader
+                .list_with_filters(Some(5), None, Some(&filters))
+                .await
+                .unwrap();
+            assert_eq!(later.len(), 5);
+            assert!(!reading.is_finished());
+            pause.resume.notify_one();
+            let rows = tokio::time::timeout(std::time::Duration::from_secs(30), reading)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(pause.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(rows.len(), 3);
+            for record in &records {
+                assert_records_eq(rows.iter().find(|row| row.id == record.id).unwrap(), record);
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                while paths.iter().any(|path| std::path::Path::new(path).exists()) {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            writer.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn selected_list_repeated_reclamation_exhausts_retry_window() {
         for before_materialization in [false, true] {
             let dir = TempDir::new().unwrap();
             let uri = dir.path().to_str().unwrap();
             let mut writer = RolloutStore::open(uri).await.unwrap();
+            writer.base.wal_collection = crate::wal_gc::Mode::Collect;
             let mut records = vec![
                 assistant_record("a"),
                 assistant_record("b"),
@@ -4780,7 +5239,9 @@ mod tests {
             }
             writer.add(&records).await.unwrap();
             writer.flush().await.unwrap();
-            let reader = Arc::new(RolloutStore::open(uri).await.unwrap());
+            let mut reader = RolloutStore::open(uri).await.unwrap();
+            reader.base.wal_read_protection = false; // Reproduce the old reader.
+            let reader = Arc::new(reader);
             let pause = Arc::new(SelectedListPause {
                 before_materialization,
                 pause_attempts: 2,
@@ -4874,6 +5335,7 @@ mod tests {
             let dir = TempDir::new().unwrap();
             let uri = dir.path().to_str().unwrap();
             let mut writer = RolloutStore::open(uri).await.unwrap();
+            writer.base.wal_collection = crate::wal_gc::Mode::Collect;
             let mut records = vec![
                 assistant_record("a"),
                 assistant_record("b"),
@@ -4883,7 +5345,9 @@ mod tests {
             records[1].content = Some("page-payload".repeat(16_384));
             writer.add(&records).await.unwrap();
             writer.flush().await.unwrap();
-            let reader = Arc::new(RolloutStore::open(uri).await.unwrap());
+            let mut reader = RolloutStore::open(uri).await.unwrap();
+            reader.base.wal_read_protection = false; // Historical unregistered reader.
+            let reader = Arc::new(reader);
             let original_version = reader.version();
             let snapshots = reader.wal_shard_snapshots().await.unwrap();
             let mut paths = Vec::new();
@@ -8756,7 +9220,8 @@ mod tests {
                 )
             };
             let mut writer = open("race-writer").await.unwrap();
-            let reader = open("race-reader").await.unwrap();
+            let mut reader = open("race-reader").await.unwrap();
+            reader.base.wal_read_protection = false; // Historical unregistered reader.
             let original_version = reader.version();
             let bytes = b"blob-moved-after-generation-open";
             writer
@@ -8768,6 +9233,17 @@ mod tests {
                 .await
                 .unwrap();
             writer.flush().await.unwrap();
+            writer.base.wal_collection = crate::wal_gc::Mode::Collect;
+            let snapshots = writer.wal_shard_snapshots().await.unwrap();
+            let paths: Vec<_> = snapshots
+                .iter()
+                .flat_map(|snapshot| {
+                    snapshot.sstables.iter().map(|generation| {
+                        writer.flushed_generation_uri(snapshot.shard_id, &generation.path)
+                    })
+                })
+                .collect();
+            assert!(!paths.is_empty());
             let pause = Arc::new(BlobReadPause::default());
             *reader.blob_read_pause.lock().unwrap() = Some(pause.clone());
             let reading = tokio::spawn(async move {
@@ -8781,6 +9257,14 @@ mod tests {
             // been read. Commit it to the base and delete its source files.
             assert_eq!(writer.cleanup_own_shard().await.unwrap(), 1);
             assert_eq!(flushed_generation_count(&writer).await, 0);
+            // Prove physical reclamation happened, rather than only logical drain.
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                while paths.iter().any(|path| std::path::Path::new(path).exists()) {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
             pause.resume.notify_one();
             let (result, version) =
                 tokio::time::timeout(std::time::Duration::from_secs(30), reading)
@@ -8824,6 +9308,17 @@ mod tests {
             .await
             .unwrap();
         writer.flush().await.unwrap();
+        writer.base.wal_collection = crate::wal_gc::Mode::Collect;
+        let snapshots = writer.wal_shard_snapshots().await.unwrap();
+        let paths: Vec<_> = snapshots
+            .iter()
+            .flat_map(|snapshot| {
+                snapshot.sstables.iter().map(|generation| {
+                    writer.flushed_generation_uri(snapshot.shard_id, &generation.path)
+                })
+            })
+            .collect();
+        assert!(!paths.is_empty());
         let pause = Arc::new(BlobReadPause {
             before_wal_snapshot: true,
             ..Default::default()
@@ -8840,6 +9335,14 @@ mod tests {
         // before WAL discovery, so opening the WAL returns no generations.
         assert_eq!(writer.cleanup_own_shard().await.unwrap(), 1);
         assert_eq!(flushed_generation_count(&writer).await, 0);
+        // Prove physical reclamation happened, rather than only logical drain.
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while paths.iter().any(|path| std::path::Path::new(path).exists()) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
         pause.resume.notify_one();
         let (result, version) = tokio::time::timeout(std::time::Duration::from_secs(30), reading)
             .await

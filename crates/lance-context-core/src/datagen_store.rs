@@ -21,7 +21,6 @@ use arrow_array::{
 };
 use arrow_schema::{ArrowError, DataType, Field, Schema, TimeUnit};
 use futures::TryStreamExt;
-use lance::dataset::mem_wal::LsmScanner;
 use lance::dataset::optimize::CompactionMetrics;
 use lance::dataset::Dataset;
 use lance::{Error as LanceError, Result as LanceResult};
@@ -39,7 +38,7 @@ use crate::merge_budget::MergeMemoryBudget;
 use crate::store::{
     column_as, column_as_optional, timestamp_from_micros, CompactionConfig, CompactionStats,
 };
-use crate::store_base::{is_not_found_error, StorageBase, StorageBaseOptions};
+use crate::store_base::{StorageBase, StorageBaseOptions};
 
 /// Configuration for opening a [`DatagenStore`].
 #[derive(Debug, Clone, Default)]
@@ -331,40 +330,39 @@ impl DatagenStore {
     /// matching `_rowid` is then passed to `take_rows` for an O(single blob)
     /// payload read.
     pub async fn get_blob(&self, event_id: &str) -> LanceResult<Option<Vec<u8>>> {
-        let snapshots = self.base.wal_shard_snapshots().await?;
-        let mut generations: Vec<(u64, String)> = snapshots
-            .iter()
-            .flat_map(|snapshot| {
-                snapshot.sstables.iter().map(|generation| {
-                    (
-                        generation.generation,
-                        self.base
-                            .flushed_generation_uri(snapshot.shard_id, &generation.path),
-                    )
-                })
+        self.base
+            .read_consistent(crate::ListSource::All, |dataset, snapshots| async move {
+                let mut generations: Vec<(u64, String)> = snapshots
+                    .iter()
+                    .flat_map(|snapshot| {
+                        snapshot.sstables.iter().map(|generation| {
+                            (
+                                generation.generation,
+                                self.base
+                                    .flushed_generation_uri(snapshot.shard_id, &generation.path),
+                            )
+                        })
+                    })
+                    .collect();
+                generations.sort_by_key(|(generation, _)| std::cmp::Reverse(*generation));
+
+                for (_, uri) in generations {
+                    // Missing source files are errors for this captured view.
+                    // The shared consistent-read path refreshes both base and WAL
+                    // before retrying instead of turning a storage error into None.
+                    let generation_dataset = self.base.open_flushed_dataset(&uri).await?;
+                    if let Some(payload) =
+                        Self::get_blob_from_dataset(&generation_dataset, event_id).await?
+                    {
+                        return Ok(payload);
+                    }
+                }
+
+                Ok(Self::get_blob_from_dataset(&dataset, event_id)
+                    .await?
+                    .flatten())
             })
-            .collect();
-        generations.sort_by_key(|(generation, _)| std::cmp::Reverse(*generation));
-
-        for (_, uri) in generations {
-            // A generation drained and deleted by a concurrent merge between
-            // taking the snapshot and opening it: its rows are already in the
-            // base table (checked below), so skip it rather than failing the
-            // whole lookup. Now that merges no longer block appends, this window
-            // is genuinely reachable. (Mirrors the rollout store.)
-            let dataset = match self.base.open_flushed_dataset(&uri).await {
-                Ok(dataset) => dataset,
-                Err(err) if is_not_found_error(&err) => continue,
-                Err(err) => return Err(err),
-            };
-            if let Some(payload) = Self::get_blob_from_dataset(&dataset, event_id).await? {
-                return Ok(payload);
-            }
-        }
-
-        Ok(Self::get_blob_from_dataset(&self.base.dataset, event_id)
-            .await?
-            .flatten())
+            .await
     }
 
     /// Materialize a folded item's blob field by name, resolving the `event_id` for the caller.
@@ -500,25 +498,35 @@ impl DatagenStore {
         filter: &str,
         columns: Option<&[String]>,
     ) -> LanceResult<Vec<DatagenEvent>> {
-        let scanner = match columns {
-            Some(columns) => {
-                let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
-                self.lsm_scanner().await?.project(&refs)?.filter(filter)?
-            }
-            None => self.lsm_scanner().await?.filter(filter)?,
-        };
-        let mut stream = scanner.try_into_stream().await?;
-        let mut events = Vec::new();
-        while let Some(batch) = stream.try_next().await? {
-            events.extend(batch_to_events(&batch)?);
-        }
-        events.sort_by(|left, right| {
-            left.item_id
-                .cmp(&right.item_id)
-                .then_with(|| left.item_seq.cmp(&right.item_seq))
-                .then_with(|| left.event_id.cmp(&right.event_id))
-        });
-        Ok(events)
+        self.base
+            .read_consistent(crate::ListSource::All, |dataset, snapshots| async move {
+                let scanner = StorageBase::lsm_scanner_for_dataset(
+                    &dataset,
+                    "event_id",
+                    crate::ListSource::All,
+                    snapshots,
+                );
+                let scanner = match columns {
+                    Some(columns) => {
+                        let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+                        scanner.project(&refs)?.filter(filter)?
+                    }
+                    None => scanner.filter(filter)?,
+                };
+                let mut stream = scanner.try_into_stream().await?;
+                let mut events = Vec::new();
+                while let Some(batch) = stream.try_next().await? {
+                    events.extend(batch_to_events(&batch)?);
+                }
+                events.sort_by(|left, right| {
+                    left.item_id
+                        .cmp(&right.item_id)
+                        .then_with(|| left.item_seq.cmp(&right.item_seq))
+                        .then_with(|| left.event_id.cmp(&right.event_id))
+                });
+                Ok(events)
+            })
+            .await
     }
     async fn get_blob_from_dataset(
         dataset: &Dataset,
@@ -562,12 +570,6 @@ impl DatagenStore {
             .map(|field| field.name.clone())
             .filter(|name| name != "value_blob")
             .collect()
-    }
-
-    /// LSM scanner over the base table unioned with every shard's flushed
-    /// generations, deduplicating by `event_id`.
-    async fn lsm_scanner(&self) -> LanceResult<LsmScanner> {
-        self.base.lsm_scanner().await
     }
 }
 
@@ -1057,6 +1059,94 @@ fn invalid_input(message: impl Into<String>) -> LanceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn wal_lifetime_covers_datagen_event_and_blob_reads() {
+        for blob in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let mut writer = DatagenStore::open(uri).await.unwrap();
+            let field = field_event(
+                1,
+                0,
+                DatagenEventType::FieldSet,
+                "screenshot",
+                "image",
+                DatagenValue::Blob(DatagenBlobValue {
+                    bytes: Some(b"protected-payload".to_vec()),
+                    size: 17,
+                    checksum: None,
+                }),
+            );
+            let id = field.event_id.clone();
+            writer.append(&[field]).await.unwrap();
+            writer.base.flush().await.unwrap();
+            let reader = DatagenStore::open_existing_with_options(uri, Default::default())
+                .await
+                .unwrap();
+            let read = async {
+                if blob {
+                    Ok(reader.get_blob(&id).await?.as_deref()
+                        == Some(b"protected-payload".as_slice()))
+                } else {
+                    let rows = reader.events_for_item("item-1").await?;
+                    Ok(rows.len() == 1 && rows[0].event_id == id)
+                }
+            };
+            assert!(
+                crate::wal_read_lifetime::assert_read_survives_merge(
+                    &reader.base,
+                    &mut writer.base,
+                    read,
+                )
+                .await
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn wal_snapshot_after_drain_datagen_event_and_blob_reads() {
+        for blob in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let mut writer = DatagenStore::open(uri).await.unwrap();
+            let field = field_event(
+                1,
+                0,
+                DatagenEventType::FieldSet,
+                "screenshot",
+                "image",
+                DatagenValue::Blob(DatagenBlobValue {
+                    bytes: Some(b"protected-payload".to_vec()),
+                    size: 17,
+                    checksum: None,
+                }),
+            );
+            let id = field.event_id.clone();
+            writer.append(&[field]).await.unwrap();
+            writer.base.flush().await.unwrap();
+            let reader = DatagenStore::open_existing_with_options(uri, Default::default())
+                .await
+                .unwrap();
+            let read = async {
+                if blob {
+                    Ok(reader.get_blob(&id).await?.as_deref()
+                        == Some(b"protected-payload".as_slice()))
+                } else {
+                    let rows = reader.events_for_item("item-1").await?;
+                    Ok(rows.len() == 1 && rows[0].event_id == id)
+                }
+            };
+            assert!(
+                crate::wal_read_lifetime::assert_read_after_merge(
+                    &reader.base,
+                    &mut writer.base,
+                    read,
+                )
+                .await
+            );
+        }
+    }
     use crate::datagen::{
         datagen_event_id, DatagenFieldChange, DatagenFieldState, DatagenItemId, DatagenItemLookup,
         DatagenItemStatus, DatagenStepId, DatagenStepKind, DatagenStreamPosition, DatagenTerminal,

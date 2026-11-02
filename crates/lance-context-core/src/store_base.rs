@@ -102,7 +102,6 @@ static OWN_WAL_RECOVERY_SLOT: tokio::sync::Semaphore = tokio::sync::Semaphore::c
 pub(crate) const DEFAULT_MERGE_MAX_GENERATIONS: usize = 8;
 
 /// Merged generation directories removed in parallel after a merge commits.
-const DELETE_GENERATION_CONCURRENCY: usize = 16;
 
 /// Buffered Arrow array bytes per merge pass, checked at generation boundaries.
 pub(crate) const DEFAULT_MERGE_MAX_BYTES: usize = 1024 * 1024 * 1024;
@@ -476,6 +475,13 @@ pub(crate) struct StorageBase {
     pending_generations_max: usize,
     /// Process-wide merge byte budget; `None` means unbounded.
     merge_budget: Option<Arc<MergeMemoryBudget>>,
+    /// Enabled in both rollout phases. Only regression tests disable this to
+    /// reproduce an old, unregistered reader.
+    pub(crate) wal_read_protection: bool,
+    pub(crate) wal_collection: crate::wal_gc::Mode,
+    #[cfg(test)]
+    pub(crate) wal_snapshot_pause:
+        std::sync::Mutex<Option<Arc<crate::wal_read_lifetime::ReadCapturePause>>>,
     /// Serializes split preparation/commit on this handle, before taking a store lock.
     merge_preparation_gate: Arc<tokio::sync::Mutex<()>>,
     /// Timestamp of the last successful [`Self::compact`] on this handle.
@@ -631,6 +637,10 @@ impl StorageBase {
             pending_generations_max: pending_generations_max
                 .unwrap_or(DEFAULT_PENDING_GENERATIONS_MAX),
             merge_budget,
+            wal_read_protection: true,
+            wal_collection: crate::wal_gc::Mode::configured()?,
+            #[cfg(test)]
+            wal_snapshot_pause: std::sync::Mutex::new(None),
             merge_preparation_gate: Arc::new(tokio::sync::Mutex::new(())),
             last_compaction: None,
             total_compactions: 0,
@@ -1299,7 +1309,8 @@ impl StorageBase {
             self.session.clone(),
         )
         .await?;
-        crate::rollout_append::reconcile_shard(&latest, self.write_shard).await?;
+        crate::rollout_append::reconcile_shard(&latest, self.write_shard, self.wal_collection)
+            .await?;
         let marks = crate::rollout_append::watermarks(&latest).await?;
         let mut manifest = manifest.clone();
         if let Some(high) = marks.get(&self.write_shard) {
@@ -1448,6 +1459,30 @@ impl StorageBase {
         // writer now owns the shard.
         let epoch = manifest.writer_epoch;
 
+        let retiring: Vec<_> = manifest
+            .sstables
+            .iter()
+            .filter(|g| merged_generations.contains(&g.generation))
+            .map(|g| crate::rollout_append::Generation {
+                number: g.generation,
+                path: g.path.clone(),
+            })
+            .collect();
+        if retiring.len() != merged_generations.len()
+            || retiring.iter().any(|g| !merged_paths.contains(&g.path))
+        {
+            return Err(LanceError::io(
+                "Prepared retirement identities no longer match",
+            ));
+        }
+        let retirements = crate::wal_retirement::record(
+            self.dataset.object_store(None).await?,
+            &self.dataset.branch_location().path,
+            self.write_shard,
+            retiring,
+        )
+        .await?;
+
         let drain_store = ShardManifestStore::new(
             self.dataset.object_store(None).await?,
             &self.dataset.branch_location().path,
@@ -1460,70 +1495,42 @@ impl StorageBase {
                 .await
         )?;
 
-        self.delete_merged_generation_dirs(&merged_paths).await?;
+        self.reclaim_retired_generations(retirements).await?;
         self.pinned_version = None;
         Ok(true)
     }
 
-    /// Delete the merged generations' directories now that no manifest
-    /// references them.
-    ///
-    /// Ordering matters: the drain already removed these ids from
-    /// `flushed_generations`, so a reader can no longer resolve them — deleting
-    /// the data second (never before) keeps the sequence crash-safe.
-    ///
-    /// Best-effort: a delete failure must NOT fail the merge — the merge has
-    /// logically succeeded (data appended, manifest drained). A failed delete
-    /// only leaks one directory.
-    /// Remove the directories of generations that the manifest no longer
-    /// lists. Runs on a spawned task, off the merge's critical path: once the
-    /// manifest drain has committed the generations are unreachable, and the
-    /// 64 to 512 `remove_dir_all` round trips (10 s per 64 on ADLS) were the
-    /// single largest phase of every merge. Directories are independent, so
-    /// they are removed concurrently. Best-effort by contract: a failure is
-    /// logged and the directory stays until reclaimed.
-    async fn delete_merged_generation_dirs(&self, merged_paths: &[String]) -> LanceResult<()> {
+    /// Reclaim directories after manifest drain and reader lifetime checks.
+    /// Drain prevents fresh captures from discovering these generations, but
+    /// readers that already captured them may still need the physical files.
+    /// Physical deletion runs off the merge's critical path: base publication
+    /// and manifest drain have already completed. Failure retains files and
+    /// does not undo the logical merge. The pre-drain durable intent remains
+    /// available to recovery if this process or its background task fails.
+    async fn reclaim_retired_generations(
+        &self,
+        retirements: Vec<object_store::path::Path>,
+    ) -> LanceResult<()> {
         let object_store = self.dataset.object_store(None).await?;
         let branch_path = self.dataset.branch_location().path.clone();
-        let shard = self.write_shard;
-        let dirs: Vec<_> = merged_paths
-            .iter()
-            .map(|path| {
-                (
-                    path.clone(),
-                    branch_path
-                        .clone()
-                        .join("_mem_wal")
-                        .join(shard.to_string().as_str())
-                        .join(path.as_str()),
-                )
-            })
-            .collect();
-        tokio::spawn(async move {
-            let phase = timer_start!();
-            stream::iter(dirs)
-                .for_each_concurrent(DELETE_GENERATION_CONCURRENCY, |(path, gen_dir)| {
-                    let object_store = object_store.clone();
-                    async move {
-                        if let Err(err) = object_store.remove_dir_all(gen_dir).await {
-                            warn!(
-                                shard = %shard,
-                                generation_path = %path,
-                                error = %err,
-                                "failed to delete merged MemWAL generation directory; \
-                                 it will remain until reclaimed"
-                            );
-                        }
-                    }
-                })
-                .await;
-            observe_duration!(
-                crate::metrics::ROLLOUT_WAL_MERGE_DURATION,
-                timer_elapsed!(phase),
-                "phase" => "delete",
-            );
-        });
+        crate::wal_gc::schedule(self.wal_collection, object_store, branch_path, retirements);
         Ok(())
+    }
+
+    /// Background lifecycle admission, including cold and zero-pending stores.
+    /// May wait for collector capacity; never call from pending/read probes or
+    /// while holding a merge claim. Persisted intents survive cancellation.
+    pub async fn discover_retired_wal(&self) -> LanceResult<()> {
+        if self.wal_collection == crate::wal_gc::Mode::Retain {
+            return Ok(());
+        }
+        let store = self.dataset.object_store(None).await?;
+        crate::wal_gc::discover(
+            self.wal_collection,
+            store,
+            self.dataset.branch_location().path.clone(),
+        )
+        .await
     }
 
     /// Read a budgeted prefix of flushed generations in `manifest`, aligned
@@ -2595,6 +2602,14 @@ impl StorageBase {
                 snapshots.len()
             )));
         }
+        #[cfg(test)]
+        {
+            let pause = self.wal_snapshot_pause.lock().unwrap().take();
+            if let Some(pause) = pause {
+                pause.captured.notify_one();
+                pause.resume.notified().await;
+            }
+        }
         Ok(snapshots)
     }
 
@@ -2678,6 +2693,43 @@ impl StorageBase {
     }
 
     pub(crate) async fn read_consistent_with_snapshots<T, F, Fut, S, Snapshot>(
+        &self,
+        source: ListSource,
+        capture: S,
+        read: F,
+    ) -> LanceResult<T>
+    where
+        F: FnMut(Dataset, Vec<ShardSnapshot>) -> Fut,
+        Fut: std::future::Future<Output = LanceResult<T>>,
+        S: FnMut() -> Snapshot,
+        Snapshot: std::future::Future<Output = LanceResult<Vec<ShardSnapshot>>>,
+    {
+        let operation = self.read_consistent_inner(source, capture, read);
+        self.protect_wal_read(source, operation).await
+    }
+
+    /// Register before either a fresh or cached read captures WAL metadata.
+    /// Keeping this separate preserves cached point-read refresh semantics.
+    pub(crate) async fn protect_wal_read<T>(
+        &self,
+        source: ListSource,
+        operation: impl std::future::Future<Output = LanceResult<T>>,
+    ) -> LanceResult<T> {
+        if self.wal_read_protection && !self.is_version_pinned() && source != ListSource::Fragments
+        {
+            crate::wal_read_lifetime::protect(
+                self.dataset.object_store(None).await?,
+                &self.dataset.branch_location().path,
+                crate::wal_read_lifetime::Policy::default(),
+                operation,
+            )
+            .await
+        } else {
+            operation.await
+        }
+    }
+
+    async fn read_consistent_inner<T, F, Fut, S, Snapshot>(
         &self,
         source: ListSource,
         mut capture: S,

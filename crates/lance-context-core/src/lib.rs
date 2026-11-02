@@ -29,7 +29,11 @@ pub mod serde;
 mod storage;
 mod store;
 mod store_base;
+mod wal_gc;
+pub use wal_gc::wal_collection_enabled;
 pub mod wal_presence;
+mod wal_read_lifetime;
+mod wal_retirement;
 mod wal_watermarks;
 pub use store_base::{
     is_pending_generations_exceeded, ShardWatermark, DEFAULT_PENDING_GENERATIONS_MAX,

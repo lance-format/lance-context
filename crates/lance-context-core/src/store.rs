@@ -19,7 +19,6 @@ use arrow_array::{
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Schema, TimeUnit};
 use chrono::{DateTime, Timelike, Utc};
 use futures::TryStreamExt;
-use lance::dataset::mem_wal::LsmScanner;
 use lance::dataset::optimize::CompactionMetrics;
 use lance::dataset::Dataset;
 use lance::dataset::NewColumnTransform;
@@ -1069,55 +1068,65 @@ impl ContextStore {
         &self,
         external_ids: &[&str],
     ) -> LanceResult<HashMap<String, ExternalIdState>> {
-        let mut states: HashMap<String, ExternalIdState> = HashMap::new();
-        let candidates: HashSet<&str> = external_ids
-            .iter()
-            .copied()
-            .filter(|value| !value.is_empty())
-            .collect();
-        if candidates.is_empty() {
-            return Ok(states);
-        }
-
-        let filter_values: Vec<&str> = candidates.iter().copied().collect();
-        let filter = format!("external_id IN ({})", sql_quoted_list(&filter_values));
-        let scanner = self.lsm_scanner().await?.filter(&filter)?;
-        let mut stream = scanner.try_into_stream().await?;
-        let mut rows: Vec<ContextRecord> = Vec::new();
-        while let Some(batch) = stream.try_next().await? {
-            rows.extend(batch_to_records(&batch)?);
-        }
-
-        let superseded_ids: HashSet<String> = rows
-            .iter()
-            .filter_map(|record| {
-                let supersedes_id = record.supersedes_id.as_ref()?;
-                if supersedes_id == &record.id {
-                    None
-                } else {
-                    Some(supersedes_id.clone())
+        self.base
+            .read_consistent(crate::ListSource::All, |dataset, snapshots| async move {
+                let mut states: HashMap<String, ExternalIdState> = HashMap::new();
+                let candidates: HashSet<&str> = external_ids
+                    .iter()
+                    .copied()
+                    .filter(|value| !value.is_empty())
+                    .collect();
+                if candidates.is_empty() {
+                    return Ok(states);
                 }
+
+                let filter_values: Vec<&str> = candidates.iter().copied().collect();
+                let filter = format!("external_id IN ({})", sql_quoted_list(&filter_values));
+                let scanner = StorageBase::lsm_scanner_for_dataset(
+                    &dataset,
+                    "id",
+                    ListSource::All,
+                    snapshots,
+                )
+                .filter(&filter)?;
+                let mut stream = scanner.try_into_stream().await?;
+                let mut rows: Vec<ContextRecord> = Vec::new();
+                while let Some(batch) = stream.try_next().await? {
+                    rows.extend(batch_to_records(&batch)?);
+                }
+
+                let superseded_ids: HashSet<String> = rows
+                    .iter()
+                    .filter_map(|record| {
+                        let supersedes_id = record.supersedes_id.as_ref()?;
+                        if supersedes_id == &record.id {
+                            None
+                        } else {
+                            Some(supersedes_id.clone())
+                        }
+                    })
+                    .collect();
+
+                let options = LifecycleQueryOptions::default();
+                for record in rows {
+                    let Some(external_id) = record.external_id.as_deref() else {
+                        continue;
+                    };
+                    if !candidates.contains(external_id) {
+                        continue;
+                    }
+                    let entry = states.entry(external_id.to_string()).or_default();
+                    if !record.is_tombstone() {
+                        entry.has_non_tombstone = true;
+                    }
+                    if options.is_visible(&record) && !superseded_ids.contains(&record.id) {
+                        entry.visible_ids.push(record.id);
+                    }
+                }
+
+                Ok(states)
             })
-            .collect();
-
-        let options = LifecycleQueryOptions::default();
-        for record in rows {
-            let Some(external_id) = record.external_id.as_deref() else {
-                continue;
-            };
-            if !candidates.contains(external_id) {
-                continue;
-            }
-            let entry = states.entry(external_id.to_string()).or_default();
-            if !record.is_tombstone() {
-                entry.has_non_tombstone = true;
-            }
-            if options.is_visible(&record) && !superseded_ids.contains(&record.id) {
-                entry.visible_ids.push(record.id);
-            }
-        }
-
-        Ok(states)
+            .await
     }
 
     /// Partially update mutable fields on a visible record by internal id.
@@ -1370,66 +1379,78 @@ impl ContextStore {
         ids: &[&str],
         external_ids: &[&str],
     ) -> LanceResult<(HashSet<String>, HashSet<String>)> {
-        let mut existing_ids = HashSet::new();
-        let mut existing_external_ids = HashSet::new();
+        self.base
+            .read_consistent(crate::ListSource::All, |dataset, snapshots| async move {
+                let mut existing_ids = HashSet::new();
+                let mut existing_external_ids = HashSet::new();
 
-        let candidate_ids: HashSet<&str> = ids.iter().copied().collect();
-        let candidate_external_ids: HashSet<&str> = external_ids.iter().copied().collect();
+                let candidate_ids: HashSet<&str> = ids.iter().copied().collect();
+                let candidate_external_ids: HashSet<&str> = external_ids.iter().copied().collect();
 
-        if !candidate_ids.is_empty() {
-            let filter = format!("id IN ({})", sql_quoted_list(ids));
-            let scanner = self
-                .lsm_scanner()
-                .await?
-                .project(&["id", "content_type"])?
-                .filter(&filter)?;
-            let mut stream = scanner.try_into_stream().await?;
-            while let Some(batch) = stream.try_next().await? {
-                let id_array = column_as::<StringArray>(&batch, "id")?;
-                let content_type_array = column_as::<StringArray>(&batch, "content_type")?;
-                for row in 0..batch.num_rows() {
-                    if content_type_array.value(row) == CONTENT_TYPE_TOMBSTONE {
-                        continue;
-                    }
-                    let id = id_array.value(row);
-                    if candidate_ids.contains(id) {
-                        existing_ids.insert(id.to_string());
+                if !candidate_ids.is_empty() {
+                    let filter = format!("id IN ({})", sql_quoted_list(ids));
+                    // Both lookups must use the same base/WAL view: a merge may
+                    // drain the manifest between consuming these two streams.
+                    let scanner = StorageBase::lsm_scanner_for_dataset(
+                        &dataset,
+                        "id",
+                        crate::ListSource::All,
+                        snapshots.clone(),
+                    )
+                    .project(&["id", "content_type"])?
+                    .filter(&filter)?;
+                    let mut stream = scanner.try_into_stream().await?;
+                    while let Some(batch) = stream.try_next().await? {
+                        let id_array = column_as::<StringArray>(&batch, "id")?;
+                        let content_type_array = column_as::<StringArray>(&batch, "content_type")?;
+                        for row in 0..batch.num_rows() {
+                            if content_type_array.value(row) == CONTENT_TYPE_TOMBSTONE {
+                                continue;
+                            }
+                            let id = id_array.value(row);
+                            if candidate_ids.contains(id) {
+                                existing_ids.insert(id.to_string());
+                            }
+                        }
                     }
                 }
-            }
-        }
 
-        if !candidate_external_ids.is_empty() && self.has_external_id_column() {
-            let filter = format!("external_id IN ({})", sql_quoted_list(external_ids));
-            let scanner = self
-                .lsm_scanner()
-                .await?
-                .project(&["external_id", "content_type"])?
-                .filter(&filter)?;
-            let mut stream = scanner.try_into_stream().await?;
-            while let Some(batch) = stream.try_next().await? {
-                let content_type_array = column_as::<StringArray>(&batch, "content_type")?;
-                let Some(external_id_array) =
-                    column_as_optional::<StringArray>(&batch, "external_id")
-                else {
-                    continue;
-                };
-                for row in 0..batch.num_rows() {
-                    if content_type_array.value(row) == CONTENT_TYPE_TOMBSTONE {
-                        continue;
-                    }
-                    if external_id_array.is_null(row) {
-                        continue;
-                    }
-                    let external_id = external_id_array.value(row);
-                    if candidate_external_ids.contains(external_id) {
-                        existing_external_ids.insert(external_id.to_string());
+                if !candidate_external_ids.is_empty() && self.has_external_id_column() {
+                    let filter = format!("external_id IN ({})", sql_quoted_list(external_ids));
+                    let scanner = StorageBase::lsm_scanner_for_dataset(
+                        &dataset,
+                        "id",
+                        crate::ListSource::All,
+                        snapshots,
+                    )
+                    .project(&["external_id", "content_type"])?
+                    .filter(&filter)?;
+                    let mut stream = scanner.try_into_stream().await?;
+                    while let Some(batch) = stream.try_next().await? {
+                        let content_type_array = column_as::<StringArray>(&batch, "content_type")?;
+                        let Some(external_id_array) =
+                            column_as_optional::<StringArray>(&batch, "external_id")
+                        else {
+                            continue;
+                        };
+                        for row in 0..batch.num_rows() {
+                            if content_type_array.value(row) == CONTENT_TYPE_TOMBSTONE {
+                                continue;
+                            }
+                            if external_id_array.is_null(row) {
+                                continue;
+                            }
+                            let external_id = external_id_array.value(row);
+                            if candidate_external_ids.contains(external_id) {
+                                existing_external_ids.insert(external_id.to_string());
+                            }
+                        }
                     }
                 }
-            }
-        }
 
-        Ok((existing_ids, existing_external_ids))
+                Ok((existing_ids, existing_external_ids))
+            })
+            .await
     }
 
     fn has_relationships_column(&self) -> bool {
@@ -1567,45 +1588,60 @@ impl ContextStore {
         options: LifecycleQueryOptions,
         projection: ReadProjection,
     ) -> LanceResult<Vec<ContextRecord>> {
-        let scanner = self.lsm_scanner_projected(projection).await?;
-        let mut stream = scanner.try_into_stream().await?;
-        let mut results = Vec::new();
-        while let Some(batch) = stream.try_next().await? {
-            results.extend(batch_to_records(&batch)?);
-        }
-
-        let superseded_ids: HashSet<String> = results
-            .iter()
-            .filter_map(|record| {
-                let supersedes_id = record.supersedes_id.as_ref()?;
-                if supersedes_id == &record.id {
-                    None
+        let options = &options;
+        self.base
+            .read_consistent(crate::ListSource::All, |dataset, snapshots| async move {
+                let scanner = StorageBase::lsm_scanner_for_dataset(
+                    &dataset,
+                    "id",
+                    ListSource::All,
+                    snapshots,
+                );
+                let scanner = if projection.loads_all() {
+                    scanner
                 } else {
-                    Some(supersedes_id.clone())
+                    scanner.project(&self.projected_columns(projection))?
+                };
+                let mut stream = scanner.try_into_stream().await?;
+                let mut results = Vec::new();
+                while let Some(batch) = stream.try_next().await? {
+                    results.extend(batch_to_records(&batch)?);
                 }
+
+                let superseded_ids: HashSet<String> = results
+                    .iter()
+                    .filter_map(|record| {
+                        let supersedes_id = record.supersedes_id.as_ref()?;
+                        if supersedes_id == &record.id {
+                            None
+                        } else {
+                            Some(supersedes_id.clone())
+                        }
+                    })
+                    .collect();
+                results.retain(|record| {
+                    options.is_visible(record)
+                        && (options.include_retired || !superseded_ids.contains(&record.id))
+                });
+                if let Some(filters) = filters.filter(|filters| !filters.is_empty()) {
+                    results.retain(|record| filters.matches(record));
+                }
+
+                results.sort_by(|left, right| {
+                    left.created_at
+                        .cmp(&right.created_at)
+                        .then_with(|| left.id.cmp(&right.id))
+                });
+
+                if let Some(offset) = offset {
+                    results = results.into_iter().skip(offset).collect();
+                }
+                if let Some(limit) = limit {
+                    results.truncate(limit);
+                }
+                Ok(results)
             })
-            .collect();
-        results.retain(|record| {
-            options.is_visible(record)
-                && (options.include_retired || !superseded_ids.contains(&record.id))
-        });
-        if let Some(filters) = filters.filter(|filters| !filters.is_empty()) {
-            results.retain(|record| filters.matches(record));
-        }
-
-        results.sort_by(|left, right| {
-            left.created_at
-                .cmp(&right.created_at)
-                .then_with(|| left.id.cmp(&right.id))
-        });
-
-        if let Some(offset) = offset {
-            results = results.into_iter().skip(offset).collect();
-        }
-        if let Some(limit) = limit {
-            results.truncate(limit);
-        }
-        Ok(results)
+            .await
     }
 
     /// Find a record by its internal storage id. Payload columns configured as
@@ -1641,103 +1677,118 @@ impl ContextStore {
         projection: ReadProjection,
         require_unique: bool,
     ) -> LanceResult<Option<ContextRecord>> {
-        // Older contexts may predate external ids and lifecycle columns.
-        if column == "external_id" && !self.has_external_id_column() {
-            return Ok(None);
-        }
-        let filter = format!("{column} IN ({})", sql_quoted_list(&[value]));
-        // Keep all scans on the same WAL view, so a concurrent replacement
-        // cannot hide a candidate without also being eligible for selection.
-        let snapshots = self.base.wal_shard_snapshots().await?;
-        let columns: Vec<&str> = [
-            "id",
-            "created_at",
-            "content_type",
-            "expires_at",
-            "lifecycle_status",
-            "retired_at",
-            "superseded_by_id",
-        ]
-        .into_iter()
-        .filter(|name| self.base.dataset.schema().field(name).is_some())
-        .collect();
-        let scanner = self
-            .base
-            .lsm_scanner_for_source(ListSource::All, snapshots.clone())
-            .project(&columns)?
-            .filter(&filter)?;
-        let mut stream = scanner.try_into_stream().await?;
-        let reference_time = Utc::now();
-        let mut selected: Option<(DateTime<Utc>, String)> = None;
-        while let Some(batch) = stream.try_next().await? {
-            // Arrow may deliver a larger batch; never convert/retain all its
-            // rows or collect batches into a growing Vec of ContextRecords.
-            for start in (0..batch.num_rows()).step_by(POINT_READ_BATCH_SIZE) {
-                let chunk = batch.slice(start, POINT_READ_BATCH_SIZE.min(batch.num_rows() - start));
-                let candidates = point_read_candidates(&chunk, reference_time)?;
-                if candidates.is_empty() {
-                    continue;
+        self.base
+            .read_consistent(crate::ListSource::All, |dataset, snapshots| async move {
+                // Older contexts may predate external ids and lifecycle columns.
+                if column == "external_id" && !self.has_external_id_column() {
+                    return Ok(None);
                 }
-                let mut live_ids: HashSet<&str> =
-                    candidates.iter().map(|(_, id)| id.as_str()).collect();
-                if self.base.dataset.schema().field("supersedes_id").is_some() {
-                    // A successor has a different id and can even have a different
-                    // external_id. Check references outside the candidate set, including
-                    // hidden successors, without reading any of their payload columns.
-                    let ids: Vec<&str> = live_ids.iter().copied().collect();
-                    let filter = format!("supersedes_id IN ({})", sql_quoted_list(&ids));
-                    let scanner = self
-                        .base
-                        .lsm_scanner_for_source(ListSource::All, snapshots.clone())
-                        .project(&["id", "supersedes_id"])?
-                        .filter(&filter)?;
-                    let mut stream = scanner.try_into_stream().await?;
-                    while let Some(batch) = stream.try_next().await? {
-                        let ids = column_as::<StringArray>(&batch, "id")?;
-                        let supersedes = column_as::<StringArray>(&batch, "supersedes_id")?;
-                        for row in 0..batch.num_rows() {
-                            if !supersedes.is_null(row) && supersedes.value(row) != ids.value(row) {
-                                live_ids.remove(supersedes.value(row));
+                let filter = format!("{column} IN ({})", sql_quoted_list(&[value]));
+                // Keep all scans on the same WAL view, so a concurrent replacement
+                // cannot hide a candidate without also being eligible for selection.
+                let columns: Vec<&str> = [
+                    "id",
+                    "created_at",
+                    "content_type",
+                    "expires_at",
+                    "lifecycle_status",
+                    "retired_at",
+                    "superseded_by_id",
+                ]
+                .into_iter()
+                .filter(|name| dataset.schema().field(name).is_some())
+                .collect();
+                let scanner = StorageBase::lsm_scanner_for_dataset(
+                    &dataset,
+                    "id",
+                    ListSource::All,
+                    snapshots.clone(),
+                )
+                .project(&columns)?
+                .filter(&filter)?;
+                let mut stream = scanner.try_into_stream().await?;
+                let reference_time = Utc::now();
+                let mut selected: Option<(DateTime<Utc>, String)> = None;
+                while let Some(batch) = stream.try_next().await? {
+                    // Arrow may deliver a larger batch; never convert/retain all its
+                    // rows or collect batches into a growing Vec of ContextRecords.
+                    for start in (0..batch.num_rows()).step_by(POINT_READ_BATCH_SIZE) {
+                        let chunk =
+                            batch.slice(start, POINT_READ_BATCH_SIZE.min(batch.num_rows() - start));
+                        let candidates = point_read_candidates(&chunk, reference_time)?;
+                        if candidates.is_empty() {
+                            continue;
+                        }
+                        let mut live_ids: HashSet<&str> =
+                            candidates.iter().map(|(_, id)| id.as_str()).collect();
+                        if dataset.schema().field("supersedes_id").is_some() {
+                            // A successor has a different id and can even have a different
+                            // external_id. Check references outside the candidate set, including
+                            // hidden successors, without reading any of their payload columns.
+                            let ids: Vec<&str> = live_ids.iter().copied().collect();
+                            let filter = format!("supersedes_id IN ({})", sql_quoted_list(&ids));
+                            let scanner = StorageBase::lsm_scanner_for_dataset(
+                                &dataset,
+                                "id",
+                                ListSource::All,
+                                snapshots.clone(),
+                            )
+                            .project(&["id", "supersedes_id"])?
+                            .filter(&filter)?;
+                            let mut stream = scanner.try_into_stream().await?;
+                            while let Some(batch) = stream.try_next().await? {
+                                let ids = column_as::<StringArray>(&batch, "id")?;
+                                let supersedes = column_as::<StringArray>(&batch, "supersedes_id")?;
+                                for row in 0..batch.num_rows() {
+                                    if !supersedes.is_null(row)
+                                        && supersedes.value(row) != ids.value(row)
+                                    {
+                                        live_ids.remove(supersedes.value(row));
+                                    }
+                                }
+                                if live_ids.is_empty() {
+                                    break;
+                                }
                             }
                         }
-                        if live_ids.is_empty() {
-                            break;
+                        for candidate in &candidates {
+                            if !live_ids.contains(candidate.1.as_str()) {
+                                continue;
+                            }
+                            if require_unique && selected.is_some() {
+                                return Err(ArrowError::InvalidArgumentError(format!(
+                                    "external_id '{}' matches multiple visible records",
+                                    value
+                                ))
+                                .into());
+                            }
+                            // Match list's (created_at, id) ordering across all chunks.
+                            if selected.as_ref().is_none_or(|current| candidate < current) {
+                                selected = Some(candidate.clone());
+                            }
                         }
                     }
                 }
-                for candidate in &candidates {
-                    if !live_ids.contains(candidate.1.as_str()) {
-                        continue;
-                    }
-                    if require_unique && selected.is_some() {
-                        return Err(ArrowError::InvalidArgumentError(format!(
-                            "external_id '{}' matches multiple visible records",
-                            value
-                        ))
-                        .into());
-                    }
-                    // Match list's (created_at, id) ordering across all chunks.
-                    if selected.as_ref().is_none_or(|current| candidate < current) {
-                        selected = Some(candidate.clone());
+                let Some((_, id)) = selected else {
+                    return Ok(None);
+                };
+                let scanner = StorageBase::lsm_scanner_for_dataset(
+                    &dataset,
+                    "id",
+                    ListSource::All,
+                    snapshots,
+                )
+                .project(&self.projected_columns(projection))?
+                .filter(&format!("id IN ({})", sql_quoted_list(&[&id])))?;
+                let mut stream = scanner.try_into_stream().await?;
+                while let Some(batch) = stream.try_next().await? {
+                    if batch.num_rows() > 0 {
+                        return Ok(batch_to_records(&batch)?.into_iter().next());
                     }
                 }
-            }
-        }
-        let Some((_, id)) = selected else {
-            return Ok(None);
-        };
-        let scanner = self
-            .base
-            .lsm_scanner_for_source(ListSource::All, snapshots)
-            .project(&self.projected_columns(projection))?
-            .filter(&format!("id IN ({})", sql_quoted_list(&[&id])))?;
-        let mut stream = scanner.try_into_stream().await?;
-        while let Some(batch) = stream.try_next().await? {
-            if batch.num_rows() > 0 {
-                return Ok(batch_to_records(&batch)?.into_iter().next());
-            }
-        }
-        Ok(None)
+                Ok(None)
+            })
+            .await
     }
 
     /// List records that have a relationship targeting `target_id`.
@@ -1972,12 +2023,6 @@ impl ContextStore {
         Ok(results)
     }
 
-    /// LSM scanner over the base table unioned with every shard's flushed
-    /// MemWAL generations, deduplicating by `id`.
-    async fn lsm_scanner(&self) -> LanceResult<LsmScanner> {
-        self.base.lsm_scanner().await
-    }
-
     fn default_read_projection(&self) -> ReadProjection {
         ReadProjection {
             text: !self.blob_columns.contains("text_payload"),
@@ -2004,41 +2049,38 @@ impl ContextStore {
             .collect()
     }
 
-    /// An LSM scanner that only reads the columns required by `projection`.
-    async fn lsm_scanner_projected(&self, projection: ReadProjection) -> LanceResult<LsmScanner> {
-        let scanner = self.lsm_scanner().await?;
-        if projection.loads_all() {
-            return Ok(scanner);
-        }
-        let columns = self.projected_columns(projection);
-        let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
-        scanner.project(&refs)
-    }
-
     /// Fetch a single record's `binary_payload` on demand, without loading it
     /// during `list`/`search`. Returns `None` if the record or its binary
     /// payload is absent.
     pub async fn get_blob(&self, id: &str) -> LanceResult<Option<Vec<u8>>> {
-        let filter = format!("id IN ({})", sql_quoted_list(&[id]));
-        let scanner = self
-            .lsm_scanner()
-            .await?
-            .project(&["id", "binary_payload"])?
-            .filter(&filter)?;
-        let mut stream = scanner.try_into_stream().await?;
-        while let Some(batch) = stream.try_next().await? {
-            let id_array = column_as::<StringArray>(&batch, "id")?;
-            let binary_array = column_as_optional::<LargeBinaryArray>(&batch, "binary_payload");
-            for row in 0..batch.num_rows() {
-                if id_array.value(row) == id {
-                    return Ok(match binary_array {
-                        Some(arr) if !arr.is_null(row) => Some(arr.value(row).to_vec()),
-                        _ => None,
-                    });
+        self.base
+            .read_consistent(crate::ListSource::All, |dataset, snapshots| async move {
+                let filter = format!("id IN ({})", sql_quoted_list(&[id]));
+                let scanner = StorageBase::lsm_scanner_for_dataset(
+                    &dataset,
+                    "id",
+                    ListSource::All,
+                    snapshots,
+                )
+                .project(&["id", "binary_payload"])?
+                .filter(&filter)?;
+                let mut stream = scanner.try_into_stream().await?;
+                while let Some(batch) = stream.try_next().await? {
+                    let id_array = column_as::<StringArray>(&batch, "id")?;
+                    let binary_array =
+                        column_as_optional::<LargeBinaryArray>(&batch, "binary_payload");
+                    for row in 0..batch.num_rows() {
+                        if id_array.value(row) == id {
+                            return Ok(match binary_array {
+                                Some(arr) if !arr.is_null(row) => Some(arr.value(row).to_vec()),
+                                _ => None,
+                            });
+                        }
+                    }
                 }
-            }
-        }
-        Ok(None)
+                Ok(None)
+            })
+            .await
     }
 
     /// Manually trigger compaction to merge small fragments.
@@ -3565,6 +3607,124 @@ fn sql_quoted_list(values: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn wal_lifetime_covers_context_read_consumers() {
+        for route in 0..5 {
+            let dir = TempDir::new().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let mut writer = ContextStore::open(uri).await.unwrap();
+            let mut record = text_record("protected", 0.5);
+            record.external_id = Some("external".into());
+            record.content_type = "image/png".into();
+            record.text_payload = None;
+            record.binary_payload = Some(b"protected-payload".to_vec());
+            writer.add(&[record]).await.unwrap();
+            let reader = ContextStore::open_existing_with_options(uri, Default::default())
+                .await
+                .unwrap();
+            let read = async {
+                match route {
+                    0 => Ok(reader
+                        .external_id_states(&["external"])
+                        .await?
+                        .contains_key("external")),
+                    1 => {
+                        let (ids, external) = reader
+                            .find_existing_keys(&["protected"], &["external"])
+                            .await?;
+                        Ok(ids.contains("protected") && external.contains("external"))
+                    }
+                    2 => {
+                        let rows = reader
+                            .list_filtered_projected(
+                                Some(1),
+                                None,
+                                None,
+                                LifecycleQueryOptions::default(),
+                                ReadProjection::default(),
+                            )
+                            .await?;
+                        Ok(rows.len() == 1 && rows[0].id == "protected")
+                    }
+                    3 => Ok(reader
+                        .get_by_external_id("external")
+                        .await?
+                        .is_some_and(|row| row.id == "protected")),
+                    _ => Ok(reader.get_blob("protected").await?.as_deref()
+                        == Some(b"protected-payload".as_slice())),
+                }
+            };
+            assert!(
+                crate::wal_read_lifetime::assert_read_survives_merge(
+                    &reader.base,
+                    &mut writer.base,
+                    read,
+                )
+                .await,
+                "context read route {route} lost its expected record during merge"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn wal_snapshot_after_drain_context_read_consumers() {
+        for route in 0..5 {
+            let dir = TempDir::new().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let mut writer = ContextStore::open(uri).await.unwrap();
+            let mut record = text_record("protected", 0.5);
+            record.external_id = Some("external".into());
+            record.content_type = "image/png".into();
+            record.text_payload = None;
+            record.binary_payload = Some(b"protected-payload".to_vec());
+            writer.add(&[record]).await.unwrap();
+            let reader = ContextStore::open_existing_with_options(uri, Default::default())
+                .await
+                .unwrap();
+            let read = async {
+                match route {
+                    0 => Ok(reader
+                        .external_id_states(&["external"])
+                        .await?
+                        .contains_key("external")),
+                    1 => {
+                        let (ids, external) = reader
+                            .find_existing_keys(&["protected"], &["external"])
+                            .await?;
+                        Ok(ids.contains("protected") && external.contains("external"))
+                    }
+                    2 => {
+                        let rows = reader
+                            .list_filtered_projected(
+                                Some(1),
+                                None,
+                                None,
+                                LifecycleQueryOptions::default(),
+                                ReadProjection::default(),
+                            )
+                            .await?;
+                        Ok(rows.len() == 1 && rows[0].id == "protected")
+                    }
+                    3 => Ok(reader
+                        .get_by_external_id("external")
+                        .await?
+                        .is_some_and(|row| row.id == "protected")),
+                    _ => Ok(reader.get_blob("protected").await?.as_deref()
+                        == Some(b"protected-payload".as_slice())),
+                }
+            };
+            assert!(
+                crate::wal_read_lifetime::assert_read_after_merge(
+                    &reader.base,
+                    &mut writer.base,
+                    read,
+                )
+                .await,
+                "context read route {route} lost its expected record during merge"
+            );
+        }
+    }
 
     use crate::serde::CONTENT_TYPE_TEXT;
     use arrow_array::RecordBatchIterator;
