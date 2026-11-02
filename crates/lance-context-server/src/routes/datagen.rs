@@ -527,6 +527,7 @@ mod tests {
         }
 
         let cached_fold = state.get_or_open_datagen_store("fold-store").await.unwrap();
+        let cached_fold_version = cached_fold.read().await.version();
         let mut fold_writer = DatagenStore::open_existing_with_options(
             &state.datagen_uri("fold-store"),
             DatagenStoreOptions {
@@ -556,9 +557,32 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(found.item.unwrap().item_id, "merged-item");
-        assert_eq!(cached_fold.read().await.version(), fold_writer.version());
+        // Consistent reads refresh a private dataset snapshot, not the shared
+        // handle. Verify another external commit through that same stale handle.
+        assert_eq!(cached_fold.read().await.version(), cached_fold_version);
+        fold_writer
+            .append(&[event(
+                "second-item",
+                0,
+                "created",
+                0,
+                DatagenEventType::ItemCreated,
+            )])
+            .await
+            .unwrap();
+        assert_eq!(fold_writer.cleanup_own_shard().await.unwrap(), 1);
+        let Json(found) = fold_datagen_item(
+            State(state.clone()),
+            Path(("fold-store".to_string(), "second-item".to_string())),
+            Query(FoldParams { load_blobs: false }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(found.item.unwrap().item_id, "second-item");
+        assert_eq!(cached_fold.read().await.version(), cached_fold_version);
 
         let cached_blob = state.get_or_open_datagen_store("blob-store").await.unwrap();
+        let cached_blob_version = cached_blob.read().await.version();
         let mut blob_writer = DatagenStore::open_existing_with_options(
             &state.datagen_uri("blob-store"),
             DatagenStoreOptions {
@@ -595,6 +619,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bytes.as_ref(), payload.as_slice());
-        assert_eq!(cached_blob.read().await.version(), blob_writer.version());
+        assert_eq!(cached_blob.read().await.version(), cached_blob_version);
     }
 }
