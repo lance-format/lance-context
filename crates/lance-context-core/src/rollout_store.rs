@@ -1043,11 +1043,19 @@ impl RolloutStore {
         let selection_schema = Arc::new(projected_arrow_schema(&dataset, &selection_columns)?);
         let columns = Self::non_blob_columns_for(&dataset);
         let target_schema = Arc::new(projected_arrow_schema(&dataset, &columns)?);
+        // Identify the failing physical source without logging filters, row
+        // values, object paths, or changing the consistent-read retry policy.
+        let report_source_failure = |phase: &'static str, source_kind: &'static str| {
+            tracing::warn!(uri = %self.base.dataset.uri(), phase, source_kind,
+                "rollout selected read source failed");
+        };
         let mut sources = vec![dataset];
         for snapshot in snapshots {
             for generation in snapshot.sstables {
                 let uri = self.flushed_generation_uri(snapshot.shard_id, &generation.path);
-                sources.push(self.open_flushed_dataset(&uri).await?);
+                sources.push(self.open_flushed_dataset(&uri).await.inspect_err(|_| {
+                    report_source_failure("open", "wal");
+                })?);
             }
         }
 
@@ -1063,12 +1071,17 @@ impl RolloutStore {
         let mut positions = HashMap::new();
         let mut selections = Vec::new();
         for (source_index, dataset) in sources.iter().enumerate() {
+            let source_kind = if source_index == 0 { "base" } else { "wal" };
             let mut scanner = dataset.scan();
             scanner
                 .project(&projected_column_refs(dataset, &selection_columns))?
                 .with_row_id();
-            let mut stream = scanner.try_into_stream().await?;
-            while let Some(batch) = stream.try_next().await? {
+            let mut stream = scanner.try_into_stream().await.inspect_err(|_| {
+                report_source_failure("selection_plan", source_kind);
+            })?;
+            while let Some(batch) = stream.try_next().await.inspect_err(|_| {
+                report_source_failure("selection_stream", source_kind);
+            })? {
                 let row_ids = column_as::<UInt64Array>(&batch, "_rowid")?.clone();
                 let selection_indices = batch
                     .schema()
@@ -1130,13 +1143,19 @@ impl RolloutStore {
             pause.reached.notify_one();
             pause.resume.notified().await;
         }
-        for (dataset, rows) in sources.iter().zip(per_source) {
+        for (source_index, (dataset, rows)) in sources.iter().zip(per_source).enumerate() {
+            let source_kind = if source_index == 0 { "base" } else { "wal" };
             // Bound individual wide-row takes, including unbounded filtered
             // callers. Allocate from observed rows, never from a client limit.
             for chunk in rows.chunks(256) {
                 let row_ids = chunk.iter().map(|(_, id)| *id).collect::<Vec<_>>();
                 let projection = projected_dataset_schema(dataset, &columns)?;
-                let batch = dataset.take_rows(&row_ids, projection).await?;
+                let batch = dataset
+                    .take_rows(&row_ids, projection)
+                    .await
+                    .inspect_err(|_| {
+                        report_source_failure("materialize", source_kind);
+                    })?;
                 let aligned = align_batch_to_schema(batch, target_schema.clone())?;
                 let records = batch_to_rollout_records(&aligned)?;
                 if records.len() != chunk.len() {
