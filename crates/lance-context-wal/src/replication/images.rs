@@ -173,7 +173,15 @@ impl CheckpointTask {
             &limits,
             cut,
             state,
-            |index, meta| read_body(&store, previous.as_deref(), index, meta),
+            |index, meta| {
+                read_body(
+                    &store,
+                    previous.as_deref(),
+                    index,
+                    meta,
+                    limits.max_record_bytes as usize,
+                )
+            },
         )?;
         permit.0.track(&loaded.image)?;
         Ok(PreparedCheckpoint {
@@ -236,12 +244,19 @@ pub(super) fn read_body(
     image: Option<&Image>,
     index: u64,
     meta: &BatchMeta,
+    limit: usize,
 ) -> Result<bytes::Bytes> {
     if let Some(image) = image {
         if let Some(body) = image.read_for_validation(index)? {
+            // Pack ranges have no individual storage checksum. Validate them
+            // before a new pack's digest could bless damaged source bytes.
+            meta.validate_payload(&body, limit)?;
             return Ok(body);
         }
     }
+    // Admission, peer reception and recovery validate the payload digest.
+    // Native reads check the complete block CRC on cache fill and bind its
+    // metadata to this captured record, just as in Node::read_accepted.
     read_log_body(store, index, meta)
 }
 

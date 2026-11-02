@@ -561,6 +561,10 @@ pub(super) fn build_sizes(
 
 /// Inputs must be a captured, immutable applied cut. The owner retains its log
 /// and prior image while this worker reads one bounded body at a time.
+/// The callback must check source integrity and bind bytes to the supplied
+/// metadata: native log reads use the block CRC and exact entry metadata;
+/// prior image ranges require payload digest validation. This writer checks
+/// lengths and hashes the complete output without rehashing each native input.
 pub(super) fn build(
     directory: &Path,
     layout: &Layout,
@@ -601,7 +605,7 @@ pub(super) fn build(
     let mut pack = Writer::new(&paths[1], payload_bytes)?;
     for (index, meta) in &state.accepted {
         let body = read(*index, meta)?;
-        meta.validate_payload(&body, limits.max_record_bytes as usize)?;
+        meta.check_body_length(body.len(), limits.max_record_bytes as usize)?;
         pack.write_all(&body)?;
     }
     let (bytes, digest) = pack.finish()?;

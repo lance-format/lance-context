@@ -39,7 +39,11 @@ fn create(directory: &Path, id: u128) -> Result<Loaded> {
             id: Uuid::from_u128(id),
         },
         state,
-        |index, _| Ok(bodies[&index].clone()),
+        |index, meta| {
+            let body = bodies[&index].clone();
+            meta.validate_payload(&body, Limits::default().max_record_bytes as usize)?;
+            Ok(body)
+        },
     )
 }
 
@@ -378,7 +382,11 @@ fn mixed_catalog_image_preserves_payloads_and_rejects_corrupt_table_frames() -> 
             id: Uuid::from_u128(220),
         },
         state.clone(),
-        |index, _| Ok(bodies[&index].clone()),
+        |index, meta| {
+            let body = bodies[&index].clone();
+            meta.validate_payload(&body, Limits::default().max_record_bytes as usize)?;
+            Ok(body)
+        },
     )?;
     let snapshot = built.image.snapshot()?;
     assert_eq!(
