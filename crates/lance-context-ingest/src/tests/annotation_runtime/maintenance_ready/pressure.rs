@@ -129,6 +129,10 @@ async fn pressured_publication_defers_one_maintenance_turn_without_starving_inde
         )
         .await?;
         assert_eq!(service.source_observation().records, 1);
+        // Applying the intervening catalog records can move the cut beyond
+        // the last mutation index. Publish exactly this complete applied cut.
+        let applied = service.observation().await.0.applied;
+        assert!(applied >= current.index);
         let before = annotation_publication::read(&c, &storage, None).await?;
         runtime.publish_once_for_test().await?;
         if round % 2 == 1 {
@@ -142,10 +146,15 @@ async fn pressured_publication_defers_one_maintenance_turn_without_starving_inde
         }
         assert_eq!(
             service.observation().await.0.materialized,
-            current.index,
+            applied,
             "source pressure must get one publication before new maintenance"
         );
-        materialized = current.index;
+        assert_eq!(service.source_observation().records, 0);
+        assert!(
+            !pending.is_finished(),
+            "publication must not ACK an unapplied update"
+        );
+        materialized = applied;
         current = finish_update(&mut runtime, pending).await?;
         assert_eq!(current.result, MutationResult::Applied);
     }
