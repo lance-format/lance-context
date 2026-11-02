@@ -428,6 +428,14 @@ struct TargetTickets {
 }
 
 impl TargetTickets {
+    fn offered(&mut self, key: &[u8]) {
+        if let Some(key) = self.keys.get(key) {
+            // A successful receiver rearms the same ticket. Resume after the
+            // selected ticket even when this scope has fewer than 64 members.
+            self.cursor = Some(key.clone());
+        }
+    }
+
     fn page(&mut self) -> Vec<Vec<u8>> {
         let start = self.cursor.take().map_or(Bound::Unbounded, Bound::Excluded);
         let mut keys: Vec<_> = self
@@ -801,12 +809,20 @@ pub(super) async fn place(
             target: task.target,
             nonce: lance_context_core::generate_id(),
         };
+        let target = offer.target.clone();
         let offer = assignment(prefix, ticket_key, &ticket_entry.value, &offer)?;
         if let Some(revision) = publisher
             .publish_assignment(&offer, ticket_entry.lease_id, entry.revision)
             .await
             .map_err(|e| e.to_string())?
         {
+            if resident {
+                for scope in [target.as_str(), "*"] {
+                    if let Some(index) = cache.placement.target_tickets.get_mut(scope) {
+                        index.offered(offer.ticket_key.as_bytes());
+                    }
+                }
+            }
             cache.placement.fallback.offered(&offer.task_id);
             // Publish into our cache immediately: don't offer this capacity twice
             // while waiting for our own writes to echo through the Watch stream.
@@ -870,6 +886,145 @@ pub(super) async fn recover(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn resident_tickets_rotate_after_successful_offers() {
+        for count in [2, 63, 64, 65, 130] {
+            let mut index = TargetTickets::default();
+            let keys: Vec<Vec<u8>> = (0..count)
+                .map(|n| format!("ticket-{n:04}").into_bytes())
+                .collect();
+            index.keys.extend(keys.iter().cloned().map(Arc::from));
+            for expected in keys.iter().cycle().take(count * 2) {
+                let page = index.page();
+                assert!(page.len() <= 64);
+                assert_eq!(&page[0], expected, "scope size {count}");
+                index.offered(&page[0]);
+                // A receiver consumes and later rearms its original ticket.
+                assert!(index.keys.remove(page[0].as_slice()));
+                index.keys.insert(Arc::from(page[0].clone()));
+            }
+        }
+    }
+
+    #[test]
+    fn resident_rotation_skips_missing_ticket_without_losing_other_members() {
+        let mut index = TargetTickets::default();
+        for key in [b"a", b"b", b"c"] {
+            index.keys.insert(Arc::from(key.as_slice()));
+        }
+        assert_eq!(index.page()[0], b"a");
+        index.offered(b"a");
+        index.keys.remove(b"a".as_slice());
+        assert_eq!(index.page()[0], b"b");
+        index.offered(b"b");
+        index.offered(b"not-a-member");
+        assert_eq!(index.page()[0], b"c");
+        index.offered(b"c");
+        assert_eq!(index.page()[0], b"b");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated ETCD_TEST_ENDPOINTS"]
+    async fn resident_offers_alternate_rearmed_exact_and_wildcard_tickets() {
+        for automatic in [false, true] {
+            let (_dir, mut cfg, store, leader) = setup().await;
+            cfg.local_merge.master_local_merge_auto = automatic;
+            cfg.local_merge.master_local_merge_targets = vec!["*".into()];
+            if !automatic {
+                cfg.merge_rollout.owned_targets = vec!["wanted".into()];
+            }
+            cfg.maintenance.wal_claim_targets = vec!["wanted".into()];
+            cfg.maintenance.fence_legacy_maintenance = true;
+            let targets = crate::local_merge::targets(&cfg);
+            assert_eq!(targets, [if automatic { "*" } else { "wanted" }]);
+            // The receiver's claim policy must match its resident capacity ticket.
+            let resident_store = TaskStore::open(&cfg).await.unwrap();
+            let mut tickets = Vec::new();
+            for executor in ["old", "new"] {
+                let value = serde_json::to_vec(&Ticket::new(
+                    &cfg,
+                    executor,
+                    "resident_merge",
+                    TaskKinds::MERGE_WAL,
+                    true,
+                ))
+                .unwrap();
+                let guard = store.create_dispatch_ticket(value.clone()).await.unwrap();
+                tickets.push((guard, value));
+            }
+            tickets.sort_by(|a, b| a.0.key().cmp(b.0.key()));
+            let publisher = store.discovery_publisher(&leader);
+            let prefix = cfg.etcd.prefix();
+            let mut cache = list(store.etcd_client(), prefix).await.unwrap();
+            let admission = Arc::new(admission::Admission::default());
+            for round in 0..6 {
+                let task = store
+                    .enqueue(TaskKind::MergeWal, "wanted", vec![])
+                    .await
+                    .unwrap();
+                // Apply real etcd changes to the existing informer, retaining its
+                // placement state just as Watch updates do between tasks.
+                let fresh = list(store.etcd_client(), prefix).await.unwrap();
+                let revision = *fresh.revisions.iter().max().unwrap();
+                let removed: Vec<_> = cache
+                    .entries
+                    .keys()
+                    .filter(|key| !fresh.entries.contains_key(*key))
+                    .cloned()
+                    .collect();
+                for key in removed {
+                    cache.apply(&key, None, revision).unwrap();
+                }
+                for (key, entry) in fresh.entries {
+                    cache
+                        .apply(&key, Some(&entry.value), entry.revision)
+                        .unwrap();
+                    cache.entries.get_mut(&key).unwrap().lease_id = entry.lease_id;
+                }
+                while place(&publisher, prefix, &mut cache).await.unwrap() {}
+                let selected = round % 2;
+                let offer = offer_for(&store, &cfg, &tickets[selected].0).await;
+                assert_eq!(offer.task_id, task.id);
+                let other = tickets[1 - selected]
+                    .0
+                    .key()
+                    .replace("/tickets/", "/offers/");
+                assert!(store
+                    .etcd_client()
+                    .clone()
+                    .get(other, None)
+                    .await
+                    .unwrap()
+                    .kvs()
+                    .is_empty());
+                let operation = admission.try_admit_named("resident_merge").unwrap();
+                let claim = resident_store
+                    .claim_assignment(&offer, TaskKinds::MERGE_WAL, Some(&targets), &operation)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(resident_store
+                    .claim_assignment(&offer, TaskKinds::MERGE_WAL, Some(&targets), &operation,)
+                    .await
+                    .unwrap()
+                    .is_none());
+                resident_store
+                    .finish(claim, Ok("completed".into()))
+                    .await
+                    .unwrap();
+                let (guard, value) = &mut tickets[selected];
+                store
+                    .rearm_dispatch_ticket(guard, value.clone())
+                    .await
+                    .unwrap();
+            }
+            for (guard, _) in tickets {
+                store.release_coordination_lock(guard).await.unwrap();
+            }
+            store.release_coordination_lock(leader).await.unwrap();
+        }
+    }
+
     #[tokio::test]
     #[ignore = "requires isolated ETCD_TEST_ENDPOINTS"]
     async fn relisting_preserves_fallback_deadlines_and_prunes_deleted_tasks() {
