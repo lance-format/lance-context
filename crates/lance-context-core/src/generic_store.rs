@@ -114,6 +114,17 @@ pub struct GenericStore {
     /// Whether `add` seals before returning. Resolved from the dataset on a
     /// reopen, from the caller on a create.
     seal_on_add: bool,
+    #[cfg(test)]
+    filtered_read_pause: std::sync::Mutex<Option<Arc<FilteredReadPause>>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct FilteredReadPause {
+    reached: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+    before_stream: bool,
+    calls: std::sync::atomic::AtomicUsize,
 }
 
 impl GenericStore {
@@ -230,6 +241,8 @@ impl GenericStore {
             spec: persisted,
             schema,
             seal_on_add,
+            #[cfg(test)]
+            filtered_read_pause: Default::default(),
         })
     }
 
@@ -447,7 +460,7 @@ impl GenericStore {
             // Keep point/filtered reads on this handle's view. The server's
             // refresh-on-miss path refreshes the cached handle itself; reading
             // a newer clone on every lookup would bypass that cache update.
-            let result = async {
+            let operation = async {
                 let snapshots = self.base.wal_shard_snapshots().await?;
                 self.scan_filtered_snapshot(
                     self.base.dataset.clone(),
@@ -458,8 +471,8 @@ impl GenericStore {
                     columns,
                 )
                 .await
-            }
-            .await;
+            };
+            let result = self.base.protect_wal_read(ListSource::All, operation).await;
             if !self.base.is_version_pinned()
                 && matches!(&result, Err(error) if is_not_found_error(error)
                     && !matches!(error, LanceError::InvalidInput { .. } | LanceError::SchemaMismatch { .. }))
@@ -532,6 +545,15 @@ impl GenericStore {
         offset: Option<usize>,
         columns: &[String],
     ) -> LanceResult<Vec<Row>> {
+        #[cfg(test)]
+        let pause = self.filtered_read_pause.lock().unwrap().clone();
+        #[cfg(test)]
+        let pause_this_attempt = pause.as_ref().is_some_and(|pause| {
+            pause
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                == 0
+        });
         let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
         let mut scanner =
             StorageBase::lsm_scanner_for_dataset(&dataset, ID_COLUMN, ListSource::All, snapshots)
@@ -543,7 +565,21 @@ impl GenericStore {
                 map_i64_bound("offset", offset)?,
             )?;
         }
+        #[cfg(test)]
+        if let Some(pause) = &pause {
+            if pause_this_attempt && pause.before_stream {
+                pause.reached.notify_one();
+                pause.resume.notified().await;
+            }
+        }
         let mut stream = scanner.try_into_stream().await?;
+        #[cfg(test)]
+        if let Some(pause) = &pause {
+            if pause_this_attempt && !pause.before_stream {
+                pause.reached.notify_one();
+                pause.resume.notified().await;
+            }
+        }
         let mut rows = Vec::new();
         while let Some(batch) = stream.try_next().await? {
             rows.extend(batch_to_rows(&self.spec, &batch)?);
@@ -615,23 +651,49 @@ impl GenericStore {
     /// Read rows from a chosen [`ListSource`] — base table, pending WAL
     /// generations, or their union.
     pub async fn list_from(&self, source: ListSource) -> LanceResult<Vec<Row>> {
-        let snapshots = match source {
-            ListSource::Fragments => Vec::new(),
-            ListSource::Wal | ListSource::All => self.base.wal_shard_snapshots().await?,
-        };
-        let columns = self.spec.scan_columns();
-        let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
-        let scanner = self
-            .base
-            .lsm_scanner_for_source(source, snapshots)
-            .project(&refs)?;
-
-        let mut stream = scanner.try_into_stream().await?;
-        let mut rows = Vec::new();
-        while let Some(batch) = stream.try_next().await? {
-            rows.extend(batch_to_rows(&self.spec, &batch)?);
+        // The All view must pair a current base with the WAL manifest captured
+        // for it. Fragments keeps the handle's base-only view; Wal keeps the
+        // captured pending-generation view, even if a merge drains it later.
+        if source == ListSource::All {
+            return self
+                .base
+                .read_consistent(source, |dataset, snapshots| async move {
+                    let columns = self.spec.scan_columns();
+                    let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+                    let scanner = StorageBase::lsm_scanner_for_dataset(
+                        &dataset, ID_COLUMN, source, snapshots,
+                    )
+                    .project(&refs)?;
+                    let mut stream = scanner.try_into_stream().await?;
+                    let mut rows = Vec::new();
+                    while let Some(batch) = stream.try_next().await? {
+                        rows.extend(batch_to_rows(&self.spec, &batch)?);
+                    }
+                    Ok(rows)
+                })
+                .await;
         }
-        Ok(rows)
+        self.base
+            .protect_wal_read(source, async {
+                let snapshots = match source {
+                    ListSource::Fragments => Vec::new(),
+                    ListSource::Wal | ListSource::All => self.base.wal_shard_snapshots().await?,
+                };
+                let columns = self.spec.scan_columns();
+                let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+                let scanner = self
+                    .base
+                    .lsm_scanner_for_source(source, snapshots)
+                    .project(&refs)?;
+
+                let mut stream = scanner.try_into_stream().await?;
+                let mut rows = Vec::new();
+                while let Some(batch) = stream.try_next().await? {
+                    rows.extend(batch_to_rows(&self.spec, &batch)?);
+                }
+                Ok(rows)
+            })
+            .await
     }
 
     /// Seal the active memtable so previously added rows become readable
@@ -746,6 +808,12 @@ impl GenericStore {
     /// Generations pending merge across all shards. Read-only.
     pub async fn pending_wal_generations(&self) -> LanceResult<usize> {
         self.base.pending_wal_generations().await
+    }
+
+    /// Admit durable WAL retirement discovery to the bounded background collector.
+    /// This may wait for capacity and must not run inside read/pending probes.
+    pub async fn discover_retired_wal(&self) -> LanceResult<()> {
+        self.base.discover_retired_wal().await
     }
 
     /// Total and largest per-shard pending counts from one manifest pass.
@@ -923,17 +991,263 @@ fn is_wal_pk_batch_error(error: &LanceError) -> bool {
 // formats the Ok value) is unavailable; `.err().expect(..)` is the alternative.
 #[allow(clippy::err_expect)]
 mod tests {
+
+    #[tokio::test]
+    async fn wal_lifetime_registration_failure_preserves_metadata_probes() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let writer = GenericStore::open(uri, spec(), sealing()).await.unwrap();
+        writer.add(&[row(json!({"id":"protected"}))]).await.unwrap();
+        let reader = GenericStore::open_existing(uri, Default::default())
+            .await
+            .unwrap();
+        // A file in place of the registration directory deterministically
+        // rejects publication, while all real WAL and base data remain intact.
+        std::fs::write(dir.path().join("_wal_readers_v1"), b"unavailable").unwrap();
+        assert!(reader.list_from(ListSource::Wal).await.is_err());
+        assert!(reader.list_from(ListSource::All).await.is_err());
+        assert!(reader
+            .list_from(ListSource::Fragments)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(reader.base.pending_wal_generations().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn wal_lifetime_covers_explicit_source_reads() {
+        for source in [ListSource::Wal, ListSource::All] {
+            let dir = TempDir::new().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let mut writer = GenericStore::open(uri, spec(), sealing()).await.unwrap();
+            writer
+                .add(&[row(json!({"id":"protected", "user_id":"payload"}))])
+                .await
+                .unwrap();
+            let reader = GenericStore::open_existing(uri, Default::default())
+                .await
+                .unwrap();
+            let rows = crate::wal_read_lifetime::assert_read_survives_merge(
+                &reader.base,
+                &mut writer.base,
+                reader.list_from(source),
+            )
+            .await;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0]["id"], json!("protected"));
+            assert_eq!(rows[0]["user_id"], json!("payload"));
+        }
+    }
+
+    #[tokio::test]
+    async fn wal_snapshot_after_drain_generic_all_reads() {
+        for source in [ListSource::All] {
+            let dir = TempDir::new().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let mut writer = GenericStore::open(uri, spec(), sealing()).await.unwrap();
+            writer
+                .add(&[row(json!({"id":"protected", "user_id":"payload"}))])
+                .await
+                .unwrap();
+            let reader = GenericStore::open_existing(uri, Default::default())
+                .await
+                .unwrap();
+            let rows = crate::wal_read_lifetime::assert_read_after_merge(
+                &reader.base,
+                &mut writer.base,
+                reader.list_from(source),
+            )
+            .await;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0]["id"], json!("protected"));
+            assert_eq!(rows[0]["user_id"], json!("payload"));
+        }
+    }
+
+    #[tokio::test]
+    async fn cold_reopen_lifecycle_discovers_retirement_with_zero_pending() {
+        use object_store::ObjectStoreExt;
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut original = GenericStore::open(uri, spec(), Default::default())
+            .await
+            .unwrap();
+        let store = original.base.dataset.object_store(None).await.unwrap();
+        let root = original.base.dataset.branch_location().path.clone();
+        let shard = uuid::Uuid::new_v4();
+        let manifests =
+            lance::dataset::mem_wal::ShardManifestStore::new(store.clone(), &root, shard, 16);
+        manifests
+            .initialize_shard(0, Default::default())
+            .await
+            .unwrap();
+        manifests
+            .commit_update(0, |current| {
+                let mut next = current.clone();
+                next.version += 1;
+                next.current_generation = 2;
+                next
+            })
+            .await
+            .unwrap();
+        let keys = crate::wal_retirement::record(
+            store.clone(),
+            &root,
+            shard,
+            vec![crate::rollout_append::Generation {
+                number: 1,
+                path: "abcdef12_gen_1".into(),
+            }],
+        )
+        .await
+        .unwrap();
+        let payload = root
+            .clone()
+            .join("_mem_wal")
+            .join(shard.to_string())
+            .join("abcdef12_gen_1")
+            .join("data")
+            .join("payload");
+        store.put(&payload, b"retired").await.unwrap();
+        original.close().await.unwrap();
+        drop(original);
+        let mut reopened = GenericStore::open_existing(uri, Default::default())
+            .await
+            .unwrap();
+        assert_eq!(reopened.pending_wal_generations().await.unwrap(), 0);
+        assert!(store.inner.head(&keys[0]).await.is_ok());
+        assert!(store.inner.head(&payload).await.is_ok());
+        reopened.discover_retired_wal().await.unwrap();
+        assert!(store.inner.head(&payload).await.is_ok());
+        reopened.base.wal_collection = crate::wal_gc::Mode::Collect;
+        reopened.discover_retired_wal().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match store.inner.head(&keys[0]).await {
+                    Err(object_store::Error::NotFound { .. }) => break,
+                    Ok(_) => tokio::time::sleep(std::time::Duration::from_millis(5)).await,
+                    Err(error) => panic!("retirement observation failed: {error}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            store.inner.head(&payload).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+        reopened.close().await.unwrap();
+    }
     use super::*;
     use lance_context_api::schema_spec::{ColumnSpec, ColumnType};
     use serde_json::json;
     use tempfile::TempDir;
 
     #[tokio::test]
+    async fn filtered_reads_protect_the_initial_cached_wal_view() {
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        for (point, before_stream) in [(true, true), (true, false), (false, true), (false, false)] {
+            let dir = TempDir::new().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let mut writer = GenericStore::open(uri, spec(), sealing()).await.unwrap();
+            writer.base.wal_collection = crate::wal_gc::Mode::Collect;
+            writer
+                .add(&[
+                    row(json!({"id":"wanted", "user_id":"original"})),
+                    row(json!({"id":"other", "user_id":"hidden"})),
+                ])
+                .await
+                .unwrap();
+            let reader = GenericStore::open_existing(uri, Default::default())
+                .await
+                .unwrap();
+            assert!(reader.base.wal_read_protection);
+            let pause = Arc::new(FilteredReadPause {
+                before_stream,
+                ..Default::default()
+            });
+            *reader.filtered_read_pause.lock().unwrap() = Some(pause.clone());
+            let reader = Arc::new(reader);
+            let reading = {
+                let reader = reader.clone();
+                tokio::spawn(async move {
+                    if point {
+                        reader
+                            .get("wanted", None)
+                            .await
+                            .map(|row| row.into_iter().collect::<Vec<_>>())
+                    } else {
+                        reader.list_filtered("id = 'wanted'", Some(1), None).await
+                    }
+                })
+            };
+            tokio::time::timeout(Duration::from_secs(30), pause.reached.notified())
+                .await
+                .unwrap();
+            let mut paths = Vec::new();
+            for value in [None, Some("updated"), Some("latest")] {
+                if let Some(value) = value {
+                    writer
+                        .add(&[row(json!({"id":"wanted", "user_id":value}))])
+                        .await
+                        .unwrap();
+                }
+                for snapshot in writer.base.wal_shard_snapshots().await.unwrap() {
+                    for generation in snapshot.sstables {
+                        paths.push(
+                            writer
+                                .base
+                                .flushed_generation_uri(snapshot.shard_id, &generation.path),
+                        );
+                    }
+                }
+                assert_eq!(writer.cleanup_wal().await.unwrap(), 1);
+                assert_eq!(writer.pending_wal_generation_counts().await.unwrap().0, 0);
+            }
+            assert_eq!(paths.len(), 3);
+            tokio::time::sleep(Duration::from_millis(2100)).await;
+            assert!(paths.iter().all(|path| std::path::Path::new(path).exists()));
+            let later = GenericStore::open_existing(uri, Default::default())
+                .await
+                .unwrap();
+            assert_eq!(
+                later.get("wanted", None).await.unwrap().unwrap()["user_id"],
+                "latest"
+            );
+            assert!(!reading.is_finished());
+            pause.resume.notify_one();
+            let rows = tokio::time::timeout(Duration::from_secs(30), reading)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                pause.calls.load(Ordering::SeqCst),
+                1,
+                "the first cached view must survive without retry"
+            );
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0]["id"], "wanted");
+            assert_eq!(rows[0]["user_id"], "original");
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while paths.iter().any(|path| std::path::Path::new(path).exists()) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn filtered_point_snapshot_recovers_peer_gc_and_preserves_filter() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let dir = TempDir::new().unwrap();
         let uri = dir.path().to_str().unwrap();
-        let writer = GenericStore::open(uri, spec(), sealing()).await.unwrap();
+        let mut writer = GenericStore::open(uri, spec(), sealing()).await.unwrap();
+        writer.base.wal_collection = crate::wal_gc::Mode::Collect;
         writer
             .add(&[
                 row(json!({"id":"wanted", "user_id":"value"})),
@@ -941,9 +1255,10 @@ mod tests {
             ])
             .await
             .unwrap();
-        let reader = GenericStore::open_existing(uri, Default::default())
+        let mut reader = GenericStore::open_existing(uri, Default::default())
             .await
             .unwrap();
+        reader.base.wal_read_protection = false; // Historical unregistered reader.
         let writer = tokio::sync::Mutex::new(writer);
         let attempts = AtomicUsize::new(0);
         let columns = vec!["id".to_string(), "user_id".to_string()];
@@ -962,9 +1277,10 @@ mod tests {
                                 let path = reader
                                     .base
                                     .flushed_generation_uri(snapshot.shard_id, &generation.path);
-                                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                                tokio::time::timeout(std::time::Duration::from_secs(30), async {
                                     while std::path::Path::new(&path).exists() {
-                                        tokio::task::yield_now().await;
+                                        tokio::time::sleep(std::time::Duration::from_millis(10))
+                                            .await;
                                     }
                                 })
                                 .await

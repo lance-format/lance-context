@@ -9,7 +9,7 @@ use arrow_array::{Array, BooleanArray, RecordBatch, StringArray};
 use arrow_schema::Schema;
 use arrow_select::filter::filter_record_batch;
 use datafusion::prelude::{col, lit};
-use futures::{StreamExt, TryStreamExt};
+use futures::TryStreamExt;
 use lance::dataset::{
     mem_wal::{DatasetMemWalExt, ShardManifestStore},
     transaction::{Operation, Transaction},
@@ -310,7 +310,11 @@ async fn shard_store(dataset: &Dataset, shard: Uuid) -> Result<ShardManifestStor
 
 /// A previous append can be visible while its separate shard drain is not.
 /// Reconcile solely from the atomic base watermark, without reading any WAL data.
-pub(crate) async fn reconcile_shard(dataset: &Dataset, shard: Uuid) -> Result<usize> {
+pub(crate) async fn reconcile_shard(
+    dataset: &Dataset,
+    shard: Uuid,
+    mode: crate::wal_gc::Mode,
+) -> Result<usize> {
     let Some(high) = watermarks(dataset).await?.get(&shard).copied() else {
         return Ok(0);
     };
@@ -326,35 +330,24 @@ pub(crate) async fn reconcile_shard(dataset: &Dataset, shard: Uuid) -> Result<us
         .collect();
     let count = generations.len();
     if count > 0 {
-        let paths: Vec<_> = manifest
+        let retiring: Vec<_> = manifest
             .sstables
             .iter()
             .filter(|g| generations.contains(&g.generation))
-            .map(|g| g.path.clone())
+            .map(|g| Generation {
+                number: g.generation,
+                path: g.path.clone(),
+            })
             .collect();
+        let object_store = dataset.object_store(None).await?;
+        let branch = dataset.branch_location().path.clone();
+        let retirements =
+            crate::wal_retirement::record(object_store.clone(), &branch, shard, retiring).await?;
         let phase = crate::merge_write_scope::work_stage("wal_drain");
         crate::merge_write_scope::drain_generations(store, manifest.writer_epoch, generations)
             .await?;
         drop(phase);
-        let object_store = dataset.object_store(None).await?;
-        let root = dataset
-            .branch_location()
-            .path
-            .join("_mem_wal")
-            .join(shard.to_string().as_str());
-        tokio::spawn(async move {
-            futures::stream::iter(paths)
-                .for_each_concurrent(16, |path| {
-                    let object_store = object_store.clone();
-                    let path = root.clone().join(path.as_str());
-                    async move {
-                        if let Err(error) = object_store.remove_dir_all(path).await {
-                            tracing::warn!(%error, "merged rollout WAL directory cleanup failed");
-                        }
-                    }
-                })
-                .await;
-        });
+        crate::wal_gc::schedule(mode, object_store, branch, retirements);
     }
     Ok(count)
 }
@@ -430,6 +423,7 @@ async fn dataset_has_sealed_wal(dataset: &Dataset, shards: &[String]) -> Result<
 /// table commits and shard drains retain ownership checks and version fencing.
 pub struct AppendCoordinator {
     dataset: Dataset,
+    pub(crate) wal_collection: crate::wal_gc::Mode,
 }
 
 impl AppendCoordinator {
@@ -450,7 +444,10 @@ impl AppendCoordinator {
                 "rollout append requires the current rollout schema",
             ));
         }
-        Ok(Self { dataset })
+        Ok(Self {
+            dataset,
+            wal_collection: crate::wal_gc::Mode::configured()?,
+        })
     }
 
     pub fn version(&self) -> u64 {
@@ -501,7 +498,7 @@ impl AppendCoordinator {
         let mut reclaimed = 0;
         let marks = watermarks(&self.dataset).await?;
         for shard in shard_ids {
-            reclaimed += reconcile_shard(&self.dataset, shard).await?;
+            reclaimed += reconcile_shard(&self.dataset, shard, self.wal_collection).await?;
             let Some(manifest) = shard_store(&self.dataset, shard)
                 .await?
                 .refresh_latest()
@@ -730,7 +727,7 @@ impl AppendCoordinator {
         }
         let mut reclaimed = 0;
         for shard in shards {
-            reclaimed += reconcile_shard(&self.dataset, shard).await?;
+            reclaimed += reconcile_shard(&self.dataset, shard, self.wal_collection).await?;
         }
         Ok(reclaimed)
     }
