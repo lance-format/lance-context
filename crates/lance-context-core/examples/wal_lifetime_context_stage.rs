@@ -3,7 +3,8 @@
 
 use lance_context_api::AddRecordRequest;
 use lance_context_core::{
-    record_from_add_request, ContextStore, ContextStoreOptions, MergeMemoryBudget,
+    discover_retired_wal_at_uri, record_from_add_request, ContextStore, ContextStoreOptions,
+    MergeMemoryBudget,
 };
 use std::io::{self, Write};
 use std::time::Duration;
@@ -45,10 +46,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::var("ETCD_ENDPOINTS").is_ok_and(|s| !s.is_empty()) {
         return Err("staging driver must not inherit etcd endpoints".into());
     }
+    let action = std::env::args().nth(2);
+    if std::env::args().nth(3).is_some() || !matches!(action.as_deref(), None | Some("recover")) {
+        return Err("unknown staging action".into());
+    }
+    if action.is_some() && std::env::var("ROCKETKEEP_WAL_LIFECYCLE").as_deref() != Ok("collect") {
+        return Err("cold recovery requires explicit collect mode".into());
+    }
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()?;
+    if action.as_deref() == Some("recover") {
+        // A fresh process receives only the canonical fixture URI. Do not open
+        // a writer, read table payloads, or reuse the writer's remembered work.
+        rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(60), discover_retired_wal_at_uri(&uri)).await
+        })??;
+        emit(serde_json::json!({"kind":"retirement_recovery_admitted","uri":uri}));
+        command("close")?;
+        emit(serde_json::json!({"kind":"retirement_recovery_closed"}));
+        return Ok(());
+    }
     let mut store = rt.block_on(async {
         tokio::time::timeout(
             Duration::from_secs(60),

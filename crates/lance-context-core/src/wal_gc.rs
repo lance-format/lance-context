@@ -54,6 +54,31 @@ pub fn wal_collection_enabled() -> lance::Result<bool> {
     Ok(Mode::configured()? == Mode::Collect)
 }
 
+/// Admit durable WAL retirement work for a canonical main-branch table URI.
+///
+/// This opens only the object store, not a dataset, schema, index, or payload.
+/// It works for Context and Datagen as well as Rollout and Generic tables,
+/// including cold tables whose original process has exited. Every intent still
+/// revalidates the shard manifest and registered readers before deleting files.
+/// The service must supply durable table discovery and revisit failed attempts.
+/// Admission shares the process-wide bounds and may wait for collector capacity;
+/// do not call this from reads, pending probes, or while holding a merge claim.
+pub async fn discover_retired_wal_at_uri(uri: &str) -> lance::Result<()> {
+    discover_uri(Mode::configured()?, uri).await
+}
+
+async fn discover_uri(mode: Mode, uri: &str) -> lance::Result<()> {
+    if mode == Mode::Retain {
+        return Ok(());
+    }
+    let (store, root) = ObjectStore::from_uri(uri).await?;
+    discover(mode, store, root).await
+}
+
+#[path = "wal_gc_root_discovery.rs"]
+mod root_discovery;
+pub use root_discovery::discover_retired_wal_under_root;
+
 type TableKey = (String, Path);
 
 struct Limits {
@@ -842,3 +867,7 @@ mod tests {
         idle(&collector).await;
     }
 }
+
+#[cfg(test)]
+#[path = "wal_gc_cold_store_tests.rs"]
+mod cold_store_tests;
