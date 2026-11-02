@@ -21,7 +21,7 @@ impl Publisher {
             // A retained plan always resolves above; idle maintenance may drain.
             // After one maintenance turn, a ready or pressured source batch
             // takes the next turn. The first maintenance after a data publication
-            // remains eligible, so continuous writes still advance maintenance.
+            // remains eligible, subject to one pressure deferral below.
             if (self.options.compaction.is_none()
                 && self.options.turn_id_index.is_none()
                 && self.options.status_index.is_none())
@@ -96,8 +96,20 @@ impl Publisher {
                 // Remember only a completed no-candidate check, never a budget
                 // skip, a failed read, or a plan that still needs to finish.
                 self.compaction_checked_version = Some(view.progress.minimum_read_version);
+                self.maintenance_deferred_for_pressure = false;
                 return Ok(false);
             };
+            // Release a full source/staging window before starting new work.
+            // Keep this debt across data publications: sustained pressure may
+            // defer only one eligible maintenance turn. Retained plans bypass
+            // this choice and must finish through their original protocol.
+            if source.records != 0
+                && self.service.apply_backpressure().is_some()
+                && !self.maintenance_deferred_for_pressure
+            {
+                self.maintenance_deferred_for_pressure = true;
+                return Ok(false);
+            }
             // One slow rewrite can exceed the window. Its durable plan must
             // finish, but after that pending annotations get the next turn.
             self.compaction_started
@@ -161,6 +173,7 @@ impl Publisher {
         // An empty-source maintenance completion changes neither the source
         // checkpoint nor the in-memory result snapshot or active source window.
         self.catalog.finish_pending().await?;
+        self.maintenance_deferred_for_pressure = false;
         Ok(true)
     }
 }
