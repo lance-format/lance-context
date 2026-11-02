@@ -136,8 +136,21 @@ async fn connect_routes(config: &Config) -> Result<Vec<(Ingress, String)>> {
     let client = config.client()?;
     let layout = Arc::new(config.layout.clone());
     let budget = MergeMemoryBudget::new(config.ingress_memory_bytes);
+    let clusters = a
+        .wal_clusters
+        .iter()
+        .map(|(name, wal)| Ok((name.clone(), (wal.client()?, Arc::new(wal.layout.clone())))))
+        .collect::<Result<BTreeMap<_, _>>>()?;
     let mut routes = Vec::with_capacity(a.routes.len());
     for route in &a.routes {
+        let (client, layout) = if let Some(name) = &route.wal_cluster {
+            let (client, layout) = clusters
+                .get(name)
+                .context("unknown annotation WAL cluster")?;
+            (client, layout)
+        } else {
+            (&client, &layout)
+        };
         let ingress = annotations::mixed::connect_shard_ingress(
             client.clone(),
             layout.clone(),

@@ -227,6 +227,7 @@ async fn exercise() -> Result<()> {
             owner_url: bases[bucket as usize].clone(),
             shard: Some(physical.shard),
             routes: vec![],
+            wal_clusters: BTreeMap::new(),
             apply_memory_bytes: 8 << 20,
             staging: fixture::limits(),
             source: None,
@@ -271,6 +272,7 @@ async fn exercise() -> Result<()> {
             binding: physical.binding.clone(),
             shard: physical.shard,
             owner_url: bases[i].clone(),
+            wal_cluster: None,
         })
         .collect();
     for i in 2..4 {

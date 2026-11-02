@@ -389,6 +389,7 @@ async fn annotation_projection_application_config_routes_bootstrap_and_rejects_b
     config.annotations = Some(config::Annotations {
         shard: None,
         routes: vec![],
+        wal_clusters: BTreeMap::new(),
         owner_url: "http://unused-owner:8080".into(),
         apply_memory_bytes: 8 << 20,
         staging: limits(),
