@@ -20,6 +20,7 @@ fn configuration(c: &network::Cluster, physical: &Physical, owner_url: String) -
         owner_url,
         shard: Some(physical.shard),
         routes: vec![],
+        wal_clusters: BTreeMap::new(),
         apply_memory_bytes: 8 << 20,
         staging: fixture::limits(),
         source: None,
@@ -64,6 +65,82 @@ pub(super) async fn frontend(
     root: &std::path::Path,
     routes: &[(&Physical, &Server)],
 ) -> Result<Server> {
+    let mut config = configuration(c, routes[0].0, routes[0].1.uri());
+    config.annotations.as_mut().unwrap().routes = routes
+        .iter()
+        .map(|(physical, owner)| config::AnnotationRoute {
+            binding: physical.binding.clone(),
+            shard: physical.shard,
+            owner_url: owner.uri(),
+            wal_cluster: None,
+        })
+        .collect();
+    serve(config, root).await
+}
+
+pub(super) async fn clustered_frontend(
+    root: &std::path::Path,
+    routes: [(&network::Cluster, &Physical, &Server); 2],
+) -> Result<Server> {
+    let (local, physical, owner) = routes[0];
+    let mut config = configuration(local, physical, owner.uri());
+    let remote = &routes[1].0.application;
+    let connection = config::WalConnection {
+        layout: remote.layout.clone(),
+        limits: remote.limits.clone(),
+        endpoints: remote.endpoints.clone(),
+        tls: remote.tls.clone(),
+        rpc: remote.rpc.clone(),
+    };
+    let annotations = config.annotations.as_mut().unwrap();
+    annotations.wal_clusters.insert("remote".into(), connection);
+    annotations.routes = routes
+        .iter()
+        .enumerate()
+        .map(|(i, (_, physical, owner))| config::AnnotationRoute {
+            binding: physical.binding.clone(),
+            shard: physical.shard,
+            owner_url: owner.uri(),
+            wal_cluster: (i == 1).then(|| "remote".into()),
+        })
+        .collect();
+    config.validate()?;
+    let mut unknown = config.clone();
+    unknown.annotations.as_mut().unwrap().routes[1].wal_cluster = Some("missing".into());
+    assert!(unknown.validate().is_err());
+    let mut mismatch = config.clone();
+    mismatch
+        .annotations
+        .as_mut()
+        .unwrap()
+        .wal_clusters
+        .get_mut("remote")
+        .unwrap()
+        .layout
+        .buckets
+        .extend_from_within(..);
+    assert!(mismatch.validate().is_err());
+    let mut duplicate = config.clone();
+    duplicate
+        .annotations
+        .as_mut()
+        .unwrap()
+        .wal_clusters
+        .get_mut("remote")
+        .unwrap()
+        .layout
+        .cluster = config.layout.cluster;
+    assert!(duplicate.validate().is_err());
+    let mut local = config.clone();
+    local.annotations.as_mut().unwrap().routes[0].wal_cluster = Some("remote".into());
+    assert!(local.validate().is_err());
+    let mut unused = config.clone();
+    unused.annotations.as_mut().unwrap().routes[1].wal_cluster = None;
+    assert!(unused.validate().is_err());
+    serve(config, root).await
+}
+
+async fn serve(mut config: Config, root: &std::path::Path) -> Result<Server> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let token = root.join(format!("shard-token-{}", address.port()));
@@ -73,15 +150,28 @@ pub(super) async fn frontend(
         &receipts,
         serde_json::to_vec(&serde_json::json!({"active":1,"keys":{"1":vec![17u8;32]}}))?,
     )?;
-    let mut config = configuration(c, routes[0].0, routes[0].1.uri());
-    config.annotations.as_mut().unwrap().routes = routes
-        .iter()
-        .map(|(physical, owner)| config::AnnotationRoute {
-            binding: physical.binding.clone(),
-            shard: physical.shard,
-            owner_url: owner.uri(),
-        })
-        .collect();
+    if let Some(wal) = config
+        .annotations
+        .as_mut()
+        .unwrap()
+        .wal_clusters
+        .get_mut("remote")
+    {
+        // Exercise relative TLS paths by actually connecting the remote cluster
+        // through a serialized application config, not just inspecting strings.
+        for (i, path) in [
+            &mut wal.tls.certificate,
+            &mut wal.tls.private_key,
+            &mut wal.tls.roots,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let name = format!("remote-tls-{}-{i}.pem", address.port());
+            std::fs::copy(&*path, root.join(&name))?;
+            *path = name.into();
+        }
+    }
     config.http = Some(config::Http {
         listen: address,
         bearer_token_file: token,

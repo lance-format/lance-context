@@ -82,6 +82,7 @@ async fn frontend_with_settings(
     config.annotations = Some(config::Annotations {
         shard: None,
         routes: vec![],
+        wal_clusters: BTreeMap::new(),
         owner_url: uri.into(),
         apply_memory_bytes: 8 << 20,
         staging: settings.limits,

@@ -216,7 +216,7 @@ For fresh mixed body/annotation bindings, each owner can use its own narrow
 table, body table and WAL bucket. Set `annotations.shard` to `{"bucket": 0}`
 for the first owner, `{"bucket": 1}` for the second, and so on. This number is
 the bucket position in `layout.buckets`, not the WAL group ID stored there.
-All roles use the same immutable layout and mutation contract. Adding a WAL
+Within each WAL cluster, roles use the same immutable layout and mutation contract. Adding a WAL
 group also requires its source verification key in the immutable policy on all
 clients and replicas, and the matching signing key on every voter hosting that
 group. Source keys must be distinct across groups and from the catalog key;
@@ -232,6 +232,36 @@ table/shard/owner fields must match one of those entries. Missing or duplicate
 buckets, repeated physical destinations and mismatched local bindings fail
 configuration validation. Owner configs may omit `routes`; each owner serves
 only its assigned table. Ingresses share one admission budget across routes.
+
+A shared ingress can also route shards to independent WAL clusters. Each cluster
+keeps its existing catalog group, so ownership checks and publication for its
+shards do not pass through another cluster's catalog. Configure additional
+connections in `annotations.wal_clusters`, keyed by a deployment-chosen name.
+Each connection contains `layout`, `limits`, `endpoints`, `tls`, and optional
+`rpc`, with the same meanings as the top-level WAL connection fields. Relative
+TLS paths resolve against the ingress configuration file's directory.
+
+Set a route's optional `wal_cluster` to that connection name. An omitted value
+uses the top-level connection; the local table's route must use that connection.
+Existing configurations omit both new fields. One client pool is shared by all
+routes using a connection, and every route still shares the ingress memory
+budget. Provision each physical table with its owner's own WAL configuration
+before starting the ingress.
+
+All clusters in one logical route set must have distinct identities, the same
+bucket count, and compatible logical and Arrow mutation contracts. Their group
+IDs and replica placement may differ: turn-to-bucket routing depends on the
+logical key and bucket count. The complete route map must still contain exactly
+one owner per bucket, and all ingresses for the logical table must use the same
+bucket-to-owner and cluster map. Producer tokens retain their exact cluster, layout, table
+and incarnation scope; a signed token from another scope is rejected before
+forwarding. A surviving cluster can keep serving its shards while another is
+unavailable. Starting an ingress still requires all configured bindings to be
+reachable and validated.
+
+Choose these connections when provisioning fresh shards. Changing a live shard's
+cluster, layout or bucket count requires a separate migration; editing the route
+map does not transfer its acknowledged WAL or Lance publication state.
 
 Point reads route by turn ID using `annotations::Shard::for_turn`. Producers
 must partition batches by that same function, bind their Arrow schema with

@@ -92,6 +92,10 @@ pub struct Annotations {
     /// Complete authorized owner map for a shared ingress. Owners may omit it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub routes: Vec<AnnotationRoute>,
+    /// Additional independent WAL clusters used by shared-ingress routes.
+    /// Each has its own existing publication catalog and connection pool.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub wal_clusters: BTreeMap<String, WalConnection>,
     pub apply_memory_bytes: usize,
     #[serde(default)]
     pub staging: lance_context_core::annotation_staging::Limits,
@@ -120,10 +124,39 @@ pub struct AnnotationRoute {
     pub binding: TableBinding,
     pub shard: crate::annotations::Shard,
     pub owner_url: String,
+    /// Omitted routes use the application's primary WAL connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wal_cluster: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WalConnection {
+    pub layout: Layout,
+    pub limits: Limits,
+    pub endpoints: BTreeMap<u64, Endpoint>,
+    pub tls: TlsFiles,
+    #[serde(default)]
+    pub rpc: Rpc,
 }
 
 impl Annotations {
     fn validate_shards(&self, layout: &Layout, local: &TableBinding) -> Result<()> {
+        ensure!(
+            self.wal_clusters.len() <= self.routes.len(),
+            "annotation WAL clusters require owner routes"
+        );
+        let mut clusters = HashSet::from([layout.cluster]);
+        for (name, wal) in &self.wal_clusters {
+            wal.layout.validate()?;
+            ensure!(
+                !name.is_empty()
+                    && name.len() <= 128
+                    && clusters.insert(wal.layout.cluster)
+                    && wal.layout.buckets.len() == layout.buckets.len(),
+                "annotation WAL clusters require distinct identities and the same bucket count"
+            );
+        }
         let Some(shard) = self.shard else {
             ensure!(
                 layout.buckets.len() == 1 && self.routes.is_empty(),
@@ -147,8 +180,19 @@ impl Annotations {
         let (mut buckets, mut tables, mut destinations) =
             (HashSet::new(), HashSet::new(), HashSet::new());
         let mut includes_local = false;
+        let mut used_clusters = HashSet::new();
         for route in &self.routes {
-            layout.group_for_bucket(route.shard.bucket)?;
+            let route_layout = if let Some(name) = &route.wal_cluster {
+                used_clusters.insert(name);
+                &self
+                    .wal_clusters
+                    .get(name)
+                    .context("unknown annotation WAL cluster")?
+                    .layout
+            } else {
+                layout
+            };
+            route_layout.group_for_bucket(route.shard.bucket)?;
             ensure!(
                 route.binding.contract()? == contract
                     && !route.binding.table.is_nil()
@@ -165,7 +209,8 @@ impl Annotations {
             );
             if route.shard == shard {
                 ensure!(
-                    route.binding.table == local.table
+                    route.wal_cluster.is_none()
+                        && route.binding.table == local.table
                         && route.binding.incarnation == local.incarnation
                         && route.binding.destination == local.destination
                         && route.owner_url == self.owner_url,
@@ -175,6 +220,10 @@ impl Annotations {
             }
         }
         ensure!(includes_local, "local annotation route missing");
+        ensure!(
+            used_clusters.len() == self.wal_clusters.len(),
+            "unused annotation WAL cluster"
+        );
         Ok(())
     }
 }
@@ -260,6 +309,11 @@ impl Config {
             }
         }
         tls(base, &mut v.tls);
+        if let Some(a) = &mut v.annotations {
+            for wal in a.wal_clusters.values_mut() {
+                tls(base, &mut wal.tls);
+            }
+        }
         if let Some(h) = &mut v.http {
             resolve(base, &mut h.bearer_token_file);
             resolve(base, &mut h.receipt_key_file);
@@ -343,60 +397,86 @@ impl Config {
     }
     pub fn client(&self) -> Result<Arc<Client>> {
         self.validate()?;
-        let roots = CertificateDer::pem_slice_iter(&read(&self.tls.roots, 1 << 20)?)
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        ensure!(
-            !roots.is_empty() && roots.len() <= 128,
-            "invalid TLS root count"
-        );
-        let mut store = RootCertStore::empty();
-        for certificate in roots {
-            store.add(certificate)?;
-        }
-        let certificates = CertificateDer::pem_slice_iter(&read(&self.tls.certificate, 1 << 20)?)
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        ensure!(
-            !certificates.is_empty() && certificates.len() <= 16,
-            "invalid TLS chain"
-        );
-        let key = PrivateKeyDer::from_pem_slice(&read(&self.tls.private_key, 64 << 10)?)?;
-        let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()?
-        .with_root_certificates(store)
-        .with_client_auth_cert(certificates, key)?;
-        tls.alpn_protocols = vec![client::ALPN.to_vec()];
-        let endpoints = self
-            .endpoints
-            .iter()
-            .map(|(&id, e)| {
-                (
-                    id,
-                    client::Endpoint {
-                        data_address: e.data_address.clone(),
-                        control_address: e.control_address.clone(),
-                        server_name: e.server_name.clone(),
-                        certificate: e.certificate,
-                    },
-                )
-            })
-            .collect();
-        Ok(Arc::new(Client::new(
+        wal_client(
             &self.layout,
             &self.limits,
-            endpoints,
-            Arc::new(tls),
-            client::Options {
-                data_bytes: self.rpc.data_bytes,
-                control_bytes: self.rpc.control_bytes,
-                connections: self.rpc.connections_per_node,
-                timeout: self.rpc.timeout,
-                ..Default::default()
-            },
-        )?))
+            &self.endpoints,
+            &self.tls,
+            &self.rpc,
+        )
     }
 }
+impl WalConnection {
+    pub(super) fn client(&self) -> Result<Arc<Client>> {
+        wal_client(
+            &self.layout,
+            &self.limits,
+            &self.endpoints,
+            &self.tls,
+            &self.rpc,
+        )
+    }
+}
+fn wal_client(
+    layout: &Layout,
+    limits: &Limits,
+    endpoints: &BTreeMap<u64, Endpoint>,
+    files: &TlsFiles,
+    rpc: &Rpc,
+) -> Result<Arc<Client>> {
+    let roots = CertificateDer::pem_slice_iter(&read(&files.roots, 1 << 20)?)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    ensure!(
+        !roots.is_empty() && roots.len() <= 128,
+        "invalid TLS root count"
+    );
+    let mut store = RootCertStore::empty();
+    for certificate in roots {
+        store.add(certificate)?;
+    }
+    let certificates = CertificateDer::pem_slice_iter(&read(&files.certificate, 1 << 20)?)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    ensure!(
+        !certificates.is_empty() && certificates.len() <= 16,
+        "invalid TLS chain"
+    );
+    let key = PrivateKeyDer::from_pem_slice(&read(&files.private_key, 64 << 10)?)?;
+    let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()?
+    .with_root_certificates(store)
+    .with_client_auth_cert(certificates, key)?;
+    tls.alpn_protocols = vec![client::ALPN.to_vec()];
+    let endpoints = endpoints
+        .iter()
+        .map(|(&id, e)| {
+            (
+                id,
+                client::Endpoint {
+                    data_address: e.data_address.clone(),
+                    control_address: e.control_address.clone(),
+                    server_name: e.server_name.clone(),
+                    certificate: e.certificate,
+                },
+            )
+        })
+        .collect();
+    Ok(Arc::new(Client::new(
+        layout,
+        limits,
+        endpoints,
+        Arc::new(tls),
+        client::Options {
+            data_bytes: rpc.data_bytes,
+            control_bytes: rpc.control_bytes,
+            connections: rpc.connections_per_node,
+            timeout: rpc.timeout,
+            ..Default::default()
+        },
+    )?))
+}
+
 pub(super) fn read(path: &Path, max: usize) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     std::fs::File::open(path)?

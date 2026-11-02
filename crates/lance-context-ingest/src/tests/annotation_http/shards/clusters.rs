@@ -55,6 +55,16 @@ fn validate_routes(routes: &[(Ingress, String)]) -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn independent_wal_clusters_preserve_routes_and_drain_during_peer_cluster_outage(
 ) -> Result<()> {
+    exercise(false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn configured_independent_wal_clusters_preserve_routes_and_drain_during_peer_cluster_outage(
+) -> Result<()> {
+    exercise(true).await
+}
+
+async fn exercise(application_roles: bool) -> Result<()> {
     let root_a = tempfile::tempdir()?;
     let root_b = tempfile::tempdir()?;
     let la = definition(10);
@@ -85,8 +95,18 @@ async fn independent_wal_clusters_preserve_routes_and_drain_during_peer_cluster_
         options(),
         TOKEN.into(),
     )?;
-    let ingress_a = Server::start(ga.router(), None).await?;
-    let ingress_b = Server::start(gb.router(), None).await?;
+    let ingress_a = if application_roles {
+        application::clustered_frontend(root_a.path(), [(&ca, &a, &owner_a), (&cb, &b, &owner_b)])
+            .await?
+    } else {
+        Server::start(ga.router(), None).await?
+    };
+    let ingress_b = if application_roles {
+        application::clustered_frontend(root_b.path(), [(&cb, &b, &owner_b), (&ca, &a, &owner_a)])
+            .await?
+    } else {
+        Server::start(gb.router(), None).await?
+    };
     let client = reqwest::Client::builder()
         .retry(reqwest::retry::never())
         .timeout(Duration::from_secs(30))
