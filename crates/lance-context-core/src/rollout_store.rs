@@ -443,6 +443,7 @@ struct SelectedListPause {
     reached: tokio::sync::Notify,
     resume: tokio::sync::Notify,
     before_materialization: bool,
+    pause_attempts: usize,
     calls: std::sync::atomic::AtomicUsize,
 }
 
@@ -1012,11 +1013,11 @@ impl RolloutStore {
         #[cfg(test)]
         let selected_pause = self.selected_list_pause.lock().unwrap().clone();
         #[cfg(test)]
-        let first_attempt = selected_pause.as_ref().is_some_and(|pause| {
+        let pause_this_attempt = selected_pause.as_ref().is_some_and(|pause| {
             pause
                 .calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                == 0
+                < pause.pause_attempts.max(1)
         });
         // Required decoder fields plus the exact-match filter columns. Text,
         // token arrays, JSON metadata and artifact bytes never enter this scan.
@@ -1062,7 +1063,7 @@ impl RolloutStore {
         #[cfg(test)]
         if let Some(pause) = selected_pause
             .as_ref()
-            .filter(|pause| first_attempt && !pause.before_materialization)
+            .filter(|pause| pause_this_attempt && !pause.before_materialization)
         {
             pause.reached.notify_one();
             pause.resume.notified().await;
@@ -1138,7 +1139,7 @@ impl RolloutStore {
         #[cfg(test)]
         if let Some(pause) = selected_pause
             .as_ref()
-            .filter(|pause| first_attempt && pause.before_materialization)
+            .filter(|pause| pause_this_attempt && pause.before_materialization)
         {
             pause.reached.notify_one();
             pause.resume.notified().await;
@@ -4761,6 +4762,110 @@ mod tests {
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, "reclaimed");
+    }
+
+    #[tokio::test]
+    async fn selected_list_repeated_reclamation_exhausts_retry_window() {
+        for before_materialization in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let mut writer = RolloutStore::open(uri).await.unwrap();
+            let mut records = vec![
+                assistant_record("a"),
+                assistant_record("b"),
+                assistant_record("c"),
+            ];
+            for record in &mut records {
+                record.content = Some("first-page-payload".repeat(16_384));
+            }
+            writer.add(&records).await.unwrap();
+            writer.flush().await.unwrap();
+            let reader = Arc::new(RolloutStore::open(uri).await.unwrap());
+            let pause = Arc::new(SelectedListPause {
+                before_materialization,
+                pause_attempts: 2,
+                ..Default::default()
+            });
+            *reader.selected_list_pause.lock().unwrap() = Some(pause.clone());
+            let reading = {
+                let reader = reader.clone();
+                tokio::spawn(async move {
+                    let filters = RolloutFilters {
+                        role: Some(ROLE_ASSISTANT.into()),
+                        ..Default::default()
+                    };
+                    reader
+                        .list_with_filters(Some(4), None, Some(&filters))
+                        .await
+                })
+            };
+            for attempt in 0..2 {
+                tokio::time::timeout(std::time::Duration::from_secs(30), pause.reached.notified())
+                    .await
+                    .unwrap();
+                assert!(!reading.is_finished());
+                let snapshots = writer.wal_shard_snapshots().await.unwrap();
+                let mut paths = Vec::new();
+                for snapshot in &snapshots {
+                    for generation in &snapshot.sstables {
+                        paths.push(
+                            writer.flushed_generation_uri(snapshot.shard_id, &generation.path),
+                        );
+                    }
+                }
+                assert_eq!(paths.len(), 1);
+                assert_eq!(writer.cleanup_own_shard().await.unwrap(), 1);
+                tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                    while paths.iter().any(|path| std::path::Path::new(path).exists()) {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                if attempt == 0 {
+                    let mut record = assistant_record("d");
+                    record.content = Some("second-page-payload".repeat(16_384));
+                    writer.add(std::slice::from_ref(&record)).await.unwrap();
+                    writer.flush().await.unwrap();
+                    records.push(record);
+                } else {
+                    // This is elapsed time inside the second real read, after
+                    // its WAL was opened/selected and then physically reclaimed.
+                    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+                }
+                pause.resume.notify_one();
+            }
+            let result = tokio::time::timeout(std::time::Duration::from_secs(30), reading)
+                .await
+                .unwrap()
+                .unwrap();
+            eprintln!(
+                "repeated reclamation before_materialization={before_materialization} attempts={} error={:?}",
+                pause.calls.load(std::sync::atomic::Ordering::SeqCst),
+                result.as_ref().err()
+            );
+            // Characterize the production baseline: committed data remains
+            // readable, but the original request fails after two reclamations.
+            assert!(
+                result.is_err(),
+                "baseline unexpectedly recovered: {result:?}"
+            );
+            assert_eq!(pause.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+            let recovered = RolloutStore::open(uri).await.unwrap();
+            let filters = RolloutFilters {
+                role: Some(ROLE_ASSISTANT.into()),
+                ..Default::default()
+            };
+            let rows = recovered
+                .list_with_filters(Some(4), None, Some(&filters))
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), records.len());
+            for record in &records {
+                assert_records_eq(rows.iter().find(|row| row.id == record.id).unwrap(), record);
+            }
+            writer.close().await.unwrap();
+        }
     }
 
     #[tokio::test]
