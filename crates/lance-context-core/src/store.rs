@@ -1510,19 +1510,31 @@ impl ContextStore {
         self.base.refresh_latest().await
     }
 
-    /// Retrieve a single record by its unique ID.
+    /// Retrieve a single record by its unique ID, including unmerged WAL.
+    /// Retains the legacy raw lookup's visibility and payload behavior; use
+    /// `get_by_id` for lifecycle-filtered, projected reads.
     pub async fn get(&self, id: &str) -> LanceResult<Option<ContextRecord>> {
-        let escaped_id = id.replace('\'', "''");
-        let mut scanner = self.base.dataset.scan();
-        scanner.filter(&format!("id = '{}'", escaped_id))?;
-        scanner.limit(Some(1), None)?;
-
-        let mut stream = scanner.try_into_stream().await?;
-        if let Some(batch) = stream.try_next().await? {
-            let records = batch_to_records(&batch)?;
-            return Ok(records.into_iter().next());
-        }
-        Ok(None)
+        let filter = format!("id = '{}'", id.replace('\'', "''"));
+        let filter = &filter;
+        self.base
+            .read_consistent(ListSource::All, |dataset, snapshots| async move {
+                let scanner = StorageBase::lsm_scanner_for_dataset(
+                    &dataset,
+                    "id",
+                    ListSource::All,
+                    snapshots,
+                )
+                .filter(filter)?
+                .limit(Some(1), None)?;
+                let mut stream = scanner.try_into_stream().await?;
+                while let Some(batch) = stream.try_next().await? {
+                    if let Some(record) = batch_to_records(&batch)?.into_iter().next() {
+                        return Ok(Some(record));
+                    }
+                }
+                Ok(None)
+            })
+            .await
     }
 
     /// List all records in the dataset.
@@ -3610,7 +3622,7 @@ mod tests {
 
     #[tokio::test]
     async fn wal_lifetime_covers_context_read_consumers() {
-        for route in 0..5 {
+        for route in 0..6 {
             let dir = TempDir::new().unwrap();
             let uri = dir.path().to_str().unwrap();
             let mut writer = ContextStore::open(uri).await.unwrap();
@@ -3651,8 +3663,13 @@ mod tests {
                         .get_by_external_id("external")
                         .await?
                         .is_some_and(|row| row.id == "protected")),
-                    _ => Ok(reader.get_blob("protected").await?.as_deref()
+                    4 => Ok(reader.get_blob("protected").await?.as_deref()
                         == Some(b"protected-payload".as_slice())),
+                    _ => Ok(reader.get("protected").await?.is_some_and(|row| {
+                        row.id == "protected"
+                            && row.binary_payload.as_deref()
+                                == Some(b"protected-payload".as_slice())
+                    })),
                 }
             };
             assert!(
@@ -3669,7 +3686,7 @@ mod tests {
 
     #[tokio::test]
     async fn wal_snapshot_after_drain_context_read_consumers() {
-        for route in 0..5 {
+        for route in 0..6 {
             let dir = TempDir::new().unwrap();
             let uri = dir.path().to_str().unwrap();
             let mut writer = ContextStore::open(uri).await.unwrap();
@@ -3710,8 +3727,13 @@ mod tests {
                         .get_by_external_id("external")
                         .await?
                         .is_some_and(|row| row.id == "protected")),
-                    _ => Ok(reader.get_blob("protected").await?.as_deref()
+                    4 => Ok(reader.get_blob("protected").await?.as_deref()
                         == Some(b"protected-payload".as_slice())),
+                    _ => Ok(reader.get("protected").await?.is_some_and(|row| {
+                        row.id == "protected"
+                            && row.binary_payload.as_deref()
+                                == Some(b"protected-payload".as_slice())
+                    })),
                 }
             };
             assert!(
@@ -4302,6 +4324,50 @@ mod tests {
             assert_eq!(all.len(), 1);
             assert_eq!(all[0].record.id, expired_better_match.id);
         });
+    }
+
+    #[tokio::test]
+    async fn legacy_get_reads_foreign_wal_and_keeps_raw_visibility() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut writer = ContextStore::open_with_options(
+            uri,
+            ContextStoreOptions {
+                shard_id: Some("foreign-writer".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut reader = ContextStore::open_existing_with_options(
+            uri,
+            ContextStoreOptions {
+                shard_id: Some("cached-reader".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut record = text_record("quoted'id", 0.5);
+        record.lifecycle_status = "retired".into();
+        record.retired_at = Some(Utc::now());
+        record.binary_payload = Some(vec![9; 8192]);
+        writer.add(std::slice::from_ref(&record)).await.unwrap();
+        assert_eq!(writer.pending_wal_generations().await.unwrap(), 1);
+        assert_eq!(reader.base.dataset.count_rows(None).await.unwrap(), 0);
+        for merged in [false, true] {
+            if merged {
+                assert_eq!(writer.cleanup_wal().await.unwrap(), 1);
+                reader.refresh_latest().await.unwrap();
+            }
+            let found = reader.get(&record.id).await.unwrap().unwrap();
+            assert_eq!(found.id, record.id);
+            assert_eq!(found.text_payload, record.text_payload);
+            assert_eq!(found.binary_payload, record.binary_payload);
+            assert_eq!(found.lifecycle_status, "retired");
+            assert!(reader.get_by_id(&record.id).await.unwrap().is_none());
+            assert!(reader.get("' OR true --").await.unwrap().is_none());
+        }
     }
 
     #[test]

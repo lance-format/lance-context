@@ -522,6 +522,7 @@ mod tests {
         let context_name = "ctx";
         let (state, _dir) = test_state(context_name).await;
         let cached = state.get_or_open_context_store(context_name).await.unwrap();
+        let cached_version = cached.read().await.version();
         let mut writer = ContextStore::open_existing_with_options(
             &state.context_uri(context_name),
             ContextStoreOptions {
@@ -540,6 +541,16 @@ mod tests {
             "external-run".to_string(),
         );
         writer.add(std::slice::from_ref(&record)).await.unwrap();
+        assert_eq!(writer.pending_wal_generations().await.unwrap(), 1);
+        // HTTP point reads must see the external writer's unmerged WAL, just
+        // as list/external-id reads do; a base refresh alone cannot find it.
+        let Json(unmerged) = get_record(
+            State(state.clone()),
+            Path((context_name.to_string(), record.id.clone())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(unmerged.record.unwrap().text_payload, record.text_payload);
         assert_eq!(writer.cleanup_wal().await.unwrap(), 1);
         assert_eq!(writer.pending_wal_generations().await.unwrap(), 0);
         assert!(writer.version() > cached.read().await.version());
@@ -551,7 +562,33 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(found.record.unwrap().id, record.id);
-        assert_eq!(cached.read().await.version(), writer.version());
+        // A protected read checks out its own fresh dataset. A successful read
+        // does not need to mutate the shared handle under an exclusive lock.
+        assert_eq!(cached.read().await.version(), cached_version);
+
+        let mut next_record = record.clone();
+        next_record.id = "second-context-record".to_string();
+        next_record.external_id = Some("second-external-record".to_string());
+        next_record.text_payload = Some("second external commit".to_string());
+        writer
+            .add(std::slice::from_ref(&next_record))
+            .await
+            .unwrap();
+        for merged in [false, true] {
+            if merged {
+                assert_eq!(writer.cleanup_wal().await.unwrap(), 1);
+            }
+            let Json(found) = get_record(
+                State(state.clone()),
+                Path((context_name.to_string(), next_record.id.clone())),
+            )
+            .await
+            .unwrap();
+            let found = found.record.unwrap();
+            assert_eq!(found.id, next_record.id);
+            assert_eq!(found.text_payload, next_record.text_payload);
+            assert_eq!(cached.read().await.version(), cached_version);
+        }
 
         let Json(found) = get_record_by_external_id(
             State(state),
