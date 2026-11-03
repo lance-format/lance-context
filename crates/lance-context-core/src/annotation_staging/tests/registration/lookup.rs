@@ -92,6 +92,10 @@ async fn lookup_shares_io_but_keeps_request_order_and_frozen_updates() -> Result
                 },
             )
             .await?;
+        assert!(staging
+            .prepare_registration_lookup(&["new-a", "new-b"], &workspace)
+            .await?
+            .is_none());
         Ok::<_, Error>(frozen)
     })
     .await;
@@ -230,14 +234,31 @@ async fn lookup_admission_and_cancellation_release_workspace_and_base_pins() -> 
         .prepare_registration_lookup(&vec![large.as_str(); 32], &workspace)
         .await?
         .is_none());
+    let before = throttle.ops.load(Ordering::Relaxed);
     throttle.frozen.store(true, Ordering::Relaxed);
-    let result = tokio::time::timeout(
-        Duration::from_millis(50),
-        staging.prepare_registration_lookup(&["new"], &workspace),
-    )
-    .await;
+    let entered = {
+        let lookup = staging.prepare_registration_lookup(&["turn-000000"], &workspace);
+        tokio::pin!(lookup);
+        let entered = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::select! {
+                _ = &mut lookup => Err(invalid("frozen lookup unexpectedly completed")),
+                _ = async {
+                    while throttle.ops.load(Ordering::Relaxed) == before {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                } => Ok::<_, Error>(()),
+            }
+        })
+        .await;
+        if matches!(&entered, Ok(Ok(()))) {
+            assert!(workspace.reserved() > 0);
+            assert_eq!(staging.observation().await.readers, 1);
+        }
+        // Drop the future only after its data-file IO has entered the gate.
+        entered
+    };
     throttle.frozen.store(false, Ordering::Relaxed);
-    assert!(result.is_err());
+    entered.map_err(|_| invalid("lookup never reached the data-file IO gate"))??;
     assert_eq!(workspace.reserved(), 0);
     assert_eq!(staging.observation().await.readers, 0);
     assert_eq!(staging.observation().await.applied, 0);
