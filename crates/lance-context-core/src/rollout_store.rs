@@ -2015,16 +2015,6 @@ impl RolloutStore {
             .collect()
     }
 
-    /// Build a paginating scanner for the requested [`ListSource`]. See
-    /// `StorageBase::lsm_scanner_for_source`.
-    fn lsm_scanner_for_source(
-        &self,
-        source: ListSource,
-        shard_snapshots: Vec<ShardSnapshot>,
-    ) -> LsmScanner {
-        self.base.lsm_scanner_for_source(source, shard_snapshots)
-    }
-
     /// Read the latest manifest for every MemWAL shard.
     async fn wal_shard_snapshots(&self) -> LanceResult<Vec<ShardSnapshot>> {
         self.base.wal_shard_snapshots().await

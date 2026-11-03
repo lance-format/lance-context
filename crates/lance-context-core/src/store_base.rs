@@ -101,8 +101,6 @@ static OWN_WAL_RECOVERY_SLOT: tokio::sync::Semaphore = tokio::sync::Semaphore::c
 /// takes them.
 pub(crate) const DEFAULT_MERGE_MAX_GENERATIONS: usize = 8;
 
-/// Merged generation directories removed in parallel after a merge commits.
-
 /// Buffered Arrow array bytes per merge pass, checked at generation boundaries.
 pub(crate) const DEFAULT_MERGE_MAX_BYTES: usize = 1024 * 1024 * 1024;
 
@@ -2954,6 +2952,7 @@ impl StorageBase {
     /// snapshot is rebuilt from shard manifests on each call, one instance sees
     /// every other instance's flushed appends — reads are not pinned to the
     /// writing instance. Deduplicates by the key column.
+    #[cfg(test)]
     pub async fn lsm_scanner(&self) -> LanceResult<LsmScanner> {
         let shard_snapshots = self.wal_shard_snapshots().await?;
         Ok(self.lsm_scanner_for_source(ListSource::All, shard_snapshots))
