@@ -685,9 +685,9 @@ impl Coordinator {
             }
             let joined = join_events(stored.as_ref(), event);
             let effective = joined.as_ref().or(stored.as_ref()).unwrap();
-            if !effective
+            if effective
                 .merged_through
-                .is_some_and(|merged| merged >= effective.sealed_through)
+                .is_none_or(|merged| merged < effective.sealed_through)
             {
                 return Ok(None);
             }
