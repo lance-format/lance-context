@@ -164,9 +164,20 @@ async fn validated_binding_queries_release_excess_server_credit_before_execution
         });
     }
     let retained = 24 * (2 * metadata.len() + 2 * MAX_BINDING_META);
-    let admitted = timeout(Duration::from_secs(3), async {
-        for client in &mut clients {
+    // Admission can select any spawned handler first. Feed all bounded streams
+    // concurrently: sequential writes could wait on a handler whose credit is
+    // held by a different handler still waiting for its own metadata.
+    let mut writers = JoinSet::new();
+    for mut client in clients.drain(..) {
+        let metadata = metadata.clone();
+        writers.spawn(async move {
             client.write_all(&metadata).await?;
+            Ok::<_, anyhow::Error>(client)
+        });
+    }
+    let admitted = timeout(Duration::from_secs(3), async {
+        while let Some(result) = writers.join_next().await {
+            clients.push(result??);
         }
         while budgets.control.available_permits() != available - retained {
             tokio::task::yield_now().await;
@@ -174,6 +185,8 @@ async fn validated_binding_queries_release_excess_server_credit_before_execution
         Ok::<_, anyhow::Error>(())
     })
     .await;
+    writers.abort_all();
+    while writers.join_next().await.is_some() {}
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
     let restored = budgets.control.available_permits();
