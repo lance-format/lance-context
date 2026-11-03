@@ -334,7 +334,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires isolated loopback ETCD_TEST_ENDPOINTS and ETCD_TEST_EXCLUSIVE=1"]
-    async fn committed_group_batches_retirement_and_does_not_recreate_idle_hints() {
+    async fn committed_demand_group_batches_retirement_and_does_not_recreate_idle_hints() {
         assert_eq!(std::env::var("ETCD_TEST_EXCLUSIVE").unwrap(), "1");
         let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
         let url = reqwest::Url::parse(&endpoint).unwrap();
