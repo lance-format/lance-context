@@ -3,6 +3,8 @@ use object_store::{local::LocalFileSystem, ObjectStore, ObjectStoreExt};
 use std::task::Poll;
 use tokio::sync::oneshot;
 
+mod http_polling;
+
 fn progress(backpressured: bool) -> (watch::Sender<Progress>, watch::Receiver<Progress>) {
     watch::channel(Progress {
         through: 0,

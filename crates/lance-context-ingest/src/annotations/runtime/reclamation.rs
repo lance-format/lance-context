@@ -10,6 +10,7 @@ use std::{future::Future, pin::Pin, sync::Mutex, task::Poll};
 
 mod deletion;
 mod indices;
+mod listing;
 #[cfg(test)]
 mod listing_tests;
 mod manifest_cache;
@@ -300,7 +301,7 @@ impl Collector {
         let mut candidates = phases
             .measure(Phase::CollectList, async {
                 if self.listing.is_none() {
-                    self.listing = Some(store.list(Some(&destination.base)));
+                    self.listing = Some(listing::drive(store.list(Some(&destination.base))));
                 }
                 let mut candidates = BTreeMap::new();
                 let mut progress = service.shared.progress.subscribe();
