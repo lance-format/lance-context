@@ -175,6 +175,41 @@ async fn bounded<T>(
         .map_err(|_| lance::Error::io("WAL read protection storage operation timed out"))?
 }
 
+// Keep reader registration failures distinguishable from data reads and from
+// the collector's storage operations. Never format the backing error here: it
+// may contain a signed URL. Return it unchanged to the caller instead.
+fn reader_failure(phase: &'static str, category: &'static str, started: Instant, last: Instant) {
+    tracing::warn!(
+        phase,
+        category,
+        operation_ms = started.elapsed().as_millis() as u64,
+        acknowledged_silence_ms = last.elapsed().as_millis() as u64,
+        "WAL reader protection failed"
+    );
+}
+
+async fn reader_publication(
+    timeout: Duration,
+    phase: &'static str,
+    last: Instant,
+    operation: impl Future<Output = lance::Result<()>>,
+) -> lance::Result<()> {
+    let started = Instant::now();
+    match tokio::time::timeout(timeout, operation).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => {
+            reader_failure(phase, "storage_error", started, last);
+            Err(error)
+        }
+        Err(_) => {
+            reader_failure(phase, "operation_timeout", started, last);
+            Err(lance::Error::io(
+                "WAL read protection storage operation timed out",
+            ))
+        }
+    }
+}
+
 async fn write_nonce(store: &ObjectStore, path: &Path, create: bool) -> lance::Result<()> {
     let nonce = uuid::Uuid::new_v4().simple().to_string();
     store
@@ -255,8 +290,10 @@ pub(crate) async fn protect<T>(
         timeout: policy.operation_timeout,
     };
     let publication_started = Instant::now();
-    bounded(
+    reader_publication(
         policy.operation_timeout,
+        "registration",
+        publication_started,
         write_nonce(&registration.store, &registration.path, true),
     )
     .await?;
@@ -265,6 +302,12 @@ pub(crate) async fn protect<T>(
     // The registration may already have expired elsewhere. Never restart its
     // lease clock or begin capturing WAL from that late acknowledgement.
     if publication_started.elapsed() >= policy.operation_timeout {
+        reader_failure(
+            "registration",
+            "acknowledgement_expired",
+            publication_started,
+            publication_started,
+        );
         return Err(lance::Error::io(
             "WAL reader registration acknowledgement expired",
         ));
@@ -273,11 +316,16 @@ pub(crate) async fn protect<T>(
     let renewal = async {
         loop {
             tokio::time::sleep(policy.heartbeat).await;
-            if acknowledged.lock().unwrap().elapsed() >= policy.max_silence {
+            let last = *acknowledged.lock().unwrap();
+            let started = Instant::now();
+            if last.elapsed() >= policy.max_silence {
+                reader_failure("renewal", "silence_expired", started, last);
                 return Err(lance::Error::io("WAL reader renewal expired"));
             }
-            bounded(
+            reader_publication(
                 policy.operation_timeout,
+                "renewal",
+                last,
                 write_nonce(&registration.store, &registration.path, false),
             )
             .await?;
@@ -285,6 +333,7 @@ pub(crate) async fn protect<T>(
             // A paused process must not resurrect an expired read by accepting
             // a delayed successful renewal response.
             if last.elapsed() >= policy.max_silence {
+                reader_failure("renewal", "acknowledgement_expired", started, *last);
                 return Err(lance::Error::io("WAL reader renewal expired"));
             }
             *last = Instant::now();
@@ -297,7 +346,9 @@ pub(crate) async fn protect<T>(
         expired = &mut renewal => expired,
         result = &mut read => result,
     };
-    if acknowledged.lock().unwrap().elapsed() >= policy.max_silence {
+    let last = *acknowledged.lock().unwrap();
+    if last.elapsed() >= policy.max_silence {
+        reader_failure("return", "silence_expired", publication_started, last);
         return Err(lance::Error::io(
             "WAL reader renewal expired before returning data",
         ));
@@ -454,6 +505,94 @@ pub(crate) async fn reclaim(
 mod tests {
     use super::*;
     use object_store::throttle::{ThrottleConfig, ThrottledStore};
+    use tracing::instrument::WithSubscriber;
+
+    #[derive(Clone, Default)]
+    struct Diagnostics(Arc<Mutex<Vec<HashMap<String, String>>>>);
+
+    impl tracing::Subscriber for Diagnostics {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Fields(HashMap<String, String>);
+            impl tracing::field::Visit for Fields {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0.insert(field.name().into(), format!("{value:?}"));
+                }
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    self.0.insert(field.name().into(), value.into());
+                }
+            }
+            let mut fields = Fields(HashMap::new());
+            event.record(&mut fields);
+            if fields
+                .0
+                .get("message")
+                .is_some_and(|v| v == "WAL reader protection failed")
+            {
+                self.0.lock().unwrap().push(fields.0);
+            }
+        }
+    }
+
+    impl Diagnostics {
+        fn assert_failure(&self, phase: &str, category: &str) {
+            let events = self.0.lock().unwrap();
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert_eq!(events[0]["phase"], phase);
+            assert_eq!(events[0]["category"], category);
+            assert!(events[0]["operation_ms"].parse::<u64>().is_ok());
+            assert!(events[0]["acknowledged_silence_ms"].parse::<u64>().is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn publication_diagnostic_preserves_storage_error_without_logging_it() {
+        for phase in ["registration", "renewal"] {
+            let diagnostics = Diagnostics::default();
+            let error = lance::Error::invalid_input("signed-url-secret");
+            let original = error.to_string();
+            let result = reader_publication(Duration::from_secs(1), phase, Instant::now(), async {
+                Err(error)
+            })
+            .with_subscriber(diagnostics.clone())
+            .await
+            .unwrap_err();
+            assert!(matches!(result, lance::Error::InvalidInput { .. }));
+            assert_eq!(result.to_string(), original);
+            diagnostics.assert_failure(phase, "storage_error");
+            assert!(!format!("{:?}", diagnostics.0.lock().unwrap()).contains("signed-url-secret"));
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_protected_read_emits_no_failure_diagnostic() {
+        let diagnostics = Diagnostics::default();
+        let dir = tempfile::TempDir::new().unwrap();
+        let (store, root) = ObjectStore::from_uri(dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            protect(store, &root, quick_policy(), async { Ok(7) })
+                .with_subscriber(diagnostics.clone())
+                .await
+                .unwrap(),
+            7
+        );
+        assert!(diagnostics.0.lock().unwrap().is_empty());
+    }
 
     #[derive(Debug)]
     struct PausedPublication {
@@ -532,6 +671,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_late_initial_acknowledgement_cannot_start_an_unregistered_read() {
+        let diagnostics = Diagnostics::default();
         use std::sync::atomic::{AtomicBool, Ordering};
         let dir = tempfile::TempDir::new().unwrap();
         let (store, root) = ObjectStore::from_uri(dir.path().to_str().unwrap())
@@ -558,12 +698,14 @@ mod tests {
             started.store(true, Ordering::SeqCst);
             Ok(7)
         })
+        .with_subscriber(diagnostics.clone())
         .await;
         assert!(result
             .unwrap_err()
             .to_string()
             .contains("registration acknowledgement expired"));
         assert!(!started.load(Ordering::SeqCst));
+        diagnostics.assert_failure("registration", "acknowledgement_expired");
     }
 
     fn quick_policy() -> Policy {
@@ -738,6 +880,7 @@ mod tests {
 
     #[tokio::test]
     async fn registration_put_timeout_never_starts_the_read() {
+        let diagnostics = Diagnostics::default();
         use std::sync::atomic::{AtomicBool, Ordering};
         let dir = tempfile::TempDir::new().unwrap();
         let (store, root) = ObjectStore::from_uri(dir.path().to_str().unwrap())
@@ -756,13 +899,16 @@ mod tests {
             started.store(true, Ordering::SeqCst);
             Ok(7)
         })
+        .with_subscriber(diagnostics.clone())
         .await;
         assert!(result.unwrap_err().to_string().contains("timed out"));
         assert!(!started.load(Ordering::SeqCst));
+        diagnostics.assert_failure("registration", "operation_timeout");
     }
 
     #[tokio::test]
     async fn renewal_timeout_fails_the_read_before_collection_can_finish() {
+        let diagnostics = Diagnostics::default();
         let dir = tempfile::TempDir::new().unwrap();
         let (store, root) = ObjectStore::from_uri(dir.path().to_str().unwrap())
             .await
@@ -774,8 +920,10 @@ mod tests {
             throttle.config_mut(|config| config.wait_put_per_call = Duration::from_secs(1));
             std::future::pending::<lance::Result<()>>().await
         })
+        .with_subscriber(diagnostics.clone())
         .await;
         assert!(result.unwrap_err().to_string().contains("timed out"));
+        diagnostics.assert_failure("renewal", "operation_timeout");
         let listing = store.inner.list(Some(&readers_root(&root)));
         wait_for_listing(store, listing, quick_policy(), 2)
             .await
