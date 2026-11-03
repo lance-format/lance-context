@@ -1033,8 +1033,8 @@ pub(crate) mod tests {
                         let row: DemandEvent =
                             serde_json::from_slice(reply.kvs()[0].value()).unwrap();
                         assert_eq!(
-                            row.merged_through, None,
-                            "default-off must retain the original behavior"
+                            row.merged_through, second.merged_through,
+                            "default-off must not advance the writer's completed prefix"
                         );
                     }
                     generic_write(&writer, "late", "after shard visited").await;
