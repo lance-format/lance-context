@@ -324,11 +324,15 @@ impl ShardManifestStore {
             }
         }
 
-        // Parallel scan forward with batches of HEAD requests
+        // Commits are gap-free. With a valid starting version, the usual case
+        // needs only a HEAD of its successor to prove that the hint is current.
+        // Once behind, retain the configured parallel batch for catching up.
+        // Without a starting version, preserve the initial discovery batch.
         let batch_size = self.manifest_scan_batch_size;
+        let mut probe_width = if latest_found > 0 { 1 } else { batch_size };
         loop {
             let mut futures = FuturesUnordered::new();
-            for offset in 0..batch_size {
+            for offset in 0..probe_width {
                 let version = latest_found + 1 + offset as u64;
                 futures.push(async move { (version, self.version_exists(version).await) });
             }
@@ -344,6 +348,7 @@ impl ShardManifestStore {
             if !found_any {
                 break;
             }
+            probe_width = batch_size;
         }
 
         Ok(latest_found)
@@ -709,6 +714,93 @@ mod tests {
             sstables: vec![],
             status: ShardStatus::Active,
         }
+    }
+
+    #[tokio::test]
+    async fn a_current_hint_has_a_constant_request_budget() {
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let writer = ShardManifestStore::new(store.clone(), &base_path, shard_id, 16);
+        for version in 1..=64 {
+            writer
+                .write(&create_test_manifest(shard_id, version, 1))
+                .await
+                .unwrap();
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let observed = calls.clone();
+        let policy = Arc::new(Mutex::new(ProxyObjectStorePolicy::new()));
+        policy.lock().unwrap().set_before_policy(
+            "requests",
+            Arc::new(move |method: &str, path: &Path| {
+                if method == "get_opts" {
+                    observed.lock().unwrap().push(path.clone());
+                }
+                Ok(())
+            }),
+        );
+        let mut proxied = (*store).clone();
+        proxied.inner = Arc::new(ProxyObjectStore::new(store.inner.clone(), policy));
+        let reader = ShardManifestStore::new(Arc::new(proxied), &base_path, shard_id, 16);
+        assert_eq!(reader.latest().await.unwrap().unwrap().version, 64);
+        // The proxy combines GET and HEAD under get_opts: hint GET, tip HEAD,
+        // successor HEAD and tip GET. Count failed probes as well as successes.
+        assert_eq!(calls.lock().unwrap().len(), 4);
+        assert!(reader.cached().is_none());
+
+        writer
+            .write(&create_test_manifest(shard_id, 65, 1))
+            .await
+            .unwrap();
+        calls.lock().unwrap().clear();
+        assert_eq!(reader.latest().await.unwrap().unwrap().version, 65);
+        assert_eq!(calls.lock().unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn successor_probe_recovers_from_unusable_hints() {
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let writer = ShardManifestStore::new(store.clone(), &base_path, shard_id, 16);
+        for version in 1..=64 {
+            writer
+                .write(&create_test_manifest(shard_id, version, 1))
+                .await
+                .unwrap();
+        }
+        let hint_path = shard_manifest_path(&base_path, &shard_id).join("version_hint.json");
+        for hint in [Some(1), Some(63), Some(999), None] {
+            if let Some(version) = hint {
+                store
+                    .inner
+                    .put(
+                        &hint_path,
+                        Bytes::from(serde_json::to_vec(&VersionHint { version }).unwrap()).into(),
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                store.inner.delete(&hint_path).await.unwrap();
+            }
+            let reader = ShardManifestStore::new(store.clone(), &base_path, shard_id, 16);
+            assert_eq!(reader.latest().await.unwrap().unwrap().version, 64);
+        }
+
+        let policy = Arc::new(Mutex::new(ProxyObjectStorePolicy::new()));
+        policy.lock().unwrap().set_before_policy(
+            "hint failure",
+            Arc::new(move |method: &str, path: &Path| {
+                if method == "get_opts" && path == &hint_path {
+                    return Err(Error::io("injected hint GET failure"));
+                }
+                Ok(())
+            }),
+        );
+        let mut proxied = (*store).clone();
+        proxied.inner = Arc::new(ProxyObjectStore::new(store.inner.clone(), policy));
+        let reader = ShardManifestStore::new(Arc::new(proxied), &base_path, shard_id, 16);
+        assert_eq!(reader.latest().await.unwrap().unwrap().version, 64);
     }
 
     /// A warm cache must not hide a successor's claim from `check_fenced`.

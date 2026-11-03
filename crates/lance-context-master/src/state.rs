@@ -105,6 +105,10 @@ pub struct MasterState {
     pub task_store: TaskStore,
     /// Local claim/scan admission, including in-flight ownership RPCs.
     pub admission: Arc<crate::admission::Admission>,
+    /// Latest deduplicated catalog from the existing registry scan. The
+    /// retirement consumer keeps one traversal and at most one newer catalog.
+    pub(crate) retirement_catalog:
+        tokio::sync::watch::Sender<Option<Arc<Vec<crate::scanner::ScanEntry>>>>,
     /// Shared HTTP client for fanning `MergeWal` tasks out to worker endpoints.
     pub http: reqwest::Client,
     pub(crate) legacy_response_waiters: Arc<Semaphore>,
@@ -265,6 +269,7 @@ impl MasterState {
             config,
             task_store,
             admission: Arc::new(crate::admission::Admission::default()),
+            retirement_catalog: tokio::sync::watch::channel(None).0,
             http: worker_http_client().map_err(|error| lance::Error::io(error.to_string()))?,
             local_append,
             compaction_permits: Arc::new(Semaphore::new(compaction_concurrency)),
