@@ -4446,6 +4446,7 @@ mod tests {
         assert_eq!(marks[0].pending_generations, 1);
         assert_eq!(marks[0].merged_through, Some(1));
         assert_eq!(crate::read_demand_watermarks(uri).await.unwrap(), marks);
+        assert_eq!(writer.own_shard_watermark().await.unwrap(), Some(marks[0]));
 
         assert_eq!(writer.cleanup_own_shard().await.unwrap(), 1);
         let marks = reader.all_shard_watermarks().await.unwrap();
@@ -4453,6 +4454,7 @@ mod tests {
         assert_eq!(marks[0].pending_generations, 0);
         assert_eq!(marks[0].merged_through, Some(2));
         assert_eq!(crate::read_demand_watermarks(uri).await.unwrap(), marks);
+        assert_eq!(writer.own_shard_watermark().await.unwrap(), Some(marks[0]));
         let epoch = marks[0].writer_epoch;
         writer.close().await.unwrap();
         let mut writer = RolloutStore::open_with_options(uri, options).await.unwrap();
@@ -4466,6 +4468,7 @@ mod tests {
         assert_eq!(marks[0].sealed_through, 3);
         assert_eq!(marks[0].pending_generations, 1);
         assert_eq!(marks[0].merged_through, Some(2));
+        assert_eq!(writer.own_shard_watermark().await.unwrap(), Some(marks[0]));
         for id in ["first", "second", "third"] {
             assert_eq!(reader.get_by_id(id).await.unwrap().unwrap().id, id);
         }

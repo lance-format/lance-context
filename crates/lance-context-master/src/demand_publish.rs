@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use lance_context_core::{GenericStore, GenericStoreOptions, RolloutStore, RolloutStoreOptions};
-use lance_context_merge::demand::{DemandEvent, EventSource, ShardMerged, SCHEMA_VERSION};
+use lance_context_merge::demand::{DemandEvent, EventSource, SCHEMA_VERSION};
 use lance_context_merge::Coordinator;
 use tokio::sync::Semaphore;
 
@@ -103,7 +103,9 @@ pub(crate) async fn spawn_scan_demand(
                     sealed_times: Default::default(),
                 })
                 .collect();
-            coordinator.publish_demand_events(&target, &events).await
+            coordinator
+                .publish_active_demand_events(&target, &events)
+                .await
         })
         .await;
         let label = match result {
@@ -122,17 +124,17 @@ pub(crate) async fn spawn_scan_demand(
     });
 }
 
-/// Base index and bounded shard-manifest reads, plus one etcd join per shard.
+/// Base index and bounded shard-manifest reads, plus batched etcd reads.
 const MERGED_PUBLISH_TIMEOUT: Duration = Duration::from_secs(15);
 
 static MERGED_PUBLISH_SLOTS: std::sync::LazyLock<Arc<Semaphore>> =
     std::sync::LazyLock::new(|| Arc::new(Semaphore::new(4)));
 
 /// After a successful WAL catch-up has released ownership, publish every
-/// shard's merged watermark. Detached and bounded; never on the release
-/// path. Each shard is a separate monotonic put, so a table with hundreds of
-/// shards never approaches the etcd transaction op limit and a concurrent
-/// writer flush on one shard cannot fail the others.
+/// shard's observed watermark. Detached and bounded; never on the release
+/// path. Reads and fully completed retirements are bounded to 32 shards;
+/// conflicting retirements fall back to independent per-shard CAS so a hot
+/// writer cannot prevent the other shards from progressing.
 pub(crate) fn spawn_merged_demand(coordinator: Coordinator, target: String, uri: String) {
     let Ok(permit) = MERGED_PUBLISH_SLOTS.clone().try_acquire_owned() else {
         metrics::counter!("master_demand_merged_watermarks_total", "result" => "dropped")
@@ -145,22 +147,28 @@ pub(crate) fn spawn_merged_demand(coordinator: Coordinator, target: String, uri:
             let marks = lance_context_core::read_demand_watermarks(&uri)
                 .await
                 .map_err(|e| e.to_string())?;
-            let merged: Vec<ShardMerged> = marks
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            // Publish the full observed seal as well as the completed prefix:
+            // a partially drained shard must remain visible after restart.
+            let events: Vec<_> = marks
                 .into_iter()
-                .filter_map(|mark| {
-                    mark.merged_through.map(|generation| ShardMerged {
-                        shard: mark.shard_id.to_string(),
-                        merged_through: generation,
-                    })
+                .map(|mark| DemandEvent {
+                    v: SCHEMA_VERSION,
+                    shard: mark.shard_id.to_string(),
+                    sealed_through: mark.sealed_through,
+                    sealed_bytes_through: 0,
+                    merged_through: mark.merged_through,
+                    flushed_at_ms: now_ms,
+                    writer_epoch: mark.writer_epoch,
+                    source: EventSource::Scan,
+                    merged_epoch: None,
+                    sealed_times: Default::default(),
                 })
                 .collect();
-            let mut written = 0usize;
-            for shard in &merged {
-                if coordinator.publish_merged_watermark(&target, shard).await? {
-                    written += 1;
-                }
-            }
-            Ok::<(usize, usize), String>((written, merged.len()))
+            let written = coordinator
+                .publish_active_demand_events(&target, &events)
+                .await?;
+            Ok::<(usize, usize), String>((written, events.len()))
         })
         .await;
         let (label, count) = match result {

@@ -63,7 +63,7 @@ pub(crate) async fn from_dataset(dataset: &Dataset) -> Result<Vec<ShardWatermark
     Ok(marks)
 }
 
-fn from_manifest(manifest: &ShardManifest, base_merged: Option<u64>) -> ShardWatermark {
+pub(crate) fn from_manifest(manifest: &ShardManifest, base_merged: Option<u64>) -> ShardWatermark {
     // Lance advances this durable counter in the same manifest commit that
     // appends a flushed SST. Allocating an in-memory generation does not advance
     // it. Upsert merge drains preserve it, even when the last SST is removed.

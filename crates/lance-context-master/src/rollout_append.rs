@@ -560,6 +560,41 @@ mod tests {
         assert!(first.config.catchup.target.is_none());
         assert!(first.config.catchup.pod_template.is_none());
         assert!(!first.config.catchup.enabled);
+        // Seed real positive hints before execution: an empty prefix after
+        // completion must prove retirement, not merely absent publication.
+        for target in ["hot", "cold"] {
+            let events: Vec<_> =
+                lance_context_core::read_demand_watermarks(&first.rollout_uri(target))
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|mark| lance_context_merge::demand::DemandEvent {
+                        v: lance_context_merge::demand::SCHEMA_VERSION,
+                        shard: mark.shard_id.to_string(),
+                        sealed_through: mark.sealed_through,
+                        sealed_bytes_through: 0,
+                        merged_through: mark.merged_through,
+                        flushed_at_ms: 1,
+                        writer_epoch: mark.writer_epoch,
+                        source: lance_context_merge::demand::EventSource::Writer,
+                        merged_epoch: None,
+                        sealed_times: Default::default(),
+                    })
+                    .collect();
+            assert_eq!(events.len(), 2);
+            assert!(events
+                .iter()
+                .all(|event| event.sealed_through > event.merged_through.unwrap_or(0)));
+            assert_eq!(
+                first
+                    .task_store
+                    .merge_coordinator()
+                    .publish_active_demand_events(target, &events)
+                    .await
+                    .unwrap(),
+                2
+            );
+        }
         let queued = first
             .task_store
             .enqueue(TaskKind::MergeWal, "hot", Vec::new())
@@ -648,20 +683,20 @@ mod tests {
                     format!("{target}-{id}")
                 );
             }
-            // The release published merged watermarks for both shards in
-            // the same transaction that gave up ownership, so a fold over
-            // the events shows no pending generations.
+            // Durable base watermarks and exact rows prove both shards were
+            // committed before their completed advisory hints are retired.
             let marks = lance_context_core::rollout_append::merged_watermarks(&uri)
                 .await
                 .unwrap();
             assert_eq!(marks.len(), 2, "{target}: {marks:?}");
+            assert!(marks.iter().all(|(_, generation)| *generation == 1));
             let encoded: String = target.bytes().map(|b| format!("{b:02x}")).collect();
             let events_prefix = format!(
                 "{}/demand-events/{encoded}/",
                 first.config.etcd.etcd_prefix.trim_end_matches('/')
             );
-            // The merged-watermark publish is detached from release; wait for
-            // both shards' records to carry a merged mark, with a bound.
+            // Publication is detached from release. Both seeded positive
+            // records must disappear after the completed manifest observation.
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
             let events = loop {
                 let events = first
@@ -674,42 +709,17 @@ mod tests {
                     )
                     .await
                     .unwrap();
-                let merged_count = events
-                    .kvs()
-                    .iter()
-                    .filter(|kv| {
-                        serde_json::from_slice::<lance_context_merge::demand::DemandEvent>(
-                            kv.value(),
-                        )
-                        .is_ok_and(|e| e.merged_through.is_some())
-                    })
-                    .count();
-                if merged_count == 2 {
+                if events.kvs().is_empty() {
                     break events;
                 }
                 assert!(
                     std::time::Instant::now() < deadline,
-                    "{target}: merged watermarks never published ({merged_count}/2)"
+                    "{target}: completed demand hints were not retired ({} remain)",
+                    events.kvs().len()
                 );
                 tokio::time::sleep(Duration::from_millis(50)).await;
             };
-            assert_eq!(events.kvs().len(), 2, "{target}");
-            let mut table = lance_context_merge::demand::TableDemand::default();
-            for kv in events.kvs() {
-                let event: lance_context_merge::demand::DemandEvent =
-                    serde_json::from_slice(kv.value()).unwrap();
-                assert_eq!(
-                    event.source,
-                    lance_context_merge::demand::EventSource::Executor
-                );
-                let expected = marks
-                    .iter()
-                    .find(|(shard, _)| shard.to_string() == event.shard)
-                    .map(|(_, generation)| *generation);
-                assert_eq!(event.merged_through, expected);
-                table.fold(&event, kv.mod_revision(), 0).unwrap();
-            }
-            assert_eq!(table.pending_generations(), 0, "{target}");
+            assert!(events.kvs().is_empty(), "{target}");
         }
     }
 
