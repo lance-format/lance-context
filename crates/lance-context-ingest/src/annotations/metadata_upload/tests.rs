@@ -230,6 +230,19 @@ fn metadata_upload_only_holds_owned_immutable_paths() {
     }
 }
 
+#[test]
+fn metadata_upload_install_normalizes_the_uri_scheme() -> Result<()> {
+    let storage = Storage {
+        uri: "FILE-OBJECT-STORE:///tmp/owner-table".to_owned(),
+        base: Path::from("tmp/owner-table"),
+        options: Default::default(),
+        session: Arc::new(lance::session::Session::default()),
+    };
+    let scope = Scope::install(&storage)?;
+    assert!(!scope.enabled.load(Ordering::Acquire));
+    Ok(())
+}
+
 #[async_trait::async_trait]
 impl ObjectStore for FaultStore {
     async fn put_opts(

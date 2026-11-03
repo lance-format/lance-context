@@ -52,15 +52,18 @@ impl Scope {
             registry.active_stores().is_empty(),
             "metadata upload scope requires an unopened owner session"
         );
-        let scheme = storage.uri.split_once("://").map_or("file", |(s, _)| s);
+        let scheme = storage
+            .uri
+            .split_once("://")
+            .map_or_else(|| "file".to_owned(), |(s, _)| s.to_ascii_lowercase());
         let inner = registry
-            .get_provider(scheme)
+            .get_provider(&scheme)
             .context("metadata upload store provider missing")?;
         let (lifetime, stopped) = watch::channel(());
         let counters = Arc::new(Counters::default());
         let enabled = Arc::new(AtomicBool::new(false));
         registry.insert(
-            scheme,
+            &scheme,
             Arc::new(Provider {
                 inner,
                 base: storage.base.clone(),

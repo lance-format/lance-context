@@ -39,17 +39,27 @@ async fn metadata_upload_throttle_keeps_acks_readable_bounds_staging_and_drains(
         wire(&limits, &["T"], 0, None, 1, Some(0.9))?,
     )
     .await?;
-    let acknowledged = service.submit(&second, Duration::from_secs(30)).await?;
-    let waiting = request(
+    service.submit(&second, Duration::from_secs(30)).await?;
+    // Frozen has its own source range. Fill both slots of the next active
+    // window before checking that a further durable proposal cannot be ACKed.
+    let third = request(
         &service,
         &producer,
         3,
         wire(&limits, &["T"], 0, None, 1, Some(0.8))?,
     )
     .await?;
+    let acknowledged = service.submit(&third, Duration::from_secs(30)).await?;
+    let waiting = request(
+        &service,
+        &producer,
+        4,
+        wire(&limits, &["T"], 0, None, 1, Some(0.7))?,
+    )
+    .await?;
     let accepted = service.ingress().append(&waiting).await?;
     tokio::time::timeout(Duration::from_secs(10), async {
-        while scope.observation().put_resubmissions < 2 {
+        while scope.observation().put_resubmissions < 2 || service.apply_backpressure().is_none() {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
@@ -66,7 +76,7 @@ async fn metadata_upload_throttle_keeps_acks_readable_bounds_staging_and_drains(
         .await?
         .unwrap();
     assert_eq!(current.status.as_deref(), Some("reviewed"));
-    assert_eq!(current.score, Some(0.9));
+    assert_eq!(current.score, Some(0.8));
     {
         let calls = fault.calls.lock().unwrap();
         let attempted = calls.last().unwrap();
@@ -90,7 +100,7 @@ async fn metadata_upload_throttle_keeps_acks_readable_bounds_staging_and_drains(
     assert_eq!(scope.observation().waiting_objects, 0);
     let current = service.get("T", Duration::from_secs(10)).await?.unwrap();
     assert_eq!(current.status.as_deref(), Some("reviewed"));
-    assert_eq!(current.score, Some(0.8));
+    assert_eq!(current.score, Some(0.7));
     stop.send(()).unwrap();
     task.await??;
     drop(scope);
