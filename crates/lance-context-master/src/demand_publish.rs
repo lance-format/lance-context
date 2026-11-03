@@ -3,10 +3,10 @@
 //! (source `scan`) and executors after a successful WAL catch-up release
 //! (source `executor`).
 //!
-//! One hard timeout and a process-wide concurrency cap. Background zero-WAL
-//! observations drop-and-count when full. Positive observations and transitions
-//! to zero wait fairly for a slot inside the scanner's existing bounded stream;
-//! they cannot be silently lost just because four background reads are active.
+//! One hard timeout and a process-wide concurrency cap. Every observation waits
+//! fairly inside the scanner's existing bounded stream. Cold tables must also get
+//! a turn: zero pending in consecutive snapshots does not prove that their old
+//! completed demand records were retired.
 //! Every publish is a per-shard monotonic join. Transport failures remain visible
 //! and are reconciled by later writer/scan events.
 
@@ -27,18 +27,10 @@ const SCAN_PUBLISH_TIMEOUT: Duration = Duration::from_secs(15);
 static SCAN_PUBLISH_SLOTS: std::sync::LazyLock<Arc<Semaphore>> =
     std::sync::LazyLock::new(|| Arc::new(Semaphore::new(4)));
 
-/// Waiters live in the scanner's bounded observation stream, not in detached
-/// per-table tasks or an unbounded side queue. Tokio's semaphore preserves FIFO
-/// order, including against subsequent background try-acquire attempts.
-async fn scan_slot(
-    slots: Arc<Semaphore>,
-    positive_or_clearing: bool,
-) -> Option<tokio::sync::OwnedSemaphorePermit> {
-    if positive_or_clearing {
-        slots.acquire_owned().await.ok()
-    } else {
-        slots.try_acquire_owned().ok()
-    }
+/// Waiters remain inside the bounded observation stream. FIFO admission gives
+/// cold and positive tables a turn without additional tasks or metadata slots.
+async fn scan_slot(slots: Arc<Semaphore>) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    slots.acquire_owned().await.ok()
 }
 
 pub(crate) async fn spawn_scan_demand(
@@ -48,10 +40,9 @@ pub(crate) async fn spawn_scan_demand(
     kind: ScanKind,
     rollout_options: RolloutStoreOptions,
     generic_options: GenericStoreOptions,
-    positive_or_clearing: bool,
 ) {
     let permit = tokio::select! {
-        permit = scan_slot(SCAN_PUBLISH_SLOTS.clone(), positive_or_clearing) => permit,
+        permit = scan_slot(SCAN_PUBLISH_SLOTS.clone()) => permit,
         _ = state.admission.wait_closed() => {
             metrics::counter!("master_scan_demand_events_total", "result" => "draining").increment(1);
             return;
@@ -197,32 +188,38 @@ mod tests {
         let slots = Arc::new(Semaphore::new(4));
         let mut active = Vec::new();
         for _ in 0..4 {
-            active.push(scan_slot(slots.clone(), false).await.unwrap());
+            active.push(scan_slot(slots.clone()).await.unwrap());
         }
-        assert!(scan_slot(slots.clone(), false).await.is_none());
-        let mut positive = Box::pin(scan_slot(slots.clone(), true));
+        let mut waiting = Box::pin(scan_slot(slots.clone()));
+        assert!(matches!(futures::poll!(waiting.as_mut()), Poll::Pending));
+        drop(waiting);
+        let mut positive = Box::pin(scan_slot(slots.clone()));
         assert!(matches!(futures::poll!(positive.as_mut()), Poll::Pending));
         drop(active.pop());
         // The released credit belongs to the already queued positive table.
-        assert!(scan_slot(slots.clone(), false).await.is_none());
+        let mut waiting = Box::pin(scan_slot(slots.clone()));
+        assert!(matches!(futures::poll!(waiting.as_mut()), Poll::Pending));
+        drop(waiting);
         let permit = positive.await.unwrap();
         assert_eq!(slots.available_permits(), 0);
         drop(permit);
-        assert!(scan_slot(slots.clone(), false).await.is_some());
+        assert!(scan_slot(slots.clone()).await.is_some());
     }
 
     #[tokio::test]
-    async fn coexisting_positive_tables_get_fifo_turns_without_extra_capacity() {
+    async fn coexisting_tables_get_fifo_turns_without_extra_capacity() {
         let slots = Arc::new(Semaphore::new(1));
-        let active = scan_slot(slots.clone(), false).await.unwrap();
-        let mut first = Box::pin(scan_slot(slots.clone(), true));
-        let mut second = Box::pin(scan_slot(slots.clone(), true));
+        let active = scan_slot(slots.clone()).await.unwrap();
+        let mut first = Box::pin(scan_slot(slots.clone()));
+        let mut second = Box::pin(scan_slot(slots.clone()));
         assert!(matches!(futures::poll!(first.as_mut()), Poll::Pending));
         assert!(matches!(futures::poll!(second.as_mut()), Poll::Pending));
         drop(active);
         let first = first.await.unwrap();
         assert!(matches!(futures::poll!(second.as_mut()), Poll::Pending));
-        assert!(scan_slot(slots.clone(), false).await.is_none());
+        let mut waiting = Box::pin(scan_slot(slots.clone()));
+        assert!(matches!(futures::poll!(waiting.as_mut()), Poll::Pending));
+        drop(waiting);
         drop(first);
         assert!(second.await.is_some());
     }
@@ -230,9 +227,9 @@ mod tests {
     #[tokio::test]
     async fn cancelled_observation_returns_its_place_without_stranding_other_tables() {
         let slots = Arc::new(Semaphore::new(1));
-        let active = scan_slot(slots.clone(), false).await.unwrap();
-        let mut cancelled = Box::pin(scan_slot(slots.clone(), true));
-        let mut next = Box::pin(scan_slot(slots.clone(), true));
+        let active = scan_slot(slots.clone()).await.unwrap();
+        let mut cancelled = Box::pin(scan_slot(slots.clone()));
+        let mut next = Box::pin(scan_slot(slots.clone()));
         assert!(matches!(futures::poll!(cancelled.as_mut()), Poll::Pending));
         assert!(matches!(futures::poll!(next.as_mut()), Poll::Pending));
         drop(cancelled);
@@ -256,7 +253,7 @@ mod tests {
                 loop {
                     assert!(
                         !scan.is_finished(),
-                        "positive scan observation was dropped instead of waiting"
+                        "scan observation was dropped instead of waiting"
                     );
                     if state.admission.status().operations.values().any(|op| {
                         op.progress
@@ -392,6 +389,65 @@ mod tests {
             .unwrap()
             .unwrap();
         await_pending(&state, 0).await;
+        assert_eq!(state.stats_cache.read().await[0].pending_wal_generations, 0);
+
+        // The table is cold in both the current and previous stats snapshots.
+        // Seed an old completed hint, as left behind by a legacy publisher.
+        let mark = writer.all_shard_watermarks().await.unwrap().remove(0);
+        let event = DemandEvent {
+            v: SCHEMA_VERSION,
+            shard: mark.shard_id.to_string(),
+            sealed_through: mark.sealed_through,
+            sealed_bytes_through: 0,
+            merged_through: mark.merged_through,
+            flushed_at_ms: 1,
+            writer_epoch: mark.writer_epoch,
+            source: EventSource::Scan,
+            merged_epoch: None,
+            sealed_times: Default::default(),
+        };
+        assert!(event.merged_through.unwrap() >= event.sealed_through);
+        state
+            .task_store
+            .merge_coordinator()
+            .publish_demand_event("generic:positive", &event)
+            .await
+            .unwrap();
+        let key = format!(
+            "{}/demand-events/67656e657269633a706f736974697665/{}",
+            state.config.etcd.prefix().trim_end_matches('/'),
+            event.shard
+        );
+        let mut client = state.task_store.etcd_client().clone();
+        assert_eq!(client.get(key.as_str(), None).await.unwrap().kvs().len(), 1);
+        let busy = SCAN_PUBLISH_SLOTS
+            .clone()
+            .acquire_many_owned(4)
+            .await
+            .unwrap();
+        let scanning = state.clone();
+        let scan = tokio::spawn(async move { crate::scanner::scan_once(&scanning).await });
+        blocked(&state, &scan).await;
+        assert_eq!(client.get(key.as_str(), None).await.unwrap().kvs().len(), 1);
+        drop(busy);
+        tokio::time::timeout(Duration::from_secs(20), scan)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !client
+                .get(key.as_str(), None)
+                .await
+                .unwrap()
+                .kvs()
+                .is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
         assert_eq!(state.stats_cache.read().await[0].pending_wal_generations, 0);
 
         writer
