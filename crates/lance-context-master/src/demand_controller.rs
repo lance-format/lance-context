@@ -168,6 +168,19 @@ struct Cache {
 }
 
 impl Cache {
+    fn replace_after_relist(&mut self, mut fresh: Self, prefix: &str) {
+        // A compacted Watch rebuilds the informer, not a queued task's grace.
+        // Preserve deadlines only for entries still present in the new List.
+        let queue = prefix_key(prefix, "queue");
+        let entries = &fresh.entries;
+        fresh
+            .placement
+            .inherit_fallbacks(&mut self.placement, |id| {
+                entries.contains_key(format!("{queue}{id}").as_bytes())
+            });
+        *self = fresh;
+    }
+
     fn new() -> Self {
         Self {
             entries: BTreeMap::new(),
@@ -204,7 +217,7 @@ impl Cache {
         let due = old.map_or_else(Instant::now, |e| e.due);
         self.placement
             .observe_ticket(key, old.map(|entry| entry.value.as_slice()), value);
-        self.placement.forget_queue_entry(key);
+        self.placement.forget_queue_entry(key, value.is_none());
         if let Some(old) = self.entries.remove(key) {
             self.ready.remove(&(old.due, key.to_vec()));
             if let Some(target) = old.offered_target {
@@ -684,6 +697,8 @@ async fn lead(state: &Arc<MasterState>, session: &CoordinationGuard) -> Result<(
     let prefix = state.config.etcd.prefix().trim_end_matches('/');
     let client = store.etcd_client();
     let mut cache = list(client, prefix).await?;
+    let fallback_grace = Duration::from_millis(state.config.local_merge.resident_offer_grace_ms);
+    cache.placement.set_fallback_grace(fallback_grace);
     let (resident_policies, resident_rx) =
         tokio::sync::watch::channel(cache.resident_policies(prefix));
     let resident = crate::resident_recovery::run(state, session, resident_rx);
@@ -702,6 +717,7 @@ async fn lead(state: &Arc<MasterState>, session: &CoordinationGuard) -> Result<(
         };
         let failure = loop {
             let next = cache.next_due();
+            let fallback_due = cache.placement.next_fallback();
             tokio::select! {
                 _ = &mut resident => return Err("resident discovery stopped".into()),
                 response = stream.message() => {
@@ -732,6 +748,12 @@ async fn lead(state: &Arc<MasterState>, session: &CoordinationGuard) -> Result<(
                         },
                         Err(error) => break error,
                     }
+                }
+                _ = async {
+                    tokio::time::sleep_until(fallback_due.expect("enabled deadline")).await;
+                }, if fallback_due.is_some() => {
+                    cache.placement.wake_fallbacks();
+                    place_more = true;
                 }
                 _ = tokio::time::sleep_until(recovery_due) => {
                     recovery_due = Instant::now() + Duration::from_secs(1);
@@ -771,7 +793,7 @@ async fn lead(state: &Arc<MasterState>, session: &CoordinationGuard) -> Result<(
         tracing::warn!(%failure, "demand watch reconnecting");
         tokio::time::sleep(RECONNECT).await;
         if failure == "compacted" || failure.contains("message length") {
-            cache = list(client, prefix).await?;
+            cache.replace_after_relist(list(client, prefix).await?, prefix);
             resident_policies.send_replace(cache.resident_policies(prefix));
             place_more = true;
         }
