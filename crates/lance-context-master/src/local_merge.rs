@@ -4,6 +4,12 @@ use std::sync::Arc;
 
 #[derive(Clone, Debug, Default, clap::Args)]
 pub struct LocalMergeConfig {
+    /// Briefly defer ordinary merge offers so resident capacity can rearm.
+    /// Zero preserves immediate fallback. Does not reserve capacity or delay
+    /// an eligible resident offer, compaction, or indexing.
+    #[arg(long, env = "RESIDENT_OFFER_GRACE_MS", default_value_t = 0,
+          value_parser = clap::value_parser!(u64).range(0..=1000))]
+    pub resident_offer_grace_ms: u64,
     /// Route new rollout/generic demand to resident masters without a static
     /// table allowlist. Enable only after every legacy writer/helper has drained
     /// and all participants use persistent fenced admission. This flag is not
@@ -15,6 +21,14 @@ pub struct LocalMergeConfig {
     /// Neither setting certifies that historical legacy writers have drained.
     #[arg(long, env = "MASTER_LOCAL_MERGE_TARGETS", value_delimiter = ',')]
     pub master_local_merge_targets: Vec<String>,
+    /// Publish confirmed native upsert-merge progress without rereading storage.
+    /// Exact opt-in targets only; detached fallback reconciliation remains enabled.
+    #[arg(
+        long,
+        env = "MASTER_LOCAL_MERGE_COMMITTED_DEMAND_TARGETS",
+        value_delimiter = ','
+    )]
+    pub master_local_merge_committed_demand_targets: Vec<String>,
 }
 
 impl LocalMergeConfig {
@@ -56,6 +70,16 @@ pub(crate) fn targets(config: &MasterConfig) -> Vec<String> {
 }
 
 pub(crate) fn validate(config: &MasterConfig) -> Result<(), String> {
+    for target in &config
+        .local_merge
+        .master_local_merge_committed_demand_targets
+    {
+        if target == "*" || !selected(config, target) || config.append.enabled(target) {
+            return Err(format!(
+                "committed demand requires an exact selected native upsert target: {target}"
+            ));
+        }
+    }
     if config.local_merge.master_local_merge_auto
         && (!config.merge_rollout.fence_legacy
             || config.local_merge.master_local_merge_targets != ["*"]

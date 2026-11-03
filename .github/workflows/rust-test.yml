@@ -247,6 +247,7 @@ jobs:
           ETCD_TEST_ENDPOINTS: http://127.0.0.1:2379
         run: |
           cargo test -p lance-context-master -p lance-context-server -p lance-context-merge -- --ignored \
+            --skip committed_demand_ \
             --skip first_worker_turn_reuses_failure_read \
             --skip private_permit_ \
             --skip quiet_execution_bounds_etcd_reads_without_delaying_completion \
@@ -282,6 +283,10 @@ jobs:
           ETCD_TEST_ALLOW_COMPACTION: "1"
           ETCD_TEST_EXCLUSIVE: "1"
         run: |
+          # Committed-demand storage tests require the same exclusive etcd scope.
+          # Aggregate tests already run under the demand_controller:: filter below.
+          cargo test -p lance-context-master --lib committed_demand_ \
+            -- --ignored --test-threads=1 --skip demand_controller::aggregate::
           cargo test -p lance-context-master --lib \
             task_store::tests::bounded_scheduler_compacted_snapshot_restarts_without_stealing_locks \
             -- --exact --ignored --test-threads=1
@@ -433,6 +438,7 @@ jobs:
           source "$RUNNER_TEMP/coverage-env.sh"
           bash scripts/ci/run-built-tests.sh "$RUNNER_TEMP/coverage-tests.jsonl" \
             lance-context-master,lance-context-server,lance-context-merge all --ignored \
+            --skip committed_demand_ \
             --skip first_worker_turn_reuses_failure_read \
             --skip private_permit_ \
             --skip quiet_execution_bounds_etcd_reads_without_delaying_completion \
@@ -463,6 +469,8 @@ jobs:
           ETCD_TEST_EXCLUSIVE: "1"
         run: |
           source "$RUNNER_TEMP/coverage-env.sh"
+          bash scripts/ci/run-built-tests.sh "$RUNNER_TEMP/coverage-tests.jsonl" lance-context-master lib \
+            committed_demand_ --ignored --test-threads=1 --skip demand_controller::aggregate::
           bash scripts/ci/run-built-tests.sh "$RUNNER_TEMP/coverage-tests.jsonl" lance-context-master lib \
             task_store::tests::bounded_scheduler_compacted_snapshot_restarts_without_stealing_locks \
             --exact --ignored --test-threads=1

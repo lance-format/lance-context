@@ -61,6 +61,10 @@ pub const ROLLOUT_WAL_MERGE_DURATION: &str = "rollout_wal_merge_duration_seconds
 /// aborts on the first failing phase, so this also identifies where it died.
 pub const ROLLOUT_WAL_MERGE_ERRORS: &str = "rollout_wal_merge_errors_total";
 
+/// Prepared groups split before publication. Bounded `reason` labels distinguish
+/// `aggregate_byte_cap`, `workspace_unavailable` and `workspace_unbounded`.
+pub const ROLLOUT_WAL_GROUP_SPLITS: &str = "rollout_wal_group_splits_total";
+
 /// Flushed MemWAL generations pending merge on one shard, sampled once per
 /// shard on every LSM read (`wal_shard_snapshots`). Unlabelled: the store and
 /// shard go on the accompanying `warn!` span, not on the series.

@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use lance_context_core::{GenericStore, GenericStoreOptions, RolloutStore, RolloutStoreOptions};
-use lance_context_merge::demand::{DemandEvent, EventSource, SCHEMA_VERSION};
+use lance_context_merge::demand::{DemandEvent, EventSource, ShardMerged, SCHEMA_VERSION};
 use lance_context_merge::Coordinator;
 use tokio::sync::Semaphore;
 
@@ -130,6 +130,146 @@ const MERGED_PUBLISH_TIMEOUT: Duration = Duration::from_secs(15);
 static MERGED_PUBLISH_SLOTS: std::sync::LazyLock<Arc<Semaphore>> =
     std::sync::LazyLock::new(|| Arc::new(Semaphore::new(4)));
 
+#[cfg(test)]
+pub(crate) async fn hold_merged_publications_for_test() -> tokio::sync::OwnedSemaphorePermit {
+    MERGED_PUBLISH_SLOTS
+        .clone()
+        .acquire_many_owned(4)
+        .await
+        .unwrap()
+}
+
+/// Prepared metadata remains inert until the exact commit future acknowledges
+/// success. This is advisory demand progress, never a storage/ownership fence.
+pub(crate) struct CommittedMergeDemand {
+    coordinator: Coordinator,
+    target: String,
+    shards: Vec<ShardMerged>,
+}
+
+impl CommittedMergeDemand {
+    pub(crate) fn prepare(
+        state: &MasterState,
+        target: &str,
+        prepared: &lance_context_core::PreparedMerge,
+    ) -> Option<Self> {
+        if !Self::selected(state, target) {
+            return None;
+        }
+        let (shard, merged_through) = prepared.prepared_watermark()?;
+        Some(Self {
+            coordinator: state.task_store.merge_coordinator(),
+            target: target.to_owned(),
+            shards: vec![ShardMerged {
+                shard: shard.to_string(),
+                merged_through,
+            }],
+        })
+    }
+
+    pub(crate) fn prepare_group(
+        state: &Arc<MasterState>,
+        target: &str,
+        prepared: &[lance_context_core::PreparedShardMerge],
+    ) -> Option<Self> {
+        if !Self::selected(state, target) || prepared.len() > 32 {
+            return None;
+        }
+        let shards: Vec<_> = prepared
+            .iter()
+            .filter_map(|part| part.prepared_watermark())
+            .map(|(shard, merged_through)| ShardMerged {
+                shard: shard.to_string(),
+                merged_through,
+            })
+            .collect();
+        (!shards.is_empty()).then(|| Self {
+            coordinator: state.task_store.merge_coordinator(),
+            target: target.to_owned(),
+            shards,
+        })
+    }
+
+    fn selected(state: &MasterState, target: &str) -> bool {
+        crate::local_merge::selected(&state.config, target)
+            && state
+                .config
+                .local_merge
+                .master_local_merge_committed_demand_targets
+                .iter()
+                .any(|allowed| allowed == target)
+    }
+
+    /// Poll the original commit in its owning task/scope. Dropping this future,
+    /// an error, or a zero-result commit never publishes its prepared progress.
+    /// Publication cannot delay commit completion or ownership release.
+    pub(crate) async fn observe<F>(observer: Option<Self>, commit: F) -> Result<usize, String>
+    where
+        F: std::future::Future<Output = Result<usize, String>>,
+    {
+        let result = commit.await?;
+        if result > 0 {
+            if let Some(observer) = observer {
+                observer.publish();
+            }
+        }
+        Ok(result)
+    }
+
+    fn publish(self) {
+        // Share the existing process-wide bound; never queue unbounded work.
+        let Ok(permit) = MERGED_PUBLISH_SLOTS.clone().try_acquire_owned() else {
+            metrics::counter!("master_demand_committed_watermarks_total", "result" => "dropped")
+                .increment(1);
+            return;
+        };
+        tokio::spawn(async move {
+            let _permit = permit;
+            let result = tokio::time::timeout(MERGED_PUBLISH_TIMEOUT, async {
+                // Reuse the bounded batch join without reopening manifests.
+                // A successful commit proves this prefix completed; a newer
+                // writer seal wins the join and prevents its hint's retirement.
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                let events: Vec<_> = self
+                    .shards
+                    .iter()
+                    .map(|shard| DemandEvent {
+                        v: SCHEMA_VERSION,
+                        shard: shard.shard.clone(),
+                        sealed_through: shard.merged_through,
+                        sealed_bytes_through: 0,
+                        merged_through: Some(shard.merged_through),
+                        flushed_at_ms: now_ms,
+                        writer_epoch: 0,
+                        source: EventSource::Executor,
+                        merged_epoch: None,
+                        sealed_times: Default::default(),
+                    })
+                    .collect();
+                self.coordinator
+                    .publish_active_demand_events(&self.target, &events)
+                    .await
+                    .map(|written| written > 0)
+            })
+            .await;
+            let label = match result {
+                Ok(Ok(true)) => "written",
+                Ok(Ok(false)) => "unchanged",
+                Ok(Err(error)) => {
+                    tracing::warn!(target = %self.target, %error, "committed watermark publish failed");
+                    "failed"
+                }
+                Err(_) => {
+                    tracing::warn!(target = %self.target, "committed watermark publish timed out");
+                    "timeout"
+                }
+            };
+            metrics::counter!("master_demand_committed_watermarks_total", "result" => label)
+                .increment(1);
+        });
+    }
+}
+
 /// After a successful WAL catch-up has released ownership, publish every
 /// shard's observed watermark. Detached and bounded; never on the release
 /// path. Reads and fully completed retirements are bounded to 32 shards;
@@ -191,6 +331,217 @@ pub(crate) fn spawn_merged_demand(coordinator: Coordinator, target: String, uri:
 mod tests {
     use super::*;
     use std::task::Poll;
+
+    #[tokio::test]
+    #[ignore = "requires isolated loopback ETCD_TEST_ENDPOINTS and ETCD_TEST_EXCLUSIVE=1"]
+    async fn committed_demand_group_batches_retirement_and_does_not_recreate_idle_hints() {
+        assert_eq!(std::env::var("ETCD_TEST_EXCLUSIVE").unwrap(), "1");
+        let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+        let url = reqwest::Url::parse(&endpoint).unwrap();
+        assert_eq!(url.host_str(), Some("127.0.0.1"));
+        assert!(url.port().is_some());
+        async fn transactions(endpoint: &str) -> u64 {
+            let metrics = reqwest::get(format!("{endpoint}/metrics"))
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            metrics
+                .lines()
+                .find(|line| {
+                    line.starts_with("grpc_server_started_total{")
+                        && line.contains("grpc_method=\"Txn\"")
+                        && line.contains("grpc_service=\"etcdserverpb.KV\"")
+                })
+                .unwrap()
+                .split_whitespace()
+                .last()
+                .unwrap()
+                .parse::<f64>()
+                .unwrap() as u64
+        }
+        let mut client = etcd_client::Client::connect([endpoint.as_str()], None)
+            .await
+            .unwrap();
+        let prefix = format!(
+            "/committed-batch-test/{}",
+            lance_context_core::generate_id()
+        );
+        let coordinator = Coordinator::new(client.clone(), &prefix);
+        let events: Vec<_> = (0..32)
+            .map(|index| DemandEvent {
+                v: SCHEMA_VERSION,
+                shard: format!("writer-{index}"),
+                sealed_through: 1,
+                sealed_bytes_through: 100,
+                merged_through: None,
+                flushed_at_ms: 1234,
+                writer_epoch: 7,
+                source: EventSource::Writer,
+                merged_epoch: None,
+                sealed_times: Default::default(),
+            })
+            .collect();
+        assert_eq!(
+            coordinator
+                .publish_demand_events("t", &events)
+                .await
+                .unwrap(),
+            32
+        );
+        // The callback is detached. Acquiring every publication permit below
+        // joins it without sleep-based guesses or polling the coordinator.
+        for expected_transactions in [2, 1] {
+            let before = transactions(&endpoint).await;
+            let observer = CommittedMergeDemand {
+                coordinator: coordinator.clone(),
+                target: "t".into(),
+                shards: events
+                    .iter()
+                    .map(|event| ShardMerged {
+                        shard: event.shard.clone(),
+                        merged_through: 1,
+                    })
+                    .collect(),
+            };
+            assert_eq!(
+                CommittedMergeDemand::observe(Some(observer), async { Ok(32) }).await,
+                Ok(32)
+            );
+            let joined = tokio::time::timeout(
+                Duration::from_secs(5),
+                MERGED_PUBLISH_SLOTS.clone().acquire_many_owned(4),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                transactions(&endpoint).await - before,
+                expected_transactions
+            );
+            assert!(client
+                .get(
+                    format!("{prefix}/demand-events/"),
+                    Some(etcd_client::GetOptions::new().with_prefix()),
+                )
+                .await
+                .unwrap()
+                .kvs()
+                .is_empty());
+            drop(joined);
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated loopback ETCD_TEST_ENDPOINTS and ETCD_TEST_EXCLUSIVE=1"]
+    async fn committed_demand_requires_success_and_preserves_newer_writer_progress() {
+        assert_eq!(std::env::var("ETCD_TEST_EXCLUSIVE").unwrap(), "1");
+        let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+        assert!(endpoint.starts_with("http://127.0.0.1:") && !endpoint.contains(','));
+        let mut client = etcd_client::Client::connect([endpoint], None)
+            .await
+            .unwrap();
+        let prefix = format!(
+            "/committed-demand-test/{}",
+            lance_context_core::generate_id()
+        );
+        let coordinator = Coordinator::new(client.clone(), &prefix);
+        let key = format!("{prefix}/demand-events/74/shard");
+        let observer = || {
+            Some(CommittedMergeDemand {
+                coordinator: coordinator.clone(),
+                target: "t".into(),
+                shards: vec![ShardMerged {
+                    shard: "shard".into(),
+                    merged_through: 1,
+                }],
+            })
+        };
+        let failed =
+            CommittedMergeDemand::observe(observer(), async { Err("uncertain commit".into()) })
+                .await;
+        assert!(failed.is_err());
+        assert_eq!(
+            CommittedMergeDemand::observe(observer(), async { Ok(0) })
+                .await
+                .unwrap(),
+            0
+        );
+        let mut canceled = Box::pin(CommittedMergeDemand::observe(
+            observer(),
+            std::future::pending(),
+        ));
+        assert!(matches!(futures::poll!(canceled.as_mut()), Poll::Pending));
+        drop(canceled);
+        assert!(client
+            .get(key.as_str(), None)
+            .await
+            .unwrap()
+            .kvs()
+            .is_empty());
+
+        let writer = DemandEvent {
+            v: SCHEMA_VERSION,
+            shard: "shard".into(),
+            sealed_through: 2,
+            sealed_bytes_through: 100,
+            merged_through: None,
+            flushed_at_ms: 1234,
+            writer_epoch: 7,
+            source: EventSource::Writer,
+            merged_epoch: None,
+            sealed_times: Default::default(),
+        };
+        coordinator
+            .publish_demand_event("t", &writer)
+            .await
+            .unwrap();
+        // Saturation drops only optional publication; a successful commit is
+        // immediately returned. Existing fallback reconciliation is retained.
+        let permits = MERGED_PUBLISH_SLOTS
+            .clone()
+            .acquire_many_owned(4)
+            .await
+            .unwrap();
+        assert_eq!(
+            CommittedMergeDemand::observe(observer(), async { Ok(1) })
+                .await
+                .unwrap(),
+            1
+        );
+        let before: DemandEvent =
+            serde_json::from_slice(client.get(key.as_str(), None).await.unwrap().kvs()[0].value())
+                .unwrap();
+        assert_eq!(before.merged_through, None);
+        drop(permits);
+        assert_eq!(
+            CommittedMergeDemand::observe(observer(), async { Ok(1) })
+                .await
+                .unwrap(),
+            1
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let row: DemandEvent = serde_json::from_slice(
+                    client.get(key.as_str(), None).await.unwrap().kvs()[0].value(),
+                )
+                .unwrap();
+                if row.merged_through == Some(1) {
+                    assert_eq!(row.sealed_through, 2);
+                    assert_eq!(row.writer_epoch, 7);
+                    assert_eq!(row.flushed_at_ms, 1234);
+                    assert_eq!(row.sealed_bytes_through, 100);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
 
     #[tokio::test]
     async fn positive_observation_waits_instead_of_dropping_when_all_four_slots_are_full() {
