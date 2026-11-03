@@ -137,8 +137,10 @@ share the scanner's batches of at most 32 exact-key reads.
 
 After joining an observation with the current record, a known completed prefix
 covering every known seal permits a revision-compared deletion of that one
-advisory record. A concurrent seal rejects the delete and is re-read and
-re-joined. An absent, fully completed record is not recreated. Unknown schemas
+advisory record. Fully completed batches retire up to 32 records in a
+single transaction (at most 512 KiB of estimated key/operation bytes). A
+concurrent seal rejects the batch and falls back to independent per-key
+comparisons, re-reading and re-joining conflicting keys. An absent, fully completed record is not recreated. Unknown schemas
 and unreadable records are not retired. These deletes never touch tasks,
 execution ownership, claims, commit permits, or WAL payloads.
 
