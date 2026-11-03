@@ -38,6 +38,10 @@ use tokio_rustls::{
 pub const ALPN: &[u8] = b"lance-context-wal-client/1";
 const MAGIC: &[u8; 8] = b"LCWCLNT1";
 const MAX_META: usize = 2 << 20;
+// PublisherBinding contains only fixed identities and the validated binding:
+// dataset <= 4096 bytes, tenant/table <= 1024 bytes each. Leave room for the
+// scope, cut and enum framing; plans and manifest history are not returned.
+const MAX_BINDING_META: usize = 16 << 10;
 const PREFIX: usize = 24;
 
 pub(super) mod observation;
@@ -134,6 +138,16 @@ enum WireRequest {
 impl WireRequest {
     fn data(&self) -> bool {
         matches!(self, Self::Append { .. } | Self::Fetch { .. })
+    }
+
+    fn reply_metadata_limit(&self) -> usize {
+        match self {
+            Self::Query {
+                query: query::Query::PublisherBinding { .. },
+                ..
+            } => MAX_BINDING_META,
+            _ => MAX_META,
+        }
     }
 
     // Fixed labels avoid formatting commands, payloads, or table identities.
@@ -456,7 +470,7 @@ async fn serve_one<S: AsyncRead + AsyncWrite + Unpin>(
     } else {
         0
     };
-    let _credit = budgets
+    let mut credit = budgets
         .reserve(data, 2 * meta_len + body_len + 2 * MAX_META + reply_body)
         .await?;
     let metadata = receive(io, meta_len).await?;
@@ -469,6 +483,17 @@ async fn serve_one<S: AsyncRead + AsyncWrite + Unpin>(
         meta.check_body_length(body_len, handle.max_record)?;
     } else {
         ensure!(body_len == 0, "unexpected request payload");
+    }
+    // The untrusted prefix cannot select a smaller reservation. Only shrink
+    // after decoding and validating the request; never wait for an upgrade
+    // while holding request credit. Keep the remaining credit through send.
+    let reply_meta = request.reply_metadata_limit();
+    if reply_meta < MAX_META {
+        drop(
+            credit
+                .split(2 * (MAX_META - reply_meta))
+                .context("client reply reservation underflow")?,
+        );
     }
     let body = receive(io, body_len).await?;
     let append = matches!(request, WireRequest::Append { .. });
@@ -489,7 +514,9 @@ async fn serve_one<S: AsyncRead + AsyncWrite + Unpin>(
         }
         Err(_) => (Reply::Unknown, Bytes::new()),
     };
-    let metadata = codec().serialize(&(scope(handle), reply))?;
+    let metadata = codec()
+        .with_limit(reply_meta as u64)
+        .serialize(&(scope(handle), reply))?;
     send(io, id, &metadata, &body).await
 }
 async fn execute(handle: &Handle, request: WireRequest, body: Bytes) -> Result<(Reply, Bytes)> {
@@ -884,12 +911,13 @@ impl Client {
         };
         let size = usize::try_from(codec().serialized_size(&(&expected, &wire))?)?;
         ensure!(size <= MAX_META, "client metadata too large");
+        let reply_meta = wire.reply_metadata_limit();
         let admission = timings.map(|c| c[0].start());
         let credit = self
             .budgets
             .reserve(
                 data,
-                2 * size + body.len() + 2 * MAX_META + if fetch { self.max_record } else { 0 },
+                2 * size + body.len() + 2 * reply_meta + if fetch { self.max_record } else { 0 },
             )
             .await?;
         drop(admission);
@@ -942,6 +970,10 @@ impl Client {
                 let (received_id, meta_len, body_len) =
                     prefix(&mut stream, if fetch { self.max_record } else { 0 }).await?;
                 ensure!(received_id == id, "client response correlation mismatch");
+                ensure!(
+                    meta_len <= reply_meta,
+                    "client response metadata exceeds request bound"
+                );
                 stage = "response_metadata";
                 let metadata = receive(&mut stream, meta_len).await?;
                 let (observed, reply): (Scope, Reply) = codec().deserialize(&metadata)?;
