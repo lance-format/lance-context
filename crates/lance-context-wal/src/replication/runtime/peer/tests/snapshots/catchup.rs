@@ -85,7 +85,7 @@ async fn successful_slow_snapshot(
     assert_eq!(
         observed.first_retained_index > original_index + 1,
         expected_images == 2,
-        "the original image must still have its complete replication suffix"
+        "the observed boundary must explain whether another image is required"
     );
     if checkpoint_during_transfer && retained_bytes > 0 {
         assert!(
@@ -186,5 +186,10 @@ async fn reopening_retained_index_one_still_loads_the_application_checkpoint() -
     for (index, batch) in expected {
         assert_eq!(node.read_accepted(10, index)?, Some(batch));
     }
+    let (runtime, _outbox) = Runtime::spawn(node, Default::default())?;
+    let recovered = runtime.handle().observation(10)?;
+    assert_eq!(recovered.checkpoint_index, index);
+    assert_eq!(recovered.first_retained_index, 1);
+    runtime.shutdown().await?;
     Ok(())
 }
