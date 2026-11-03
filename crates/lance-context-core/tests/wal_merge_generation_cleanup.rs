@@ -1,4 +1,4 @@
-//! Regression test: WAL merge must delete the merged generation's blob dir.
+//! Regression tests: collect mode must reclaim merged generation directories.
 //!
 //! One store, one shard, fully serial — no concurrency, no fence. This isolates
 //! a single property: `merge_own_shard` appends merged generations into the base
@@ -7,10 +7,35 @@
 //! zombie directory per merged generation (a pure storage leak: data was correct
 //! but `_mem_wal/` grew without bound). After the fix, the count of on-disk
 //! `_gen_` directories tracks the manifest's pending generations exactly.
+//! Physical cleanup runs in an isolated process with collection explicitly
+//! enabled; default retain mode intentionally preserves retired generations.
 
 use std::path::Path;
 
 use lance_context_core::{RolloutRecord, RolloutStore, RolloutStoreOptions, ROLE_ASSISTANT};
+
+/// Re-execute only this test with collection configured before any store opens.
+/// Each test owns a temporary local directory and has no legacy readers or
+/// deleters, so its collection barrier is satisfied. A child process avoids
+/// mutating the shared environment of concurrently running tests.
+fn run_collect_child(test_name: &str) -> bool {
+    if std::env::var("ROCKETKEEP_WAL_LIFECYCLE").as_deref() == Ok("collect") {
+        return false;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test_name, "--nocapture"])
+        .env("ROCKETKEEP_WAL_LIFECYCLE", "collect")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains("1 passed; 0 failed"),
+        "collect-mode test {test_name} did not pass: {}\n{stdout}\n{stderr}",
+        output.status
+    );
+    true
+}
 
 fn rec(id: &str) -> RolloutRecord {
     RolloutRecord {
@@ -87,6 +112,9 @@ fn count_gen_dirs_on_disk(dataset_dir: &Path) -> usize {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn serial_merge_deletes_merged_generation_dirs() {
+    if run_collect_child("serial_merge_deletes_merged_generation_dirs") {
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let uri = tmp.path().to_string_lossy().to_string();
 
@@ -173,6 +201,9 @@ async fn serial_merge_deletes_merged_generation_dirs() {
 /// cap binds, and nothing is lost to it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn merge_pass_is_bounded_and_leftovers_survive() {
+    if run_collect_child("merge_pass_is_bounded_and_leftovers_survive") {
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let uri = tmp.path().to_string_lossy().to_string();
 
@@ -263,6 +294,9 @@ async fn merge_pass_is_bounded_and_leftovers_survive() {
 /// Disabling both caps restores the unbounded behavior.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn zero_merge_caps_merge_everything_in_one_pass() {
+    if run_collect_child("zero_merge_caps_merge_everything_in_one_pass") {
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let uri = tmp.path().to_string_lossy().to_string();
 
@@ -340,27 +374,42 @@ async fn assert_blob_merge_passes(max_generations: usize, max_bytes: usize, pass
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn byte_budget_binds_before_generation_cap() {
+    if run_collect_child("byte_budget_binds_before_generation_cap") {
+        return;
+    }
     // Each generation is below 1.5 MiB, but two together exceed it.
     assert_blob_merge_passes(8, 1536 * 1024, &[2, 2, 1]).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn byte_budget_applies_with_generation_cap_disabled() {
+    if run_collect_child("byte_budget_applies_with_generation_cap_disabled") {
+        return;
+    }
     assert_blob_merge_passes(0, 1536 * 1024, &[2, 2, 1]).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn generation_cap_binds_before_byte_budget() {
+    if run_collect_child("generation_cap_binds_before_byte_budget") {
+        return;
+    }
     assert_blob_merge_passes(2, 16 * 1024 * 1024, &[2, 2, 1]).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn zero_byte_budget_keeps_generation_cap() {
+    if run_collect_child("zero_byte_budget_keeps_generation_cap") {
+        return;
+    }
     assert_blob_merge_passes(2, 0, &[2, 2, 1]).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn oversized_generation_is_merged_in_full_and_makes_progress() {
+    if run_collect_child("oversized_generation_is_merged_in_full_and_makes_progress") {
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let uri = tmp.path().to_string_lossy().to_string();
     let opts = RolloutStoreOptions {

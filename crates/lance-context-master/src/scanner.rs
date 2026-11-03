@@ -442,6 +442,13 @@ async fn scan_once_inner(
     );
     let live: HashSet<String> = entries.iter().map(|e| e.name.clone()).collect();
     let (entries, ambiguous) = unique_scan_entries(entries);
+    let entries = Arc::new(entries);
+    // Publish before version/pending shortcuts. Discovery must also revisit
+    // cold stores, including intents left by a process that no longer exists.
+    // This send cannot wait for readers, object storage, or collector capacity.
+    if state.retirement_catalog.receiver_count() > 0 {
+        state.retirement_catalog.send_replace(Some(entries.clone()));
+    }
     let concurrency = state.config.scan_concurrency.max(1);
 
     // Read the previous snapshot once, up front. Each experiment's row supplies
@@ -469,7 +476,8 @@ async fn scan_once_inner(
     // rather than dropped.
     operation.phase("observe_tables");
     let shard_counts = Arc::new(std::sync::Mutex::new(HashMap::new()));
-    let observations = observations_until_drain(&state.admission, stream::iter(entries))
+    let scan_entries = stream::iter(entries.iter().cloned());
+    let observations = observations_until_drain(&state.admission, scan_entries)
         .map(|entry| {
             let shard_counts = shard_counts.clone();
             let previous = previous.clone();
@@ -762,7 +770,8 @@ pub(crate) enum ScanKind {
 
 /// One store to observe this round. `name` is the stats-row / task-target
 /// name (prefixed for generic stores); `uri` is the physical dataset.
-struct ScanEntry {
+#[derive(Clone)]
+pub(crate) struct ScanEntry {
     name: String,
     uri: String,
     kind: ScanKind,
@@ -1180,32 +1189,165 @@ pub async fn refresh_one(state: &Arc<MasterState>, name: &str, uri: &str) -> lan
     result.and(release)
 }
 
+/// Traverse each admitted catalog to completion before taking its newest
+/// successor. Replacing a catalog cannot repeatedly starve its cold tail.
+/// Four pending opens/admissions bound work independently of the stats scan;
+/// the collector separately bounds deletion workers, tables and intent streams.
+async fn consume_retirement_catalogs<F, Fut, C, CFut>(
+    admission: Arc<crate::admission::Admission>,
+    mut catalogs: tokio::sync::watch::Receiver<Option<Arc<Vec<ScanEntry>>>>,
+    visit: F,
+    cold: C,
+) where
+    C: Fn() -> CFut + Send + Sync,
+    CFut: std::future::Future<Output = lance::Result<()>> + Send,
+    F: Fn(ScanEntry) -> Fut + Send + Sync,
+    Fut: std::future::Future<Output = lance::Result<()>> + Send,
+{
+    loop {
+        tokio::select! {
+            biased;
+            _ = admission.wait_closed() => return,
+            changed = catalogs.changed() => if changed.is_err() { return; },
+        }
+        let Some(entries) = catalogs.borrow_and_update().clone() else {
+            continue;
+        };
+        let traversal = stream::iter(entries.iter().cloned()).for_each_concurrent(4, |entry| {
+            let operation = admission.try_admit_named("wal_retirement_discovery");
+            let visit = &visit;
+            async move {
+                let Some(operation) = operation else {
+                    return;
+                };
+                operation.target(&entry.name);
+                operation.phase("admit_retirement_discovery");
+                let name = entry.name.clone();
+                if let Err(error) = visit(entry).await {
+                    tracing::warn!(store = %name, %error, "WAL retirement discovery deferred");
+                }
+            }
+        });
+        // Cancellation only drops metadata opens or pending admissions here.
+        // Already admitted collectors retain durable intents independently.
+        tokio::select! {
+            biased;
+            _ = admission.wait_closed() => return,
+            _ = traversal => {},
+        }
+        // Finish the cold traversal before accepting the newest successor;
+        // frequent catalogs must not restart root paging at its first page.
+        let Some(operation) = admission.try_admit_named("wal_cold_retirement_discovery") else {
+            return;
+        };
+        operation.phase("discover_cold_tables");
+        tokio::select! {
+            biased;
+            _ = admission.wait_closed() => return,
+            result = cold() => if let Err(error) = result {
+                tracing::warn!(%error, "Cold WAL retirement traversal deferred");
+            },
+        }
+    }
+}
+
+async fn discover_retired_wal(entry: ScanEntry) -> lance::Result<()> {
+    // Registry URIs are canonical main-branch locations. Recovery must not
+    // depend on opening a typed dataset, schema, index or payload first.
+    lance_context_core::discover_retired_wal_at_uri(&entry.uri).await
+}
+
+async fn discover_cold_stores(state: &MasterState) -> lance::Result<()> {
+    // Only the scan owner's local watch receiver calls this. The root walk
+    // includes unregistered Context stores and cold zero-pending stores.
+    // A namespace error must not suppress registered external Datagen URIs.
+    let root = lance_context_core::discover_retired_wal_under_root(&state.base_uri).await;
+    let datagen = async {
+        // Use the existing registry contract (one metadata catalog, not table
+        // payloads). This API materializes the registry, as the stats scanner
+        // already does for Rollout/Generic; only table admissions are bounded.
+        let entries = tokio::time::timeout(OBSERVE_TIMEOUT, state.datagen_registry.list())
+            .await.map_err(|_| lance::Error::io("Retirement Datagen registry timed out"))??;
+        let failures = std::sync::atomic::AtomicUsize::new(0);
+        stream::iter(entries).for_each_concurrent(4, |entry| {
+            let failures = &failures;
+            async move {
+                if let Err(error) = lance_context_core::discover_retired_wal_at_uri(&entry.uri).await {
+                    failures.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(store = %entry.name, %error, "Datagen WAL retirement discovery deferred");
+                }
+            }
+        }).await;
+        if failures.load(Ordering::Relaxed) != 0 {
+            return Err(lance::Error::io("Datagen retirement admissions deferred"));
+        }
+        Ok(())
+    }.await;
+    // Log both independent failures, retaining an error for the owning loop.
+    if let Err(error) = &root {
+        tracing::warn!(%error, "Retirement root discovery incomplete");
+    }
+    if let Err(error) = &datagen {
+        tracing::warn!(%error, "Retirement Datagen discovery incomplete");
+    }
+    root.and(datagen)
+}
+
 /// Spawn the periodic scanner. Returns `None` when the interval is `0`.
 pub fn spawn_scanner(state: &Arc<MasterState>) -> Option<JoinHandle<()>> {
     let interval_secs = state.config.stats_scan_interval_secs;
     if interval_secs == 0 {
         return None;
     }
+    let catalogs = state.retirement_catalog.subscribe();
     let state = state.clone();
     Some(tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
-        let every_n = state.config.stats_maintenance_every_n_scans;
-        let mut round: u64 = 0;
-        loop {
-            ticker.tick().await;
-            round += 1;
-            // Round 1 included: an existing deployment may start with a very
-            // long version chain, and waiting N rounds to reclaim it would
-            // leave cold start slow for another N intervals.
-            let maintain = every_n > 0 && (round == 1 || round.is_multiple_of(every_n));
-            match try_scan_once(&state, maintain).await {
-                Ok(Some(n)) => tracing::info!(experiments = n, "stats scan complete"),
-                Ok(None) => {
-                    tracing::debug!("stats scan skipped; another master owns the writer lock")
+        let discovery_state = state.clone();
+        let discovery = async move {
+            match lance_context_core::wal_collection_enabled() {
+                Ok(true) => {
+                    consume_retirement_catalogs(
+                        discovery_state.admission.clone(),
+                        catalogs,
+                        discover_retired_wal,
+                        move || {
+                            let state = discovery_state.clone();
+                            async move { discover_cold_stores(&state).await }
+                        },
+                    )
+                    .await;
                 }
-                Err(e) => tracing::warn!(error = %e, "stats scan round failed"),
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::error!(%error, "WAL collection disabled by invalid lifecycle configuration")
+                }
             }
-        }
+        };
+        let scanning = async {
+            let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+            let every_n = state.config.stats_maintenance_every_n_scans;
+            let mut round: u64 = 0;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = state.admission.wait_closed() => return,
+                    _ = ticker.tick() => {},
+                }
+                round += 1;
+                // Round 1 included: an existing deployment may start with a very
+                // long version chain, and waiting N rounds to reclaim it would
+                // leave cold start slow for another N intervals.
+                let maintain = every_n > 0 && (round == 1 || round.is_multiple_of(every_n));
+                match try_scan_once(&state, maintain).await {
+                    Ok(Some(n)) => tracing::info!(experiments = n, "stats scan complete"),
+                    Ok(None) => {
+                        tracing::debug!("stats scan skipped; another master owns the writer lock")
+                    }
+                    Err(e) => tracing::warn!(error = %e, "stats scan round failed"),
+                }
+            }
+        };
+        tokio::join!(scanning, discovery);
     }))
 }
 
@@ -2381,5 +2523,194 @@ mod retirement_tests {
         )
         .await
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod retirement_lifecycle_tests {
+    use super::*;
+
+    fn catalog(prefix: &str, count: usize) -> Arc<Vec<ScanEntry>> {
+        Arc::new(
+            (0..count)
+                .map(|i| ScanEntry {
+                    name: format!("{prefix}{i}"),
+                    uri: format!("memory://{prefix}{i}"),
+                    kind: if i % 2 == 0 {
+                        ScanKind::Rollout
+                    } else {
+                        ScanKind::Generic
+                    },
+                })
+                .collect(),
+        )
+    }
+
+    #[tokio::test]
+    async fn retirement_catalog_keeps_cold_tail_and_only_latest_successor() {
+        let admission = Arc::new(crate::admission::Admission::default());
+        let (sender, receiver) = tokio::sync::watch::channel(None);
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let completed = Arc::new(Semaphore::new(0));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let handle = {
+            let (entered, release, completed, seen) = (
+                entered.clone(),
+                release.clone(),
+                completed.clone(),
+                seen.clone(),
+            );
+            tokio::spawn(consume_retirement_catalogs(
+                admission.clone(),
+                receiver,
+                move |entry| {
+                    let (entered, release, completed, seen) = (
+                        entered.clone(),
+                        release.clone(),
+                        completed.clone(),
+                        seen.clone(),
+                    );
+                    async move {
+                        seen.lock().unwrap().push(entry.name.clone());
+                        entered.add_permits(1);
+                        release.acquire().await.unwrap().forget();
+                        completed.add_permits(1);
+                        // A poisoned table cannot hide the rest of the catalog.
+                        if entry.name == "old0" {
+                            Err(lance::Error::io("fixture failure"))
+                        } else {
+                            Ok(())
+                        }
+                    }
+                },
+                || async { Ok(()) },
+            ))
+        };
+        sender.send_replace(Some(catalog("old", 8)));
+        tokio::time::timeout(Duration::from_secs(5), entered.acquire_many(4))
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        assert_eq!(seen.lock().unwrap().len(), 4);
+        assert_eq!(admission.status().active_operations, 4);
+        sender.send_replace(Some(catalog("superseded", 4)));
+        sender.send_replace(Some(catalog("new", 4)));
+        release.add_permits(12);
+        tokio::time::timeout(Duration::from_secs(5), completed.acquire_many(12))
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        admission.begin_drain();
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .unwrap()
+            .unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 12);
+        for prefix in ["old", "new"] {
+            for i in 0..if prefix == "old" { 8 } else { 4 } {
+                assert_eq!(
+                    seen.iter()
+                        .filter(|n| **n == format!("{prefix}{i}"))
+                        .count(),
+                    1
+                );
+            }
+        }
+        assert!(seen[..8].iter().all(|name| name.starts_with("old")));
+        assert!(admission.status().drained());
+    }
+
+    #[tokio::test]
+    async fn retirement_drain_cancels_waiting_admissions_without_visiting_remaining_tables() {
+        let admission = Arc::new(crate::admission::Admission::default());
+        let (sender, receiver) = tokio::sync::watch::channel(None);
+        let entered = Arc::new(Semaphore::new(0));
+        let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handle = {
+            let (entered, started) = (entered.clone(), started.clone());
+            tokio::spawn(consume_retirement_catalogs(
+                admission.clone(),
+                receiver,
+                move |_| {
+                    let (entered, started) = (entered.clone(), started.clone());
+                    async move {
+                        started.fetch_add(1, Ordering::SeqCst);
+                        entered.add_permits(1);
+                        std::future::pending::<lance::Result<()>>().await
+                    }
+                },
+                || async { Ok(()) },
+            ))
+        };
+        sender.send_replace(Some(catalog("cold", 20)));
+        tokio::time::timeout(Duration::from_secs(5), entered.acquire_many(4))
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        admission.begin_drain();
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(started.load(Ordering::SeqCst), 4);
+        assert!(admission.status().drained());
+    }
+
+    #[tokio::test]
+    async fn cold_phase_finishes_before_latest_successor_and_drain_cancels_it() {
+        let admission = Arc::new(crate::admission::Admission::default());
+        let (sender, receiver) = tokio::sync::watch::channel(None);
+        let cold_entered = Arc::new(Semaphore::new(0));
+        let cold_release = Arc::new(Semaphore::new(0));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let handle = {
+            let (entered, release, seen) =
+                (cold_entered.clone(), cold_release.clone(), seen.clone());
+            tokio::spawn(consume_retirement_catalogs(
+                admission.clone(),
+                receiver,
+                move |entry| {
+                    seen.lock().unwrap().push(entry.name);
+                    async { Ok(()) }
+                },
+                move || {
+                    let (entered, release) = (entered.clone(), release.clone());
+                    async move {
+                        entered.add_permits(1);
+                        release.acquire().await.unwrap().forget();
+                        // Failure must not stop future catalog rounds.
+                        Err(lance::Error::io("cold fixture incomplete"))
+                    }
+                },
+            ))
+        };
+        sender.send_replace(Some(catalog("old", 2)));
+        tokio::time::timeout(Duration::from_secs(5), cold_entered.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        sender.send_replace(Some(catalog("superseded", 2)));
+        sender.send_replace(Some(catalog("new", 2)));
+        assert_eq!(seen.lock().unwrap().len(), 2);
+        cold_release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(5), cold_entered.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        assert_eq!(*seen.lock().unwrap(), vec!["old0", "old1", "new0", "new1"]);
+        assert_eq!(admission.status().active_operations, 1);
+        admission.begin_drain();
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(admission.status().drained());
     }
 }
