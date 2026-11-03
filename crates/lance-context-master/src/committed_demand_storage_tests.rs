@@ -448,7 +448,8 @@ async fn committed_demand_counts_drained_generations_with_no_rows() {
     assert!(generation > before.sstables[0].generation);
     let mut empty = before.sstables[0].clone();
     empty.generation = generation;
-    empty.path = format!("empty-format-fixture-{generation}.lance");
+    // Match the supported legacy generation identity, including its number.
+    empty.path = format!("gen_{generation}");
     empty.in_memory_bytes = Some(0);
     empty.physical_rows = Some(0);
     empty.primary_key_bytes = Some(0);
