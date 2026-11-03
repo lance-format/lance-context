@@ -2,6 +2,7 @@
 
 use std::borrow::BorrowMut;
 use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::convert::TryFrom;
 use std::marker::PhantomData;
 use std::ops::Bound;
 use std::sync::Arc;
@@ -384,6 +385,35 @@ impl<A: AllocatorTrait> MemTable<A> {
         } else {
             None
         }
+    }
+
+    /// Find a bounded retained suffix using index metadata, without payload I/O.
+    pub fn retained_entries_start(
+        &self,
+        end: u64,
+        max_bytes: u64,
+        max_entries: usize,
+    ) -> Option<u64> {
+        let (first, last) = self.span()?;
+        if end < first || end > last {
+            return None;
+        }
+        let mut start = end.checked_add(1)?;
+        let mut remaining = max_bytes;
+        for offset in (0..=usize::try_from(end - first).ok()?)
+            .rev()
+            .take(max_entries)
+        {
+            // Include a conservative per-entry framing allowance. File rotation
+            // and obsolete segments still require independent disk admission.
+            let charge = u64::from(self.entry_indexes[offset].entry_len) + 128;
+            if charge > remaining {
+                break;
+            }
+            remaining -= charge;
+            start = first + offset as u64;
+        }
+        Some(start)
     }
 
     /// Appends some log entries from append queue. Existing entries newer than

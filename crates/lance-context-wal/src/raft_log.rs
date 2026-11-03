@@ -48,6 +48,7 @@ const HARD: &[u8] = b"hard";
 const CONF: &[u8] = b"conf";
 const TERMS: &[u8] = b"terms";
 const SNAPSHOT: &[u8] = b"snapshot";
+const TRUNCATED: &[u8] = b"truncated";
 const MAX_SNAPSHOT_BYTES: usize = 4096;
 // raft-engine preallocates entry descriptors for the requested index interval,
 // before applying max_size. Never pass an unbounded interval to that API.
@@ -192,6 +193,9 @@ struct GroupState {
     conf: ConfState,
     terms: Vec<TermRange>,
     snapshot: Snapshot,
+    // Durable log truncation can trail the application checkpoint. The term at
+    // this boundary is needed for AppendEntries even after its entry is gone.
+    truncated: (u64, u64),
 }
 
 impl GroupState {
@@ -202,12 +206,12 @@ impl GroupState {
     }
 
     fn boundary(&self) -> u64 {
-        self.snapshot.get_metadata().index
+        self.truncated.0
     }
 
     fn term(&self, index: u64) -> Option<u64> {
         if index == self.boundary() {
-            return Some(self.snapshot.get_metadata().term);
+            return Some(self.truncated.1);
         }
         self.terms
             .get(self.terms.partition_point(|range| range.last < index))
@@ -217,15 +221,19 @@ impl GroupState {
 
     fn validate(&self) -> Result<()> {
         let metadata = self.snapshot.get_metadata();
-        if self.boundary() == 0 {
+        if metadata.index == 0 {
             ensure!(
-                self.snapshot == Snapshot::default(),
+                self.snapshot == Snapshot::default() && self.truncated == (0, 0),
                 "invalid empty checkpoint"
             );
         } else {
             checkpoint::validate(&self.snapshot, &self.conf)?;
         }
-        let (mut previous_last, mut previous_term) = (metadata.index, metadata.term);
+        ensure!(
+            self.boundary() <= metadata.index && (self.boundary() == 0) == (self.truncated.1 == 0),
+            "invalid durable truncation boundary"
+        );
+        let (mut previous_last, mut previous_term) = self.truncated;
         for range in &self.terms {
             ensure!(
                 range.first == previous_last + 1
@@ -239,8 +247,9 @@ impl GroupState {
             (previous_last, previous_term) = (range.last, range.term);
         }
         ensure!(
-            self.hard.commit >= self.boundary()
+            self.hard.commit >= metadata.index
                 && self.hard.commit <= self.last()
+                && self.term(metadata.index) == Some(metadata.term)
                 && self.hard.term >= previous_term
                 && (self.hard.term > 0 || self.hard.vote == 0)
                 && (self.hard.vote == 0 || self.conf.voters.contains(&self.hard.vote)),
@@ -302,6 +311,7 @@ impl GroupState {
             conf: self.conf.clone(),
             terms,
             snapshot: self.snapshot.clone(),
+            truncated: self.truncated,
         };
         next.validate()?;
         Ok(next)
@@ -485,7 +495,7 @@ impl PhysicalLog {
         for (group, voters) in assigned {
             let mut expected_conf = ConfState::default();
             expected_conf.set_voters(voters.clone());
-            let state = GroupState {
+            let mut state = GroupState {
                 hard: node
                     .engine
                     .get_message(group, HARD)?
@@ -518,6 +528,26 @@ impl PhysicalLog {
                     }
                     None => Snapshot::default(),
                 },
+                truncated: (0, 0),
+            };
+            state.truncated = match node.engine.get(group, TRUNCATED) {
+                Some(bytes) => {
+                    ensure!(bytes.len() == 24, "invalid durable truncation metadata");
+                    ensure!(
+                        u64::from_le_bytes(bytes[16..].try_into().unwrap())
+                            == state.snapshot.get_metadata().index,
+                        "truncation metadata belongs to a different checkpoint"
+                    );
+                    (
+                        u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+                        u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+                    )
+                }
+                // Existing directories compacted to the checkpoint itself.
+                None => (
+                    state.snapshot.get_metadata().index,
+                    state.snapshot.get_metadata().term,
+                ),
             };
             ensure!(state.conf == expected_conf, "static membership changed");
             state.validate()?;
@@ -535,7 +565,7 @@ impl PhysicalLog {
             );
             // Native purge can discard an append-queue Compact command while
             // its old entries still exist in a shared rewrite file. The durable
-            // checkpoint remains authoritative: replay only its covered prefix.
+            // truncation metadata remains authoritative: compact only its prefix.
             // Missing or extra suffix entries still fail the check above.
             if first.is_some_and(|index| index <= state.boundary()) {
                 compacted_prefixes.add_command(
@@ -759,7 +789,8 @@ impl Storage for GroupLog {
 
     fn snapshot(&self, request_index: u64, _: u64) -> raft::Result<Snapshot> {
         let state = self.read().map_err(storage_error)?;
-        if state.boundary() == 0 || state.boundary() < request_index {
+        let index = state.snapshot.get_metadata().index;
+        if index == 0 || index < request_index {
             return Err(StorageError::SnapshotTemporarilyUnavailable.into());
         }
         Ok(state.snapshot.clone())

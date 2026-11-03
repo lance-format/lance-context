@@ -394,8 +394,9 @@ impl Node {
             let store = log.group(*group)?;
             store.bind_application(&identity)?;
             let committed = store.initial_state()?.hard_state.commit;
-            let (mut state, image) = if store.first_index()? > 1 {
-                let snapshot = store.snapshot(store.first_index()? - 1, id)?;
+            let checkpoint_index = store.checkpoint_index()?;
+            let (mut state, image) = if checkpoint_index > 0 {
+                let snapshot = store.snapshot(checkpoint_index, id)?;
                 let loaded = checkpoint::load(directory, &snapshot, &layout, &limits, *group)?;
                 images.installed(&loaded.image)?;
                 (loaded.state, Some(loaded.image))
@@ -547,14 +548,12 @@ impl Node {
 
     pub(crate) fn checkpoint_index(&self, group: u64) -> Result<u64> {
         self.healthy()?;
-        Ok(self
-            .groups
+        self.groups
             .get(&group)
             .context("unhosted group")?
             .raw
             .store()
-            .first_index()?
-            .saturating_sub(1))
+            .checkpoint_index()
     }
 
     fn request_pending(&self, request: u64) -> bool {

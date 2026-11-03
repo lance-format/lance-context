@@ -19,6 +19,7 @@ fn options() -> maintenance::Options {
         interval_ms: 25,
         checkpoint_entries: u64::MAX,
         checkpoint_interval_ms: 4000,
+        checkpoint_trailing_bytes: 0,
         log_interval_ms: 60_000,
         scan_entries: 8,
     }
