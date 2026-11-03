@@ -62,8 +62,10 @@ pub enum Phase {
     AnnotationBodyCommit,
     /// Preparing the frozen narrow annotations against that body snapshot.
     AnnotationNarrowPrepare,
+    /// A shared existence lookup for a small prefix of separate create requests.
+    AnnotationRegistrationLookup,
 }
-const NAMES: [&str; 35] = [
+const NAMES: [&str; 36] = [
     "claim",
     "acquire",
     "state",
@@ -99,6 +101,7 @@ const NAMES: [&str; 35] = [
     "annotation_body_write",
     "annotation_body_commit",
     "annotation_narrow_prepare",
+    "annotation_registration_lookup",
 ];
 pub const PHASE_COUNT: usize = NAMES.len();
 
