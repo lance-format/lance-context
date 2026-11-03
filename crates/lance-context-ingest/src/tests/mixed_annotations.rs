@@ -4,6 +4,7 @@ mod compaction;
 mod id_index;
 #[cfg(feature = "service")]
 mod lost_prepare;
+mod prefetch;
 mod pressure;
 mod replay;
 mod runtime;
