@@ -1662,7 +1662,7 @@ mod tests {
                         shard: mark.shard_id.to_string(),
                         sealed_through: mark.sealed_through,
                         sealed_bytes_through: 0,
-                        merged_through: None,
+                        merged_through: mark.merged_through,
                         merged_epoch: None,
                         flushed_at_ms: chrono::Utc::now().timestamp_millis(),
                         writer_epoch: mark.writer_epoch,
@@ -1741,7 +1741,11 @@ mod tests {
                     // The normal release did invoke the fallback, but its shared
                     // publication slots are full until these assertions complete.
                     cache = snapshot(client, prefix).await.unwrap();
-                    let expected_pending = u64::from(!enabled) + u64::from(late_flush);
+                    // A late writer publication carries the durable merged
+                    // prefix, even when direct executor publication is disabled.
+                    // Retiring a completed hint must not make that writer
+                    // recreate already-consumed generations as pending work.
+                    let expected_pending = u64::from(!enabled || late_flush);
                     assert_eq!(cache.tables["generic:a"].pending(), expected_pending);
                     reconcile(&publisher, prefix, &mut cache, "generic:a")
                         .await
