@@ -34,7 +34,7 @@ impl AnnotationStaging {
     /// registration requests. This does not apply or validate those requests.
     /// Invalid/oversized key windows and unavailable workspace/read admission
     /// return `None`; callers should continue their ordinary ordered apply.
-    /// Admission never waits for more memory while holding an appliable prefix.
+    /// Admission never waits for more memory while holding pending requests.
     ///
     /// Use the caller's existing bounded apply workspace. Owned-key accounting
     /// does not include Lance's internal scan workspace or establish an RSS cap.
