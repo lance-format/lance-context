@@ -5,7 +5,24 @@ use lance_io::object_store::ObjectStoreParams;
 use std::{sync::atomic::Ordering, time::Duration};
 
 async fn opened(path: &std::path::Path) -> Result<(Arc<Dataset>, Throttle)> {
-    narrow(path).await?;
+    opened_rows(path, 1).await
+}
+
+pub(super) async fn opened_rows(
+    path: &std::path::Path,
+    count: usize,
+) -> Result<(Arc<Dataset>, Throttle)> {
+    let batch = imported(0, count)?;
+    let schema = batch.schema();
+    Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        path.to_str().unwrap(),
+        Some(WriteParams {
+            enable_stable_row_ids: true,
+            ..Default::default()
+        }),
+    )
+    .await?;
     let throttle = Throttle::new(Duration::ZERO);
     let base = DatasetBuilder::from_uri(format!("file-object-store://{}", path.display()))
         .with_session(Arc::new(Session::new(1 << 20, 0, Default::default())))

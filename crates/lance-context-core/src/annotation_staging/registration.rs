@@ -92,7 +92,7 @@ impl AnnotationStaging {
         through: u64,
         rows: &[Registration<'_>],
     ) -> Result<ApplyOutcome> {
-        self.apply_inner(after, through, Batch::Registrations(rows), true, None)
+        self.apply_inner(after, through, Batch::Registrations(rows), true, None, None)
             .await
     }
 }

@@ -17,6 +17,7 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
 
 mod body;
 mod compaction;
+mod patch_lookup;
 mod preserve_id;
 mod publication;
 mod published_values;
@@ -25,6 +26,7 @@ mod registration_lookup;
 mod status_filter;
 mod views;
 pub use body::{BodySnapshot, TurnBodySource, TurnRead, BODY_SNAPSHOT_PROPERTY};
+pub use patch_lookup::PatchLookup;
 pub use publication::{
     FrozenAnnotations, PreparedAnnotations, MAX_RESULTS_BYTES, RESULTS_PROPERTY,
 };
@@ -286,7 +288,7 @@ impl AnnotationStaging {
         mutations: &[Mutation<'_>],
     ) -> Result<()> {
         match self
-            .apply_inner(after, through, Batch::Patches(mutations), false, None)
+            .apply_inner(after, through, Batch::Patches(mutations), false, None, None)
             .await?
         {
             ApplyOutcome::Applied => Ok(()),
@@ -309,7 +311,7 @@ impl AnnotationStaging {
         through: u64,
         mutations: &[Mutation<'_>],
     ) -> Result<ApplyOutcome> {
-        self.apply_inner(after, through, Batch::Patches(mutations), true, None)
+        self.apply_inner(after, through, Batch::Patches(mutations), true, None, None)
             .await
     }
 
@@ -330,12 +332,13 @@ impl AnnotationStaging {
         mutations: Batch<'_, '_>,
         advance_rejection: bool,
         lookup: Option<&RegistrationLookup>,
+        patch_lookup: Option<&PatchLookup>,
     ) -> Result<ApplyOutcome> {
         let _mutation = self.mutation.lock().await;
         let pending = {
             let state = self.state.read().await;
             check_order(&state, after, through)?;
-            self.pending_batch(&state, through, mutations, lookup)
+            self.pending_batch(&state, through, mutations, lookup, patch_lookup)
                 .await?
         };
         // The mutation gate keeps the base, values and applied cut unchanged
@@ -364,6 +367,7 @@ impl AnnotationStaging {
         through: u64,
         mutations: Batch<'_, '_>,
         lookup: Option<&RegistrationLookup>,
+        patch_lookup: Option<&PatchLookup>,
     ) -> Result<PendingBatch> {
         if mutations.len() == 0 || mutations.len() > 65_536 {
             return Ok(reject(0, RejectionReason::BatchTooLarge));
@@ -374,6 +378,8 @@ impl AnnotationStaging {
         let lookup = lookup.filter(|lookup| {
             matches!(mutations, Batch::Registrations(_)) && lookup.matches(&state.base)
         });
+        let patch_lookup = patch_lookup
+            .filter(|lookup| matches!(mutations, Batch::Patches(_)) && lookup.matches(&state.base));
         for row in 0..mutations.len() {
             let input = mutations.row(row);
             let result = match input {
@@ -406,7 +412,9 @@ impl AnnotationStaging {
                 }
             }
             keys.retain(|turn| {
-                !cached.contains_key(turn) && lookup.and_then(|lookup| lookup.get(turn)).is_none()
+                !cached.contains_key(turn)
+                    && lookup.and_then(|lookup| lookup.get(turn)).is_none()
+                    && patch_lookup.and_then(|lookup| lookup.get(turn)).is_none()
             });
             let cold = match mutations {
                 Batch::Patches(_) => read_bases(&state.base, &keys).await?,
@@ -447,11 +455,15 @@ impl AnnotationStaging {
                         let mut current = match &previous {
                             Some(value) => value.value.clone(),
                             None if cached.contains_key(turn) => cached[turn].value.clone(),
-                            None => match cold.get(turn) {
-                                Some(batch) => {
-                                    decode_base_row(batch, 0, turn, self.limits.value_bytes)?
-                                }
-                                None => return Ok(reject(row, RejectionReason::MissingTurn)),
+                            None => match patch_lookup.and_then(|lookup| lookup.get(turn)) {
+                                Some(Some(value)) => value.clone(),
+                                Some(None) => return Ok(reject(row, RejectionReason::MissingTurn)),
+                                None => match cold.get(turn) {
+                                    Some(batch) => {
+                                        decode_base_row(batch, 0, turn, self.limits.value_bytes)?
+                                    }
+                                    None => return Ok(reject(row, RejectionReason::MissingTurn)),
+                                },
                             },
                         };
                         patch

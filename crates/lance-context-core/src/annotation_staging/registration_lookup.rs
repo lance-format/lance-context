@@ -129,6 +129,7 @@ impl AnnotationStaging {
             Batch::Registrations(rows),
             true,
             Some(lookup),
+            None,
         )
         .await
     }

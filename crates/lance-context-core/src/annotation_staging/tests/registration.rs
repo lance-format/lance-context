@@ -5,6 +5,7 @@ use lance::dataset::transaction::Operation;
 use lance_core::{ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION};
 
 mod lookup;
+mod patch_lookup;
 
 fn imported(start: usize, count: usize) -> Result<RecordBatch> {
     let ids = (start..start + count)
