@@ -16,7 +16,8 @@ impl Window {
             after,
             records: Vec::new(),
             bytes: 0,
-            max_records: p::MAX_INPUTS,
+            // Raising the protocol ceiling must not enlarge existing workloads.
+            max_records: 512,
             max_bytes,
         }
     }

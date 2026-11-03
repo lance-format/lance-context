@@ -19,6 +19,7 @@ pub use manifest::{
     ReserveManifest, RetireManifestHistory, MAX_MANIFEST_VERSIONS,
 };
 pub use outcome::{ConfirmPublication, Published};
+pub(super) use plan::MAX_PLAN_BYTES;
 pub use plan::{PendingPlan, Plan, PlanRequest, Progress, SourceRange, MAX_INPUTS};
 pub use prepared::{Descriptors, PrepareRequest, Prepared, MAX_DESCRIPTOR_BYTES};
 #[cfg(test)]
