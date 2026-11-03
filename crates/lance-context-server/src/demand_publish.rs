@@ -15,13 +15,14 @@ const MAX_ACKNOWLEDGEMENTS: usize = 16_384;
 const MAX_ACK_KEY_BYTES: usize = 1024;
 type Job = Pin<Box<dyn Future<Output = ()> + Send>>;
 
-/// Only the simple writer observation is cached. Additional age/merge evidence
-/// must always reach the durable join, even if the sealed watermark is equal.
+/// Only simple writer observations are cached. A change to the completed
+/// prefix must reach etcd even when the sealed watermark is unchanged.
 #[derive(Clone, Copy)]
 struct WriterAcknowledgement {
     generation: u64,
     epoch: u64,
     bytes: u64,
+    merged: Option<u64>,
     flushed_at_ms: i64,
 }
 
@@ -29,13 +30,13 @@ impl WriterAcknowledgement {
     fn from_event(event: &DemandEvent) -> Option<Self> {
         (event.v == SCHEMA_VERSION
             && event.source == EventSource::Writer
-            && event.merged_through.is_none()
             && event.merged_epoch.is_none()
             && event.sealed_times.is_empty())
         .then_some(Self {
             generation: event.sealed_through,
             epoch: event.writer_epoch,
             bytes: event.sealed_bytes_through,
+            merged: event.merged_through,
             flushed_at_ms: event.flushed_at_ms,
         })
     }
@@ -44,6 +45,7 @@ impl WriterAcknowledgement {
         self.generation == next.generation
             && self.epoch == next.epoch
             && self.bytes == next.bytes
+            && self.merged == next.merged
             && self.flushed_at_ms <= next.flushed_at_ms
     }
 
@@ -52,7 +54,9 @@ impl WriterAcknowledgement {
         // newer watermark; an earlier time for the SAME generation is useful.
         let earliest = self.flushed_at_ms.min(next.flushed_at_ms);
         let same_generation = self.generation == next.generation;
-        if (next.generation, next.epoch, next.bytes) > (self.generation, self.epoch, self.bytes) {
+        if (next.generation, next.epoch, next.bytes, next.merged)
+            > (self.generation, self.epoch, self.bytes, self.merged)
+        {
             *self = next;
         }
         if same_generation {
@@ -580,6 +584,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completed_prefix_changes_are_published_but_idle_repeats_are_cached() {
+        let publisher = DemandPublisher::new(8);
+        let mut observation = event();
+        observation.merged_through = Some(6);
+        publisher
+            .publish_writer_event("t", &observation, async { Ok::<_, ()>(true) })
+            .await
+            .unwrap();
+        must_skip(&publisher, "t", &observation).await;
+        observation.merged_through = Some(7);
+        assert_eq!(
+            publisher
+                .publish_writer_event("t", &observation, async { Ok::<_, ()>(true) })
+                .await,
+            Ok("written")
+        );
+        for _ in 0..100 {
+            must_skip(&publisher, "t", &observation).await;
+        }
+        observation.sealed_through = 8;
+        assert_eq!(
+            publisher
+                .publish_writer_event("t", &observation, async { Err::<bool, _>("lost response") })
+                .await,
+            Err("lost response")
+        );
+        assert_eq!(
+            publisher
+                .publish_writer_event("t", &observation, async { Ok::<_, ()>(true) })
+                .await,
+            Ok("written")
+        );
+        must_skip(&publisher, "t", &observation).await;
+    }
+
+    #[tokio::test]
     async fn extended_events_and_large_keys_always_reach_durable_join() {
         let publisher = DemandPublisher::new(8);
         let observation = event();
@@ -588,9 +628,6 @@ mod tests {
             .await
             .unwrap();
         let mut variants = Vec::new();
-        let mut e = observation.clone();
-        e.merged_through = Some(3);
-        variants.push(e);
         let mut e = observation.clone();
         e.merged_epoch = Some(1);
         variants.push(e);
