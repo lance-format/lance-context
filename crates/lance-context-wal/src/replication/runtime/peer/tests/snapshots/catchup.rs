@@ -4,6 +4,7 @@ use super::*;
 async fn successful_slow_snapshot(
     checkpoint_during_transfer: bool,
     retained_bytes: u64,
+    expected_images: u64,
 ) -> Result<()> {
     let root = tempfile::tempdir()?;
     let mut c = Images::open(root.path()).await?;
@@ -79,7 +80,19 @@ async fn successful_slow_snapshot(
     };
     assert_eq!(statistics.sent.load(Ordering::Acquire), 0);
     assert_eq!(receiver.installed.load(Ordering::Acquire), 0);
-    assert_eq!(leader.observation(10)?.checkpoint_index, latest_index);
+    wait_for(|| leader.observation(10).unwrap().checkpoint_index == latest_index).await?;
+    let observed = leader.observation(10)?;
+    assert_eq!(
+        observed.first_retained_index > original_index + 1,
+        expected_images == 2,
+        "the original image must still have its complete replication suffix"
+    );
+    if checkpoint_during_transfer && retained_bytes > 0 {
+        assert!(
+            observed.first_retained_index <= latest_index,
+            "the test must retain real entries, not just configure a nonzero allowance"
+        );
+    }
     std::fs::write(marker.with_extension("resume"), b"resume")?;
 
     wait_for(|| {
@@ -92,11 +105,8 @@ async fn successful_slow_snapshot(
             == 12
     })
     .await?;
-    let extra_image = checkpoint_during_transfer && retained_bytes == 0;
-    // Without a retained tail, a checkpoint overtaking this successful
-    // transfer requires another image. With a sufficient tail, the same
-    // follower replays the suffix despite the newer installed checkpoint.
-    let expected_images = if extra_image { 2 } else { 1 };
+    // A nonzero tail is insufficient when the checkpoint has discarded the
+    // start of this image's suffix. Only a complete suffix avoids a new image.
     wait_for(|| {
         statistics.sent.load(Ordering::Acquire) == expected_images
             && receiver.installed.load(Ordering::Acquire) == expected_images
@@ -122,17 +132,25 @@ async fn successful_slow_snapshot(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn successful_slow_snapshot_catches_up_from_retained_suffix() -> Result<()> {
-    successful_slow_snapshot(false, 0).await
+    successful_slow_snapshot(false, 0, 1).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn successful_slow_snapshot_needs_another_image_when_checkpoint_overtakes_it() -> Result<()> {
-    successful_slow_snapshot(true, 0).await
+    successful_slow_snapshot(true, 0, 2).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn successful_slow_snapshot_uses_tail_despite_newer_checkpoint() -> Result<()> {
-    successful_slow_snapshot(true, 16 << 20).await
+    successful_slow_snapshot(true, 16 << 20, 1).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn successful_slow_snapshot_needs_another_image_when_nonzero_tail_is_too_short() -> Result<()>
+{
+    // Eight 1 MiB suffix records exceed this allowance, which still retains
+    // at least one actual entry. Use a paused real transfer, not a timing race.
+    successful_slow_snapshot(true, 2 << 20, 2).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -152,7 +170,8 @@ async fn reopening_retained_index_one_still_loads_the_application_checkpoint() -
     leader
         .install_checkpoint_retaining(image, 16 << 20)?
         .await?;
-    assert_eq!(leader.observation(10)?.checkpoint_index, index);
+    wait_for(|| leader.observation(10).unwrap().checkpoint_index == index).await?;
+    assert_eq!(leader.observation(10)?.first_retained_index, 1);
     c.shutdown().await?;
     let node = Node::open(
         &root.path().join(leader_id.to_string()),

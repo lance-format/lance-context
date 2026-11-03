@@ -22,6 +22,7 @@ pub(super) struct State {
 struct Group {
     status: crate::replication::Status,
     checkpoint_index: u64,
+    first_retained_index: u64,
     observed_age_ms: u64,
     polling: bool,
     stopped: bool,
@@ -68,6 +69,7 @@ impl State {
                 Group {
                     status: o.status,
                     checkpoint_index: o.checkpoint_index,
+                    first_retained_index: o.first_retained_index,
                     observed_age_ms: age.as_millis().min(u64::MAX as u128) as u64,
                     polling: o.polling,
                     stopped: o.stopped,
