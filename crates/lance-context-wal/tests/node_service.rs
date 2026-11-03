@@ -161,6 +161,13 @@ async fn run_cluster(f: &Fixture) -> Result<()> {
     }
     let lagging = *(1..=3).find(|n| *n != first_leader).as_ref().unwrap();
     let before_disconnect = f.status(first_leader).await?;
+    assert!(
+        before_disconnect["outbound_snapshots"]
+            .as_array()
+            .unwrap()
+            .len()
+            <= 2
+    );
     let poll = &before_disconnect["groups"]["10"]["durable_poll"];
     assert!(poll["completed"].as_u64().unwrap() > 0);
     assert_eq!(poll["failed"], 0);
@@ -246,6 +253,38 @@ async fn run_cluster(f: &Fixture) -> Result<()> {
                 }
             }
             children.get_mut(&lagging).unwrap().assert_live()?;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await??;
+    // Observe the actual service's bounded transport record through HTTP,
+    // independently of the client Status wire message used for mutations.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let status = f.status(first_leader).await?;
+            let transfers = status["outbound_snapshots"].as_array().unwrap();
+            assert!(transfers.len() <= 2);
+            if let Some(sent) = transfers
+                .iter()
+                .find(|v| v["to"] == lagging && v["delivered"] == true)
+            {
+                assert!(sent["group"] == 10 || sent["group"] == 20);
+                for key in [
+                    "index",
+                    "term",
+                    "attempt",
+                    "metadata_bytes",
+                    "payload_bytes",
+                ] {
+                    assert!(sent[key].as_u64().unwrap() > 0);
+                }
+                assert!(
+                    sent["elapsed_ms"].as_u64().unwrap()
+                        <= sent["started_ago_ms"].as_u64().unwrap()
+                );
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         Ok::<_, anyhow::Error>(())

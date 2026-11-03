@@ -664,51 +664,54 @@ mod tests {
 
     #[tokio::test]
     async fn unordered_reader_batches_keep_the_live_tail_protected() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
         let dir = tempfile::TempDir::new().unwrap();
         let (store, root) = ObjectStore::from_uri(dir.path().to_str().unwrap())
             .await
             .unwrap();
-        let reached = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
-        let reading = {
-            let (store, root, reached, release) = (
-                store.clone(),
-                root.clone(),
-                reached.clone(),
-                release.clone(),
-            );
-            tokio::spawn(async move {
-                protect(store, &root, quick_policy(), async {
-                    reached.notify_one();
-                    release.notified().await;
-                    Ok(7)
-                })
-                .await
-            })
-        };
-        reached.notified().await;
-        let live = captured_readers(&store, &root).await.unwrap().remove(0);
+        let mut memory = store.as_ref().clone();
+        memory.inner = Arc::new(object_store::memory::InMemory::new());
+        let store = Arc::new(memory);
+        let live = readers_root(&root).join("m-live");
+        write_nonce(&store, &live, true).await.unwrap();
         let mut entries = Vec::new();
         for name in ["z-abandoned", "a-abandoned"] {
             let path = readers_root(&root).join(name);
             write_nonce(&store, &path, true).await.unwrap();
             entries.push(Ok(store.inner.head(&path).await.unwrap()));
+            // A captured listing can still contain keys released by readers.
+            store.inner.delete(&path).await.unwrap();
         }
         entries.push(Ok(store.inner.head(&live).await.unwrap()));
-        let collecting = tokio::spawn(wait_for_listing(
+        let listed = Arc::new(AtomicUsize::new(0));
+        let listing = stream::iter(entries)
+            .inspect({
+                let listed = listed.clone();
+                move |_| {
+                    listed.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+            .boxed();
+        let mut collecting = Box::pin(wait_for_listing(
             store.clone(),
-            stream::iter(entries).boxed(),
-            quick_policy(),
+            listing,
+            Policy {
+                poll: Duration::from_millis(1),
+                ..Policy::default()
+            },
             2,
         ));
-        tokio::time::sleep(Duration::from_millis(900)).await;
-        assert!(!collecting.is_finished());
+        // All storage calls are immediately ready. Poll through the removed
+        // first batch and prove the collector waits on the live final entry.
+        // Lease renewal and expiry have separate tests; this assertion must
+        // not depend on a heartbeat task winning a wall-clock scheduling race.
+        assert!(futures::poll!(collecting.as_mut()).is_pending());
+        assert_eq!(listed.load(Ordering::Relaxed), 3);
         assert!(read_nonce(&store, &live).await.unwrap().is_some());
-        release.notify_one();
-        assert_eq!(reading.await.unwrap().unwrap(), 7);
-        tokio::time::timeout(Duration::from_secs(2), collecting)
+        store.inner.delete(&live).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), collecting)
             .await
-            .unwrap()
             .unwrap()
             .unwrap();
     }

@@ -319,7 +319,16 @@ async fn stalled_tls_snapshot_does_not_block_healthy_quorum_and_recovers_after_d
     for sequence in 1..=4 {
         expected.push(append(&c.net.nodes[&leader_id].handle, 10, sequence).await?);
     }
-    drop(checkpoint(&c.net.nodes[&leader_id].handle, 10).await?);
+    let original = checkpoint(&c.net.nodes[&leader_id].handle, 10).await?;
+    let original_index = original.snapshot()?.get_metadata().index;
+    drop(original);
+    let statistics = c.services[&leader_id].statistics().clone();
+    let transfer = || {
+        statistics
+            .outbound_observations()
+            .into_iter()
+            .find(|v| v.to == follower)
+    };
     // The follower handles ordinary Raft messages, but its separate image socket is a
     // correctly authenticated peer that never grants receive admission.
     c.net.start(
@@ -342,6 +351,11 @@ async fn stalled_tls_snapshot_does_not_block_healthy_quorum_and_recovers_after_d
         Ok::<_, anyhow::Error>(())
     });
     wait_for(|| connected.load(Ordering::Acquire)).await?;
+    let sending = transfer().context("missing actual outgoing snapshot")?;
+    assert_eq!((sending.group, sending.index), (10, original_index));
+    assert!(sending.attempt > 0);
+    assert_eq!(sending.delivered, None);
+    assert!(sending.metadata_bytes > 0 && sending.payload_bytes >= 4 << 20);
     // Transfers have a60sdeadline; quorum writes must finish much earlier.
     timeout(Duration::from_secs(10), async {
         for sequence in 5..=12 {
@@ -351,6 +365,24 @@ async fn stalled_tls_snapshot_does_not_block_healthy_quorum_and_recovers_after_d
     })
     .await??;
     assert!(!stalled.is_finished());
+    // Publishing a newer image must not change the observed index of the
+    // original transfer. File retention alone cannot establish this identity.
+    let newer = checkpoint(&c.net.nodes[&leader_id].handle, 10).await?;
+    let newer_index = newer.snapshot()?.get_metadata().index;
+    drop(newer);
+    assert!(newer_index > original_index);
+    assert!(
+        c.net.nodes[&leader_id]
+            .handle
+            .observation(10)?
+            .checkpoint_index
+            >= newer_index
+    );
+    let still_sending = transfer().context("outgoing snapshot disappeared")?;
+    assert_eq!(still_sending.index, original_index);
+    assert_eq!(still_sending.attempt, sending.attempt);
+    assert_eq!(still_sending.delivered, None);
+    assert!(still_sending.elapsed_ms >= sending.elapsed_ms);
     stalled.abort();
     let _ = stalled.await;
     c.attach(follower, c.listener(follower)?)?;
@@ -364,6 +396,13 @@ async fn stalled_tls_snapshot_does_not_block_healthy_quorum_and_recovers_after_d
             == 12
     })
     .await?;
+    wait_for(|| transfer().is_some_and(|v| v.delivered == Some(true) && v.index == newer_index))
+        .await?;
+    let delivered = transfer().unwrap();
+    assert!(delivered.attempt > sending.attempt);
+    assert!(delivered.elapsed_ms <= delivered.started_ago_ms);
+    assert!(statistics.outbound_observations().len() <= 2);
+    assert!(statistics.failed.load(Ordering::Acquire) > 0);
     wait_for(|| {
         c.services[&follower]
             .statistics()

@@ -8,6 +8,9 @@ use crate::replication::checkpoint::{Image, Part, CHUNK_BYTES};
 use std::{future::Future, thread};
 use tokio::sync::oneshot;
 
+mod observation;
+pub use observation::TransferObservation;
+
 pub const ALPN: &[u8] = b"lance-context-wal-snapshot/1";
 const MAGIC: &[u8; 8] = b"LCWSNAP1";
 const ACK: &[u8; 8] = b"LCWSYNC1";
@@ -86,6 +89,8 @@ pub struct Statistics {
     pub installed: AtomicU64,
     pub failed: AtomicU64,
     pub rejected: AtomicU64,
+    // Exactly one slot per configured destination. No payload or image is retained.
+    outgoing: BTreeMap<u64, std::sync::Mutex<Option<observation::Transfer>>>,
 }
 
 struct Queued {
@@ -225,7 +230,13 @@ impl Transport {
                 }
             })?;
         let files = Files(file_send);
-        let statistics = Arc::new(Statistics::default());
+        let statistics = Arc::new(Statistics {
+            outgoing: peers
+                .keys()
+                .map(|&id| (id, std::sync::Mutex::new(None)))
+                .collect(),
+            ..Statistics::default()
+        });
         let mut tasks = JoinSet::new();
         let mut routes = BTreeMap::new();
         for (id, peer) in peers {
@@ -346,6 +357,7 @@ async fn send_loop(
             _ = stopping(stop.clone()) => return Ok(()),
             queued = receive.recv() => match queued { Some(q) => q, None => return Ok(()) },
         };
+        statistics.started(&queued.outgoing);
         let result = bounded(&stop, options.transfer_timeout, async {
             let tcp = TcpStream::connect(&peer.address).await?;
             tcp.set_nodelay(true)?;
@@ -360,6 +372,7 @@ async fn send_loop(
             send_image(&mut stream, &queued.outgoing, &files, &options).await
         })
         .await;
+        statistics.finished(&queued.outgoing, result.is_ok());
         if result.is_ok() {
             queued.outgoing.finish_snapshot(true)?;
             statistics.sent.fetch_add(1, Ordering::Relaxed);
