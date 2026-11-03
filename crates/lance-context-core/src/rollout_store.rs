@@ -67,7 +67,7 @@ use datafusion::prelude::SessionContext;
 use datafusion::sql::parser::{DFParser, Statement as DFStatement};
 use datafusion::sql::sqlparser::ast::Statement as SqlStatement;
 use futures::{stream, FutureExt, StreamExt, TryStreamExt};
-use lance::dataset::mem_wal::{LsmScanner, ShardManifestStore, ShardSnapshot};
+use lance::dataset::mem_wal::{ShardManifestStore, ShardSnapshot};
 use lance::dataset::optimize::CompactionMetrics;
 use lance::dataset::scanner::MaterializationStyle;
 use lance::dataset::Dataset;
