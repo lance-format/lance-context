@@ -346,9 +346,13 @@ async fn committed_demand_real_publication_ack_loss_and_cancellation() {
                     .unwrap();
                 if matches!(outcome, Outcome::Success) {
                     tokio::time::timeout(Duration::from_secs(5), async {
-                        for (key, mark) in keys.iter().zip(&marks) {
-                            while demand(&mut client, key).await.merged_through
-                                != Some(mark.sealed_through)
+                        for key in &keys {
+                            while !client
+                                .get(key.as_str(), None)
+                                .await
+                                .unwrap()
+                                .kvs()
+                                .is_empty()
                             {
                                 tokio::time::sleep(Duration::from_millis(10)).await;
                             }
@@ -389,9 +393,13 @@ async fn committed_demand_real_publication_ack_loss_and_cancellation() {
                 );
                 crate::demand_publish::spawn_merged_demand(coordinator, "hot".into(), uri);
                 tokio::time::timeout(Duration::from_secs(5), async {
-                    for (key, mark) in keys.iter().zip(&marks) {
-                        while demand(&mut client, key).await.merged_through
-                            != Some(mark.sealed_through)
+                    for key in &keys {
+                        while !client
+                            .get(key.as_str(), None)
+                            .await
+                            .unwrap()
+                            .kvs()
+                            .is_empty()
                         {
                             tokio::time::sleep(Duration::from_millis(10)).await;
                         }
@@ -527,13 +535,19 @@ async fn committed_demand_counts_drained_generations_with_no_rows() {
         1
     );
     // No maintenance release/fallback publisher ran in this scope. The empty
-    // generation's progress must come from its successful native commit.
+    // generation's completed hint must retire after its successful native commit.
     tokio::time::timeout(Duration::from_secs(5), async {
-        while demand(&mut client, &key).await.merged_through != Some(generation) {
+        while !client
+            .get(key.as_str(), None)
+            .await
+            .unwrap()
+            .kvs()
+            .is_empty()
+        {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
     .unwrap();
-    eprintln!("verified actual empty-data generation drain: two generations reclaimed, one real row retained, committed demand reaches empty generation");
+    eprintln!("verified actual empty-data generation drain: two generations reclaimed, one real row retained, completed demand hint retires through the empty generation");
 }
