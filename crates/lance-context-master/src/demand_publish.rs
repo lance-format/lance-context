@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use lance_context_core::{GenericStore, GenericStoreOptions, RolloutStore, RolloutStoreOptions};
-use lance_context_merge::demand::{DemandEvent, EventSource, SCHEMA_VERSION};
+use lance_context_merge::demand::{DemandEvent, EventSource, ShardMerged, SCHEMA_VERSION};
 use lance_context_merge::Coordinator;
 use tokio::sync::Semaphore;
 
