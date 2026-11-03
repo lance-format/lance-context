@@ -159,7 +159,9 @@ async fn one_request_budget_drains_without_waiting_for_lookahead_memory() -> Res
     let narrow = storage(root.path(), "annotations.lance").await?;
     let body = storage(root.path(), "body.lance").await?;
     seed(&c, &narrow, &body).await?;
-    let budget = MergeMemoryBudget::new(1 << 20);
+    // Leave one rounded permit available while other work holds the rest.
+    let budget = MergeMemoryBudget::new(4 << 20);
+    let held = budget.reserve(3 << 20).await;
     let (a, mut driver) = with_budget(&c, &narrow, &body, budget.clone()).await?;
     let inputs = backlog(
         &c,
@@ -179,7 +181,7 @@ async fn one_request_budget_drains_without_waiting_for_lookahead_memory() -> Res
     assert_eq!(a.observation().await.0.applied, inputs[0].1);
     assert!(budget.reserved() <= budget.limit());
     pressure::publish(&c, &a, &narrow, &body).await?;
-    assert_eq!(budget.reserved(), 0);
+    assert_eq!(budget.reserved(), held.bytes());
     driver.step_for_test().await?;
     assert_eq!(a.observation().await.0.applied, inputs[1].1);
     assert_eq!(a.apply_backpressure(), None);
@@ -187,9 +189,11 @@ async fn one_request_budget_drains_without_waiting_for_lookahead_memory() -> Res
     let (stop, task) = run(driver);
     check(&a, "A", "s", 1, "pending", None).await?;
     check(&a, "B", "t", 2, "pending", None).await?;
-    assert_eq!(budget.reserved(), 0);
+    assert_eq!(budget.reserved(), held.bytes());
     stop.send(()).unwrap();
     task.await??;
+    drop(held);
+    assert_eq!(budget.reserved(), 0);
     c.shutdown().await
 }
 
