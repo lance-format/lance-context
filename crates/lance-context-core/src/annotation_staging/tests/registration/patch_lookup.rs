@@ -25,7 +25,7 @@ async fn shared_values_avoid_io_and_preserve_active_and_frozen_fields() -> Resul
     let root = tempfile::tempdir()?;
     let (base, throttle) = opened_rows(&root.path().join("narrow.lance"), 8).await?;
     let staging = AnnotationStaging::new(base, scope(), 0, Limits::default())?;
-    let workspace = crate::MergeMemoryBudget::new(1 << 20);
+    let workspace = crate::MergeMemoryBudget::new(8 << 20);
     let lookup = staging
         .prepare_patch_lookup(&["turn-000000", "turn-000001", "turn-000000"], &workspace)
         .await?
@@ -66,7 +66,9 @@ async fn shared_values_avoid_io_and_preserve_active_and_frozen_fields() -> Resul
     throttle.frozen.store(false, Ordering::Relaxed);
     let frozen = result.map_err(|_| invalid("shared patch lookup performed more IO"))??;
     assert_eq!(throttle.ops.load(Ordering::Relaxed), before);
-    let prepared = frozen.prepare(&workspace, 32).await?;
+    let prepared = frozen
+        .prepare(&crate::MergeMemoryBudget::new(8 << 20), 32)
+        .await?;
     staging
         .install_published(&prepared, commit(&prepared).await?)
         .await?;
@@ -86,7 +88,7 @@ async fn old_base_foreign_staging_and_unqueried_values_fall_back() -> Result<()>
     let (base, throttle) = opened_rows(&root.path().join("narrow.lance"), 8).await?;
     let staging = AnnotationStaging::new(base.clone(), scope(), 0, Limits::default())?;
     let other = AnnotationStaging::new(base, scope(), 0, Limits::default())?;
-    let workspace = crate::MergeMemoryBudget::new(1 << 20);
+    let workspace = crate::MergeMemoryBudget::new(8 << 20);
     let lookup = staging
         .prepare_patch_lookup(&["turn-000000"], &workspace)
         .await?
@@ -96,7 +98,9 @@ async fn old_base_foreign_staging_and_unqueried_values_fall_back() -> Result<()>
     assert!(throttle.ops.load(Ordering::Relaxed) > before);
     apply(&staging, 0, "turn-000000", &score(0.9), &lookup).await?;
     let frozen = staging.freeze(uuid::Uuid::new_v4()).await?.unwrap();
-    let prepared = frozen.prepare(&workspace, 32).await?;
+    let prepared = frozen
+        .prepare(&crate::MergeMemoryBudget::new(8 << 20), 32)
+        .await?;
     let selected = commit(&prepared).await?;
     staging
         .install_published(&prepared, selected.clone())
@@ -276,5 +280,47 @@ async fn admission_and_cancelled_lookup_release_all_resources() -> Result<()> {
     assert_eq!(workspace.reserved(), 0);
     assert_eq!(staging.observation().await.readers, 0);
     assert_eq!(staging.observation().await.applied, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn shared_lookup_reduces_native_io_for_eight_independent_requests() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let (base, throttle) = opened_rows(&root.path().join("narrow.lance"), 8).await?;
+    let separate = AnnotationStaging::new(base.clone(), scope(), 0, Limits::default())?;
+    let shared = AnnotationStaging::new(base, scope(), 0, Limits::default())?;
+    let turns = (0..8).map(|i| format!("turn-{i:06}")).collect::<Vec<_>>();
+    let before = throttle.ops.load(Ordering::Relaxed);
+    for (i, turn) in turns.iter().enumerate() {
+        separate
+            .apply(i as u64, i as u64 + 1, turn, &score(0.9))
+            .await?;
+    }
+    let separate_ops = throttle.ops.load(Ordering::Relaxed) - before;
+    let before = throttle.ops.load(Ordering::Relaxed);
+    let workspace = crate::MergeMemoryBudget::new(1 << 20);
+    let keys = turns.iter().map(String::as_str).collect::<Vec<_>>();
+    let lookup = shared
+        .prepare_patch_lookup(&keys, &workspace)
+        .await?
+        .unwrap();
+    for (i, turn) in turns.iter().enumerate() {
+        assert_eq!(
+            apply(&shared, i as u64, turn, &score(0.9), &lookup).await?,
+            ApplyOutcome::Applied
+        );
+    }
+    let shared_ops = throttle.ops.load(Ordering::Relaxed) - before;
+    assert!(shared_ops > 0);
+    assert!(
+        shared_ops < separate_ops,
+        "shared={shared_ops}, separate={separate_ops}"
+    );
+    for turn in &turns {
+        assert_eq!(
+            current(&shared, turn).await?,
+            current(&separate, turn).await?
+        );
+    }
     Ok(())
 }
