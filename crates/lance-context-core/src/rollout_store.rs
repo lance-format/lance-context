@@ -2838,6 +2838,23 @@ mod tests {
     }
     use super::*;
 
+    // Current mergers retain retired WAL until reader-safe collection. During a
+    // rolling upgrade, an old peer can still delete it immediately after its
+    // successful merge. Keep testing that compatibility race with real missing
+    // files, independently of the new collector's retention policy.
+    fn simulate_legacy_peer_gc(reader: &RolloutStore, snapshots: &[ShardSnapshot]) {
+        assert!(snapshots
+            .iter()
+            .any(|snapshot| !snapshot.sstables.is_empty()));
+        for snapshot in snapshots {
+            for generation in &snapshot.sstables {
+                let path = reader.flushed_generation_uri(snapshot.shard_id, &generation.path);
+                std::fs::remove_dir_all(&path).unwrap();
+                assert!(!std::path::Path::new(&path).exists());
+            }
+        }
+    }
+
     use std::collections::HashSet;
 
     use arrow_array::RecordBatchIterator;
@@ -3283,24 +3300,11 @@ mod tests {
                 async move {
                     if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                         // A valid capture can lose a generation while the initial
-                        // payload read is slow. Use actual peer commit and GC,
-                        // rather than manufacturing a NotFound response.
+                        // payload read is slow. Commit the merge and simulate an
+                        // old peer deleting files, rather than a synthetic error.
                         tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
                         assert_eq!(writer.lock().await.cleanup_own_shard().await.unwrap(), 1);
-                        for snapshot in &snapshots {
-                            for generation in &snapshot.sstables {
-                                let path = reader
-                                    .flushed_generation_uri(snapshot.shard_id, &generation.path);
-                                tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                                    while std::path::Path::new(&path).exists() {
-                                        tokio::time::sleep(std::time::Duration::from_millis(1))
-                                            .await;
-                                    }
-                                })
-                                .await
-                                .unwrap();
-                            }
-                        }
+                        simulate_legacy_peer_gc(reader, &snapshots);
                     }
                     reader.list_non_blob_snapshot(dataset, snapshots).await
                 }
@@ -3339,19 +3343,7 @@ mod tests {
                     .await;
                     let mut writer = writer.lock().await;
                     assert_eq!(writer.cleanup_own_shard().await.unwrap(), 1);
-                    for snapshot in &snapshots {
-                        for generation in &snapshot.sstables {
-                            let path =
-                                reader.flushed_generation_uri(snapshot.shard_id, &generation.path);
-                            tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                                while std::path::Path::new(&path).exists() {
-                                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                                }
-                            })
-                            .await
-                            .unwrap();
-                        }
-                    }
+                    simulate_legacy_peer_gc(reader, &snapshots);
                     // Every retry sees a different real base version and WAL file.
                     // That must not reset the payload recovery window indefinitely.
                     writer
@@ -3512,24 +3504,7 @@ mod tests {
                     async move {
                         if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                             writer.lock().await.cleanup_own_shard().await.unwrap();
-                            for snapshot in &snapshots {
-                                for generation in &snapshot.sstables {
-                                    let path = reader.flushed_generation_uri(
-                                        snapshot.shard_id,
-                                        &generation.path,
-                                    );
-                                    tokio::time::timeout(
-                                        std::time::Duration::from_secs(2),
-                                        async {
-                                            while std::path::Path::new(&path).exists() {
-                                                tokio::task::yield_now().await;
-                                            }
-                                        },
-                                    )
-                                    .await
-                                    .unwrap();
-                                }
-                            }
+                            simulate_legacy_peer_gc(reader, &snapshots);
                         }
                         reader
                             .scan_one_by_id_snapshot("point", source, dataset, snapshots)
@@ -3639,6 +3614,7 @@ mod tests {
                 async move {
                     if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                         writer.lock().await.cleanup_own_shard().await.unwrap();
+                        simulate_legacy_peer_gc(reader, &snapshots);
                     }
                     reader.list_non_blob_snapshot(dataset, snapshots).await
                 }
@@ -3752,20 +3728,7 @@ mod tests {
                         // a permanently missing file to retry indefinitely.
                         let mut writer = writer.lock().await;
                         assert_eq!(writer.cleanup_own_shard().await.unwrap(), 1);
-                        for snapshot in &snapshots {
-                            for generation in &snapshot.sstables {
-                                let path = reader
-                                    .flushed_generation_uri(snapshot.shard_id, &generation.path);
-                                tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                                    while std::path::Path::new(&path).exists() {
-                                        tokio::time::sleep(std::time::Duration::from_millis(1))
-                                            .await;
-                                    }
-                                })
-                                .await
-                                .expect("the actual merge GC must invalidate this snapshot");
-                            }
-                        }
+                        simulate_legacy_peer_gc(reader, &snapshots);
                         writer
                             .add(&[assistant_record(&format!("row-{}", attempt + 1))])
                             .await
@@ -4813,18 +4776,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(writer.cleanup_own_shard().await.unwrap(), 1);
-        for snapshot in &captured {
-            for generation in &snapshot.sstables {
-                let path = reader.flushed_generation_uri(snapshot.shard_id, &generation.path);
-                tokio::time::timeout(std::time::Duration::from_secs(10), async {
-                    while std::path::Path::new(&path).exists() {
-                        tokio::task::yield_now().await;
-                    }
-                })
-                .await
-                .unwrap();
-            }
-        }
+        simulate_legacy_peer_gc(&reader, &captured);
         pause.resume.notify_one();
         let observed = tokio::time::timeout(std::time::Duration::from_secs(10), read)
             .await
