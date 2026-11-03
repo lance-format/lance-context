@@ -11,16 +11,18 @@ use crate::{
 use lance::dataset::builder::DatasetBuilder;
 use lance_context_api::annotation::TurnAnnotation;
 use lance_context_core::annotation_staging::{
-    AnnotationStaging, ApplyOutcome, Limits, Mutation, Rejection, Scope as StagingScope,
+    AnnotationStaging, ApplyOutcome, Limits, Mutation, RegistrationLookup, Rejection,
+    Scope as StagingScope,
 };
 use lance_context_wal::replication::publication::lance::ManagedManifest;
-use std::{future::Future, sync::Mutex};
+use std::{collections::VecDeque, future::Future, sync::Mutex};
 use tokio::sync::watch;
 
 mod accepted;
 pub(crate) mod checkpoint;
 mod local_payload;
 pub mod mixed;
+mod prefetch;
 pub mod runtime;
 mod shard;
 #[cfg(feature = "http")]
@@ -102,6 +104,8 @@ struct Pending {
 pub struct Driver {
     service: Service,
     pending: Option<Pending>,
+    lookahead: VecDeque<Pending>,
+    registration_lookup: Option<RegistrationLookup>,
     source_page: Option<lance_context_wal::replication::Page>,
     staging_pressure: Option<(u64, usize, usize)>,
 }
@@ -395,6 +399,8 @@ impl Service {
         let driver = Driver {
             service: service.clone(),
             pending: None,
+            lookahead: VecDeque::new(),
+            registration_lookup: None,
             source_page: None,
             staging_pressure: None,
         };
@@ -717,6 +723,12 @@ impl Driver {
             return Ok(());
         }
         if self.pending.is_none() {
+            self.pending = self.lookahead.pop_front();
+            if self.pending.is_none() {
+                self.registration_lookup = None;
+            }
+        }
+        if self.pending.is_none() {
             if self
                 .source_page
                 .as_ref()
@@ -768,8 +780,8 @@ impl Driver {
                     );
                     previous = *index;
                 }
-                // Retain bounded committed metadata only. Payload admission and
-                // apply remain sequential; a page is not application progress.
+                // Retain bounded committed metadata. Payload read-ahead has
+                // separate admission; a page is not application progress.
                 self.source_page = Some(page);
             }
             let page = self.source_page.as_ref().unwrap();
@@ -782,90 +794,24 @@ impl Driver {
                         && meta.kind == RecordKind::Data,
                     "foreign annotation source"
                 );
-                let producer_slot = slot(&meta, ingress.client.producer_slots())?;
-                let bytes = usize::try_from(meta.body_bytes)?;
-                ensure!(
-                    bytes <= ingress.scope.contract.max_record_bytes as usize,
-                    "oversized annotation WAL record"
-                );
-                // Mixed imports retain decoded frames until publication. Never
-                // wait for capacity while those frames need this owner's
-                // publisher to drain. Signal pressure even below its normal
-                // batching threshold, and fetch only after admission succeeds.
-                let Some(reservation) = service.apply_budget.try_reserve(decode_workspace(
-                    &ingress.scope.contract,
-                    &service.limits,
-                    bytes,
-                )?) else {
+                let Some(pending) = prefetch::fetch(service, index, meta).await? else {
                     service
                         .shared
                         .progress
                         .send_modify(|p| p.backpressure = Some(ApplyBackpressure::ApplyMemory));
                     return Ok(());
                 };
-                let body = match service.shared.local_payloads.body(producer_slot, &meta) {
-                    Some(body) => body,
-                    None => {
-                        let group = service.group()?;
-                        let response = service
-                            .shared
-                            .phases
-                            .measure(
-                                Phase::AnnotationFetch,
-                                ingress
-                                    .client
-                                    .request_routed(Request::Fetch { group, index }),
-                            )
-                            .await?;
-                        ensure!(
-                            matches!(response.reply, Reply::Record(Some(ref observed)) if observed == &meta),
-                            "committed annotation payload unavailable"
-                        );
-                        response.body
-                    }
-                };
-                meta.check_body_length(
-                    body.len(),
-                    ingress.scope.contract.max_record_bytes as usize,
-                )?;
-                let schema = ingress.schema.clone();
-                let max_rows = ingress.scope.contract.max_rows;
-                let value_bytes = service.limits.value_bytes;
-                let mixed = ingress.scope.contract.policy == WritePolicy::TurnIngestion;
-                let shard = service.shard;
-                let layout = ingress.layout.clone();
-                let scope = ingress.scope.clone();
-                self.pending = Some(
-                    service
-                        .shared
-                        .phases
-                        .measure(Phase::AnnotationDecode, async {
-                            tokio::task::spawn_blocking(move || -> Result<Pending> {
-                                let decoded = if mixed {
-                                    mixed::wire::decode(body, schema, max_rows, value_bytes)?
-                                } else {
-                                    mixed::Decoded::Patches(wire::decode(
-                                        body,
-                                        schema,
-                                        max_rows,
-                                        value_bytes,
-                                    )?)
-                                };
-                                decoded.validate_shard(shard, &layout, &scope.contract)?;
-                                Ok(Pending {
-                                    index,
-                                    meta,
-                                    decoded,
-                                    _reservation: reservation,
-                                })
-                            })
-                            .await?
-                        })
-                        .await?,
-                );
+                self.pending = Some(pending);
                 // Keep the entry until fetch/decode succeeds. Cancellation or
                 // admission pressure must not skip the next committed record.
                 self.source_page.as_mut().unwrap().entries.remove(0);
+                self.registration_lookup = prefetch::prepare(
+                    service,
+                    self.pending.as_ref().unwrap(),
+                    self.source_page.as_mut().unwrap(),
+                    &mut self.lookahead,
+                )
+                .await?;
             } else {
                 if page.through > after {
                     // Control progress participates in the same freeze gate;
@@ -947,14 +893,29 @@ impl Driver {
                 service
                     .shared
                     .phases
-                    .measure(
-                        Phase::AnnotationCreate,
-                        service.shared.staging.register_committed(
-                            after,
-                            pending.index,
-                            &registrations,
-                        ),
-                    )
+                    .measure(Phase::AnnotationCreate, async {
+                        match &self.registration_lookup {
+                            Some(lookup) => {
+                                service
+                                    .shared
+                                    .staging
+                                    .register_committed_with_lookup(
+                                        after,
+                                        pending.index,
+                                        &registrations,
+                                        lookup,
+                                    )
+                                    .await
+                            }
+                            None => {
+                                service
+                                    .shared
+                                    .staging
+                                    .register_committed(after, pending.index, &registrations)
+                                    .await
+                            }
+                        }
+                    })
                     .await?
             }
         };

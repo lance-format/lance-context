@@ -19,6 +19,16 @@ pub(super) async fn publish(
         .freeze(Uuid::new_v4())
         .await?
         .context("no checkpoint to drain")?;
+    publish_frozen(c, service, narrow, body, frozen).await
+}
+
+pub(super) async fn publish_frozen(
+    c: &network::Cluster,
+    service: &Service,
+    narrow: &Storage,
+    body: &Storage,
+    frozen: service::checkpoint::FrozenCheckpoint,
+) -> Result<()> {
     let selection = annotation_publication::select_range(
         c,
         frozen.sources().records.clone(),
