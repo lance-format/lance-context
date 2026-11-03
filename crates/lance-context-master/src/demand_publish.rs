@@ -226,17 +226,30 @@ impl CommittedMergeDemand {
         tokio::spawn(async move {
             let _permit = permit;
             let result = tokio::time::timeout(MERGED_PUBLISH_TIMEOUT, async {
-                // A group occupies one bounded publication slot. Shard
-                // joins stay sequential and retain their monotonic CAS;
-                // no detached task per shard or unbounded queue is added.
-                let mut written = false;
-                for shard in &self.shards {
-                    written |= self
-                        .coordinator
-                        .publish_merged_watermark(&self.target, shard)
-                        .await?;
-                }
-                Ok::<_, String>(written)
+                // Reuse the bounded batch join without reopening manifests.
+                // A successful commit proves this prefix completed; a newer
+                // writer seal wins the join and prevents its hint's retirement.
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                let events: Vec<_> = self
+                    .shards
+                    .iter()
+                    .map(|shard| DemandEvent {
+                        v: SCHEMA_VERSION,
+                        shard: shard.shard.clone(),
+                        sealed_through: shard.merged_through,
+                        sealed_bytes_through: 0,
+                        merged_through: Some(shard.merged_through),
+                        flushed_at_ms: now_ms,
+                        writer_epoch: 0,
+                        source: EventSource::Executor,
+                        merged_epoch: None,
+                        sealed_times: Default::default(),
+                    })
+                    .collect();
+                self.coordinator
+                    .publish_active_demand_events(&self.target, &events)
+                    .await
+                    .map(|written| written > 0)
             })
             .await;
             let label = match result {
@@ -318,6 +331,109 @@ pub(crate) fn spawn_merged_demand(coordinator: Coordinator, target: String, uri:
 mod tests {
     use super::*;
     use std::task::Poll;
+
+    #[tokio::test]
+    #[ignore = "requires isolated loopback ETCD_TEST_ENDPOINTS and ETCD_TEST_EXCLUSIVE=1"]
+    async fn committed_group_batches_retirement_and_does_not_recreate_idle_hints() {
+        assert_eq!(std::env::var("ETCD_TEST_EXCLUSIVE").unwrap(), "1");
+        let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+        let url = reqwest::Url::parse(&endpoint).unwrap();
+        assert_eq!(url.host_str(), Some("127.0.0.1"));
+        assert!(url.port().is_some());
+        async fn transactions(endpoint: &str) -> u64 {
+            let metrics = reqwest::get(format!("{endpoint}/metrics"))
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            metrics
+                .lines()
+                .find(|line| {
+                    line.starts_with("grpc_server_started_total{")
+                        && line.contains("grpc_method=\"Txn\"")
+                        && line.contains("grpc_service=\"etcdserverpb.KV\"")
+                })
+                .unwrap()
+                .split_whitespace()
+                .last()
+                .unwrap()
+                .parse::<f64>()
+                .unwrap() as u64
+        }
+        let mut client = etcd_client::Client::connect([endpoint.as_str()], None)
+            .await
+            .unwrap();
+        let prefix = format!(
+            "/committed-batch-test/{}",
+            lance_context_core::generate_id()
+        );
+        let coordinator = Coordinator::new(client.clone(), &prefix);
+        let events: Vec<_> = (0..32)
+            .map(|index| DemandEvent {
+                v: SCHEMA_VERSION,
+                shard: format!("writer-{index}"),
+                sealed_through: 1,
+                sealed_bytes_through: 100,
+                merged_through: None,
+                flushed_at_ms: 1234,
+                writer_epoch: 7,
+                source: EventSource::Writer,
+                merged_epoch: None,
+                sealed_times: Default::default(),
+            })
+            .collect();
+        assert_eq!(
+            coordinator
+                .publish_demand_events("t", &events)
+                .await
+                .unwrap(),
+            32
+        );
+        // The callback is detached. Acquiring every publication permit below
+        // joins it without sleep-based guesses or polling the coordinator.
+        for expected_transactions in [2, 1] {
+            let before = transactions(&endpoint).await;
+            let observer = CommittedMergeDemand {
+                coordinator: coordinator.clone(),
+                target: "t".into(),
+                shards: events
+                    .iter()
+                    .map(|event| ShardMerged {
+                        shard: event.shard.clone(),
+                        merged_through: 1,
+                    })
+                    .collect(),
+            };
+            assert_eq!(
+                CommittedMergeDemand::observe(Some(observer), async { Ok(32) }).await,
+                Ok(32)
+            );
+            let joined = tokio::time::timeout(
+                Duration::from_secs(5),
+                MERGED_PUBLISH_SLOTS.clone().acquire_many_owned(4),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                transactions(&endpoint).await - before,
+                expected_transactions
+            );
+            assert!(client
+                .get(
+                    format!("{prefix}/demand-events/"),
+                    Some(etcd_client::GetOptions::new().with_prefix()),
+                )
+                .await
+                .unwrap()
+                .kvs()
+                .is_empty());
+            drop(joined);
+        }
+    }
 
     #[tokio::test]
     #[ignore = "requires isolated loopback ETCD_TEST_ENDPOINTS and ETCD_TEST_EXCLUSIVE=1"]
