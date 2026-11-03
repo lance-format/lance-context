@@ -23,7 +23,7 @@ async fn with_budget(
         narrow,
         body.clone(),
         limits(),
-        MergeMemoryBudget::new(8 << 20),
+        MergeMemoryBudget::new(16 << 20),
         budget,
     )
     .await
@@ -38,7 +38,12 @@ async fn backlog(
     for (offset, batch) in batches.into_iter().enumerate() {
         // Each producer has one unresolved request, including rejected requests.
         let producer = producer(service, offset as u32 + 1).await?;
-        let prepared = request(service, &producer, 1, encoded(batch)?).await?;
+        let prepared = tokio::time::timeout(
+            Duration::from_secs(5),
+            request(service, &producer, 1, encoded(batch)?),
+        )
+        .await
+        .context("test backlog upload admission timed out")??;
         let response = c
             .client
             .request_routed(Request::Append {
