@@ -1067,43 +1067,37 @@ async fn sweep_candidates_inner(
         .await?;
     let options = compact_options_key(&config);
     let mut queued = 0;
-    for row in rows {
+    // Batch only advisory suppression metadata. Active-task reads and enqueue
+    // CAS stay per candidate, preserving task accounting and publisher fencing.
+    let rows: Vec<_> = rows
+        .into_iter()
+        .filter(|row| parse_target(&row.name).0 == StoreKind::Rollout)
+        .collect();
+    'pages: for page in rows.chunks(crate::task_store::COMPACT_PREFLIGHT_BATCH) {
         if queued >= MAX_SWEEP_ENQUEUE {
             break;
         }
-        // Generic rows share the stats table (their name carries the
-        // `generic:` prefix) so the WAL-merge sweep sees them; compaction of
-        // generic stores is not master-scheduled, so they are skipped here.
-        if parse_target(&row.name).0 != StoreKind::Rollout {
-            continue;
-        }
-        if state
-            .task_store
-            .is_cooling_down(TaskKind::Compact, &row.name)
-            .await?
-        {
-            continue;
-        }
-        if state
-            .task_store
-            .compact_is_unchanged(
-                &row.name,
-                &state.rollout_uri(&row.name),
-                row.version,
-                &options,
-            )
-            .await?
-        {
-            metrics::counter!("master_compact_noop_suppressed_total").increment(1);
-            continue;
-        }
-        let before = state
-            .task_store
-            .get_active_id(TaskKind::Compact, &row.name)
-            .await?;
-        let task = enqueue_sweep_candidate(state, publisher, TaskKind::Compact, &row).await?;
-        if before.as_deref() != Some(task.id.as_str()) {
-            queued += 1;
+        let targets: Vec<_> = page.iter().map(|row| row.name.as_str()).collect();
+        let preflight = state.task_store.compact_preflight(&targets).await?;
+        for (row, hint) in page.iter().zip(preflight) {
+            if queued >= MAX_SWEEP_ENQUEUE {
+                break 'pages;
+            }
+            if hint.cooling_down()? {
+                continue;
+            }
+            if hint.unchanged(&state.rollout_uri(&row.name), row.version, &options)? {
+                metrics::counter!("master_compact_noop_suppressed_total").increment(1);
+                continue;
+            }
+            let before = state
+                .task_store
+                .get_active_id(TaskKind::Compact, &row.name)
+                .await?;
+            let task = enqueue_sweep_candidate(state, publisher, TaskKind::Compact, row).await?;
+            if before.as_deref() != Some(task.id.as_str()) {
+                queued += 1;
+            }
         }
     }
     Ok(queued)
