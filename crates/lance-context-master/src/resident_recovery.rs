@@ -969,7 +969,7 @@ pub(crate) mod tests {
                 shard: watermark.shard_id.to_string(),
                 sealed_through: watermark.sealed_through,
                 sealed_bytes_through: 0,
-                merged_through: None,
+                merged_through: watermark.merged_through,
                 flushed_at_ms: chrono::Utc::now().timestamp_millis(),
                 writer_epoch: watermark.writer_epoch,
                 source: EventSource::Writer,
@@ -1018,9 +1018,9 @@ pub(crate) mod tests {
                         tokio::time::timeout(Duration::from_secs(5), async {
                             loop {
                                 let reply = client.get(key.as_str(), None).await.unwrap();
-                                let row: DemandEvent =
-                                    serde_json::from_slice(reply.kvs()[0].value()).unwrap();
-                                if row.merged_through == Some(second.sealed_through) {
+                                // Confirmed completion retires the seeded hint
+                                // before maintenance ownership is released.
+                                if reply.kvs().is_empty() {
                                     break;
                                 }
                                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1046,7 +1046,10 @@ pub(crate) mod tests {
                     let reply = client.get(key.as_str(), None).await.unwrap();
                     let row: DemandEvent = serde_json::from_slice(reply.kvs()[0].value()).unwrap();
                     assert_eq!(row.sealed_through, late.sealed_through);
-                    assert_eq!(row.merged_through, enabled.then_some(second.sealed_through));
+                    // The writer carries its durable completed prefix even if
+                    // the earlier completed hint has already been retired.
+                    assert_eq!(late.merged_through, Some(second.sealed_through));
+                    assert_eq!(row.merged_through, late.merged_through);
                     assert!(row.sealed_through > row.merged_through.unwrap_or(0));
                     Ok(result)
                 },
