@@ -225,6 +225,7 @@ fn plan_bounds_reject_bad_sources_before_admission_and_allow_large_metadata() ->
         .is_err());
     let mut large = request;
     let range = large.plan.sources.get_mut(&20).unwrap();
+    range.through = MAX_INPUTS as u64 + 1;
     let meta = range.records[0].1.clone();
     range.records = (1..=MAX_INPUTS as u64)
         .map(|index| {
@@ -245,13 +246,26 @@ fn plan_bounds_reject_bad_sources_before_admission_and_allow_large_metadata() ->
     );
     let table = &catalog.tables[&large.authority.table];
     assert_eq!(decode_table(&encode_table(table)?)?, *table);
+    // Each group fits separately, but the limit is shared by the whole plan.
+    let mut aggregate = large.clone();
+    let range = aggregate.plan.sources.get_mut(&20).unwrap();
+    let mut second = range.clone();
+    range.records.truncate(MAX_INPUTS / 2 + 1);
+    second.records.truncate(MAX_INPUTS / 2 + 1);
+    for (_, meta) in &mut second.records {
+        meta.bucket = 0;
+    }
+    aggregate.plan.sources.insert(10, second);
+    assert!(aggregate.clone().batch(&layout(), &limits).is_err());
+    let invalid = Command::Plan(Box::new(aggregate)).batch(&layout())?;
+    assert!(validate_record(&layout(), 10, &limits, &invalid.meta, &invalid.body).is_err());
     large
         .plan
         .sources
         .get_mut(&20)
         .unwrap()
         .records
-        .push((513, meta));
+        .push((MAX_INPUTS as u64 + 1, meta));
     assert!(large.batch(&layout(), &limits).is_err());
     Ok(())
 }

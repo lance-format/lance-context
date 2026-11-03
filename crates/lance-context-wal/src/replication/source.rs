@@ -20,7 +20,9 @@ pub(super) struct QuerySigners<'a> {
 #[cfg(test)]
 mod tests;
 
-pub(super) const MAX_BYTES: usize = 136 * 1024;
+// A source pin includes the selected plan range plus its signed envelope and
+// ingestion contract. Keep its bound coupled to the catalog plan bound.
+pub(super) const MAX_BYTES: usize = publication::MAX_PLAN_BYTES + 8 * 1024;
 pub(super) const MAX_PIN_BYTES: usize = MAX_BYTES + 8;
 const DOMAIN: &str = "lance-context/catalog-source-pin/v1";
 

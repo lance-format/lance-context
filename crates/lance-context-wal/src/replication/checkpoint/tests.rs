@@ -353,7 +353,7 @@ fn mixed_catalog_image_preserves_payloads_and_rejects_corrupt_table_frames() -> 
                 20,
                 publication::SourceRange {
                     after: 0,
-                    through: 1000,
+                    through: publication::MAX_INPUTS as u64,
                     records,
                 },
             )]),
