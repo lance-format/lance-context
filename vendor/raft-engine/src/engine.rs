@@ -317,6 +317,24 @@ where
         Ok(None)
     }
 
+    /// First entry of a suffix ending at `end` within the byte/count allowances.
+    /// Uses serialized lengths in the in-memory index; never loads payload files.
+    /// Returns `end + 1` if no entry fits, or None if `end` is unavailable.
+    /// The byte allowance includes per-entry framing, but is not a bound on
+    /// total physical disk allocation, obsolete files, or rotation headroom.
+    pub fn retained_entries_start(
+        &self,
+        region_id: u64,
+        end: u64,
+        max_bytes: u64,
+        max_entries: usize,
+    ) -> Option<u64> {
+        self.memtables
+            .get(region_id)?
+            .read()
+            .retained_entries_start(end, max_bytes, max_entries)
+    }
+
     /// Purges expired logs files and returns a set of Raft group ids that need
     /// to be compacted.
     pub fn purge_expired_files(&self) -> Result<Vec<u64>> {

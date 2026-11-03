@@ -190,6 +190,17 @@ impl Handle {
         self.local(image.group(), move |node| node.install_checkpoint(image))
     }
 
+    /// Install an application checkpoint with a byte-bounded replication tail.
+    pub fn install_checkpoint_retaining(
+        &self,
+        image: PreparedCheckpoint,
+        retained_bytes: u64,
+    ) -> Result<Pending<()>> {
+        self.local(image.group(), move |node| {
+            node.install_checkpoint_retaining(image, retained_bytes)
+        })
+    }
+
     /// Create an authenticated snapshot receiver after the caller has reserved
     /// transfer and disk capacity. Feed sequential chunks and finish it on an
     /// admitted blocking worker. This admission is not a peer acknowledgment.

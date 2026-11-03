@@ -12,6 +12,10 @@ pub struct Options {
     pub interval_ms: u64,
     pub checkpoint_entries: u64,
     pub checkpoint_interval_ms: u64,
+    /// Encoded bytes plus framing retained before each group's checkpoint for
+    /// follower catch-up. Zero preserves immediate prefix compaction. This is
+    /// part of the existing node disk budget, not additional disk capacity.
+    pub checkpoint_trailing_bytes: u64,
     pub log_interval_ms: u64,
     pub scan_entries: usize,
 }
@@ -21,6 +25,7 @@ impl Default for Options {
             interval_ms: 1000,
             checkpoint_entries: 8192,
             checkpoint_interval_ms: 60_000,
+            checkpoint_trailing_bytes: 0,
             log_interval_ms: 30_000,
             scan_entries: 512,
         }
@@ -31,6 +36,7 @@ impl Options {
         ensure!(
             (10..=60_000).contains(&self.interval_ms)
                 && self.checkpoint_entries > 0
+                && self.checkpoint_trailing_bytes <= 2 << 30
                 && (self.interval_ms..=3_600_000).contains(&self.checkpoint_interval_ms)
                 && (self.interval_ms..=3_600_000).contains(&self.log_interval_ms)
                 && (1..=4096).contains(&self.scan_entries),
@@ -160,7 +166,9 @@ pub(crate) async fn run(
                     return Ok(false);
                 };
                 let built = tokio::task::spawn_blocking(move || capture.run()).await??;
-                handle.install_checkpoint(built)?.await?;
+                handle
+                    .install_checkpoint_retaining(built, options.checkpoint_trailing_bytes)?
+                    .await?;
                 Ok(true)
             }
             .await;

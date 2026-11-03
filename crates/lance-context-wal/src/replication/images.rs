@@ -301,7 +301,7 @@ impl Node {
         let g = self.groups.get(&group).context("unhosted group")?;
         // A snapshot received while admission waited may already cover the
         // observed cut. Inspect the current owner state after gaining the slot.
-        if g.state.applied < g.raw.store().first_index()? {
+        if g.state.applied <= g.raw.store().checkpoint_index()? {
             return Ok(None);
         }
         let cut = Cut {
@@ -326,6 +326,16 @@ impl Node {
     /// callers must service MsgSnapshot before enabling periodic compaction.
     /// This logically compacts only; it does not bound retained disk space.
     pub fn install_checkpoint(&mut self, prepared: PreparedCheckpoint) -> Result<()> {
+        self.install_checkpoint_retaining(prepared, 0)
+    }
+
+    /// Keep a byte-bounded replication tail without replaying it on recovery.
+    /// Retained entries remain subject to the node's existing disk admission.
+    pub fn install_checkpoint_retaining(
+        &mut self,
+        prepared: PreparedCheckpoint,
+        retained_bytes: u64,
+    ) -> Result<()> {
         self.healthy()?;
         ensure!(
             Arc::ptr_eq(&prepared.permit.0, &self.images),
@@ -347,7 +357,7 @@ impl Node {
         if let Err(error) = g
             .raw
             .store()
-            .checkpoint(&snapshot)
+            .checkpoint_retaining(&snapshot, retained_bytes)
             .and_then(|_| self.images.installed(&prepared.loaded.image))
         {
             self.failed = true;

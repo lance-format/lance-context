@@ -67,6 +67,7 @@ impl GroupLog {
             conf: state.conf.clone(),
             terms: Vec::new(),
             snapshot: snapshot.clone(),
+            truncated: (metadata.index, metadata.term),
         };
         let next = base.appended(entries, Some(hard))?;
         let mut batch = LogBatch::default();
@@ -77,6 +78,11 @@ impl GroupLog {
         batch.put_message(self.group, CONF.to_vec(), &next.conf)?;
         batch.put_message(self.group, HARD.to_vec(), &next.hard)?;
         batch.put_message(self.group, SNAPSHOT.to_vec(), &next.snapshot)?;
+        batch.put(
+            self.group,
+            TRUNCATED.to_vec(),
+            encode_boundary(next.truncated, metadata.index),
+        )?;
         batch.put(self.group, TERMS.to_vec(), encode_terms(&next.terms)?)?;
         if !entries.is_empty() {
             batch.add_entries::<EntryIndex>(self.group, entries)?;
@@ -103,6 +109,24 @@ impl GroupLog {
     /// physical segment deletion are separate operations, not supplied here.
     /// replication::Node installs its validated application images here.
     pub fn checkpoint(&self, snapshot: &Snapshot) -> Result<()> {
+        self.checkpoint_retaining(snapshot, 0)
+    }
+
+    /// Install a checkpoint while retaining a bounded log tail for replication.
+    /// The allowance counts encoded entry bytes plus 128 bytes of framing per
+    /// entry, and at most 1,048,576 entries. Selection reads only engine index
+    /// metadata, without decoding or copying the payload. Existing node disk
+    /// admission still bounds total physical allocation and rewrite headroom.
+    ///
+    /// Truncation index/term, checkpoint and term ranges cross one sync barrier.
+    /// Existing directories without truncation metadata remain readable. Older
+    /// binaries cannot open a directory with a tail preceding its checkpoint;
+    /// checkpoint with a zero allowance before downgrading.
+    pub fn checkpoint_retaining(&self, snapshot: &Snapshot, retained_bytes: u64) -> Result<()> {
+        ensure!(
+            retained_bytes <= 2 << 30,
+            "checkpoint log tail exceeds maximum allowance"
+        );
         let mut state = self
             .state
             .write()
@@ -115,43 +139,76 @@ impl GroupLog {
         );
         let metadata = snapshot.get_metadata();
         ensure!(
-            metadata.index >= state.boundary()
+            metadata.index >= state.snapshot.get_metadata().index
                 && metadata.index <= state.hard.commit
                 && state.term(metadata.index) == Some(metadata.term),
             "checkpoint is not a retained durable committed cut"
         );
-        if metadata.index == state.boundary() {
+        if metadata.index == state.snapshot.get_metadata().index {
             ensure!(
                 *snapshot == state.snapshot,
                 "checkpoint changed at the same cut"
             );
+        }
+        let first = if retained_bytes == 0 || metadata.index == state.boundary() {
+            metadata.index + 1
+        } else {
+            self.node
+                .engine
+                .retained_entries_start(self.group, metadata.index, retained_bytes, 1 << 20)
+                .context("checkpoint tail is missing from engine index")?
+                .max(state.boundary() + 1)
+        };
+        let truncated = (
+            first - 1,
+            state.term(first - 1).context("missing truncation term")?,
+        );
+        if metadata.index == state.snapshot.get_metadata().index && truncated == state.truncated {
             return self.node.check();
         }
         let mut terms = state.terms.clone();
-        terms.retain(|range| range.last > metadata.index);
+        terms.retain(|range| range.last > truncated.0);
         if let Some(first) = terms.first_mut() {
-            first.first = metadata.index + 1;
+            first.first = truncated.0 + 1;
         }
         let next = GroupState {
             hard: state.hard.clone(),
             conf: state.conf.clone(),
             terms,
             snapshot: snapshot.clone(),
+            truncated,
         };
         next.validate()?;
         let mut batch = LogBatch::default();
         batch.put_message(self.group, SNAPSHOT.to_vec(), snapshot)?;
+        batch.put(
+            self.group,
+            TRUNCATED.to_vec(),
+            encode_boundary(truncated, metadata.index),
+        )?;
         batch.put(self.group, TERMS.to_vec(), encode_terms(&next.terms)?)?;
         // Engine::compact_to writes without sync and suppresses errors. Keep
         // the command and its recovery metadata under our shared failure fence.
-        batch.add_command(
-            self.group,
-            raft_engine::Command::Compact {
-                index: metadata.index + 1,
-            },
-        );
+        batch.add_command(self.group, raft_engine::Command::Compact { index: first });
         self.node.write(&mut batch)?;
         *state = next;
         Ok(())
     }
+
+    /// Application recovery cut, independent of the retained replication log.
+    pub fn checkpoint_index(&self) -> Result<u64> {
+        Ok(self.read()?.snapshot.get_metadata().index)
+    }
 }
+
+fn encode_boundary((index, term): (u64, u64), checkpoint: u64) -> Vec<u8> {
+    [
+        index.to_le_bytes(),
+        term.to_le_bytes(),
+        checkpoint.to_le_bytes(),
+    ]
+    .concat()
+}
+
+#[cfg(test)]
+mod tests;

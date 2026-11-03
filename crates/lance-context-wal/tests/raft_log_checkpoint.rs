@@ -263,7 +263,7 @@ fn invalid_or_changed_checkpoint_never_changes_usable_log() -> Result<()> {
 #[test]
 fn missing_corrupt_or_inconsistent_checkpoint_fails_reopen() -> Result<()> {
     let _case = TEST_CASE.lock().unwrap();
-    for corruption in 0..7 {
+    for corruption in 0..10 {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("log");
         let saved;
@@ -302,6 +302,16 @@ fn missing_corrupt_or_inconsistent_checkpoint_fails_reopen() -> Result<()> {
                     }
                     batch.add_entries::<Indexed>(10, &[entry(4, 2)])?;
                 }
+                7 => batch.put(10, b"truncated".to_vec(), vec![0; 23])?,
+                8 | 9 => {
+                    let mut bytes = engine.get(10, b"truncated").unwrap();
+                    if corruption == 8 {
+                        bytes[8..16].copy_from_slice(&3u64.to_le_bytes());
+                    } else {
+                        bytes[16..24].copy_from_slice(&4u64.to_le_bytes());
+                    }
+                    batch.put(10, b"truncated".to_vec(), bytes)?;
+                }
                 _ => unreachable!(),
             }
             engine.write(&mut batch, true)?;
@@ -313,7 +323,19 @@ fn missing_corrupt_or_inconsistent_checkpoint_fails_reopen() -> Result<()> {
         // A transient lock failure is not evidence that corrupt state was
         // rejected. Require the actual validation failure for every case.
         match corruption {
-            0 | 2 => assert!(
+            0 | 2 | 9 => assert!(
+                error
+                    .to_string()
+                    .contains("truncation metadata belongs to a different checkpoint"),
+                "{error:#}"
+            ),
+            7 => assert!(
+                error
+                    .to_string()
+                    .contains("invalid durable truncation metadata"),
+                "{error:#}"
+            ),
+            8 => assert!(
                 error.to_string().contains("invalid durable term index"),
                 "{error:#}"
             ),

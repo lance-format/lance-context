@@ -183,6 +183,7 @@ impl Fixture {
                     interval_ms: 25,
                     checkpoint_entries: 4,
                     checkpoint_interval_ms: 100,
+                    checkpoint_trailing_bytes: 0,
                     log_interval_ms: 100,
                     scan_entries: 8,
                 },

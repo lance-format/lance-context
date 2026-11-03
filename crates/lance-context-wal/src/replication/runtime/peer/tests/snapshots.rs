@@ -3,6 +3,8 @@ use super::*;
 use crate::replication::checkpoint::Image;
 use std::sync::atomic::AtomicU64;
 
+mod catchup;
+
 // Conservative fixture accounting for image files only. Charges never return
 // during one incarnation, including failed receptions. Reopen scans original
 // image files. Production also needs log/rewrite headroom and collection.
