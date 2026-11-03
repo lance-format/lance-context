@@ -731,6 +731,23 @@ impl GenericStore {
         self.base.stage_prepared_merge(prepared).await
     }
 
+    /// Prepare this sealed shard for an opt-in bounded, ordered group.
+    pub async fn prepare_grouped_merge_reserved(
+        &self,
+        reservation: crate::MergeReservation,
+    ) -> LanceResult<Option<crate::PreparedShardMerge>> {
+        self.base.prepare_grouped_merge_reserved(reservation).await
+    }
+
+    /// Publish a group under the caller's existing table maintenance scope.
+    pub async fn commit_prepared_group(
+        &mut self,
+        shards: Vec<crate::PreparedShardMerge>,
+        max_bytes: usize,
+    ) -> LanceResult<usize> {
+        self.base.commit_prepared_group(shards, max_bytes).await
+    }
+
     /// Commit a merge prepared by [`Self::prepare_cleanup_merge`].
     pub async fn commit_prepared_merge(
         &mut self,
