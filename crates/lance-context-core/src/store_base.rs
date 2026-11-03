@@ -2692,9 +2692,23 @@ impl StorageBase {
         const MAX_SNAPSHOT_ATTEMPTS: usize = 16;
         const MAX_MISSING_AT_VERSION: usize = 3;
         let started = std::time::Instant::now();
+        // Report only terminal failures. Preserve the original error and retry
+        // decisions while distinguishing metadata failures from payload limits.
+        let report_failure = |phase: &'static str,
+                              attempt: usize,
+                              version: Option<u64>,
+                              missing_count: usize,
+                              payload_retry_ms: Option<u128>,
+                              error: &LanceError| {
+            warn!(uri = %self.dataset.uri(), phase, attempt = attempt + 1,
+                ?version, missing_count, ?payload_retry_ms, ?source,
+                missing_file = is_not_found_error(error),
+                elapsed_ms = started.elapsed().as_millis(),
+                "consistent read failed");
+        };
         let retry_budget = std::time::Duration::from_secs(2);
         let mut metadata_retry_started = None;
-        let mut payload_retry_started = None;
+        let mut payload_retry_started: Option<std::time::Instant> = None;
         let mut next_dataset = None;
         let mut captures = 0;
         let mut last_missing_view: Option<Arc<lance_table::format::Manifest>> = None;
@@ -2719,7 +2733,16 @@ impl StorageBase {
                 None => {
                     let mut dataset = self.dataset.clone();
                     if !self.is_version_pinned() {
-                        dataset.checkout_latest().await?;
+                        dataset.checkout_latest().await.inspect_err(|error| {
+                            report_failure(
+                                "base_open",
+                                attempt,
+                                None,
+                                missing_at_version,
+                                payload_retry_started.map(|t| t.elapsed().as_millis()),
+                                error,
+                            );
+                        })?;
                     }
                     dataset
                 }
@@ -2730,16 +2753,45 @@ impl StorageBase {
             let mut snapshots = if source == ListSource::Fragments {
                 Vec::new()
             } else {
-                capture().await?
+                capture().await.inspect_err(|error| {
+                    report_failure(
+                        "wal_capture",
+                        attempt,
+                        Some(version),
+                        missing_at_version,
+                        payload_retry_started.map(|t| t.elapsed().as_millis()),
+                        error,
+                    );
+                })?
             };
             wal_capture_secs += phase_started.elapsed().as_secs_f64();
             if !self.is_version_pinned() {
                 let phase_started = std::time::Instant::now();
                 let mut latest = dataset.clone();
-                latest.checkout_latest().await?;
+                latest.checkout_latest().await.inspect_err(|error| {
+                    report_failure(
+                        "base_validate",
+                        attempt,
+                        Some(version),
+                        missing_at_version,
+                        payload_retry_started.map(|t| t.elapsed().as_millis()),
+                        error,
+                    );
+                })?;
                 let compatible = latest.manifest.version == version
                     || same_base_read_data(&dataset.manifest, &latest.manifest)
-                    || rebase_wal_read_snapshot(&dataset, &latest, &mut snapshots).await?;
+                    || rebase_wal_read_snapshot(&dataset, &latest, &mut snapshots)
+                        .await
+                        .inspect_err(|error| {
+                            report_failure(
+                                "wal_rebase",
+                                attempt,
+                                Some(version),
+                                missing_at_version,
+                                payload_retry_started.map(|t| t.elapsed().as_millis()),
+                                error,
+                            );
+                        })?;
                 // Include transaction-history IO in validation time so slow
                 // reads do not acquire an unaccounted metadata phase.
                 base_validate_secs += phase_started.elapsed().as_secs_f64();
@@ -2764,10 +2816,28 @@ impl StorageBase {
             metadata_retry_started = None;
             let result = read(dataset.clone(), snapshots).await;
             if self.is_version_pinned() {
+                if let Err(error) = &result {
+                    report_failure(
+                        "payload_pinned",
+                        attempt,
+                        Some(dataset.manifest.version),
+                        missing_at_version,
+                        None,
+                        error,
+                    );
+                }
                 return result;
             }
             if let Err(err) = &result {
                 if !is_not_found_error(err) {
+                    report_failure(
+                        "payload_non_missing",
+                        attempt,
+                        Some(dataset.manifest.version),
+                        missing_at_version,
+                        payload_retry_started.map(|t| t.elapsed().as_millis()),
+                        err,
+                    );
                     return result;
                 }
                 let payload_started =
@@ -2789,6 +2859,21 @@ impl StorageBase {
                     || attempt + 1 == MAX_SNAPSHOT_ATTEMPTS
                     || payload_started.elapsed() >= retry_budget
                 {
+                    let phase = if missing_at_version >= MAX_MISSING_AT_VERSION {
+                        "payload_same_view_limit"
+                    } else if attempt + 1 == MAX_SNAPSHOT_ATTEMPTS {
+                        "payload_attempt_limit"
+                    } else {
+                        "payload_time_limit"
+                    };
+                    report_failure(
+                        phase,
+                        attempt,
+                        Some(dataset.manifest.version),
+                        missing_at_version,
+                        Some(payload_started.elapsed().as_millis()),
+                        err,
+                    );
                     return result;
                 }
                 // A merge may already have committed before this read began.
