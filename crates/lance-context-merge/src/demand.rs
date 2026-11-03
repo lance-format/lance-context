@@ -546,7 +546,17 @@ impl Coordinator {
         &self,
         key: &str,
         event: &DemandEvent,
+        current: GetResponse,
+    ) -> Result<bool> {
+        self.join_from_read_inner(key, event, current, false).await
+    }
+
+    async fn join_from_read_inner(
+        &self,
+        key: &str,
+        event: &DemandEvent,
         mut current: GetResponse,
+        retire_completed: bool,
     ) -> Result<bool> {
         let mut client = self.client.clone();
         for attempt in 0..5 {
@@ -560,10 +570,32 @@ impl Coordinator {
                     .map_err(|e| e.to_string())?;
             }
             let stored = stored_event(current.kvs().first())?;
-            let Some(next) = join_events(stored.as_ref(), event) else {
+            // The shard manifest retains the completed prefix. Never retire
+            // an unreadable/future record or a concurrent newer seal.
+            if retire_completed && stored.is_none() && !current.kvs().is_empty() {
+                return Err("cannot retire an unreadable demand record".into());
+            }
+            let next = join_events(stored.as_ref(), event);
+            let effective = next.as_ref().or(stored.as_ref()).unwrap();
+            let drained = retire_completed
+                && event.merged_through.is_some()
+                && effective
+                    .merged_through
+                    .is_some_and(|merged| merged >= effective.sealed_through);
+            let operation = if drained {
+                if current.kvs().is_empty() {
+                    return Ok(false);
+                }
+                TxnOp::delete(key, None)
+            } else if let Some(next) = next {
+                TxnOp::put(
+                    key,
+                    serde_json::to_vec(&next).map_err(|e| e.to_string())?,
+                    None,
+                )
+            } else {
                 return Ok(false);
             };
-            let value = serde_json::to_vec(&next).map_err(|e| e.to_string())?;
             let compare = match current.kvs().first() {
                 Some(kv) => Compare::mod_revision(key, CompareOp::Equal, kv.mod_revision()),
                 None => Compare::version(key, CompareOp::Equal, 0),
@@ -572,9 +604,13 @@ impl Coordinator {
                 .txn(
                     etcd_client::Txn::new()
                         .when(vec![compare])
-                        .and_then(vec![TxnOp::put(key, value, None)]),
+                        .and_then(vec![operation]),
                 )
-                .observed(Operation::DemandPublish)
+                .observed(if drained {
+                    Operation::DemandRetire
+                } else {
+                    Operation::DemandPublish
+                })
                 .await
                 .map_err(|e| e.to_string())?;
             if response.succeeded() {
@@ -604,13 +640,36 @@ impl Coordinator {
         target: &str,
         events: &[DemandEvent],
     ) -> Result<usize> {
+        self.publish_events(target, events, false).await
+    }
+
+    /// Publish self-contained manifest observations, retaining only active
+    /// demand. A completed prefix can retire a fully drained hint with the
+    /// same revision CAS used by writers. No execution/claim/fence is deleted.
+    /// New writers carry the manifest's completed prefix so recreated hints
+    /// count only new generations. Legacy replays may overstate demand until
+    /// another manifest observation repairs it; they cannot hide new work.
+    pub async fn publish_active_demand_events(
+        &self,
+        target: &str,
+        events: &[DemandEvent],
+    ) -> Result<usize> {
+        self.publish_events(target, events, true).await
+    }
+
+    async fn publish_events(
+        &self,
+        target: &str,
+        events: &[DemandEvent],
+        retire_completed: bool,
+    ) -> Result<usize> {
         for event in events {
             TableDemand::check_version(event.v).map_err(|e| format!("{e:?}"))?;
         }
         let mut written = 0;
         let mut client = self.client.clone();
         for chunk in events.chunks(DEMAND_READ_BATCH_SIZE) {
-            if chunk.len() == 1 {
+            if chunk.len() == 1 && !retire_completed {
                 written += usize::from(self.publish_demand_event(target, &chunk[0]).await?);
                 continue;
             }
@@ -637,7 +696,10 @@ impl Coordinator {
                 let TxnOpResponse::Get(current) = read else {
                     return Err("demand batch read returned a non-Get response".into());
                 };
-                written += usize::from(self.join_from_read(key, event, current).await?);
+                written += usize::from(
+                    self.join_from_read_inner(key, event, current, retire_completed)
+                        .await?,
+                );
             }
         }
         Ok(written)
@@ -1651,5 +1713,227 @@ mod tests {
             ),
             (7, Some(7), 0)
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn active_observations_retire_completed_keys_and_batch_repeated_reads() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let coordinator = batch_test_coordinator().await;
+        let events: Vec<_> = (0..97)
+            .map(|i| ev(&format!("s{i}"), 10, Some(10), 1, EventSource::Scan))
+            .collect();
+        // Existing deployments have accumulated completed per-shard records.
+        assert_eq!(
+            coordinator
+                .publish_demand_events("t", &events)
+                .await
+                .unwrap(),
+            97
+        );
+        let before = operation_count(&handle, "demand_read");
+        assert_eq!(
+            coordinator
+                .publish_active_demand_events("t", &events)
+                .await
+                .unwrap(),
+            97
+        );
+        assert_eq!(operation_count(&handle, "demand_read") - before, 4);
+        assert_eq!(operation_count(&handle, "demand_retire"), 97);
+        let prefix = format!("{}/demand-events/", coordinator.prefix);
+        assert!(coordinator
+            .client
+            .clone()
+            .get(
+                prefix.as_str(),
+                Some(etcd_client::GetOptions::new().with_prefix())
+            )
+            .await
+            .unwrap()
+            .kvs()
+            .is_empty());
+        let writes = operation_count(&handle, "demand_publish");
+        assert_eq!(
+            coordinator
+                .publish_active_demand_events("t", &events)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(operation_count(&handle, "demand_read") - before, 8);
+        assert_eq!(operation_count(&handle, "demand_retire"), 97);
+        assert_eq!(operation_count(&handle, "demand_publish"), writes);
+        println!("97 completed keys -> 0; repeated 97-shard completion: 4 reads, 0 writes");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn retirement_conflict_preserves_new_seals_and_partial_completion() {
+        let coordinator = batch_test_coordinator().await;
+        let old = ev("s", 10, Some(10), 1, EventSource::Scan);
+        coordinator.publish_demand_event("t", &old).await.unwrap();
+        let key = coordinator.demand_event_key("t", "s");
+        let stale = coordinator
+            .client
+            .clone()
+            .get(key.as_str(), None)
+            .await
+            .unwrap();
+        // The retiring publisher holds an obsolete snapshot. Another writer
+        // wins before its delete transaction, including during a mixed rollout.
+        coordinator
+            .publish_demand_event("t", &ev("s", 12, None, 2, EventSource::Writer))
+            .await
+            .unwrap();
+        assert!(!coordinator
+            .join_from_read_inner(&key, &old, stale, true)
+            .await
+            .unwrap());
+        let current = coordinator
+            .client
+            .clone()
+            .get(key.as_str(), None)
+            .await
+            .unwrap();
+        let record = stored_event(current.kvs().first()).unwrap().unwrap();
+        assert_eq!(
+            (record.sealed_through, record.merged_through),
+            (12, Some(10))
+        );
+        let partial = ev("s", 12, Some(11), 2, EventSource::Scan);
+        assert_eq!(
+            coordinator
+                .publish_active_demand_events("t", &[partial])
+                .await
+                .unwrap(),
+            1
+        );
+        let current = coordinator
+            .client
+            .clone()
+            .get(key.as_str(), None)
+            .await
+            .unwrap();
+        let record = stored_event(current.kvs().first()).unwrap().unwrap();
+        assert_eq!(
+            (record.sealed_through, record.merged_through),
+            (12, Some(11))
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn retired_hint_recreation_survives_restart_and_old_writer_replay() {
+        let coordinator = batch_test_coordinator().await;
+        let done = ev("s", 1000, Some(1000), 1, EventSource::Scan);
+        coordinator.publish_demand_event("t", &done).await.unwrap();
+        coordinator
+            .publish_active_demand_events("t", std::slice::from_ref(&done))
+            .await
+            .unwrap();
+        let key = coordinator.demand_event_key("t", "s");
+        // An old binary may recreate a stale hint. It overstates demand, then
+        // the next authoritative observation removes it; no negative hint is
+        // trusted to cancel work or release an execution.
+        coordinator
+            .publish_demand_event("t", &ev("s", 999, None, 1, EventSource::Writer))
+            .await
+            .unwrap();
+        coordinator
+            .publish_active_demand_events("t", &[done])
+            .await
+            .unwrap();
+        assert!(coordinator
+            .client
+            .clone()
+            .get(key.as_str(), None)
+            .await
+            .unwrap()
+            .kvs()
+            .is_empty());
+        let restarted = Coordinator::new(coordinator.client.clone(), coordinator.prefix.clone());
+        let fresh = ev("s", 1001, Some(1000), 2, EventSource::Writer);
+        restarted
+            .publish_active_demand_events("t", &[fresh])
+            .await
+            .unwrap();
+        let current = coordinator
+            .client
+            .clone()
+            .get(key.as_str(), None)
+            .await
+            .unwrap();
+        let record = stored_event(current.kvs().first()).unwrap().unwrap();
+        let mut rebuilt = TableDemand::default();
+        rebuilt
+            .fold(&record, current.kvs()[0].mod_revision(), 0)
+            .unwrap();
+        assert_eq!(rebuilt.pending_generations(), 1);
+        // Replaying the same active observation must issue no write.
+        let revision = current.kvs()[0].mod_revision();
+        assert_eq!(
+            restarted
+                .publish_active_demand_events("t", &[record])
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            coordinator
+                .client
+                .clone()
+                .get(key.as_str(), None)
+                .await
+                .unwrap()
+                .kvs()[0]
+                .mod_revision(),
+            revision
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn retirement_refuses_unknown_records_and_never_touches_execution_state() {
+        let coordinator = batch_test_coordinator().await;
+        let key = coordinator.demand_event_key("t", "s");
+        let mut client = coordinator.client.clone();
+        let done = ev("s", 10, Some(10), 1, EventSource::Scan);
+        let mut future = done.clone();
+        future.v += 1;
+        for value in [b"corrupt".to_vec(), serde_json::to_vec(&future).unwrap()] {
+            client.put(key.as_str(), value.clone(), None).await.unwrap();
+            assert!(coordinator
+                .publish_active_demand_events("t", std::slice::from_ref(&done))
+                .await
+                .is_err());
+            assert_eq!(
+                client.get(key.as_str(), None).await.unwrap().kvs()[0].value(),
+                value
+            );
+        }
+        client
+            .put(key.as_str(), serde_json::to_vec(&done).unwrap(), None)
+            .await
+            .unwrap();
+        let protected: Vec<_> = ["merge-executions", "claims", "queue", "target-locks"]
+            .into_iter()
+            .map(|kind| format!("{}/{kind}/t", coordinator.prefix))
+            .collect();
+        for key in &protected {
+            client.put(key.as_str(), "protected", None).await.unwrap();
+        }
+        coordinator
+            .publish_active_demand_events("t", &[done])
+            .await
+            .unwrap();
+        for key in &protected {
+            assert_eq!(
+                client.get(key.as_str(), None).await.unwrap().kvs()[0].value(),
+                b"protected"
+            );
+        }
     }
 }

@@ -1077,18 +1077,7 @@ impl StorageBase {
         Ok(manifest_store
             .refresh_latest()
             .await?
-            .map(|manifest| ShardWatermark {
-                shard_id: manifest.shard_id,
-                writer_epoch: manifest.writer_epoch,
-                sealed_through: manifest
-                    .sstables
-                    .iter()
-                    .map(|g| g.generation)
-                    .max()
-                    .unwrap_or(0),
-                pending_generations: manifest.sstables.len(),
-                merged_through: None,
-            }))
+            .map(|manifest| crate::wal_watermarks::from_manifest(&manifest, None)))
     }
 
     /// Metadata-only count trigger for a coordinated sweeper. Never prepares

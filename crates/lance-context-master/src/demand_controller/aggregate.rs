@@ -1090,6 +1090,24 @@ mod tests {
     }
 
     #[test]
+    fn retired_and_recreated_hint_matches_a_new_leader_snapshot() {
+        let mut live = tail_cache();
+        publish(&mut live, "t", "s", 1000, Some(998), 1);
+        live.apply(0, "/p", b"/p/demand-events/74/s", None, 2)
+            .unwrap();
+        assert_eq!(live.tables["t"].pending(), 0);
+        publish(&mut live, "t", "s", 1001, Some(1000), 3);
+        let mut restarted = tail_cache();
+        publish(&mut restarted, "t", "s", 1001, Some(1000), 3);
+        assert_eq!(live.tables["t"].pending(), 1);
+        assert_eq!(restarted.tables["t"].pending(), 1);
+        // A delayed old delete cannot hide the new generation.
+        live.apply(0, "/p", b"/p/demand-events/74/s", None, 2)
+            .unwrap();
+        assert_eq!(live.tables["t"].pending(), 1);
+    }
+
+    #[test]
     fn small_tail_wakes_without_another_event_or_completed_stats_scan() {
         let mut cache = tail_cache();
         publish(&mut cache, "t", "s", 7, None, 1);
