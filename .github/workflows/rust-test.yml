@@ -186,6 +186,12 @@ jobs:
         run: |
           rustup toolchain install stable
           rustup default stable
+      - name: Make room for the HA build cache
+        run: |
+          # These hosted-runner SDKs are unused by the Rust/Python HA tests.
+          # Free space before restoring the larger optional-feature build graph.
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          df -h / "$RUNNER_TEMP"
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "lance-context-ha-deps"

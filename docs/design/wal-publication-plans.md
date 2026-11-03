@@ -24,7 +24,7 @@ an existing plan's retry or an ownership takeover. Cloned table/checkpoint views
 share the immutable plan with `Arc`; payload bodies do not live in the catalog.
 
 The bounds are separate: acquisition commands retain their 8 KiB limit, plan
-commands have a 128 KiB limit and at most 512 selected records, and the policy
+commands have a 512 KiB limit and at most 2048 selected records, and the policy
 bounds their aggregate encoded source bytes before payload fetch. Defaults allow
 128 active plans and 64 MiB of selected source bytes per plan. These limits bound
 metadata and selected input. Each registered ingestion contract's maximum record
@@ -35,6 +35,16 @@ queues. Checkpoint metadata capacity accounts separately for table bindings and
 active plans. Large metadata frames allocate only their bounded actual length on
 the heap. Decoders reject noncanonical maps instead of silently accepting duplicate
 keys normalized by the serializer.
+
+Windows above 512 records are opt-in. Upgrade every WAL voter, publisher and
+recovery reader before configuring a larger window: older binaries cannot read
+the larger plans or source pins. The encoding is unchanged, but these expanded
+bounds are not safe to enable during a mixed-version rollout. The annotation
+driver's default remains 512 records, and the materializer's default remains 128.
+Source-byte and application memory limits still apply. In particular, active and
+frozen generations must fit their existing budgets; a larger record limit does
+not reserve more payload memory or disable backpressure. Source-pin encoding and
+checkpoint metadata budgets follow the plan's byte limit.
 
 Source pins subsequently advance the optional application identity and checkpoint
 format to v9. Existing v1/v2/v3/v4/v5/v6/v7/v8 directories and images are rejected; there is no in-place migration

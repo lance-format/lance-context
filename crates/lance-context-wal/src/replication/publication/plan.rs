@@ -5,8 +5,10 @@ use super::*;
 #[cfg(test)]
 mod tests;
 
-pub const MAX_INPUTS: usize = 512;
-pub(super) const MAX_PLAN_BYTES: usize = 128 * 1024;
+/// Hard protocol limit. Larger windows require every voter and publisher to
+/// support this limit; application defaults can remain smaller.
+pub const MAX_INPUTS: usize = 2048;
+pub(in crate::replication) const MAX_PLAN_BYTES: usize = 512 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceRange {

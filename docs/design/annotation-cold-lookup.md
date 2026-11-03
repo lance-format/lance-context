@@ -31,6 +31,52 @@ scanner buffers and Lance I/O workspace remain separate from staging charges;
 row limits and shared slices do not establish a total RSS bound. This change
 adds no WAL format, request identity, read barrier, or publication protocol.
 
+## Sharing registration lookups between requests
+
+`prepare_registration_lookup` captures a bounded ID-only lookup for callers
+that already have several admitted registration requests. The temporary result
+owns at most one lookup window, charges the caller's apply workspace, and holds
+one read-view permit. Admission returns `None` when the window or available
+budget cannot accommodate it; callers can continue ordinary ordered application.
+The helper does not wait for workspace or consume publication metadata reserves.
+
+Each original request is still applied separately with
+`register_committed_with_lookup`. Active and frozen values take precedence.
+Only explicitly queried keys from the same staging instance and exact base
+generation can skip a native query. A publication or a different staging instance
+invalidates the entire lookup; unqueried keys also use the ordinary query path.
+The captured base participates in local GC protection until the lookup is dropped.
+The result carries no applied cursor, request outcome, or permission to ACK.
+
+These helpers do not themselves add driver prefetch, change ingestion defaults,
+or establish an end-to-end throughput improvement. A driver integrating them
+must bound its admitted payload prefix, release it on cancellation, and continue
+to advance results and source progress one original request at a time.
+
+### Driver integration
+
+The mixed-ingestion driver can share one lookup across up to eight already
+committed requests from its current source page. A small create request starts
+the window; each additional payload must be at most 256 KiB and obtain its own
+existing apply-workspace reservation immediately. The driver never waits for a
+larger batch or for extra memory while holding requests it can apply.
+
+A shared lookup is prepared only when the prefix includes at least two create
+requests and at most 128 decoded rows in total. Decoding the last admitted
+request can cross that row threshold; in that case the prefix uses ordinary
+lookups. The byte budget and eight-request limit still bound retained payloads.
+Large create heads and patch-only heads keep their ordinary apply path.
+
+Prefetch changes neither application progress nor the publication cut. Each
+request retains its own validation, outcome, source record and ACK. Publication
+can invalidate a lookup while the suffix is queued, so later requests fall back
+to the new base. Dropping the owner releases the queued memory; reconnecting
+rebuilds unapplied state from the selected Lance checkpoint and retained WAL.
+
+The `annotation_registration_lookup` phase measures the whole helper, including
+admission and cache checks; its count is not an exact native-query count. No
+end-to-end throughput improvement is claimed by this integration alone.
+
 Query windows are independent of scanner vectors, which remain 128 rows. The
 original implementation used that vector size as the key-window size too: a
 2048-row cold mutation batch could issue 16 sequential Lance queries while

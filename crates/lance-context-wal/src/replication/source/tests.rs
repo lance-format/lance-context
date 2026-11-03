@@ -312,6 +312,79 @@ fn disjoint_groups_pin_their_full_prefix_and_recover_original_index() -> Result<
 }
 
 #[test]
+fn maximum_publication_window_survives_catalog_and_source_checkpoints() -> Result<()> {
+    let mut c = Cluster::new()?;
+    for sequence in 1..=publication::MAX_INPUTS as u64 {
+        c.append(c.table, sequence)?;
+    }
+    let source = &c.nodes[3].groups[&20].state;
+    let range = SourceRange {
+        after: 0,
+        through: source.applied,
+        records: source
+            .accepted
+            .iter()
+            .map(|(i, m)| (*i, m.clone()))
+            .collect(),
+    };
+    assert_eq!(range.records.len(), publication::MAX_INPUTS);
+    let authority = c.acquire(0)?;
+    c.nodes[0].plan_publication(
+        102,
+        PlanRequest {
+            authority,
+            plan: Plan {
+                transaction: c.transaction,
+                read_version: 8,
+                sources: BTreeMap::from([(20, range.clone())]),
+                next_group: 10,
+            },
+        },
+    )?;
+    let index = c
+        .pump()?
+        .completions
+        .into_iter()
+        .find_map(|completion| match completion.outcome {
+            Outcome::Committed(Applied::Publisher(publication::Reply::Planned { index })) => {
+                Some(index)
+            }
+            _ => None,
+        })
+        .context("missing maximum-window plan")?;
+    let permit = c.permit(index)?;
+    assert_eq!(permit.selection.range, range);
+    assert!(permit.clone().batch(&c.layout, &c.limits)?.body.len() > 136 * 1024);
+    let result = c.pin(permit)?;
+    assert!(matches!(result, Reply::Pinned { .. }));
+    c.append(c.table, publication::MAX_INPUTS as u64 + 1)?;
+    for n in 0..6 {
+        let group = if n < 3 { 10 } else { 20 };
+        let image = c.nodes[n]
+            .prepare_checkpoint(group, Uuid::from_u128(500 + n as u128))?
+            .run()?;
+        c.nodes[n].install_checkpoint(image)?;
+    }
+    c.reopen()?;
+    let recovered = c.permit(index)?;
+    assert_eq!(recovered.selection.range, range);
+    assert_eq!(c.pin(recovered)?, result);
+    for node in &c.nodes[3..] {
+        let state = &node.groups[&20].state;
+        assert_eq!(state.pins[&c.table].permit.selection.range, range);
+        assert_eq!(state.accepted.len(), publication::MAX_INPUTS + 1);
+        for (index, meta) in &state.accepted {
+            let record = node
+                .read_accepted(20, *index)?
+                .context("lost source payload")?;
+            assert_eq!(record.meta, *meta);
+            assert_eq!(record.body, Bytes::from(vec![meta.sequence as u8; 4096]));
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn signed_catalog_selection_cannot_omit_or_change_the_source_prefix() -> Result<()> {
     for mutation in 0..4 {
         let mut c = Cluster::new()?;

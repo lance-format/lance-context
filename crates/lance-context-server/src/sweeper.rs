@@ -483,7 +483,7 @@ fn spawn_publish_demand<S: Sweepable>(
                     shard: watermark.shard_id.to_string(),
                     sealed_through: watermark.sealed_through,
                     sealed_bytes_through: 0,
-                    merged_through: None,
+                    merged_through: watermark.merged_through,
                     flushed_at_ms: chrono::Utc::now().timestamp_millis(),
                     writer_epoch: watermark.writer_epoch,
                     source: lance_context_merge::demand::EventSource::Writer,

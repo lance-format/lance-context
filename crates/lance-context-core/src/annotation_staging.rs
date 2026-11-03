@@ -21,6 +21,7 @@ mod preserve_id;
 mod publication;
 mod published_values;
 mod registration;
+mod registration_lookup;
 mod status_filter;
 mod views;
 pub use body::{BodySnapshot, TurnBodySource, TurnRead, BODY_SNAPSHOT_PROPERTY};
@@ -29,12 +30,13 @@ pub use publication::{
 };
 use registration::{Batch, Input, PendingTurn};
 pub use registration::{NewTurnSource, Registration};
+pub use registration_lookup::RegistrationLookup;
 pub use status_filter::{StatusMatches, StatusRead, MAX_STATUS_MATCHES};
 pub use views::ProtectedBases;
 #[cfg(test)]
 mod tests;
 
-/// Limits for retained annotation values/map nodes and captured point reads.
+/// Limits for retained annotation values/map nodes and captured read views.
 /// Lance scan/merge workspace and RPC queues require separate admission.
 #[derive(Clone, Debug, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -284,7 +286,7 @@ impl AnnotationStaging {
         mutations: &[Mutation<'_>],
     ) -> Result<()> {
         match self
-            .apply_inner(after, through, Batch::Patches(mutations), false)
+            .apply_inner(after, through, Batch::Patches(mutations), false, None)
             .await?
         {
             ApplyOutcome::Applied => Ok(()),
@@ -307,7 +309,7 @@ impl AnnotationStaging {
         through: u64,
         mutations: &[Mutation<'_>],
     ) -> Result<ApplyOutcome> {
-        self.apply_inner(after, through, Batch::Patches(mutations), true)
+        self.apply_inner(after, through, Batch::Patches(mutations), true, None)
             .await
     }
 
@@ -327,12 +329,14 @@ impl AnnotationStaging {
         through: u64,
         mutations: Batch<'_, '_>,
         advance_rejection: bool,
+        lookup: Option<&RegistrationLookup>,
     ) -> Result<ApplyOutcome> {
         let _mutation = self.mutation.lock().await;
         let pending = {
             let state = self.state.read().await;
             check_order(&state, after, through)?;
-            self.pending_batch(&state, through, mutations).await?
+            self.pending_batch(&state, through, mutations, lookup)
+                .await?
         };
         // The mutation gate keeps the base, values and applied cut unchanged
         // while upgrading. Cancellation before this point installs nothing.
@@ -359,6 +363,7 @@ impl AnnotationStaging {
         state: &State,
         through: u64,
         mutations: Batch<'_, '_>,
+        lookup: Option<&RegistrationLookup>,
     ) -> Result<PendingBatch> {
         if mutations.len() == 0 || mutations.len() > 65_536 {
             return Ok(reject(0, RejectionReason::BatchTooLarge));
@@ -366,6 +371,9 @@ impl AnnotationStaging {
         if matches!(mutations, Batch::Registrations(_)) {
             registration::validate_target(&state.base)?;
         }
+        let lookup = lookup.filter(|lookup| {
+            matches!(mutations, Batch::Registrations(_)) && lookup.matches(&state.base)
+        });
         for row in 0..mutations.len() {
             let input = mutations.row(row);
             let result = match input {
@@ -397,7 +405,9 @@ impl AnnotationStaging {
                     cached.insert(*turn, value);
                 }
             }
-            keys.retain(|turn| !cached.contains_key(turn));
+            keys.retain(|turn| {
+                !cached.contains_key(turn) && lookup.and_then(|lookup| lookup.get(turn)).is_none()
+            });
             let cold = match mutations {
                 Batch::Patches(_) => read_bases(&state.base, &keys).await?,
                 Batch::Registrations(_) => read_existing(&state.base, &keys, &["id"]).await?,
@@ -415,8 +425,10 @@ impl AnnotationStaging {
                             .as_ref()
                             .and_then(|f| f.values.get(turn).cloned())
                     });
-                let exists =
-                    previous.is_some() || cached.contains_key(turn) || cold.contains_key(turn);
+                let exists = previous.is_some()
+                    || cached.contains_key(turn)
+                    || cold.contains_key(turn)
+                    || lookup.and_then(|lookup| lookup.get(turn)) == Some(true);
                 if matches!(input, Input::Register(_)) && exists {
                     // Re-import must neither reset annotations nor create dirty
                     // values/files for a turn already visible at this cut.

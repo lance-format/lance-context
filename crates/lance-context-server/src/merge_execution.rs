@@ -214,8 +214,9 @@ impl Executions {
         self.coordinator()
             .await
             .map_err(|e| format!("{e:?}"))?
-            .publish_demand_event(target, event)
+            .publish_active_demand_events(target, std::slice::from_ref(event))
             .await
+            .map(|changed| changed > 0)
     }
 
     pub(crate) async fn request_merge(&self, target: &str) -> Result<(), String> {

@@ -125,6 +125,40 @@ at 100 × 20 shards (both over the respective caps when unbounded).
 
 No existing key is removed or re-purposed in P1.
 
+
+### Completed advisory records
+
+The active publication path retains `demand-events` only while there is
+unmerged demand. Writer observations carry the conservative completed prefix
+from the same durable shard manifest as the sealed watermark (the prefix is
+before the oldest remaining SST, not highest generation minus SST count).
+Executor observations use the full manifest seal and completed prefix and
+share the scanner's batches of at most 32 exact-key reads.
+
+After joining an observation with the current record, a known completed prefix
+covering every known seal permits a revision-compared deletion of that one
+advisory record. Fully completed batches retire up to 32 records in a
+single transaction (at most 512 KiB of estimated key/operation bytes). A
+concurrent seal rejects the batch and falls back to independent per-key
+comparisons, re-reading and re-joining conflicting keys. An absent, fully completed record is not recreated. Unknown schemas
+and unreadable records are not retired. These deletes never touch tasks,
+execution ownership, claims, commit permits, or WAL payloads.
+
+This changes persistence of *completed hints*, not the monotonic watermarks in
+storage. A newly active shard publishes its own completed prefix along with its
+new seal, so a leader rebuilding after retirement sees the new pending suffix.
+A legacy publisher can recreate an overestimated hint during a mixed rollout;
+a subsequent manifest observation reconciles it. Absence of a hint never
+proves execution termination and cannot authorize takeover or payload deletion.
+The old publication API remains monotonic for existing consumers.
+
+Rollout validation must cover partial/non-prefix merges, an old publisher
+racing retirement, a new writer after retirement, and snapshot/Watch recovery.
+The writer acknowledgement cache includes completed-prefix changes and only
+acknowledges successful publication; restart or eviction replays the observation.
+`etcd_operation_attempts_total{operation="demand_retire"}` counts retirement CAS
+calls (not guaranteed deletions); failed comparisons are successful RPCs.
+
 ## 2. Executors and reservations
 
 ### 2.1 Executor heartbeat — leased (`ETCD_LEASE_TTL_SECS`)

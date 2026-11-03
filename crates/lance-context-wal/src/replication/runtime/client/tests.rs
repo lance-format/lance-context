@@ -10,6 +10,7 @@ mod admission;
 mod binding_timing;
 mod deadline;
 mod observation;
+mod publication_window;
 mod reconnect;
 mod routing;
 
