@@ -51,6 +51,13 @@ impl SnapshotFeedback {
 }
 
 impl Outbound {
+    /// Local attempt identity for transport observation, outside the wire protocol.
+    pub(super) fn snapshot_attempt(&self) -> Option<u64> {
+        self.snapshot_feedback
+            .as_ref()
+            .map(|feedback| feedback.attempt)
+    }
+
     /// Consume a snapshot owner and return its transfer result on a reserved
     /// lane. Report success only after the remote durable installation response.
     /// This queues local Raft feedback; it is not a client durability receipt.
