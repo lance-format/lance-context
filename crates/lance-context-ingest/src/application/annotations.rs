@@ -239,6 +239,7 @@ pub async fn serve_owner(
                 Arc::default(),
             )),
         ).await?;
+        let mut metadata_uploads = annotations::metadata_upload::Scope::install(&storage)?;
         let configuration = runtime::Configuration {
                 limits: a.staging.clone(),
                 upload_budget: ingress.budget.clone(),
@@ -270,6 +271,7 @@ pub async fn serve_owner(
             None => runtime,
         };
         let owner = Owner::new(&runtime, keys, options.options.clone())?;
+        metadata_uploads.start();
         let app = owner.router().layer(middleware::from_fn_with_state(auth, authorize));
         let (stop_http, stopped_http) = oneshot::channel();
         let (stop_runtime, stopped_runtime) = oneshot::channel();
@@ -302,6 +304,7 @@ pub async fn serve_owner(
                     "source_bytes": source.bytes, "backpressured": pressure.is_some(),
                     "backpressure_reason": pressure,
                     "reclamation": service.reclamation_observation(),
+                    "metadata_uploads": metadata_uploads.observation(),
                     "http": owner.observation(),
                     "phases": service.phase_observation().as_slice(),
                     "append_rpc": ingress.client.append_timings(),
@@ -318,6 +321,7 @@ pub async fn serve_owner(
                 _ => Err(anyhow::anyhow!("annotation role stopped before shutdown")),
             },
         };
+        metadata_uploads.cancel();
         // Keep the applier alive while admitted HTTP operations finish. No new
         // operations enter after shutdown starts; response buffers drain too.
         owner.shutdown().await;

@@ -21,6 +21,8 @@ use tokio::sync::watch;
 mod accepted;
 pub(crate) mod checkpoint;
 mod local_payload;
+#[cfg(feature = "service")]
+pub(crate) mod metadata_upload;
 pub mod mixed;
 mod prefetch;
 pub mod runtime;

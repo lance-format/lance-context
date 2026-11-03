@@ -18,6 +18,8 @@ mod lost_plan;
 #[cfg(feature = "service")]
 pub(super) mod lost_prepare;
 mod maintenance_ready;
+#[cfg(feature = "service")]
+mod metadata_upload;
 mod open;
 
 #[cfg(unix)]
