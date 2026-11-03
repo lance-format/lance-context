@@ -6607,6 +6607,41 @@ pub(crate) mod tests {
     #[tokio::test]
     #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn compact_preflight_batch_preserves_suppression_and_refreshes() {
+        // The HA suite shares etcd with concurrent tests. Functional assertions
+        // always run; exact server-wide RPC counts additionally require the
+        // explicitly exclusive, loopback-only test harness.
+        let exclusive = std::env::var("ETCD_TEST_EXCLUSIVE").as_deref() == Ok("1");
+        let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+        if exclusive {
+            assert_eq!(
+                reqwest::Url::parse(&endpoint).unwrap().host_str(),
+                Some("127.0.0.1")
+            );
+        }
+        async fn count(endpoint: &str, method: &str) -> u64 {
+            let body = reqwest::get(format!("{endpoint}/metrics"))
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            body.lines()
+                .filter(|line| {
+                    line.starts_with("grpc_server_started_total{")
+                        && line.contains(&format!("grpc_method=\"{method}\""))
+                        && line.contains("grpc_service=\"etcdserverpb.KV\"")
+                })
+                .map(|line| {
+                    line.split_whitespace()
+                        .last()
+                        .unwrap()
+                        .parse::<u64>()
+                        .unwrap()
+                })
+                .sum()
+        }
         let dir = TempDir::new().unwrap();
         let mut cfg = config(&dir);
         cfg.etcd.etcd_endpoints = std::env::var("ETCD_TEST_ENDPOINTS")
@@ -6645,7 +6680,27 @@ pub(crate) mod tests {
         let noop_key = lance_context_merge::execution_key(&cfg.etcd.etcd_prefix, &names[0])
             .replace("/merge-executions/", "/compact-noops/");
         client.put(noop_key.clone(), "invalid", None).await.unwrap();
+        let before = if exclusive {
+            Some((
+                count(&endpoint, "Range").await,
+                count(&endpoint, "Txn").await,
+            ))
+        } else {
+            None
+        };
         let page = store.compact_preflight(&targets).await.unwrap();
+        if let Some(before) = before {
+            let after = (
+                count(&endpoint, "Range").await,
+                count(&endpoint, "Txn").await,
+            );
+            assert_eq!(after.0 - before.0, 0, "no per-table Range RPCs");
+            assert_eq!(
+                after.1 - before.1,
+                1,
+                "64 exact keys share one read-only Txn"
+            );
+        }
         assert_eq!(page.len(), 32);
         assert!(page[0].cooling_down().unwrap());
         assert!(page[0].unchanged("/table", 10, "options").is_err());
@@ -6689,62 +6744,6 @@ pub(crate) mod tests {
         assert!(!disabled.compact_preflight(&targets[..1]).await.unwrap()[0]
             .cooling_down()
             .unwrap());
-    }
-
-    #[tokio::test]
-    #[ignore = "requires exclusive loopback ETCD_TEST_ENDPOINTS and ETCD_TEST_EXCLUSIVE=1"]
-    async fn compact_preflight_batch_uses_one_transaction_for_32_targets() {
-        assert_eq!(std::env::var("ETCD_TEST_EXCLUSIVE").as_deref(), Ok("1"));
-        let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
-        let url = reqwest::Url::parse(&endpoint).unwrap();
-        assert_eq!(url.host_str(), Some("127.0.0.1"));
-        async fn count(endpoint: &str, method: &str) -> u64 {
-            let body = reqwest::get(format!("{endpoint}/metrics"))
-                .await
-                .unwrap()
-                .error_for_status()
-                .unwrap()
-                .text()
-                .await
-                .unwrap();
-            body.lines()
-                .filter(|line| {
-                    line.starts_with("grpc_server_started_total{")
-                        && line.contains(&format!("grpc_method=\"{method}\""))
-                        && line.contains("grpc_service=\"etcdserverpb.KV\"")
-                })
-                .map(|line| {
-                    line.split_whitespace()
-                        .last()
-                        .unwrap()
-                        .parse::<u64>()
-                        .unwrap()
-                })
-                .sum()
-        }
-        let dir = TempDir::new().unwrap();
-        let mut cfg = config(&dir);
-        cfg.etcd.etcd_endpoints = vec![endpoint.clone()];
-        cfg.etcd.etcd_prefix = format!("/test/{}", generate_id());
-        cfg.task_cooldown_after_failures = 2;
-        let store = TaskStore::open(&cfg).await.unwrap();
-        let before = (
-            count(&endpoint, "Range").await,
-            count(&endpoint, "Txn").await,
-        );
-        let names: Vec<_> = (0..32).map(|i| format!("table-{i}")).collect();
-        let targets: Vec<_> = names.iter().map(String::as_str).collect();
-        assert_eq!(store.compact_preflight(&targets).await.unwrap().len(), 32);
-        let after = (
-            count(&endpoint, "Range").await,
-            count(&endpoint, "Txn").await,
-        );
-        assert_eq!(after.0 - before.0, 0, "no per-table Range RPCs");
-        assert_eq!(
-            after.1 - before.1,
-            1,
-            "64 exact keys share one read-only Txn"
-        );
     }
 
     #[tokio::test]
