@@ -1067,19 +1067,30 @@ impl RolloutStore {
         let selection_schema = Arc::new(projected_arrow_schema(&dataset, &selection_columns)?);
         let columns = Self::non_blob_columns_for(&dataset);
         let target_schema = Arc::new(projected_arrow_schema(&dataset, &columns)?);
-        // Identify the failing physical source without logging filters, row
+        // Identify the captured WAL generation without logging filters, row
         // values, object paths, or changing the consistent-read retry policy.
-        let report_source_failure = |phase: &'static str, source_kind: &'static str| {
+        let base_version = dataset.manifest.version;
+        let report_source_failure = |phase: &'static str,
+                                     source_kind: &'static str,
+                                     wal_source: Option<(Uuid, u64)>,
+                                     error: &LanceError| {
             tracing::warn!(uri = %self.base.dataset.uri(), phase, source_kind,
+                base_version,
+                wal_shard = ?wal_source.map(|(shard, _)| shard),
+                wal_generation = ?wal_source.map(|(_, generation)| generation),
+                missing_file = crate::store_base::is_not_found_error(error),
                 "rollout selected read source failed");
         };
         let mut sources = vec![dataset];
+        let mut wal_sources = vec![None];
         for snapshot in snapshots {
             for generation in snapshot.sstables {
+                let wal_source = Some((snapshot.shard_id, generation.generation));
                 let uri = self.flushed_generation_uri(snapshot.shard_id, &generation.path);
-                sources.push(self.open_flushed_dataset(&uri).await.inspect_err(|_| {
-                    report_source_failure("open", "wal");
+                sources.push(self.open_flushed_dataset(&uri).await.inspect_err(|error| {
+                    report_source_failure("open", "wal", wal_source, error);
                 })?);
+                wal_sources.push(wal_source);
             }
         }
 
@@ -1100,11 +1111,21 @@ impl RolloutStore {
             scanner
                 .project(&projected_column_refs(dataset, &selection_columns))?
                 .with_row_id();
-            let mut stream = scanner.try_into_stream().await.inspect_err(|_| {
-                report_source_failure("selection_plan", source_kind);
+            let mut stream = scanner.try_into_stream().await.inspect_err(|error| {
+                report_source_failure(
+                    "selection_plan",
+                    source_kind,
+                    wal_sources[source_index],
+                    error,
+                );
             })?;
-            while let Some(batch) = stream.try_next().await.inspect_err(|_| {
-                report_source_failure("selection_stream", source_kind);
+            while let Some(batch) = stream.try_next().await.inspect_err(|error| {
+                report_source_failure(
+                    "selection_stream",
+                    source_kind,
+                    wal_sources[source_index],
+                    error,
+                );
             })? {
                 let row_ids = column_as::<UInt64Array>(&batch, "_rowid")?.clone();
                 let selection_indices = batch
@@ -1177,8 +1198,13 @@ impl RolloutStore {
                 let batch = dataset
                     .take_rows(&row_ids, projection)
                     .await
-                    .inspect_err(|_| {
-                        report_source_failure("materialize", source_kind);
+                    .inspect_err(|error| {
+                        report_source_failure(
+                            "materialize",
+                            source_kind,
+                            wal_sources[source_index],
+                            error,
+                        );
                     })?;
                 let aligned = align_batch_to_schema(batch, target_schema.clone())?;
                 let records = batch_to_rollout_records(&aligned)?;
