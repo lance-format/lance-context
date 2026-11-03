@@ -47,6 +47,45 @@ const SCHEDULER_CLAIM_MAX_PAGES: usize = 4;
 const CLAIM_READ_BATCH_TASKS: usize = 8;
 const CLAIM_READ_BATCH_KEYS: usize = 64;
 
+pub(crate) const COMPACT_PREFLIGHT_BATCH: usize = 32;
+
+/// Advisory metadata for one sweep page, never cached across sweeps. Decode
+/// lazily so an irrelevant malformed no-op cannot fail a cooling-down target.
+pub(crate) struct CompactPreflight {
+    cooldown: Option<Vec<u8>>,
+    noop: Option<Vec<u8>>,
+}
+
+impl CompactPreflight {
+    pub(crate) fn cooling_down(&self) -> lance::Result<bool> {
+        self.cooldown
+            .as_deref()
+            .map(|value| {
+                serde_json::from_slice::<TaskCooldown>(value)
+                    .map(|c| c.until_ms.is_some_and(|until| until > now_ms()))
+                    .map_err(|e| lance::Error::io(format!("decode cooldown: {e}")))
+            })
+            .transpose()
+            .map(|cooling| cooling.unwrap_or(false))
+    }
+
+    pub(crate) fn unchanged(&self, uri: &str, version: i64, options: &str) -> lance::Result<bool> {
+        if version < 0 {
+            return Ok(false);
+        }
+        let Some(bytes) = self.noop.as_deref() else {
+            return Ok(false);
+        };
+        let value: serde_json::Value = serde_json::from_slice(bytes)
+            .map_err(|e| lance::Error::io(format!("invalid compact no-op record: {e}")))?;
+        Ok(
+            value["uri"] == uri
+                && value["version"] == version as u64
+                && value["options"] == options,
+        )
+    }
+}
+
 /// Owned by one scheduler pool, never shared between kind/target filters.
 /// A fixed etcd revision closes each sweep even while new tasks keep arriving.
 #[cfg(test)]
@@ -537,6 +576,7 @@ impl TaskStore {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) async fn compact_is_unchanged(
         &self,
         target: &str,
@@ -567,6 +607,44 @@ impl TaskStore {
                 && value["version"] == version as u64
                 && value["options"] == options,
         )
+    }
+
+    /// At most 64 exact-key reads in one transaction. These are suppression
+    /// hints only: enqueue still checks dedupe transactionally,
+    /// and the publisher's leadership fence still protects publication.
+    pub(crate) async fn compact_preflight(
+        &self,
+        targets: &[&str],
+    ) -> lance::Result<Vec<CompactPreflight>> {
+        if targets.len() > COMPACT_PREFLIGHT_BATCH {
+            return Err(lance::Error::io("compact preflight page exceeds limit"));
+        }
+        if targets.is_empty() {
+            return Ok(Vec::new());
+        }
+        let check_cooldown = self.cooldown.after_failures != 0;
+        let mut keys = Vec::with_capacity(targets.len() * 2);
+        for target in targets {
+            if check_cooldown {
+                keys.push(self.inner.cooldown_key(TaskKind::Compact, target));
+            }
+            keys.push(
+                lance_context_merge::execution_key(&self.inner.prefix, target)
+                    .replace("/merge-executions/", "/compact-noops/"),
+            );
+        }
+        let mut values = self.inner.read_values(&keys).await?.into_iter();
+        Ok(targets
+            .iter()
+            .map(|_| CompactPreflight {
+                cooldown: if check_cooldown {
+                    values.next().unwrap()
+                } else {
+                    None
+                },
+                noop: values.next().unwrap(),
+            })
+            .collect())
     }
 
     /// Share admission-change notifications across this master's scheduler pools.
@@ -6524,6 +6602,149 @@ pub(crate) mod tests {
         assert_eq!(store.inner.recover_orphaned().await.unwrap(), 0);
         assert_eq!(store.queue_depth().await.unwrap(), 70);
         store.finish(live, Ok("done".into())).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn compact_preflight_batch_preserves_suppression_and_refreshes() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.etcd.etcd_endpoints = std::env::var("ETCD_TEST_ENDPOINTS")
+            .unwrap()
+            .split(',')
+            .map(str::to_owned)
+            .collect();
+        cfg.etcd.etcd_prefix = format!("/test/{}", generate_id());
+        cfg.task_cooldown_after_failures = 2;
+        let store = TaskStore::open(&cfg).await.unwrap();
+        let names: Vec<_> = (0..32).map(|i| format!("table-{i}")).collect();
+        let targets: Vec<_> = names.iter().map(String::as_str).collect();
+        for name in &names {
+            store
+                .record_compact_noop(name, "/table", 10, "options")
+                .await
+                .unwrap();
+        }
+        let cooldown = TaskCooldown {
+            kind: TaskKind::Compact,
+            target: names[0].clone(),
+            failures: 2,
+            until_ms: Some(now_ms() + 60_000),
+            last_error: "test".into(),
+        };
+        let mut client = store.inner.client.clone();
+        client
+            .put(
+                store.inner.cooldown_key(TaskKind::Compact, &names[0]),
+                serde_json::to_vec(&cooldown).unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+        // A cooling-down row must not decode its malformed no-op payload.
+        let noop_key = lance_context_merge::execution_key(&cfg.etcd.etcd_prefix, &names[0])
+            .replace("/merge-executions/", "/compact-noops/");
+        client.put(noop_key.clone(), "invalid", None).await.unwrap();
+        let page = store.compact_preflight(&targets).await.unwrap();
+        assert_eq!(page.len(), 32);
+        assert!(page[0].cooling_down().unwrap());
+        assert!(page[0].unchanged("/table", 10, "options").is_err());
+        assert!(!page[0].unchanged("/table", -1, "options").unwrap());
+        for hint in &page[1..] {
+            assert!(!hint.cooling_down().unwrap());
+            assert!(hint.unchanged("/table", 10, "options").unwrap());
+            assert!(!hint.unchanged("/elsewhere", 10, "options").unwrap());
+            assert!(!hint.unchanged("/table", 11, "options").unwrap());
+            assert!(!hint.unchanged("/table", 10, "changed").unwrap());
+        }
+        assert!(store.compact_preflight(&[]).await.unwrap().is_empty());
+        assert!(store.compact_preflight(&["too-many"; 33]).await.is_err());
+        client.delete(noop_key, None).await.unwrap();
+        let expired = TaskCooldown {
+            until_ms: Some(now_ms() - 1),
+            ..cooldown
+        };
+        client
+            .put(
+                store.inner.cooldown_key(TaskKind::Compact, &names[0]),
+                serde_json::to_vec(&expired).unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+        // Each new page rereads etcd; there is no process-lifetime cache.
+        let refreshed = store.compact_preflight(&targets[..1]).await.unwrap();
+        assert!(!refreshed[0].cooling_down().unwrap());
+        assert!(!refreshed[0].unchanged("/table", 10, "options").unwrap());
+        client
+            .put(
+                store.inner.cooldown_key(TaskKind::Compact, &names[0]),
+                "invalid",
+                None,
+            )
+            .await
+            .unwrap();
+        cfg.task_cooldown_after_failures = 0;
+        let disabled = TaskStore::open(&cfg).await.unwrap();
+        assert!(!disabled.compact_preflight(&targets[..1]).await.unwrap()[0]
+            .cooling_down()
+            .unwrap());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires exclusive loopback ETCD_TEST_ENDPOINTS and ETCD_TEST_EXCLUSIVE=1"]
+    async fn compact_preflight_batch_uses_one_transaction_for_32_targets() {
+        assert_eq!(std::env::var("ETCD_TEST_EXCLUSIVE").as_deref(), Ok("1"));
+        let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+        let url = reqwest::Url::parse(&endpoint).unwrap();
+        assert_eq!(url.host_str(), Some("127.0.0.1"));
+        async fn count(endpoint: &str, method: &str) -> u64 {
+            let body = reqwest::get(format!("{endpoint}/metrics"))
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            body.lines()
+                .filter(|line| {
+                    line.starts_with("grpc_server_started_total{")
+                        && line.contains(&format!("grpc_method=\"{method}\""))
+                        && line.contains("grpc_service=\"etcdserverpb.KV\"")
+                })
+                .map(|line| {
+                    line.split_whitespace()
+                        .last()
+                        .unwrap()
+                        .parse::<u64>()
+                        .unwrap()
+                })
+                .sum()
+        }
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.etcd.etcd_endpoints = vec![endpoint.clone()];
+        cfg.etcd.etcd_prefix = format!("/test/{}", generate_id());
+        cfg.task_cooldown_after_failures = 2;
+        let store = TaskStore::open(&cfg).await.unwrap();
+        let before = (
+            count(&endpoint, "Range").await,
+            count(&endpoint, "Txn").await,
+        );
+        let names: Vec<_> = (0..32).map(|i| format!("table-{i}")).collect();
+        let targets: Vec<_> = names.iter().map(String::as_str).collect();
+        assert_eq!(store.compact_preflight(&targets).await.unwrap().len(), 32);
+        let after = (
+            count(&endpoint, "Range").await,
+            count(&endpoint, "Txn").await,
+        );
+        assert_eq!(after.0 - before.0, 0, "no per-table Range RPCs");
+        assert_eq!(
+            after.1 - before.1,
+            1,
+            "64 exact keys share one read-only Txn"
+        );
     }
 
     #[tokio::test]
