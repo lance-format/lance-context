@@ -132,9 +132,9 @@ static MERGED_PUBLISH_SLOTS: std::sync::LazyLock<Arc<Semaphore>> =
 
 /// After a successful WAL catch-up has released ownership, publish every
 /// shard's observed watermark. Detached and bounded; never on the release
-/// path. Each shard is a separate monotonic put, so a table with hundreds of
-/// shards never approaches the etcd transaction op limit and a concurrent
-/// writer flush on one shard cannot fail the others.
+/// path. Reads and fully completed retirements are bounded to 32 shards;
+/// conflicting retirements fall back to independent per-shard CAS so a hot
+/// writer cannot prevent the other shards from progressing.
 pub(crate) fn spawn_merged_demand(coordinator: Coordinator, target: String, uri: String) {
     let Ok(permit) = MERGED_PUBLISH_SLOTS.clone().try_acquire_owned() else {
         metrics::counter!("master_demand_merged_watermarks_total", "result" => "dropped")
