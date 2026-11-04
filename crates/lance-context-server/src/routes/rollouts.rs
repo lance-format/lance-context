@@ -5,7 +5,7 @@ use axum::body::Body;
 use axum::extract::{FromRequest, Multipart, Path, Query, Request, State};
 use axum::http::{header, StatusCode};
 use axum::response::Response;
-use axum::Json;
+use axum::{Extension, Json};
 use lance_context_api::{
     AddRolloutRequest, AddRolloutsRequest, AddRolloutsResponse, CheckoutRequest, CompactRequest,
     CompactResponse, CompactStatsResponse, CreateRolloutStoreRequest, GetRolloutResponse,
@@ -19,6 +19,7 @@ use lance_context_core::{
 };
 use tokio::sync::RwLock;
 
+use crate::drain::ClientCancellation;
 use crate::error::AppError;
 use crate::state::AppState;
 
@@ -612,6 +613,7 @@ impl<'a> ListReadTrace<'a> {
             AppError::Internal(_) => "internal",
             AppError::CompactionInProgress => "compaction_in_progress",
             AppError::Overloaded(_) => "overloaded",
+            AppError::ClientDisconnected => "client_disconnected",
         });
     }
 
@@ -670,6 +672,7 @@ impl Drop for ListReadTrace<'_> {
 }
 
 pub async fn list_rollouts(
+    cancellation: Option<Extension<ClientCancellation>>,
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
     Query(params): Query<RolloutListParams>,
@@ -692,15 +695,28 @@ pub async fn list_rollouts(
         .inspect_err(|error| trace.open_error(error))?;
     trace.advance();
 
-    let store = store_lock.read().await;
-    trace.advance();
-    let records = store
-        .list_with_filters(params.limit, params.offset, filters.as_ref())
-        .await
-        .map_err(|error| {
-            trace.list_error(&error);
-            AppError::from_lance(error)
-        })?;
+    // Lazy opening may publish storage state and remains protected. Only the
+    // read, including its table-lock wait, opts into client cancellation.
+    let read = async {
+        let store = store_lock.read().await;
+        trace.advance();
+        let records = store
+            .list_with_filters(params.limit, params.offset, filters.as_ref())
+            .await
+            .map_err(|error| {
+                trace.list_error(&error);
+                AppError::from_lance(error)
+            })?;
+        Ok::<_, AppError>((store, records))
+    };
+    let (_store, records) = match cancellation {
+        Some(Extension(cancellation)) => tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(AppError::ClientDisconnected),
+            records = read => records?,
+        },
+        None => read.await?,
+    };
     trace.advance();
     trace.rows = Some(records.len());
 
@@ -1802,8 +1818,108 @@ mod tests {
             .unwrap()
     }
 
+    #[tokio::test]
+    async fn cancelled_list_stops_waiting_for_the_table_read_lock() {
+        let (state, _dir) = rollout_state().await;
+        let store = state.get_or_open_rollout_store("rl").await.unwrap();
+        let write_guard = store.write().await;
+        let (lifetime, cancellation) = ClientCancellation::channel();
+        let read = list_rollouts(
+            Some(Extension(cancellation)),
+            State(state.clone()),
+            Path("rl".to_string()),
+            Query(RolloutListParams::default()),
+        );
+        tokio::pin!(read);
+        assert!(futures::poll!(&mut read).is_pending());
+        drop(lifetime);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), read)
+            .await
+            .unwrap();
+        assert!(matches!(result, Err(AppError::ClientDisconnected)));
+        drop(write_guard);
+        assert!(store.try_write().is_ok());
+    }
+
+    #[tokio::test]
+    async fn cancelled_list_keeps_store_lookup_protected() {
+        let (state, _dir) = rollout_state().await;
+        let cache_guard = state.rollout_stores.lock().await;
+        let (lifetime, cancellation) = ClientCancellation::channel();
+        let read = list_rollouts(
+            Some(Extension(cancellation)),
+            State(state.clone()),
+            Path("rl".to_string()),
+            Query(RolloutListParams::default()),
+        );
+        tokio::pin!(read);
+        assert!(futures::poll!(&mut read).is_pending());
+        drop(lifetime);
+        // Cancellation cannot drop lazy store opening or its protected setup.
+        assert!(futures::poll!(&mut read).is_pending());
+        drop(cache_guard);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), read)
+            .await
+            .unwrap();
+        assert!(matches!(result, Err(AppError::ClientDisconnected)));
+    }
+
+    #[tokio::test]
+    async fn disconnected_list_socket_does_not_hold_shutdown_behind_the_table_lock() {
+        use tokio::io::AsyncWriteExt;
+        let (state, _dir) = rollout_state().await;
+        let store = state.get_or_open_rollout_store("rl").await.unwrap();
+        let write_guard = store.write().await;
+        let baseline = Arc::strong_count(&store);
+        let app = axum::Router::new()
+            .route(
+                "/api/v1/rollouts/{name}/records",
+                axum::routing::get(list_rollouts),
+            )
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (stop, stopping) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(crate::drain::serve(
+            listener,
+            app,
+            std::time::Duration::from_millis(10),
+            async {
+                let _ = stopping.await;
+            },
+        ));
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        client
+            .write_all(b"GET /api/v1/rollouts/rl/records HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        // The real handler has obtained the cached store and cannot acquire its
+        // read guard while this test owns the write guard.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while Arc::strong_count(&store) == baseline {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let client = client.into_std().unwrap();
+        client.shutdown(std::net::Shutdown::Both).unwrap();
+        drop(client);
+        stop.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        // Shutdown completed without releasing the lock that blocked the read.
+        assert_eq!(Arc::strong_count(&store), baseline);
+        drop(write_guard);
+        assert!(store.try_write().is_ok());
+    }
+
     async fn count_rollouts(state: &Arc<AppState>) -> usize {
         let Json(list) = list_rollouts(
+            None,
             State(state.clone()),
             Path("rl".to_string()),
             Query(RolloutListParams::default()),
@@ -2060,6 +2176,7 @@ mod tests {
 
         // Read routed to B must lazily open the store, not 404.
         let Json(list) = list_rollouts(
+            None,
             State(state_b.clone()),
             Path("rl".to_string()),
             Query(RolloutListParams::default()),
@@ -2092,6 +2209,7 @@ mod tests {
     async fn read_of_nonexistent_store_still_404s() {
         let (state, _dir) = rollout_state().await;
         let err = list_rollouts(
+            None,
             State(state.clone()),
             Path("no-such-store".to_string()),
             Query(RolloutListParams::default()),
@@ -2281,10 +2399,14 @@ mod tests {
                 serde_json::json!({"policy_version": "private-filter-value"}).to_string(),
             ),
         };
-        let Json(expected) =
-            list_rollouts(State(state.clone()), Path("rl".into()), Query(params()))
-                .await
-                .unwrap();
+        let Json(expected) = list_rollouts(
+            None,
+            State(state.clone()),
+            Path("rl".into()),
+            Query(params()),
+        )
+        .await
+        .unwrap();
         let log = Log(Arc::default());
         let sink = log.clone();
         let subscriber = tracing_subscriber::fmt()
@@ -2300,6 +2422,7 @@ mod tests {
 
         let held = cached.write().await;
         let mut request = Box::pin(list_rollouts(
+            None,
             State(state.clone()),
             Path("rl".into()),
             Query(params()),
@@ -2318,6 +2441,7 @@ mod tests {
 
         let held = cached.write().await;
         let mut cancelled = Box::pin(list_rollouts(
+            None,
             State(state.clone()),
             Path("rl".into()),
             Query(params()),
@@ -2434,6 +2558,7 @@ mod tests {
         flush_store(&state, "rl").await;
 
         let Json(response) = list_rollouts(
+            None,
             State(state),
             Path("rl".to_string()),
             Query(RolloutListParams {
@@ -2458,6 +2583,7 @@ mod tests {
     async fn list_rollouts_rejects_invalid_filters() {
         let (state, _dir) = rollout_state().await;
         let invalid_json = list_rollouts(
+            None,
             State(state.clone()),
             Path("rl".to_string()),
             Query(RolloutListParams {
@@ -2470,6 +2596,7 @@ mod tests {
         assert!(matches!(invalid_json, AppError::InvalidRequest(_)));
 
         let unsupported = list_rollouts(
+            None,
             State(state),
             Path("rl".to_string()),
             Query(RolloutListParams {
