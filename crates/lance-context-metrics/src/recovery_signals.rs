@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::Query;
@@ -18,6 +18,9 @@ use serde_json::json;
 
 const SHARDS: usize = 32;
 const PER_SHARD: usize = 128;
+// Reserve bounded space for read failures/slow reads when ordinary activity
+// occupies a shard. Neither recording path waits for a lock.
+const PRIORITY_PER_SHARD: usize = 8;
 const WINDOW: Duration = Duration::from_secs(300);
 const MAX_REPLY: usize = 1024 * 1024;
 const MAX_TARGET: usize = 1032;
@@ -32,8 +35,24 @@ struct Entry {
     read_slow: Option<(Instant, u64, u16, u64)>,
 }
 
+impl Entry {
+    fn merge(&mut self, other: &Self) {
+        if other.touched > self.touched {
+            self.touched = other.touched;
+            self.active_at = other.active_at;
+        }
+        if other.read_error.map(|v| v.0) > self.read_error.map(|v| v.0) {
+            self.read_error = other.read_error;
+        }
+        if other.read_slow.map(|v| v.0) > self.read_slow.map(|v| v.0) {
+            self.read_slow = other.read_slow;
+        }
+    }
+}
+
 struct Signals {
     shards: [Mutex<HashMap<String, Entry>>; SHARDS],
+    priority_shards: [Mutex<HashMap<String, Entry>>; SHARDS],
     snapshot_gate: Mutex<()>,
     dropped: AtomicU64,
     last_drop_tick: AtomicU64,
@@ -55,6 +74,7 @@ impl Signals {
     fn new(enabled: bool) -> Self {
         Self {
             shards: std::array::from_fn(|_| Mutex::new(HashMap::new())),
+            priority_shards: std::array::from_fn(|_| Mutex::new(HashMap::new())),
             snapshot_gate: Mutex::new(()),
             dropped: AtomicU64::new(0),
             last_drop_tick: AtomicU64::new(0),
@@ -87,6 +107,32 @@ impl Signals {
         self.record_with_latency(target, read, status, now, wall, None);
     }
 
+    fn writable_shard(
+        &self,
+        target: &str,
+        priority: bool,
+        now: Instant,
+    ) -> Option<MutexGuard<'_, HashMap<String, Entry>>> {
+        let index = Self::shard(target);
+        let candidates = [
+            (&self.shards[index], PER_SHARD),
+            (&self.priority_shards[index], PRIORITY_PER_SHARD),
+        ];
+        for (shard, capacity) in candidates.into_iter().take(if priority { 2 } else { 1 }) {
+            let Ok(mut values) = shard.try_lock() else {
+                continue;
+            };
+            if !values.contains_key(target) && values.len() >= capacity {
+                values.retain(|_, entry| now.saturating_duration_since(entry.touched) < WINDOW);
+                if values.len() >= capacity {
+                    continue;
+                }
+            }
+            return Some(values);
+        }
+        None
+    }
+
     fn record_with_latency(
         &self,
         target: String,
@@ -109,17 +155,11 @@ impl Signals {
             self.drop_event(now);
             return;
         }
-        let Ok(mut values) = self.shards[Self::shard(&target)].try_lock() else {
+        let priority = read && (status.is_server_error() || slow.is_some());
+        let Some(mut values) = self.writable_shard(&target, priority, now) else {
             self.drop_event(now);
             return;
         };
-        if !values.contains_key(&target) && values.len() >= PER_SHARD {
-            values.retain(|_, entry| now.saturating_duration_since(entry.touched) < WINDOW);
-            if values.len() >= PER_SHARD {
-                self.drop_event(now);
-                return;
-            }
-        }
         let entry = values.entry(target).or_insert(Entry {
             touched: now,
             active_at: wall,
@@ -149,19 +189,23 @@ impl Signals {
             return unavailable("request signals disabled");
         }
         let dropped_before = self.dropped.load(Ordering::Relaxed);
-        let mut entries = Vec::new();
+        let mut entries = HashMap::<String, Entry>::new();
         let mut complete = true;
-        for shard in &self.shards {
+        for shard in self.shards.iter().chain(&self.priority_shards) {
             let Ok(values) = shard.try_lock() else {
                 complete = false;
                 continue;
             };
             for (name, entry) in values.iter() {
                 if now.saturating_duration_since(entry.touched) < WINDOW {
-                    entries.push((name.clone(), entry.clone()));
+                    entries
+                        .entry(name.clone())
+                        .and_modify(|current| current.merge(entry))
+                        .or_insert_with(|| entry.clone());
                 }
             }
         }
+        let mut entries: Vec<_> = entries.into_iter().collect();
         // Preserve recent failures, then slow reads, before ordinary activity.
         entries.sort_by_key(|(_, entry)| {
             let error = entry
@@ -192,7 +236,7 @@ impl Signals {
                 "read_slow_status": slow.map(|(_, _, status, _)| status),
                 "read_slow_header_millis": slow.map(|(_, _, _, millis)| millis)});
             let size = serde_json::to_vec(&row).expect("bounded scalar row").len() + 1;
-            if bytes + size > MAX_REPLY {
+            if tables.len() >= SHARDS * PER_SHARD || bytes + size > MAX_REPLY {
                 complete = false;
                 continue;
             }
@@ -544,6 +588,9 @@ mod tests {
         let response = {
             let _held = signals.shards[Signals::shard("t")].lock().unwrap();
             signals.record("t".into(), true, StatusCode::SERVICE_UNAVAILABLE, now, 1);
+            // Ordinary activity still drops without waiting; the read error
+            // survives independently in the bounded reserve.
+            signals.record("t".into(), false, StatusCode::OK, now, 1);
             signals.snapshot("n", now)
         };
         let v: Value =
@@ -551,6 +598,7 @@ mod tests {
                 .unwrap();
         assert_eq!(v["complete"], false);
         assert_eq!(v["dropped_total"], 1);
+        assert_eq!(v["tables"][0]["read_error_status"], 503);
         signals.record("t".into(), true, StatusCode::OK, now, 2);
         let v = value(&signals, now).await;
         assert_eq!(v["complete"], false);
@@ -636,7 +684,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn slow_read_recording_keeps_the_nonblocking_loss_contract() {
+    async fn slow_read_recording_uses_reserved_space_without_waiting() {
         let signals = Signals::new(true);
         let now = Instant::now();
         {
@@ -651,9 +699,135 @@ mod tests {
             );
         }
         let v = value(&signals, now).await;
+        assert_eq!(v["complete"], true);
+        assert_eq!(v["dropped_total"], 0);
+        assert_eq!(v["tables"][0]["read_slow_status"], 404);
+        assert_eq!(v["tables"][0]["read_slow_header_millis"], 5000);
+    }
+
+    #[tokio::test]
+    async fn full_activity_shard_does_not_discard_a_new_read_error() {
+        let signals = Signals::new(true);
+        let now = Instant::now();
+        let index = Signals::shard("urgent");
+        let names: Vec<_> = (0..)
+            .map(|n| format!("activity-{n}"))
+            .filter(|name| Signals::shard(name) == index)
+            .take(PER_SHARD + 1)
+            .collect();
+        for name in &names[..PER_SHARD] {
+            signals.record(name.clone(), false, StatusCode::OK, now, 1);
+        }
+        signals.record(
+            "urgent".into(),
+            true,
+            StatusCode::SERVICE_UNAVAILABLE,
+            now,
+            2,
+        );
+        let v = value(&signals, now).await;
+        assert_eq!(v["complete"], true);
+        assert_eq!(v["dropped_total"], 0);
+        assert_eq!(v["tables"][0]["name"], "urgent");
+        assert_eq!(v["tables"][0]["read_error_status"], 503);
+        assert_eq!(signals.priority_shards[index].lock().unwrap().len(), 1);
+        signals.record(names[PER_SHARD].clone(), false, StatusCode::OK, now, 3);
+        assert_eq!(value(&signals, now).await["complete"], false);
+        assert_eq!(signals.priority_shards[index].lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn priority_and_activity_entries_merge_without_losing_newer_hints() {
+        let signals = Signals::new(true);
+        let now = Instant::now();
+        {
+            let _held = signals.shards[Signals::shard("t")].lock().unwrap();
+            signals.record_with_latency(
+                "t".into(),
+                true,
+                StatusCode::SERVICE_UNAVAILABLE,
+                now,
+                1,
+                Some(SLOW_READ),
+            );
+        }
+        signals.record(
+            "t".into(),
+            true,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            now + Duration::from_secs(1),
+            2,
+        );
+        signals.record(
+            "t".into(),
+            false,
+            StatusCode::OK,
+            now + Duration::from_secs(2),
+            3,
+        );
+        let v = value(&signals, now + Duration::from_secs(3)).await;
+        let rows = v["tables"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["active_at_unix_millis"], 3);
+        assert_eq!(rows[0]["read_error_status"], 500);
+        assert_eq!(rows[0]["read_error_at_unix_millis"], 2);
+        assert_eq!(rows[0]["read_slow_status"], 503);
+        assert_eq!(rows[0]["read_slow_at_unix_millis"], 1);
+        assert_eq!(v["complete"], true);
+        let expired = value(&signals, now + WINDOW).await;
+        assert_eq!(expired["tables"][0]["read_slow_status"], Value::Null);
+        assert_eq!(expired["tables"][0]["read_error_status"], 500);
+    }
+
+    #[tokio::test]
+    async fn reserve_contention_still_reports_loss_without_waiting() {
+        let signals = Signals::new(true);
+        let now = Instant::now();
+        {
+            let index = Signals::shard("t");
+            let _activity = signals.shards[index].lock().unwrap();
+            let _priority = signals.priority_shards[index].lock().unwrap();
+            signals.record("t".into(), true, StatusCode::SERVICE_UNAVAILABLE, now, 1);
+        }
+        let v = value(&signals, now).await;
         assert_eq!(v["complete"], false);
         assert_eq!(v["dropped_total"], 1);
         assert!(v["tables"].as_array().unwrap().is_empty());
+        assert_eq!(value(&signals, now + WINDOW * 2).await["complete"], true);
+    }
+
+    #[tokio::test]
+    async fn critical_hint_storm_cannot_grow_the_reserve_without_bound() {
+        let signals = Signals::new(true);
+        let now = Instant::now();
+        let held: Vec<_> = signals.shards.iter().map(|s| s.lock().unwrap()).collect();
+        for n in 0..10_000 {
+            signals.record(
+                format!("error-{n}"),
+                true,
+                StatusCode::SERVICE_UNAVAILABLE,
+                now,
+                1,
+            );
+        }
+        let count: usize = signals
+            .priority_shards
+            .iter()
+            .map(|s| s.lock().unwrap().len())
+            .sum();
+        assert!(count > 0 && count <= SHARDS * PRIORITY_PER_SHARD);
+        assert!(signals
+            .priority_shards
+            .iter()
+            .all(|s| s.lock().unwrap().len() <= PRIORITY_PER_SHARD));
+        drop(held);
+        let v = value(&signals, now).await;
+        assert_eq!(v["tables"].as_array().unwrap().len(), count);
+        assert_eq!(v["complete"], false);
+        assert!(v["dropped_total"].as_u64().unwrap() > 0);
+        let expired = value(&signals, now + WINDOW * 2).await;
+        assert!(expired["tables"].as_array().unwrap().is_empty());
+        assert_eq!(expired["complete"], true);
     }
 
     #[tokio::test]
@@ -661,13 +835,16 @@ mod tests {
         let signals = Signals::new(true);
         let now = Instant::now();
         // Long valid names fill the reply before the cardinality limit.
-        signals.record(
-            "urgent".into(),
-            true,
-            StatusCode::SERVICE_UNAVAILABLE,
-            now,
-            1,
-        );
+        {
+            let _held = signals.shards[Signals::shard("urgent")].lock().unwrap();
+            signals.record(
+                "urgent".into(),
+                true,
+                StatusCode::SERVICE_UNAVAILABLE,
+                now,
+                1,
+            );
+        }
         signals.record_with_latency(
             "slow".into(),
             true,
