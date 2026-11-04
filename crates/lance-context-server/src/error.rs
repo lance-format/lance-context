@@ -11,6 +11,8 @@ pub enum AppError {
     InvalidRequest(String),
     Internal(String),
     CompactionInProgress,
+    /// An opted-in read stopped after its outer HTTP future was dropped.
+    ClientDisconnected,
     /// The in-flight blob-byte budget is exhausted; the client should retry
     /// later. Maps to `503 Service Unavailable`.
     Overloaded(String),
@@ -65,6 +67,11 @@ impl AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, code, message) = match self {
+            AppError::ClientDisconnected => (
+                StatusCode::from_u16(499).expect("499 is a valid HTTP status"),
+                "CLIENT_DISCONNECTED",
+                "client disconnected".to_string(),
+            ),
             AppError::NotFound(msg) => (StatusCode::NOT_FOUND, "NOT_FOUND", msg),
             AppError::AlreadyExists(msg) => (StatusCode::CONFLICT, "ALREADY_EXISTS", msg),
             AppError::InvalidRequest(msg) => (StatusCode::BAD_REQUEST, "INVALID_REQUEST", msg),

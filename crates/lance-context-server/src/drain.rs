@@ -252,6 +252,25 @@ impl Drain {
     }
 }
 
+/// A route may opt its audited read-only phase into client cancellation while
+/// keeping store opening and accepted mutations protected by the handler task.
+#[derive(Clone)]
+pub(crate) struct ClientCancellation(tokio::sync::watch::Receiver<()>);
+
+impl ClientCancellation {
+    pub(crate) fn channel() -> (tokio::sync::watch::Sender<()>, Self) {
+        let (sender, receiver) = tokio::sync::watch::channel(());
+        (sender, Self(receiver))
+    }
+
+    pub(crate) async fn cancelled(&self) {
+        let mut receiver = self.0.clone();
+        // The only sender belongs to the outer HTTP future. Closing admission
+        // does not drop it; disconnecting that request does.
+        let _ = receiver.changed().await;
+    }
+}
+
 pub(crate) async fn track_handler(
     State(drain): State<Arc<Drain>>,
     request: Request,
@@ -259,10 +278,12 @@ pub(crate) async fn track_handler(
 ) -> Response {
     let (mut parts, body) = request.into_parts();
     let info = RequestInfo::extract(&mut parts).await;
-    let request = Request::from_parts(parts, body);
+    let mut request = Request::from_parts(parts, body);
     let Some(handler) = drain.admit(info) else {
         return (StatusCode::SERVICE_UNAVAILABLE, "worker is draining").into_response();
     };
+    let (_request_lifetime, cancellation) = ClientCancellation::channel();
+    request.extensions_mut().insert(cancellation);
     // Dropping a JoinHandle detaches it. A client disconnect therefore cannot
     // drop an accepted mutation halfway through a storage commit. The guard
     // remains in the task until success, error or panic.
@@ -282,6 +303,9 @@ pub(crate) async fn track_handler(
         }
     }
 }
+
+#[cfg(test)]
+mod cancellation_tests;
 
 struct Connection {
     control: std::net::TcpStream,
