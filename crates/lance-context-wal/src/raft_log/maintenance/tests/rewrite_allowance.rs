@@ -1,4 +1,91 @@
 use super::*;
+use raft_engine::internals::{EventListener, FileBlockHandle, FileId, LogQueue};
+
+#[derive(Default)]
+struct RewriteObservation {
+    bytes: AtomicU64,
+    purged: AtomicU64,
+}
+impl EventListener for RewriteObservation {
+    fn on_append_log_file(&self, handle: FileBlockHandle) {
+        if handle.id.queue == LogQueue::Rewrite {
+            self.bytes.fetch_add(handle.len as u64, Ordering::Relaxed);
+        }
+    }
+    fn post_purge(&self, file: FileId) {
+        let queue = match file.queue {
+            LogQueue::Append => 1,
+            LogQueue::Rewrite => 2,
+        };
+        self.purged.fetch_or(queue, Ordering::Relaxed);
+    }
+}
+
+#[test]
+fn native_two_queue_rewrite_bytes_fit_the_live_allowance() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let config = raft_engine::Config {
+        dir: root.path().to_str().unwrap().to_owned(),
+        target_file_size: raft_engine::ReadableSize(64 << 10),
+        purge_threshold: raft_engine::ReadableSize(64 << 10),
+        purge_rewrite_threshold: Some(raft_engine::ReadableSize(64 << 10)),
+        purge_rewrite_garbage_ratio: 0.0,
+        batch_compression_threshold: raft_engine::ReadableSize(0),
+        enable_log_recycle: false,
+        ..Default::default()
+    };
+    let observed = Arc::new(RewriteObservation::default());
+    let engine = Engine::open_with_listeners(config.clone(), vec![observed.clone()])?;
+    let records: Vec<_> = (1..=16)
+        .map(|index| Entry {
+            data: vec![index as u8; 128 << 10].into(),
+            ..entry(10, index)
+        })
+        .collect();
+    for (offset, records) in records.chunks(8).enumerate() {
+        for record in records {
+            let mut batch = LogBatch::default();
+            batch.add_entries::<EntryIndex>(10, std::slice::from_ref(record))?;
+            engine.write(&mut batch, true)?;
+        }
+        let mut batch = LogBatch::default();
+        batch.put(20, b"value".to_vec(), vec![offset as u8; 16 << 10])?;
+        if offset == 0 {
+            batch.put(30, b"old".to_vec(), vec![7; 4096])?;
+            engine.write(&mut batch, true)?;
+            engine.purge_manager().must_rewrite_append_queue(None, None);
+        } else {
+            batch.add_command(30, raft_engine::Command::Clean);
+            batch.put(30, b"new".to_vec(), vec![9; 4096])?;
+            engine.write(&mut batch, true)?;
+        }
+    }
+    engine.compact_to(10, 3);
+    engine.sync()?;
+    let allowance = engine.estimated_rewrite_bytes().unwrap() as u64;
+    observed.bytes.store(0, Ordering::Relaxed);
+    observed.purged.store(0, Ordering::Relaxed);
+    engine.purge_expired_files()?;
+    let written = observed.bytes.load(Ordering::Relaxed);
+    assert_eq!(observed.purged.load(Ordering::Relaxed), 3);
+    assert!(
+        written > 0 && written <= allowance,
+        "{written} > {allowance}"
+    );
+    drop(engine);
+    let reopened = Engine::open(config)?;
+    assert!(reopened.get_entry::<EntryIndex>(10, 2)?.is_none());
+    for record in &records[2..] {
+        assert_eq!(
+            reopened.get_entry::<EntryIndex>(10, record.index)?,
+            Some(record.clone())
+        );
+    }
+    assert_eq!(reopened.get(20, b"value"), Some(vec![1; 16 << 10]));
+    assert!(reopened.get(30, b"old").is_none());
+    assert_eq!(reopened.get(30, b"new"), Some(vec![9; 4096]));
+    Ok(())
+}
 
 #[test]
 fn one_live_copy_headroom_reclaims_both_queues_and_recovers_every_record() -> Result<()> {

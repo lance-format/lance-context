@@ -427,7 +427,7 @@ where
     /// Conservative uncompressed live-data allowance for a native rewrite pass.
     /// Reads entry lengths and key/value metadata, without reading payload files.
     /// Excludes obsolete segments, application files and file rotation headroom.
-    /// Callers must exclude concurrent writes and account for allocation rounding;
+    /// Callers must exclude concurrent writes/maintenance and account for allocation rounding;
     /// this is not a hard filesystem-space guarantee. None means size overflow.
     pub fn estimated_rewrite_bytes(&self) -> Option<usize> {
         self.memtables.rewrite_size_hint()
