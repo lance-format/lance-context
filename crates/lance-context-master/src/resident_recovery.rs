@@ -1445,9 +1445,18 @@ pub(crate) mod tests {
             let error = format!(
                 "error sending request for url ({endpoint}/api/v1/internal/merge-executor)"
             );
-            let transient = ShardFailure::advance(target, endpoint, None, &error, 1);
-            let permanent =
-                ShardFailure::advance(target, "http://permanent:3000", None, "invalid schema", 1);
+            let failure = |endpoint: &str, error: &str| ShardFailure {
+                target: target.into(),
+                endpoint: endpoint.into(),
+                consecutive_attempts: 1,
+                class: lance_context_merge::failure::classify(error),
+                last_error: error.into(),
+                last_failure_ms: 1,
+                next_retry_ms: 2,
+                needs_attention: false,
+            };
+            let transient = failure(endpoint, &error);
+            let permanent = failure("http://permanent:3000", "invalid schema");
             client
                 .put(
                     failure_key(state.config.etcd.prefix(), target, &permanent.endpoint),
