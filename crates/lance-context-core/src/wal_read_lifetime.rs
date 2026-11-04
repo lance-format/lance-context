@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use futures::{stream, stream::BoxStream, StreamExt, TryStreamExt};
 use lance_io::object_store::ObjectStore;
 use object_store::{path::Path, GetOptions, GetRange, ObjectStoreExt, PutMode, PutOptions};
+use tracing::{instrument::WithSubscriber, Instrument};
 
 const READER_BATCH: usize = 128;
 const CLEANUP_CONCURRENCY: usize = 32;
@@ -274,6 +275,17 @@ impl Drop for Registration {
     }
 }
 
+// A dropped read must not leave a task renewing its registration forever.
+// The task holds its own registration reference, so cancellation stops the
+// renewal future before the last reference can schedule storage cleanup.
+struct RenewalTask(tokio::task::JoinHandle<lance::Result<()>>);
+
+impl Drop for RenewalTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 pub(crate) async fn protect<T>(
     store: Arc<ObjectStore>,
     root: &Path,
@@ -284,11 +296,11 @@ pub(crate) async fn protect<T>(
     let path = readers_root(root).join(uuid::Uuid::new_v4().simple().to_string());
     // Install cleanup before PUT: a timeout is an ambiguous publication, not
     // proof that the registration was never stored.
-    let registration = Registration {
+    let registration = Arc::new(Registration {
         store,
         path,
         timeout: policy.operation_timeout,
-    };
+    });
     let publication_started = Instant::now();
     reader_publication(
         policy.operation_timeout,
@@ -312,63 +324,95 @@ pub(crate) async fn protect<T>(
             "WAL reader registration acknowledgement expired",
         ));
     }
-    let acknowledged = Mutex::new(publication_started);
-    let renewal = async {
-        loop {
-            tokio::time::sleep(policy.heartbeat).await;
-            let last = *acknowledged.lock().unwrap();
-            let started = Instant::now();
-            if last.elapsed() >= policy.max_silence {
-                reader_failure("renewal", "silence_expired", started, last);
-                return Err(lance::Error::io("WAL reader renewal expired"));
-            }
-            let renewed = reader_publication(
-                policy.operation_timeout,
-                "renewal",
-                last,
-                write_nonce(&registration.store, &registration.path, false),
-            )
-            .await;
-            if let Err(error) = renewed {
-                // One failed PUT need not invalidate an acknowledged reader
-                // that is still within its original monotonic deadline. Retry
-                // once, without refreshing that deadline or extending GC's
-                // stale-reader window. A late ambiguous PUT can only retain
-                // this unique registration longer; it cannot authorize a read.
-                let backoff = policy.heartbeat.min(Duration::from_millis(250));
-                if last.elapsed().saturating_add(backoff) >= policy.max_silence {
-                    return Err(error);
+    let acknowledged = Arc::new(Mutex::new(publication_started));
+    let renewal_acknowledged = acknowledged.clone();
+    let renewal_registration = registration.clone();
+    let (started, ready) = tokio::sync::oneshot::channel();
+    let mut renewal = RenewalTask(tokio::spawn(
+        (async move {
+            let acknowledged = renewal_acknowledged;
+            let registration = renewal_registration;
+            // Let this task start and arm its timer before polling potentially
+            // non-yielding read code on another runtime worker.
+            let _ = started.send(());
+            loop {
+                tokio::time::sleep(policy.heartbeat).await;
+                let last = *acknowledged.lock().unwrap();
+                let started = Instant::now();
+                if last.elapsed() >= policy.max_silence {
+                    reader_failure("renewal", "silence_expired", started, last);
+                    return Err(lance::Error::io("WAL reader renewal expired"));
                 }
-                tokio::time::sleep(backoff).await;
-                let remaining = policy.max_silence.saturating_sub(last.elapsed());
-                if remaining.is_zero() {
-                    return Err(error);
-                }
-                reader_publication(
-                    policy.operation_timeout.min(remaining),
-                    "renewal_retry",
+                let renewed = reader_publication(
+                    policy.operation_timeout,
+                    "renewal",
                     last,
                     write_nonce(&registration.store, &registration.path, false),
                 )
-                .await?;
+                .await;
+                if let Err(error) = renewed {
+                    // One failed PUT need not invalidate an acknowledged reader
+                    // that is still within its original monotonic deadline. Retry
+                    // once, without refreshing that deadline or extending GC's
+                    // stale-reader window. A late ambiguous PUT can only retain
+                    // this unique registration longer; it cannot authorize a read.
+                    let backoff = policy.heartbeat.min(Duration::from_millis(250));
+                    if last.elapsed().saturating_add(backoff) >= policy.max_silence {
+                        return Err(error);
+                    }
+                    tokio::time::sleep(backoff).await;
+                    let remaining = policy.max_silence.saturating_sub(last.elapsed());
+                    if remaining.is_zero() {
+                        return Err(error);
+                    }
+                    reader_publication(
+                        policy.operation_timeout.min(remaining),
+                        "renewal_retry",
+                        last,
+                        write_nonce(&registration.store, &registration.path, false),
+                    )
+                    .await?;
+                }
+                let mut last = acknowledged.lock().unwrap();
+                // A paused process must not resurrect an expired read by accepting
+                // a delayed successful renewal response.
+                if last.elapsed() >= policy.max_silence {
+                    reader_failure("renewal", "acknowledgement_expired", started, *last);
+                    return Err(lance::Error::io("WAL reader renewal expired"));
+                }
+                *last = Instant::now();
             }
-            let mut last = acknowledged.lock().unwrap();
-            // A paused process must not resurrect an expired read by accepting
-            // a delayed successful renewal response.
-            if last.elapsed() >= policy.max_silence {
-                reader_failure("renewal", "acknowledgement_expired", started, *last);
-                return Err(lance::Error::io("WAL reader renewal expired"));
-            }
-            *last = Instant::now();
-        }
-    };
-    tokio::pin!(renewal);
+        })
+        .in_current_span()
+        .with_current_subscriber(),
+    ));
+    ready
+        .await
+        .map_err(|_| lance::Error::io("WAL reader renewal task failed to start"))?;
     tokio::pin!(read);
-    let result = tokio::select! {
+    let (mut result, renewal_finished) = tokio::select! {
         biased;
-        expired = &mut renewal => expired,
-        result = &mut read => result,
+        expired = &mut renewal.0 => (
+            Err(match expired {
+                Ok(Err(error)) => error,
+                _ => lance::Error::io("WAL reader renewal task failed"),
+            }),
+            true,
+        ),
+        result = &mut read => (result, false),
     };
+    if !renewal_finished {
+        // Join cancellation before checking the final acknowledgement. This
+        // also observes a renewal failure/panic racing with read completion.
+        renewal.0.abort();
+        match (&mut renewal.0).await {
+            Ok(Err(error)) => result = Err(error),
+            Err(error) if !error.is_cancelled() => {
+                result = Err(lance::Error::io("WAL reader renewal task failed"));
+            }
+            _ => {}
+        }
+    }
     let last = *acknowledged.lock().unwrap();
     if last.elapsed() >= policy.max_silence {
         reader_failure("return", "silence_expired", publication_started, last);
