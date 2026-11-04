@@ -181,7 +181,12 @@ where
         let _guard = self.force_rewrite_candidates.try_lock().ok_or_else(|| {
             crate::Error::TryAgain("rewrite reclamation is already running".into())
         })?;
-        self.rewrite_rewrite_queue()?;
+        // Image reservations can keep producer admission closed even when
+        // every rewritten entry is still live. Rewriting that queue again
+        // cannot reclaim its payloads; retain the stale-file scan below.
+        if self.global_stats.deleted_rewrite_entries() > 0 {
+            self.rewrite_rewrite_queue()?;
+        }
         self.rescan_memtables_and_purge_stale_files(
             LogQueue::Rewrite,
             self.pipe_log.file_span(LogQueue::Rewrite).1,
