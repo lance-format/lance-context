@@ -326,6 +326,10 @@ pub struct Observation {
     pub status: Status,
     /// Persisted image boundary; local scheduling data, not a quorum result.
     pub checkpoint_index: u64,
+    /// First retained durable log entry, sampled with the checkpoint boundary.
+    /// A snapshot needs a suffix starting at its index plus one; a later first
+    /// index means that suffix is no longer available from this local store.
+    pub first_retained_index: u64,
     pub observed_at: Instant,
     pub polling: bool,
     pub stopped: bool,
@@ -635,17 +639,20 @@ impl Runtime {
                 let group = *node.groups.keys().next().context("empty worker group")?;
                 let status = node.status(group)?;
                 let checkpoint_index = node.checkpoint_index(group)?;
-                Ok((node, group, status, checkpoint_index))
+                let first_retained_index =
+                    raft::Storage::first_index(node.groups[&group].raw.store())?;
+                Ok((node, group, status, checkpoint_index, first_retained_index))
             })
             .collect::<Result<Vec<_>>>()?;
         let mut routes = BTreeMap::new();
         let mut workers: Vec<JoinHandle<Result<()>>> = Vec::new();
-        for (node, group, status, checkpoint_index) in nodes {
+        for (node, group, status, checkpoint_index, first_retained_index) in nodes {
             let observation = Arc::new(Mutex::new(Observation {
                 fetch: FetchObservation::default(),
                 durable_poll: PollObservation::default(),
                 status,
                 checkpoint_index,
+                first_retained_index,
                 observed_at: Instant::now(),
                 polling: false,
                 stopped: false,
@@ -953,9 +960,12 @@ impl Worker {
                 }
                 let status = self.node.status(self.group)?;
                 let checkpoint_index = self.node.checkpoint_index(self.group)?;
+                let first_retained_index =
+                    raft::Storage::first_index(self.node.groups[&self.group].raw.store())?;
                 let mut observation = self.observation.lock().unwrap();
                 observation.status = status;
                 observation.checkpoint_index = checkpoint_index;
+                observation.first_retained_index = first_retained_index;
                 observation.observed_at = Instant::now();
                 observation.polling = false;
             }

@@ -35,6 +35,9 @@ impl Server {
             address.unwrap_or_else(|| "127.0.0.1:0".parse().unwrap()),
         )
         .await?;
+        Self::with_listener(router, listener)
+    }
+    fn with_listener(router: axum::Router, listener: tokio::net::TcpListener) -> Result<Self> {
         let address = listener.local_addr()?;
         let (stop, stopped) = oneshot::channel();
         let app = router.layer(axum::middleware::from_fn(

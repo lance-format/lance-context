@@ -82,7 +82,17 @@ async fn exercise(application_roles: bool) -> Result<()> {
     let (sb, rb) = b.owner(&cb, &lb, Duration::from_millis(20)).await?;
     let oa = Owner::new(&ra, keys()?, options())?;
     let ob = Owner::new(&rb, keys()?, options())?;
-    let owner_a = Server::start(oa.router(), None).await?;
+    // Reserve A's route throughout the outage and replacement. Releasing it
+    // would let another test or outbound connection claim this ephemeral port.
+    let reservation = std::net::TcpListener::bind("127.0.0.1:0")?;
+    reservation.set_nonblocking(true)?;
+    let start_a = |router| {
+        Server::with_listener(
+            router,
+            tokio::net::TcpListener::from_std(reservation.try_clone()?)?,
+        )
+    };
+    let owner_a = start_a(oa.router())?;
     let owner_b = Server::start(ob.router(), None).await?;
     let (_stop_a, task_a) = annotation_runtime::run_owner(ra);
     let (stop_b, task_b) = annotation_runtime::run_owner(rb);
@@ -177,8 +187,9 @@ async fn exercise(application_roles: bool) -> Result<()> {
     assert!(sa.source_observation().records > 0);
     task_a.abort();
     assert!(task_a.await.unwrap_err().is_cancelled());
-    let address_a = owner_a.address;
     owner_a.shutdown().await?;
+    let unavailable_a =
+        start_a(axum::Router::new().fallback(|| async { StatusCode::SERVICE_UNAVAILABLE }))?;
     oa.shutdown().await;
     drop((oa, sa));
     ca.shutdown().await?;
@@ -206,7 +217,8 @@ async fn exercise(application_roles: bool) -> Result<()> {
     let ca = network::Cluster::open_signed(root_a.path(), la.clone()).await?;
     let (sa, ra) = a.owner(&ca, &la, Duration::from_millis(20)).await?;
     let oa = Owner::new(&ra, keys()?, options())?;
-    let owner_a = Server::start(oa.router(), Some(address_a)).await?;
+    unavailable_a.shutdown().await?;
+    let owner_a = start_a(oa.router())?;
     let (stop_a, task_a) = annotation_runtime::run_owner(ra);
     assert_eq!(read(&client, &ingress_b, &ta).await?, current_a);
     assert_eq!(mutate(&client, &ingress_a, &pa, 3, score).await?, final_a);
