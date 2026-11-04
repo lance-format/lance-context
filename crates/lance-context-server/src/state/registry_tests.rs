@@ -189,3 +189,69 @@ async fn registry_change_during_open_never_installs_a_stale_handle() {
             .is_none());
     }
 }
+
+#[tokio::test]
+async fn store_info_timing_preserves_lock_wait_and_metadata() {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    use std::time::Duration;
+
+    let dir = TempDir::new().unwrap();
+    let state = Arc::new(AppState::new_for_test(dir.path().to_path_buf()).await);
+    let uri = dir
+        .path()
+        .join("registered.lance")
+        .to_str()
+        .unwrap()
+        .to_string();
+    create_at(&uri).await;
+    state
+        .rollout_registry
+        .upsert("logical", &uri)
+        .await
+        .unwrap();
+    let opened = state.get_or_open_rollout_store("logical").await.unwrap();
+    let held = opened.write().await;
+    let expected_version = held.version();
+    let recorder = DebuggingRecorder::new();
+    let snapshots = recorder.snapshotter();
+    let _recorder = metrics::set_default_local_recorder(&recorder);
+    tokio::time::pause();
+
+    let mut request = Box::pin(get_rollout_store(
+        State(state.clone()),
+        Path("logical".into()),
+    ));
+    assert!(futures::poll!(&mut request).is_pending());
+    tokio::time::advance(Duration::from_secs(6)).await;
+    assert!(futures::poll!(&mut request).is_pending());
+    drop(held);
+    let info = request.await.unwrap().0;
+    assert_eq!(info.uri, uri);
+    assert_eq!(info.version, Some(expected_version));
+
+    let series = snapshots.snapshot().into_vec();
+    let stages: Vec<_> = series
+        .iter()
+        .filter(|(key, _, _, _)| key.key().name() == "rollout_store_stage_duration_seconds")
+        .collect();
+    assert_eq!(stages.len(), 3);
+    for (key, _, _, value) in stages {
+        let labels: std::collections::BTreeMap<_, _> =
+            key.key().labels().map(|l| (l.key(), l.value())).collect();
+        assert_eq!(labels["outcome"], "completed");
+        let DebugValue::Histogram(values) = value else {
+            panic!("expected histogram")
+        };
+        assert_eq!(values.len(), 1);
+        assert_eq!(
+            values[0].into_inner(),
+            match labels["stage"] {
+                "info_resolve" | "cache_lock" => 0.0,
+                "info_lock" => 6.0,
+                other => panic!("unexpected stage: {other}"),
+            }
+        );
+    }
+    tokio::time::resume();
+    state.shutdown().await;
+}
