@@ -167,6 +167,61 @@ fn received_images_reject_partial_corrupt_and_out_of_order_bytes() -> Result<()>
 }
 
 #[test]
+fn received_images_validate_file_and_record_digests_before_install() -> Result<()> {
+    let source = tempfile::tempdir()?;
+    let built = create(source.path(), 115)?;
+    // Both complete-file checks remain mandatory, even though receiving no
+    // longer hashes the same bytes once on write and again on load.
+    for metadata in [true, false] {
+        let target = tempfile::tempdir()?;
+        let mut descriptor = built.image.descriptor.clone();
+        if metadata {
+            descriptor.metadata_digest[0] ^= 1;
+        } else {
+            descriptor.payload_digest[0] ^= 1;
+        }
+        let mut receiver = Receiver::new(
+            target.path(),
+            &descriptor.snapshot()?,
+            layout(),
+            Limits::default(),
+            10,
+            Uuid::new_v4(),
+        )?;
+        copy(&built.image, &mut receiver)?;
+        let error = receiver.finish().err().context("invalid image accepted")?;
+        assert!(error.to_string().contains("image file checksum mismatch"));
+    }
+    // A matching full-pack digest must not hide a changed record body.
+    let target = tempfile::tempdir()?;
+    let mut payload = built
+        .image
+        .chunk(Part::Payload, 0, built.image.bytes(Part::Payload) as usize)?
+        .to_vec();
+    payload[0] ^= 1;
+    let mut descriptor = built.image.descriptor.clone();
+    descriptor.payload_digest = Sha256::digest(&payload).into();
+    let mut receiver = Receiver::new(
+        target.path(),
+        &descriptor.snapshot()?,
+        layout(),
+        Limits::default(),
+        10,
+        Uuid::new_v4(),
+    )?;
+    let metadata = built.image.chunk(
+        Part::Metadata,
+        0,
+        built.image.bytes(Part::Metadata) as usize,
+    )?;
+    receiver.write(Part::Metadata, 0, &metadata)?;
+    receiver.write(Part::Payload, 0, &payload)?;
+    let error = receiver.finish().err().context("invalid record accepted")?;
+    assert!(error.to_string().contains("image record checksum mismatch"));
+    Ok(())
+}
+
+#[test]
 fn installed_files_fail_closed_on_corruption_missing_parts_and_foreign_binding() -> Result<()> {
     let root = tempfile::tempdir()?;
     let built = create(root.path(), 121)?;

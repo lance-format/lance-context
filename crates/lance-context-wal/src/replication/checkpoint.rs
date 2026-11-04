@@ -307,7 +307,7 @@ pub(super) struct Cut {
 
 struct Writer {
     file: BufWriter<File>,
-    digest: DigestContext,
+    digest: Option<DigestContext>,
     bytes: u64,
     limit: u64,
     failed: bool,
@@ -316,19 +316,36 @@ impl Writer {
     fn new(path: &Path, limit: u64) -> Result<Self> {
         Ok(Self {
             file: BufWriter::new(OpenOptions::new().create_new(true).write(true).open(path)?),
-            digest: DigestContext::new(&SHA256),
+            digest: Some(DigestContext::new(&SHA256)),
             bytes: 0,
             limit,
             failed: false,
         })
     }
-    fn finish(mut self) -> Result<(u64, [u8; 32])> {
+    fn receiving(path: &Path, limit: u64) -> Result<Self> {
+        let mut writer = Self::new(path, limit)?;
+        // load() validates the persisted file and every record before install.
+        // Hashing the incoming stream as well repeats a full pass over it.
+        writer.digest = None;
+        Ok(writer)
+    }
+    fn sync(mut self) -> Result<Self> {
         ensure!(!self.failed, "image writer failed; abandon this candidate");
         self.file.flush()?;
         self.file.get_ref().sync_all()?;
+        Ok(self)
+    }
+    fn finish(self) -> Result<(u64, [u8; 32])> {
+        let writer = self.sync()?;
         let mut digest = [0; 32];
-        digest.copy_from_slice(self.digest.finish().as_ref());
-        Ok((self.bytes, digest))
+        digest.copy_from_slice(
+            writer
+                .digest
+                .context("image builder needs a digest")?
+                .finish()
+                .as_ref(),
+        );
+        Ok((writer.bytes, digest))
     }
 }
 impl Write for Writer {
@@ -347,7 +364,9 @@ impl Write for Writer {
             }
         };
         self.bytes += n as u64;
-        self.digest.update(&bytes[..n]);
+        if let Some(digest) = &mut self.digest {
+            digest.update(&bytes[..n]);
+        }
         Ok(n)
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -804,8 +823,8 @@ impl Receiver {
         descriptor.id = local_id;
         let paths = descriptor.paths(directory);
         let writers = [
-            Writer::new(&paths[0], descriptor.metadata_bytes)?,
-            Writer::new(&paths[1], descriptor.payload_bytes)?,
+            Writer::receiving(&paths[0], descriptor.metadata_bytes)?,
+            Writer::receiving(&paths[1], descriptor.payload_bytes)?,
         ];
         Ok(Self {
             directory: directory.to_path_buf(),
@@ -829,19 +848,13 @@ impl Receiver {
 
     pub fn finish(self) -> Result<Loaded> {
         let expected = [
-            (
-                self.descriptor.metadata_bytes,
-                self.descriptor.metadata_digest,
-            ),
-            (
-                self.descriptor.payload_bytes,
-                self.descriptor.payload_digest,
-            ),
+            self.descriptor.metadata_bytes,
+            self.descriptor.payload_bytes,
         ];
         for (writer, expected) in self.writers.into_iter().zip(expected) {
             ensure!(
-                writer.finish()? == expected,
-                "incomplete or corrupt received image"
+                writer.sync()?.bytes == expected,
+                "incomplete received image"
             );
         }
         File::open(&self.directory)?.sync_all()?;
