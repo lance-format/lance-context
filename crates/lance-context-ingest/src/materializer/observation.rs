@@ -64,8 +64,16 @@ pub enum Phase {
     AnnotationNarrowPrepare,
     /// A shared existence lookup for a small prefix of separate create requests.
     AnnotationRegistrationLookup,
+    /// Create submissions within AnnotationAppend; counts attempts, not unique rows.
+    AnnotationCreateAppend,
+    /// Patch submissions within AnnotationAppend; counts attempts, not unique rows.
+    AnnotationPatchAppend,
+    /// Create submissions waiting for local apply, within AnnotationApplyWait.
+    AnnotationCreateApplyWait,
+    /// Patch submissions waiting for local apply, within AnnotationApplyWait.
+    AnnotationPatchApplyWait,
 }
-const NAMES: [&str; 36] = [
+const NAMES: [&str; 40] = [
     "claim",
     "acquire",
     "state",
@@ -102,6 +110,10 @@ const NAMES: [&str; 36] = [
     "annotation_body_commit",
     "annotation_narrow_prepare",
     "annotation_registration_lookup",
+    "annotation_create_append",
+    "annotation_patch_append",
+    "annotation_create_apply_wait",
+    "annotation_patch_apply_wait",
 ];
 pub const PHASE_COUNT: usize = NAMES.len();
 

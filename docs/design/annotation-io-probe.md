@@ -30,6 +30,18 @@ counter counts observed responses, not application mutation retries. A successfu
 operation counter is not proof of durable annotation publication. Requested byte
 counts are not a physical network/disk measurement.
 
+Mixed ingestion also reports `annotation_create_append`,
+`annotation_patch_append`, `annotation_create_apply_wait`, and
+`annotation_patch_apply_wait`. The first pair separates WAL submission from
+waiting for the ordered applier in the second pair. Classification comes from
+the already validated Arrow operation, including one-row creates, and is kept
+only in the prepared request. It adds no payload decoding or persisted field.
+These are child intervals of `annotation_append` and `annotation_apply_wait`;
+do not add child and parent times. Counters describe submission attempts,
+including failed/cancelled attempts and exact-identity resubmission, rather than
+unique mutations. Compare interval deltas for each kind before attributing a
+mixed mean to ingestion latency. Elapsed times include waiting, not just CPU.
+
 The probe adds measurement overhead and does not by itself establish a
 performance improvement. Keep workload, admission budgets and deadlines fixed
 when comparing it with the normal owner. Its owner is exclusive: stop the old

@@ -110,6 +110,8 @@ pub struct PreparedAppend {
     scope: Arc<Scope>,
     batch: Batch,
     rows: u32,
+    #[cfg(feature = "materializer")]
+    annotation_kind: Option<annotations::WriteKind>,
     _reservation: MergeReservation,
 }
 impl PreparedAppend {
@@ -579,6 +581,8 @@ fn prepare(
         scope: upload.scope,
         batch,
         rows,
+        #[cfg(feature = "materializer")]
+        annotation_kind: None,
         _reservation: upload.reservation,
     })
 }
