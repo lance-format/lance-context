@@ -36,6 +36,7 @@ struct View {
     groups: BTreeMap<u64, Group>,
     admission: runtime::Admission,
     appends: BTreeMap<&'static str, u64>,
+    last_append_disk_refusal: Option<crate::admission::DiskBudgetExhausted>,
     append_execution: runtime::client::timing::Observation,
     disk: Option<crate::admission::Snapshot>,
     maintenance: maintenance::Progress,
@@ -84,6 +85,7 @@ impl State {
             groups,
             admission: self.handle.admission(),
             appends: self.handle.append_observation(),
+            last_append_disk_refusal: self.handle.last_append_disk_refusal(),
             append_execution: self.handle.append_execution_timing(),
             disk: self.handle.disk_budget(),
             maintenance: self

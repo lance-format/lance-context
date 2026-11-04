@@ -11,13 +11,14 @@ use std::sync::{
 use anyhow::{ensure, Result};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug)]
-pub(crate) struct DiskBudgetExhausted {
-    accounted_bytes: u64,
-    reserved_proposal_bytes: u64,
-    reserved_file_bytes: u64,
-    requested_bytes: u64,
-    limit_bytes: u64,
+/// Byte values captured together under the accounting lock at a refused reservation.
+#[derive(Clone, Debug, Serialize)]
+pub struct DiskBudgetExhausted {
+    pub accounted_bytes: u64,
+    pub reserved_proposal_bytes: u64,
+    pub reserved_file_bytes: u64,
+    pub requested_bytes: u64,
+    pub limit_bytes: u64,
 }
 impl std::fmt::Display for DiskBudgetExhausted {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

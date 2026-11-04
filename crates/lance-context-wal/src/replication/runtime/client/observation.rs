@@ -10,7 +10,10 @@ use crate::{
 use anyhow::Result;
 use std::{
     collections::BTreeMap,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex,
+    },
 };
 
 #[derive(Clone, Copy)]
@@ -56,6 +59,7 @@ const LABELS: [&str; 17] = [
 #[derive(Default)]
 pub(in crate::replication::runtime) struct Counters {
     outcomes: [AtomicU64; LABELS.len()],
+    last_disk_refusal: Mutex<Option<DiskBudgetExhausted>>,
     pub(super) execution: super::timing::Counter,
 }
 impl Counters {
@@ -76,6 +80,9 @@ impl Counters {
             finished: false,
         }
     }
+    pub(super) fn last_disk_refusal(&self) -> Option<DiskBudgetExhausted> {
+        self.last_disk_refusal.lock().unwrap().clone()
+    }
 }
 pub(super) struct Guard<'a> {
     counters: &'a Counters,
@@ -94,7 +101,14 @@ impl Guard<'_> {
                 _ => Kind::UnexpectedReply,
             },
             Ok(_) => Kind::UnexpectedReply,
-            Err(error) => classify(error),
+            Err(error) => {
+                if let Some(decision) = error.downcast_ref::<DiskBudgetExhausted>() {
+                    // Copy the failed decision before its wire reply discards
+                    // the byte values. Successful appends never take this lock.
+                    *self.counters.last_disk_refusal.lock().unwrap() = Some(decision.clone());
+                }
+                classify(error)
+            }
         };
         self.counters.increment(kind);
         self.finished = true;

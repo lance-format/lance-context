@@ -35,6 +35,7 @@ async fn append_diagnostics_distinguish_disk_refusals_from_unknown_outcomes() ->
         Reply::Unknown
     ));
     assert_eq!(handle.append_observation()["byte_credits"], 1);
+    assert!(handle.last_append_disk_refusal().is_none());
     drop(bytes);
 
     let first = c.client.request(leader, request.clone()).await?;
@@ -60,6 +61,9 @@ async fn append_diagnostics_distinguish_disk_refusals_from_unknown_outcomes() ->
         Reply::AppendNotSubmittedDiskBudget
     ));
     let observed = handle.append_observation();
+    let decision = handle.last_append_disk_refusal().unwrap();
+    assert_eq!(decision.limit_bytes, 1);
+    assert!(decision.requested_bytes > decision.limit_bytes);
     assert_eq!(observed["disk_budget"], 1);
     assert_eq!(observed["accepted"], 2);
     assert_eq!(observed["started"], 5);
@@ -70,6 +74,67 @@ async fn append_diagnostics_distinguish_disk_refusals_from_unknown_outcomes() ->
     assert_eq!(execution.started, 5);
     assert_eq!(execution.finished, 5);
     assert!(execution.elapsed_micros >= execution.max_elapsed_micros);
+    c.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn append_disk_refusal_retains_decision_after_reservations_release() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let c = RpcCluster::open(dir.path(), Options::default()).await?;
+    let leader = c.leader().await?;
+    let handle = &c.net.nodes[&leader].handle;
+    let budget = handle.disk.as_ref().unwrap();
+    let request = Request::Append {
+        group: 10,
+        batch: batch(1),
+    };
+    // Populate both kinds of reservation. Control headroom permits holding the
+    // producer window without racing heartbeat accounting at its exact limit.
+    let file = budget.reserve_files(&[4097])?;
+    let view = budget.snapshot();
+    let proposal_bytes = view.data_limit - view.accounted_disk_bytes - view.reserved_file_bytes;
+    let proposal = budget.reserve(proposal_bytes as usize, false)?;
+    assert!(matches!(
+        c.client.request(leader, request.clone()).await?.reply,
+        Reply::AppendNotSubmittedDiskBudget
+    ));
+    let decision = handle.last_append_disk_refusal().unwrap();
+    assert_eq!(decision.limit_bytes, view.data_limit);
+    assert_eq!(decision.reserved_file_bytes, 8192);
+    assert!(decision.reserved_proposal_bytes >= proposal_bytes);
+    assert!(decision.requested_bytes > 0);
+    assert!(
+        decision.accounted_bytes
+            + decision.reserved_proposal_bytes
+            + decision.reserved_file_bytes
+            + decision.requested_bytes
+            > decision.limit_bytes
+    );
+    assert_eq!(producer(&c.client, leader, &batch(1)).await?, None);
+
+    drop(proposal);
+    drop(file);
+    budget.refresh()?;
+    assert_eq!(budget.snapshot().reserved_file_bytes, 0);
+    let retry = c.client.request(leader, request.clone()).await?;
+    let index = accepted(&retry);
+    drop(retry);
+    assert_eq!(producer(&c.client, leader, &batch(1)).await?, Some(index));
+    // Status retains the failure's exact values, even after pressure is gone
+    // and the same request succeeds. It must not synthesize a fresh measurement.
+    assert_eq!(
+        serde_json::to_value(handle.last_append_disk_refusal().unwrap())?,
+        serde_json::to_value(decision)?
+    );
+    assert_eq!(handle.append_observation()["disk_budget"], 1);
+
+    budget.limit_data(1)?;
+    assert!(matches!(
+        c.client.request(leader, request).await?.reply,
+        Reply::AppendNotSubmittedDiskBudget
+    ));
+    assert_eq!(handle.last_append_disk_refusal().unwrap().limit_bytes, 1);
+    assert_eq!(handle.append_observation()["disk_budget"], 2);
     c.shutdown().await
 }
 

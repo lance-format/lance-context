@@ -310,6 +310,12 @@ impl Handle {
     pub fn append_observation(&self) -> BTreeMap<&'static str, u64> {
         self.shared.appends.snapshot()
     }
+    /// Most recently observed append disk refusal, retained across successful
+    /// requests. These are decision-time bytes, not a current disk measurement
+    /// or a commit receipt. Keeps one decision per node; resets on restart.
+    pub fn last_append_disk_refusal(&self) -> Option<crate::admission::DiskBudgetExhausted> {
+        self.shared.appends.last_disk_refusal()
+    }
     /// From receipt of the complete body to execution ending, including worker
     /// queue, proposal validation and quorum completion. Not pure disk time;
     /// excludes request transport/admission and sending the reply.
