@@ -74,9 +74,9 @@ pub fn classify(error: &str) -> FailureClass {
         };
     }
     let error = lowered;
-    if is_preparation_conflict(&error) {
-        FailureClass::Retryable
-    } else if has_http_status(&error, &["408", "429", "500", "502", "503", "504"]) {
+    if is_preparation_conflict(&error)
+        || has_http_status(&error, &["408", "429", "500", "502", "503", "504"])
+    {
         FailureClass::Retryable
     } else if [
         "not found",
