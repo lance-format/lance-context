@@ -4,6 +4,7 @@ use crate::{raft_log::DiskOptions, service::maintenance};
 use raft_proto::eraftpb::{Message, MessageType};
 use uuid::Uuid;
 
+mod checkpoint_hints;
 mod retired_images;
 
 fn disk() -> DiskOptions {
