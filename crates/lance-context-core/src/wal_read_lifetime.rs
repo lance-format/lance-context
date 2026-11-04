@@ -322,13 +322,36 @@ pub(crate) async fn protect<T>(
                 reader_failure("renewal", "silence_expired", started, last);
                 return Err(lance::Error::io("WAL reader renewal expired"));
             }
-            reader_publication(
+            let renewed = reader_publication(
                 policy.operation_timeout,
                 "renewal",
                 last,
                 write_nonce(&registration.store, &registration.path, false),
             )
-            .await?;
+            .await;
+            if let Err(error) = renewed {
+                // One failed PUT need not invalidate an acknowledged reader
+                // that is still within its original monotonic deadline. Retry
+                // once, without refreshing that deadline or extending GC's
+                // stale-reader window. A late ambiguous PUT can only retain
+                // this unique registration longer; it cannot authorize a read.
+                let backoff = policy.heartbeat.min(Duration::from_millis(250));
+                if last.elapsed().saturating_add(backoff) >= policy.max_silence {
+                    return Err(error);
+                }
+                tokio::time::sleep(backoff).await;
+                let remaining = policy.max_silence.saturating_sub(last.elapsed());
+                if remaining.is_zero() {
+                    return Err(error);
+                }
+                reader_publication(
+                    policy.operation_timeout.min(remaining),
+                    "renewal_retry",
+                    last,
+                    write_nonce(&registration.store, &registration.path, false),
+                )
+                .await?;
+            }
             let mut last = acknowledged.lock().unwrap();
             // A paused process must not resurrect an expired read by accepting
             // a delayed successful renewal response.
@@ -507,8 +530,23 @@ mod tests {
     use object_store::throttle::{ThrottleConfig, ThrottledStore};
     use tracing::instrument::WithSubscriber;
 
-    #[derive(Clone, Default)]
+    #[derive(Clone)]
     struct Diagnostics(Arc<Mutex<Vec<HashMap<String, String>>>>);
+
+    impl Default for Diagnostics {
+        fn default() -> Self {
+            // With a single live dispatch, tracing can register a callsite
+            // using another test thread's current NoSubscriber. Keep a second
+            // dispatch alive so first-use interest considers this recorder
+            // even before its instrumented future is polled. This does not
+            // install a global subscriber or change production diagnostics.
+            static ANCHOR: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+            ANCHOR.get_or_init(|| {
+                tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default())
+            });
+            Self(Arc::default())
+        }
+    }
 
     impl tracing::Subscriber for Diagnostics {
         fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
@@ -556,6 +594,20 @@ mod tests {
             assert!(events[0]["operation_ms"].parse::<u64>().is_ok());
             assert!(events[0]["acknowledged_silence_ms"].parse::<u64>().is_ok());
         }
+    }
+
+    #[test]
+    fn diagnostics_capture_a_callsite_first_used_without_a_subscriber() {
+        let diagnostics = Diagnostics::default();
+        let dispatch = tracing::Dispatch::new(diagnostics.clone());
+        let now = Instant::now();
+        // Other tests can reach the same callsite while this test's future
+        // owns a dispatch but has not yet been polled with it installed.
+        reader_failure("unobserved", "unobserved", now, now);
+        tracing::dispatcher::with_default(&dispatch, || {
+            reader_failure("registration", "acknowledgement_expired", now, now);
+        });
+        diagnostics.assert_failure("registration", "acknowledgement_expired");
     }
 
     #[tokio::test]
@@ -923,7 +975,16 @@ mod tests {
         .with_subscriber(diagnostics.clone())
         .await;
         assert!(result.unwrap_err().to_string().contains("timed out"));
-        diagnostics.assert_failure("renewal", "operation_timeout");
+        {
+            let events = diagnostics.0.lock().unwrap();
+            assert_eq!(events.len(), 2, "{events:?}");
+            for (event, phase) in events.iter().zip(["renewal", "renewal_retry"]) {
+                assert_eq!(event["phase"], phase);
+                assert_eq!(event["category"], "operation_timeout");
+                assert!(event["operation_ms"].parse::<u64>().is_ok());
+                assert!(event["acknowledged_silence_ms"].parse::<u64>().is_ok());
+            }
+        }
         let listing = store.inner.list(Some(&readers_root(&root)));
         wait_for_listing(store, listing, quick_policy(), 2)
             .await
@@ -1068,3 +1129,7 @@ mod tests {
 #[cfg(test)]
 #[path = "wal_read_lifetime_azure_tests.rs"]
 mod azure_tests;
+
+#[cfg(test)]
+#[path = "wal_read_renewal_tests.rs"]
+mod renewal_tests;
