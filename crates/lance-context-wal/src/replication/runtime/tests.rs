@@ -35,11 +35,25 @@ impl Cluster {
         options: Options,
         disk: Option<crate::raft_log::DiskOptions>,
     ) -> Result<Self> {
+        Self::open_with_storage(root, options, disk, crate::raft_log::LogOptions::default())
+    }
+    fn open_with_storage(
+        root: &Path,
+        options: Options,
+        disk: Option<crate::raft_log::DiskOptions>,
+        storage: crate::raft_log::LogOptions,
+    ) -> Result<Self> {
         let mut runtimes = Vec::new();
         let mut handles = BTreeMap::new();
         let mut outboxes = Vec::new();
         for id in 1..=3 {
-            let mut node = Node::open(&root.join(id.to_string()), layout(), id, Limits::default())?;
+            let mut node = Node::open_with_storage_options(
+                &root.join(id.to_string()),
+                layout(),
+                id,
+                Limits::default(),
+                storage,
+            )?;
             if let Some(disk) = disk {
                 node = node.with_disk_budget(disk)?;
             }

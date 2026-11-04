@@ -106,8 +106,16 @@ pub(crate) async fn run(
                 .status
                 .applied
                 .saturating_sub(observed.checkpoint_index);
+            // Native entry-count hints include the intentionally retained log
+            // tail. Another checkpoint keeps that tail, so the hint can remain
+            // set after every successful install and repeatedly rebuild images
+            // for just a few new records. Use the configured cadence when a
+            // byte-retained tail is enabled; ordinary prefix compaction can
+            // still act on native hints immediately.
+            let suggested =
+                options.checkpoint_trailing_bytes == 0 && background.suggested.contains(&group);
             if new == 0
-                || (!background.suggested.contains(&group)
+                || (!suggested
                     && new < options.checkpoint_entries
                     && checkpoints[&group].elapsed()
                         < Duration::from_millis(options.checkpoint_interval_ms))
