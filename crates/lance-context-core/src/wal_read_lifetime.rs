@@ -322,13 +322,36 @@ pub(crate) async fn protect<T>(
                 reader_failure("renewal", "silence_expired", started, last);
                 return Err(lance::Error::io("WAL reader renewal expired"));
             }
-            reader_publication(
+            let renewed = reader_publication(
                 policy.operation_timeout,
                 "renewal",
                 last,
                 write_nonce(&registration.store, &registration.path, false),
             )
-            .await?;
+            .await;
+            if let Err(error) = renewed {
+                // One failed PUT need not invalidate an acknowledged reader
+                // that is still within its original monotonic deadline. Retry
+                // once, without refreshing that deadline or extending GC's
+                // stale-reader window. A late ambiguous PUT can only retain
+                // this unique registration longer; it cannot authorize a read.
+                let backoff = policy.heartbeat.min(Duration::from_millis(250));
+                if last.elapsed().saturating_add(backoff) >= policy.max_silence {
+                    return Err(error);
+                }
+                tokio::time::sleep(backoff).await;
+                let remaining = policy.max_silence.saturating_sub(last.elapsed());
+                if remaining.is_zero() {
+                    return Err(error);
+                }
+                reader_publication(
+                    policy.operation_timeout.min(remaining),
+                    "renewal_retry",
+                    last,
+                    write_nonce(&registration.store, &registration.path, false),
+                )
+                .await?;
+            }
             let mut last = acknowledged.lock().unwrap();
             // A paused process must not resurrect an expired read by accepting
             // a delayed successful renewal response.
@@ -920,7 +943,16 @@ mod tests {
         .with_subscriber(diagnostics.clone())
         .await;
         assert!(result.unwrap_err().to_string().contains("timed out"));
-        diagnostics.assert_failure("renewal", "operation_timeout");
+        {
+            let events = diagnostics.0.lock().unwrap();
+            assert_eq!(events.len(), 2, "{events:?}");
+            for (event, phase) in events.iter().zip(["renewal", "renewal_retry"]) {
+                assert_eq!(event["phase"], phase);
+                assert_eq!(event["category"], "operation_timeout");
+                assert!(event["operation_ms"].parse::<u64>().is_ok());
+                assert!(event["acknowledged_silence_ms"].parse::<u64>().is_ok());
+            }
+        }
         let listing = store.inner.list(Some(&readers_root(&root)));
         wait_for_listing(store, listing, quick_policy(), 2)
             .await
@@ -1065,3 +1097,7 @@ mod tests {
 #[cfg(test)]
 #[path = "wal_read_lifetime_azure_tests.rs"]
 mod azure_tests;
+
+#[cfg(test)]
+#[path = "wal_read_renewal_tests.rs"]
+mod renewal_tests;
