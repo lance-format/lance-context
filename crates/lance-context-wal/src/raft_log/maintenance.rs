@@ -1,5 +1,6 @@
 //! Physical segment maintenance after durable logical checkpointing.
 use super::*;
+use raft_engine::internals::RewriteBoundary;
 
 /// A handle to one physical engine's maintenance boundary, shared by every
 /// hosted group. Run it on a bounded blocking worker, outside the Raft loop.
@@ -79,6 +80,9 @@ impl LogMaintenance {
                 .write()
                 .map_err(|_| anyhow::anyhow!("append gate poisoned"))?;
             self.node.check()?;
+            // Freeze the native file watermark before sizing. A moving
+            // watermark would allow concurrent appends to enlarge this pass.
+            let boundary = self.node.engine.purge_manager().capture_append_boundary();
             let reservation = self
                 .node
                 .budget
@@ -90,7 +94,7 @@ impl LogMaintenance {
                     let live = if force_rewrite {
                         self.node.engine.estimated_rewrite_queue_bytes()
                     } else {
-                        self.node.engine.estimated_rewrite_bytes()
+                        self.node.engine.estimated_rewrite_bytes_before(boundary)
                     };
                     let bytes = live
                         .and_then(|live| {
@@ -109,7 +113,6 @@ impl LogMaintenance {
             }
             // Later appends and their tombstones stay outside this pass. Rewrite
             // queue values cannot grow while our node-wide job guard is held.
-            let boundary = self.node.engine.purge_manager().capture_append_boundary();
             (reservation, boundary)
         };
         let result = self.run_native(force_rewrite, boundary);
@@ -119,7 +122,7 @@ impl LogMaintenance {
         result
     }
 
-    fn run_native(&self, force_rewrite: bool, boundary: (u64, usize)) -> Result<Vec<u64>> {
+    fn run_native(&self, force_rewrite: bool, boundary: RewriteBoundary) -> Result<Vec<u64>> {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if force_rewrite {
                 self.node.engine.purge_manager().reclaim_rewrite_queue()?;

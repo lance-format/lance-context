@@ -22,7 +22,7 @@ impl EventListener for RewriteObservation {
 }
 
 #[test]
-fn native_two_queue_rewrite_bytes_fit_the_live_allowance() -> Result<()> {
+fn captured_prefix_allowance_covers_both_queues_with_later_appends() -> Result<()> {
     let root = tempfile::tempdir()?;
     let config = raft_engine::Config {
         dir: root.path().to_str().unwrap().to_owned(),
@@ -36,7 +36,7 @@ fn native_two_queue_rewrite_bytes_fit_the_live_allowance() -> Result<()> {
     };
     let observed = Arc::new(RewriteObservation::default());
     let engine = Engine::open_with_listeners(config.clone(), vec![observed.clone()])?;
-    let records: Vec<_> = (1..=16)
+    let mut records: Vec<_> = (1..=16)
         .map(|index| Entry {
             data: vec![index as u8; 128 << 10].into(),
             ..entry(10, index)
@@ -62,11 +62,37 @@ fn native_two_queue_rewrite_bytes_fit_the_live_allowance() -> Result<()> {
     }
     engine.compact_to(10, 3);
     engine.sync()?;
-    let allowance = engine.estimated_rewrite_bytes().unwrap() as u64;
+    let boundary = engine.purge_manager().capture_append_boundary();
+    let allowance = engine.estimated_rewrite_bytes_before(boundary).unwrap() as u64;
+    let all_live = engine.estimated_rewrite_bytes().unwrap() as u64;
+    assert!(
+        all_live > allowance,
+        "tail was not excluded: {all_live} <= {allowance}"
+    );
+    // These writes rotate the append queue and move its normal watermark.
+    // The captured pass must still fit its original allowance, including when
+    // a key or group is replaced after capture.
+    let later = Entry {
+        data: vec![17; 4 << 20].into(),
+        ..entry(10, 17)
+    };
+    let mut batch = LogBatch::default();
+    batch.add_entries::<EntryIndex>(10, std::slice::from_ref(&later))?;
+    batch.put(20, b"value".to_vec(), vec![2; 1 << 20])?;
+    batch.add_command(30, raft_engine::Command::Clean);
+    batch.put(30, b"later".to_vec(), vec![8; 1 << 20])?;
+    engine.write(&mut batch, true)?;
+    records.push(later);
+    assert!(engine.estimated_rewrite_bytes().unwrap() as u64 > allowance + (5 << 20));
     observed.bytes.store(0, Ordering::Relaxed);
     observed.purged.store(0, Ordering::Relaxed);
-    engine.purge_expired_files()?;
+    engine
+        .purge_manager()
+        .purge_expired_files_before(boundary)?;
     let written = observed.bytes.load(Ordering::Relaxed);
+    eprintln!(
+        "captured prefix allowance: all_live={all_live}, reserved={allowance}, written={written}"
+    );
     assert_eq!(observed.purged.load(Ordering::Relaxed), 3);
     assert!(
         written > 0 && written <= allowance,
@@ -81,9 +107,10 @@ fn native_two_queue_rewrite_bytes_fit_the_live_allowance() -> Result<()> {
             Some(record.clone())
         );
     }
-    assert_eq!(reopened.get(20, b"value"), Some(vec![1; 16 << 10]));
+    assert_eq!(reopened.get(20, b"value"), Some(vec![2; 1 << 20]));
     assert!(reopened.get(30, b"old").is_none());
-    assert_eq!(reopened.get(30, b"new"), Some(vec![9; 4096]));
+    assert!(reopened.get(30, b"new").is_none());
+    assert_eq!(reopened.get(30, b"later"), Some(vec![8; 1 << 20]));
     Ok(())
 }
 
@@ -211,7 +238,13 @@ fn rewrite_queue_allowance_covers_actual_bytes_and_preserves_both_queues() -> Re
         written > 0 && written <= allowance,
         "{written} > {allowance}"
     );
-    assert_eq!(engine.purge_manager().capture_append_boundary().1, 1);
+    assert_eq!(
+        engine
+            .purge_manager()
+            .capture_append_boundary()
+            .cleaned_regions(),
+        1
+    );
     drop(engine);
     let reopened = Engine::open(config)?;
     assert!(reopened.get_entry::<EntryIndex>(10, 4)?.is_none());
