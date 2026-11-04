@@ -4,6 +4,8 @@ use crate::{raft_log::DiskOptions, service::maintenance};
 use raft_proto::eraftpb::{Message, MessageType};
 use uuid::Uuid;
 
+mod retired_images;
+
 fn disk() -> DiskOptions {
     DiskOptions {
         max_bytes: 1 << 30,
