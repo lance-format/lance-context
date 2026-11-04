@@ -93,47 +93,7 @@ pub(crate) async fn run(
         if *background.stop.borrow() {
             return Ok(());
         }
-        // Preserve the scan cursor across bounded batches. Do not repeatedly
-        // restart at the first directory entry and starve later orphan files.
-        let Some(prepared) = background
-            .admit(handle.prepare_image_collection_wait())
-            .await
-        else {
-            return Ok(());
-        };
-        match prepared {
-            Ok(pending) => match pending.await {
-                Ok(mut collection) => loop {
-                    let count = options.scan_entries;
-                    let (returned, result) = tokio::task::spawn_blocking(move || {
-                        let result = collection.run_batch(count);
-                        (collection, result)
-                    })
-                    .await?;
-                    collection = returned;
-                    match result {
-                        Ok(batch) => {
-                            let mut p = progress.lock().unwrap();
-                            p.collected_files =
-                                p.collected_files.saturating_add(batch.removed_files);
-                            p.collected_bytes =
-                                p.collected_bytes.saturating_add(batch.removed_bytes);
-                            if batch.finished || *background.stop.borrow() {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            error(&progress, e);
-                            break;
-                        }
-                    }
-                    tokio::task::yield_now().await;
-                },
-                Err(e) => error(&progress, e),
-            },
-            Err(e) => error(&progress, e),
-        }
-        if *background.stop.borrow() {
+        if !background.collect_images().await? {
             return Ok(());
         }
         for &group in &groups {
@@ -180,9 +140,20 @@ pub(crate) async fn run(
                     checkpoints.insert(group, Instant::now());
                     background.suggested.remove(&group);
                     if built {
-                        let mut p = progress.lock().unwrap();
-                        p.checkpoints = p.checkpoints.saturating_add(1);
-                        p.checkpoint_micros = p.checkpoint_micros.saturating_add(micros(start));
+                        {
+                            let mut p = progress.lock().unwrap();
+                            p.checkpoints = p.checkpoints.saturating_add(1);
+                            p.checkpoint_micros = p.checkpoint_micros.saturating_add(micros(start));
+                        }
+                        // Installation retires the previous image. Reclaim it
+                        // before another group builds files or a log rewrite
+                        // reserves headroom, rather than holding obsolete bytes
+                        // against producer admission until the next tick.
+                        // Existing reader/transfer and installed-image guards
+                        // still decide which files can actually be removed.
+                        if !background.collect_images().await? {
+                            return Ok(());
+                        }
                     }
                 }
                 Err(e) => error(&progress, e),
@@ -211,6 +182,48 @@ struct Background<'a> {
     suggested: BTreeSet<u64>,
 }
 impl Background<'_> {
+    async fn collect_images(&mut self) -> Result<bool> {
+        let handle = self.handle;
+        let Some(prepared) = self.admit(handle.prepare_image_collection_wait()).await else {
+            return Ok(false);
+        };
+        match prepared {
+            Ok(pending) => match pending.await {
+                // Preserve the cursor across bounded batches so later orphan
+                // files cannot be starved by repeatedly starting a fresh scan.
+                Ok(mut collection) => loop {
+                    let count = self.options.scan_entries;
+                    let (returned, result) = tokio::task::spawn_blocking(move || {
+                        let result = collection.run_batch(count);
+                        (collection, result)
+                    })
+                    .await?;
+                    collection = returned;
+                    match result {
+                        Ok(batch) => {
+                            let mut p = self.progress.lock().unwrap();
+                            p.collected_files =
+                                p.collected_files.saturating_add(batch.removed_files);
+                            p.collected_bytes =
+                                p.collected_bytes.saturating_add(batch.removed_bytes);
+                            if batch.finished || *self.stop.borrow() {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            error(self.progress, e);
+                            break;
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                },
+                Err(e) => error(self.progress, e),
+            },
+            Err(e) => error(self.progress, e),
+        }
+        Ok(!*self.stop.borrow())
+    }
+
     async fn admit<T>(
         &mut self,
         admission: impl std::future::Future<Output = Result<T>>,
