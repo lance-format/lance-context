@@ -383,39 +383,44 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn unusable_local_stats_skip_cursor_but_fresh_stats_resume_it() {
-        let (_dir, state) = fixture().await;
-        let now = chrono::Utc::now().timestamp_millis();
-        let key = format!("{}/wal-tail-cursor", state.config.etcd.etcd_prefix);
-        let mut client = state.task_store.etcd_client().clone();
-        // A cursor that cannot be decoded makes an accidental read observable
-        // without relying on process-wide counters shared by parallel CI tests.
-        client
-            .put(key.as_str(), "invalid-cursor", None)
-            .await
-            .unwrap();
-        for snapshot in [
-            vec![],
-            vec![row("old", 1, now - 901_000)],
-            vec![row("future", 1, now + 1)],
-        ] {
-            *state.stats_cache.write().await = Arc::new(snapshot);
-            for _ in 0..10 {
-                assert_eq!(tick(&state, now).await.unwrap(), 0);
+        for targets in [vec![], vec!["tail".to_string()]] {
+            let (_dir, original) = fixture().await;
+            let mut cfg = original.config.clone();
+            cfg.merge_wal_admission_targets = targets;
+            let state = MasterState::new(cfg).await.unwrap();
+            let now = chrono::Utc::now().timestamp_millis();
+            let key = cursor_key(&state.config);
+            let mut client = state.task_store.etcd_client().clone();
+            // A cursor that cannot be decoded makes an accidental read observable
+            // without relying on process-wide counters shared by parallel CI tests.
+            client
+                .put(key.as_str(), "invalid-cursor", None)
+                .await
+                .unwrap();
+            for snapshot in [
+                vec![],
+                vec![row("old", 1, now - 901_000)],
+                vec![row("future", 1, now + 1)],
+            ] {
+                *state.stats_cache.write().await = Arc::new(snapshot);
+                for _ in 0..10 {
+                    assert_eq!(tick(&state, now).await.unwrap(), 0);
+                }
             }
+            *state.stats_cache.write().await = Arc::new(vec![row("tail", 1, now)]);
+            assert!(
+                tick(&state, now).await.is_err(),
+                "fresh replicas must read the cursor"
+            );
+            client.delete(key.as_str(), None).await.unwrap();
+            assert_eq!(tick(&state, now).await.unwrap(), 1);
+            assert!(state
+                .task_store
+                .get_active_id(TaskKind::MergeWal, "tail")
+                .await
+                .unwrap()
+                .is_some());
         }
-        *state.stats_cache.write().await = Arc::new(vec![row("tail", 1, now)]);
-        assert!(
-            tick(&state, now).await.is_err(),
-            "fresh replicas must read the cursor"
-        );
-        client.delete(key.as_str(), None).await.unwrap();
-        assert_eq!(tick(&state, now).await.unwrap(), 1);
-        assert!(state
-            .task_store
-            .get_active_id(TaskKind::MergeWal, "tail")
-            .await
-            .unwrap()
-            .is_some());
     }
 
     #[tokio::test]
