@@ -34,9 +34,20 @@ impl Sweep {
 
     fn policy_name(self, state: &MasterState) -> String {
         let policy = match self {
-            Self::Merge => serde_json::json!({
-                "pending": state.config.merge_wal_min_generations,
-            }),
+            Self::Merge => {
+                let mut policy = serde_json::json!({
+                    "pending": state.config.merge_wal_min_generations,
+                });
+                // Preserve the old election key for an unrestricted policy.
+                // Distinct scopes must not suppress each other's sweep owner.
+                if !state.config.merge_wal_admission_targets.is_empty() {
+                    let mut targets = state.config.merge_wal_admission_targets.clone();
+                    targets.sort_unstable();
+                    targets.dedup();
+                    policy["targets"] = serde_json::json!(targets);
+                }
+                policy
+            }
             Self::Compact => {
                 let config = state.compaction_config();
                 serde_json::json!({

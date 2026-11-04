@@ -170,6 +170,12 @@ pub struct MasterConfig {
     #[arg(long, env = "MERGE_WAL_MIN_GENERATIONS", default_value_t = 8)]
     pub merge_wal_min_generations: i64,
 
+    /// Exact targets to which this master's automatic WAL admission policy applies.
+    /// Empty preserves the existing unrestricted policy. This does not change
+    /// execution ownership, manual tasks, or recovery of durable merge requests.
+    #[arg(long, env = "MERGE_WAL_ADMISSION_TARGETS", value_delimiter = ',')]
+    pub merge_wal_admission_targets: Vec<String>,
+
     /// Data-plane worker base URLs (comma-separated), e.g.
     /// `http://rollout-0:3000,http://rollout-1:3000`. A `MergeWal` task fans out
     /// to every endpoint so each worker merges its own MemWAL shard (the master
@@ -276,8 +282,29 @@ pub struct MasterConfig {
     pub ui_dir: Option<String>,
 }
 
+impl MasterConfig {
+    pub(crate) fn admits_automatic_wal(&self, target: &str) -> bool {
+        self.merge_wal_admission_targets.is_empty()
+            || self
+                .merge_wal_admission_targets
+                .iter()
+                .any(|name| name == target)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scoped_wal_admission_uses_exact_names_and_keeps_default_unrestricted() {
+        let cfg =
+            MasterConfig::parse_from(["master", "--merge-wal-admission-targets", "a,generic:b"]);
+        assert!(cfg.admits_automatic_wal("a"));
+        assert!(cfg.admits_automatic_wal("generic:b"));
+        assert!(!cfg.admits_automatic_wal("ab"));
+        assert!(!cfg.admits_automatic_wal("b"));
+        assert!(MasterConfig::parse_from(["master"]).admits_automatic_wal("any"));
+    }
+
     #[test]
     fn key_index_policy_is_explicit_and_validated() {
         use clap::Parser;
