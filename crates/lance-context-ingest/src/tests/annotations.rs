@@ -258,6 +258,27 @@ async fn quorum_ack_waits_for_apply_and_another_ingress_reads_without_a_tail_sca
                 assert_eq!(append.completed, 1);
                 assert_eq!(append.failed + append.cancelled, 0);
                 assert_eq!(apply.completed + apply.failed + apply.cancelled, 0);
+                let patch_append = phases
+                    .iter()
+                    .find(|p| p.phase == "annotation_patch_append")
+                    .unwrap();
+                let patch_apply = phases
+                    .iter()
+                    .find(|p| p.phase == "annotation_patch_apply_wait")
+                    .unwrap();
+                assert_eq!(patch_append.completed, 1);
+                assert_eq!(patch_append.failed + patch_append.cancelled, 0);
+                // The aggregate timer starts first; wait until its child is
+                // also observed before checking the paused apply boundary.
+                if patch_apply.started == 0 {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                assert_eq!(patch_apply.started, 1);
+                assert_eq!(patch_apply.completed + patch_apply.cancelled, 0);
+                for name in ["annotation_create_append", "annotation_create_apply_wait"] {
+                    assert_eq!(phases.iter().find(|p| p.phase == name).unwrap().started, 0);
+                }
                 break;
             }
             tokio::task::yield_now().await;
@@ -280,6 +301,13 @@ async fn quorum_ack_waits_for_apply_and_another_ingress_reads_without_a_tail_sca
     assert_eq!(apply.started, 1);
     assert_eq!(apply.completed, 1);
     assert_eq!(apply.failed + apply.cancelled, 0);
+    let patch_apply = phases
+        .iter()
+        .find(|p| p.phase == "annotation_patch_apply_wait")
+        .unwrap();
+    assert_eq!(patch_apply.started, 1);
+    assert_eq!(patch_apply.completed, 1);
+    assert_eq!(patch_apply.failed + patch_apply.cancelled, 0);
     assert_eq!(
         phases
             .iter()

@@ -41,6 +41,13 @@ pub enum MutationResult {
     Rejected(Rejection),
 }
 
+/// Retained from validated input for local timing only; never encoded in the WAL.
+#[derive(Clone, Copy)]
+pub(crate) enum WriteKind {
+    Create,
+    Patch,
+}
+
 /// A bounded latest outcome, independent of dirty turn values. Until these
 /// outcomes are included in publication recovery state, retain the source WAL.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -534,6 +541,10 @@ impl Service {
             };
             decoded.validate_shard(shard, &layout, &upload.scope.contract)?;
             let rows = decoded.rows() as u32;
+            let annotation_kind = Some(match &decoded {
+                mixed::Decoded::Creates { .. } => WriteKind::Create,
+                mixed::Decoded::Patches(_) => WriteKind::Patch,
+            });
             drop(decoded);
             // Validation owns decoded patches only inside this blocking task.
             // Keep the existing encoded-body allowance through WAL submission
@@ -543,6 +554,7 @@ impl Service {
             Ok(PreparedAppend {
                 batch: Batch::new(upload.scope.table, bucket, producer, sequence, body),
                 rows,
+                annotation_kind,
                 scope: upload.scope,
                 _reservation: reservation,
             })
@@ -559,6 +571,19 @@ impl Service {
             *prepared.scope == *self.ingress.scope && prepared.meta().bucket == self.bucket(),
             "prepared annotation belongs to another shard"
         );
+        let (append_phase, apply_phase) = match prepared
+            .annotation_kind
+            .context("prepared request is not an annotation write")?
+        {
+            WriteKind::Create => (
+                Phase::AnnotationCreateAppend,
+                Phase::AnnotationCreateApplyWait,
+            ),
+            WriteKind::Patch => (
+                Phase::AnnotationPatchAppend,
+                Phase::AnnotationPatchApplyWait,
+            ),
+        };
         let producer_slot = slot(prepared.meta(), self.ingress.client.producer_slots())?;
         // Share the upload only while its caller awaits apply. This registration
         // proves neither acceptance nor ordering; the driver still observes both
@@ -571,13 +596,20 @@ impl Service {
             let accepted = self
                 .shared
                 .phases
-                .measure(Phase::AnnotationAppend, self.append_observed(prepared))
+                .measure(
+                    Phase::AnnotationAppend,
+                    self.shared
+                        .phases
+                        .measure(append_phase, self.append_observed(prepared)),
+                )
                 .await?;
             self.shared
                 .phases
                 .measure(
                     Phase::AnnotationApplyWait,
-                    self.wait_through(accepted.position.index),
+                    self.shared
+                        .phases
+                        .measure(apply_phase, self.wait_through(accepted.position.index)),
                 )
                 .await?;
             let slot = slot(&accepted.meta, self.ingress.client.producer_slots())?;

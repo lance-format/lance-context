@@ -323,6 +323,20 @@ async fn mixed_held_body_read_outlives_publication_source_closure_and_frame_reti
     )
     .await?;
     a.submit(&suffix, Duration::from_secs(10)).await?;
+    // Classification comes from the already validated mixed Arrow operation,
+    // including the one-row create above; row count is not an operation tag.
+    let phases = a.phase_observation();
+    for name in [
+        "annotation_create_append",
+        "annotation_patch_append",
+        "annotation_create_apply_wait",
+        "annotation_patch_apply_wait",
+    ] {
+        let phase = phases.iter().find(|p| p.phase == name).unwrap();
+        assert_eq!(phase.started, 1, "{name}");
+        assert_eq!(phase.completed, 1, "{name}");
+        assert_eq!(phase.failed + phase.cancelled, 0, "{name}");
+    }
     let selected = crate::annotation_publication::mixed::publish(
         Arc::new(c.client.manifest_catalog()),
         &annotation_publication::one_shard(),
