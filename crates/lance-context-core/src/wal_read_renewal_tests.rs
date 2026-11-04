@@ -13,12 +13,54 @@ fn policy() -> Policy {
 
 #[derive(Clone, Copy, Debug)]
 enum Fault {
+    Healthy,
+    PanicRenewal,
     TimeoutOnce,
     ErrorOnce,
     AlwaysTimeout,
     LateRetryAcknowledgement,
     ExpiredFirstFailure,
     InitialFailure,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn protected_read_keeps_renewing_while_its_own_poll_is_busy() {
+    let (_dir, store, root, faulty) = fixture(Fault::Healthy).await;
+    let ticks = Arc::new(AtomicUsize::new(0));
+    let (ready, started) = tokio::sync::oneshot::channel();
+    let timer = tokio::spawn({
+        let ticks = ticks.clone();
+        async move {
+            ready.send(()).unwrap();
+            loop {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                ticks.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    });
+    started.await.unwrap();
+    let read_faulty = faulty.clone();
+    let read_ticks = ticks.clone();
+    let result = tokio::spawn(async move {
+        protect(store, &root, policy(), async {
+            read_faulty.renewed.notified().await;
+            read_ticks.store(0, Ordering::SeqCst);
+            // Occupy an actual runtime worker, not just the test's caller.
+            std::thread::sleep(Duration::from_millis(450));
+            Ok(42)
+        })
+        .await
+    })
+    .await
+    .unwrap();
+    timer.abort();
+    assert!(timer.await.unwrap_err().is_cancelled());
+    assert!(
+        ticks.load(Ordering::SeqCst) >= 10,
+        "the other worker stalled"
+    );
+    assert_eq!(result.unwrap(), 42);
+    assert!(faulty.renewals.load(Ordering::SeqCst) > 1);
 }
 
 #[derive(Debug)]
@@ -49,6 +91,7 @@ impl object_store::ObjectStore for FaultyRenewal {
             let attempt = self.renewals.fetch_add(1, Ordering::SeqCst) + 1;
             self.attempted.notify_one();
             match (self.fault, attempt) {
+                (Fault::PanicRenewal, _) => panic!("injected renewal panic"),
                 (Fault::TimeoutOnce | Fault::LateRetryAcknowledgement, 1)
                 | (Fault::AlwaysTimeout, _) => std::future::pending::<()>().await,
                 (Fault::ErrorOnce, 1) => {
@@ -264,4 +307,75 @@ async fn cancelling_during_failed_renewal_releases_the_registration() {
     .await
     .unwrap()
     .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn renewal_starts_before_a_non_yielding_first_read_poll() {
+    let (_dir, store, root, faulty) = fixture(Fault::Healthy).await;
+    let result = tokio::spawn(async move {
+        protect(store, &root, policy(), async {
+            std::thread::sleep(Duration::from_millis(450));
+            Ok(17)
+        })
+        .await
+    })
+    .await
+    .unwrap();
+    assert_eq!(result.unwrap(), 17);
+    assert!(faulty.renewals.load(Ordering::SeqCst) > 1);
+}
+
+#[tokio::test]
+async fn a_panicked_renewal_fails_the_protected_read() {
+    let (_dir, store, root, _faulty) = fixture(Fault::PanicRenewal).await;
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        protect(store, &root, policy(), async {
+            std::future::pending::<lance::Result<()>>().await
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("renewal task failed"));
+}
+
+#[tokio::test]
+async fn completed_and_cancelled_reads_stop_renewing_before_cleanup() {
+    for cancel in [false, true] {
+        let (_dir, store, root, faulty) = fixture(Fault::Healthy).await;
+        let release = Arc::new(tokio::sync::Notify::new());
+        let reading = {
+            let (store, root, release) = (store.clone(), root.clone(), release.clone());
+            tokio::spawn(async move {
+                protect(store, &root, policy(), async {
+                    release.notified().await;
+                    Ok(23)
+                })
+                .await
+            })
+        };
+        faulty.renewed.notified().await;
+        assert_eq!(captured_readers(&store, &root).await.unwrap().len(), 1);
+        if cancel {
+            reading.abort();
+            assert!(reading.await.unwrap_err().is_cancelled());
+        } else {
+            release.notify_one();
+            assert_eq!(reading.await.unwrap().unwrap(), 23);
+        }
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while !captured_readers(&store, &root).await.unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let renewals = faulty.renewals.load(Ordering::SeqCst);
+        tokio::time::sleep(policy().heartbeat * 5).await;
+        assert_eq!(faulty.renewals.load(Ordering::SeqCst), renewals);
+        assert!(captured_readers(&store, &root).await.unwrap().is_empty());
+    }
 }
