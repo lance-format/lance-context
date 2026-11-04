@@ -84,10 +84,15 @@ impl LogMaintenance {
                 .budget
                 .get()
                 .map(|budget| {
-                    let bytes = self
-                        .node
-                        .engine
-                        .estimated_rewrite_bytes()
+                    // Pressure reclamation touches only the rewrite queue.
+                    // Charging the unrelated append tail again can itself close
+                    // producer admission while this background pass runs.
+                    let live = if force_rewrite {
+                        self.node.engine.estimated_rewrite_queue_bytes()
+                    } else {
+                        self.node.engine.estimated_rewrite_bytes()
+                    };
+                    let bytes = live
                         .and_then(|live| {
                             usize::try_from(self.node.target_file_bytes)
                                 .ok()?

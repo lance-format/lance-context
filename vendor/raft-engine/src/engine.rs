@@ -435,6 +435,14 @@ where
         self.memtables.rewrite_size_hint()
     }
 
+    /// Conservative allowance for reclaiming only the rewrite queue.
+    /// Excludes the untouched append tail and its pending tombstones. As with
+    /// `estimated_rewrite_bytes`, capture while writes/maintenance are excluded;
+    /// retain exclusive maintenance ownership until the pass finishes.
+    pub fn estimated_rewrite_queue_bytes(&self) -> Option<usize> {
+        self.memtables.rewrite_queue_size_hint()
+    }
+
     pub fn path(&self) -> &str {
         self.cfg.dir.as_str()
     }
