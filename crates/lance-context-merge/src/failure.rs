@@ -60,7 +60,8 @@ pub fn classify(error: &str) -> FailureClass {
     // must never be laundered by a code (auth failures), then the stable
     // code, then explicit transient HTTP statuses, then legacy text. Codes
     // and statuses beat incidental words in object paths (e.g. "schema" in
-    // a table name), but never beat a 401/403 or unresolved ownership.
+    // a table name), but never beat a 401/403 or unresolved ownership. A generic
+    // worker 500 can wrap a real data error, so it does not override that text.
     let lowered = error.to_ascii_lowercase();
     if lowered.contains("ownership unresolved") {
         return FailureClass::OwnershipUnresolved;
@@ -75,7 +76,7 @@ pub fn classify(error: &str) -> FailureClass {
     }
     let error = lowered;
     if is_preparation_conflict(&error)
-        || has_http_status(&error, &["408", "429", "500", "502", "503", "504"])
+        || has_http_status(&error, &["408", "429", "502", "503", "504"])
     {
         FailureClass::Retryable
     } else if [
@@ -814,6 +815,31 @@ mod tests {
         assert_eq!(
             classify("merge ownership unresolved: HTTP 503"),
             FailureClass::OwnershipUnresolved
+        );
+    }
+
+    #[test]
+    fn generic_worker_500_preserves_explicit_data_failures() {
+        for detail in [
+            "Not found: data/frag.lance",
+            "schema mismatch",
+            "corrupt manifest",
+        ] {
+            let error = format!("worker returned HTTP 500: {{\"error\":\"{detail}\"}}");
+            let failure = ShardFailure::advance("broken", "worker", None, &error, 1000);
+            assert_eq!(failure.class, FailureClass::DataOrConfiguration, "{error}");
+            assert!(failure.needs_attention);
+            assert_eq!(failure.next_retry_ms, 3_601_000);
+        }
+        assert_eq!(
+            classify("worker returned HTTP 500"),
+            FailureClass::Retryable
+        );
+        let azure = include_str!("../tests/fixtures/azure-server-busy.txt")
+            .replace("/container/table/", "/container/l30-schema60/");
+        assert_eq!(
+            classify(&format!("worker returned HTTP 500: {azure}")),
+            FailureClass::Retryable
         );
     }
 
