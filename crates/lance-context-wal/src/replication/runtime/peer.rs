@@ -240,18 +240,17 @@ impl Transport {
                 (statistics.clone(), statistics.destinations[&id].clone()),
             )));
         }
-        let feedback = handle.clone();
+        let mut feedback = AppendFeedback {
+            handle: handle.clone(),
+            pending: None,
+        };
         tasks.push(tokio::spawn(dispatch(
             outbox,
             routes,
             snapshots.clone(),
             shutdown.clone(),
             statistics.clone(),
-            move |failed: FailedAppend| {
-                // Use the existing bounded control lane. If it is unavailable,
-                // ordinary Raft heartbeats still provide the fallback progress.
-                let _ = feedback.local(failed.group, move |node| failed.apply(node));
-            },
+            move |failed| feedback.report(failed),
         )));
         tasks.push(tokio::spawn(listen(
             handle,
@@ -362,6 +361,32 @@ struct FailedAppend {
     to: u64,
     term: u64,
 }
+
+// Transport feedback shares admission with publication and quorum reads. Keep
+// one outstanding report across all groups/destinations on this physical node;
+// a rejection burst must not fill that lane. Dropped hints retain the ordinary
+// Raft heartbeat fallback and never represent a client command or an ACK.
+struct AppendFeedback {
+    handle: Handle,
+    pending: Option<super::Pending<()>>,
+}
+impl AppendFeedback {
+    fn report(&mut self, failed: FailedAppend) {
+        if let Some(pending) = &mut self.pending {
+            if matches!(
+                pending.0.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ) {
+                return;
+            }
+        }
+        self.pending = self
+            .handle
+            .local(failed.group, move |node| failed.apply(node))
+            .ok();
+    }
+}
+
 impl FailedAppend {
     fn capture(packet: &Packet) -> Option<Self> {
         (packet.message.get_msg_type() == raft_proto::eraftpb::MessageType::MsgAppend).then_some(

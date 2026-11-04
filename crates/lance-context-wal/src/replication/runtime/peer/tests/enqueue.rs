@@ -300,3 +300,104 @@ fn append_feedback_excludes_quorum_responses_and_snapshot_delivery() {
         assert_eq!(FailedAppend::capture(&packet), None);
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rejection_burst_leaves_control_capacity_for_quorum_reads() -> Result<()> {
+    use crate::replication::{query, runtime::Work};
+
+    let directory = tempfile::tempdir()?;
+    let c = Cluster::open(directory.path()).await?;
+    c.nodes[&1].handle.campaign(10)?.await?;
+    let leader = c.leader(10).await?;
+    let handle = c.nodes[&leader].handle.clone();
+    let destination = (1..=3).find(|&id| id != leader).unwrap();
+    let term = handle.observation(10)?.status.term;
+    let (entered, arrived) = tokio::sync::oneshot::channel();
+    let (release, resumed) = std::sync::mpsc::channel::<()>();
+    handle.enqueue(
+        handle.route(10)?,
+        Work::Local(Box::new(move |_| {
+            let _ = entered.send(());
+            let _ = resumed.recv();
+            Box::new(|| {})
+        })),
+        false,
+    )?;
+    timeout(Duration::from_secs(5), arrived).await??;
+
+    let (outbox, incoming) = mpsc::channel(4096);
+    for i in 0..4096 {
+        let mut message = Message {
+            from: leader,
+            to: destination,
+            term,
+            ..Default::default()
+        };
+        message.set_msg_type(MessageType::MsgAppend);
+        outbox
+            .try_send(Outbound {
+                packet: Packet {
+                    cluster: uuid::Uuid::nil(),
+                    layout: [0; 32],
+                    policy: [0; 32],
+                    group: if i % 2 == 0 { 10 } else { 20 },
+                    message,
+                },
+                _credit: None,
+                image: None,
+                snapshot_feedback: None,
+            })
+            .map_err(|_| anyhow::anyhow!("test outbox full"))?;
+    }
+    drop(outbox);
+    let (send, _receive) = mpsc::channel(1);
+    let route = Route {
+        send,
+        ready: Arc::new(AtomicBool::new(false)),
+        bytes: Arc::new(Semaphore::new(4096)),
+    };
+    let (_stop, stopped) = watch::channel(false);
+    let statistics = Arc::new(Statistics::default());
+    let mut feedback = AppendFeedback {
+        handle: handle.clone(),
+        pending: None,
+    };
+    dispatch(
+        incoming,
+        BTreeMap::from([(destination, route)]),
+        Arc::new(OnceLock::new()),
+        stopped,
+        statistics.clone(),
+        |failed| feedback.report(failed),
+    )
+    .await?;
+    assert_eq!(statistics.enqueue_not_ready.load(Ordering::Relaxed), 4096);
+    assert_eq!(handle.shared.control.observation().used_requests, 1);
+
+    // Keep the worker paused while admitting real read-index requests. They
+    // cannot free credits early and hide feedback occupying the control lane.
+    let mut reads = Vec::new();
+    for _ in 1..64 {
+        reads.push(handle.query(10, query::Query::Accepted { after: 0, limit: 1 })?);
+    }
+    assert_eq!(handle.shared.control.observation().used_requests, 64);
+    drop(release);
+    for pending in reads {
+        assert!(matches!(
+            timeout(Duration::from_secs(10), pending).await??,
+            query::Outcome::Observed { .. }
+        ));
+    }
+    wait_for(|| handle.shared.control.observation().used_requests == 0).await?;
+
+    // Completion permits a later hint, so limiting the burst does not disable
+    // feedback permanently. This result is still delivered after durable poll.
+    feedback.report(FailedAppend {
+        group: 10,
+        to: destination,
+        term,
+    });
+    timeout(Duration::from_secs(10), feedback.pending.take().unwrap()).await??;
+    c.shutdown().await?;
+    Ok(())
+}
