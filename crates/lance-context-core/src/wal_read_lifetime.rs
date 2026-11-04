@@ -530,8 +530,23 @@ mod tests {
     use object_store::throttle::{ThrottleConfig, ThrottledStore};
     use tracing::instrument::WithSubscriber;
 
-    #[derive(Clone, Default)]
+    #[derive(Clone)]
     struct Diagnostics(Arc<Mutex<Vec<HashMap<String, String>>>>);
+
+    impl Default for Diagnostics {
+        fn default() -> Self {
+            // With a single live dispatch, tracing can register a callsite
+            // using another test thread's current NoSubscriber. Keep a second
+            // dispatch alive so first-use interest considers this recorder
+            // even before its instrumented future is polled. This does not
+            // install a global subscriber or change production diagnostics.
+            static ANCHOR: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+            ANCHOR.get_or_init(|| {
+                tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default())
+            });
+            Self(Arc::default())
+        }
+    }
 
     impl tracing::Subscriber for Diagnostics {
         fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
@@ -579,6 +594,20 @@ mod tests {
             assert!(events[0]["operation_ms"].parse::<u64>().is_ok());
             assert!(events[0]["acknowledged_silence_ms"].parse::<u64>().is_ok());
         }
+    }
+
+    #[test]
+    fn diagnostics_capture_a_callsite_first_used_without_a_subscriber() {
+        let diagnostics = Diagnostics::default();
+        let dispatch = tracing::Dispatch::new(diagnostics.clone());
+        let now = Instant::now();
+        // Other tests can reach the same callsite while this test's future
+        // owns a dispatch but has not yet been polled with it installed.
+        reader_failure("unobserved", "unobserved", now, now);
+        tracing::dispatcher::with_default(&dispatch, || {
+            reader_failure("registration", "acknowledgement_expired", now, now);
+        });
+        diagnostics.assert_failure("registration", "acknowledgement_expired");
     }
 
     #[tokio::test]

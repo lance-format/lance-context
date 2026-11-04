@@ -185,9 +185,16 @@ async fn one_transient_storage_error_can_recover_without_restarting_the_read() {
 #[tokio::test]
 async fn repeated_renewal_timeouts_fail_with_only_one_retry() {
     let (_dir, store, root, faulty) = fixture(Fault::AlwaysTimeout).await;
+    // Test the bounded retry limit independently of lease expiry. The outer
+    // two-second bound still requires failure well before this lease expires.
+    let policy = Policy {
+        max_silence: Duration::from_secs(10),
+        stale_after: Duration::from_secs(20),
+        ..policy()
+    };
     let result = tokio::time::timeout(
         Duration::from_secs(2),
-        protect(store, &root, policy(), async {
+        protect(store, &root, policy, async {
             std::future::pending::<lance::Result<()>>().await
         }),
     )
