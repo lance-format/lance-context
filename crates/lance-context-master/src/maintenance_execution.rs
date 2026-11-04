@@ -407,6 +407,18 @@ where
         .start(&reserved)
         .await?
         .ok_or("maintenance start lost")?;
+    let worker_failures = if maintenance == MaintenanceKind::Catchup
+        && crate::local_merge::selected(&state.config, &claim.task.target)
+    {
+        crate::native_failure_recovery::snapshot(
+            &coordinator,
+            &claim.task.target,
+            &state.config.worker_endpoints,
+        )
+        .await
+    } else {
+        Vec::new()
+    };
     // These handles are ephemeral to this operation. Observe successful file
     // IO as well as logical checkpoints so a long legacy compact/index scan
     // does not look idle merely because Lance has not completed a whole phase.
@@ -465,6 +477,16 @@ where
         return Err(format!(
             "maintenance storage fenced after ambiguous commit: {error}"
         ));
+    }
+    if outcome.is_ok() {
+        crate::native_failure_recovery::reconcile(
+            &coordinator,
+            &proof,
+            &running,
+            &uri,
+            worker_failures,
+        )
+        .await;
     }
     let terminal = running.finished(outcome.as_ref().map(|_| 0).map_err(Clone::clone));
     if !coordinator
