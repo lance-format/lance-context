@@ -257,8 +257,14 @@ pub async fn get_rollout_store(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<Json<RolloutStoreInfo>, AppError> {
-    let store_lock = state.get_or_open_rollout_store(&name).await?;
-    let store = store_lock.read().await;
+    use crate::store_timing::{measure, Stage};
+    let store_lock = measure(
+        &name,
+        Stage::InfoResolve,
+        state.get_or_open_rollout_store(&name),
+    )
+    .await?;
+    let store = measure(&name, Stage::InfoLock, store_lock.read()).await;
 
     Ok(Json(RolloutStoreInfo {
         name,
