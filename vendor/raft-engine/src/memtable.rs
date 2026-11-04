@@ -182,11 +182,12 @@ impl MemTable<VacantAllocator> {
 impl<A: AllocatorTrait> MemTable<A> {
     fn rewrite_size_hint(&self) -> Option<usize> {
         // Include framing even if each item is emitted in its own batch. The
-        // per-group allowance also covers rewrite atomic-group markers.
+        // per-group allowance covers framing and atomic-group markers for both
+        // the rewrite-queue and append-queue portions of one maintenance pass.
         let entries = self
             .entry_indexes
             .iter()
-            .try_fold(512usize, |size, entry| {
+            .try_fold(1024usize, |size, entry| {
                 size.checked_add(entry.entry_len as usize)?.checked_add(128)
             })?;
         self.kvs
@@ -1010,9 +1011,11 @@ impl<A: AllocatorTrait> MemTableAccessor<A> {
             size?.checked_add(table.rewrite_size_hint()?)
         })?;
         let tombstones = self.removed_memtables.lock().len().checked_mul(128)?;
-        // One native maintenance pass can rewrite both queues. This deliberately
-        // allows two copies of every live item instead of predicting selection.
-        live.checked_add(tombstones)?.checked_mul(2)
+        // A pass rewrites the rewrite queue before the append queue. The latter
+        // selects only append entries/KVs, so it cannot rewrite the former's
+        // output again. With concurrent writes excluded, each live item needs
+        // at most one copy; allow all items without predicting which are chosen.
+        live.checked_add(tombstones)
     }
 
     pub fn collect<F: FnMut(&MemTable<A>) -> bool>(

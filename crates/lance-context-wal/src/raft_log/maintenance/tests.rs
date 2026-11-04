@@ -2,6 +2,7 @@ use super::*;
 use std::{fs, path::PathBuf};
 
 mod pressure;
+mod rewrite_allowance;
 
 fn layout() -> Layout {
     Layout {
