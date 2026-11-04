@@ -31,6 +31,8 @@ use tokio::sync::{mpsc as async_mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 #[cfg(feature = "peer-transport")]
 pub mod client;
 mod images;
+mod peer_observation;
+pub use peer_observation::{PeerDiskRefusal, PeerRejections};
 mod poll_observation;
 pub use poll_observation::{EngineWriteObservation, PollObservation};
 #[cfg(feature = "peer-transport")]
@@ -318,6 +320,7 @@ struct Shared {
     outgoing: Credits,
     dropped_outgoing: AtomicU64,
     rejected_incoming: AtomicU64,
+    peer_rejections: Mutex<PeerRejections>,
 }
 
 /// A stale, local observation. Its timestamp does not establish quorum freshness.
@@ -573,6 +576,11 @@ impl Handle {
             self.shared.rejected_incoming.load(Ordering::Relaxed),
         )
     }
+    /// Node-wide causes of packets rejected by the durable workers after queue
+    /// admission. Queue and transport refusals have their own counters.
+    pub fn peer_rejections(&self) -> PeerRejections {
+        self.shared.peer_rejections.lock().unwrap().clone()
+    }
     /// Observe bounded local admission without contacting peers or allocating
     /// payloads. Successful admissions do not update rejection counters.
     pub fn admission(&self) -> Admission {
@@ -607,6 +615,7 @@ impl Runtime {
             outgoing: Credits::new(options.peer_requests, options.peer_bytes),
             dropped_outgoing: AtomicU64::new(0),
             rejected_incoming: AtomicU64::new(0),
+            peer_rejections: Mutex::new(PeerRejections::default()),
         });
         let (outbox, receive) = async_mpsc::channel(options.peer_requests);
         let mut handle = Handle {
@@ -834,7 +843,13 @@ impl Worker {
                     any = true;
                 }
                 if let Ok(peer) = self.peers.try_recv() {
-                    if self.node.step(peer.packet).is_err() {
+                    let from = peer.packet.message.from;
+                    if let Err(error) = self.node.step(peer.packet) {
+                        self.shared
+                            .peer_rejections
+                            .lock()
+                            .unwrap()
+                            .record(self.group, from, &error);
                         self.shared
                             .rejected_incoming
                             .fetch_add(1, Ordering::Relaxed);
