@@ -1407,6 +1407,129 @@ pub(crate) mod tests {
 
     #[tokio::test]
     #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn native_takeover_retires_capability_failure_only_after_all_wal_drains() {
+        use lance_context_merge::failure::{failure_key, ShardFailure};
+        for historical_pending in [false, true] {
+            let (_dir, initial) = generic_fixture_with_auto(true).await;
+            let mut cfg = initial.config.clone();
+            let endpoint = "http://worker:3000";
+            cfg.worker_endpoints = vec![endpoint.into(), "http://permanent:3000".into()];
+            let state = MasterState::new(cfg).await.unwrap();
+            let target = "recovered-rollout";
+            let writer = write(&state, target, 4).await;
+            let _historical = if historical_pending {
+                let old = RolloutStore::open_with_options(
+                    &state.rollout_uri(target),
+                    RolloutStoreOptions {
+                        shard_id: Some("not-in-current-worker-config".into()),
+                        merge_after_generations: Some(0),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+                let dto = serde_json::from_value(
+                    serde_json::json!({"id":"historical", "rollout_id":"r", "content":"retain"}),
+                )
+                .unwrap();
+                old.add(&[lance_context_core::rollout_record_from_add_request(&dto)])
+                    .await
+                    .unwrap();
+                old.flush().await.unwrap();
+                Some(old)
+            } else {
+                None
+            };
+            let c = state.task_store.merge_coordinator();
+            let mut client = state.task_store.etcd_client().clone();
+            let error = format!(
+                "error sending request for url ({endpoint}/api/v1/internal/merge-executor)"
+            );
+            let failure = |endpoint: &str, error: &str| ShardFailure {
+                target: target.into(),
+                endpoint: endpoint.into(),
+                consecutive_attempts: 1,
+                class: lance_context_merge::failure::classify(error),
+                last_error: error.into(),
+                last_failure_ms: 1,
+                next_retry_ms: 2,
+                needs_attention: false,
+            };
+            let transient = failure(endpoint, &error);
+            let permanent = failure("http://permanent:3000", "invalid schema");
+            client
+                .put(
+                    failure_key(state.config.etcd.prefix(), target, &permanent.endpoint),
+                    serde_json::to_vec(&permanent).unwrap(),
+                    None,
+                )
+                .await
+                .unwrap();
+            // Repeat once with an actually empty configured shard. A DONE0
+            // string alone must not clear debt if a historical shard remains.
+            for expected_generations in [4, 0] {
+                client
+                    .put(
+                        failure_key(state.config.etcd.prefix(), target, endpoint),
+                        serde_json::to_vec(&transient).unwrap(),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                crate::scheduler::enqueue(&state, TaskKind::MergeWal, target)
+                    .await
+                    .unwrap();
+                let claim = state
+                    .task_store
+                    .claim_resident_merge(&crate::local_merge::targets(&state.config))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let result = crate::merge_execution::run_merge_wal(&state, &claim).await;
+                assert_eq!(
+                    result.as_ref().unwrap(),
+                    &format!("local WAL merge reclaimed {expected_generations} generations")
+                );
+                state.task_store.finish(claim, result).await.unwrap();
+                assert_eq!(
+                    c.failure(target, endpoint).await.unwrap().is_some(),
+                    historical_pending
+                );
+                assert!(c
+                    .failure(target, &permanent.endpoint)
+                    .await
+                    .unwrap()
+                    .is_some());
+                assert_eq!(
+                    writer
+                        .own_shard_watermark()
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .pending_generations,
+                    0
+                );
+                assert_eq!(
+                    lance_context_core::wal_presence::has_pending_wal(&state.rollout_uri(target))
+                        .await
+                        .unwrap(),
+                    historical_pending
+                );
+                assert_eq!(
+                    lance::Dataset::open(&state.rollout_uri(target))
+                        .await
+                        .unwrap()
+                        .count_rows(None)
+                        .await
+                        .unwrap(),
+                    4
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn generic_discovery_and_continuation_preserve_updates_without_workers() {
         let (_dir, state) = generic_fixture().await;
         let writer = generic_writer(&state, "a").await;

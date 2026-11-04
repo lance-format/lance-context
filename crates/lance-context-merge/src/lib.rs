@@ -1145,6 +1145,82 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn native_failure_retirement_preserves_new_debt_and_lost_ownership() {
+        let (c, mut client, proof, _) = fixture().await;
+        let endpoint = "http://worker:3000";
+        let error =
+            format!("error sending request for url ({endpoint}/api/v1/internal/merge-executor)");
+        c.record_failure(&proof, "table", endpoint, &error)
+            .await
+            .unwrap();
+        let observed = c
+            .target_failure_observations("table")
+            .await
+            .unwrap()
+            .remove(0);
+        assert!(c
+            .target_failure_observations("other-table")
+            .await
+            .unwrap()
+            .is_empty());
+        let mut reserved =
+            Execution::new("table", MaintenanceKind::Catchup.endpoint(), "native", 60);
+        reserved.maintenance = Some(MaintenanceKind::Catchup);
+        assert!(c.reserve(&proof, &reserved).await.unwrap());
+        let running = c.start(&reserved).await.unwrap().unwrap();
+        c.record_failure(&proof, "table", endpoint, &error)
+            .await
+            .unwrap();
+        assert!(!c
+            .clear_observed_failure_after_native_recovery(&proof, &running, &observed)
+            .await
+            .unwrap());
+        let fresh = c
+            .target_failure_observations("table")
+            .await
+            .unwrap()
+            .remove(0);
+        let mut wrong_execution = running.clone();
+        wrong_execution.id = uuid::Uuid::new_v4().to_string();
+        assert!(!c
+            .clear_observed_failure_after_native_recovery(&proof, &wrong_execution, &fresh)
+            .await
+            .unwrap());
+        let mut wrong_claim = proof.clone();
+        wrong_claim.token = "not-the-owner".into();
+        assert!(!c
+            .clear_observed_failure_after_native_recovery(&wrong_claim, &running, &fresh)
+            .await
+            .unwrap());
+        assert_eq!(
+            c.failure("table", endpoint)
+                .await
+                .unwrap()
+                .unwrap()
+                .consecutive_attempts,
+            2
+        );
+        assert!(c
+            .clear_observed_failure_after_native_recovery(&proof, &running, &fresh)
+            .await
+            .unwrap());
+        assert!(c.failure("table", endpoint).await.unwrap().is_none());
+        assert_eq!(c.get("table").await.unwrap().unwrap(), running);
+        assert!(!c
+            .clear_observed_failure_after_native_recovery(&proof, &running, &fresh)
+            .await
+            .unwrap());
+        client
+            .delete(
+                format!("{}/", c.prefix),
+                Some(etcd_client::DeleteOptions::new().with_prefix()),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
     async fn reserved_recovery_preserves_unrelated_failure_budgets() {
         for error in [
             None,
