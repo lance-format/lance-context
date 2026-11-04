@@ -95,6 +95,23 @@ async fn tick(state: &Arc<MasterState>, now: i64) -> Result<usize, String> {
     let Some(_operation) = state.admission.try_admit_named("wal_tail") else {
         return Ok(0);
     };
+    // Existing in-memory scalar stats only: no datasets, payloads, WAL listing
+    // or stats-writer lock. Followers without a fresh snapshot do no work.
+    let snapshot = state.stats_cache.read().await.clone();
+    let max_age = state
+        .config
+        .wal_tail
+        .wal_tail_stats_max_age_secs
+        .min(86_400) as i64
+        * 1000;
+    // An uninitialized/stale follower must not consume or reset the shared
+    // cursor before a replica with a usable snapshot can finish the rotation.
+    if !snapshot
+        .iter()
+        .any(|row| row.scanned_at <= now && now.saturating_sub(row.scanned_at) <= max_age)
+    {
+        return Ok(0);
+    }
     let key = format!(
         "{}/wal-tail-cursor",
         state.config.etcd.etcd_prefix.trim_end_matches('/')
@@ -111,23 +128,6 @@ async fn tick(state: &Arc<MasterState>, now: i64) -> Result<usize, String> {
         .map_err(|e| e.to_string())?
         .unwrap_or_default();
     if cursor.next_batch_ms > now {
-        return Ok(0);
-    }
-    // Existing in-memory scalar stats only: no datasets, payloads, WAL listing
-    // or stats-writer lock. Followers without a fresh snapshot do no work.
-    let snapshot = state.stats_cache.read().await.clone();
-    let max_age = state
-        .config
-        .wal_tail
-        .wal_tail_stats_max_age_secs
-        .min(86_400) as i64
-        * 1000;
-    // An uninitialized/stale follower must not consume or reset the shared
-    // cursor before a replica with a usable snapshot can finish the rotation.
-    if !snapshot
-        .iter()
-        .any(|row| row.scanned_at <= now && now.saturating_sub(row.scanned_at) <= max_age)
-    {
         return Ok(0);
     }
     let mut names = candidates(&state.config, &snapshot, cursor.after.as_deref(), now);
@@ -321,6 +321,44 @@ mod tests {
             .collect();
         cfg.etcd.etcd_prefix = format!("/wal-tail-test/{}", lance_context_core::generate_id());
         (dir, MasterState::new(cfg).await.unwrap())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn unusable_local_stats_skip_cursor_but_fresh_stats_resume_it() {
+        let (_dir, state) = fixture().await;
+        let now = chrono::Utc::now().timestamp_millis();
+        let key = format!("{}/wal-tail-cursor", state.config.etcd.etcd_prefix);
+        let mut client = state.task_store.etcd_client().clone();
+        // A cursor that cannot be decoded makes an accidental read observable
+        // without relying on process-wide counters shared by parallel CI tests.
+        client
+            .put(key.as_str(), "invalid-cursor", None)
+            .await
+            .unwrap();
+        for snapshot in [
+            vec![],
+            vec![row("old", 1, now - 901_000)],
+            vec![row("future", 1, now + 1)],
+        ] {
+            *state.stats_cache.write().await = Arc::new(snapshot);
+            for _ in 0..10 {
+                assert_eq!(tick(&state, now).await.unwrap(), 0);
+            }
+        }
+        *state.stats_cache.write().await = Arc::new(vec![row("tail", 1, now)]);
+        assert!(
+            tick(&state, now).await.is_err(),
+            "fresh replicas must read the cursor"
+        );
+        client.delete(key.as_str(), None).await.unwrap();
+        assert_eq!(tick(&state, now).await.unwrap(), 1);
+        assert!(state
+            .task_store
+            .get_active_id(TaskKind::MergeWal, "tail")
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]
