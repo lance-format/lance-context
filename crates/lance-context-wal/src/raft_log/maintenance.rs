@@ -16,26 +16,24 @@ impl LogMaintenance {
     /// deletes application snapshots or Lance objects.
     ///
     /// Pending appends and checkpoint metadata first cross a physical sync
-    /// barrier. Payload reads and writes are excluded for this maintenance pass;
-    /// an error or panic fences every group on the node. The native pass has no
-    /// per-call byte/time bound, so callers must measure its latency and reserve
-    /// rewrite headroom. This API alone does not impose a disk quota.
+    /// barrier. Sizing and that barrier briefly exclude foreground work; the
+    /// native rewrite then overlaps appends and reads. Its eligible append prefix
+    /// and tombstones are captured with the rewrite reservation. Native payload
+    /// readers are excluded only for physical file retirement. An error or panic
+    /// fences every group on the node. This API does not bound filesystem latency.
     pub fn run(&self) -> Result<Vec<u64>> {
-        let _maintenance = self
+        let _job = self
             .node
-            .maintenance_gate
-            .write()
-            .map_err(|_| anyhow::anyhow!("maintenance gate poisoned"))?;
-        let _sync = self
-            .node
-            .sync_gate
+            .maintenance_job
             .lock()
-            .map_err(|_| anyhow::anyhow!("sync gate poisoned"))?;
-        let _exclusive = self
+            .map_err(|_| anyhow::anyhow!("maintenance job lock poisoned"))?;
+        // A refresh cannot measure uncounted native rewrite growth while its
+        // reservation is in flight. Ordinary appends retain their growth counter.
+        let _files = self
             .node
-            .append_gate
+            .filesystem
             .write()
-            .map_err(|_| anyhow::anyhow!("append gate poisoned"))?;
+            .map_err(|_| anyhow::anyhow!("filesystem lifecycle lock poisoned"))?;
         self.node.check()?;
         let groups = self.run_pass(false)?;
         if self.node.budget.get().is_some_and(|budget| {
@@ -64,47 +62,68 @@ impl LogMaintenance {
         // fence a healthy node. Existing accepted traffic still owns its window.
         // Exclude writes while sizing live entries. Dead segments need deletion,
         // not another directory-sized reservation that can prevent their cleanup.
-        let _reservation = self
-            .node
-            .budget
-            .get()
-            .map(|budget| {
-                let bytes = self
-                    .node
-                    .engine
-                    .estimated_rewrite_bytes()
-                    .and_then(|live| {
-                        usize::try_from(self.node.target_file_bytes)
-                            .ok()?
-                            .checked_mul(2)?
-                            .checked_add(live)
-                    })
-                    .context("native rewrite reservation overflow")?;
-                budget.reserve(bytes, false)
-            })
-            .transpose()?;
-        let result = self.run_locked(force_rewrite);
+        let (_reservation, boundary) = {
+            let _maintenance = self
+                .node
+                .maintenance_gate
+                .write()
+                .map_err(|_| anyhow::anyhow!("maintenance gate poisoned"))?;
+            let _sync = self
+                .node
+                .sync_gate
+                .lock()
+                .map_err(|_| anyhow::anyhow!("sync gate poisoned"))?;
+            let _exclusive = self
+                .node
+                .append_gate
+                .write()
+                .map_err(|_| anyhow::anyhow!("append gate poisoned"))?;
+            self.node.check()?;
+            let reservation = self
+                .node
+                .budget
+                .get()
+                .map(|budget| {
+                    let bytes = self
+                        .node
+                        .engine
+                        .estimated_rewrite_bytes()
+                        .and_then(|live| {
+                            usize::try_from(self.node.target_file_bytes)
+                                .ok()?
+                                .checked_mul(2)?
+                                .checked_add(live)
+                        })
+                        .context("native rewrite reservation overflow")?;
+                    budget.reserve(bytes, false)
+                })
+                .transpose()?;
+            if let Err(error) = self.node.sync_locked() {
+                self.node.failed.store(true, Ordering::Release);
+                return Err(error);
+            }
+            // Later appends and their tombstones stay outside this pass. Rewrite
+            // queue values cannot grow while our node-wide job guard is held.
+            let boundary = self.node.engine.purge_manager().capture_append_boundary();
+            (reservation, boundary)
+        };
+        let result = self.run_native(force_rewrite, boundary);
         if result.is_err() {
             self.node.failed.store(true, Ordering::Release);
         }
         result
     }
 
-    fn run_locked(&self, force_rewrite: bool) -> Result<Vec<u64>> {
-        // The maintenance gate drained pending appends and checkpoint writes.
-        // Establish an explicit durable marker before the native rewrite too.
-        self.node.sync_locked()?;
-        let _files = self
-            .node
-            .filesystem
-            .write()
-            .map_err(|_| anyhow::anyhow!("filesystem lifecycle lock poisoned"))?;
+    fn run_native(&self, force_rewrite: bool, boundary: (u64, usize)) -> Result<Vec<u64>> {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if force_rewrite {
                 self.node.engine.purge_manager().reclaim_rewrite_queue()?;
                 Ok(Vec::new())
             } else {
-                self.node.engine.purge_expired_files()
+                self.node
+                    .engine
+                    .purge_manager()
+                    .purge_expired_files_before(boundary)
             }
         }));
         let mut groups = match outcome {
@@ -122,8 +141,8 @@ impl LogMaintenance {
         groups.sort_unstable();
         groups.dedup();
         if let Some(budget) = self.node.budget.get() {
-            // Native rewrites are outside Engine::write. While every appender
-            // and image collector is excluded, replace the measured baseline.
+            // Native rewrites have completed. The filesystem lifecycle excludes
+            // other unlink/rename work; concurrent appends use the growth counter.
             budget.refresh_exclusive()?;
         }
         self.node.check()?;

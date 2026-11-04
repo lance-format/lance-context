@@ -304,6 +304,7 @@ where
         log_idx: u64,
     ) -> Result<Option<M::Entry>> {
         let _t = StopWatch::new(&*ENGINE_READ_ENTRY_DURATION_HISTOGRAM);
+        let _files = self.purge_manager.payload_reads.read();
         if let Some(memtable) = self.memtables.get(region_id) {
             if let Some(idx) = memtable.read().get_entry(log_idx) {
                 ENGINE_READ_ENTRY_COUNT_HISTOGRAM.observe(1.0);
@@ -351,6 +352,7 @@ where
         vec: &mut Vec<M::Entry>,
     ) -> Result<usize> {
         let _t = StopWatch::new(&*ENGINE_READ_ENTRY_DURATION_HISTOGRAM);
+        let _files = self.purge_manager.payload_reads.read();
         if let Some(memtable) = self.memtables.get(region_id) {
             let mut ents_idx: Vec<EntryIndex> = Vec::with_capacity((end - begin) as usize);
             memtable

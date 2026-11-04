@@ -3,6 +3,7 @@ use std::{fs, path::PathBuf};
 
 mod pressure;
 mod rewrite_allowance;
+mod rewrite_pause;
 
 fn layout() -> Layout {
     Layout {

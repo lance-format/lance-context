@@ -49,6 +49,9 @@ where
     global_stats: Arc<GlobalStats>,
     listeners: Vec<Arc<dyn EventListener>>,
     pub(crate) read_cache_id: u64,
+    // Keep an entry's selected file alive until its payload read finishes.
+    // Rewrites can overlap readers; only physical file retirement excludes them.
+    pub(crate) payload_reads: RwLock<()>,
 
     // Only one thread can run `purge_expired_files` at a time.
     //
@@ -75,11 +78,31 @@ where
             global_stats,
             listeners,
             read_cache_id: next_read_cache_id(),
+            payload_reads: RwLock::new(()),
             force_rewrite_candidates: Arc::new(Mutex::new(HashMap::default())),
         }
     }
 
     pub fn purge_expired_files(&self) -> Result<Vec<u64>> {
+        self.purge_expired_files_inner(None)
+    }
+
+    /// Capture while appends are excluded, together with the caller's rewrite
+    /// allowance. Later writes cannot enlarge the eligible append prefix.
+    #[cfg(feature = "internals")]
+    pub fn capture_append_boundary(&self) -> (FileSeq, usize) {
+        (
+            self.pipe_log.file_span(LogQueue::Append).1,
+            self.memtables.cleaned_region_count(),
+        )
+    }
+
+    #[cfg(feature = "internals")]
+    pub fn purge_expired_files_before(&self, boundary: (FileSeq, usize)) -> Result<Vec<u64>> {
+        self.purge_expired_files_inner(Some(boundary))
+    }
+
+    fn purge_expired_files_inner(&self, boundary: Option<(FileSeq, usize)>) -> Result<Vec<u64>> {
         let _t = StopWatch::new(&*ENGINE_PURGE_DURATION_HISTOGRAM);
         let guard = self.force_rewrite_candidates.try_lock();
         if guard.is_none() {
@@ -102,18 +125,27 @@ where
                 self.append_queue_watermarks()
             {
                 let (first_append, latest_append) = self.pipe_log.file_span(LogQueue::Append);
-                let append_queue_barrier =
+                let mut append_queue_barrier =
                     self.listeners.iter().fold(latest_append, |barrier, l| {
                         l.first_file_not_ready_for_purge(LogQueue::Append)
                             .map_or(barrier, |f| std::cmp::min(f, barrier))
                     });
+                let (rewrite_watermark, compact_watermark) = if let Some((before, _)) = boundary {
+                    append_queue_barrier = append_queue_barrier.min(before).max(first_append);
+                    (
+                        rewrite_watermark.min(before.saturating_sub(1)),
+                        compact_watermark.min(before.saturating_sub(1)),
+                    )
+                } else {
+                    (rewrite_watermark, compact_watermark)
+                };
 
                 // Ordering
                 // 1. Must rewrite tombstones AFTER acquiring `append_queue_barrier`, or
                 //    deletion marks might be lost after restart.
                 // 2. Must rewrite tombstones BEFORE rewrite entries, or entries from recreated
                 //    region might be lost after restart.
-                self.rewrite_append_queue_tombstones()?;
+                self.rewrite_append_queue_tombstones_up_to(boundary.map(|(_, count)| count))?;
                 should_compact.extend(self.rewrite_or_compact_append_queue(
                     rewrite_watermark,
                     compact_watermark,
@@ -318,7 +350,13 @@ where
     }
 
     fn rewrite_append_queue_tombstones(&self) -> Result<()> {
-        let mut log_batch = self.memtables.take_cleaned_region_logs();
+        self.rewrite_append_queue_tombstones_up_to(None)
+    }
+
+    fn rewrite_append_queue_tombstones_up_to(&self, limit: Option<usize>) -> Result<()> {
+        let mut log_batch = self
+            .memtables
+            .take_cleaned_region_logs_up_to(limit.unwrap_or(usize::MAX));
         self.rewrite_impl(
             &mut log_batch,
             None, /* rewrite_watermark */
@@ -329,6 +367,7 @@ where
 
     // Exclusive.
     fn rescan_memtables_and_purge_stale_files(&self, queue: LogQueue, seq: FileSeq) -> Result<()> {
+        let _readers = self.payload_reads.write();
         let min_seq = self.memtables.fold(seq, |min, t| {
             t.min_file_seq(queue).map_or(min, |m| std::cmp::min(min, m))
         });
