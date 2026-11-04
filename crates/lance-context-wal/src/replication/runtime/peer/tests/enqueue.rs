@@ -15,6 +15,7 @@ async fn observe(pressure: Pressure) -> Result<()> {
     let mut message = Message {
         from: 1,
         to: 2,
+        term: 1,
         ..Default::default()
     };
     message.set_msg_type(MessageType::MsgAppend);
@@ -66,12 +67,14 @@ async fn observe(pressure: Pressure) -> Result<()> {
     drop(outbox);
     let (_stop, stopped) = watch::channel(false);
     let statistics = Arc::new(Statistics::default());
+    let mut failures = Vec::new();
     dispatch(
         incoming,
         BTreeMap::from([(2, route)]),
         Arc::new(OnceLock::new()),
         stopped,
         statistics.clone(),
+        |failed| failures.push(failed),
     )
     .await?;
     let counts = (
@@ -87,6 +90,22 @@ async fn observe(pressure: Pressure) -> Result<()> {
         Pressure::Closed => ((0, 0, 0, 3), false),
     };
     assert_eq!(counts, expected);
+    let rejected_groups = if accepted {
+        vec![20, 10]
+    } else {
+        vec![10, 20, 10]
+    };
+    assert_eq!(
+        failures,
+        rejected_groups
+            .into_iter()
+            .map(|group| FailedAppend {
+                group,
+                to: 2,
+                term: 1
+            })
+            .collect::<Vec<_>>()
+    );
     assert_eq!(
         statistics.dropped_outbound.load(Ordering::Relaxed),
         if accepted { 2 } else { 3 }
@@ -133,4 +152,151 @@ async fn peer_enqueue_observes_full_queue_and_returns_destination_credits() -> R
 #[tokio::test]
 async fn peer_enqueue_observes_closed_queue_and_returns_destination_credits() -> Result<()> {
     observe(Pressure::Closed).await
+}
+
+#[tokio::test]
+async fn rejected_append_returns_to_probe_and_reopens_the_acknowledged_record() -> Result<()> {
+    use crate::replication::tests::pump;
+    use raft::ProgressState;
+
+    let directory = tempfile::tempdir()?;
+    let open = || {
+        (1..=3)
+            .map(|id| {
+                Node::open(
+                    &directory.path().join(id.to_string()),
+                    layout(),
+                    id,
+                    Limits::default(),
+                )
+            })
+            .collect::<Result<Vec<_>>>()
+    };
+    let mut nodes = open()?;
+    nodes[0].campaign(10)?;
+    pump(&mut nodes)?;
+    let expected = batch(1);
+    nodes[0].propose(10, 7, expected.clone())?;
+    let mut events = nodes[0].poll()?;
+    assert!(events.completions.is_empty());
+    let selected = events
+        .messages
+        .iter()
+        .position(|p| {
+            p.group == 10 && p.message.to == 2 && p.message.get_msg_type() == MessageType::MsgAppend
+        })
+        .unwrap();
+    let packet = events.messages.remove(selected);
+    let failure = FailedAppend::capture(&packet).unwrap();
+    assert_eq!(
+        nodes[0].groups[&10].raw.raft.prs().get(2).unwrap().state,
+        ProgressState::Replicate
+    );
+
+    // The real dispatcher rejects a native Ready packet at its byte limit.
+    // Feed the resulting failure back before delivering the healthy voter ACK.
+    let (send, incoming) = mpsc::channel(1);
+    send.send(Outbound {
+        packet,
+        _credit: None,
+        image: None,
+        snapshot_feedback: None,
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("test outbox closed"))?;
+    drop(send);
+    let (send, _receive) = mpsc::channel(1);
+    let route = Route {
+        send,
+        ready: Arc::new(AtomicBool::new(true)),
+        bytes: Arc::new(Semaphore::new(0)),
+    };
+    let (_stop, stopped) = watch::channel(false);
+    let statistics = Arc::new(Statistics::default());
+    let mut failures = Vec::new();
+    dispatch(
+        incoming,
+        BTreeMap::from([(2, route)]),
+        Arc::new(OnceLock::new()),
+        stopped,
+        statistics.clone(),
+        |failed| failures.push(failed),
+    )
+    .await?;
+    assert_eq!(statistics.enqueue_byte_capacity.load(Ordering::Relaxed), 1);
+    assert_eq!(failures, vec![failure]);
+    failure.apply(&mut nodes[0])?;
+    assert_eq!(
+        nodes[0].groups[&10].raw.raft.prs().get(2).unwrap().state,
+        ProgressState::Probe
+    );
+    assert!(nodes[0].poll()?.completions.is_empty());
+    for packet in events.messages {
+        nodes[packet.message.to as usize - 1].step(packet)?;
+    }
+    let completed = pump(&mut nodes)?;
+    let Outcome::Committed(Applied::Accepted { index }) = completed
+        .into_iter()
+        .find(|c| c.request == 7)
+        .unwrap()
+        .outcome
+    else {
+        anyhow::bail!("healthy quorum did not acknowledge the original record");
+    };
+    for _ in 0..10 {
+        nodes[0].tick()?;
+        pump(&mut nodes)?;
+    }
+    for node in &nodes {
+        assert!(node.read_accepted(10, index)?.unwrap() == expected);
+    }
+
+    // Reopen as followers and elect a fresh term through the supported peer
+    // protocol. Delayed old-term feedback must not reset the new leader.
+    drop(nodes);
+    nodes = open()?;
+    assert_eq!(
+        nodes[0].groups[&10].raw.raft.state,
+        raft::StateRole::Follower
+    );
+    failure.apply(&mut nodes[0])?;
+    nodes[0].campaign(10)?;
+    pump(&mut nodes)?;
+    assert!(nodes[0].groups[&10].raw.raft.term > failure.term);
+    assert_eq!(
+        nodes[0].groups[&10].raw.raft.prs().get(2).unwrap().state,
+        ProgressState::Replicate
+    );
+    failure.apply(&mut nodes[0])?;
+    assert_eq!(
+        nodes[0].groups[&10].raw.raft.prs().get(2).unwrap().state,
+        ProgressState::Replicate
+    );
+    drop(nodes);
+    for node in open()? {
+        assert!(node.read_accepted(10, index)?.unwrap() == expected);
+    }
+    Ok(())
+}
+
+#[test]
+fn append_feedback_excludes_quorum_responses_and_snapshot_delivery() {
+    for kind in [
+        MessageType::MsgAppendResponse,
+        MessageType::MsgHeartbeat,
+        MessageType::MsgHeartbeatResponse,
+        MessageType::MsgSnapshot,
+        MessageType::MsgReadIndexResp,
+    ] {
+        let mut message = Message::default();
+        message.set_msg_type(kind);
+        let packet = Packet {
+            cluster: uuid::Uuid::nil(),
+            layout: [0; 32],
+            policy: [0; 32],
+            group: 10,
+            message,
+        };
+        assert_eq!(FailedAppend::capture(&packet), None);
+    }
 }

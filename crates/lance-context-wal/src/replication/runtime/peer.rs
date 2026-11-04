@@ -240,12 +240,18 @@ impl Transport {
                 (statistics.clone(), statistics.destinations[&id].clone()),
             )));
         }
+        let feedback = handle.clone();
         tasks.push(tokio::spawn(dispatch(
             outbox,
             routes,
             snapshots.clone(),
             shutdown.clone(),
             statistics.clone(),
+            move |failed: FailedAppend| {
+                // Use the existing bounded control lane. If it is unavailable,
+                // ordinary Raft heartbeats still provide the fallback progress.
+                let _ = feedback.local(failed.group, move |node| failed.apply(node));
+            },
         )));
         tasks.push(tokio::spawn(listen(
             handle,
@@ -350,25 +356,61 @@ impl Route {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FailedAppend {
+    group: u64,
+    to: u64,
+    term: u64,
+}
+impl FailedAppend {
+    fn capture(packet: &Packet) -> Option<Self> {
+        (packet.message.get_msg_type() == raft_proto::eraftpb::MessageType::MsgAppend).then_some(
+            Self {
+                group: packet.group,
+                to: packet.message.to,
+                term: packet.message.term,
+            },
+        )
+    }
+
+    fn apply(self, node: &mut super::super::Node) -> Result<()> {
+        node.healthy()?;
+        let group = node.groups.get_mut(&self.group).context("unhosted group")?;
+        // A queued failure can outlive its leader. It must not reset a new
+        // term's replication progress or affect a follower's state.
+        if group.raw.raft.state == raft::StateRole::Leader && group.raw.raft.term == self.term {
+            group.raw.report_unreachable(self.to);
+        }
+        Ok(())
+    }
+}
+
 async fn dispatch(
     mut outbox: mpsc::Receiver<Outbound>,
     routes: BTreeMap<u64, Route>,
     snapshots: Arc<OnceLock<snapshot::Route>>,
     mut stop: watch::Receiver<bool>,
     statistics: Arc<Statistics>,
+    mut rejected_append: impl FnMut(FailedAppend) + Send,
 ) -> Result<()> {
     loop {
         tokio::select! {
             _ = stop.changed() => return Ok(()),
             packet = outbox.recv() => {
                 let Some(packet) = packet else { return Ok(()); };
+                let failed = FailedAppend::capture(packet.packet());
                 let sent = if packet.snapshot_image().is_some() {
                     snapshots.get().is_some_and(|route| route.enqueue(packet))
                 } else {
                     routes.get(&packet.packet().message.to)
                         .is_some_and(|route| route.enqueue(packet, &statistics))
                 };
-                if !sent { statistics.dropped_outbound.fetch_add(1, Ordering::Relaxed); }
+                if !sent {
+                    statistics.dropped_outbound.fetch_add(1, Ordering::Relaxed);
+                    if let Some(failed) = failed {
+                        rejected_append(failed);
+                    }
+                }
             }
         }
     }
