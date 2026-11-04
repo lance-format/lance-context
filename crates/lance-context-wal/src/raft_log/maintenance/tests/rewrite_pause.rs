@@ -2,6 +2,97 @@ use super::*;
 use std::{sync::mpsc, time::Duration};
 
 #[test]
+fn captured_prefix_reservation_preserves_foreground_admission() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let layout = layout();
+    let log = PhysicalLog::open_with_file_size(root.path(), &layout, 1, 64 << 10)?;
+    let group = log.group(10)?;
+    let records: Vec<_> = (1..=16)
+        .map(|index| Entry {
+            data: vec![index as u8; 256 << 10].into(),
+            ..entry(10, index)
+        })
+        .collect();
+    for record in &records {
+        group.persist(
+            std::slice::from_ref(record),
+            Some(&HardState {
+                term: 1,
+                vote: 1,
+                commit: record.index,
+                ..Default::default()
+            }),
+        )?;
+    }
+    group.configure_disk(DiskOptions {
+        max_bytes: 16 << 20,
+        data_bytes: 8 << 20,
+        headroom_bytes: 2 << 20,
+    })?;
+    let budget = group.disk_budget().unwrap().clone();
+    const REQUEST: usize = 32 << 10;
+    drop(budget.reserve(REQUEST, true)?);
+    let all_live = group.node.engine.estimated_rewrite_bytes().unwrap() as u64
+        + group.node.target_file_bytes * 2;
+    let before = budget.snapshot();
+    assert!(before.accounted_disk_bytes + all_live + REQUEST as u64 > before.data_limit);
+    let pause = group.node.fault.pause_rewrite_sync_for_test();
+    let maintenance = group.maintenance();
+    let maintain = std::thread::spawn(move || maintenance.run());
+    if let Err(error) = pause.wait() {
+        drop(pause);
+        maintain.join().unwrap()?;
+        return Err(error.context("fixture did not reach a real rewrite sync"));
+    }
+    let during = budget.snapshot();
+    let producer = budget.reserve(REQUEST, true);
+    let admitted = producer.is_ok();
+    // A reduced rewrite allowance must still consume the same data ceiling.
+    let remaining = during
+        .data_limit
+        .saturating_sub(during.accounted_disk_bytes + during.reserved_proposal_bytes);
+    let too_large = budget.reserve(usize::try_from(remaining)? + 1, true);
+    drop(pause);
+    maintain.join().unwrap()?;
+    assert!(admitted, "ineligible append tail closed data admission");
+    assert!(too_large.is_err(), "shared data ceiling was bypassed");
+    assert!(during.reserved_proposal_bytes + (256 << 10) < all_live);
+    let reservation = producer?;
+    let next = Entry {
+        data: vec![17; 16 << 10].into(),
+        ..entry(10, 17)
+    };
+    group.persist(
+        std::slice::from_ref(&next),
+        Some(&HardState {
+            term: 1,
+            vote: 1,
+            commit: 17,
+            ..Default::default()
+        }),
+    )?;
+    drop(reservation);
+    eprintln!(
+        "captured prefix: all_live_reservation={all_live}, prefix_reservation={}, accounted={}, data_limit={}; producer admitted during rewrite; oversized request refused",
+        during.reserved_proposal_bytes,
+        during.accounted_disk_bytes,
+        during.data_limit,
+    );
+    assert_eq!(budget.snapshot().reserved_proposal_bytes, 0);
+    drop((group, budget, log));
+    let reopened = PhysicalLog::open(root.path(), &layout, 1)?;
+    let group = reopened.group(10)?;
+    assert_eq!(group.initial_state()?.hard_state.commit, 17);
+    let mut expected = records;
+    expected.push(next);
+    assert_eq!(
+        group.entries(1, 18, None, GetEntriesContext::empty(false))?,
+        expected
+    );
+    Ok(())
+}
+
+#[test]
 fn slow_background_rewrite_does_not_stop_foreground_append_or_retained_read() -> Result<()> {
     let root = tempfile::tempdir()?;
     let layout = layout();
@@ -172,7 +263,7 @@ fn rewrite_allowance_excludes_later_snapshot_entries_and_tombstones() -> Result<
             .engine
             .purge_manager()
             .capture_append_boundary()
-            .1
+            .cleaned_regions()
     });
     let reserved_after = budget.snapshot().reserved_proposal_bytes;
     drop(pause);
@@ -189,7 +280,7 @@ fn rewrite_allowance_excludes_later_snapshot_entries_and_tombstones() -> Result<
             .engine
             .purge_manager()
             .capture_append_boundary()
-            .1,
+            .cleaned_regions(),
         1,
         "new snapshot tombstone consumed by an older rewrite allowance"
     );

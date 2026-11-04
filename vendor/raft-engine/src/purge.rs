@@ -39,6 +39,22 @@ fn max_forcely_sync_bytes() -> usize {
     max_batch_bytes() * 4
 }
 
+/// Limits one maintenance pass to the append prefix sized by its caller.
+/// Capture while appends and other maintenance are excluded. Later appends
+/// cannot enlarge either the rewrite watermark or the tombstone allowance.
+#[derive(Clone, Copy)]
+pub struct RewriteBoundary {
+    file: FileSeq,
+    cleaned_regions: usize,
+    pub(crate) watermark: FileSeq,
+}
+
+impl RewriteBoundary {
+    pub fn cleaned_regions(&self) -> usize {
+        self.cleaned_regions
+    }
+}
+
 pub struct PurgeManager<P>
 where
     P: PipeLog,
@@ -90,19 +106,20 @@ where
     /// Capture while appends are excluded, together with the caller's rewrite
     /// allowance. Later writes cannot enlarge the eligible append prefix.
     #[cfg(feature = "internals")]
-    pub fn capture_append_boundary(&self) -> (FileSeq, usize) {
-        (
-            self.pipe_log.file_span(LogQueue::Append).1,
-            self.memtables.cleaned_region_count(),
-        )
+    pub fn capture_append_boundary(&self) -> RewriteBoundary {
+        RewriteBoundary {
+            file: self.pipe_log.file_span(LogQueue::Append).1,
+            cleaned_regions: self.memtables.cleaned_region_count(),
+            watermark: self.append_queue_watermarks().0.unwrap_or(0),
+        }
     }
 
     #[cfg(feature = "internals")]
-    pub fn purge_expired_files_before(&self, boundary: (FileSeq, usize)) -> Result<Vec<u64>> {
+    pub fn purge_expired_files_before(&self, boundary: RewriteBoundary) -> Result<Vec<u64>> {
         self.purge_expired_files_inner(Some(boundary))
     }
 
-    fn purge_expired_files_inner(&self, boundary: Option<(FileSeq, usize)>) -> Result<Vec<u64>> {
+    fn purge_expired_files_inner(&self, boundary: Option<RewriteBoundary>) -> Result<Vec<u64>> {
         let _t = StopWatch::new(&*ENGINE_PURGE_DURATION_HISTOGRAM);
         let guard = self.force_rewrite_candidates.try_lock();
         if guard.is_none() {
@@ -130,11 +147,12 @@ where
                         l.first_file_not_ready_for_purge(LogQueue::Append)
                             .map_or(barrier, |f| std::cmp::min(f, barrier))
                     });
-                let (rewrite_watermark, compact_watermark) = if let Some((before, _)) = boundary {
-                    append_queue_barrier = append_queue_barrier.min(before).max(first_append);
+                let (rewrite_watermark, compact_watermark) = if let Some(boundary) = boundary {
+                    append_queue_barrier =
+                        append_queue_barrier.min(boundary.file).max(first_append);
                     (
-                        rewrite_watermark.min(before.saturating_sub(1)),
-                        compact_watermark.min(before.saturating_sub(1)),
+                        rewrite_watermark.min(boundary.watermark),
+                        compact_watermark.min(boundary.watermark),
                     )
                 } else {
                     (rewrite_watermark, compact_watermark)
@@ -145,7 +163,7 @@ where
                 //    deletion marks might be lost after restart.
                 // 2. Must rewrite tombstones BEFORE rewrite entries, or entries from recreated
                 //    region might be lost after restart.
-                self.rewrite_append_queue_tombstones_up_to(boundary.map(|(_, count)| count))?;
+                self.rewrite_append_queue_tombstones_up_to(boundary.map(|b| b.cleaned_regions))?;
                 should_compact.extend(self.rewrite_or_compact_append_queue(
                     rewrite_watermark,
                     compact_watermark,

@@ -180,22 +180,30 @@ impl MemTable<VacantAllocator> {
 }
 
 impl<A: AllocatorTrait> MemTable<A> {
-    fn rewrite_size_hint(&self) -> Option<usize> {
+    fn rewrite_size_hint(&self, append_watermark: FileSeq) -> Option<usize> {
         // Include framing even if each item is emitted in its own batch. The
         // per-group allowance covers framing and atomic-group markers for both
         // the rewrite-queue and append-queue portions of one maintenance pass.
         let entries = self
             .entry_indexes
             .iter()
+            .filter(|entry| {
+                let file = entry.entries.unwrap().id;
+                file.queue == LogQueue::Rewrite || file.seq <= append_watermark
+            })
             .try_fold(1024usize, |size, entry| {
                 size.checked_add(entry.entry_len as usize)?.checked_add(128)
             })?;
         self.kvs
             .iter()
-            .try_fold(entries, |size, (key, (value, _))| {
-                size.checked_add(key.len())?
-                    .checked_add(value.len())?
-                    .checked_add(128)
+            .try_fold(entries, |size, (key, (value, file))| {
+                if file.queue == LogQueue::Rewrite || file.seq <= append_watermark {
+                    size.checked_add(key.len())?
+                        .checked_add(value.len())?
+                        .checked_add(128)
+                } else {
+                    Some(size)
+                }
             })
     }
 
@@ -1030,15 +1038,16 @@ impl<A: AllocatorTrait> MemTableAccessor<A> {
         init
     }
 
-    pub(crate) fn rewrite_size_hint(&self) -> Option<usize> {
+    pub(crate) fn rewrite_size_hint(&self, append_watermark: FileSeq) -> Option<usize> {
         let live = self.fold(Some(0usize), |size, table| {
-            size?.checked_add(table.rewrite_size_hint()?)
+            size?.checked_add(table.rewrite_size_hint(append_watermark)?)
         })?;
         let tombstones = self.removed_memtables.lock().len().checked_mul(128)?;
         // A pass rewrites the rewrite queue before the append queue. The latter
         // selects only append entries/KVs, so it cannot rewrite the former's
         // output again. With concurrent writes excluded, each live item needs
-        // at most one copy; allow all items without predicting which are chosen.
+        // at most one copy; allow every item within the captured file watermark
+        // without predicting which groups are chosen.
         live.checked_add(tombstones)
     }
 

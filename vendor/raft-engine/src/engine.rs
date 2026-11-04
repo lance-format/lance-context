@@ -432,7 +432,19 @@ where
     /// Callers must exclude concurrent writes/maintenance and account for allocation rounding;
     /// this is not a hard filesystem-space guarantee. None means size overflow.
     pub fn estimated_rewrite_bytes(&self) -> Option<usize> {
-        self.memtables.rewrite_size_hint()
+        self.memtables.rewrite_size_hint(u64::MAX)
+    }
+
+    /// Conservative allowance for a pass using this captured append boundary.
+    /// Includes every live rewrite-queue value, eligible append values and
+    /// tombstones, without decoding payloads. Capture and size while writes and
+    /// other maintenance are excluded; execute with the same boundary.
+    #[cfg(feature = "internals")]
+    pub fn estimated_rewrite_bytes_before(
+        &self,
+        boundary: crate::purge::RewriteBoundary,
+    ) -> Option<usize> {
+        self.memtables.rewrite_size_hint(boundary.watermark)
     }
 
     /// Conservative allowance for reclaiming only the rewrite queue.
