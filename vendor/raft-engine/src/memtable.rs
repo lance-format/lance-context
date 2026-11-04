@@ -199,6 +199,30 @@ impl<A: AllocatorTrait> MemTable<A> {
             })
     }
 
+    fn rewrite_queue_size_hint(&self) -> Option<usize> {
+        // A rewrite-queue pass never copies append entries or append KVs.
+        // Its live values cannot grow while other maintenance is excluded;
+        // concurrent appends/checkpoints only replace or remove these values.
+        let entries = self
+            .entry_indexes
+            .iter()
+            .take(self.rewrite_count)
+            .try_fold(1024usize, |size, entry| {
+                size.checked_add(entry.entry_len as usize)?.checked_add(128)
+            })?;
+        self.kvs
+            .iter()
+            .try_fold(entries, |size, (key, (value, file))| {
+                if file.queue == LogQueue::Rewrite {
+                    size.checked_add(key.len())?
+                        .checked_add(value.len())?
+                        .checked_add(128)
+                } else {
+                    Some(size)
+                }
+            })
+    }
+
     fn with_allocator(
         region_id: u64,
         global_stats: Arc<GlobalStats>,
@@ -1016,6 +1040,14 @@ impl<A: AllocatorTrait> MemTableAccessor<A> {
         // output again. With concurrent writes excluded, each live item needs
         // at most one copy; allow all items without predicting which are chosen.
         live.checked_add(tombstones)
+    }
+
+    pub(crate) fn rewrite_queue_size_hint(&self) -> Option<usize> {
+        // Pending Clean commands belong to the append queue and are not
+        // consumed by rewrite-queue reclamation.
+        self.fold(Some(0usize), |size, table| {
+            size?.checked_add(table.rewrite_queue_size_hint()?)
+        })
     }
 
     pub fn collect<F: FnMut(&MemTable<A>) -> bool>(
