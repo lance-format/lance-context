@@ -22,6 +22,10 @@ use crate::rollout_append::Generation;
 const MAX_GENERATIONS: usize = 256;
 const MAX_INTENT_BYTES: usize = 128 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
+// Intent publication is on the merge's commit-to-drain path. Allow brief
+// object-store throttling to recover without abandoning an already committed
+// merge, while keeping background discovery/collection metadata I/O short.
+const PUBLICATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -96,7 +100,7 @@ pub(crate) async fn record(
             return Err(Error::io("WAL retirement intent exceeds size bound"));
         }
         let key = prefix(root).join(Uuid::new_v4().simple().to_string());
-        io(async {
+        tokio::time::timeout(PUBLICATION_TIMEOUT, async {
             store
                 .inner
                 .put_opts(
@@ -108,9 +112,10 @@ pub(crate) async fn record(
                     },
                 )
                 .await?;
-            Ok(())
+            Ok::<(), Error>(())
         })
-        .await?;
+        .await
+        .map_err(|_| Error::io("WAL retirement intent publication timed out"))??;
         tickets.push(key);
     }
     Ok(tickets)
@@ -235,6 +240,140 @@ pub(crate) async fn recover_pending(
 mod tests {
     use super::*;
     use lance_index::mem_wal::SsTable;
+
+    async fn publication_fixture() -> (Arc<ObjectStore>, Path, Uuid, Generation) {
+        let uri = format!("memory:///retirement-publication-{}", Uuid::new_v4());
+        let (store, root) = ObjectStore::from_uri(&uri).await.unwrap();
+        let shard = Uuid::new_v4();
+        let generation = Generation {
+            number: 1,
+            path: "abcdef12_gen_1".into(),
+        };
+        let manifests = ShardManifestStore::new(store.clone(), &root, shard, 16);
+        manifests
+            .initialize_shard(0, Default::default())
+            .await
+            .unwrap();
+        manifests
+            .commit_update(0, |current| {
+                let mut next = current.clone();
+                next.version += 1;
+                next.current_generation = 2;
+                next.sstables.push(SsTable {
+                    generation: 1,
+                    path: generation.path.clone(),
+                    in_memory_bytes: Some(1),
+                    physical_rows: Some(1),
+                    primary_key_bytes: Some(1),
+                });
+                next
+            })
+            .await
+            .unwrap();
+        store
+            .put(&data_path(&root, shard, &generation.path), b"payload")
+            .await
+            .unwrap();
+        (store, root, shard, generation)
+    }
+
+    fn delayed(store: &ObjectStore, put_secs: u64, get_secs: u64) -> Arc<ObjectStore> {
+        use object_store::throttle::{ThrottleConfig, ThrottledStore};
+        let mut wrapped = store.clone();
+        wrapped.inner = Arc::new(ThrottledStore::new(
+            store.inner.clone(),
+            ThrottleConfig {
+                wait_put_per_call: Duration::from_secs(put_secs),
+                wait_get_per_call: Duration::from_secs(get_secs),
+                ..Default::default()
+            },
+        ));
+        Arc::new(wrapped)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn publication_survives_slow_put_without_relaxing_collection_reads() {
+        let (store, root, shard, generation) = publication_fixture().await;
+        let tickets = record(
+            delayed(&store, 6, 0),
+            &root,
+            shard,
+            vec![generation.clone()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(tickets.len(), 1);
+        // A slower publication must not extend background metadata read limits.
+        let error = recover_one(delayed(&store, 0, 6), &root, &tickets[0])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("metadata operation timed out"));
+        assert!(!recover_one(store.clone(), &root, &tickets[0])
+            .await
+            .unwrap());
+        assert!(store
+            .inner
+            .head(&data_path(&root, shard, &generation.path))
+            .await
+            .is_ok());
+        drain(store.clone(), &root, shard).await;
+        assert!(recover_one(store.clone(), &root, &tickets[0])
+            .await
+            .unwrap());
+        assert!(matches!(
+            store.inner.head(&tickets[0]).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+        assert!(matches!(
+            store
+                .inner
+                .head(&data_path(&root, shard, &generation.path))
+                .await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn publication_deadline_preserves_manifest_and_allows_later_retry() {
+        let (store, root, shard, generation) = publication_fixture().await;
+        let manifests = ShardManifestStore::new(store.clone(), &root, shard, 16);
+        let before = manifests.refresh_latest().await.unwrap().unwrap();
+        let started = tokio::time::Instant::now();
+        let error = record(
+            delayed(&store, 31, 0),
+            &root,
+            shard,
+            vec![generation.clone()],
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("intent publication timed out"));
+        assert_eq!(started.elapsed(), Duration::from_secs(30));
+        let after = manifests.refresh_latest().await.unwrap().unwrap();
+        assert_eq!(after.version, before.version);
+        assert_eq!(after.sstables.len(), 1);
+        assert_eq!(after.sstables[0].path, generation.path);
+        assert!(store
+            .inner
+            .head(&data_path(&root, shard, &generation.path))
+            .await
+            .is_ok());
+        assert!(store
+            .inner
+            .list(Some(&prefix(&root)))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .is_empty());
+        let tickets = record(store.clone(), &root, shard, vec![generation])
+            .await
+            .unwrap();
+        assert!(!recover_one(store.clone(), &root, &tickets[0])
+            .await
+            .unwrap());
+        drain(store.clone(), &root, shard).await;
+        assert!(recover_one(store, &root, &tickets[0]).await.unwrap());
+    }
 
     // Metadata/physical-file fixture: tests the recovery protocol independently
     // of base publication. Real merge publication remains covered by the paused
