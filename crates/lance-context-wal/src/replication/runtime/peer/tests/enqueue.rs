@@ -388,7 +388,9 @@ async fn rejection_burst_leaves_control_capacity_for_quorum_reads() -> Result<()
             query::Outcome::Observed { .. }
         ));
     }
-    wait_for(|| handle.shared.control.observation().used_requests == 0).await?;
+    wait_for(|| !feedback.pending.as_ref().unwrap().0.is_empty()).await?;
+    // Completed replies retain their admission credit until consumed too.
+    assert_eq!(handle.shared.control.observation().used_requests, 1);
 
     // Completion permits a later hint, so limiting the burst does not disable
     // feedback permanently. This result is still delivered after durable poll.
@@ -398,6 +400,7 @@ async fn rejection_burst_leaves_control_capacity_for_quorum_reads() -> Result<()
         term,
     });
     timeout(Duration::from_secs(10), feedback.pending.take().unwrap()).await??;
+    assert_eq!(handle.shared.control.observation().used_requests, 0);
     c.shutdown().await?;
     Ok(())
 }
