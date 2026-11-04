@@ -1500,7 +1500,21 @@ pub(crate) mod tests {
                     .await
                     .unwrap()
                     .is_some());
-                assert_eq!(writer.pending_wal_generations().await.unwrap(), 0);
+                assert_eq!(
+                    writer
+                        .own_shard_watermark()
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .pending_generations,
+                    0
+                );
+                assert_eq!(
+                    lance_context_core::wal_presence::has_pending_wal(&state.rollout_uri(target))
+                        .await
+                        .unwrap(),
+                    historical_pending
+                );
                 assert_eq!(
                     lance::Dataset::open(&state.rollout_uri(target))
                         .await
