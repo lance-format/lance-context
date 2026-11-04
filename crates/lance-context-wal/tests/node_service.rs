@@ -188,6 +188,10 @@ async fn run_cluster(f: &Fixture) -> Result<()> {
         );
     }
     let failed_exchanges = before_disconnect["peer_failed_exchanges"].as_u64().unwrap();
+    let rejections = &before_disconnect["peer_rejections"];
+    assert!(rejections["disk_budget"].is_u64());
+    assert!(rejections["other"].is_u64());
+    assert!(rejections["last_disk_refusal"].is_null());
     let destinations = before_disconnect["peer_destinations"].as_object().unwrap();
     assert_eq!(destinations.len(), 2);
     assert!(destinations
