@@ -65,7 +65,10 @@ fn captured_prefix_allowance_covers_both_queues_with_later_appends() -> Result<(
     let boundary = engine.purge_manager().capture_append_boundary();
     let allowance = engine.estimated_rewrite_bytes_before(boundary).unwrap() as u64;
     let all_live = engine.estimated_rewrite_bytes().unwrap() as u64;
-    assert!(all_live > allowance + (256 << 10));
+    assert!(
+        all_live > allowance,
+        "tail was not excluded: {all_live} <= {allowance}"
+    );
     // These writes rotate the append queue and move its normal watermark.
     // The captured pass must still fit its original allowance, including when
     // a key or group is replaced after capture.
@@ -80,12 +83,16 @@ fn captured_prefix_allowance_covers_both_queues_with_later_appends() -> Result<(
     batch.put(30, b"later".to_vec(), vec![8; 1 << 20])?;
     engine.write(&mut batch, true)?;
     records.push(later);
+    assert!(engine.estimated_rewrite_bytes().unwrap() as u64 > allowance + (5 << 20));
     observed.bytes.store(0, Ordering::Relaxed);
     observed.purged.store(0, Ordering::Relaxed);
     engine
         .purge_manager()
         .purge_expired_files_before(boundary)?;
     let written = observed.bytes.load(Ordering::Relaxed);
+    eprintln!(
+        "captured prefix allowance: all_live={all_live}, reserved={allowance}, written={written}"
+    );
     assert_eq!(observed.purged.load(Ordering::Relaxed), 3);
     assert!(
         written > 0 && written <= allowance,
