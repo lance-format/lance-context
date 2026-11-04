@@ -71,6 +71,7 @@ struct NodeEngine {
     written: Arc<AtomicU64>,
     budget: OnceLock<Arc<crate::admission::Budget>>,
     failed: AtomicBool,
+    maintenance_job: Mutex<()>,
     maintenance_gate: Arc<RwLock<()>>,
     filesystem: Arc<RwLock<()>>,
     append_gate: RwLock<()>,
@@ -445,6 +446,7 @@ impl PhysicalLog {
             written: Arc::new(AtomicU64::new(0)),
             budget: OnceLock::new(),
             failed: AtomicBool::new(false),
+            maintenance_job: Mutex::new(()),
             maintenance_gate: Arc::new(RwLock::new(())),
             filesystem: Arc::new(RwLock::new(())),
             append_gate: RwLock::new(()),
@@ -721,8 +723,8 @@ impl Storage for GroupLog {
         _: GetEntriesContext,
     ) -> raft::Result<Vec<Entry>> {
         let state = self.read().map_err(storage_error)?;
-        // Native maintenance can relocate entries and delete their old files.
-        // Keep its exclusive gate out until indexes and payloads are both read.
+        // Initial maintenance sizing/sync excludes us briefly. The native read
+        // guard then protects selected files against deletion during payload I/O.
         let _read = self
             .node
             .maintenance_gate

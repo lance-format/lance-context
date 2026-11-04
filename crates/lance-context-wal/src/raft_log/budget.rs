@@ -63,6 +63,12 @@ impl GroupLog {
     #[cfg(any(test, feature = "replication"))]
     pub(crate) fn configure_disk(&self, options: DiskOptions) -> Result<()> {
         options.validate()?;
+        // Match physical maintenance's lifecycle-before-admission lock order.
+        let _files = self
+            .node
+            .filesystem
+            .write()
+            .map_err(|_| anyhow::anyhow!("filesystem lifecycle lock poisoned"))?;
         let _guard = self
             .node
             .maintenance_gate
@@ -73,11 +79,6 @@ impl GroupLog {
             self.node.budget.get().is_none(),
             "node disk budget already configured"
         );
-        let _files = self
-            .node
-            .filesystem
-            .write()
-            .map_err(|_| anyhow::anyhow!("filesystem lifecycle lock poisoned"))?;
         let budget = Budget::new(
             &self.node.directory,
             self.node.written.clone(),

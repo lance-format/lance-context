@@ -17,12 +17,34 @@ pub(super) struct FaultControl {
     fail_sync: AtomicBool,
     fail_once: AtomicBool,
     fail_rewrite_sync: AtomicBool,
+    pause_rewrite_sync: AtomicBool,
+    pause_payload_read: AtomicBool,
     sync_calls: AtomicU64,
     entered: Mutex<Option<mpsc::SyncSender<()>>>,
     release: Mutex<Option<mpsc::Receiver<()>>>,
 }
 
 impl FaultControl {
+    pub(super) fn pause_rewrite_sync_for_test(&self) -> FilePause {
+        self.pause_for_test(&self.pause_rewrite_sync)
+    }
+
+    pub(super) fn pause_payload_read_for_test(&self) -> FilePause {
+        self.pause_for_test(&self.pause_payload_read)
+    }
+
+    fn pause_for_test(&self, armed: &AtomicBool) -> FilePause {
+        let (entered, wait_entered) = mpsc::sync_channel(1);
+        let (release, wait_release) = mpsc::channel();
+        *self.entered.lock().unwrap() = Some(entered);
+        *self.release.lock().unwrap() = Some(wait_release);
+        armed.store(true, Ordering::Release);
+        FilePause {
+            entered: wait_entered,
+            release,
+        }
+    }
+
     pub(super) fn fail_rewrite_sync_for_test(self: &Arc<Self>) -> RewriteSyncFault {
         self.fail_rewrite_sync.store(true, Ordering::Release);
         RewriteSyncFault(self.clone())
@@ -31,6 +53,24 @@ impl FaultControl {
     #[cfg(feature = "replication")]
     pub(super) fn fail_sync_for_test(&self) {
         self.fail_once.store(true, Ordering::Release);
+    }
+}
+
+pub(super) struct FilePause {
+    entered: mpsc::Receiver<()>,
+    release: mpsc::Sender<()>,
+}
+
+impl FilePause {
+    pub(super) fn wait(&self) -> Result<()> {
+        self.entered.recv_timeout(Duration::from_secs(10))?;
+        Ok(())
+    }
+}
+
+impl Drop for FilePause {
+    fn drop(&mut self) {
+        let _ = self.release.send(());
     }
 }
 
@@ -61,6 +101,19 @@ impl Handle for FaultHandle {
 
     fn sync(&self) -> io::Result<()> {
         self.control.sync_calls.fetch_add(1, Ordering::Relaxed);
+        if self.rewrite
+            && self
+                .control
+                .pause_rewrite_sync
+                .swap(false, Ordering::AcqRel)
+        {
+            if let Some(entered) = self.control.entered.lock().unwrap().take() {
+                let _ = entered.send(());
+            }
+            if let Some(release) = self.control.release.lock().unwrap().take() {
+                let _ = release.recv_timeout(Duration::from_secs(10));
+            }
+        }
         if self.control.fail_once.swap(false, Ordering::AcqRel)
             || self.control.fail_sync.load(Ordering::Acquire)
             || (self.rewrite && self.control.fail_rewrite_sync.swap(false, Ordering::AcqRel))
@@ -194,6 +247,19 @@ impl FileSystem for FaultFileSystem {
     }
 
     fn new_reader(&self, handle: Arc<Self::Handle>) -> io::Result<Self::Reader> {
+        if self
+            .control
+            .pause_payload_read
+            .swap(false, Ordering::AcqRel)
+        {
+            if let Some(entered) = self.control.entered.lock().unwrap().take() {
+                let _ = entered.send(());
+            }
+            if let Some(release) = self.control.release.lock().unwrap().take() {
+                // The RAII guard releases this even when the test unwinds.
+                let _ = release.recv();
+            }
+        }
         DefaultFileSystem.new_reader(handle.inner.clone())
     }
 

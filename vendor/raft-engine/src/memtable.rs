@@ -1038,9 +1038,19 @@ impl<A: AllocatorTrait> MemTableAccessor<A> {
     /// [`MemTable`]s. The records for these tables will be cleaned up
     /// afterwards.
     pub fn take_cleaned_region_logs(&self) -> LogBatch {
+        self.take_cleaned_region_logs_up_to(usize::MAX)
+    }
+
+    #[cfg(feature = "internals")]
+    pub(crate) fn cleaned_region_count(&self) -> usize {
+        self.removed_memtables.lock().len()
+    }
+
+    pub(crate) fn take_cleaned_region_logs_up_to(&self, limit: usize) -> LogBatch {
         let mut log_batch = LogBatch::default();
         let mut removed_memtables = self.removed_memtables.lock();
-        for id in removed_memtables.drain(..) {
+        let count = removed_memtables.len().min(limit);
+        for id in removed_memtables.drain(..count) {
             log_batch.add_command(id, Command::Clean);
         }
         log_batch
