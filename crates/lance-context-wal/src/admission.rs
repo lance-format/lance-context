@@ -11,11 +11,28 @@ use std::sync::{
 use anyhow::{ensure, Result};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug)]
-pub(crate) struct DiskBudgetExhausted;
+/// Byte values captured together under the accounting lock at a refused reservation.
+#[derive(Clone, Debug, Serialize)]
+pub struct DiskBudgetExhausted {
+    pub accounted_bytes: u64,
+    pub reserved_proposal_bytes: u64,
+    pub reserved_file_bytes: u64,
+    pub requested_bytes: u64,
+    pub limit_bytes: u64,
+}
 impl std::fmt::Display for DiskBudgetExhausted {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("node proposal disk budget exhausted; data admission preserves control window")
+        write!(
+            f,
+            "node proposal disk budget exhausted; data admission preserves control window \
+             (accounted_bytes={}, reserved_proposal_bytes={}, reserved_file_bytes={}, \
+             requested_bytes={}, limit_bytes={})",
+            self.accounted_bytes,
+            self.reserved_proposal_bytes,
+            self.reserved_file_bytes,
+            self.requested_bytes,
+            self.limit_bytes,
+        )
     }
 }
 impl std::error::Error for DiskBudgetExhausted {}
@@ -128,12 +145,22 @@ impl Budget {
             !self.failed.load(Ordering::Acquire),
             "disk accounting failed"
         );
+        let accounted_bytes = self.accounted(&state);
+        let limit_bytes = limit();
         ensure!(
-            self.accounted(&state)
+            accounted_bytes
                 .checked_add(state.pending)
                 .and_then(|n| n.checked_add(bytes))
-                .is_some_and(|n| n <= limit()),
-            DiskBudgetExhausted
+                .is_some_and(|n| n <= limit_bytes),
+            // Capture the values used for this decision while holding the
+            // accounting lock. A later status sample can miss this pressure.
+            DiskBudgetExhausted {
+                accounted_bytes,
+                reserved_proposal_bytes: state.pending - state.pending_files,
+                reserved_file_bytes: state.pending_files,
+                requested_bytes: bytes,
+                limit_bytes,
+            }
         );
         state.pending += bytes;
         if file {
@@ -299,7 +326,13 @@ mod tests {
         budget.limit_data(4 << 20)?;
         budget.limit_files(5 << 20)?;
         let receiving = budget.reserve_files(&[3 << 20, 1])?;
-        assert!(budget.reserve(1 << 20, true).is_err());
+        let refused = budget.reserve(1 << 20, true).err().unwrap();
+        let charge = refused.downcast_ref::<DiskBudgetExhausted>().unwrap();
+        assert_eq!(charge.accounted_bytes, 0);
+        assert_eq!(charge.reserved_proposal_bytes, 0);
+        assert_eq!(charge.reserved_file_bytes, (3 << 20) + 4096);
+        assert_eq!(charge.requested_bytes, 1 << 20);
+        assert_eq!(charge.limit_bytes, 4 << 20);
         let path = directory.path().join("partial.pack");
         std::fs::write(&path, vec![7; 1 << 20])?;
         std::fs::OpenOptions::new()
@@ -360,13 +393,21 @@ mod tests {
         assert!(budget.limit_data(3 * 1024 * 1024).is_err());
         assert_eq!(budget.snapshot().data_limit, 2 * 1024 * 1024);
         assert_eq!(budget.snapshot().reserved_proposal_bytes, 4 * 1024 * 1024);
-        assert!(budget.reserve(1, true).is_err());
+        let refused = budget.reserve(1, true).err().unwrap();
         let maintenance = budget.reserve(4 * 1024 * 1024, false)?;
         assert!(budget.reserve(1, false).is_err());
         drop(data);
         // Maintenance still occupies the shared producer ceiling.
         assert!(budget.reserve(1, true).is_err());
         drop(maintenance);
+        // The failure retains the original admission decision even after its
+        // concurrent reservations have gone away.
+        let charge = refused.downcast_ref::<DiskBudgetExhausted>().unwrap();
+        assert_eq!(charge.accounted_bytes, 0);
+        assert_eq!(charge.reserved_proposal_bytes, 4 * 1024 * 1024);
+        assert_eq!(charge.reserved_file_bytes, 0);
+        assert_eq!(charge.requested_bytes, 1);
+        assert_eq!(charge.limit_bytes, 2 * 1024 * 1024);
         assert!(budget.reserve(2 * 1024 * 1024, true).is_ok());
         Ok(())
     }
