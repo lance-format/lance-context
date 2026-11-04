@@ -26,15 +26,20 @@ mod upload_admission;
 
 struct Server {
     address: std::net::SocketAddr,
+    listener: std::net::TcpListener,
     stop: oneshot::Sender<()>,
     task: tokio::task::JoinHandle<std::io::Result<()>>,
 }
 impl Server {
     async fn start(router: axum::Router, address: Option<std::net::SocketAddr>) -> Result<Self> {
-        let listener = tokio::net::TcpListener::bind(
+        let listener = std::net::TcpListener::bind(
             address.unwrap_or_else(|| "127.0.0.1:0".parse().unwrap()),
-        )
-        .await?;
+        )?;
+        listener.set_nonblocking(true)?;
+        Self::with_listener(router, listener)
+    }
+    fn with_listener(router: axum::Router, reserved: std::net::TcpListener) -> Result<Self> {
+        let listener = tokio::net::TcpListener::from_std(reserved.try_clone()?)?;
         let address = listener.local_addr()?;
         let (stop, stopped) = oneshot::channel();
         let app = router.layer(axum::middleware::from_fn(
@@ -66,12 +71,20 @@ impl Server {
         });
         Ok(Self {
             address,
+            listener: reserved,
             stop,
             task,
         })
     }
     fn uri(&self) -> String {
         format!("http://{}", self.address)
+    }
+    async fn replace(self, router: axum::Router) -> Result<Self> {
+        // Keep the bound socket throughout replacement: another test or an
+        // outbound connection must not claim this route's ephemeral port.
+        let _ = self.stop.send(());
+        tokio::time::timeout(Duration::from_secs(30), self.task).await???;
+        Self::with_listener(router, self.listener)
     }
     async fn shutdown(self) -> Result<()> {
         let _ = self.stop.send(());
