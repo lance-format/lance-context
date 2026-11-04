@@ -373,13 +373,17 @@ async fn stalled_tls_snapshot_does_not_block_healthy_quorum_and_recovers_after_d
     let newer_index = newer.snapshot()?.get_metadata().index;
     drop(newer);
     assert!(newer_index > original_index);
-    assert!(
+    // Installation completes before the runtime refreshes its cached observation.
+    // Wait for that refresh before comparing it with the installed image.
+    wait_for(|| {
         c.net.nodes[&leader_id]
             .handle
-            .observation(10)?
+            .observation(10)
+            .unwrap()
             .checkpoint_index
             >= newer_index
-    );
+    })
+    .await?;
     let still_sending = transfer().context("outgoing snapshot disappeared")?;
     assert_eq!(still_sending.index, original_index);
     assert_eq!(still_sending.attempt, sending.attempt);
