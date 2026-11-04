@@ -32,9 +32,8 @@ struct Server {
 }
 impl Server {
     async fn start(router: axum::Router, address: Option<std::net::SocketAddr>) -> Result<Self> {
-        let listener = std::net::TcpListener::bind(
-            address.unwrap_or_else(|| "127.0.0.1:0".parse().unwrap()),
-        )?;
+        let listener =
+            std::net::TcpListener::bind(address.unwrap_or_else(|| "127.0.0.1:0".parse().unwrap()))?;
         listener.set_nonblocking(true)?;
         Self::with_listener(router, listener)
     }
