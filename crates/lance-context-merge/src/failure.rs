@@ -187,6 +187,20 @@ fn has_http_status(error: &str, codes: &[&str]) -> bool {
 }
 
 impl ShardFailure {
+    /// Capability discovery is a read, before a worker can receive merge work.
+    /// Native execution can supersede this particular transport failure. Do not
+    /// infer recovery of data/configuration errors or ambiguous worker writes.
+    pub fn is_worker_capability_transport_failure(&self) -> bool {
+        self.class == FailureClass::Retryable
+            && !self.needs_attention
+            && (self.endpoint.starts_with("http://") || self.endpoint.starts_with("https://"))
+            && self.last_error
+                == format!(
+                    "error sending request for url ({}/api/v1/internal/merge-executor)",
+                    self.endpoint.trim_end_matches('/')
+                )
+    }
+
     fn retry_policy(class: &FailureClass, attempts: u32) -> (bool, u64) {
         let needs_attention = attempts >= 15
             || matches!(
@@ -249,6 +263,74 @@ impl ShardFailure {
 }
 
 impl Coordinator {
+    /// One bounded snapshot for native takeover; never scan another target.
+    pub async fn target_failure_observations(
+        &self,
+        target: &str,
+    ) -> Result<Vec<FailureObservation>> {
+        let prefix = failure_key(&self.prefix, target, "");
+        let response = self
+            .client
+            .clone()
+            .get(prefix, Some(GetOptions::new().with_prefix().with_limit(32)))
+            .observed(Operation::MergeFailureRead)
+            .await
+            .map_err(|e| e.to_string())?;
+        if response.more() {
+            return Err("target failure snapshot exceeds native recovery bound".into());
+        }
+        response
+            .kvs()
+            .iter()
+            .map(|kv| {
+                let failure: ShardFailure =
+                    serde_json::from_slice(kv.value()).map_err(|e| e.to_string())?;
+                if failure.target != target
+                    || kv.key() != self.failure_key(target, &failure.endpoint).as_bytes()
+                {
+                    return Err("target failure snapshot identity mismatch".into());
+                }
+                Ok(FailureObservation {
+                    failure: failure.corrected(),
+                    revision: kv.mod_revision(),
+                })
+            })
+            .collect()
+    }
+
+    /// Retire only the exact old worker failure observed before successful native
+    /// recovery. Caller must have joined its fenced work and confirmed drained WAL.
+    /// A newer failure, lost claim, or changed execution is always preserved.
+    pub async fn clear_observed_failure_after_native_recovery(
+        &self,
+        proof: &ClaimProof,
+        execution: &Execution,
+        observed: &FailureObservation,
+    ) -> Result<bool> {
+        if execution.maintenance != Some(crate::MaintenanceKind::Catchup)
+            || execution.phase != Phase::Running
+            || observed.failure.target != execution.target
+            || observed.revision <= 0
+            || !observed.failure.is_worker_capability_transport_failure()
+        {
+            return Err("invalid native failure recovery evidence".into());
+        }
+        let key = self.failure_key(&execution.target, &observed.failure.endpoint);
+        self.transact(
+            vec![
+                Compare::value(proof.key.as_str(), CompareOp::Equal, proof.token.as_bytes()),
+                Compare::value(
+                    crate::execution_key(&self.prefix, &execution.target),
+                    CompareOp::Equal,
+                    crate::encode(execution),
+                ),
+                Compare::mod_revision(key.clone(), CompareOp::Equal, observed.revision),
+            ],
+            vec![TxnOp::delete(key, None)],
+        )
+        .await
+    }
+
     fn failures_prefix(&self) -> String {
         format!("{}/merge-failures/", self.prefix.trim_end_matches('/'))
     }
@@ -478,6 +560,31 @@ impl Coordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_takeover_only_recognizes_exact_capability_read_transport_errors() {
+        let endpoint = "http://worker:3000";
+        let error =
+            format!("error sending request for url ({endpoint}/api/v1/internal/merge-executor)");
+        let eligible = ShardFailure::advance("table", endpoint, None, &error, 1);
+        assert!(eligible.is_worker_capability_transport_failure());
+        for error in [
+            "schema mismatch".to_string(),
+            format!("error sending request for url ({endpoint}/api/v1/internal/merge)"),
+            format!("HTTP 403: {error}"),
+            format!("ownership unresolved: {error}"),
+            error.replace("http://worker", "http://other-worker"),
+        ] {
+            assert!(!ShardFailure::advance("table", endpoint, None, &error, 1)
+                .is_worker_capability_transport_failure());
+        }
+        let mut attention = eligible.clone();
+        attention.needs_attention = true;
+        assert!(!attention.is_worker_capability_transport_failure());
+        let mut unresolved = eligible;
+        unresolved.class = FailureClass::OwnershipUnresolved;
+        assert!(!unresolved.is_worker_capability_transport_failure());
+    }
+
     const STALE_INDEX: &str = "Invalid user input: index metadata changed; reprepare, crates/lance-context-core/src/store_base.rs:1529:24";
 
     #[test]
