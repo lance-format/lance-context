@@ -9,6 +9,7 @@ mod legacy_merge;
 mod merge_execution;
 mod routes;
 mod state;
+mod store_timing;
 mod sweeper;
 
 use std::sync::Arc;

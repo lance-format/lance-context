@@ -632,45 +632,51 @@ impl AppState {
         &self,
         name: &str,
     ) -> Result<Arc<RwLock<RolloutStore>>, AppError> {
+        use crate::store_timing::{measure, Stage};
         Self::validate_name(name)?;
         // Fast path: resident in this process's LRU (updates recency).
-        if let Some(store) = self.rollout_stores.lock().await.get(name) {
+        if let Some(store) = measure(name, Stage::CacheLock, self.rollout_stores.lock())
+            .await
+            .get(name)
+        {
             metrics::counter!("rollout_store_cache_hits_total").increment(1);
             return Ok(store.clone());
         }
         metrics::counter!("rollout_store_cache_misses_total").increment(1);
 
-        let mut handle = self.rollout_handles.lock(name).await;
+        let mut handle = measure(name, Stage::NameLock, self.rollout_handles.lock(name)).await;
         if let Some(store) = handle.upgrade() {
-            self.rollout_stores
-                .lock()
+            measure(name, Stage::CacheLock, self.rollout_stores.lock())
                 .await
                 .put(name.to_string(), store.clone());
             return Ok(store);
         }
 
         // The registry owns both existence and the physical dataset location.
-        let entry = self
-            .rollout_registry
-            .get(name)
+        let entry = measure(name, Stage::RegistryLookup, self.rollout_registry.get(name))
             .await
             .map_err(AppError::from_lance)?
             .ok_or_else(|| AppError::NotFound(format!("Rollout store '{name}' does not exist")))?;
 
         // Load from storage WITHOUT holding the LRU lock, so a slow open does
         // not block other stores' requests.
-        let opened =
-            RolloutStore::open_existing_with_options(&entry.uri, self.rollout_store_options())
-                .await
-                .map_err(AppError::from_lance)?;
+        let opened = measure(
+            name,
+            Stage::DatasetOpen,
+            RolloutStore::open_existing_with_options(&entry.uri, self.rollout_store_options()),
+        )
+        .await
+        .map_err(AppError::from_lance)?;
         let opened = Arc::new(RwLock::new(opened));
         // Reject a removal or replacement observed during this open. This is
         // not a distributed lease: cached handles still need lifecycle fencing.
-        match self
-            .rollout_registry
-            .get(name)
-            .await
-            .map_err(AppError::from_lance)?
+        match measure(
+            name,
+            Stage::RegistryRecheck,
+            self.rollout_registry.get(name),
+        )
+        .await
+        .map_err(AppError::from_lance)?
         {
             Some(current) if current == entry => {}
             Some(_) => {
@@ -687,7 +693,7 @@ impl AppState {
         // The per-name lock excludes deletion and concurrent opens through
         // publication in both the weak registry and the resident cache.
         *handle = Arc::downgrade(&opened);
-        let mut cache = self.rollout_stores.lock().await;
+        let mut cache = measure(name, Stage::CacheLock, self.rollout_stores.lock()).await;
         cache.put(name.to_string(), opened.clone());
         metrics::gauge!("rollout_stores_resident").set(cache.len() as f64);
         Ok(opened)
