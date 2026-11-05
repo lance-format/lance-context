@@ -31,6 +31,22 @@ Concurrent scrapes return 503 rather than building several snapshots at once.
 Recent read errors have priority if long table names fill the response budget.
 Successful access never erases an unexpired read error.
 
+The additive `loss` object explains incomplete observations:
+
+- `activity_dropped_total` counts lost ordinary activity hints;
+  `critical_dropped_total` counts lost read 5xx or slow-read hints, including
+  slow non-5xx responses. These count hints, not failed user requests.
+- `recent_activity_loss` and `recent_critical_loss` expire independently after
+  five minutes. The cumulative counters do not reset when a loss ages out.
+- `snapshot_skipped_shards` and `snapshot_truncated_rows` count omissions in
+  this response; `recording_loss_during_snapshot` indicates that the aggregate
+  loss counter changed while collecting it.
+
+These are diagnostic fields, sampled independently under concurrency. They do
+not replace `complete` or establish critical-only coverage: a skipped shard or
+truncated row may contain critical hints even if `critical_dropped_total` is
+zero. The existing conservative coverage checks still apply to every consumer.
+
 Validation: metrics crate unit and real Axum middleware tests, Clippy with
 warnings denied, and opt-in/disabled tests in isolated processes. The manual
 release-mode microbenchmark performs one million parse+cache-update operations
