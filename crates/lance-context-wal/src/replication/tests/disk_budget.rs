@@ -166,9 +166,9 @@ fn benchmark_peer_disk_pressure_rejection() -> Result<()> {
                 },
             )?
             .with_disk_budget(DiskOptions {
-                max_bytes: 32 << 20,
+                max_bytes: 64 << 20,
                 data_bytes: 8 << 20,
-                headroom_bytes: 8 << 20,
+                headroom_bytes: 24 << 20,
             })
         })
         .collect::<Result<Vec<_>>>()?;
