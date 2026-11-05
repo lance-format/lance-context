@@ -983,6 +983,14 @@ impl Node {
                     &mut events,
                 )?;
                 group.raw.advance_apply();
+                // Confirmation can unlock the next queued batch during this
+                // poll. Send its fresh barrier now, without waiting for another
+                // work item or tick; its members never reuse the old quorum.
+                if group.raw.raft.state == StateRole::Leader {
+                    if let Some(context) = group.reads.take_barrier(group.raw.raft.term) {
+                        group.raw.read_index(context);
+                    }
+                }
             }
             // Old-term pending entries may still commit after leader loss. They
             // must not be reported as a definite rejection or leak forever.

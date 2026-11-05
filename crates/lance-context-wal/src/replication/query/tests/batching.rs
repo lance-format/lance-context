@@ -74,23 +74,30 @@ fn later_arrivals_cannot_reuse_an_already_sent_barriers_quorum() -> Result<()> {
     }
     let first = nodes[0].poll()?;
     assert!(first.reads.is_empty());
-    // Both batches are pending when the first batch's responses arrive.
+    let first_context = first.messages[0].message.context.clone();
+    // Both batches are pending when the first batch's responses arrive. Only
+    // the first batch has sent a quorum barrier at this point.
     for request in 3..=4 {
         nodes[0].query(10, request, accepted())?;
     }
     let second = nodes[0].poll()?;
     assert!(second.reads.is_empty());
-    assert_ne!(
-        first.messages[0].message.context,
-        second.messages[0].message.context
-    );
+    assert!(second.messages.is_empty());
     deliver(&mut nodes, first.messages)?;
-    let results = pump(&mut nodes)?.reads;
+    let mut replies = Vec::new();
+    for node in &mut nodes[1..] {
+        replies.extend(node.poll()?.messages);
+    }
+    deliver(&mut nodes, replies)?;
+    let confirmed = nodes[0].poll()?;
+    let results = confirmed.reads;
     assert_eq!(results.len(), 2);
     assert!(results.iter().all(|r| r.request <= 2));
     assert_eq!(nodes[0].status(10)?.pending_reads, 2);
+    assert!(!confirmed.messages.is_empty());
+    assert_ne!(first_context, confirmed.messages[0].message.context);
     assert!(nodes[0].poll()?.reads.is_empty());
-    deliver(&mut nodes, second.messages)?;
+    deliver(&mut nodes, confirmed.messages)?;
     let results = pump(&mut nodes)?.reads;
     assert_eq!(results.len(), 2);
     assert!(results.iter().all(|r| r.request >= 3));
