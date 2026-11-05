@@ -55,7 +55,8 @@ pub struct Options {
     pub tick_interval: Duration,
     /// Maximum commands from each lane before polling durable Raft progress.
     pub batch_requests: usize,
-    /// End the drain batch after a round consumes this wall-time budget.
+    /// Bound the control prefix, then end the batch after a peer/data round
+    /// consumes this wall-time budget. Every batch visits peer/data at least once.
     /// Cannot preempt a single operation or bound a poll's persistence latency.
     #[cfg_attr(feature = "service", serde(with = "crate::service::duration_millis"))]
     pub batch_time: Duration,
@@ -831,16 +832,29 @@ impl Worker {
             let mut peer_credits = Vec::new();
             let mut after_poll = Vec::new();
             let batch_started = Instant::now();
-            for _ in 0..self.options.batch_requests {
+            for round in 0..self.options.batch_requests {
                 let mut any = false;
                 if let Ok(result) = self.snapshot_results.try_recv() {
                     self.snapshot_result(&result)?;
                     peer_credits.push(result.credit);
                     any = true;
                 }
-                if let Ok(work) = self.control.try_recv() {
-                    self.work(work, &mut after_poll);
-                    any = true;
+                if round == 0 {
+                    // Already queued reads can share this poll's fresh quorum
+                    // barrier before expensive data work consumes the budget.
+                    // Bound both count and time, and always visit peer/data
+                    // below before polling so a busy control lane cannot starve
+                    // replication or writes. Later arrivals wait for a new poll.
+                    for _ in 0..self.options.batch_requests {
+                        let Ok(work) = self.control.try_recv() else {
+                            break;
+                        };
+                        self.work(work, &mut after_poll);
+                        any = true;
+                        if batch_started.elapsed() >= self.options.batch_time {
+                            break;
+                        }
+                    }
                 }
                 if let Ok(peer) = self.peers.try_recv() {
                     let from = peer.packet.message.from;
