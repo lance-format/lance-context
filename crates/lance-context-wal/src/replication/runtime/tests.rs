@@ -518,6 +518,11 @@ async fn failed_durable_poll_stops_sibling_workers_and_releases_no_peer_response
     assert!(poll.completed > 0);
     assert_eq!(poll.failed, 1);
     assert!(poll.elapsed_micros >= poll.max_elapsed_micros);
+    let append = h.observation(10)?.append;
+    assert_eq!(append.accepted.completed, 0);
+    assert_eq!(append.committed_other.completed, 0);
+    assert_eq!(append.unknown.completed, 0);
+    assert_eq!(append.proposal_error.completed, 0);
     assert!(h.campaign(20).is_err());
     assert!(
         outbox.try_recv().is_err(),

@@ -28,6 +28,7 @@ struct Group {
     stopped: bool,
     fetch: runtime::FetchObservation,
     durable_poll: runtime::PollObservation,
+    append: runtime::AppendObservation,
 }
 #[derive(Serialize)]
 struct View {
@@ -38,6 +39,7 @@ struct View {
     appends: BTreeMap<&'static str, u64>,
     last_append_disk_refusal: Option<crate::admission::DiskBudgetExhausted>,
     append_execution: runtime::client::timing::Observation,
+    append_receive: BTreeMap<&'static str, runtime::client::timing::Observation>,
     disk: Option<crate::admission::Snapshot>,
     maintenance: maintenance::Progress,
     snapshots_sent: u64,
@@ -77,6 +79,7 @@ impl State {
                     stopped: o.stopped,
                     fetch: o.fetch,
                     durable_poll: o.durable_poll,
+                    append: o.append,
                 },
             );
         }
@@ -88,6 +91,7 @@ impl State {
             appends: self.handle.append_observation(),
             last_append_disk_refusal: self.handle.last_append_disk_refusal(),
             append_execution: self.handle.append_execution_timing(),
+            append_receive: self.handle.append_receive_timings(),
             disk: self.handle.disk_budget(),
             maintenance: self
                 .maintenance

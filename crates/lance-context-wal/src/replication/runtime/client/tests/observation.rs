@@ -74,6 +74,11 @@ async fn append_diagnostics_distinguish_disk_refusals_from_unknown_outcomes() ->
     assert_eq!(execution.started, 5);
     assert_eq!(execution.finished, 5);
     assert!(execution.elapsed_micros >= execution.max_elapsed_micros);
+    for interval in handle.append_receive_timings().values() {
+        assert_eq!(interval.started, 5);
+        assert_eq!(interval.finished, 5);
+        assert!(interval.elapsed_micros >= interval.max_elapsed_micros);
+    }
     c.shutdown().await
 }
 

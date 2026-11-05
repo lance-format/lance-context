@@ -322,6 +322,18 @@ impl Handle {
     pub fn append_execution_timing(&self) -> timing::Observation {
         self.shared.appends.execution.snapshot()
     }
+    /// Server-side byte-budget and body-receive intervals for complete append
+    /// bodies. Failed/incomplete receives are excluded. Includes redirects and
+    /// subsequently rejected appends; neither interval is quorum execution.
+    pub fn append_receive_timings(&self) -> BTreeMap<&'static str, timing::Observation> {
+        BTreeMap::from([
+            (
+                "admission",
+                self.shared.appends.receive_admission.snapshot(),
+            ),
+            ("body", self.shared.appends.receive_body.snapshot()),
+        ])
+    }
     /// Read on the owner thread with data-lane credit, separate from small
     /// control replies. Returned bytes describe local committed state only.
     /// Complete after validating that already durable payload, without waiting
@@ -476,9 +488,11 @@ async fn serve_one<S: AsyncRead + AsyncWrite + Unpin>(
     } else {
         0
     };
+    let admission_started = std::time::Instant::now();
     let mut credit = budgets
         .reserve(data, 2 * meta_len + body_len + 2 * MAX_META + reply_body)
         .await?;
+    let admission_elapsed = admission_started.elapsed();
     let metadata = receive(io, meta_len).await?;
     let (request_scope, request): (Scope, WireRequest) = codec().deserialize(&metadata)?;
     ensure!(
@@ -501,8 +515,18 @@ async fn serve_one<S: AsyncRead + AsyncWrite + Unpin>(
                 .context("client reply reservation underflow")?,
         );
     }
+    let body_started = std::time::Instant::now();
     let body = receive(io, body_len).await?;
+    let body_elapsed = body_started.elapsed();
     let append = matches!(request, WireRequest::Append { .. });
+    if append {
+        handle
+            .shared
+            .appends
+            .receive_admission
+            .record(admission_elapsed);
+        handle.shared.appends.receive_body.record(body_elapsed);
+    }
     let observation = append.then(|| handle.shared.appends.start());
     let execution = append.then(|| handle.shared.appends.execution.start());
     let executed = execute(handle, request, body).await;

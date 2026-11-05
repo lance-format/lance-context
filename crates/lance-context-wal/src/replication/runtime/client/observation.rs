@@ -61,6 +61,8 @@ pub(in crate::replication::runtime) struct Counters {
     outcomes: [AtomicU64; LABELS.len()],
     last_disk_refusal: Mutex<Option<DiskBudgetExhausted>>,
     pub(super) execution: super::timing::Counter,
+    pub(super) receive_admission: super::timing::Counter,
+    pub(super) receive_body: super::timing::Counter,
 }
 impl Counters {
     fn increment(&self, kind: Kind) {
