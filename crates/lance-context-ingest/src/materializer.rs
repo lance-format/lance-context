@@ -9,6 +9,7 @@ use object_store::path::Path as ObjectPath;
 use std::collections::{BTreeMap, HashMap};
 
 mod advance;
+mod close;
 pub(crate) mod compaction;
 pub mod observation;
 mod pipeline;
@@ -653,29 +654,14 @@ impl Publisher {
                         bail!("source closure authorization unavailable");
                     };
                     let expected = permit.closure().clone();
-                    let closed = commit(&self.ingress.client, Command::Close(*permit)).await?;
-                    ensure!(
-                        matches!(closed, Applied::Source(source::Reply::Closed { .. })),
-                        "source closure rejected: {closed:?}"
-                    );
-                    let query::Value::ClosedProof(Some(proof)) = query(
-                        &self.ingress,
-                        group,
-                        query::Query::ClosedProof {
-                            table: self.authority.table,
-                        },
-                    )
-                    .await?
-                    else {
-                        bail!("source closure proof unavailable");
-                    };
+                    let proof = self.close_source(*permit).await?;
                     ensure!(
                         proof.closed().permit.closure() == &expected
                             && expected.published_index == published.index
                             && proof.source_cut().group == group,
                         "foreign source closure proof"
                     );
-                    Ok::<_, anyhow::Error>((group, *proof))
+                    Ok::<_, anyhow::Error>((group, proof))
                 }),
         )
         .buffer_unordered(self.options.fetch_parallelism)

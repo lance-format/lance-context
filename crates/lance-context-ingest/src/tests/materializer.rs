@@ -6,6 +6,8 @@ use std::collections::HashMap;
 
 #[cfg(feature = "service")]
 mod advance;
+#[cfg(feature = "service")]
+mod close;
 mod compaction;
 #[cfg(feature = "service")]
 mod plan;
