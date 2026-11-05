@@ -78,3 +78,31 @@ entry fields, corruption on a cache miss, and successful reads after restoring
 the original byte. Separately recorded Rust diagnostics measure the real log
 read path and allocator-requested bytes; they are not end-to-end throughput or
 RSS benchmarks.
+
+# Append reclamation across independent file counters
+
+Append and rewrite files have independent sequence numbers. Rewritten entries
+form a memtable's prefix, so they precede its append entries even when their
+rewrite file numbers are larger. The native entry-count predicate now preserves
+that queue ordering before comparing sequence numbers within the same queue.
+
+Previously, a rewritten prefix could fail the heavy-region test while its append
+suffix passed the append-heavy test. Neither ordinary rewrite nor the eventual
+forced rewrite would then select that region. A small retained catalog could pin
+large obsolete files from another group and keep producer disk admission closed
+after application state had drained.
+
+`append-queue-order.patch` records this correction. The actual-file regression
+advances the rewrite queue, interleaves live catalog entries with large data
+entries, checkpoints away the data and runs maintenance without further writes.
+It requires physical reclamation and renewed admission, then reopens the engine
+and verifies every retained catalog entry and the data checkpoint. The old code
+still retained approximately 16 MiB after 32 passes; the fixture is a correctness
+check, not a throughput benchmark. No disk/wire format or durability barrier
+changes.
+
+```sh
+cargo test --locked --release -p lance-context-wal --features service --lib \
+  raft_log::maintenance::tests::pressure::append_pressure_recovers_when_rewrite_file_numbers_are_ahead \
+  -- --exact --test-threads=1
+```
