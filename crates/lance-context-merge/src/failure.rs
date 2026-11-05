@@ -58,8 +58,10 @@ pub fn now_ms() -> u64 {
 pub fn classify(error: &str) -> FailureClass {
     // Priority: unresolved ownership, then explicit permanent signals that
     // must never be laundered by a code (auth failures), then the stable
-    // code, then legacy text. A code beats prose, paths and wrapper formats
-    // but never beats a 401/403 that wraps it.
+    // code, then explicit transient HTTP statuses, then legacy text. Codes
+    // and statuses beat incidental words in object paths (e.g. "schema" in
+    // a table name), but never beat a 401/403 or unresolved ownership. A generic
+    // worker 500 can wrap a real data error, so it does not override that text.
     let lowered = error.to_ascii_lowercase();
     if lowered.contains("ownership unresolved") {
         return FailureClass::OwnershipUnresolved;
@@ -73,7 +75,9 @@ pub fn classify(error: &str) -> FailureClass {
         };
     }
     let error = lowered;
-    if is_preparation_conflict(&error) {
+    if is_preparation_conflict(&error)
+        || has_http_status(&error, &["408", "429", "502", "503", "504"])
+    {
         FailureClass::Retryable
     } else if [
         "not found",
@@ -94,8 +98,6 @@ pub fn classify(error: &str) -> FailureClass {
         || has_http_status(&error, &["401", "403"])
     {
         FailureClass::DataOrConfiguration
-    } else if has_http_status(&error, &["408", "429", "500", "502", "503", "504"]) {
-        FailureClass::Retryable
     } else if error.contains("deadline") || error.contains("timeout") || error.contains("timed out")
     {
         FailureClass::Deadline
@@ -707,6 +709,71 @@ mod tests {
             classify("merge ownership unresolved: HTTP 503"),
             FailureClass::OwnershipUnresolved
         );
+    }
+
+    #[test]
+    fn generic_worker_500_preserves_explicit_data_failures() {
+        for detail in [
+            "Not found: data/frag.lance",
+            "schema mismatch",
+            "corrupt manifest",
+        ] {
+            let error = format!("worker returned HTTP 500: {{\"error\":\"{detail}\"}}");
+            let failure = ShardFailure::advance("broken", "worker", None, &error, 1000);
+            assert_eq!(failure.class, FailureClass::DataOrConfiguration, "{error}");
+            assert!(failure.needs_attention);
+            assert_eq!(failure.next_retry_ms, 3_601_000);
+        }
+        assert_eq!(
+            classify("worker returned HTTP 500"),
+            FailureClass::Retryable
+        );
+        let azure = include_str!("../tests/fixtures/azure-server-busy.txt")
+            .replace("/container/table/", "/container/l30-schema60/");
+        assert_eq!(
+            classify(&format!("worker returned HTTP 500: {azure}")),
+            FailureClass::Retryable
+        );
+    }
+
+    #[test]
+    fn transient_http_status_is_not_a_schema_error_from_the_object_path() {
+        let azure = include_str!("../tests/fixtures/azure-server-busy.txt");
+        for component in [
+            "l30-schema60-rl256k-miv-1103t",
+            "invalid",
+            "corrupt",
+            "protocol",
+        ] {
+            let error = azure.replace("/container/table/", &format!("/container/{component}/"));
+            let failure = ShardFailure::advance("table", "master:merge_wal", None, &error, 1000);
+            assert_eq!(failure.class, FailureClass::Retryable, "{error}");
+            assert!(!failure.needs_attention);
+            assert_eq!(failure.next_retry_ms, 3000);
+
+            let old = ShardFailure {
+                class: FailureClass::DataOrConfiguration,
+                needs_attention: true,
+                next_retry_ms: 3_601_000,
+                ..failure.clone()
+            };
+            let corrected = old.corrected();
+            assert_eq!(corrected.class, FailureClass::Retryable);
+            assert_eq!(corrected.consecutive_attempts, 1);
+            assert_eq!(corrected.last_failure_ms, 1000);
+            assert_eq!(corrected.last_error, error);
+            assert_eq!(corrected.next_retry_ms, 3000);
+            assert!(!corrected.needs_attention);
+
+            assert_eq!(
+                classify(&format!("HTTP 403: {error}")),
+                FailureClass::DataOrConfiguration
+            );
+            assert_eq!(
+                classify(&format!("ownership unresolved: {error}")),
+                FailureClass::OwnershipUnresolved
+            );
+        }
     }
 
     #[test]
