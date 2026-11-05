@@ -31,7 +31,7 @@ that same poll; no timer or later request is needed to start it. The first round
 quorum never confirms the later arrivals. Confirmed queries still wait for apply,
 and leadership loss retires both the sent round and its queued successor.
 This reduces overlapping read rounds, but sequential reads still require fresh
-quorums. It adds no lease, batching delay or persistent format.
+quorums. It adds no lease, batching timer or persistent format.
 
 Each group's reader uses a new incarnation UUID on reopen and a never-reused
 monotonic context counter. Caller token reuse cannot match an earlier context.
