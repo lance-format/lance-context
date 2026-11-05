@@ -29,7 +29,7 @@ async fn exercise() -> Result<()> {
     let proxy = proxy::Proxy::open_close(&c, root.path()).await?;
     let direct = std::mem::replace(&mut c.client, proxy.client.clone());
     let (service, runtime) = owner(&c, &storage, &limits).await?;
-    let (_stop, task) = run_owner(runtime);
+    let (stop, task) = run_owner(runtime);
     let a = producer(&service, 1).await?;
     let b = producer(&service, 2).await?;
     let first = request(
@@ -71,21 +71,22 @@ async fn exercise() -> Result<()> {
         None
     };
     proxy.release.notify_one();
-    let error = tokio::time::timeout(Duration::from_secs(30), task)
-        .await??
-        .unwrap_err();
     let suffix_result = suffix_result
         .context("confirmed publication retained staging capacity while source closure waited")??;
     assert_eq!(suffix_result.result, MutationResult::Applied);
     let current = current.unwrap();
     assert_eq!(current.status.as_deref(), Some("reviewed"));
     assert_eq!(current.score, Some(0.9));
+    drained(&c, &service, suffix_result.index).await?;
     assert!(
-        format!("{error:#}").contains("outcome unknown"),
-        "{error:#}"
+        !task.is_finished(),
+        "lost source-close reply stopped the owner"
     );
     assert_eq!(proxy.dropped.load(Ordering::SeqCst), 1);
-    assert!(service.get("T", Duration::from_secs(1)).await.is_err());
+    assert_eq!(
+        service.get("T", Duration::from_secs(1)).await?,
+        Some(current.clone())
+    );
     assert!(matches!(
         direct
             .request_routed(Request::Fetch {
@@ -96,6 +97,8 @@ async fn exercise() -> Result<()> {
             .reply,
         Reply::Record(Some(_))
     ));
+    stop.send(()).unwrap();
+    task.await??;
     drop(service);
     c.client = direct;
     drop(proxy);
