@@ -69,7 +69,7 @@ async fn exercise(case: Case) -> Result<()> {
         // executes. Its unknown outcome cannot be proven by the earlier receipt.
         assert!(matches!(
             crate::materializer::commit(&direct, Command::Close(permit.clone())).await?,
-            Applied::Source(_)
+            Applied::Source(lance_context_wal::replication::source::Reply::Closed { .. })
         ));
         let mut value = serde_json::to_value(&permit)?;
         value["closure"]["published_index"] = (permit.closure().published_index + 1).into();
@@ -94,10 +94,24 @@ async fn exercise(case: Case) -> Result<()> {
         matches!(case, Case::Committed | Case::Timeout),
         "{result:?}"
     );
-    if let Ok(proof) = result {
-        assert_eq!(proof.closed().permit.closure(), &expected);
+    match result {
+        Ok(proof) => assert_eq!(proof.closed().permit.closure(), &expected),
+        Err(error) => {
+            let reason = match case {
+                Case::Absent => "source closure proof unavailable",
+                Case::DifferentClosure => "foreign source closure proof",
+                Case::Fenced => "publisher fenced or table incarnation changed",
+                _ => unreachable!(),
+            };
+            assert!(format!("{error:#}").contains(reason), "{error:#}");
+        }
     }
     assert_eq!(proxy.closes.load(Ordering::SeqCst), 1, "Close resubmitted");
+    assert_eq!(
+        proxy.dropped.load(Ordering::SeqCst),
+        usize::from(!matches!(case, Case::Timeout)),
+        "timeout case must finish while the original reply is still held"
+    );
     // Let the held proxy task exit even when the real client deadline expired.
     proxy.release.notify_one();
     cluster.client = direct;
