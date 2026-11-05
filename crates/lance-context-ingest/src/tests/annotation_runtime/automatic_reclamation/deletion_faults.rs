@@ -272,8 +272,12 @@ async fn annotation_collector_delayed_delete_survives_owner_takeover() -> Result
         .await??
         .unwrap_err();
     let reason = format!("{old_error:#}");
+    // Takeover may reach a read barrier or the replicated Prepare first. Both
+    // must stop the stale owner; the latter reports an authority rejection.
     assert!(
-        reason.contains("fenced") || reason.contains("view is behind source closure"),
+        reason.contains("fenced")
+            || reason.contains("view is behind source closure")
+            || reason == "annotation preparation rejected: Publisher(Rejected(Authority))",
         "{reason}"
     );
     assert!(!abandoned[0].exists());

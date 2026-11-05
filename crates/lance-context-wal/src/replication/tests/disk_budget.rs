@@ -73,6 +73,152 @@ fn acquisition() -> publication::Acquire {
 }
 
 #[test]
+fn failed_peer_validation_releases_reservation_without_appending_a_prefix() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let mut nodes = (1..=3)
+        .map(|id| open(root.path(), id))
+        .collect::<Result<Vec<_>>>()?;
+    nodes[0].campaign(10)?;
+    pump(&mut nodes)?;
+    let previous_last = nodes[2].groups[&10].raw.raft.raft_log.last_index();
+    nodes[0].propose(10, 100, payload(10, 1))?;
+    nodes[0].propose(10, 101, payload(10, 2))?;
+    let events = nodes[0].poll()?;
+    let mut valid = events
+        .messages
+        .iter()
+        .find(|p| p.message.to == 3 && !p.message.entries.is_empty())
+        .context("leader did not send entries to the follower")?
+        .clone();
+    let entries: BTreeMap<_, _> = events
+        .messages
+        .iter()
+        .filter(|p| p.message.to == 3)
+        .flat_map(|p| p.message.entries.iter().map(|e| (e.index, e.clone())))
+        .collect();
+    assert_eq!(entries.len(), 2);
+    valid.message.entries = entries.into_values().collect();
+    let mut corrupt = valid.clone();
+    let body = &mut corrupt.message.entries[1].data;
+    let mut changed = body.to_vec();
+    changed[0] ^= 1;
+    *body = Bytes::from(changed);
+    assert!(nodes[2].step(corrupt).is_err());
+    assert_eq!(nodes[2].disk_budget().unwrap().reserved_proposal_bytes, 0);
+    assert_eq!(
+        nodes[2].groups[&10].raw.raft.raft_log.last_index(),
+        previous_last
+    );
+    // Neither a valid prefix nor a higher term may reach Raft on failed validation.
+    let previous_term = nodes[2].status(10)?.term;
+    let mut malformed = valid.clone();
+    malformed.message.term += 1;
+    malformed.message.entries[1].context = Bytes::from_static(b"invalid metadata");
+    assert!(nodes[2].step(malformed).is_err());
+    assert_eq!(nodes[2].status(10)?.term, previous_term);
+    assert_eq!(nodes[2].disk_budget().unwrap().reserved_proposal_bytes, 0);
+    assert_eq!(
+        nodes[2].groups[&10].raw.raft.raft_log.last_index(),
+        previous_last
+    );
+    for message in events.messages {
+        nodes[message.message.to as usize - 1].step(message)?;
+    }
+    assert!(nodes[2].disk_budget().unwrap().reserved_proposal_bytes > 0);
+    pump(&mut nodes)?;
+    assert_eq!(nodes[2].disk_budget().unwrap().reserved_proposal_bytes, 0);
+    let indexes = valid
+        .message
+        .entries
+        .iter()
+        .map(|e| e.index)
+        .collect::<Vec<_>>();
+    drop(nodes);
+    for id in 1..=3 {
+        let node = open(root.path(), id)?;
+        for (sequence, index) in (1..=2).zip(&indexes) {
+            assert_eq!(node.read_accepted(10, *index)?, Some(payload(10, sequence)));
+        }
+    }
+    Ok(())
+}
+
+/// Measures only the owner-thread rejection path, excluding transport and
+/// payload construction. This is not a distributed throughput benchmark.
+#[test]
+#[ignore = "manual peer disk-pressure timing experiment"]
+fn benchmark_peer_disk_pressure_rejection() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let mut nodes = (1..=3)
+        .map(|id| {
+            Node::open_with_storage_options(
+                &root.path().join(id.to_string()),
+                layout(),
+                id,
+                Limits {
+                    max_record_bytes: 8 << 20,
+                    max_uncommitted_bytes: 8 << 20,
+                    ..Limits::default()
+                },
+                LogOptions {
+                    target_file_bytes: 16 << 10,
+                    purge_threshold_bytes: 64 << 10,
+                },
+            )?
+            .with_disk_budget(DiskOptions {
+                max_bytes: 64 << 20,
+                data_bytes: 8 << 20,
+                headroom_bytes: 24 << 20,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    nodes[0].campaign(10)?;
+    pump(&mut nodes)?;
+    let occupied = root.path().join("3").join("retained-space-fixture");
+    std::fs::write(&occupied, vec![7_u8; 9 << 20])?;
+    nodes[2].prepare_disk_measurement()?.run()?;
+    let body_bytes = 4 << 20;
+    nodes[0].propose(
+        10,
+        100,
+        Batch::new(
+            Uuid::from_u128(2),
+            0,
+            Uuid::from_u128(10),
+            1,
+            Bytes::from(vec![7; body_bytes]),
+        ),
+    )?;
+    let events = nodes[0].poll()?;
+    let deferred = events
+        .messages
+        .iter()
+        .find(|p| p.message.to == 3 && !p.message.entries.is_empty())
+        .context("missing peer append")?;
+    let previous_last = nodes[2].groups[&10].raw.raft.raft_log.last_index();
+    let attempts = 1024;
+    for run in 0..5 {
+        let started = std::time::Instant::now();
+        for _ in 0..attempts {
+            let error = nodes[2]
+                .step(std::hint::black_box(deferred.clone()))
+                .unwrap_err();
+            assert!(error.is::<crate::admission::DiskBudgetExhausted>());
+        }
+        println!(
+            "peer_pressure run={run} attempts={attempts} body_bytes={body_bytes} elapsed_us={}",
+            started.elapsed().as_micros()
+        );
+    }
+    assert_eq!(
+        nodes[2].groups[&10].raw.raft.raft_log.last_index(),
+        previous_last
+    );
+    assert_eq!(nodes[2].disk_budget().unwrap().reserved_proposal_bytes, 0);
+    Ok(())
+}
+
+#[test]
 fn pressured_follower_defers_new_data_and_catches_up_after_space_is_reclaimed() -> Result<()> {
     let root = tempfile::tempdir()?;
     let mut nodes = (1..=3)
@@ -98,6 +244,16 @@ fn pressured_follower_defers_new_data_and_catches_up_after_space_is_reclaimed() 
         nodes[2].step(deferred.clone()).is_err(),
         "follower accepted a new payload despite exhausted data admission"
     );
+    let mut corrupt = deferred.clone();
+    let mut changed = corrupt.message.entries[0].data.to_vec();
+    changed[0] ^= 1;
+    corrupt.message.entries[0].data = Bytes::from(changed);
+    // Pressure refuses the packet before its body is scanned. Once admission
+    // reopens, the same corrupt packet must fail integrity validation instead.
+    assert!(nodes[2]
+        .step(corrupt.clone())
+        .unwrap_err()
+        .is::<crate::admission::DiskBudgetExhausted>());
     let previous_applied = nodes[2].status(10)?.applied;
     nodes[2].poll()?;
     assert_eq!(nodes[2].status(10)?.applied, previous_applied);
@@ -132,6 +288,14 @@ fn pressured_follower_defers_new_data_and_catches_up_after_space_is_reclaimed() 
     assert_eq!(nodes[2].read_accepted(10, index)?, None);
     std::fs::remove_file(&occupied)?;
     nodes[2].prepare_disk_measurement()?.run()?;
+    assert!(matches!(
+        nodes[2]
+            .step(corrupt)
+            .unwrap_err()
+            .downcast_ref::<crate::record::ValidationError>(),
+        Some(crate::record::ValidationError::DigestMismatch)
+    ));
+    assert_eq!(nodes[2].disk_budget().unwrap().reserved_proposal_bytes, 0);
     nodes[2].step(deferred.clone())?;
     assert!(nodes[2].disk_budget().unwrap().reserved_proposal_bytes > 0);
     pump(&mut nodes)?;
