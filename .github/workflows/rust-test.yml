@@ -56,6 +56,8 @@ jobs:
         with:
           shared-key: "lance-context-deps"
           workspaces: "."
+          # Match HA: PR cache cleanup must not fail already passing tests.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install dependencies
         timeout-minutes: 10
         run: |
