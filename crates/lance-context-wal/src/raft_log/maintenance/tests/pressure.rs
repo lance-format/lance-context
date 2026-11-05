@@ -1,6 +1,122 @@
 use super::*;
 
 #[test]
+fn append_pressure_recovers_when_rewrite_file_numbers_are_ahead() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let layout = layout();
+    let log = PhysicalLog::open_with_file_size(root.path(), &layout, 1, 64 << 10)?;
+    let catalog = log.group(10)?;
+    let data = log.group(20)?;
+    data.bind_application(b"maintenance-test/v1")?;
+    let records: Vec<_> = (1..=96)
+        .map(|index| Entry {
+            data: vec![index as u8; 128].into(),
+            ..entry(10, index)
+        })
+        .collect();
+    catalog.persist(
+        &records[..32],
+        Some(&HardState {
+            term: 1,
+            vote: 1,
+            commit: 32,
+            ..Default::default()
+        }),
+    )?;
+    // Both queues have independent file counters. A quiet append queue can
+    // coexist with frequent rewrite reclamation of a small live prefix.
+    let purge = catalog.node.engine.purge_manager();
+    purge.must_rewrite_append_queue(None, None);
+    for _ in 0..256 {
+        purge.must_rewrite_rewrite_queue();
+    }
+    for index in 1..=64 {
+        let large = Entry {
+            data: vec![index as u8; 256 << 10].into(),
+            ..entry(20, index)
+        };
+        data.persist(
+            &[large],
+            Some(&HardState {
+                term: 1,
+                vote: 1,
+                commit: index,
+                ..Default::default()
+            }),
+        )?;
+        catalog.persist(
+            &records[index as usize + 31..index as usize + 32],
+            Some(&HardState {
+                term: 1,
+                vote: 1,
+                commit: index + 32,
+                ..Default::default()
+            }),
+        )?;
+    }
+    let snapshot = checkpoint(&data, 64)?;
+    let native_files = files(root.path())?;
+    let last_file = |extension: &str| {
+        native_files
+            .keys()
+            .filter(|path| path.extension().is_some_and(|ext| ext == extension))
+            .map(|path| {
+                path.file_stem()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap()
+            })
+            .max()
+            .unwrap()
+    };
+    assert!(last_file("rewrite") > last_file("raftlog"));
+    catalog.configure_disk(DiskOptions {
+        max_bytes: 32 << 20,
+        data_bytes: 4 << 20,
+        headroom_bytes: 8 << 20,
+    })?;
+    let budget = catalog.disk_budget().unwrap().clone();
+    let before = budget.snapshot().accounted_disk_bytes;
+    assert!(
+        before > 12 << 20,
+        "fixture did not retain obsolete append files: {before}"
+    );
+    assert!(budget.reserve(4096, true).is_err());
+    let maintenance = catalog.maintenance();
+    // No new writes or more logical compaction: reclamation must make progress
+    // by itself, retaining all catalog entries and the data checkpoint.
+    for _ in 0..32 {
+        maintenance.run()?;
+    }
+    let after = budget.snapshot().accounted_disk_bytes;
+    eprintln!("append pressure: before={before}, after={after}");
+    assert!(
+        after < 1 << 20,
+        "obsolete append files still occupy {after} bytes"
+    );
+    assert!(budget.reserve(4096, true).is_ok());
+    assert_eq!(
+        catalog.entries(1, 97, None, GetEntriesContext::empty(false))?,
+        records
+    );
+    drop((budget, maintenance, catalog, data, log));
+    let reopened = PhysicalLog::open(root.path(), &layout, 1)?;
+    assert_eq!(
+        reopened
+            .group(10)?
+            .entries(1, 97, None, GetEntriesContext::empty(false))?,
+        records
+    );
+    let data = reopened.group(20)?;
+    assert_eq!(data.snapshot(64, 2)?, snapshot);
+    assert_eq!(data.first_index()?, 65);
+    assert_eq!(data.last_index()?, 64);
+    Ok(())
+}
+
+#[test]
 fn compacted_large_records_release_admission_despite_many_small_live_values() -> Result<()> {
     release_admission(2 << 20, None)
 }
