@@ -677,6 +677,14 @@ impl Service {
         let query::Value::SourceClosure(closed) = value else {
             bail!("source closure unavailable");
         };
+        self.check_source_closure(closed.as_deref())?;
+        Ok(cut.quorum_index)
+    }
+
+    fn check_source_closure(
+        &self,
+        closed: Option<&lance_context_wal::replication::source::Closed>,
+    ) -> Result<()> {
         if let Some(closed) = closed {
             let closure = closed.permit.closure();
             ensure!(
@@ -687,7 +695,7 @@ impl Service {
                 "annotation view is behind source closure; reconnect to its durable checkpoint"
             );
         }
-        Ok(cut.quorum_index)
+        Ok(())
     }
 
     async fn wait_through(&self, through: u64) -> Result<()> {
@@ -774,29 +782,26 @@ impl Driver {
                 let (cut, value) = service
                     .shared
                     .phases
-                    .measure(Phase::AnnotationObserve, async {
-                        // Validate both observations before consuming a page.
-                        // Its cursor belongs to its own captured cut; closure
-                        // independently checks that our recovery base is usable.
-                        let (_, observed) = tokio::try_join!(
-                            service.barrier(),
-                            reader::observe(
-                                ingress,
-                                service.group()?,
-                                query::Query::AcceptedBucket {
-                                    table: ingress.scope.table,
-                                    bucket: service.bucket(),
-                                    after,
-                                    limit: 32,
-                                },
-                            )
-                        )?;
-                        Ok::<_, anyhow::Error>(observed)
-                    })
+                    .measure(
+                        Phase::AnnotationObserve,
+                        reader::observe(
+                            ingress,
+                            service.group()?,
+                            query::Query::AcceptedBucketWithClosure {
+                                table: ingress.scope.table,
+                                bucket: service.bucket(),
+                                after,
+                                limit: 32,
+                            },
+                        ),
+                    )
                     .await?;
-                let query::Value::Accepted(mut page) = value else {
+                let query::Value::SourcePage { mut page, closure } = value else {
                     bail!("annotation source page unavailable");
                 };
+                // The page and closure share one fresh quorum cut. Check the
+                // recovery base before any payload fetch or cursor advancement.
+                service.check_source_closure(closure.as_deref())?;
                 if let Some(cut) = replay_cut {
                     page.through = page.through.min(cut);
                     page.entries.retain(|(index, _)| *index <= cut);

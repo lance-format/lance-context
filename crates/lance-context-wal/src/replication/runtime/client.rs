@@ -189,6 +189,7 @@ impl WireRequest {
                     query::Query::Visibility { .. } => "query.visibility",
                     query::Query::PublisherBinding { .. } => "query.publisher_binding",
                     query::Query::AcceptedBucket { .. } => "query.accepted_bucket",
+                    query::Query::AcceptedBucketWithClosure { .. } => "query.source_page",
                 },
             ),
         }

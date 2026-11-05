@@ -151,6 +151,70 @@ fn close(c: &mut Cluster, permit: ClosurePermit) -> Result<Reply> {
 }
 
 #[test]
+fn source_page_captures_published_closure_and_live_suffix_after_reopen() -> Result<()> {
+    let (mut c, _, incarnation, predecessor) = fixture()?;
+    let permit = publish(&mut c, incarnation, predecessor)?;
+    c.append(c.table, 3)?;
+    assert!(matches!(
+        close(&mut c, permit.clone())?,
+        Reply::Closed { .. }
+    ));
+    for reopen in [false, true] {
+        if reopen {
+            c.reopen()?;
+        }
+        c.nodes[3].query(
+            20,
+            900,
+            Query::AcceptedBucketWithClosure {
+                table: c.table,
+                bucket: 1,
+                after: 0,
+                limit: 128,
+            },
+        )?;
+        let held = c.nodes[3].poll()?;
+        assert!(
+            held.reads.is_empty(),
+            "closure/page escaped its quorum barrier"
+        );
+        for packet in held.messages {
+            c.nodes[packet.message.to as usize - 1].step(packet)?;
+        }
+        let reads = c.pump()?.reads;
+        let result = reads
+            .iter()
+            .find(|r| r.request == 900)
+            .context("source page missing")?;
+        let ReadOutcome::Observed {
+            cut,
+            value:
+                Value::SourcePage {
+                    page,
+                    closure: Some(closed),
+                },
+        } = &result.outcome
+        else {
+            anyhow::bail!("source page lost its durable closure");
+        };
+        assert_eq!(closed.permit, permit);
+        assert_eq!(cut.group, 20);
+        assert!(cut.applied >= cut.quorum_index);
+        assert_eq!(page.through, cut.applied);
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].1.sequence, 3);
+        assert!(page.entries[0].0 > closed.permit.closure().through);
+        let encoded = bincode::serialize(&result.outcome)?;
+        assert!(encoded.len() <= 256 * 128 + 1024 + MAX_CLOSED_BYTES);
+        assert_eq!(
+            bincode::deserialize::<ReadOutcome>(&encoded)?,
+            result.outcome
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn closure_retires_selected_payloads_preserves_suffix_and_rejects_delayed_pins() -> Result<()> {
     let (mut c, pin, incarnation, predecessor) = fixture()?;
     assert!(closure_permit(&mut c, pin.selection().plan_index)?.is_none());
