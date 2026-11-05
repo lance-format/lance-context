@@ -150,7 +150,15 @@ fn leadership_loss_retires_both_queued_and_sent_read_batches() -> Result<()> {
             nodes[0].query(10, request, accepted())?;
         }
         let held = if send_first {
-            nodes[0].poll()?.messages
+            let held = nodes[0].poll()?.messages;
+            // Lose leadership with both a sent round and its unsent successor.
+            for request in 5..=8 {
+                nodes[0].query(10, request, accepted())?;
+            }
+            let deferred = nodes[0].poll()?;
+            assert!(deferred.messages.is_empty());
+            assert!(deferred.reads.is_empty());
+            held
         } else {
             Vec::new()
         };
@@ -169,7 +177,7 @@ fn leadership_loss_retires_both_queued_and_sent_read_batches() -> Result<()> {
         };
         nodes[0].step(packet)?;
         let events = nodes[0].poll()?;
-        assert_eq!(events.reads.len(), 4);
+        assert_eq!(events.reads.len(), if send_first { 8 } else { 4 });
         assert!(events.reads.iter().all(|r| r.outcome == Outcome::Unknown));
         assert_eq!(nodes[0].status(10)?.pending_reads, 0);
         deliver(&mut nodes, held)?;
