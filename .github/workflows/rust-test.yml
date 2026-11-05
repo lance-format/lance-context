@@ -348,6 +348,7 @@ jobs:
           cargo test -p lance-context-ingest --features service,http-client --lib tests::annotation_http -- --test-threads=2
           cargo test -p lance-context-ingest --features service,http-client --lib tests::mixed_annotations -- --test-threads=2
           cargo test -p lance-context-ingest --features service,http-client --lib tests::materializer::advance -- --test-threads=2
+          cargo test -p lance-context-ingest --features service,http-client --lib tests::materializer::close -- --test-threads=2
           cargo test -p lance-context-ingest --features service,http-client --lib tests::annotation_runtime::lost_advance -- --test-threads=1
           cargo test -p lance-context-ingest --features service,http-client --lib tests::materializer::plan -- --test-threads=2
           cargo test -p lance-context-ingest --features service,http-client --lib tests::annotation_runtime::lost_plan -- --test-threads=1
