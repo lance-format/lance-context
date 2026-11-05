@@ -35,6 +35,9 @@ mod peer_observation;
 pub use peer_observation::{PeerDiskRefusal, PeerRejections};
 mod poll_observation;
 pub use poll_observation::{EngineWriteObservation, PollObservation};
+mod append_observation;
+use append_observation::AppendTiming;
+pub use append_observation::{AppendIntervals, AppendObservation};
 #[cfg(feature = "peer-transport")]
 pub mod peer;
 
@@ -289,7 +292,7 @@ impl<T> Completion<T> {
 }
 enum Work {
     // Keep the data lane inline; only larger control metadata needs boxing.
-    Append(u64, Batch, Completion<Outcome>),
+    Append(u64, Batch, Instant, Completion<Outcome>),
     Commit(u64, Box<Command>, Completion<Outcome>),
     Query(u64, query::Query, Completion<query::Outcome>),
     Campaign(Completion<()>),
@@ -342,6 +345,8 @@ pub struct Observation {
     pub fetch: FetchObservation,
     /// Completed durable polls and native write timings on this worker thread.
     pub durable_poll: PollObservation,
+    /// Per-append completed intervals, grouped by the worker's outcome.
+    pub append: AppendObservation,
 }
 
 /// Bounded cumulative timings for serviced local fetch requests, including
@@ -480,7 +485,7 @@ impl Handle {
         };
         let token = self.token()?;
         let work = match command {
-            Command::Append { batch, .. } => Work::Append(token, batch, completion),
+            Command::Append { batch, .. } => Work::Append(token, batch, Instant::now(), completion),
             control => Work::Commit(token, Box::new(control), completion),
         };
         self.enqueue(route, work, data)?;
@@ -660,6 +665,7 @@ impl Runtime {
             let observation = Arc::new(Mutex::new(Observation {
                 fetch: FetchObservation::default(),
                 durable_poll: PollObservation::default(),
+                append: AppendObservation::default(),
                 status,
                 checkpoint_index,
                 first_retained_index,
@@ -769,29 +775,62 @@ struct Worker {
     outbox: async_mpsc::Sender<Outbound>,
     observation: Arc<Mutex<Observation>>,
     options: Options,
-    writes: BTreeMap<u64, Completion<Outcome>>,
+    writes: BTreeMap<u64, PendingWrite>,
     reads: BTreeMap<u64, Completion<query::Outcome>>,
 }
+struct PendingWrite {
+    reply: Completion<Outcome>,
+    append: Option<AppendTiming>,
+}
 impl Worker {
-    fn track_write(&mut self, token: u64, reply: Completion<Outcome>, result: Result<()>) {
+    fn track_write(&mut self, token: u64, pending: PendingWrite, result: Result<()>) {
         match result {
             Ok(()) => {
-                self.writes.insert(token, reply);
+                self.writes.insert(token, pending);
             }
             Err(e) => {
-                reply.finish(Err(e));
+                self.finish_write(pending, Err(e));
             }
         }
     }
+    fn finish_write(&self, pending: PendingWrite, result: Result<Outcome>) {
+        if let Some(timing) = pending.append {
+            // Capture before the diagnostic lock; never add sampling contention
+            // to the measured consensus/completion interval.
+            let finished = Instant::now();
+            self.observation
+                .lock()
+                .unwrap()
+                .append
+                .record(timing, finished, &result);
+        }
+        pending.reply.finish(result);
+    }
     fn work(&mut self, work: Work, after_poll: &mut Vec<AfterPoll>) {
         match work {
-            Work::Append(token, batch, reply) => {
+            Work::Append(token, batch, queued, reply) => {
+                let dequeued = Instant::now();
                 let result = self.node.propose(self.group, token, batch);
-                self.track_write(token, reply, result);
+                let pending = PendingWrite {
+                    reply,
+                    append: Some(AppendTiming {
+                        queued,
+                        dequeued,
+                        proposed: Instant::now(),
+                    }),
+                };
+                self.track_write(token, pending, result);
             }
             Work::Commit(token, command, reply) => {
                 let result = command.execute(&mut self.node, token);
-                self.track_write(token, reply, result);
+                self.track_write(
+                    token,
+                    PendingWrite {
+                        reply,
+                        append: None,
+                    },
+                    result,
+                );
             }
             Work::Query(token, query, reply) => match self.node.query(self.group, token, query) {
                 Ok(()) => {
@@ -926,7 +965,7 @@ impl Worker {
                         .writes
                         .remove(&done.request)
                         .context("uncorrelated durable completion")?;
-                    pending.finish(Ok(done.outcome));
+                    self.finish_write(pending, Ok(done.outcome));
                 }
                 for done in events.reads {
                     let pending = self

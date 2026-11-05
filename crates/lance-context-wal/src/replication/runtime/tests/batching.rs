@@ -35,6 +35,126 @@ async fn worker_polled(handle: &Handle) -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn append_intervals_separate_worker_queue_from_quorum_and_survive_caller_cancellation(
+) -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let c = Cluster::open(
+        directory.path(),
+        Options {
+            tick_interval: Duration::from_secs(1),
+            ..Options::default()
+        },
+    )?;
+    c.elect(1, 10).await?;
+    let h = &c.handles[&1];
+    let warmup = index(
+        h.commit(Command::Append {
+            group: 10,
+            batch: batch(1),
+        })?
+        .await?,
+    );
+    wait_for(|| {
+        c.handles
+            .values()
+            .all(|h| h.observation(10).unwrap().status.applied >= warmup)
+    })
+    .await?;
+    let before = h.observation(10)?.append.accepted;
+    assert_eq!(before.completed, 1);
+
+    c.isolated.store(1, Ordering::Release);
+    let (entered, resume) = hold_worker(h)?;
+    entered.recv_timeout(Duration::from_secs(5))?;
+    let pending = h.commit(Command::Append {
+        group: 10,
+        batch: batch(2),
+    })?;
+    let queued_since = Instant::now();
+    sleep(Duration::from_millis(20)).await;
+    let queued_micros = queued_since.elapsed().as_micros() as u64;
+    assert_eq!(h.observation(10)?.append.accepted.completed, 1);
+    assert!(pending.0.is_empty());
+    drop(resume);
+    worker_polled(h).await?;
+    // The local proposal and persistence have finished, but no follower can
+    // acknowledge it. This interval belongs to completion, not the queue.
+    let quorum_since = Instant::now();
+    sleep(Duration::from_millis(20)).await;
+    let quorum_micros = quorum_since.elapsed().as_micros() as u64;
+    assert!(pending.0.is_empty(), "append bypassed quorum persistence");
+    assert_eq!(h.observation(10)?.append.accepted.completed, 1);
+    c.isolated.store(0, Ordering::Release);
+    let second = index(timeout(Duration::from_secs(10), pending).await??);
+    let measured = h.observation(10)?.append.accepted;
+    assert_eq!(measured.completed, 2);
+    assert!(measured.queue_micros - before.queue_micros >= queued_micros);
+    assert!(measured.completion_micros - before.completion_micros >= quorum_micros);
+
+    // Durable sequence rejection and a pre-proposal follower error must not
+    // dilute accepted-request timings.
+    assert!(matches!(
+        h.commit(Command::Append {
+            group: 10,
+            batch: batch(4)
+        })?
+        .await?,
+        Outcome::Committed(Applied::Rejected { .. })
+    ));
+    assert_eq!(h.observation(10)?.append.accepted.completed, 2);
+    assert_eq!(h.observation(10)?.append.committed_other.completed, 1);
+    assert!(c.handles[&2]
+        .commit(Command::Append {
+            group: 10,
+            batch: batch(3)
+        })?
+        .await
+        .is_err());
+    assert_eq!(
+        c.handles[&2]
+            .observation(10)?
+            .append
+            .proposal_error
+            .completed,
+        1
+    );
+
+    // Once queued, a dropped caller does not cancel the underlying append.
+    let (entered, resume) = hold_worker(h)?;
+    entered.recv_timeout(Duration::from_secs(5))?;
+    drop(h.commit(Command::Append {
+        group: 10,
+        batch: batch(3),
+    })?);
+    drop(resume);
+    wait_for(|| {
+        let observed = h.observation(10).unwrap();
+        observed.append.accepted.completed == 3 && observed.status.accepted_records == 3
+    })
+    .await?;
+    let third = h.observation(10)?.status.applied;
+    wait_for(|| {
+        c.handles
+            .values()
+            .all(|h| h.observation(10).unwrap().status.applied >= third)
+    })
+    .await?;
+    c.shutdown().await?;
+    for id in 1..=3 {
+        let node = Node::open(
+            &directory.path().join(id.to_string()),
+            layout(),
+            id,
+            Limits::default(),
+        )?;
+        assert_eq!(node.read_accepted(10, warmup)?, Some(batch(1)));
+        assert_eq!(node.read_accepted(10, second)?, Some(batch(2)));
+        assert_eq!(node.read_accepted(10, third)?, Some(batch(3)));
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn queued_reads_share_one_quorum_before_slow_data_without_reusing_it_for_later_reads(
 ) -> Result<()> {
     use raft::eraftpb::MessageType;
