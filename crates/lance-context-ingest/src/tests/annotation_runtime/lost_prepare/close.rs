@@ -87,6 +87,8 @@ async fn exercise() -> Result<()> {
         service.get("T", Duration::from_secs(1)).await?,
         Some(current.clone())
     );
+    // Both publications have advanced; their payload can retire while point
+    // reads and retained request results continue to work from the new base.
     assert!(matches!(
         direct
             .request_routed(Request::Fetch {
@@ -95,7 +97,7 @@ async fn exercise() -> Result<()> {
             })
             .await?
             .reply,
-        Reply::Record(Some(_))
+        Reply::Record(None)
     ));
     stop.send(()).unwrap();
     task.await??;
