@@ -37,10 +37,24 @@ pub struct Fixture {
 }
 impl Fixture {
     pub fn new() -> Result<Self> {
+        Self::with_groups(
+            BTreeMap::from([(10, vec![1, 2, 3]), (20, vec![4, 5, 6])]),
+            vec![10, 20, 10, 20],
+        )
+    }
+    pub fn shared_groups() -> Result<Self> {
+        Self::with_groups(
+            BTreeMap::from([(5, vec![1, 2, 3]), (10, vec![1, 2, 3]), (11, vec![1, 2, 3])]),
+            vec![10, 5, 11, 5],
+        )
+    }
+    fn with_groups(groups: BTreeMap<u64, Vec<u64>>, buckets: Vec<u64>) -> Result<Self> {
+        let nodes: BTreeSet<_> = groups.values().flatten().copied().collect();
+        let catalog_group = *groups.keys().next().unwrap();
         let root = tempfile::tempdir()?;
         let mut leases = Vec::new();
         let mut listens = BTreeMap::new();
-        for node in 1..=6 {
+        for &node in &nodes {
             let mut ports = Vec::new();
             for _ in 0..5 {
                 let listener = TcpListener::bind("127.0.0.1:0")?;
@@ -64,8 +78,8 @@ impl Fixture {
                 .iter()
                 .map(|(&id, l)| (id, l.peer.to_string()))
                 .collect(),
-            groups: BTreeMap::from([(10, vec![1, 2, 3]), (20, vec![4, 5, 6])]),
-            buckets: vec![10, 20, 10, 20],
+            groups,
+            buckets,
         });
         let mut roots = RootCertStore::empty();
         let mut roots_pem = String::new();
@@ -97,7 +111,7 @@ impl Fixture {
             .map_err(|_| anyhow::anyhow!("generate fixture catalog key"))?;
         fs::write(root.path().join("catalog.pk8"), catalog.as_ref())?;
         let mut source_keys = BTreeMap::new();
-        for group in [10, 20] {
+        for &group in layout.groups.keys() {
             let key = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
                 .map_err(|_| anyhow::anyhow!("generate fixture source key"))?;
             fs::write(
@@ -152,7 +166,7 @@ impl Fixture {
                 trusted_clients: BTreeSet::from([fingerprints[&7]]),
                 signing: SigningFiles {
                     catalog: groups
-                        .contains(&10)
+                        .contains(&catalog_group)
                         .then(|| root.path().join("catalog.pk8")),
                     sources: groups
                         .iter()
