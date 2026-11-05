@@ -834,9 +834,17 @@ impl<A: AllocatorTrait> MemTable<A> {
     #[inline]
     pub fn has_at_least_some_entries_before(&self, gate: FileId, count: usize) -> bool {
         debug_assert!(count > 0);
-        self.entry_indexes
-            .get(count - 1)
-            .map_or(false, |ei| ei.entries.unwrap().id.seq <= gate.seq)
+        self.entry_indexes.get(count - 1).map_or(false, |ei| {
+            let file = ei.entries.unwrap().id;
+            // Rewritten entries form the prefix of this table, before all
+            // append entries. The queues' file counters advance independently;
+            // comparing their sequence numbers can strand a heavy append tail.
+            match (file.queue, gate.queue) {
+                (LogQueue::Rewrite, LogQueue::Append) => true,
+                (LogQueue::Append, LogQueue::Rewrite) => false,
+                _ => file.seq <= gate.seq,
+            }
+        })
     }
 
     /// Returns the region ID.
