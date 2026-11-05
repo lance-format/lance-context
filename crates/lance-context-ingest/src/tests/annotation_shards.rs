@@ -203,7 +203,9 @@ async fn producer(service: &Service) -> Result<Producer> {
     service
         .open_producer(ProducerOpen {
             bucket: service.bucket(),
-            slot: 1,
+            // Slots belong to the data group, including when both shards
+            // share it. Give each shard its own producer slot.
+            slot: service.bucket() + 1,
             expected_generation: 0,
             operation: Uuid::new_v4(),
         })
@@ -213,11 +215,53 @@ async fn producer(service: &Service) -> Result<Producer> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn annotation_shards_reject_foreign_batches_and_drain_independently_across_recovery(
 ) -> Result<()> {
+    independent_shards_across_recovery(ShardLayout::SeparateData).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn annotation_shards_with_a_shared_data_group_drain_and_recover() -> Result<()> {
+    independent_shards_across_recovery(ShardLayout::SharedData).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn annotation_shards_with_a_separate_catalog_drain_and_recover() -> Result<()> {
+    independent_shards_across_recovery(ShardLayout::SeparateCatalog).await
+}
+
+#[derive(Clone, Copy)]
+enum ShardLayout {
+    SeparateData,
+    SharedData,
+    SeparateCatalog,
+}
+
+async fn independent_shards_across_recovery(placement: ShardLayout) -> Result<()> {
     let root = tempfile::tempdir()?;
     let mut definition = (*layout()).clone();
-    definition.buckets = vec![10, 20];
+    match placement {
+        ShardLayout::SeparateData => definition.buckets = vec![10, 20],
+        ShardLayout::SharedData | ShardLayout::SeparateCatalog => {
+            definition.groups.remove(&20);
+            definition.buckets = vec![10; 4];
+            if matches!(placement, ShardLayout::SeparateCatalog) {
+                // Active data buckets 0/1 keep their group. Group 5 owns only
+                // catalog state and unused buckets in this workload.
+                definition.groups.insert(5, vec![1, 2, 3]);
+                definition.buckets[2] = 5;
+                definition.buckets[3] = 5;
+            }
+        }
+    }
     let layout = Arc::new(definition);
     let c = network::Cluster::open_signed(root.path(), layout.clone()).await?;
+    assert_eq!(
+        c.client.catalog_group(),
+        if matches!(placement, ShardLayout::SeparateCatalog) {
+            5
+        } else {
+            10
+        }
+    );
     let a = Physical::provision(&c, &layout, root.path(), 0).await?;
     let b = Physical::provision(&c, &layout, root.path(), 1).await?;
     assert_eq!(a.binding.qualified_table, b.binding.qualified_table);
