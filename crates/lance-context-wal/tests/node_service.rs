@@ -352,3 +352,6 @@ async fn run_cluster(f: &Fixture) -> Result<()> {
     }
     Ok(())
 }
+
+#[path = "node_service/shared_groups.rs"]
+mod shared_groups;
