@@ -244,6 +244,16 @@ fn pressured_follower_defers_new_data_and_catches_up_after_space_is_reclaimed() 
         nodes[2].step(deferred.clone()).is_err(),
         "follower accepted a new payload despite exhausted data admission"
     );
+    let mut corrupt = deferred.clone();
+    let mut changed = corrupt.message.entries[0].data.to_vec();
+    changed[0] ^= 1;
+    corrupt.message.entries[0].data = Bytes::from(changed);
+    // Pressure refuses the packet before its body is scanned. Once admission
+    // reopens, the same corrupt packet must fail integrity validation instead.
+    assert!(nodes[2]
+        .step(corrupt.clone())
+        .unwrap_err()
+        .is::<crate::admission::DiskBudgetExhausted>());
     let previous_applied = nodes[2].status(10)?.applied;
     nodes[2].poll()?;
     assert_eq!(nodes[2].status(10)?.applied, previous_applied);
@@ -278,6 +288,14 @@ fn pressured_follower_defers_new_data_and_catches_up_after_space_is_reclaimed() 
     assert_eq!(nodes[2].read_accepted(10, index)?, None);
     std::fs::remove_file(&occupied)?;
     nodes[2].prepare_disk_measurement()?.run()?;
+    assert!(matches!(
+        nodes[2]
+            .step(corrupt)
+            .unwrap_err()
+            .downcast_ref::<crate::record::ValidationError>(),
+        Some(crate::record::ValidationError::DigestMismatch)
+    ));
+    assert_eq!(nodes[2].disk_budget().unwrap().reserved_proposal_bytes, 0);
     nodes[2].step(deferred.clone())?;
     assert!(nodes[2].disk_budget().unwrap().reserved_proposal_bytes > 0);
     pump(&mut nodes)?;

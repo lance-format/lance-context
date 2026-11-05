@@ -832,9 +832,6 @@ impl Node {
             message.snapshot.is_none(),
             "snapshot requires receive_snapshot and step_snapshot"
         );
-        for entry in &message.entries {
-            state::validate_entry(&self.layout, packet.group, &self.limits, entry, true)?;
-        }
         let group = self
             .groups
             .get_mut(&packet.group)
@@ -874,6 +871,13 @@ impl Node {
         } else {
             None
         };
+        // Refuse new payloads that cannot fit before scanning their bodies.
+        // Every admitted entry (including retransmissions) is still validated
+        // before Raft can change term or append any prefix. Validation failure
+        // drops the reservation without changing the log or acknowledging it.
+        for entry in &message.entries {
+            state::validate_entry(&self.layout, packet.group, &self.limits, entry, true)?;
+        }
         group.raw.step(message)?;
         if let Some(reservation) = reservation {
             // Keep queued entries charged across sibling-group admission until
