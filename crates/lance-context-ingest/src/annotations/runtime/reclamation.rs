@@ -34,9 +34,9 @@ pub struct Options {
     /// other backends retain one path per call.
     pub delete_parallelism: usize,
     /// Minimum delay after a completed collection pass. Slow object storage I/O
-    /// does not consume this cooldown. Data listing yields after at most this
-    /// interval (capped at one second), or when pending under write backpressure,
-    /// retaining the same listing stream.
+    /// does not consume this cooldown. Reference and data listings yield after
+    /// at most this interval (capped at one second), or when pending under write
+    /// backpressure, retaining the same listing stream.
     pub interval: Duration,
 }
 impl Default for Options {
@@ -105,6 +105,9 @@ pub(super) struct Collector {
     options: Options,
     metadata: lance::cache::LanceCache,
     next_run: tokio::time::Instant,
+    // One original tag/branch response for the current destination. Pending
+    // checks yield to publication; no candidates are classified until EOF.
+    reference_listing: Option<BoxStream<'static, object_store::Result<ObjectMeta>>>,
     listing: Option<BoxStream<'static, object_store::Result<ObjectMeta>>>,
     deferred: Option<(Path, u64)>,
     sealed: Option<SealedPage>,
@@ -135,6 +138,7 @@ impl Collector {
                 .with_key_prefix("lance-context.annotation-collection")
                 .with_key_prefix(&Uuid::new_v4().to_string()),
             next_run: tokio::time::Instant::now(),
+            reference_listing: None,
             listing: None,
             deferred: None,
             sealed: None,
@@ -201,6 +205,7 @@ impl Collector {
         if result.is_ok()
             && self.sealed.is_none()
             && !self.listing_blocked
+            && self.reference_listing.is_none()
             && service.shared.body.is_some()
         {
             std::mem::swap(&mut self.listing, &mut self.other_listing);
@@ -283,19 +288,41 @@ impl Collector {
         // Inspect at most the first reference. Do not enumerate arbitrary tag
         // or branch histories into memory. External writers are prohibited by
         // the exclusive-ownership contract, including during this check.
-        for prefix in [
-            lance::dataset::refs::base_tags_path(&destination.base),
-            lance::dataset::refs::base_branches_contents_path(&destination.base),
-        ] {
-            ensure!(
-                phases
-                    .measure(Phase::CollectList, store.list(Some(&prefix)).try_next())
-                    .await
-                    .context(ListingFailure)?
-                    .is_none(),
-                "annotation data collection requires a table without tags or branches"
-            );
+        if self.reference_listing.is_none() {
+            let tags = lance::dataset::refs::base_tags_path(&destination.base);
+            let branches = lance::dataset::refs::base_branches_contents_path(&destination.base);
+            self.reference_listing = Some(listing::drive(
+                store
+                    .list(Some(&tags))
+                    .chain(store.list(Some(&branches)))
+                    .boxed(),
+            ));
         }
+        let mut progress = service.shared.progress.subscribe();
+        let until = tokio::time::Instant::now() + self.options.interval.min(Duration::from_secs(1));
+        let reference = phases
+            .measure(Phase::CollectList, async {
+                next_listing(
+                    self.reference_listing.as_mut().unwrap(),
+                    &mut progress,
+                    until,
+                )
+                .await
+                .transpose()
+            })
+            .await;
+        if !matches!(&reference, Ok(None)) {
+            self.reference_listing = None;
+        }
+        let Some(reference) = reference.context(ListingFailure)? else {
+            // Drop this pass's protection roots and reacquire them next time.
+            // The same bounded response keeps progressing during publication.
+            return Ok(());
+        };
+        ensure!(
+            reference.is_none(),
+            "annotation data collection requires a table without tags or branches"
+        );
         let page_charge = self.options.max_bytes * 3;
         let workspace = budget.reserve(page_charge).await;
         let mut candidates = phases
