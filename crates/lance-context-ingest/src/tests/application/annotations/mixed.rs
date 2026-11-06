@@ -197,16 +197,45 @@ async fn exercise(failure: Failure) -> Result<()> {
     )?)?;
     let patched = update(&client, &bases[2], &producer, 2, patch).await?;
     reclaimed(&c, patched.completion.index).await?;
-    let suffix = fixture::encoded(fixture::create(&["U"], &["s"], &[2])?)?;
+    let (suffix, current_status, current_score) = if matches!(failure, Failure::Sigkill) {
+        (fixture::create(&["U"], &["s"], &[2])?, "reviewed", 0.9)
+    } else {
+        (
+            mixed::wire::patches(
+                &fixture::patch(&["T"], Some("approved"), Some(0.7))?,
+                &fixture::limits(),
+            )?,
+            "approved",
+            0.7,
+        )
+    };
+    let suffix = fixture::encoded(suffix)?;
     let imported = update(&client, &bases[1], &producer, 3, suffix.clone()).await?;
     let visible: TurnAnnotation = post(&client, &bases[2], "read")
-        .json(&PointRequest { turn: "U".into() })
+        .json(&PointRequest {
+            turn: if matches!(failure, Failure::Sigkill) {
+                "U"
+            } else {
+                "T"
+            }
+            .into(),
+        })
         .send()
         .await?
         .error_for_status()?
         .json()
         .await?;
-    assert_eq!(visible.status.as_deref(), Some("pending"));
+    assert_eq!(
+        visible.status.as_deref(),
+        Some(if matches!(failure, Failure::Sigkill) {
+            "pending"
+        } else {
+            current_status
+        })
+    );
+    if !matches!(failure, Failure::Sigkill) {
+        assert_eq!(visible.score, Some(current_score));
+    }
     assert_eq!(
         annotation_publication::read(&c, &narrow, None)
             .await?
@@ -246,7 +275,7 @@ async fn exercise(failure: Failure) -> Result<()> {
             // not a successful stale base read or an invented missing turn.
             for base in &bases[1..=2] {
                 let response = post(&client, base, "read")
-                    .json(&PointRequest { turn: "U".into() })
+                    .json(&PointRequest { turn: "T".into() })
                     .send()
                     .await?;
                 assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
@@ -285,8 +314,8 @@ async fn exercise(failure: Failure) -> Result<()> {
             .await?;
         assert_eq!(visible.status.as_deref(), Some("pending"));
         let current = read(&client, base).await?;
-        assert_eq!(current.status.as_deref(), Some("reviewed"));
-        assert_eq!(current.score, Some(0.9));
+        assert_eq!(current.status.as_deref(), Some(current_status));
+        assert_eq!(current.score, Some(current_score));
     }
     reclaimed(&c, through).await?;
     assert!(annotation_publication::state(&c).await?.authority.epoch > authority.epoch);
@@ -318,13 +347,15 @@ async fn exercise(failure: Failure) -> Result<()> {
     )
     .await?;
     let current = read(&client, &bases[1]).await?;
-    assert_eq!(current.status.as_deref(), Some("reviewed"));
-    assert_eq!(current.score, Some(0.9));
+    assert_eq!(current.status.as_deref(), Some(current_status));
+    assert_eq!(current.score, Some(current_score));
     reclaimed(&c, latest.completion.index).await?;
-    assert_eq!(
-        update(&client, &bases[1], &producer, next_sequence, reimport).await?,
-        latest
-    );
+    if matches!(failure, Failure::Sigkill) {
+        assert_eq!(
+            update(&client, &bases[1], &producer, next_sequence, reimport).await?,
+            latest
+        );
+    }
     let selected = annotation_publication::read(&c, &narrow, None).await?;
     assert_eq!(selected.count_rows(None).await?, 3);
     let reference = BodySnapshot::read(&selected).await?.unwrap();

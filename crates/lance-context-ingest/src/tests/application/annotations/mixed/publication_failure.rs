@@ -61,14 +61,11 @@ pub(super) async fn fail(
     let before = annotation_publication::state(c).await?;
     assert!(before.progress.pending.is_none());
     let blocked = ReadOnlyDirectory::new(root.join("body.lance/data"))?;
-    // The ACKed create is already in the one-record suffix. This original
-    // second record fills the window and triggers the failing body publication.
-    // Keep the existing annotation unchanged so even an unknown HTTP outcome
-    // cannot make the final expected value depend on a replacement request.
-    let body = fixture::encoded(mixed::wire::patches(
-        &fixture::patch(&["T"], Some("reviewed"), Some(0.9))?,
-        &fixture::limits(),
-    )?)?;
+    // The ACKed field update is already in the one-record suffix. This original
+    // create fills the window and triggers the failing body publication. Its
+    // HTTP outcome can be unknown; the retained plan below proves the exact
+    // original WAL identity that the successor must apply without resubmission.
+    let body = fixture::encoded(fixture::create(&["U"], &["s"], &[2])?)?;
     let response = post(client, ingress, "update")
         .header(crate::http::PRODUCER, &producer.producer)
         .header(crate::http::SEQUENCE, 4)
