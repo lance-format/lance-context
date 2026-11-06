@@ -9,7 +9,10 @@ use object_store::{
     path::Path, CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
     ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
 };
-use std::sync::Mutex;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Mutex,
+};
 
 #[derive(Debug)]
 struct Gate {
@@ -46,6 +49,8 @@ pub(super) struct Gates {
     put: Mutex<Option<Gate>>,
     committed_put: Mutex<Option<Gate>>,
     pub(super) failed_upload: Mutex<Option<Path>>,
+    pub(super) multipart_parts: AtomicUsize,
+    pub(super) multipart_completions: AtomicUsize,
 }
 impl Gates {
     fn arm(slot: &Mutex<Option<Gate>>) -> Paused {
@@ -223,10 +228,14 @@ struct GatedUpload {
 #[async_trait::async_trait]
 impl MultipartUpload for GatedUpload {
     fn put_part(&mut self, data: PutPayload) -> object_store::UploadPart {
+        self.gates.multipart_parts.fetch_add(1, Ordering::SeqCst);
         self.inner.put_part(data)
     }
     async fn complete(&mut self) -> object_store::Result<PutResult> {
         let result = self.inner.complete().await?;
+        self.gates
+            .multipart_completions
+            .fetch_add(1, Ordering::SeqCst);
         self.gates.after_put(&self.path).await?;
         Ok(result)
     }

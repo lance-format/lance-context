@@ -4,6 +4,7 @@ use arrow_array::Array;
 use futures::TryStreamExt;
 
 mod fencing;
+mod multipart_recovery;
 mod status_filter;
 mod store;
 mod upload_failure;
