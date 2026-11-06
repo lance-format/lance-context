@@ -94,3 +94,45 @@ async fn authenticated_idle_peer_delivers_the_next_frame_without_reconnecting() 
     receiver.close().await?;
     result
 }
+
+#[tokio::test]
+async fn partial_peer_frames_keep_the_deadline_and_release_receive_credits() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let node = Node::open(directory.path(), layout(), 1, Limits::default())?;
+    let (runtime, _outbox) = Runtime::spawn(node, super::super::super::Options::default())?;
+    let handle = runtime.handle();
+    let result = async {
+        let frame = packet(&handle, 2, Bytes::from(vec![0xa5; 1024]));
+        let (header, bodies) = encode(&frame)?;
+        let mut wire = header.clone();
+        for body in bodies {
+            wire.extend_from_slice(&body);
+        }
+        // Partial length, header and payload must all expire, even when the
+        // sender keeps its connection open. Header/body credits cannot leak.
+        for prefix in [1, 3, 4, header.len() - 1, header.len(), wire.len() - 1] {
+            let (mut write, mut read) = tokio::io::duplex(4096);
+            write.write_all(&wire[..prefix]).await?;
+            let credits = Arc::new(Semaphore::new(4096));
+            let error = timeout(
+                Duration::from_secs(2),
+                read_next_packet(&mut read, &handle, 2, &credits, FRAME_TIMEOUT),
+            )
+            .await?
+            .err()
+            .context("partial peer frame unexpectedly completed")?;
+            ensure!(
+                error.to_string() == "peer frame receive deadline",
+                "partial frame failed for a different reason: {error:#}"
+            );
+            ensure!(
+                credits.available_permits() == 4096,
+                "receive credits leaked"
+            );
+        }
+        Ok(())
+    }
+    .await;
+    runtime.shutdown().await?;
+    result
+}
