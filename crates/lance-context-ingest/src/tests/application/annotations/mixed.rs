@@ -2,13 +2,30 @@ use super::*;
 use crate::{annotations::mixed, tests::mixed_annotations as fixture};
 use lance_context_core::annotation_staging::BodySnapshot;
 
+#[cfg(unix)]
+mod publication_failure;
+
+enum Failure {
+    Sigkill,
+    #[cfg(unix)]
+    Publication,
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires INGEST_TEST_BIN and ETCD_TEST_ENDPOINTS; real mixed owner/ingress processes"]
 async fn mixed_executable_recovers_acked_import_and_annotations_after_sigkill() -> Result<()> {
-    tokio::time::timeout(Duration::from_secs(60), exercise()).await?
+    tokio::time::timeout(Duration::from_secs(60), exercise(Failure::Sigkill)).await?
 }
 
-async fn exercise() -> Result<()> {
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires INGEST_TEST_BIN and ETCD_TEST_ENDPOINTS; real owner publication failure"]
+async fn mixed_executable_recovers_after_native_write_failure_without_resubmitting_requests(
+) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(120), exercise(Failure::Publication)).await?
+}
+
+async fn exercise(failure: Failure) -> Result<()> {
     let binary = std::env::var("INGEST_TEST_BIN")?;
     let endpoints = std::env::var("ETCD_TEST_ENDPOINTS")?;
     let root = tempfile::Builder::new()
@@ -180,16 +197,45 @@ async fn exercise() -> Result<()> {
     )?)?;
     let patched = update(&client, &bases[2], &producer, 2, patch).await?;
     reclaimed(&c, patched.completion.index).await?;
-    let suffix = fixture::encoded(fixture::create(&["U"], &["s"], &[2])?)?;
+    let (suffix, current_status, current_score) = if matches!(failure, Failure::Sigkill) {
+        (fixture::create(&["U"], &["s"], &[2])?, "reviewed", 0.9)
+    } else {
+        (
+            mixed::wire::patches(
+                &fixture::patch(&["T"], Some("approved"), Some(0.7))?,
+                &fixture::limits(),
+            )?,
+            "approved",
+            0.7,
+        )
+    };
+    let suffix = fixture::encoded(suffix)?;
     let imported = update(&client, &bases[1], &producer, 3, suffix.clone()).await?;
     let visible: TurnAnnotation = post(&client, &bases[2], "read")
-        .json(&PointRequest { turn: "U".into() })
+        .json(&PointRequest {
+            turn: if matches!(failure, Failure::Sigkill) {
+                "U"
+            } else {
+                "T"
+            }
+            .into(),
+        })
         .send()
         .await?
         .error_for_status()?
         .json()
         .await?;
-    assert_eq!(visible.status.as_deref(), Some("pending"));
+    assert_eq!(
+        visible.status.as_deref(),
+        Some(if matches!(failure, Failure::Sigkill) {
+            "pending"
+        } else {
+            current_status
+        })
+    );
+    if !matches!(failure, Failure::Sigkill) {
+        assert_eq!(visible.score, Some(current_score));
+    }
     assert_eq!(
         annotation_publication::read(&c, &narrow, None)
             .await?
@@ -207,8 +253,36 @@ async fn exercise() -> Result<()> {
             .reply,
         Reply::Record(Some(_))
     ));
-    owner.0.kill()?;
-    ensure!(!owner.0.wait()?.success(), "owner SIGKILL failed");
+    let (through, next_sequence) = match failure {
+        Failure::Sigkill => {
+            owner.0.kill()?;
+            ensure!(!owner.0.wait()?.success(), "owner SIGKILL failed");
+            (imported.completion.index, 4)
+        }
+        #[cfg(unix)]
+        Failure::Publication => {
+            let through = publication_failure::fail(
+                &c,
+                &root,
+                &client,
+                &bases[1],
+                &producer,
+                &mut owner,
+                imported.completion.index,
+            )
+            .await?;
+            // An exited owner must yield an explicit unavailable response,
+            // not a successful stale base read or an invented missing turn.
+            for base in &bases[1..=2] {
+                let response = post(&client, base, "read")
+                    .json(&PointRequest { turn: "T".into() })
+                    .send()
+                    .await?;
+                assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+            }
+            (through, 5)
+        }
+    };
     let mut etcd =
         etcd_client::Client::connect(endpoints.split(',').collect::<Vec<_>>(), None).await?;
     let key = format!("{}/{}/{}", prefix, config.layout.cluster, binding().table);
@@ -219,6 +293,10 @@ async fn exercise() -> Result<()> {
         Ok::<_, anyhow::Error>(())
     })
     .await??;
+    // The replacement must drain the retained suffix while no new business
+    // request is arriving, through the ordinary low-volume publication timer.
+    config.worker.publication.max_batch_wait = Duration::from_millis(20);
+    std::fs::write(&files[0], serde_json::to_vec(&config)?)?;
     let mut replacement = Process::spawn(
         &binary,
         &files[0],
@@ -226,32 +304,58 @@ async fn exercise() -> Result<()> {
         &root.join("replacement.log"),
     )?;
     ready(&client, &bases[0], TOKEN, &mut replacement).await?;
+    for base in &bases[1..=2] {
+        let visible: TurnAnnotation = post(&client, base, "read")
+            .json(&PointRequest { turn: "U".into() })
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(visible.status.as_deref(), Some("pending"));
+        let current = read(&client, base).await?;
+        assert_eq!(current.status.as_deref(), Some(current_status));
+        assert_eq!(current.score, Some(current_score));
+    }
+    reclaimed(&c, through).await?;
+    assert!(annotation_publication::state(&c).await?.authority.epoch > authority.epoch);
     assert_eq!(
-        update(&client, &bases[2], &producer, 3, suffix).await?,
-        imported
+        annotation_publication::read(&c, &narrow, None)
+            .await?
+            .count_rows(None)
+            .await?,
+        2
     );
-    let visible: TurnAnnotation = post(&client, &bases[1], "read")
-        .json(&PointRequest { turn: "U".into() })
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    assert_eq!(visible.status.as_deref(), Some("pending"));
+    if matches!(failure, Failure::Sigkill) {
+        // Check an exact known result only after independent recovery and reads.
+        assert_eq!(
+            update(&client, &bases[2], &producer, 3, suffix).await?,
+            imported
+        );
+    }
     let reimport = fixture::encoded(fixture::create(
         &["T", "U", "V"],
         &["wrong", "wrong", "s"],
         &[9, 9, 3],
     )?)?;
-    let latest = update(&client, &bases[2], &producer, 4, reimport.clone()).await?;
+    let latest = update(
+        &client,
+        &bases[2],
+        &producer,
+        next_sequence,
+        reimport.clone(),
+    )
+    .await?;
     let current = read(&client, &bases[1]).await?;
-    assert_eq!(current.status.as_deref(), Some("reviewed"));
-    assert_eq!(current.score, Some(0.9));
+    assert_eq!(current.status.as_deref(), Some(current_status));
+    assert_eq!(current.score, Some(current_score));
     reclaimed(&c, latest.completion.index).await?;
-    assert_eq!(
-        update(&client, &bases[1], &producer, 4, reimport).await?,
-        latest
-    );
+    if matches!(failure, Failure::Sigkill) {
+        assert_eq!(
+            update(&client, &bases[1], &producer, next_sequence, reimport).await?,
+            latest
+        );
+    }
     let selected = annotation_publication::read(&c, &narrow, None).await?;
     assert_eq!(selected.count_rows(None).await?, 3);
     let reference = BodySnapshot::read(&selected).await?.unwrap();
