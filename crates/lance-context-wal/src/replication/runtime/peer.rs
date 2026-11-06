@@ -60,6 +60,8 @@ pub struct Options {
     /// follower cannot retain the entire runtime outbox's byte allowance.
     pub peer_bytes: usize,
     /// Deadline for a complete handshake or frame, including bounded admission.
+    /// Receive framing starts with its first byte; authenticated peers may idle
+    /// between frames (for example, two followers of the same leader).
     #[cfg_attr(feature = "service", serde(with = "crate::service::duration_millis"))]
     pub io_timeout: Duration,
     #[cfg_attr(feature = "service", serde(with = "crate::service::duration_millis"))]
@@ -528,9 +530,9 @@ async fn listen(
                         return;
                     };
                     loop {
-                        let result = timeout(options.io_timeout, read_packet(&mut stream, &handle, peer, &bytes)).await;
+                        let result = read_next_packet(&mut stream, &handle, peer, &bytes, options.io_timeout).await;
                         match result {
-                            Ok(Ok(frame)) => {
+                            Ok(frame) => {
                                 statistics.received_frames.fetch_add(1, Ordering::Relaxed);
                                 // Runtime admission acquires its own credits before
                                 // these framing credits are released (no ownership gap).
@@ -604,6 +606,27 @@ async fn write_packet<W: AsyncWrite + Unpin>(writer: &mut W, packet: &Packet) ->
     writer.flush().await?;
     Ok(())
 }
+
+async fn read_next_packet<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    handle: &Handle,
+    peer: u64,
+    bytes: &Arc<Semaphore>,
+    frame_timeout: Duration,
+) -> Result<Frame> {
+    // An idle connection has no frame to time out. Once its first byte arrives,
+    // keep the existing deadline over the entire remaining header and payload.
+    // Prepending this byte on the stack preserves the parser and body buffers.
+    let first = reader.read_u8().await?;
+    let mut prefixed = std::io::Cursor::new([first]).chain(reader);
+    timeout(
+        frame_timeout,
+        read_packet(&mut prefixed, handle, peer, bytes),
+    )
+    .await
+    .context("peer frame receive deadline")?
+}
+
 async fn read_packet<R: AsyncRead + Unpin>(
     reader: &mut R,
     handle: &Handle,

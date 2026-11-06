@@ -15,6 +15,7 @@ use rustls::{
 use std::{net::SocketAddr, path::Path};
 
 mod enqueue;
+mod idle;
 mod process;
 mod snapshots;
 mod timing;
