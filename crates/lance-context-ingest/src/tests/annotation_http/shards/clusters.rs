@@ -78,8 +78,8 @@ async fn exercise(application_roles: bool) -> Result<()> {
     let tb = b.turn(&lb);
     assert_eq!(a.turn(&lb), ta);
     assert_eq!(b.turn(&la), tb);
-    let (sa, ra) = a.owner(&ca, &la, Duration::from_secs(60)).await?;
-    let (sb, rb) = b.owner(&cb, &lb, Duration::from_millis(20)).await?;
+    let (sa, mut ra) = a.owner(&ca, &la, Duration::from_secs(60)).await?;
+    let (sb, mut rb) = b.owner(&cb, &lb, Duration::from_millis(20)).await?;
     let oa = Owner::new(&ra, keys()?, options())?;
     let ob = Owner::new(&rb, keys()?, options())?;
     // Reserve A's route throughout the outage and replacement. Releasing it
@@ -94,8 +94,6 @@ async fn exercise(application_roles: bool) -> Result<()> {
     };
     let owner_a = start_a(oa.router())?;
     let owner_b = Server::start(ob.router(), None).await?;
-    let (_stop_a, task_a) = annotation_runtime::run_owner(ra);
-    let (stop_b, task_b) = annotation_runtime::run_owner(rb);
     let routes = configured((&ca, &la, &a, &owner_a), (&cb, &lb, &b, &owner_b)).await?;
     validate_routes(&routes)?;
     let ga = Forwarder::new(routes.clone(), keys()?, options(), TOKEN.into())?;
@@ -125,9 +123,12 @@ async fn exercise(application_roles: bool) -> Result<()> {
     let pb = open_bucket(&client, &ingress_b, 1).await?;
     let bytes_a = a.encode(fixture::create(&[&ta], &["same-session"], &[7])?)?;
     let bytes_b = b.encode(fixture::create(&[&tb], &["same-session"], &[9])?)?;
-    let (ack_a, ack_b) = tokio::try_join!(
+    // Verify the forwarded bytes before either publisher may retire the WAL.
+    let (ack_a, ack_b, (), ()) = tokio::try_join!(
         mutate(&client, &ingress_b, &pa, 1, bytes_a.clone()),
-        mutate(&client, &ingress_a, &pb, 1, bytes_b.clone())
+        mutate(&client, &ingress_a, &pb, 1, bytes_b.clone()),
+        apply_first_without_publication(&mut ra, &sa),
+        apply_first_without_publication(&mut rb, &sb),
     )?;
     for (c, l, physical, bytes, ack) in [
         (&ca, &la, &a, &bytes_a, &ack_a),
@@ -140,11 +141,18 @@ async fn exercise(application_roles: bool) -> Result<()> {
                 index: ack.completion.index,
             })
             .await?;
+        assert!(
+            matches!(&fetched.reply, Reply::Record(Some(_))),
+            "expected retained original input, got {:?}",
+            fetched.reply
+        );
         assert_eq!(
             &fetched.body, bytes,
             "forwarded Arrow bytes must be unchanged"
         );
     }
+    let (_stop_a, task_a) = annotation_runtime::run_owner(ra);
+    let (stop_b, task_b) = annotation_runtime::run_owner(rb);
 
     // A valid signature for the same table and bucket in a foreign cluster
     // must not become an authorized route or consume the producer sequence.

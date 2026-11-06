@@ -1,6 +1,7 @@
 use super::*;
 use std::{fs, path::PathBuf};
 
+mod append_admission;
 mod pressure;
 mod pressure_admission;
 mod rewrite_allowance;
