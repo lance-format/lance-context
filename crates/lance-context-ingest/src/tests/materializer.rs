@@ -11,6 +11,8 @@ mod close;
 mod compaction;
 #[cfg(feature = "service")]
 mod plan;
+#[cfg(feature = "service")]
+mod prepare;
 mod session_index;
 mod source_rotation;
 

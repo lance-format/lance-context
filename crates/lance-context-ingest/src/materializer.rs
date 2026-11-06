@@ -14,6 +14,7 @@ pub(crate) mod compaction;
 pub mod observation;
 mod pipeline;
 mod plan;
+mod prepare;
 mod read_policy;
 mod session_index;
 pub(crate) mod stage;
@@ -411,15 +412,8 @@ impl Publisher {
                 descriptors,
             });
         }
-        let reply = commit(
-            &self.ingress.client,
-            Command::Prepare(self.prepared_attempt.as_ref().unwrap().clone()),
-        )
-        .await?;
-        ensure!(
-            matches!(reply, Applied::Publisher(p::Reply::Prepared { .. })),
-            "materialization result rejected: {reply:?}"
-        );
+        self.record_preparation(self.prepared_attempt.as_ref().unwrap().clone())
+            .await?;
         Ok(self.state().await?.progress.prepared)
     }
     fn maintenance_group(&self) -> Result<u64> {

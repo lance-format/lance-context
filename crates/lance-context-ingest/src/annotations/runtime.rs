@@ -447,8 +447,9 @@ impl Publisher {
                 }
             })
             .await?;
-        // Preserve these exact bytes until Prepare is resolved. On any unknown
-        // result this runtime stops; a fenced restart reads the retained result.
+        // Preserve these exact bytes until Prepare is confirmed, including a
+        // quorum observation after an unknown reply. An unconfirmed result
+        // still stops this runtime; a fenced restart reads the retained result.
         let descriptors = phases
             .measure(Phase::BlobWrite, async {
                 let maximum = self.service.ingress.client.max_descriptor_bytes();
@@ -472,20 +473,14 @@ impl Publisher {
                 }
             })
             .await?;
-        let reply = materializer::commit(
-            &self.service.ingress.client,
-            Command::Prepare(p::PrepareRequest {
+        self.catalog
+            .record_preparation(p::PrepareRequest {
                 authority: self.catalog.authority().clone(),
                 transaction: pending.plan.transaction,
                 plan_index: pending.index,
                 descriptors,
-            }),
-        )
-        .await?;
-        ensure!(
-            matches!(reply, Applied::Publisher(p::Reply::Prepared { .. })),
-            "annotation preparation rejected: {reply:?}"
-        );
+            })
+            .await?;
         let ready = self.catalog.state().await?;
         let selected = self.resolve_prepared(&ready).await?;
         self.service.install_published(&prepared, selected).await?;
