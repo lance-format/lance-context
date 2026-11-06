@@ -72,15 +72,23 @@ fn append_watermark_cannot_expand_after_its_rewrite_allowance_is_reserved() -> R
     let input = suffix.clone();
     let (sent, received) = mpsc::sync_channel(1);
     let write = std::thread::spawn(move || {
-        sent.send(writer.persist(
-            &input,
-            Some(&HardState {
-                term: 1,
-                vote: 1,
-                commit: 68,
-                ..Default::default()
-            }),
-        ))
+        sent.send((|| {
+            // Separate native writes rotate several files. One oversized batch
+            // can occupy one active file and leave the file-based watermark
+            // unchanged, despite adding the same number of payload bytes.
+            for record in &input {
+                writer.persist(
+                    std::slice::from_ref(record),
+                    Some(&HardState {
+                        term: 1,
+                        vote: 1,
+                        commit: record.index,
+                        ..Default::default()
+                    }),
+                )?;
+            }
+            Ok::<(), anyhow::Error>(())
+        })())
         .unwrap();
     });
     let written = received.recv_timeout(Duration::from_secs(2));
@@ -101,7 +109,11 @@ fn append_watermark_cannot_expand_after_its_rewrite_allowance_is_reserved() -> R
         progressed,
         "append did not progress while native rewrite sync was paused"
     );
-    assert!(expanded.is_some_and(|watermark| watermark > boundary.2));
+    assert!(
+        expanded.is_some_and(|watermark| watermark > boundary.2),
+        "append watermark did not move: before={}, after={expanded:?}",
+        boundary.2
+    );
     assert!(
         group.node.engine.estimated_rewrite_queue_bytes().unwrap() <= allowance,
         "later append growth expanded the already reserved rewrite prefix"
