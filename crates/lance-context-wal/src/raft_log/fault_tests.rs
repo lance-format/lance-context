@@ -1,7 +1,7 @@
 //! Test-only filesystem adapter: real files with a controlled sync error. No
 //! fault adapter or injection flag is included in ordinary library/binary builds.
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
@@ -22,9 +22,36 @@ pub(super) struct FaultControl {
     sync_calls: AtomicU64,
     entered: Mutex<Option<mpsc::SyncSender<()>>>,
     release: Mutex<Option<mpsc::Receiver<()>>>,
+    allocated_peak: Mutex<Option<(PathBuf, Arc<AtomicU64>)>>,
 }
 
 impl FaultControl {
+    pub(super) fn observe_allocated_peak_for_test(&self, directory: &Path) -> Arc<AtomicU64> {
+        let peak = Arc::new(AtomicU64::new(0));
+        *self.allocated_peak.lock().unwrap() = Some((directory.to_owned(), peak.clone()));
+        peak
+    }
+
+    fn observe_allocated_peak(&self) -> io::Result<()> {
+        if let Some((directory, peak)) = &*self.allocated_peak.lock().unwrap() {
+            let mut bytes = 0;
+            for entry in std::fs::read_dir(directory)? {
+                let metadata = entry?.metadata()?;
+                if metadata.is_file() {
+                    let mut occupied = metadata.len();
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::MetadataExt;
+                        occupied = occupied.max(metadata.blocks().saturating_mul(512));
+                    }
+                    bytes += occupied;
+                }
+            }
+            peak.fetch_max(bytes, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
     pub(super) fn pause_rewrite_sync_for_test(&self) -> FilePause {
         self.pause_for_test(&self.pause_rewrite_sync)
     }
@@ -92,6 +119,7 @@ pub(super) struct FaultHandle {
 
 impl Handle for FaultHandle {
     fn truncate(&self, offset: usize) -> io::Result<()> {
+        self.control.observe_allocated_peak()?;
         self.inner.truncate(offset)
     }
 
@@ -100,6 +128,7 @@ impl Handle for FaultHandle {
     }
 
     fn sync(&self) -> io::Result<()> {
+        self.control.observe_allocated_peak()?;
         self.control.sync_calls.fetch_add(1, Ordering::Relaxed);
         if self.rewrite
             && self
@@ -239,6 +268,7 @@ impl FileSystem for FaultFileSystem {
     }
 
     fn delete<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
+        self.control.observe_allocated_peak()?;
         DefaultFileSystem.delete(path)
     }
 
