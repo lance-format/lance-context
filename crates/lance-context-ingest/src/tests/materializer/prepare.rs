@@ -78,6 +78,24 @@ async fn exercise(case: Case) -> Result<()> {
         }
     }
     let authority = publisher.authority().clone();
+    if matches!(case, Case::Unobservable) {
+        // Warm every destination: the confirmation must still fail after the
+        // client's allowed reconnect of a disconnected pooled read.
+        for node in 1..=3 {
+            proxy
+                .client
+                .request(
+                    node,
+                    Request::Query {
+                        group: authority.group,
+                        query: query::Query::Publisher {
+                            table: authority.table,
+                        },
+                    },
+                )
+                .await?;
+        }
+    }
     let operation = tokio::spawn(async move { publisher.record_preparation(request).await });
     if execute {
         tokio::time::timeout(Duration::from_secs(10), proxy.committed.notified()).await?;

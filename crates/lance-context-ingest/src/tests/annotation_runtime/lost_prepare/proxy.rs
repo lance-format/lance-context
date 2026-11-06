@@ -368,13 +368,17 @@ impl Proxy {
                             connections.spawn(async move {
                                 let mut downstream = acceptor.accept(socket).await?;
                                 let mut upstream = connector.connect(name, TcpStream::connect(address).await?).await?;
+                                let mut used = false;
                                 while let Some(mut request) = Frame::read(&mut downstream, matches!(point, Point::Append { .. })).await? {
                                     if matches!(point, Point::Append { .. }) { request.payload(&mut downstream, true).await?; }
-                                    if matches!(point, Point::Prepare { observe: false, .. }) && dropped.load(Ordering::SeqCst) > 0 && request.publisher_query()? && blocked_reads.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-                                        // One unavailable confirmation read preserves the original
-                                        // fenced-restart test after Prepare gains reconciliation.
+                                    if matches!(point, Point::Prepare { observe: false, .. }) && dropped.load(Ordering::SeqCst) > 0 && request.publisher_query()? && blocked_reads.load(Ordering::SeqCst) == 0 {
+                                        // A pooled read may reconnect once. Keep the fault armed
+                                        // until its fresh connection also fails, so one logical
+                                        // confirmation is unavailable even with a warm pool.
+                                        if !used { blocked_reads.store(1, Ordering::SeqCst); }
                                         return Ok(());
                                     }
+                                    used = true;
                                     let hold = request.matches_command(point)?;
                                     if hold && matches!(point, Point::Prepare { .. }) {
                                         prepares.fetch_add(1, Ordering::SeqCst);
