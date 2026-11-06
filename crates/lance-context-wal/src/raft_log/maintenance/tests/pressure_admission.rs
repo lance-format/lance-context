@@ -2,6 +2,26 @@ use super::*;
 
 #[test]
 fn pressure_reclamation_progresses_when_normal_rewrite_admission_is_closed() -> Result<()> {
+    exercise(Failure::None)
+}
+
+#[test]
+fn pressure_fallback_respects_held_reservations_without_mutating_or_fencing() -> Result<()> {
+    exercise(Failure::Admission)
+}
+
+#[test]
+fn pressure_fallback_sync_failure_fences_siblings_and_preserves_recovery() -> Result<()> {
+    exercise(Failure::RewriteSync)
+}
+
+enum Failure {
+    None,
+    Admission,
+    RewriteSync,
+}
+
+fn exercise(failure: Failure) -> Result<()> {
     let root = tempfile::tempdir()?;
     let layout = layout();
     let log = PhysicalLog::open_with_file_size(root.path(), &layout, 1, 64 << 10)?;
@@ -24,7 +44,8 @@ fn pressure_reclamation_progresses_when_normal_rewrite_admission_is_closed() -> 
             }),
         )?;
     }
-    append(&log.group(20)?, 1, 4)?;
+    let sibling = log.group(20)?;
+    append(&sibling, 1, 4)?;
     group
         .node
         .engine
@@ -56,20 +77,45 @@ fn pressure_reclamation_progresses_when_normal_rewrite_admission_is_closed() -> 
     assert!(budget.reserve(normal, false).is_err());
     drop(budget.reserve(pressure, false)?);
 
-    // Exercise the public maintenance entry point. No new writes, lower logical
-    // retention, released reservations or enlarged disk budget can unblock it.
-    group.maintenance().run()?;
+    if matches!(&failure, Failure::Admission) {
+        // Keep only 64 KiB free: the pressure pass must obtain its own allowance.
+        let held_bytes = budget.snapshot().max_log_bytes - before - (64 << 10);
+        let held = budget.reserve(usize::try_from(held_bytes)?, false)?;
+        let before_files = files(root.path())?;
+        let error = group.maintenance().run().unwrap_err();
+        assert!(error.is::<crate::admission::DiskBudgetExhausted>());
+        assert_eq!(files(root.path())?, before_files);
+        assert_eq!(budget.snapshot().reserved_proposal_bytes, held_bytes);
+        assert_eq!(group.initial_state()?.hard_state.commit, 64);
+        verify(&sibling, 1, 4)?;
+        drop(held);
+    }
+
+    // Exercise the public maintenance entry point without new writes, lower
+    // logical retention or an enlarged disk budget.
+    let fault = matches!(failure, Failure::RewriteSync)
+        .then(|| group.node.fault.fail_rewrite_sync_for_test());
+    let result = group.maintenance().run();
     let after = budget.snapshot().accounted_disk_bytes;
-    assert!(after < before, "physical reclamation made no progress");
-    assert!(budget.reserve(4096, true).is_ok());
+    if fault.is_some() {
+        let error = result.unwrap_err();
+        assert!(!error.is::<crate::admission::DiskBudgetExhausted>());
+        assert!(group.initial_state().is_err());
+        assert!(sibling.initial_state().is_err());
+        assert!(group.maintenance().run().is_err());
+    } else {
+        result?;
+        assert!(after < before, "physical reclamation made no progress");
+        assert!(budget.reserve(4096, true).is_ok());
+        assert_eq!(
+            group.entries(13, 65, None, GetEntriesContext::empty(false))?,
+            records[12..]
+        );
+        verify(&sibling, 1, 4)?;
+    }
     assert_eq!(budget.snapshot().reserved_proposal_bytes, 0);
-    assert_eq!(
-        group.entries(13, 65, None, GetEntriesContext::empty(false))?,
-        records[12..]
-    );
-    verify(&log.group(20)?, 1, 4)?;
     eprintln!("maintenance admission: before={before}, after={after}, normal={normal}, pressure={pressure}");
-    drop((group, budget, log));
+    drop((fault, group, sibling, budget, log));
 
     let reopened = PhysicalLog::open(root.path(), &layout, 1)?;
     let group = reopened.group(10)?;
