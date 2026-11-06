@@ -74,6 +74,20 @@ async fn read(client: &reqwest::Client, server: &Server, turn: &str) -> Result<T
         .context("sharded point missing")
 }
 
+async fn apply_first_without_publication(
+    runtime: &mut annotations::runtime::Runtime,
+    service: &annotations::Service,
+) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while service.source_observation().records == 0 {
+            runtime.apply_once_for_test().await?;
+            tokio::task::yield_now().await;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await?
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sharded_forwarders_route_original_batches_and_points_across_owner_replacement(
 ) -> Result<()> {
@@ -105,14 +119,12 @@ async fn exercise(application_roles: bool) -> Result<()> {
     };
     let ta = a.turn(&layout);
     let tb = b.turn(&layout);
-    let (sa, ra) = a.owner(&c, &layout, Duration::from_secs(60)).await?;
-    let (sb, rb) = b.owner(&c, &layout, Duration::from_millis(20)).await?;
+    let (sa, mut ra) = a.owner(&c, &layout, Duration::from_secs(60)).await?;
+    let (sb, mut rb) = b.owner(&c, &layout, Duration::from_millis(20)).await?;
     let oa = Owner::new(&ra, keys()?, options())?;
     let ob = Owner::new(&rb, keys()?, options())?;
     let owner_a = Server::start(oa.router(), None).await?;
     let owner_b = Server::start(ob.router(), None).await?;
-    let (_stop_a, task_a) = annotation_runtime::run_owner(ra);
-    let (stop_b, task_b) = annotation_runtime::run_owner(rb);
     let configured = routes(&c, &layout, &[(&a, &owner_a), (&b, &owner_b)]).await?;
     assert!(
         Forwarder::new(
@@ -156,9 +168,14 @@ async fn exercise(application_roles: bool) -> Result<()> {
     let pb = open_bucket(&client, &ingress_b, 1).await?;
     let bytes_a = a.encode(fixture::create(&[&ta], &["same-session"], &[7])?)?;
     let bytes_b = b.encode(fixture::create(&[&tb], &["same-session"], &[9])?)?;
-    let (ack_a, ack_b) = tokio::try_join!(
+    // Apply the writes for their HTTP ACKs, but keep publication stopped until
+    // the original WAL bytes have been checked. A fast publisher can otherwise
+    // legitimately retire these records before the raw Fetch below.
+    let (ack_a, ack_b, (), ()) = tokio::try_join!(
         mutate(&client, &ingress_b, &pa, 1, bytes_a.clone()),
-        mutate(&client, &ingress_a, &pb, 1, bytes_b.clone())
+        mutate(&client, &ingress_a, &pb, 1, bytes_b.clone()),
+        apply_first_without_publication(&mut ra, &sa),
+        apply_first_without_publication(&mut rb, &sb),
     )?;
     for (physical, bytes, ack) in [(&a, &bytes_a, &ack_a), (&b, &bytes_b, &ack_b)] {
         assert_eq!(ack.completion.meta.stream, physical.binding.table);
@@ -170,11 +187,18 @@ async fn exercise(application_roles: bool) -> Result<()> {
                 index: ack.completion.index,
             })
             .await?;
+        assert!(
+            matches!(&fetched.reply, Reply::Record(Some(_))),
+            "expected retained original input, got {:?}",
+            fetched.reply
+        );
         assert_eq!(
             &fetched.body, bytes,
             "ingress must preserve the original Arrow IPC bytes"
         );
     }
+    let (_stop_a, task_a) = annotation_runtime::run_owner(ra);
+    let (stop_b, task_b) = annotation_runtime::run_owner(rb);
     assert_eq!(
         read(&client, &ingress_a, &ta).await?.status.as_deref(),
         Some("pending")
