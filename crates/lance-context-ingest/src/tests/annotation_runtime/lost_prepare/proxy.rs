@@ -33,6 +33,7 @@ pub(in crate::tests) struct Proxy {
     pub plans: Arc<AtomicUsize>,
     pub advances: Arc<AtomicUsize>,
     pub appends: Arc<AtomicUsize>,
+    pub closes: Arc<AtomicUsize>,
     pub committed: Arc<Notify>,
     pub release: Arc<Notify>,
     _tasks: JoinSet<Result<()>>,
@@ -59,7 +60,7 @@ struct Frame {
 enum Point {
     Prepare,
     Append { execute: bool },
-    Close,
+    Close { execute: bool },
     Plan { execute: bool },
     Advance { execute: bool },
 }
@@ -136,7 +137,7 @@ impl Frame {
         Ok(matches!(
             (point, command),
             (Point::Prepare, Command::Prepare(_))
-                | (Point::Close, Command::Close(_))
+                | (Point::Close { .. }, Command::Close(_))
                 | (Point::Plan { .. }, Command::Plan(_))
                 | (Point::Advance { .. }, Command::Advance(_))
         ))
@@ -178,7 +179,7 @@ impl Frame {
                     _
                 ))))
             ) | (
-                Point::Close,
+                Point::Close { .. },
                 Reply::Commit(Outcome::Committed(Applied::Source(
                     lance_context_wal::replication::source::Reply::Closed { .. }
                 )))
@@ -196,7 +197,16 @@ impl Proxy {
     }
 
     pub async fn open_close(c: &network::Cluster, root: &FsPath) -> Result<Self> {
-        Self::open_at(c, root, Point::Close).await
+        Self::open_at(c, root, Point::Close { execute: true }).await
+    }
+
+    pub async fn close_fault(
+        c: &network::Cluster,
+        root: &FsPath,
+        execute: bool,
+        timeout: Duration,
+    ) -> Result<Self> {
+        Self::open_at_with_timeout(c, root, Point::Close { execute }, timeout).await
     }
 
     pub async fn open_plan(c: &network::Cluster, root: &FsPath, execute: bool) -> Result<Self> {
@@ -208,6 +218,15 @@ impl Proxy {
     }
 
     async fn open_at(c: &network::Cluster, root: &FsPath, point: Point) -> Result<Self> {
+        Self::open_at_with_timeout(c, root, point, Duration::from_secs(30)).await
+    }
+
+    async fn open_at_with_timeout(
+        c: &network::Cluster,
+        root: &FsPath,
+        point: Point,
+        timeout: Duration,
+    ) -> Result<Self> {
         let mut roots = RootCertStore::empty();
         for cert in certificates(&root.join("roots.pem"))? {
             roots.add(cert)?;
@@ -231,6 +250,7 @@ impl Proxy {
         let plans = Arc::new(AtomicUsize::new(0));
         let advances = Arc::new(AtomicUsize::new(0));
         let appends = Arc::new(AtomicUsize::new(0));
+        let closes = Arc::new(AtomicUsize::new(0));
         let committed = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
         let mut tasks = JoinSet::new();
@@ -267,6 +287,7 @@ impl Proxy {
             let plans = plans.clone();
             let advances = advances.clone();
             let appends = appends.clone();
+            let closes = closes.clone();
             let committed = committed.clone();
             let release = release.clone();
             tasks.spawn(async move {
@@ -280,13 +301,15 @@ impl Proxy {
                             let plans = plans.clone();
                             let advances = advances.clone();
                             let appends = appends.clone();
+                            let closes = closes.clone();
                             connections.spawn(async move {
                                 let mut downstream = acceptor.accept(socket).await?;
                                 let mut upstream = connector.connect(name, TcpStream::connect(address).await?).await?;
                                 while let Some(mut request) = Frame::read(&mut downstream, matches!(point, Point::Append { .. })).await? {
                                     if matches!(point, Point::Append { .. }) { request.payload(&mut downstream, true).await?; }
                                     let hold = request.matches_command(point)?;
-                                    if hold && matches!(point, Point::Append { execute: false }) && armed.swap(false, Ordering::SeqCst) {
+                                    if hold && matches!(point, Point::Close { .. }) { closes.fetch_add(1, Ordering::SeqCst); }
+                                    if hold && matches!(point, Point::Append { execute: false } | Point::Close { execute: false }) && armed.swap(false, Ordering::SeqCst) {
                                         committed.notify_one(); release.notified().await;
                                         dropped.fetch_add(1, Ordering::SeqCst);
                                         request.unknown_reply()?.write(&mut downstream).await?;
@@ -356,12 +379,16 @@ impl Proxy {
                 &config.limits,
                 endpoints,
                 outbound,
-                lance_context_wal::replication::runtime::client::Options::default(),
+                lance_context_wal::replication::runtime::client::Options {
+                    timeout,
+                    ..Default::default()
+                },
             )?),
             dropped,
             plans,
             advances,
             appends,
+            closes,
             committed,
             release,
             _tasks: tasks,
