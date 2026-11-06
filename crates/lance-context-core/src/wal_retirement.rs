@@ -5,7 +5,7 @@
 //! deleting immutable generation directories. Runtime-wide bounded scheduling
 //! and periodic discovery of cold tables still precede production activation.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,6 +45,47 @@ async fn io<T>(future: impl std::future::Future<Output = Result<T>>) -> Result<T
         .map_err(|_| Error::io("WAL retirement metadata operation timed out"))?
 }
 
+fn valid_generation_path(generation: &Generation) -> bool {
+    let suffix = generation.path.strip_prefix("gen_").or_else(|| {
+        generation
+            .path
+            .rsplit_once("_gen_")
+            .and_then(|(hash, number)| {
+                (!hash.is_empty() && hash.bytes().all(|c| c.is_ascii_hexdigit())).then_some(number)
+            })
+    });
+    generation.path.len() <= 256
+        && suffix.and_then(|s| s.parse::<u64>().ok()) == Some(generation.number)
+}
+
+/// A repeated reference to the same immutable generation is one unit of work.
+/// Conflicting identities must still fail before reading or publishing data.
+/// Validate the entire input before splitting retirement intents into chunks.
+pub(crate) fn unique_generations(
+    generations: impl IntoIterator<Item = Generation>,
+) -> Result<Vec<Generation>> {
+    let mut numbers = HashMap::new();
+    let mut paths = HashSet::new();
+    let mut unique = Vec::new();
+    for generation in generations {
+        if !valid_generation_path(&generation) {
+            return Err(Error::io("Invalid WAL retirement generation identity"));
+        }
+        if let Some(path) = numbers.get(&generation.number) {
+            if path != &generation.path {
+                return Err(Error::io("Conflicting WAL retirement generation identity"));
+            }
+            continue;
+        }
+        if !paths.insert(generation.path.clone()) {
+            return Err(Error::io("Conflicting WAL retirement generation identity"));
+        }
+        numbers.insert(generation.number, generation.path.clone());
+        unique.push(generation);
+    }
+    Ok(unique)
+}
+
 impl Intent {
     fn validate(&self) -> Result<()> {
         let mut numbers = HashSet::new();
@@ -58,17 +99,7 @@ impl Intent {
         for generation in &self.generations {
             // Never let an intent address a shard manifest, active WAL log,
             // another shard, or an arbitrary path. Legacy gen_N is allowed.
-            let suffix = generation.path.strip_prefix("gen_").or_else(|| {
-                generation
-                    .path
-                    .rsplit_once("_gen_")
-                    .and_then(|(hash, number)| {
-                        (!hash.is_empty() && hash.bytes().all(|c| c.is_ascii_hexdigit()))
-                            .then_some(number)
-                    })
-            });
-            if generation.path.len() > 256
-                || suffix.and_then(|s| s.parse::<u64>().ok()) != Some(generation.number)
+            if !valid_generation_path(generation)
                 || !numbers.insert(generation.number)
                 || !paths.insert(&generation.path)
             {
@@ -87,6 +118,7 @@ pub(crate) async fn record(
     shard: Uuid,
     generations: Vec<Generation>,
 ) -> Result<Vec<Path>> {
+    let generations = unique_generations(generations)?;
     let mut tickets = Vec::new();
     for chunk in generations.chunks(MAX_GENERATIONS) {
         let intent = Intent {
@@ -240,6 +272,80 @@ pub(crate) async fn recover_pending(
 mod tests {
     use super::*;
     use lance_index::mem_wal::SsTable;
+
+    #[test]
+    fn duplicate_identities_are_idempotent_but_conflicts_and_paths_fail() {
+        let first = Generation {
+            number: 7,
+            path: "1234abcd_gen_7".into(),
+        };
+        let second = Generation {
+            number: 8,
+            path: "gen_8".into(),
+        };
+        assert_eq!(
+            unique_generations([first.clone(), first.clone(), second.clone()]).unwrap(),
+            vec![first.clone(), second]
+        );
+        let conflict = Generation {
+            number: 7,
+            path: "abcdef12_gen_7".into(),
+        };
+        assert!(unique_generations([first.clone(), conflict]).is_err());
+        for path in ["../gen_7", "manifest/gen_7", "xyz_gen_7", "gen_8"] {
+            assert!(unique_generations([Generation {
+                number: 7,
+                path: path.into()
+            }])
+            .is_err());
+        }
+        // Persisted intent validation stays strict; only live input normalization
+        // can collapse duplicates before publication.
+        assert!(Intent {
+            schema: 1,
+            shard: Uuid::nil(),
+            generations: vec![first.clone(), first]
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn duplicate_publication_validates_conflicts_across_chunk_boundary() {
+        let (store, root, shard, first) = publication_fixture().await;
+        let mut generations: Vec<_> = (1..=MAX_GENERATIONS as u64)
+            .map(|number| Generation {
+                number,
+                path: format!("abcdef12_gen_{number}"),
+            })
+            .collect();
+        generations.push(Generation {
+            number: 1,
+            path: "fedcba98_gen_1".into(),
+        });
+        assert!(record(store.clone(), &root, shard, generations)
+            .await
+            .is_err());
+        assert!(
+            store
+                .inner
+                .list(Some(&prefix(&root)))
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+                .is_empty(),
+            "reject the whole conflicting input before publishing any intent"
+        );
+        let tickets = record(store.clone(), &root, shard, vec![first.clone(), first])
+            .await
+            .unwrap();
+        let intent = load(&store, &tickets[0]).await.unwrap().unwrap();
+        assert_eq!(intent.generations.len(), 1);
+        assert!(
+            !recover_one(store, &root, &tickets[0]).await.unwrap(),
+            "duplicate normalization must not bypass live-manifest protection"
+        );
+    }
 
     async fn publication_fixture() -> (Arc<ObjectStore>, Path, Uuid, Generation) {
         let uri = format!("memory:///retirement-publication-{}", Uuid::new_v4());
