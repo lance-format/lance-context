@@ -164,9 +164,13 @@ async fn bulk_lookahead_stops_at_total_payload_and_key_limits() -> Result<()> {
             network::Cluster::open_signed(root.path(), annotation_publication::one_shard()).await?;
         let (a, mut driver) = connect_bulk(&c, &narrow, &body, budget.clone()).await?;
         // The original durable suffix must replay without any prefetched state.
-        while a.observation().await.0.applied < inputs.last().unwrap().1 {
-            tokio::time::timeout(Duration::from_secs(5), driver.step_for_test()).await??;
-        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while a.observation().await.0.applied < inputs.last().unwrap().1 {
+                driver.step_for_test().await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
         pressure::publish(&c, &a, &narrow, &body).await?;
         drop(driver);
         assert_eq!(a.retained_body_frames(), (0, 0));
