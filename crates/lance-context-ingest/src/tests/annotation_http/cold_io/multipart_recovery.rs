@@ -124,7 +124,7 @@ async fn exercise() -> Result<()> {
         .map(|row| format!("large-{row}"))
         .collect::<Vec<_>>();
     let names = ids.iter().map(String::as_str).collect::<Vec<_>>();
-    let batch = fixture::create(&names, &vec!["s"; ROWS], &vec![0; ROWS])?;
+    let batch = fixture::create(&names, &["s"; ROWS], &[0; ROWS])?;
     let mut columns = batch.columns().to_vec();
     columns[batch.schema().index_of("binary_payload")?] = Arc::new(
         arrow_array::LargeBinaryArray::from_iter_values((0..ROWS).map(payload)),
