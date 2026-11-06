@@ -87,22 +87,30 @@ where
         self.purge_expired_files_inner(None)
     }
 
-    /// Capture while appends are excluded, together with the caller's rewrite
-    /// allowance. Later writes cannot enlarge the eligible append prefix.
+    /// Capture the append purge barrier, tombstone count and inclusive rewrite
+    /// watermark while appends are excluded. Both the allowance and the pass
+    /// use this watermark; later writes cannot enlarge the selected prefix.
     #[cfg(feature = "internals")]
-    pub fn capture_append_boundary(&self) -> (FileSeq, usize) {
+    pub fn capture_append_boundary(&self) -> (FileSeq, usize, FileSeq) {
         (
             self.pipe_log.file_span(LogQueue::Append).1,
             self.memtables.cleaned_region_count(),
+            self.append_queue_watermarks().0.unwrap_or(0),
         )
     }
 
     #[cfg(feature = "internals")]
-    pub fn purge_expired_files_before(&self, boundary: (FileSeq, usize)) -> Result<Vec<u64>> {
+    pub fn purge_expired_files_before(
+        &self,
+        boundary: (FileSeq, usize, FileSeq),
+    ) -> Result<Vec<u64>> {
         self.purge_expired_files_inner(Some(boundary))
     }
 
-    fn purge_expired_files_inner(&self, boundary: Option<(FileSeq, usize)>) -> Result<Vec<u64>> {
+    fn purge_expired_files_inner(
+        &self,
+        boundary: Option<(FileSeq, usize, FileSeq)>,
+    ) -> Result<Vec<u64>> {
         let _t = StopWatch::new(&*ENGINE_PURGE_DURATION_HISTOGRAM);
         let guard = self.force_rewrite_candidates.try_lock();
         if guard.is_none() {
@@ -130,22 +138,23 @@ where
                         l.first_file_not_ready_for_purge(LogQueue::Append)
                             .map_or(barrier, |f| std::cmp::min(f, barrier))
                     });
-                let (rewrite_watermark, compact_watermark) = if let Some((before, _)) = boundary {
-                    append_queue_barrier = append_queue_barrier.min(before).max(first_append);
-                    (
-                        rewrite_watermark.min(before.saturating_sub(1)),
-                        compact_watermark.min(before.saturating_sub(1)),
-                    )
-                } else {
-                    (rewrite_watermark, compact_watermark)
-                };
+                let (rewrite_watermark, compact_watermark) =
+                    if let Some((before, _, cap)) = boundary {
+                        append_queue_barrier = append_queue_barrier.min(before).max(first_append);
+                        (
+                            rewrite_watermark.min(before.saturating_sub(1)).min(cap),
+                            compact_watermark.min(before.saturating_sub(1)).min(cap),
+                        )
+                    } else {
+                        (rewrite_watermark, compact_watermark)
+                    };
 
                 // Ordering
                 // 1. Must rewrite tombstones AFTER acquiring `append_queue_barrier`, or
                 //    deletion marks might be lost after restart.
                 // 2. Must rewrite tombstones BEFORE rewrite entries, or entries from recreated
                 //    region might be lost after restart.
-                self.rewrite_append_queue_tombstones_up_to(boundary.map(|(_, count)| count))?;
+                self.rewrite_append_queue_tombstones_up_to(boundary.map(|(_, count, _)| count))?;
                 should_compact.extend(self.rewrite_or_compact_append_queue(
                     rewrite_watermark,
                     compact_watermark,

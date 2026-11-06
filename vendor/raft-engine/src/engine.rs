@@ -20,7 +20,7 @@ use crate::file_pipe_log::{DefaultMachineFactory, FilePipeLog, FilePipeLogBuilde
 use crate::log_batch::{Command, LogBatch, MessageExt};
 use crate::memtable::{EntryIndex, MemTableRecoverContextFactory, MemTables};
 use crate::metrics::*;
-use crate::pipe_log::{FileBlockHandle, FileId, LogQueue, PipeLog};
+use crate::pipe_log::{FileBlockHandle, FileId, FileSeq, LogQueue, PipeLog};
 use crate::purge::{PurgeHook, PurgeManager};
 use crate::write_barrier::{WriteBarrier, Writer};
 use crate::{perf_context, Error, GlobalStats, Result};
@@ -433,6 +433,14 @@ where
     /// this is not a hard filesystem-space guarantee. None means size overflow.
     pub fn estimated_rewrite_bytes(&self) -> Option<usize> {
         self.memtables.rewrite_size_hint()
+    }
+
+    /// Allow all live rewrite-queue values, but only append values at or below
+    /// a captured rewrite watermark. The caller must enforce that same cap
+    /// during the pass, even if later appends move the native watermarks.
+    pub fn estimated_rewrite_bytes_through(&self, append_watermark: FileSeq) -> Option<usize> {
+        self.memtables
+            .bounded_rewrite_size_hint(Some(append_watermark))
     }
 
     /// Conservative allowance for reclaiming only the rewrite queue.

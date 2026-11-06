@@ -99,6 +99,9 @@ impl LogMaintenance {
                 .write()
                 .map_err(|_| anyhow::anyhow!("append gate poisoned"))?;
             self.node.check()?;
+            // Freeze eligibility with the allowance. Later appends can move
+            // the native ratio-based watermark, but not this pass's copy cap.
+            let boundary = self.node.engine.purge_manager().capture_append_boundary();
             let reservation = self
                 .node
                 .budget
@@ -110,7 +113,7 @@ impl LogMaintenance {
                     let live = if force_rewrite {
                         self.node.engine.estimated_rewrite_queue_bytes()
                     } else {
-                        self.node.engine.estimated_rewrite_bytes()
+                        self.node.engine.estimated_rewrite_bytes_through(boundary.2)
                     };
                     let bytes = live
                         .and_then(|live| {
@@ -129,7 +132,6 @@ impl LogMaintenance {
             }
             // Later appends and their tombstones stay outside this pass. Rewrite
             // queue values cannot grow while our node-wide job guard is held.
-            let boundary = self.node.engine.purge_manager().capture_append_boundary();
             (reservation, boundary)
         };
         let result = self.run_native(force_rewrite, boundary);
@@ -139,7 +141,7 @@ impl LogMaintenance {
         result
     }
 
-    fn run_native(&self, force_rewrite: bool, boundary: (u64, usize)) -> Result<Vec<u64>> {
+    fn run_native(&self, force_rewrite: bool, boundary: (u64, usize, u64)) -> Result<Vec<u64>> {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if force_rewrite {
                 self.node.engine.purge_manager().reclaim_rewrite_queue()?;
