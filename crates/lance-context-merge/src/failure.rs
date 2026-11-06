@@ -63,6 +63,7 @@ pub fn classify(error: &str) -> FailureClass {
     // a table name), but never beat a 401/403 or unresolved ownership. A generic
     // worker 500 can wrap a real data error, so it does not override that text.
     let lowered = error.to_ascii_lowercase();
+    let lowered = without_storage_request_urls(&lowered);
     if lowered.contains("ownership unresolved") {
         return FailureClass::OwnershipUnresolved;
     }
@@ -103,6 +104,51 @@ pub fn classify(error: &str) -> FailureClass {
         FailureClass::Deadline
     } else {
         FailureClass::Retryable
+    }
+}
+
+// The object_store transport formatter includes the object URL inside its
+// diagnostic. Table/path words are not failure causes. Only remove that URL in
+// the recognized formatter shape; retain all surrounding errors and statuses.
+fn without_storage_request_urls(error: &str) -> std::borrow::Cow<'_, str> {
+    let mut output = String::new();
+    let mut copied = 0;
+    for (offset, _) in error.match_indices("error performing ") {
+        let request = &error[offset + "error performing ".len()..];
+        let Some((method, rest)) = request.split_once(' ') else {
+            continue;
+        };
+        if !matches!(method, "get" | "put" | "head" | "post" | "delete" | "patch") {
+            continue;
+        }
+        let Some((url, diagnostic)) = rest.split_once(" in ") else {
+            continue;
+        };
+        if !(url.starts_with("https://") || url.starts_with("http://"))
+            || url.chars().any(char::is_whitespace)
+        {
+            continue;
+        }
+        let Some((seconds, cause)) = diagnostic.split_once("s - ") else {
+            continue;
+        };
+        if !cause.starts_with("http error:")
+            || seconds.is_empty()
+            || !seconds.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+            || !seconds.parse::<f64>().is_ok_and(|s| s.is_finite())
+        {
+            continue;
+        }
+        let start = error.len() - rest.len();
+        output.push_str(&error[copied..start]);
+        output.push_str("<request-url>");
+        copied = start + url.len();
+    }
+    if copied == 0 {
+        std::borrow::Cow::Borrowed(error)
+    } else {
+        output.push_str(&error[copied..]);
+        std::borrow::Cow::Owned(output)
     }
 }
 
@@ -560,6 +606,100 @@ impl Coordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn storage_request_failure(table: &str, cause: &str) -> String {
+        format!("merge storage fenced for recovery; original failure: LanceError(IO): Failed to write manifest version 25 for shard f6b8b417-cd9d-5953-a06c-521973335aad: Generic MicrosoftAzure error: Error performing PUT https://falconphxdataprocessing.blob.core.windows.net/snowflake-rollouts/rocketkeep/{table}.rollout.lance/_mem_wal/f6b8b417-cd9d-5953-a06c-521973335aad/manifest/100110.binpb in 30.000676823s - HTTP error: {cause}, vendor/lance/src/dataset/mem_wal/manifest.rs:277:21")
+    }
+
+    #[test]
+    fn storage_url_table_names_do_not_change_transport_classification() {
+        for table in [
+            "longsft_5b_rkldprotocol_reasoning",
+            "schema",
+            "invalid",
+            "notfound",
+            "corrupt",
+            "forbidden",
+            "unauthorized",
+            "deadline",
+        ] {
+            assert_eq!(
+                classify(&storage_request_failure(table, "error sending request")),
+                FailureClass::Retryable,
+                "{table}"
+            );
+            assert_eq!(
+                classify(&storage_request_failure(table, "operation timed out")),
+                FailureClass::Deadline,
+                "{table}"
+            );
+        }
+    }
+
+    #[test]
+    fn storage_url_normalization_preserves_real_failure_causes() {
+        for cause in [
+            "invalid WAL generation identity",
+            "corrupt manifest",
+            "protocol mismatch",
+            "schema mismatch",
+            "permission denied",
+            "status code: 403",
+            "HTTP/1.1 401 Unauthorized",
+        ] {
+            assert_eq!(
+                classify(&storage_request_failure("ordinary", cause)),
+                FailureClass::DataOrConfiguration,
+                "{cause}"
+            );
+        }
+        let error = storage_request_failure("protocol", "error sending request");
+        assert_eq!(
+            classify(&format!("merge ownership unresolved: {error}")),
+            FailureClass::OwnershipUnresolved
+        );
+        assert_eq!(
+            classify(&format!("invalid WAL identity; {error}")),
+            FailureClass::DataOrConfiguration
+        );
+        assert_eq!(
+            classify(&format!("status code: 403; {error}")),
+            FailureClass::DataOrConfiguration
+        );
+        // An arbitrary URL or a malformed transport envelope is not rewritten.
+        for error in ["invalid storage URL https://host/protocol", "Error performing PUT https://host/protocol in unknowns - HTTP error: error sending request", "Error performing PUT https://host/protocol in 1s - invalid configuration", "Error performing OTHER https://host/protocol in 1s - HTTP error: error sending request"] {
+            assert_eq!(classify(error), FailureClass::DataOrConfiguration, "{error}");
+        }
+    }
+
+    #[test]
+    fn storage_url_historical_failures_keep_the_retry_budget() {
+        let error =
+            storage_request_failure("longsft_5b_rkldprotocol_reasoning", "error sending request");
+        for attempts in [1, 4, 15, 16] {
+            let old = ShardFailure {
+                target: "longsft_5b_rkldprotocol_reasoning".into(),
+                endpoint: "master:catchup".into(),
+                consecutive_attempts: attempts,
+                class: FailureClass::DataOrConfiguration,
+                last_error: error.clone(),
+                last_failure_ms: 1000,
+                next_retry_ms: 3_601_000,
+                needs_attention: true,
+            };
+            let fixed = old.corrected();
+            assert_eq!(fixed.class, FailureClass::Retryable);
+            assert_eq!(fixed.consecutive_attempts, attempts);
+            assert_eq!(fixed.last_failure_ms, 1000);
+            assert_eq!(fixed.last_error, error);
+            let (attention, delay) = ShardFailure::retry_policy(&FailureClass::Retryable, attempts);
+            assert_eq!(fixed.needs_attention, attention);
+            assert_eq!(fixed.next_retry_ms, 1000 + delay * 1000);
+            if attempts >= 15 {
+                assert_eq!(fixed.next_retry_ms, 3_601_000);
+            }
+        }
+    }
     #[test]
     fn native_takeover_only_recognizes_exact_capability_read_transport_errors() {
         let endpoint = "http://worker:3000";
