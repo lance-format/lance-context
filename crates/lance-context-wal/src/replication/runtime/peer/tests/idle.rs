@@ -103,14 +103,16 @@ async fn partial_peer_frames_keep_the_deadline_and_release_receive_credits() -> 
     let handle = runtime.handle();
     let result = async {
         let frame = packet(&handle, 2, Bytes::from(vec![0xa5; 1024]));
-        let (header, bodies) = encode(&frame)?;
-        let mut wire = header.clone();
-        for body in bodies {
-            wire.extend_from_slice(&body);
-        }
+        // Capture the actual wire bytes, including write_frame's length prefix.
+        let (mut output, mut input) = tokio::io::duplex(4096);
+        write_packet(&mut output, &frame).await?;
+        drop(output);
+        let mut wire = Vec::new();
+        input.read_to_end(&mut wire).await?;
+        let header_end = 4 + u32::from_be_bytes(wire[..4].try_into()?) as usize;
         // Partial length, header and payload must all expire, even when the
         // sender keeps its connection open. Header/body credits cannot leak.
-        for prefix in [1, 3, 4, header.len() - 1, header.len(), wire.len() - 1] {
+        for prefix in [1, 3, 4, header_end - 1, header_end, wire.len() - 1] {
             let (mut write, mut read) = tokio::io::duplex(4096);
             write.write_all(&wire[..prefix]).await?;
             let credits = Arc::new(Semaphore::new(4096));
@@ -123,7 +125,7 @@ async fn partial_peer_frames_keep_the_deadline_and_release_receive_credits() -> 
             .context("partial peer frame unexpectedly completed")?;
             ensure!(
                 error.to_string() == "peer frame receive deadline",
-                "partial frame failed for a different reason: {error:#}"
+                "partial frame at byte {prefix} failed for a different reason: {error:#}"
             );
             ensure!(
                 credits.available_permits() == 4096,
