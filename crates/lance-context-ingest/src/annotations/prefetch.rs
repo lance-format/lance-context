@@ -2,8 +2,11 @@
 use super::*;
 
 const MAX_REQUESTS: usize = 8;
-const MAX_ROWS: usize = 128;
-const MAX_PAYLOAD_BYTES: u64 = 256 << 10;
+// Match one core cold-lookup window. Bodies stay in their original requests;
+// only IDs participate in the shared query. Bound cumulative wire bytes as
+// well as requests/keys; decode reservations still charge the apply budget.
+const MAX_ROWS: usize = 2048;
+const MAX_PAYLOAD_BYTES: u64 = 32 << 20;
 
 pub(super) async fn fetch(
     service: &Service,
@@ -98,11 +101,12 @@ pub(super) async fn prepare(
         return Ok(None);
     }
     let mut rows = head.decoded.rows();
+    let mut payload_bytes = head.meta.body_bytes;
     while queued.len() + 1 < MAX_REQUESTS && rows < MAX_ROWS {
         let Some((index, meta)) = page.entries.first().cloned() else {
             break;
         };
-        if meta.body_bytes > MAX_PAYLOAD_BYTES {
+        if meta.body_bytes > MAX_PAYLOAD_BYTES - payload_bytes {
             break;
         }
         // Metadata was ordered and cut-bounded when the page was captured.
@@ -111,6 +115,7 @@ pub(super) async fn prepare(
             break;
         };
         rows += next.decoded.rows();
+        payload_bytes += next.meta.body_bytes;
         queued.push_back(next);
         page.entries.remove(0);
     }

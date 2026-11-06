@@ -1,6 +1,8 @@
 //! Shared lookups must leave request visibility, publication and recovery ordered.
 use super::*;
 
+mod large;
+
 fn completed(service: &Service, phase: &str) -> u64 {
     service
         .phase_observation()
