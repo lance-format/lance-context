@@ -301,23 +301,26 @@ impl Collector {
         let mut progress = service.shared.progress.subscribe();
         let until = tokio::time::Instant::now() + self.options.interval.min(Duration::from_secs(1));
         let reference = phases
-            .measure(
-                Phase::CollectList,
+            .measure(Phase::CollectList, async {
                 next_listing(
                     self.reference_listing.as_mut().unwrap(),
                     &mut progress,
                     until,
-                ),
-            )
+                )
+                .await
+                .transpose()
+            })
             .await;
-        let Some(reference) = reference else {
+        if !matches!(&reference, Ok(None)) {
+            self.reference_listing = None;
+        }
+        let Some(reference) = reference.context(ListingFailure)? else {
             // Drop this pass's protection roots and reacquire them next time.
             // The same bounded response keeps progressing during publication.
             return Ok(());
         };
-        self.reference_listing = None;
         ensure!(
-            reference.context(ListingFailure)?.is_none(),
+            reference.is_none(),
             "annotation data collection requires a table without tags or branches"
         );
         let page_charge = self.options.max_bytes * 3;
