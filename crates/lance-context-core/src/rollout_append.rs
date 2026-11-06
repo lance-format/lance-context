@@ -603,14 +603,12 @@ impl AppendCoordinator {
             } else {
                 previous_cutoff.unwrap_or(0)
             };
-            let mut generations: Vec<_> = manifest
-                .sstables
-                .into_iter()
-                .map(|g| Generation {
+            let mut generations = crate::wal_retirement::unique_generations(
+                manifest.sstables.into_iter().map(|g| Generation {
                     number: g.generation,
                     path: g.path,
-                })
-                .collect();
+                }),
+            )?;
             generations.sort_by_key(|g| g.number);
             generations.truncate(max_generations);
             if !generations.is_empty() {
@@ -2155,6 +2153,160 @@ mod tests {
         let staged = stage(uri, plans[0].clone(), budget(), None).await.unwrap();
         restarted.commit(vec![staged]).await.unwrap();
         assert_eq!(rows(uri).await, 2);
+    }
+
+    async fn repeat_first_generation(uri: &str, conflicting: bool) {
+        let dataset = Dataset::open(uri).await.unwrap();
+        let manifests = shard_store(&dataset, derive_shard_id(Some("a")))
+            .await
+            .unwrap();
+        let epoch = manifests
+            .refresh_latest()
+            .await
+            .unwrap()
+            .unwrap()
+            .writer_epoch;
+        manifests
+            .commit_update(epoch, |current| {
+                let mut next = current.clone();
+                next.version += 1;
+                let mut repeated = current.sstables[0].clone();
+                if conflicting {
+                    repeated.path = format!("abcdef012345_gen_{}", repeated.generation);
+                    assert_ne!(repeated.path, current.sstables[0].path);
+                }
+                next.sstables.push(repeated);
+                next
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn duplicate_manifest_generations_merge_once_in_both_paths() {
+        for append in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let mut a = writer(uri, "a").await;
+            put(&a, "first", 4096).await;
+            repeat_first_generation(uri, false).await;
+            // A live writer must be able to append after the duplicate appeared.
+            put(&a, "tail", 4096).await;
+            if append {
+                let mut coordinator = AppendCoordinator::open(uri, None).await.unwrap();
+                let (plans, _) = coordinator
+                    .plan(&["a".into()], 64, 1024 * 1024)
+                    .await
+                    .unwrap();
+                assert_eq!(plans[0].generations.len(), 2);
+                let part = stage(uri, plans[0].clone(), budget(), None).await.unwrap();
+                assert_eq!(part.rows, 2);
+                assert_eq!(coordinator.commit(vec![part]).await.unwrap(), 2);
+            } else {
+                a.cleanup_own_shard().await.unwrap();
+            }
+            assert_eq!(rows(uri).await, 2, "no duplicate physical append");
+            assert_eq!(a.list(None, None).await.unwrap().len(), 2);
+            let dataset = Dataset::open(uri).await.unwrap();
+            let manifests = shard_store(&dataset, derive_shard_id(Some("a")))
+                .await
+                .unwrap();
+            assert!(manifests
+                .refresh_latest()
+                .await
+                .unwrap()
+                .unwrap()
+                .sstables
+                .is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_manifest_reconciles_committed_prefix_and_preserves_new_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let a = writer(uri, "a").await;
+        put(&a, "first", 4096).await;
+        let scope =
+            MergeWriteScope::with_pinned_authorizer(Arc::new(FailDrain(AtomicBool::new(true))));
+        scope
+            .run(async {
+                let mut coordinator = AppendCoordinator::open(uri, None).await.unwrap();
+                let (plans, _) = coordinator
+                    .plan(&["a".into()], 64, 1024 * 1024)
+                    .await
+                    .unwrap();
+                let part = stage(uri, plans[0].clone(), budget(), None).await.unwrap();
+                assert!(coordinator
+                    .commit(vec![part])
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("injected"));
+            })
+            .await;
+        scope.drain().await;
+        assert_eq!(rows(uri).await, 1);
+        repeat_first_generation(uri, false).await;
+        put(&a, "tail", 4096).await;
+        let before = Dataset::open(uri).await.unwrap().version().version;
+        let mut restarted = AppendCoordinator::open(uri, None).await.unwrap();
+        let (plans, reclaimed) = restarted
+            .plan(&["a".into()], 64, 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(reclaimed, 1, "duplicate references count as one generation");
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].generations.len(), 1, "new tail remains pending");
+        assert_eq!(
+            rows(uri).await,
+            1,
+            "recovery must not append the covered data again"
+        );
+        assert_eq!(Dataset::open(uri).await.unwrap().version().version, before);
+        let part = stage(uri, plans[0].clone(), budget(), None).await.unwrap();
+        restarted.commit(vec![part]).await.unwrap();
+        assert_eq!(rows(uri).await, 2);
+        assert_eq!(a.list(None, None).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn conflicting_manifest_identity_fails_before_base_publication() {
+        for append in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let mut a = writer(uri, "a").await;
+            put(&a, "first", 4096).await;
+            repeat_first_generation(uri, true).await;
+            let error = if append {
+                AppendCoordinator::open(uri, None)
+                    .await
+                    .unwrap()
+                    .plan(&["a".into()], 64, 1024 * 1024)
+                    .await
+                    .unwrap_err()
+            } else {
+                a.cleanup_own_shard().await.unwrap_err()
+            };
+            assert!(error
+                .to_string()
+                .contains("Conflicting WAL retirement generation identity"));
+            assert_eq!(rows(uri).await, 0);
+            let dataset = Dataset::open(uri).await.unwrap();
+            let manifests = shard_store(&dataset, derive_shard_id(Some("a")))
+                .await
+                .unwrap();
+            assert_eq!(
+                manifests
+                    .refresh_latest()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .sstables
+                    .len(),
+                2
+            );
+        }
     }
 
     #[tokio::test]
