@@ -698,13 +698,18 @@ impl AppendCoordinator {
                 .refresh_latest()
                 .await?
                 .ok_or_else(|| Error::io("staged shard disappeared"))?;
-            let mut pending: Vec<_> = manifest.sstables.iter().collect();
-            pending.sort_by_key(|g| g.generation);
+            let mut pending = crate::wal_retirement::unique_generations(
+                manifest.sstables.into_iter().map(|g| Generation {
+                    number: g.generation,
+                    path: g.path,
+                }),
+            )?;
+            pending.sort_by_key(|g| g.number);
             if pending.len() < selected.len()
                 || pending
                     .iter()
                     .zip(selected)
-                    .any(|(a, b)| a.generation != b.number || a.path != b.path)
+                    .any(|(a, b)| a.number != b.number || a.path != b.path)
             {
                 return Err(Error::invalid_input("staged WAL prefix changed; replan"));
             }
@@ -2218,6 +2223,49 @@ mod tests {
                 .unwrap()
                 .sstables
                 .is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_manifest_references_added_during_staging_are_validated() {
+        for conflicting in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let a = writer(uri, "a").await;
+            put(&a, "first", 4096).await;
+            let mut coordinator = AppendCoordinator::open(uri, None).await.unwrap();
+            let (plans, _) = coordinator
+                .plan(&["a".into()], 64, 1024 * 1024)
+                .await
+                .unwrap();
+            let part = stage(uri, plans[0].clone(), budget(), None).await.unwrap();
+            repeat_first_generation(uri, conflicting).await;
+            put(&a, "tail", 4096).await;
+            let result = coordinator.commit(vec![part]).await;
+            if conflicting {
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Conflicting WAL retirement generation identity"));
+                assert_eq!(rows(uri).await, 0, "conflict must precede base publication");
+            } else {
+                assert_eq!(result.unwrap(), 1);
+                assert_eq!(rows(uri).await, 1, "publish the staged prefix once");
+                let (tail, _) = coordinator
+                    .plan(&["a".into()], 64, 1024 * 1024)
+                    .await
+                    .unwrap();
+                assert_eq!(tail.len(), 1);
+                assert_eq!(
+                    tail[0].generations.len(),
+                    1,
+                    "preserve concurrent ingestion"
+                );
+                let tail = stage(uri, tail[0].clone(), budget(), None).await.unwrap();
+                coordinator.commit(vec![tail]).await.unwrap();
+                assert_eq!(rows(uri).await, 2);
+                assert_eq!(a.list(None, None).await.unwrap().len(), 2);
+            }
         }
     }
 
