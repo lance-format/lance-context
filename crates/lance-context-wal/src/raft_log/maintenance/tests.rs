@@ -2,6 +2,7 @@ use super::*;
 use std::{fs, path::PathBuf};
 
 mod pressure;
+mod pressure_admission;
 mod rewrite_allowance;
 mod rewrite_pause;
 

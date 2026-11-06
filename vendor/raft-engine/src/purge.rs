@@ -216,13 +216,20 @@ where
         // Image reservations can keep producer admission closed even when
         // every rewritten entry is still live. Rewriting that queue again
         // cannot reclaim its payloads; retain the stale-file scan below.
-        if self.global_stats.deleted_rewrite_entries() > 0 {
+        if self.has_obsolete_rewrite_entries() {
             self.rewrite_rewrite_queue()?;
         }
         self.rescan_memtables_and_purge_stale_files(
             LogQueue::Rewrite,
             self.pipe_log.file_span(LogQueue::Rewrite).1,
         )
+    }
+
+    /// Whether a pressure pass has obsolete rewrite entries to reclaim.
+    /// This is a progress hint, not a reservation or permission to delete files.
+    #[cfg(feature = "internals")]
+    pub fn has_obsolete_rewrite_entries(&self) -> bool {
+        self.global_stats.deleted_rewrite_entries() > 0
     }
 
     pub fn must_purge_all_stale(&self) {

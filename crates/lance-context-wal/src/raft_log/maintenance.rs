@@ -35,7 +35,27 @@ impl LogMaintenance {
             .write()
             .map_err(|_| anyhow::anyhow!("filesystem lifecycle lock poisoned"))?;
         self.node.check()?;
-        let groups = self.run_pass(false)?;
+        let groups = match self.run_pass(false) {
+            Ok(groups) => groups,
+            Err(error)
+                if error.is::<crate::admission::DiskBudgetExhausted>()
+                    && self
+                        .node
+                        .engine
+                        .purge_manager()
+                        .has_obsolete_rewrite_entries() =>
+            {
+                // Normal reservation failed before touching storage. Retained
+                // append data can make that allowance too large even when the
+                // smaller rewrite-queue pass can reclaim obsolete bytes. Keep
+                // its independent reservation and all sync/failure fencing.
+                // No-garbage admission failures and native I/O errors stay errors.
+                return self.run_pass(true).with_context(|| {
+                    format!("normal rewrite admission failed before reclamation: {error:#}")
+                });
+            }
+            Err(error) => return Err(error),
+        };
         if self.node.budget.get().is_some_and(|budget| {
             let observed = budget.snapshot();
             observed
