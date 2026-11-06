@@ -65,6 +65,36 @@ impl RolloutStore {
         Ok(Self::Remote(store))
     }
 
+    /// Append rollout rows and wait until they are visible to subsequent reads.
+    ///
+    /// Remote stores require server v0.6.5 or newer; older servers ignore the
+    /// flush option. If flushing fails, the append may still be durable. Retries
+    /// should reuse the same record ids. A flush may also publish other pending
+    /// appends.
+    pub async fn add_with_flush(
+        &mut self,
+        records: &[AddRolloutRequest],
+    ) -> ContextResult<AddRolloutsResponse> {
+        if records.is_empty() {
+            return Err(ContextError::InvalidRequest(
+                "records must not be empty".to_string(),
+            ));
+        }
+
+        match self {
+            Self::Local(store) => {
+                let response = RolloutStoreApi::add(store.as_mut(), records).await?;
+                store
+                    .flush()
+                    .await
+                    .map_err(|e| ContextError::Internal(e.to_string()))?;
+                Ok(response)
+            }
+            #[cfg(feature = "remote")]
+            Self::Remote(store) => store.add_with_flush(records).await,
+        }
+    }
+
     /// Seal the local MemWAL memtable so rows written by [`RolloutStoreApi::add`]
     /// become visible to subsequent reads on this handle.
     ///
@@ -73,8 +103,8 @@ impl RolloutStore {
     /// sweeper, so without an explicit `flush` a write-then-read sequence
     /// returns nothing. Call this before reading back rows you just wrote.
     ///
-    /// A no-op for `Remote` stores, where the server owns flush scheduling and
-    /// per-request `?flush=true` provides read-your-write.
+    /// A no-op for `Remote` stores. Use [`Self::add_with_flush`] when a remote
+    /// append needs read-your-write visibility.
     pub async fn flush(&self) -> Result<(), ContextError> {
         match self {
             RolloutStore::Local(s) => s

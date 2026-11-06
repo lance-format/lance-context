@@ -285,17 +285,40 @@ impl RemoteRolloutStore {
             cached_version: info.version.unwrap_or(0),
         })
     }
+
+    /// Append rollout rows and wait until they are visible to subsequent reads.
+    ///
+    /// Requires server v0.6.5 or newer; older servers ignore the flush option.
+    /// If flushing fails, the append may still be durable. Retries should reuse
+    /// the same record ids.
+    pub async fn add_with_flush(
+        &mut self,
+        records: &[AddRolloutRequest],
+    ) -> ContextResult<AddRolloutsResponse> {
+        self.add_inner(records, true).await
+    }
+
+    async fn add_inner(
+        &mut self,
+        records: &[AddRolloutRequest],
+        flush: bool,
+    ) -> ContextResult<AddRolloutsResponse> {
+        let resp = if flush {
+            self.client
+                .add_rollouts_with_flush(&self.store_name, records)
+                .await
+        } else {
+            self.client.add_rollouts(&self.store_name, records).await
+        }
+        .map_err(to_ctx_err)?;
+        self.cached_version = resp.version;
+        Ok(resp)
+    }
 }
 
 impl RolloutStoreApi for RemoteRolloutStore {
     async fn add(&mut self, records: &[AddRolloutRequest]) -> ContextResult<AddRolloutsResponse> {
-        let resp = self
-            .client
-            .add_rollouts(&self.store_name, records)
-            .await
-            .map_err(to_ctx_err)?;
-        self.cached_version = resp.version;
-        Ok(resp)
+        self.add_inner(records, false).await
     }
 
     async fn list(
@@ -1020,12 +1043,41 @@ impl ContextClient {
     /// are not unique). The `metadata` part is sent first so the server can parse
     /// the manifest before matching binary parts. When no record carries bytes, a
     /// plain JSON body is sent instead.
+    ///
+    /// This method does not wait for read visibility. Use
+    /// [`Self::add_rollouts_with_flush`] when the next operation must read the rows.
     pub async fn add_rollouts(
         &self,
         name: &str,
         records: &[AddRolloutRequest],
     ) -> Result<AddRolloutsResponse, ClientError> {
+        self.add_rollouts_inner(name, records, false).await
+    }
+
+    /// Append rollout rows and wait until the server makes them readable.
+    ///
+    /// Requires server v0.6.5 or newer; older servers ignore the flush option.
+    /// If flushing fails, the append may still be durable. Retries should reuse
+    /// the same record ids.
+    pub async fn add_rollouts_with_flush(
+        &self,
+        name: &str,
+        records: &[AddRolloutRequest],
+    ) -> Result<AddRolloutsResponse, ClientError> {
+        self.add_rollouts_inner(name, records, true).await
+    }
+
+    async fn add_rollouts_inner(
+        &self,
+        name: &str,
+        records: &[AddRolloutRequest],
+        flush: bool,
+    ) -> Result<AddRolloutsResponse, ClientError> {
         let url = self.url(&format!("/rollouts/{}/records", name));
+        let mut request = self.http.post(url);
+        if flush {
+            request = request.query(&[("flush", true)]);
+        }
         let has_blob = records.iter().any(|r| r.binary_payload.is_some());
 
         let resp = if has_blob {
@@ -1049,12 +1101,12 @@ impl ContextClient {
                     form = form.part(idx.to_string(), part);
                 }
             }
-            self.http.post(url).multipart(form).send().await?
+            request.multipart(form).send().await?
         } else {
             let req = AddRolloutsRequest {
                 records: records.to_vec(),
             };
-            self.http.post(url).json(&req).send().await?
+            request.json(&req).send().await?
         };
         Self::handle_response(resp).await
     }
