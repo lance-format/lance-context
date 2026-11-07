@@ -73,7 +73,7 @@ impl FrozenCheckpoint {
                         );
                     }
                     let selected = if batches.is_empty() {
-                        return Ok(prior);
+                        return Ok::<_, anyhow::Error>(prior);
                     } else {
                         // The input frames own their apply reservations. This separate
                         // writer allowance remains with the admitted task if its
