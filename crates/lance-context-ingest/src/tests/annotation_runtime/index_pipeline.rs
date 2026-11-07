@@ -2,7 +2,11 @@ use super::automatic_reclamation::deletion_faults::fault_store;
 use super::*;
 use lance::index::DatasetIndexExt;
 
-async fn owner(c: &network::Cluster, storage: &Storage) -> Result<(Service, Runtime)> {
+async fn owner(
+    c: &network::Cluster,
+    storage: &Storage,
+    status_index: bool,
+) -> Result<(Service, Runtime)> {
     let state = annotation_publication::state(c).await?;
     let (service, runtime) = Runtime::connect(
         c.client.clone(),
@@ -25,7 +29,12 @@ async fn owner(c: &network::Cluster, storage: &Storage) -> Result<(Service, Runt
                 max_records: 2,
                 max_batch_wait: Duration::from_millis(20),
                 retained_manifest_versions: 2,
-                turn_id_index: Some(crate::materializer::TurnIdIndex { min_rows: 1 }),
+                turn_id_index: (!status_index)
+                    .then_some(crate::materializer::TurnIdIndex { min_rows: 1 }),
+                status_index: status_index.then_some(crate::materializer::StatusIndex {
+                    min_rows: 1,
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
         },
@@ -49,15 +58,25 @@ async fn owner(c: &network::Cluster, storage: &Storage) -> Result<(Service, Runt
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn slow_id_index_allows_publication_and_gc_then_selects_unchanged_id_columns() -> Result<()> {
-    tokio::time::timeout(Duration::from_secs(90), paused(false)).await?
+    tokio::time::timeout(Duration::from_secs(90), paused(false, false)).await?
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restart_during_id_index_preserves_acknowledged_updates_and_rebuilds_index() -> Result<()> {
-    tokio::time::timeout(Duration::from_secs(90), paused(true)).await?
+    tokio::time::timeout(Duration::from_secs(90), paused(true, false)).await?
 }
 
-async fn paused(restart: bool) -> Result<()> {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slow_status_index_allows_publication_without_restoring_old_values() -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(90), paused(false, true)).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restart_during_status_index_preserves_updates_and_catches_up() -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(90), paused(true, true)).await?
+}
+
+async fn paused(restart: bool, status_index: bool) -> Result<()> {
     let root = tempfile::tempdir()?;
     let directory = root.path().join("turns.lance");
     let faults = Arc::new(fault_store::Faults::default());
@@ -72,7 +91,7 @@ async fn paused(restart: bool) -> Result<()> {
     annotation_publication::seed_contract(&c, &storage, Service::contract(&binding(), &limits)?)
         .await?;
     let (entered, resume) = faults.pause_index_write();
-    let (service, runtime) = owner(&c, &storage).await?;
+    let (service, runtime) = owner(&c, &storage, status_index).await?;
     let (stop, task) = run_owner(runtime);
     let producer = producer(&service, 1).await?;
     let initial = request(
@@ -83,8 +102,14 @@ async fn paused(restart: bool) -> Result<()> {
     )
     .await?;
     let first = service.submit(&initial, Duration::from_secs(10)).await?;
-    drained(&c, &service, first.index).await?;
     let index_file = tokio::time::timeout(Duration::from_secs(10), entered).await??;
+    // The serial status path already retains its maintenance plan here. Verify
+    // the initial data cut independently, then require the next updates to drain.
+    let checkpoint = annotation_publication::state(&c).await?.progress.checkpoint;
+    assert!(checkpoint.get(&10).copied().unwrap_or(0) >= first.index);
+    if !status_index {
+        drained(&c, &service, first.index).await?;
+    }
     let local_index_file = std::path::Path::new("/").join(index_file.as_ref());
     assert!(
         local_index_file.exists(),
@@ -99,18 +124,32 @@ async fn paused(restart: bool) -> Result<()> {
     std::fs::write(&orphan, b"unreferenced data file")?;
     let mut last = None;
     for sequence in 2..=7 {
+        let status = if status_index && sequence % 2 == 1 {
+            "accepted"
+        } else {
+            "reviewed"
+        };
         let update = request(
             &service,
             &producer,
             sequence,
-            wire(&limits, &["T"], 0, None, 1, Some(sequence as f32))?,
+            wire(
+                &limits,
+                &["T"],
+                u8::from(status_index),
+                status_index.then_some(status),
+                1,
+                Some(sequence as f32),
+            )?,
         )
         .await?;
         let result = service.submit(&update, Duration::from_secs(10)).await?;
-        drained(&c, &service, result.index).await?;
         let value = service.get("T", Duration::from_secs(10)).await?.unwrap();
-        assert_eq!(value.status.as_deref(), Some("reviewed"));
+        assert_eq!(value.status.as_deref(), Some(status));
         assert_eq!(value.score, Some(sequence as f32));
+        drained(&c, &service, result.index)
+            .await
+            .context("acknowledged update must materialize while native index I/O is paused")?;
         assert_eq!(service.source_observation().records, 0);
         assert!(local_index_file.exists(), "GC removed a building index");
         last = Some((update, result));
@@ -144,7 +183,7 @@ async fn paused(restart: bool) -> Result<()> {
         // the paused response completes that original job with an error; its
         // unselected files may be collected by the successor.
         drop(resume);
-        let (service, runtime) = owner(&c, &storage).await?;
+        let (service, runtime) = owner(&c, &storage, status_index).await?;
         let (stop, task) = run_owner(runtime);
         (service, stop, task)
     } else {
@@ -154,7 +193,19 @@ async fn paused(restart: bool) -> Result<()> {
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let base = annotation_publication::read(&c, &storage, None).await?;
-            if !base.load_indices().await?.is_empty()
+            let indices = base.load_indices().await?;
+            let ready = if status_index {
+                let covered: std::collections::BTreeSet<_> = indices
+                    .iter()
+                    .filter(|i| i.name == "lance_context_annotation_status")
+                    .flat_map(|i| i.fragment_bitmap.as_ref().unwrap().iter())
+                    .map(u64::from)
+                    .collect();
+                !covered.is_empty() && base.fragments().iter().all(|f| covered.contains(&f.id))
+            } else {
+                !indices.is_empty()
+            };
+            if ready
                 && annotation_publication::state(&c)
                     .await?
                     .progress
@@ -169,14 +220,28 @@ async fn paused(restart: bool) -> Result<()> {
     })
     .await??;
     let value = service.get("T", Duration::from_secs(10)).await?.unwrap();
-    assert_eq!(value.status.as_deref(), Some("reviewed"));
+    assert_eq!(
+        value.status.as_deref(),
+        Some(if status_index { "accepted" } else { "reviewed" })
+    );
     assert_eq!(value.score, Some(7.0));
+    if status_index {
+        let base = annotation_publication::read(&c, &storage, None).await?;
+        assert_eq!(
+            base.count_rows(Some("status = 'accepted'".into())).await?,
+            1
+        );
+        assert_eq!(
+            base.count_rows(Some("status = 'reviewed'".into())).await?,
+            0
+        );
+    }
     let (last, result) = last.unwrap();
     assert_eq!(
         service.submit(&last, Duration::from_secs(10)).await?,
         result
     );
-    if restart {
+    if restart || status_index {
         tokio::time::timeout(Duration::from_secs(10), async {
             while local_index_file.exists() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
