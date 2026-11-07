@@ -59,7 +59,7 @@ and the same regressions pass against that release.
 
 ## Azure completion after a lost success response
 
-The workspace and this crate's standalone test manifest temporarily pin
+This crate's standalone test manifest temporarily pins
 `object_store 0.14.2` to commit
 `09b0593d4702ba390bab1710b3e67f86fd7defcb` in the maintainer's fork of
 `apache/arrow-rs-object-store`, implementing
@@ -126,3 +126,22 @@ Their existing runtimes, abort-on-drop behavior, and error mapping are retained.
 Existing multipart retry and classification fixes are retained. The standalone
 manifest and lockfile select the same path-patched `lance-core 13.0.0` as the
 workspace, including its transitive namespace user. No version is upgraded.
+
+## Owner-scoped Azure completion policy
+
+The workspace now pins object_store to commit `1149230d06b87d2b458a1b6a886e0b8224498338`,
+which retains the serializer fix above and adds an opt-in Azure block-list
+completion retry hook. The standalone Lance regression manifest keeps the
+serializer-fix revision; its tests do not activate the owner policy.
+
+The hook retains the original serialized block list, attributes and tags inside
+one SDK completion call. lance-context enables it after owner startup, supplies
+backoff only for explicit 429/503 responses, and cancels pending requests and
+backoff when the owner scope closes. It records completion policy decisions
+separately from part retries. Other failures retain the SDK's existing behavior.
+Completion retries do not re-upload data parts or replay the outer multipart
+completion or catalog publication.
+
+The context multipart tests exercise the real Azure SDK through an injected
+HTTP transport, including identical shared completion buffers and options,
+ordered blocks, exhausted native retries, cancellation and startup behavior.

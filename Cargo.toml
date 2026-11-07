@@ -30,4 +30,4 @@ lance-core = { path = "vendor/lance-core" }
 lance = { path = "vendor/lance" }
 lance-encoding = { path = "vendor/lance-encoding" }
 # Azure completion response-loss fix; same object_store 0.14.2, see vendor/lance-io/BACKPORT.md.
-object_store = { git = "https://github.com/beinan/arrow-rs-object-store", rev = "09b0593d4702ba390bab1710b3e67f86fd7defcb" }
+object_store = { git = "https://github.com/beinan/arrow-rs-object-store", rev = "1149230d06b87d2b458a1b6a886e0b8224498338" }
