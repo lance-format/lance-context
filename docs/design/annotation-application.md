@@ -288,7 +288,7 @@ entries, source bytes/records, and application pressure once per second.
 Each observation includes `observed_unix_ms` and the existing cumulative phase
 counters under `phases`. `collect` measures the collector step, `compact` the
 maintenance check/rewrite, `prepare` native preparation, `blob_write` descriptor
-persistence or a compaction task's file writes, and `commit` managed publication
+persistence or native rewrite/index work, and `commit` managed publication
 resolution. The shared catalog also reports `state`, `prepare`, and `retire`
 work. This distinguishes a full source window waiting on maintenance from one
 waiting on native preparation or publication without logging individual turns.
@@ -301,6 +301,16 @@ native fragment writing and the private detached commit. The following
 already prepared body does not repeat its body phases. Native writer observations
 remain with the admitted task if its caller is cancelled. These overlapping
 intervals are not additive and do not by themselves identify storage saturation.
+
+Native maintenance adds five child phases inside `blob_write`:
+`native_compaction` measures the ordinary table rewrite, and
+`native_body_compaction` measures the mixed-ingestion body rewrite.
+`native_session_index`, `native_turn_id_index`, and `native_status_index` measure
+the corresponding native BTree build or segment merge. These intervals include
+native reads, processing and writes; they exclude workspace admission and later
+catalog publication. They distinguish actual native work from the parent
+`compact` scheduling checks. Each child records one admitted native call, not
+one fragment, cloud request or successfully published version.
 
 Annotation commit resolution reports four nested phases.
 `annotation_commit_base` loads the fixed predecessor;

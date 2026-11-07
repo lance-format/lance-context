@@ -72,8 +72,18 @@ pub enum Phase {
     AnnotationCreateApplyWait,
     /// Patch submissions waiting for local apply, within AnnotationApplyWait.
     AnnotationPatchApplyWait,
+    /// Native fragment rewrite, including reads and writes, within BlobWrite.
+    NativeCompaction,
+    /// Native mixed-ingestion body rewrite, within BlobWrite.
+    NativeBodyCompaction,
+    /// Native session index build or segment merge, within BlobWrite.
+    NativeSessionIndex,
+    /// Native turn-ID index build or segment merge, within BlobWrite.
+    NativeTurnIdIndex,
+    /// Native status index build or segment merge, within BlobWrite.
+    NativeStatusIndex,
 }
-const NAMES: [&str; 40] = [
+const NAMES: [&str; 45] = [
     "claim",
     "acquire",
     "state",
@@ -114,6 +124,11 @@ const NAMES: [&str; 40] = [
     "annotation_patch_append",
     "annotation_create_apply_wait",
     "annotation_patch_apply_wait",
+    "native_compaction",
+    "native_body_compaction",
+    "native_session_index",
+    "native_turn_id_index",
+    "native_status_index",
 ];
 pub const PHASE_COUNT: usize = NAMES.len();
 
