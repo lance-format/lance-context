@@ -73,7 +73,7 @@ impl FrozenCheckpoint {
                         );
                     }
                     let selected = if batches.is_empty() {
-                        base
+                        return Ok::<_, anyhow::Error>(prior);
                     } else {
                         // The input frames own their apply reservations. This separate
                         // writer allowance remains with the admitted task if its
@@ -153,9 +153,15 @@ impl FrozenCheckpoint {
                             .await??,
                         )
                     };
-                    BodySnapshot::capture(prior.table_instance, &selected)
-                        .await
-                        .map_err(anyhow::Error::from)
+                    // The successful detached commit confirms this frozen
+                    // identity. Reading its transaction again adds a storage
+                    // round trip; loading an existing snapshot still verifies it.
+                    Ok(BodySnapshot {
+                        table_instance: prior.table_instance,
+                        uri: selected.uri().to_string(),
+                        version: selected.version_id(),
+                        transaction: self.identity().to_owned(),
+                    })
                 })
                 .await?;
             *prepared = Some(snapshot);
