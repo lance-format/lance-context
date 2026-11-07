@@ -117,7 +117,7 @@ async fn exercise() -> Result<()> {
     fixture::seed_with_binding(&c, &narrow, &body, large_binding()).await?;
     let base = annotation_publication::read(&c, &narrow, None).await?;
     let (a, runtime) = owner(&c, &narrow, &body).await?;
-    let (_stop, task) = annotation_runtime::run_owner(runtime);
+    let (stop, task) = annotation_runtime::run_owner(runtime);
     let mut failed_upload = gates.lose_put_reply();
 
     let ids = (0..ROWS)
@@ -184,14 +184,27 @@ async fn exercise() -> Result<()> {
     assert_eq!(plan.plan.sources[&10].records[0].0, acknowledged[0].1.index);
 
     failed_upload.release();
-    let error = tokio::time::timeout(Duration::from_secs(30), task)
-        .await??
-        .unwrap_err();
-    assert!(
-        format!("{error:#}").contains("injected lost native PUT reply"),
-        "{error:#}"
-    );
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !a
+            .phase_observation()
+            .iter()
+            .any(|phase| phase.phase == "annotation_body_write" && phase.failed == 1)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    // The object exists but no native commit was attempted. Keep acknowledged
+    // values readable until an explicit fenced restart resolves the old cut.
+    assert!(!task.is_finished(), "lost upload reply stopped owned reads");
+    current_values(&a, false).await?;
+    assert!(a
+        .phase_observation()
+        .iter()
+        .all(|phase| phase.phase != "annotation_body_commit" || phase.started == 0));
     assert_eq!(gates.multipart_completions.load(Ordering::SeqCst), 1);
+    stop.send(()).unwrap();
+    task.await??;
     let stopped = annotation_publication::state(&c).await?;
     assert_eq!(stopped.progress.pending.as_ref(), Some(&plan));
     assert!(stopped.progress.prepared.is_none());
