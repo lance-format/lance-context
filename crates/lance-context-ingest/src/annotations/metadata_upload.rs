@@ -1,5 +1,5 @@
-//! Keep the original immutable metadata PUT alive through storage throttling.
-//! No preparation, catalog mutation, or multipart operation is re-executed.
+//! Keep admitted file uploads alive through explicit storage throttling.
+//! No preparation, catalog mutation, or multipart completion is re-executed.
 use crate::materializer::Storage;
 use anyhow::{ensure, Context, Result};
 use bytes::Bytes;
@@ -23,10 +23,14 @@ use std::{
 use tokio::sync::watch;
 use uuid::Uuid;
 
+mod multipart;
+
 #[derive(Debug, Default)]
 struct Counters {
     waiting: AtomicU64,
     resubmissions: AtomicU64,
+    waiting_part_retries: AtomicU64,
+    part_retry_decisions: AtomicU64,
 }
 
 #[derive(Debug, Serialize)]
@@ -34,6 +38,10 @@ pub(crate) struct Observation {
     pub(crate) waiting_objects: u64,
     /// Calls to the underlying store, not HTTP attempts inside its SDK.
     pub(crate) put_resubmissions: u64,
+    /// Parts currently waiting in the SDK policy's backoff.
+    pub(crate) waiting_part_retries: u64,
+    /// Policy approvals, not HTTP attempts inside the SDK.
+    pub(crate) part_retry_decisions: u64,
 }
 
 /// Held by the owner role, never by its detached file writers. Dropping this
@@ -93,6 +101,8 @@ impl Scope {
         Observation {
             waiting_objects: self.counters.waiting.load(Ordering::Relaxed),
             put_resubmissions: self.counters.resubmissions.load(Ordering::Relaxed),
+            waiting_part_retries: self.counters.waiting_part_retries.load(Ordering::Relaxed),
+            part_retry_decisions: self.counters.part_retry_decisions.load(Ordering::Relaxed),
         }
     }
 }
@@ -242,9 +252,10 @@ impl ObjectStore for UploadStore {
         path: &Path,
         opts: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
-        // Reinvoking put_part can allocate a different part ordinal. Leave
-        // multipart retry semantics to the SDK that owns that ordinal.
-        self.inner.put_multipart_opts(path, opts).await
+        if !self.enabled.load(Ordering::Acquire) {
+            return self.inner.put_multipart_opts(path, opts).await;
+        }
+        multipart::start(self, path, opts).await
     }
     async fn get_opts(&self, path: &Path, opts: GetOptions) -> object_store::Result<GetResult> {
         self.inner.get_opts(path, opts).await
