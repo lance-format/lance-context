@@ -30,7 +30,9 @@ use tokio_rustls::{
     TlsAcceptor, TlsConnector,
 };
 
+mod queue;
 pub mod snapshot;
+use queue::{Receiver, Route};
 
 pub const ALPN: &[u8] = b"lance-context-wal-peer/1";
 const MAGIC: &[u8; 8] = b"LCWPEER1";
@@ -222,16 +224,14 @@ impl Transport {
         let mut tasks = Vec::new();
         let mut routes = BTreeMap::new();
         for (id, peer) in peers {
-            let (send, receive) = mpsc::channel(options.peer_queue);
             let ready = Arc::new(AtomicBool::new(false));
-            routes.insert(
-                id,
-                Route {
-                    send,
-                    ready: ready.clone(),
-                    bytes: Arc::new(Semaphore::new(options.peer_bytes)),
-                },
+            let (route, receive) = Route::new(
+                options.peer_queue,
+                options.peer_bytes,
+                largest,
+                ready.clone(),
             );
+            routes.insert(id, route);
             tasks.push(tokio::spawn(send_loop(
                 peer,
                 receive,
@@ -310,46 +310,8 @@ impl Drop for Transport {
 struct Queued {
     packet: Outbound,
     _bytes: OwnedSemaphorePermit,
+    _data_bytes: Option<OwnedSemaphorePermit>,
     enqueued: Instant,
-}
-struct Route {
-    send: mpsc::Sender<Queued>,
-    ready: Arc<AtomicBool>,
-    bytes: Arc<Semaphore>,
-}
-impl Route {
-    fn enqueue(&self, packet: Outbound, statistics: &Statistics) -> bool {
-        if !self.ready.load(Ordering::Acquire) {
-            statistics.enqueue_not_ready.fetch_add(1, Ordering::Relaxed);
-            return false;
-        }
-        let size = packet.packet().message.compute_size().saturating_add(256);
-        let Ok(bytes) = self.bytes.clone().try_acquire_many_owned(size) else {
-            statistics
-                .enqueue_byte_capacity
-                .fetch_add(1, Ordering::Relaxed);
-            return false;
-        };
-        match self.send.try_send(Queued {
-            packet,
-            _bytes: bytes,
-            enqueued: Instant::now(),
-        }) {
-            Ok(()) => true,
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                statistics
-                    .enqueue_queue_full
-                    .fetch_add(1, Ordering::Relaxed);
-                false
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                statistics
-                    .enqueue_queue_closed
-                    .fetch_add(1, Ordering::Relaxed);
-                false
-            }
-        }
-    }
 }
 
 async fn dispatch(
@@ -387,7 +349,7 @@ fn fingerprint(certificates: Option<&[rustls::pki_types::CertificateDer<'_>]>) -
 
 async fn send_loop(
     peer: Peer,
-    mut receive: mpsc::Receiver<Queued>,
+    mut receive: Receiver,
     ready: Arc<AtomicBool>,
     connector: TlsConnector,
     options: Options,

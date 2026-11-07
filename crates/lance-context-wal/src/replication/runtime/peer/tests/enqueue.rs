@@ -34,16 +34,16 @@ async fn observe(pressure: Pressure) -> Result<()> {
     } else {
         charge * 3
     };
-    let bytes = Arc::new(Semaphore::new(capacity));
-    let (send, mut receive) = mpsc::channel(1);
+    let (route, mut receive) = Route::new(
+        1,
+        capacity,
+        capacity,
+        Arc::new(AtomicBool::new(!matches!(pressure, Pressure::NotReady))),
+    );
+    let bytes = route.bytes.clone();
     if matches!(pressure, Pressure::Closed) {
         receive.close();
     }
-    let route = Route {
-        send,
-        ready: Arc::new(AtomicBool::new(!matches!(pressure, Pressure::NotReady))),
-        bytes: bytes.clone(),
-    };
     let (outbox, incoming) = mpsc::channel(3);
     for group in [10, 20, 10] {
         outbox

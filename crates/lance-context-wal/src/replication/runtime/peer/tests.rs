@@ -16,6 +16,7 @@ use std::{net::SocketAddr, path::Path};
 
 mod enqueue;
 mod idle;
+mod priority;
 mod process;
 mod snapshots;
 mod timing;

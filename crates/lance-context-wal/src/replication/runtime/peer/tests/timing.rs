@@ -20,13 +20,9 @@ fn queued() -> Result<(Queued, Credits, Arc<Semaphore>, Bytes)> {
     );
     let size = message.compute_size() as usize;
     let credits = Credits::new(1, size + 256);
-    let bytes = Arc::new(Semaphore::new(size + 256));
-    let (send, mut receive) = mpsc::channel(1);
-    let route = Route {
-        send,
-        ready: Arc::new(AtomicBool::new(true)),
-        bytes: bytes.clone(),
-    };
+    let (route, mut receive) =
+        Route::new(1, size + 256, size + 256, Arc::new(AtomicBool::new(true)));
+    let bytes = route.bytes.clone();
     assert!(route.enqueue(
         Outbound {
             packet: Packet {
