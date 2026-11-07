@@ -8,6 +8,7 @@ mod prefetch;
 mod pressure;
 mod replay;
 mod runtime;
+mod snapshot;
 mod status_index;
 #[cfg(feature = "http")]
 mod upload_failure;

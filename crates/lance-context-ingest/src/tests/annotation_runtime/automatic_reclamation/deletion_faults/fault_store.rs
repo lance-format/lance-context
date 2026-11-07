@@ -42,6 +42,7 @@ pub(in crate::tests) struct Faults {
     failed_listing: Mutex<Option<FailedListing>>,
     pub data_listings: Mutex<Vec<Path>>,
     pub manifest_reads: AtomicUsize,
+    pub manifest_gets: Mutex<Vec<Path>>,
     remote: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     index_write: Mutex<Option<PausedIndexWrite>>,
 }
@@ -321,6 +322,7 @@ impl ObjectStore for FaultStore {
     async fn get_opts(&self, path: &Path, opts: GetOptions) -> object_store::Result<GetResult> {
         if !opts.head && path.as_ref().contains("/_versions/") {
             self.faults.manifest_reads.fetch_add(1, Ordering::Relaxed);
+            self.faults.manifest_gets.lock().unwrap().push(path.clone());
         }
         self.inner.get_opts(path, opts).await
     }
