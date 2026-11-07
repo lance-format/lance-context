@@ -39,6 +39,7 @@ struct Publisher {
     compaction_started: Option<tokio::time::Instant>,
     compaction_checked_version: Option<u64>,
     maintenance_deferred_for_pressure: bool,
+    index_preparation: Option<materializer::turn_id_index::Preparation>,
     reclamation: Option<reclamation::Collector>,
 }
 
@@ -232,6 +233,7 @@ impl Runtime {
             compaction_started: None,
             compaction_checked_version: None,
             maintenance_deferred_for_pressure: false,
+            index_preparation: None,
             reclamation: None,
         };
         let mut view = publisher.catalog.state().await?;
@@ -296,12 +298,14 @@ impl Runtime {
         ))
     }
 
-    /// No detached tasks. Publication/protocol failures stop this owner and its
+    /// Publication/protocol failures stop this owner and its
     /// read barriers. Restart reconciles durable plan/preparation/selection state.
     /// An in-flight sealed DELETE retains one bounded page while publication
     /// continues. Failed outcomes pause new publication until that sealed page
     /// clears; applied values remain readable. Only immutable DELETE requests repeat;
     /// this loop never invents a request or blindly retries failed mutations.
+    /// One admitted native ID-index writer can outlive cancellation, retaining
+    /// its workspace until completion. It cannot publish a manifest itself.
     pub async fn run(mut self, shutdown: impl Future<Output = ()>) -> Result<()> {
         tokio::pin!(shutdown);
         tokio::select! {
@@ -330,7 +334,13 @@ impl Publisher {
                 let cleared = phases
                     .measure(
                         Phase::Collect,
-                        collector.step(&self.service, &self.catalog, &self.storage, &self.budget),
+                        collector.step(
+                            &self.service,
+                            &self.catalog,
+                            &self.storage,
+                            &self.budget,
+                            self.index_preparation.as_ref().map(|job| &job.source),
+                        ),
                     )
                     .await?;
                 if !cleared {

@@ -33,6 +33,9 @@ impl Key {
 const MAX_ROWS: usize = 1 << 20;
 pub(super) const WORKSPACE: usize = 512 << 20;
 
+#[cfg(test)]
+mod rebase_tests;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SessionIndex {
@@ -215,14 +218,23 @@ pub(super) async fn prepare(
 
 pub(super) async fn prepare_action(
     publisher: &Publisher,
-    mut dataset: Dataset,
+    dataset: Dataset,
     action: Action,
     key: Key,
 ) -> Result<p::Descriptors> {
     let reservation = publisher.budget.reserve(WORKSPACE).await;
-    let phases = publisher.phases.clone();
+    spawn_action(dataset, action, key, reservation, publisher.phases.clone()).await?
+}
+
+pub(super) fn spawn_action(
+    mut dataset: Dataset,
+    action: Action,
+    key: Key,
+    reservation: MergeReservation,
+    phases: Arc<PhaseCounters>,
+) -> tokio::task::JoinHandle<Result<p::Descriptors>> {
     // Cancellation cannot release admission while a native index build still runs.
-    let descriptors = tokio::spawn(async move {
+    tokio::spawn(async move {
         let _reservation = reservation;
         let is_merge = matches!(&action, Action::Merge(_));
         let (coverage, removed): (BTreeSet<_>, Vec<_>) = match &action {
@@ -287,8 +299,79 @@ pub(super) async fn prepare_action(
         };
         p::Descriptors::lance_index(Bytes::from(serde_json::to_vec(&change)?))
     })
-    .await??;
-    Ok(descriptors)
+}
+
+/// Certify an ID-only result at a later snapshot without reading or rewriting
+/// its native pages. Every covered physical ID column and row mapping must
+/// still be identical. Annotation columns and newly appended fragments may
+/// differ. Publication continues to use the exact-snapshot descriptor decoder.
+pub(super) async fn rebase_turn(
+    source: &Dataset,
+    target: &Dataset,
+    descriptors: &p::Descriptors,
+) -> Result<p::Descriptors> {
+    ensure!(
+        source.uri() == target.uri()
+            && source.schema() == target.schema()
+            && source.version_id() <= target.version_id(),
+        "ID index snapshot binding changed"
+    );
+    let Operation::CreateIndex { new_indices, .. } =
+        operation_for(source, descriptors, Key::Turn).await?
+    else {
+        unreachable!("index descriptor decoder returns CreateIndex")
+    };
+    let id = source.schema().field_id("id")?;
+    let index = &new_indices[0];
+    for fragment_id in index.fragment_bitmap.as_ref().unwrap().iter() {
+        let original = source
+            .get_fragment(fragment_id as usize)
+            .context("ID index source fragment missing")?;
+        let current = target
+            .get_fragment(fragment_id as usize)
+            .context("ID index source fragment was replaced")?;
+        let mut original = original.metadata().clone();
+        let mut current = current.metadata().clone();
+        for fragment in [&mut original, &mut current] {
+            ensure!(
+                fragment.deletion_file.is_none() && fragment.overlays.is_empty(),
+                "ID index source has deletions or overlays"
+            );
+            fragment.files.retain(|file| file.fields.contains(&id));
+            ensure!(
+                fragment.files.len() == 1
+                    && fragment.files[0]
+                        .fields
+                        .iter()
+                        .filter(|&&field| field == id)
+                        .count()
+                        == 1,
+                "ID index source column mapping is ambiguous"
+            );
+            let file = &mut fragment.files[0];
+            file.fields = file
+                .fields
+                .iter()
+                .map(|&field| if field == id { id } else { -2 })
+                .collect::<Vec<_>>()
+                .into();
+        }
+        current.last_updated_at_version_meta = original.last_updated_at_version_meta.clone();
+        ensure!(current == original, "ID index physical input changed");
+    }
+    let mut change: Change = serde_json::from_slice(&descriptors.bytes)?;
+    let mut index = index.clone();
+    // The equality above proves this same ID-only index is also a build for
+    // target's covered fragments. Keep its UUID, native files and coverage;
+    // certify only the version. Never do this for a mutable status index.
+    change.read_version = target.version_id();
+    index.dataset_version = target.version_id();
+    change.index = pb::IndexMetadata::from(&index).encode_to_vec();
+    let rebased = p::Descriptors::lance_index(Bytes::from(serde_json::to_vec(&change)?))?;
+    // Source index UUIDs and coverage must also still match. This rejects a
+    // competing consolidation or overlapping index installation.
+    operation_for(target, &rebased, Key::Turn).await?;
+    Ok(rebased)
 }
 
 pub(super) async fn operation(

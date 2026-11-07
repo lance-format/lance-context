@@ -11,6 +11,7 @@ use crate::{
 use lance_context_core::annotation_staging::Limits;
 
 pub(super) mod automatic_reclamation;
+mod index_pipeline;
 #[cfg(feature = "service")]
 mod lost_advance;
 #[cfg(feature = "service")]

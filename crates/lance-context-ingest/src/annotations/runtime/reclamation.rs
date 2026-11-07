@@ -1,7 +1,8 @@
 //! Bounded file collection for an exclusively owned annotation table.
 //! Called only between publications in the same serial publisher loop. A pending
-//! listing response can span publications; candidate protection/sealing cannot
-//! overlap native preparation. A successor fences the final catalog operation
+//! listing response can span publications. One concurrent ID-index job protects
+//! its source and defers index-page collection; data collection can continue.
+//! Other native preparation remains serial. A successor fences the final catalog operation
 //! and opens its recovery base after acquisition.
 use super::*;
 use futures::{stream, stream::BoxStream, StreamExt, TryStreamExt};
@@ -156,6 +157,7 @@ impl Collector {
         catalog: &materializer::Publisher,
         storage: &Storage,
         budget: &Arc<MergeMemoryBudget>,
+        index_source: Option<&Dataset>,
     ) -> Result<bool> {
         // A sealed page cannot gain paths. Its protection/fence completed before
         // any native preparation resumes; future publications use protected live
@@ -175,7 +177,8 @@ impl Collector {
             self.delete_page(service).await?;
             Ok(())
         } else {
-            self.collect_page(service, catalog, storage, budget).await
+            self.collect_page(service, catalog, storage, budget, index_source)
+                .await
         };
         if self.deleting.get_mut().unwrap().is_some() {
             return Ok(self.may_publish());
@@ -248,6 +251,7 @@ impl Collector {
         catalog: &materializer::Publisher,
         storage: &Storage,
         budget: &Arc<MergeMemoryBudget>,
+        index_source: Option<&Dataset>,
     ) -> Result<()> {
         let phases = service.shared.phases.clone();
         let state = catalog.state().await?;
@@ -366,6 +370,7 @@ impl Collector {
                     // Body index objects keep their existing retention behavior.
                     if !candidate(&path, &destination.base, service.ingress.scope.incarnation)
                         && !(body_storage.is_none()
+                            && index_source.is_none()
                             && indices::candidate(&path, &storage.base).is_some())
                     {
                         continue;
@@ -397,6 +402,19 @@ impl Collector {
         // occur after protection/sealing, even if a DELETE outlives this owner.
         phases
             .measure(Phase::CollectProtect, async {
+                if body_storage.is_none() {
+                    if let Some(source) = index_source {
+                        // The job's original native snapshot remains readable
+                        // even after its catalog history entry is retired.
+                        protect(
+                            &mut candidates,
+                            source.manifest(),
+                            &source.manifest_location().path,
+                            &storage.base,
+                            true,
+                        )?;
+                    }
+                }
                 for base in roots.datasets() {
                     if let Some(body) = body_storage {
                         paired::protect_body(

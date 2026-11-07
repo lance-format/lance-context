@@ -41,6 +41,7 @@ pub(in crate::tests) struct Faults {
     pub data_listings: Mutex<Vec<Path>>,
     pub manifest_reads: AtomicUsize,
     remote: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    index_write: Mutex<Option<(oneshot::Sender<Path>, oneshot::Receiver<()>)>>,
 }
 
 #[derive(Debug)]
@@ -59,6 +60,28 @@ struct FailedListing {
 }
 
 impl Faults {
+    pub fn pause_index_write(&self) -> (oneshot::Receiver<Path>, oneshot::Sender<()>) {
+        let (entered, observed) = oneshot::channel();
+        let (resume, waiting) = oneshot::channel();
+        assert!(self
+            .index_write
+            .lock()
+            .unwrap()
+            .replace((entered, waiting))
+            .is_none());
+        (observed, resume)
+    }
+
+    async fn index_written(&self, path: &Path) -> object_store::Result<()> {
+        if path.as_ref().contains("/_indices/") {
+            let pause = self.index_write.lock().unwrap().take();
+            if let Some((entered, resume)) = pause {
+                let _ = entered.send(path.clone());
+                resume.await.map_err(|_| failure())?;
+            }
+        }
+        Ok(())
+    }
     pub async fn fail_listing(
         &self,
         prefix: &std::path::Path,
@@ -255,14 +278,20 @@ impl ObjectStore for FaultStore {
         payload: PutPayload,
         opts: PutOptions,
     ) -> object_store::Result<PutResult> {
-        self.inner.put_opts(path, payload, opts).await
+        let result = self.inner.put_opts(path, payload, opts).await?;
+        self.faults.index_written(path).await?;
+        Ok(result)
     }
     async fn put_multipart_opts(
         &self,
         path: &Path,
         opts: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
-        self.inner.put_multipart_opts(path, opts).await
+        Ok(Box::new(IndexUpload {
+            inner: self.inner.put_multipart_opts(path, opts).await?,
+            path: path.clone(),
+            faults: self.faults.clone(),
+        }))
     }
     async fn get_opts(&self, path: &Path, opts: GetOptions) -> object_store::Result<GetResult> {
         if !opts.head && path.as_ref().contains("/_versions/") {
@@ -423,5 +452,29 @@ impl ObjectStore for FaultStore {
                 }
             })
             .boxed()
+    }
+}
+
+#[derive(Debug)]
+struct IndexUpload {
+    inner: Box<dyn MultipartUpload>,
+    path: Path,
+    faults: Arc<Faults>,
+}
+
+#[async_trait::async_trait]
+impl MultipartUpload for IndexUpload {
+    fn put_part(&mut self, data: PutPayload) -> object_store::UploadPart {
+        self.inner.put_part(data)
+    }
+
+    async fn complete(&mut self) -> object_store::Result<PutResult> {
+        let result = self.inner.complete().await?;
+        self.faults.index_written(&self.path).await?;
+        Ok(result)
+    }
+
+    async fn abort(&mut self) -> object_store::Result<()> {
+        self.inner.abort().await
     }
 }
