@@ -102,7 +102,9 @@ async fn paused(restart: bool, status_index: bool) -> Result<()> {
     )
     .await?;
     let first = service.submit(&initial, Duration::from_secs(10)).await?;
-    let index_file = tokio::time::timeout(Duration::from_secs(10), entered).await??;
+    let index_file = tokio::time::timeout(Duration::from_secs(10), entered)
+        .await
+        .context("native index upload did not reach the pause")??;
     // The serial status path already retains its maintenance plan here. Verify
     // the initial data cut independently, then require the next updates to drain.
     let checkpoint = annotation_publication::state(&c).await?.progress.checkpoint;
@@ -159,7 +161,8 @@ async fn paused(restart: bool, status_index: bool) -> Result<()> {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
-    .await?;
+    .await
+    .context("orphan data file was not collected while the index upload was paused")?;
     let state = annotation_publication::state(&c).await?;
     assert!(
         state.progress.pending.is_none(),
@@ -218,7 +221,8 @@ async fn paused(restart: bool, status_index: bool) -> Result<()> {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
-    .await??;
+    .await
+    .context("index coverage did not catch up after the paused job ended")??;
     let value = service.get("T", Duration::from_secs(10)).await?.unwrap();
     assert_eq!(
         value.status.as_deref(),
@@ -227,6 +231,20 @@ async fn paused(restart: bool, status_index: bool) -> Result<()> {
     assert_eq!(value.score, Some(7.0));
     if status_index {
         let base = annotation_publication::read(&c, &storage, None).await?;
+        let old_index = local_index_file
+            .parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            base.load_indices()
+                .await?
+                .iter()
+                .all(|index| index.uuid.to_string() != old_index),
+            "the fully stale status result must never become selected"
+        );
         assert_eq!(
             base.count_rows(Some("status = 'accepted'".into())).await?,
             1
@@ -247,7 +265,14 @@ async fn paused(restart: bool, status_index: bool) -> Result<()> {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
-        .await?;
+        .await
+        .with_context(|| {
+            format!(
+                "unselected index file remained after catch-up: {}; reclamation: {:?}",
+                local_index_file.display(),
+                service.reclamation_observation()
+            )
+        })?;
     } else {
         assert!(
             local_index_file.exists(),
