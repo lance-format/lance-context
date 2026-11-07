@@ -117,9 +117,13 @@ async fn paused(restart: bool, status_index: bool) -> Result<()> {
         local_index_file.exists(),
         "pause follows a real native file upload"
     );
-    let source_version = annotation_publication::read(&c, &storage, None)
-        .await?
-        .version_id();
+    let (source_version, unchanged_fragment) = {
+        // The fixture seeds T and U in separate fragments. Only T is updated;
+        // the original status pages remain valid for U after rebasing.
+        let source = annotation_publication::read(&c, &storage, None).await?;
+        assert_eq!(source.fragments().len(), 2);
+        (source.version_id(), source.fragments()[1].id as u32)
+    };
     let orphan = directory
         .join("data")
         .join(format!("{}.lance", Uuid::new_v4()));
@@ -238,13 +242,28 @@ async fn paused(restart: bool, status_index: bool) -> Result<()> {
             .unwrap()
             .to_str()
             .unwrap();
-        assert!(
-            base.load_indices()
-                .await?
-                .iter()
-                .all(|index| index.uuid.to_string() != old_index),
-            "the fully stale status result must never become selected"
-        );
+        let indices = base.load_indices().await?;
+        let retained = indices
+            .iter()
+            .find(|index| index.uuid.to_string() == old_index);
+        if restart {
+            assert!(
+                retained.is_none(),
+                "a stopped owner's result cannot publish"
+            );
+        } else {
+            assert_eq!(
+                retained
+                    .expect("unchanged U must retain the original native pages")
+                    .fragment_bitmap
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>(),
+                vec![unchanged_fragment],
+                "the old segment must exclude every updated T fragment"
+            );
+        }
         assert_eq!(
             base.count_rows(Some("status = 'accepted'".into())).await?,
             1
@@ -253,13 +272,14 @@ async fn paused(restart: bool, status_index: bool) -> Result<()> {
             base.count_rows(Some("status = 'reviewed'".into())).await?,
             0
         );
+        assert_eq!(base.count_rows(Some("status = 'pending'".into())).await?, 1);
     }
     let (last, result) = last.unwrap();
     assert_eq!(
         service.submit(&last, Duration::from_secs(10)).await?,
         result
     );
-    if restart || status_index {
+    if restart {
         tokio::time::timeout(Duration::from_secs(10), async {
             while local_index_file.exists() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
