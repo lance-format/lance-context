@@ -33,6 +33,8 @@ pub(in crate::tests) enum Action {
 
 #[derive(Debug, Default)]
 pub(in crate::tests) struct Faults {
+    pub body_write_failure: std::sync::atomic::AtomicBool,
+    pub body_write_attempts: AtomicUsize,
     actions: Mutex<BTreeMap<Path, Action>>,
     pub calls: Mutex<Vec<Path>>,
     pub collection_starts: Mutex<Vec<tokio::time::Instant>>,
@@ -66,6 +68,19 @@ struct FailedListing {
 }
 
 impl Faults {
+    fn body_write(&self, path: &Path) -> object_store::Result<()> {
+        if path.as_ref().contains("/data/") {
+            self.body_write_attempts.fetch_add(1, Ordering::SeqCst);
+            if self.body_write_failure.load(Ordering::SeqCst) {
+                return Err(object_store::Error::Generic {
+                    store: "annotation-body-upload-test",
+                    source: std::io::Error::other("503 Service Unavailable: ServerBusy").into(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     pub fn pause_index_write(&self) -> (oneshot::Receiver<Path>, oneshot::Sender<()>) {
         let (entered, observed) = oneshot::channel();
         let (resume, waiting) = oneshot::channel();
@@ -287,6 +302,7 @@ impl ObjectStore for FaultStore {
         payload: PutPayload,
         opts: PutOptions,
     ) -> object_store::Result<PutResult> {
+        self.faults.body_write(path)?;
         let result = self.inner.put_opts(path, payload, opts).await?;
         self.faults.index_written(path).await?;
         Ok(result)
@@ -474,6 +490,9 @@ struct IndexUpload {
 #[async_trait::async_trait]
 impl MultipartUpload for IndexUpload {
     fn put_part(&mut self, data: PutPayload) -> object_store::UploadPart {
+        if let Err(error) = self.faults.body_write(&self.path) {
+            return Box::pin(async move { Err(error) });
+        }
         self.inner.put_part(data)
     }
 
