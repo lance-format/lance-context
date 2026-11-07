@@ -278,7 +278,7 @@ async fn annotation_collector_delayed_delete_survives_owner_takeover() -> Result
     assert!(
         reason.contains("fenced")
             || reason.contains("view is behind source closure")
-            || reason == "annotation preparation rejected: Publisher(Rejected(Authority))",
+            || reason == "materialization result rejected: Publisher(Rejected(Authority))",
         "{reason}"
     );
     assert!(!abandoned[0].exists());

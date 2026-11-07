@@ -239,27 +239,31 @@ pub(super) async fn prepare_action(
                 segments.iter().map(|i| i.uuid).collect(),
             ),
         };
-        let index = phases
-            .measure(Phase::BlobWrite, async {
-                match action {
-                    Action::Build(ids) | Action::BuildReplacingEmpty { fragments: ids, .. } => {
-                        dataset
-                            .create_index_builder(
-                                &[key.column()],
-                                IndexType::BTree,
-                                &ScalarIndexParams::default(),
-                            )
-                            .name(key.name().to_owned())
-                            .replace(true)
-                            .fragments(ids)
-                            .execute_uncommitted()
-                            .await
-                    }
-                    Action::Merge(segments) => {
-                        dataset.merge_existing_index_segments(segments).await
-                    }
+        let native_phase = match key {
+            Key::Session => Phase::NativeSessionIndex,
+            Key::Turn => Phase::NativeTurnIdIndex,
+            Key::Status => Phase::NativeStatusIndex,
+        };
+        let native = async {
+            match action {
+                Action::Build(ids) | Action::BuildReplacingEmpty { fragments: ids, .. } => {
+                    dataset
+                        .create_index_builder(
+                            &[key.column()],
+                            IndexType::BTree,
+                            &ScalarIndexParams::default(),
+                        )
+                        .name(key.name().to_owned())
+                        .replace(true)
+                        .fragments(ids)
+                        .execute_uncommitted()
+                        .await
                 }
-            })
+                Action::Merge(segments) => dataset.merge_existing_index_segments(segments).await,
+            }
+        };
+        let index = phases
+            .measure(Phase::BlobWrite, phases.measure(native_phase, native))
             .await?;
         validate_metadata(&dataset, &index, key)?;
         ensure!(

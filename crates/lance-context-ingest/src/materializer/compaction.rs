@@ -259,7 +259,10 @@ pub(super) async fn prepare(
     tokio::spawn(async move {
         let _reservation = reservation;
         let mut result = phases
-            .measure(Phase::BlobWrite, task.execute(&dataset))
+            .measure(
+                Phase::BlobWrite,
+                phases.measure(Phase::NativeCompaction, task.execute(&dataset)),
+            )
             .await?;
         if !indices.is_empty() {
             // The catalog fixes the read and target versions and fences other
@@ -328,7 +331,10 @@ pub(crate) async fn prepare_body_dataset(
     // No prepared output is deleted on an error or an ambiguous later commit.
     tokio::spawn(async move {
         let mut result = phases
-            .measure(Phase::BlobWrite, task.execute(&dataset))
+            .measure(
+                Phase::BlobWrite,
+                phases.measure(Phase::NativeBodyCompaction, task.execute(&dataset)),
+            )
             .await?;
         // The catalog fixes the read and target versions and fences other
         // writers. Persist real IDs now so bitmap maintenance sees the same
