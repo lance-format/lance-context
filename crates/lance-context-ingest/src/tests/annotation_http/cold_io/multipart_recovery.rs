@@ -117,6 +117,7 @@ async fn exercise() -> Result<()> {
     fixture::seed_with_binding(&c, &narrow, &body, large_binding()).await?;
     let base = annotation_publication::read(&c, &narrow, None).await?;
     let (a, runtime) = owner(&c, &narrow, &body).await?;
+    let (_, _, recovery_cut) = runtime.http_binding();
     let (stop, task) = annotation_runtime::run_owner(runtime);
     let mut failed_upload = gates.lose_put_reply();
 
@@ -197,7 +198,25 @@ async fn exercise() -> Result<()> {
     // The object exists but no native commit was attempted. Keep acknowledged
     // values readable until an explicit fenced restart resolves the old cut.
     assert!(!task.is_finished(), "lost upload reply stopped owned reads");
-    current_values(&a, false).await?;
+    for row in 0..ROWS {
+        let current = a
+            .get_owned(
+                &format!("large-{row}"),
+                recovery_cut,
+                Duration::from_secs(1),
+            )
+            .await?
+            .context("acknowledged annotation missing after upload error")?;
+        assert_eq!(
+            current.status.as_deref(),
+            Some(if row == 0 { "reviewed" } else { "pending" })
+        );
+        assert_eq!(current.score, (row == 0).then_some(0.9));
+        assert_eq!(
+            current.labels,
+            std::collections::BTreeSet::from(["imported".into()])
+        );
+    }
     assert!(a
         .phase_observation()
         .iter()
