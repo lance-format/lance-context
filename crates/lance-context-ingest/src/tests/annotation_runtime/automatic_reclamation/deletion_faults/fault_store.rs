@@ -41,7 +41,13 @@ pub(in crate::tests) struct Faults {
     pub data_listings: Mutex<Vec<Path>>,
     pub manifest_reads: AtomicUsize,
     remote: Mutex<Vec<tokio::task::JoinHandle<()>>>,
-    index_write: Mutex<Option<(oneshot::Sender<Path>, oneshot::Receiver<()>)>>,
+    index_write: Mutex<Option<PausedIndexWrite>>,
+}
+
+#[derive(Debug)]
+struct PausedIndexWrite {
+    entered: oneshot::Sender<Path>,
+    resume: oneshot::Receiver<()>,
 }
 
 #[derive(Debug)]
@@ -67,7 +73,10 @@ impl Faults {
             .index_write
             .lock()
             .unwrap()
-            .replace((entered, waiting))
+            .replace(PausedIndexWrite {
+                entered,
+                resume: waiting
+            })
             .is_none());
         (observed, resume)
     }
@@ -75,9 +84,9 @@ impl Faults {
     async fn index_written(&self, path: &Path) -> object_store::Result<()> {
         if path.as_ref().contains("/_indices/") {
             let pause = self.index_write.lock().unwrap().take();
-            if let Some((entered, resume)) = pause {
-                let _ = entered.send(path.clone());
-                resume.await.map_err(|_| failure())?;
+            if let Some(pause) = pause {
+                let _ = pause.entered.send(path.clone());
+                pause.resume.await.map_err(|_| failure())?;
             }
         }
         Ok(())

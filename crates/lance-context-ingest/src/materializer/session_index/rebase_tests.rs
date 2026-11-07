@@ -90,3 +90,24 @@ async fn id_rebase_rejects_status_result_even_when_rows_are_unchanged() -> Resul
     assert!(rebase_turn(&source, &source, &status).await.is_err());
     Ok(())
 }
+
+#[tokio::test]
+async fn id_rebase_rejects_competing_index_coverage() -> Result<()> {
+    use lance::dataset::{transaction::Transaction, CommitBuilder};
+    let root = tempfile::tempdir()?;
+    let uri = root.path().join("turns.lance");
+    let source = write(uri.to_str().unwrap(), "A", WriteMode::Create).await?;
+    let original = index(&source, Key::Turn).await?;
+    let competing = index(&source, Key::Turn).await?;
+    let operation = operation_for(&source, &competing, Key::Turn).await?;
+    let target = CommitBuilder::new(Arc::new(source.clone()))
+        .with_max_retries(0)
+        .with_skip_auto_cleanup(true)
+        .execute(Transaction::new_from_version(
+            source.version_id(),
+            operation,
+        ))
+        .await?;
+    assert!(rebase_turn(&source, &target, &original).await.is_err());
+    Ok(())
+}

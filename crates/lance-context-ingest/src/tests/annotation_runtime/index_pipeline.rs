@@ -176,6 +176,19 @@ async fn paused(restart: bool) -> Result<()> {
         service.submit(&last, Duration::from_secs(10)).await?,
         result
     );
+    if restart {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while local_index_file.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await?;
+    } else {
+        assert!(
+            local_index_file.exists(),
+            "selected index file was collected"
+        );
+    }
     assert_eq!(service.reclamation_observation().delete_failures, 0);
     stop.send(()).unwrap();
     task.await??;
