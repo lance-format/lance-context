@@ -1,4 +1,5 @@
 //! A real quorum commits Prepare, but its successful reply never reaches the owner.
+//! Confirm it in place when observable; preserve fenced recovery when it is not.
 use super::*;
 use std::sync::atomic::Ordering;
 
@@ -8,10 +9,16 @@ pub(in crate::tests) mod proxy;
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn annotation_unknown_prepare_preserves_acked_suffix_and_reuses_original_files() -> Result<()>
 {
-    tokio::time::timeout(Duration::from_secs(60), exercise()).await?
+    tokio::time::timeout(Duration::from_secs(60), exercise(false)).await?
 }
 
-async fn exercise() -> Result<()> {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn committed_unknown_prepare_keeps_owner_live_and_preserves_concurrent_updates() -> Result<()>
+{
+    tokio::time::timeout(Duration::from_secs(60), exercise(true)).await?
+}
+
+async fn exercise(confirm: bool) -> Result<()> {
     let mut builder = tempfile::Builder::new();
     builder.prefix("annotation-lost-prepare-");
     let root = if let Ok(parent) = std::env::var("INGEST_TEST_ARTIFACTS") {
@@ -37,10 +44,14 @@ async fn exercise() -> Result<()> {
     annotation_publication::seed_contract(&c, &storage, Service::contract(&binding(), &limits)?)
         .await?;
     let base = annotation_publication::read(&c, &storage, None).await?;
-    let proxy = proxy::Proxy::open(&c, root.path()).await?;
+    let proxy = if confirm {
+        proxy::Proxy::open_prepare(&c, root.path(), true, true).await?
+    } else {
+        proxy::Proxy::open(&c, root.path()).await?
+    };
     let direct = std::mem::replace(&mut c.client, proxy.client.clone());
     let (service, runtime) = owner(&c, &storage, &limits).await?;
-    let (_stop, task) = run_owner(runtime);
+    let (stop, task) = run_owner(runtime);
     let a = producer(&service, 1).await?;
     let b = producer(&service, 2).await?;
     let d = producer(&service, 3).await?;
@@ -103,10 +114,33 @@ async fn exercise() -> Result<()> {
     assert!(pending.plan.sources[&10].through < score_result.index.min(status_result.index));
 
     proxy.release.notify_one();
+    if confirm {
+        let through = score_result.index.max(status_result.index);
+        drained(&c, &service, through).await?;
+        assert!(!task.is_finished(), "confirmed Prepare stopped the owner");
+        assert_eq!(
+            service.get("T", Duration::from_secs(30)).await?.unwrap(),
+            current
+        );
+        let selected = annotation_publication::read(&c, &storage, Some(target)).await?;
+        assert_eq!(
+            selected.read_transaction().await?,
+            Some(expected_transaction),
+            "confirmation must reuse the original prepared files and transaction"
+        );
+        assert_eq!(proxy.dropped.load(Ordering::SeqCst), 1);
+        assert_eq!(proxy.blocked_reads.load(Ordering::SeqCst), 0);
+        stop.send(()).unwrap();
+        task.await??;
+        c.client = direct;
+        drop(proxy);
+        return c.shutdown().await;
+    }
     let error = tokio::time::timeout(Duration::from_secs(30), task)
         .await??
         .unwrap_err();
     assert_eq!(proxy.dropped.load(Ordering::SeqCst), 1);
+    assert_eq!(proxy.blocked_reads.load(Ordering::SeqCst), 1);
     let context = format!("{error:#}");
     assert!(
         context.contains("WAL RPC prepare") && context.contains("outcome unknown"),

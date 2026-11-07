@@ -106,20 +106,14 @@ impl Publisher {
             self.service.ingress.client.max_descriptor_bytes(),
         )
         .await?;
-        let reply = materializer::commit(
-            &self.service.ingress.client,
-            Command::Prepare(p::PrepareRequest {
+        self.catalog
+            .record_preparation(p::PrepareRequest {
                 authority: self.catalog.authority().clone(),
                 transaction: pending.plan.transaction,
                 plan_index: pending.index,
                 descriptors,
-            }),
-        )
-        .await?;
-        ensure!(
-            matches!(reply, Applied::Publisher(p::Reply::Prepared { .. })),
-            "body maintenance Prepare rejected: {reply:?}"
-        );
+            })
+            .await?;
         Ok(true)
     }
 }

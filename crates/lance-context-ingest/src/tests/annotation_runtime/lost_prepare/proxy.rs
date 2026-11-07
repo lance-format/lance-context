@@ -31,6 +31,8 @@ pub(in crate::tests) struct Proxy {
     pub client: Arc<Client>,
     pub dropped: Arc<AtomicUsize>,
     pub plans: Arc<AtomicUsize>,
+    pub prepares: Arc<AtomicUsize>,
+    pub blocked_reads: Arc<AtomicUsize>,
     pub advances: Arc<AtomicUsize>,
     pub appends: Arc<AtomicUsize>,
     pub closes: Arc<AtomicUsize>,
@@ -58,11 +60,23 @@ struct Frame {
 
 #[derive(Clone, Copy)]
 enum Point {
-    Prepare,
-    Append { execute: bool },
-    Close { execute: bool },
-    Plan { execute: bool },
-    Advance { execute: bool },
+    Prepare {
+        execute: bool,
+        observe: bool,
+        structured: bool,
+    },
+    Append {
+        execute: bool,
+    },
+    Close {
+        execute: bool,
+    },
+    Plan {
+        execute: bool,
+    },
+    Advance {
+        execute: bool,
+    },
 }
 impl Frame {
     async fn read(io: &mut (impl AsyncRead + Unpin), data: bool) -> Result<Option<Self>> {
@@ -136,10 +150,26 @@ impl Frame {
             codec().reject_trailing_bytes().deserialize(&self.meta)?;
         Ok(matches!(
             (point, command),
-            (Point::Prepare, Command::Prepare(_))
+            (Point::Prepare { .. }, Command::Prepare(_))
                 | (Point::Close { .. }, Command::Close(_))
                 | (Point::Plan { .. }, Command::Plan(_))
                 | (Point::Advance { .. }, Command::Advance(_))
+        ))
+    }
+    fn publisher_query(&self) -> Result<bool> {
+        let (_, kind): (WireScope, u32) = codec().allow_trailing_bytes().deserialize(&self.meta)?;
+        if kind != 2 {
+            return Ok(false);
+        }
+        let (_, _, _, query): (
+            WireScope,
+            u32,
+            u64,
+            lance_context_wal::replication::query::Query,
+        ) = codec().reject_trailing_bytes().deserialize(&self.meta)?;
+        Ok(matches!(
+            query,
+            lance_context_wal::replication::query::Query::Publisher { .. }
         ))
     }
     fn unknown_reply(&self) -> Result<Self> {
@@ -164,7 +194,7 @@ impl Frame {
                 Point::Append { .. },
                 Reply::Commit(Outcome::Committed(Applied::Accepted { .. }))
             ) | (
-                Point::Prepare,
+                Point::Prepare { .. },
                 Reply::Commit(Outcome::Committed(Applied::Publisher(
                     p::Reply::Prepared { .. }
                 )))
@@ -193,7 +223,34 @@ impl Proxy {
         Self::open_at(c, root, Point::Append { execute }).await
     }
     pub async fn open(c: &network::Cluster, root: &FsPath) -> Result<Self> {
-        Self::open_at(c, root, Point::Prepare).await
+        Self::open_at(
+            c,
+            root,
+            Point::Prepare {
+                execute: true,
+                observe: false,
+                structured: false,
+            },
+        )
+        .await
+    }
+
+    pub async fn open_prepare(
+        c: &network::Cluster,
+        root: &FsPath,
+        execute: bool,
+        observe: bool,
+    ) -> Result<Self> {
+        Self::open_at(
+            c,
+            root,
+            Point::Prepare {
+                execute,
+                observe,
+                structured: true,
+            },
+        )
+        .await
     }
 
     pub async fn open_close(c: &network::Cluster, root: &FsPath) -> Result<Self> {
@@ -248,6 +305,8 @@ impl Proxy {
         let armed = Arc::new(AtomicBool::new(true));
         let dropped = Arc::new(AtomicUsize::new(0));
         let plans = Arc::new(AtomicUsize::new(0));
+        let prepares = Arc::new(AtomicUsize::new(0));
+        let blocked_reads = Arc::new(AtomicUsize::new(0));
         let advances = Arc::new(AtomicUsize::new(0));
         let appends = Arc::new(AtomicUsize::new(0));
         let closes = Arc::new(AtomicUsize::new(0));
@@ -285,6 +344,8 @@ impl Proxy {
             let armed = armed.clone();
             let dropped = dropped.clone();
             let plans = plans.clone();
+            let prepares = prepares.clone();
+            let blocked_reads = blocked_reads.clone();
             let advances = advances.clone();
             let appends = appends.clone();
             let closes = closes.clone();
@@ -299,15 +360,34 @@ impl Proxy {
                             let (acceptor, connector, name, address, armed, dropped, committed, release) =
                                 (acceptor.clone(), connector.clone(), name.clone(), address.clone(), armed.clone(), dropped.clone(), committed.clone(), release.clone());
                             let plans = plans.clone();
+                            let prepares = prepares.clone();
+                            let blocked_reads = blocked_reads.clone();
                             let advances = advances.clone();
                             let appends = appends.clone();
                             let closes = closes.clone();
                             connections.spawn(async move {
                                 let mut downstream = acceptor.accept(socket).await?;
                                 let mut upstream = connector.connect(name, TcpStream::connect(address).await?).await?;
+                                let mut used = false;
                                 while let Some(mut request) = Frame::read(&mut downstream, matches!(point, Point::Append { .. })).await? {
                                     if matches!(point, Point::Append { .. }) { request.payload(&mut downstream, true).await?; }
+                                    if matches!(point, Point::Prepare { observe: false, .. }) && dropped.load(Ordering::SeqCst) > 0 && request.publisher_query()? && blocked_reads.load(Ordering::SeqCst) == 0 {
+                                        // A pooled read may reconnect once. Keep the fault armed
+                                        // until its fresh connection also fails, so one logical
+                                        // confirmation is unavailable even with a warm pool.
+                                        if !used { blocked_reads.store(1, Ordering::SeqCst); }
+                                        return Ok(());
+                                    }
+                                    used = true;
                                     let hold = request.matches_command(point)?;
+                                    if hold && matches!(point, Point::Prepare { .. }) {
+                                        prepares.fetch_add(1, Ordering::SeqCst);
+                                        if matches!(point, Point::Prepare { execute: false, .. }) && armed.swap(false, Ordering::SeqCst) {
+                                            dropped.fetch_add(1, Ordering::SeqCst);
+                                            request.unknown_reply()?.write(&mut downstream).await?;
+                                            continue;
+                                        }
+                                    }
                                     if hold && matches!(point, Point::Close { .. }) { closes.fetch_add(1, Ordering::SeqCst); }
                                     if hold && matches!(point, Point::Append { execute: false } | Point::Close { execute: false }) && armed.swap(false, Ordering::SeqCst) {
                                         committed.notify_one(); release.notified().await;
@@ -335,7 +415,7 @@ impl Proxy {
                                         committed.notify_one();
                                         release.notified().await;
                                         dropped.fetch_add(1, Ordering::SeqCst);
-                                        if matches!(point, Point::Plan { .. } | Point::Advance { .. } | Point::Append { .. }) {
+                                        if matches!(point, Point::Plan { .. } | Point::Advance { .. } | Point::Append { .. } | Point::Prepare { structured: true, .. }) {
                                             request.unknown_reply()?.write(&mut downstream).await?;
                                             continue;
                                         }
@@ -386,6 +466,8 @@ impl Proxy {
             )?),
             dropped,
             plans,
+            prepares,
+            blocked_reads,
             advances,
             appends,
             closes,
