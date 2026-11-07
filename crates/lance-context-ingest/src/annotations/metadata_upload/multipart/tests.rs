@@ -227,7 +227,8 @@ async fn multipart_throttle_preserves_part_ids_shared_bytes_and_completion_order
     let second_id = second_calls[0].block.as_ref().unwrap();
     assert_ne!(first_id, second_id);
     assert!(xml.find(first_id).unwrap() < xml.find(second_id).unwrap());
-    assert_eq!(xml.matches("<Uncommitted>").count(), 2);
+    // Preserve the pinned SDK's completion response-loss fix as well.
+    assert_eq!(xml.matches("<Latest>").count(), 2);
     assert_eq!(scope.observation().waiting_part_retries, 0);
     assert_eq!(scope.observation().part_retry_decisions, 4);
     assert_eq!(scope.observation().put_resubmissions, 0);
