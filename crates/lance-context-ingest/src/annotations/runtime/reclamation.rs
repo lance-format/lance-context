@@ -1,6 +1,6 @@
 //! Bounded file collection for an exclusively owned annotation table.
 //! Called only between publications in the same serial publisher loop. A pending
-//! listing response can span publications. One concurrent ID-index job protects
+//! listing response can span publications. One concurrent annotation index job protects
 //! its source and defers index-page collection; data collection can continue.
 //! Other native preparation remains serial. A successor fences the final catalog operation
 //! and opens its recovery base after acquisition.
@@ -366,7 +366,7 @@ impl Collector {
                         examined += 1;
                         (meta.location, meta.size)
                     };
-                    // This owner builds ID indexes only in the narrow table.
+                    // This owner builds annotation indexes only in the narrow table.
                     // Body index objects keep their existing retention behavior.
                     if !candidate(&path, &destination.base, service.ingress.scope.incarnation)
                         && !(body_storage.is_none()
