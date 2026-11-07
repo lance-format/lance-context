@@ -23,6 +23,8 @@ use crate::drain::ClientCancellation;
 use crate::error::AppError;
 use crate::state::AppState;
 
+mod write_diagnostics;
+
 /// Upper bound on a single rollout append request body (JSON or multipart).
 /// Artifact blobs routinely exceed axum's 2 MiB default, so the batch endpoint
 /// raises the ceiling well above it while still bounding memory.
@@ -356,7 +358,10 @@ pub async fn add_rollouts(
 
     observe_blob_sizes(&state, &name, &records);
 
-    let store_lock = state.get_or_open_rollout_store(&name).await?;
+    let store_lock = state
+        .get_or_open_rollout_store(&name)
+        .await
+        .inspect_err(|error| write_diagnostics::open(&name, error))?;
 
     let ids: Vec<String> = records.iter().map(|r| r.id.clone()).collect();
     let core_records: Vec<RolloutRecord> = records.into_iter().map(RolloutRecord::from).collect();
@@ -382,13 +387,18 @@ pub async fn add_rollouts(
     let version = store
         .add(&core_records)
         .await
+        .inspect_err(|error| write_diagnostics::lance(&name, "append", error))
         .map_err(AppError::from_lance)?;
 
     // Opt-in read-your-write: seal the memtable so the rows just appended are
     // readable by the time this responds. Still the read lock — `flush` is
     // `&self`, and concurrent appends are safe against it.
     if flush {
-        store.flush().await.map_err(AppError::from_lance)?;
+        store
+            .flush()
+            .await
+            .inspect_err(|error| write_diagnostics::lance(&name, "flush", error))
+            .map_err(AppError::from_lance)?;
         metrics::counter!("rollout_appends_flushed_total").increment(1);
     }
 
