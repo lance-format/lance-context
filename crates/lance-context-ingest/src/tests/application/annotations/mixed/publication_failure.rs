@@ -1,4 +1,4 @@
-//! A real filesystem error stops the executable owner before catalog Prepare.
+//! A real filesystem error pauses publication before catalog Prepare.
 use super::*;
 use std::{fs::Permissions, os::unix::fs::PermissionsExt, path::PathBuf};
 
@@ -91,13 +91,24 @@ pub(super) async fn fail(
             None
         }
     };
-    failed(owner).await?;
-    assert_eq!(owner.0.try_wait()?.unwrap().code(), Some(1));
-    let log = std::fs::read_to_string(root.join("owner.log"))?;
-    ensure!(
-        log.contains("Permission denied"),
-        "owner failed for another reason: {log}"
-    );
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            ensure!(
+                owner.0.try_wait()?.is_none(),
+                "owner exited on body write failure"
+            );
+            let log = std::fs::read_to_string(root.join("owner.log"))?;
+            if log.contains("annotation publication paused until fenced restart") {
+                ensure!(
+                    log.contains("Permission denied"),
+                    "unexpected failure: {log}"
+                );
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
     let failed = annotation_publication::state(c).await?;
     assert_eq!(failed.authority, before.authority);
     assert_eq!(failed.manifests, before.manifests);
