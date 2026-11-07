@@ -8,6 +8,7 @@ fn policy() -> Policy {
         max_silence: Duration::from_millis(300),
         stale_after: Duration::from_millis(700),
         poll: Duration::from_millis(10),
+        initial_registration_retry: false,
     }
 }
 
@@ -21,6 +22,10 @@ enum Fault {
     LateRetryAcknowledgement,
     ExpiredFirstFailure,
     InitialFailure,
+    InitialTimeoutOnce,
+    InitialErrorOnce,
+    InitialAlwaysTimeout,
+    InitialLateRetryAcknowledgement,
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -70,6 +75,8 @@ struct FaultyRenewal {
     renewals: AtomicUsize,
     attempted: tokio::sync::Notify,
     renewed: tokio::sync::Notify,
+    initial_attempted: tokio::sync::Notify,
+    registration_paths: Mutex<Vec<Path>>,
 }
 
 impl std::fmt::Display for FaultyRenewal {
@@ -114,11 +121,41 @@ impl object_store::ObjectStore for FaultyRenewal {
                 }
                 _ => {}
             }
-        } else if matches!(self.fault, Fault::InitialFailure) {
-            return Err(object_store::Error::Generic {
-                store: "injected registration",
-                source: "initial PUT failure".into(),
-            });
+        } else {
+            let attempt = {
+                let mut paths = self.registration_paths.lock().unwrap();
+                paths.push(path.clone());
+                paths.len()
+            };
+            self.initial_attempted.notify_one();
+            if matches!(self.fault, Fault::InitialFailure) {
+                return Err(object_store::Error::Generic {
+                    store: "injected registration",
+                    source: "initial PUT failure".into(),
+                });
+            }
+            match (self.fault, attempt) {
+                (Fault::InitialTimeoutOnce | Fault::InitialLateRetryAcknowledgement, 1)
+                | (Fault::InitialAlwaysTimeout, _) => {
+                    // Acceptance is real but its acknowledgement never arrives.
+                    self.inner.put_opts(path, payload, options).await?;
+                    return std::future::pending().await;
+                }
+                (Fault::InitialErrorOnce, 1) => {
+                    self.inner.put_opts(path, payload, options).await?;
+                    return Err(object_store::Error::Generic {
+                        store: "injected ambiguous registration",
+                        source: "reply lost after acceptance".into(),
+                    });
+                }
+                (Fault::InitialLateRetryAcknowledgement, 2) => {
+                    let result = self.inner.put_opts(path, payload, options).await?;
+                    std::thread::sleep(policy().stale_after);
+                    self.inner.delete(path).await?;
+                    return Ok(result);
+                }
+                _ => {}
+            }
         }
         let result = self.inner.put_opts(path, payload, options).await?;
         if renewal {
@@ -187,15 +224,137 @@ async fn fixture(
         .await
         .unwrap();
     let faulty = Arc::new(FaultyRenewal {
-        inner: store.inner.clone(),
+        // This fault must return a ready acknowledgement in the very poll
+        // that resumes after the pause. A local-filesystem delete can yield
+        // there and exercise the ordinary timeout instead of a late ACK.
+        inner: if matches!(fault, Fault::InitialLateRetryAcknowledgement) {
+            Arc::new(object_store::memory::InMemory::new())
+        } else {
+            store.inner.clone()
+        },
         fault,
         renewals: AtomicUsize::new(0),
         attempted: tokio::sync::Notify::new(),
         renewed: tokio::sync::Notify::new(),
+        initial_attempted: tokio::sync::Notify::new(),
+        registration_paths: Mutex::new(Vec::new()),
     });
     let mut wrapped = store.as_ref().clone();
     wrapped.inner = faulty.clone();
     (dir, Arc::new(wrapped), root, faulty)
+}
+
+async fn registrations_cleaned(store: &ObjectStore, root: &Path) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !captured_readers(store, root).await.unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn initial_registration_retry_uses_a_fresh_key_before_polling_the_read() {
+    for fault in [Fault::InitialTimeoutOnce, Fault::InitialErrorOnce] {
+        let (_dir, store, root, faulty) = fixture(fault).await;
+        let reads = AtomicUsize::new(0);
+        let result = protect(
+            store.clone(),
+            &root,
+            policy().with_initial_registration_retry(true),
+            async {
+                reads.fetch_add(1, Ordering::SeqCst);
+                let paths = faulty.registration_paths.lock().unwrap().clone();
+                assert_eq!(paths.len(), 2);
+                assert_ne!(paths[0], paths[1]);
+                // The read starts with the successful retry's real publication.
+                store.inner.head(&paths[1]).await.unwrap();
+                Ok(42)
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        registrations_cleaned(&store, &root).await;
+    }
+}
+
+#[tokio::test]
+async fn two_ambiguous_initial_timeouts_are_bounded_and_never_poll_the_read() {
+    let (_dir, store, root, faulty) = fixture(Fault::InitialAlwaysTimeout).await;
+    let reads = AtomicUsize::new(0);
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        protect(
+            store.clone(),
+            &root,
+            policy().with_initial_registration_retry(true),
+            async {
+                reads.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(result.unwrap_err().to_string().contains("timed out"));
+    assert_eq!(faulty.registration_paths.lock().unwrap().len(), 2);
+    assert_eq!(reads.load(Ordering::SeqCst), 0);
+    registrations_cleaned(&store, &root).await;
+}
+
+#[tokio::test]
+async fn late_initial_retry_acknowledgement_cannot_authorize_the_read() {
+    let (_dir, store, root, faulty) = fixture(Fault::InitialLateRetryAcknowledgement).await;
+    let reads = AtomicUsize::new(0);
+    let result = protect(
+        store.clone(),
+        &root,
+        policy().with_initial_registration_retry(true),
+        async {
+            reads.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        },
+    )
+    .await;
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("acknowledgement expired"));
+    assert_eq!(faulty.registration_paths.lock().unwrap().len(), 2);
+    assert_eq!(reads.load(Ordering::SeqCst), 0);
+    registrations_cleaned(&store, &root).await;
+}
+
+#[tokio::test]
+async fn cancelling_initial_publication_cleans_up_without_retrying_or_reading() {
+    let (_dir, store, root, faulty) = fixture(Fault::InitialAlwaysTimeout).await;
+    let reads = Arc::new(AtomicUsize::new(0));
+    let task = tokio::spawn({
+        let store = store.clone();
+        let root = root.clone();
+        let reads = reads.clone();
+        async move {
+            protect(
+                store,
+                &root,
+                policy().with_initial_registration_retry(true),
+                async {
+                    reads.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await
+        }
+    });
+    faulty.initial_attempted.notified().await;
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    registrations_cleaned(&store, &root).await;
+    tokio::time::sleep(policy().operation_timeout * 3).await;
+    assert_eq!(faulty.registration_paths.lock().unwrap().len(), 1);
+    assert_eq!(reads.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

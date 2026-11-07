@@ -209,9 +209,10 @@ pub async fn create_rollout_store(
         session: state.rollout_session.clone(),
     };
 
-    let store = RolloutStore::open_with_options(&uri, options)
+    let mut store = RolloutStore::open_with_options(&uri, options)
         .await
         .map_err(AppError::from_lance)?;
+    store.enable_wal_reader_registration_retry();
     let version = store.version();
 
     let store = Arc::new(RwLock::new(store));

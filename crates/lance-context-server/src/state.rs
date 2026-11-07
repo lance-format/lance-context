@@ -659,10 +659,11 @@ impl AppState {
 
         // Load from storage WITHOUT holding the LRU lock, so a slow open does
         // not block other stores' requests.
-        let opened =
+        let mut opened =
             RolloutStore::open_existing_with_options(&entry.uri, self.rollout_store_options())
                 .await
                 .map_err(AppError::from_lance)?;
+        opened.enable_wal_reader_registration_retry();
         let opened = Arc::new(RwLock::new(opened));
         // Reject a removal or replacement observed during this open. This is
         // not a distributed lease: cached handles still need lifecycle fencing.

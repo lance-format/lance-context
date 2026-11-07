@@ -575,6 +575,13 @@ impl RolloutStore {
         self.base.uri()
     }
 
+    /// Retry an initial WAL reader registration once before capturing any WAL.
+    /// Serving layers may opt in to tolerate one transient storage failure;
+    /// existing readers' lease deadlines and payload reads are unchanged.
+    pub fn enable_wal_reader_registration_retry(&mut self) {
+        self.base.wal_registration_retry = true;
+    }
+
     /// Current dataset version.
     #[must_use]
     pub fn version(&self) -> u64 {

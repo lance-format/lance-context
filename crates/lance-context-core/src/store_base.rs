@@ -491,6 +491,8 @@ pub(crate) struct StorageBase {
     /// Enabled in both rollout phases. Only regression tests disable this to
     /// reproduce an old, unregistered reader.
     pub(crate) wal_read_protection: bool,
+    /// Explicit serving-layer opt-in; other core consumers retain one attempt.
+    pub(crate) wal_registration_retry: bool,
     pub(crate) wal_collection: crate::wal_gc::Mode,
     #[cfg(test)]
     pub(crate) wal_snapshot_pause:
@@ -651,6 +653,7 @@ impl StorageBase {
                 .unwrap_or(DEFAULT_PENDING_GENERATIONS_MAX),
             merge_budget,
             wal_read_protection: true,
+            wal_registration_retry: false,
             wal_collection: crate::wal_gc::Mode::configured()?,
             #[cfg(test)]
             wal_snapshot_pause: std::sync::Mutex::new(None),
@@ -2728,7 +2731,8 @@ impl StorageBase {
             crate::wal_read_lifetime::protect(
                 self.dataset.object_store(None).await?,
                 &self.dataset.branch_location().path,
-                crate::wal_read_lifetime::Policy::default(),
+                crate::wal_read_lifetime::Policy::default()
+                    .with_initial_registration_retry(self.wal_registration_retry),
                 operation,
             )
             .await

@@ -149,6 +149,7 @@ pub(crate) struct Policy {
     max_silence: Duration,
     stale_after: Duration,
     poll: Duration,
+    initial_registration_retry: bool,
 }
 
 impl Default for Policy {
@@ -159,7 +160,15 @@ impl Default for Policy {
             max_silence: Duration::from_secs(15),
             stale_after: Duration::from_secs(45),
             poll: Duration::from_secs(2),
+            initial_registration_retry: false,
         }
+    }
+}
+
+impl Policy {
+    pub(crate) fn with_initial_registration_retry(mut self, enabled: bool) -> Self {
+        self.initial_registration_retry = enabled;
+        self
     }
 }
 
@@ -286,6 +295,74 @@ impl Drop for RenewalTask {
     }
 }
 
+async fn register_reader(
+    store: Arc<ObjectStore>,
+    root: &Path,
+    policy: Policy,
+) -> lance::Result<(Arc<Registration>, Instant)> {
+    let backoff = policy.heartbeat.min(Duration::from_millis(250));
+    let attempts = if policy.initial_registration_retry {
+        2
+    } else {
+        1
+    };
+    let deadline = Instant::now() + policy.operation_timeout * attempts + backoff * (attempts - 1);
+    for attempt in 0..attempts {
+        // A timed-out PUT may still publish remotely. Each attempt owns a
+        // different key and installs cleanup before PUT, so delayed cleanup or
+        // publication of the abandoned attempt cannot invalidate the new one.
+        let registration = Arc::new(Registration {
+            store: store.clone(),
+            path: readers_root(root).join(uuid::Uuid::new_v4().simple().to_string()),
+            timeout: policy.operation_timeout,
+        });
+        let publication_started = Instant::now();
+        let timeout = policy
+            .operation_timeout
+            .min(deadline.saturating_duration_since(publication_started));
+        if timeout.is_zero() {
+            return Err(lance::Error::io("WAL reader registration deadline expired"));
+        }
+        let phase = if attempt == 0 {
+            "registration"
+        } else {
+            "registration_retry"
+        };
+        let result = reader_publication(
+            timeout,
+            phase,
+            publication_started,
+            write_nonce(&registration.store, &registration.path, true),
+        )
+        .await;
+        if let Err(error) = result {
+            drop(registration);
+            if attempt + 1 == attempts
+                || deadline.saturating_duration_since(Instant::now()) <= backoff
+            {
+                return Err(error);
+            }
+            tokio::time::sleep(backoff).await;
+            continue;
+        }
+        // A runtime paused after remote acceptance can poll ready success
+        // after the timeout. Never capture WAL using that expired lease.
+        if publication_started.elapsed() >= timeout {
+            reader_failure(
+                phase,
+                "acknowledgement_expired",
+                publication_started,
+                publication_started,
+            );
+            return Err(lance::Error::io(
+                "WAL reader registration acknowledgement expired",
+            ));
+        }
+        return Ok((registration, publication_started));
+    }
+    unreachable!("at least one registration attempt")
+}
+
 pub(crate) async fn protect<T>(
     store: Arc<ObjectStore>,
     root: &Path,
@@ -293,37 +370,10 @@ pub(crate) async fn protect<T>(
     read: impl Future<Output = lance::Result<T>>,
 ) -> lance::Result<T> {
     assert!(policy.stale_after > policy.max_silence + policy.operation_timeout);
-    let path = readers_root(root).join(uuid::Uuid::new_v4().simple().to_string());
-    // Install cleanup before PUT: a timeout is an ambiguous publication, not
-    // proof that the registration was never stored.
-    let registration = Arc::new(Registration {
-        store,
-        path,
-        timeout: policy.operation_timeout,
-    });
-    let publication_started = Instant::now();
-    reader_publication(
-        policy.operation_timeout,
-        "registration",
-        publication_started,
-        write_nonce(&registration.store, &registration.path, true),
-    )
-    .await?;
-    // Timeout polls the operation first: a runtime paused after remote PUT
-    // acceptance can receive a ready success after the timeout has elapsed.
-    // The registration may already have expired elsewhere. Never restart its
-    // lease clock or begin capturing WAL from that late acknowledgement.
-    if publication_started.elapsed() >= policy.operation_timeout {
-        reader_failure(
-            "registration",
-            "acknowledgement_expired",
-            publication_started,
-            publication_started,
-        );
-        return Err(lance::Error::io(
-            "WAL reader registration acknowledgement expired",
-        ));
-    }
+    // The read future (including WAL capture) stays unpolled until registration
+    // succeeds. Retrying publication never retries business reads or extends a
+    // previously acknowledged reader's lease.
+    let (registration, publication_started) = register_reader(store, root, policy).await?;
     let acknowledged = Arc::new(Mutex::new(publication_started));
     let renewal_acknowledged = acknowledged.clone();
     let renewal_registration = registration.clone();
@@ -782,6 +832,7 @@ mod tests {
             max_silence: Duration::from_millis(300),
             stale_after: Duration::from_millis(700),
             poll: Duration::from_millis(10),
+            initial_registration_retry: false,
         }
     }
 
@@ -859,6 +910,7 @@ mod tests {
             max_silence: Duration::from_millis(30),
             stale_after: Duration::from_millis(60),
             poll: Duration::from_millis(5),
+            initial_registration_retry: false,
         };
         let listing = store.inner.list(Some(&readers_root(&root)));
         tokio::time::timeout(
