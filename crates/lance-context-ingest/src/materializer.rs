@@ -470,9 +470,21 @@ impl Publisher {
     }
 
     pub(crate) async fn has_ready_annotation_maintenance_work(&self, version: u64) -> Result<bool> {
-        Ok(turn_id_index::has_work(self, version).await?
-            || status_index::has_batched_work(self, version).await?
-            || compaction::has_work(self, version).await?)
+        // Match maintenance_plan's selected work. A ready ID build or rewrite
+        // cannot admit a smaller status build that would run ahead of it.
+        if Self::compaction_first(version) && compaction::has_work(self, version).await? {
+            return Ok(true);
+        }
+        if Self::status_index_first(version) && status_index::has_work(self, version).await? {
+            return status_index::has_batched_work(self, version).await;
+        }
+        if turn_id_index::has_work(self, version).await? {
+            return Ok(true);
+        }
+        if status_index::has_work(self, version).await? {
+            return status_index::has_batched_work(self, version).await;
+        }
+        compaction::has_work(self, version).await
     }
 
     pub(crate) fn compaction_first(read_version: u64) -> bool {

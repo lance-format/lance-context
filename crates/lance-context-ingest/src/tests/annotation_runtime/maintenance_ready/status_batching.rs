@@ -2,15 +2,20 @@ use super::*;
 
 #[tokio::test]
 async fn ready_updates_defer_small_status_build_then_idle_tail_catches_up() -> Result<()> {
-    scenario(3, false).await
+    scenario(3, false, false).await
 }
 
 #[tokio::test]
 async fn status_tail_at_threshold_advances_despite_ready_updates() -> Result<()> {
-    scenario(2, true).await
+    scenario(2, true, false).await
 }
 
-async fn scenario(min_rows: usize, expect_maintenance: bool) -> Result<()> {
+#[tokio::test]
+async fn ready_id_work_does_not_admit_a_small_preferred_status_build() -> Result<()> {
+    scenario(3, false, true).await
+}
+
+async fn scenario(min_rows: usize, expect_maintenance: bool, competing_id: bool) -> Result<()> {
     let root = tempfile::tempdir()?;
     let c = network::Cluster::open_signed(root.path(), annotation_publication::one_shard()).await?;
     let storage = Storage::resolve(
@@ -27,36 +32,47 @@ async fn scenario(min_rows: usize, expect_maintenance: bool) -> Result<()> {
     };
     annotation_publication::seed_contract(&c, &storage, Service::contract(&binding(), &limits)?)
         .await?;
-    let state = annotation_publication::state(&c).await?;
-    let (service, mut runtime) = Runtime::connect(
-        c.client.clone(),
-        annotation_publication::one_shard(),
-        binding(),
-        storage.clone(),
-        Configuration {
-            limits: limits.clone(),
-            upload_budget: MergeMemoryBudget::new(8 << 20),
-            apply_budget: MergeMemoryBudget::new(8 << 20),
-            publication_budget: MergeMemoryBudget::new(512 << 20),
-            publication: Options {
-                max_source_bytes: 1 << 20,
-                min_source_bytes: 1,
-                max_records: 1,
-                max_batch_wait: Duration::from_secs(5),
-                status_index: Some(crate::materializer::StatusIndex {
-                    min_rows,
-                    ..Default::default()
-                }),
+    let configuration = |indexing: bool| Configuration {
+        limits: limits.clone(),
+        upload_budget: MergeMemoryBudget::new(8 << 20),
+        apply_budget: MergeMemoryBudget::new(8 << 20),
+        publication_budget: MergeMemoryBudget::new(512 << 20),
+        publication: Options {
+            max_source_bytes: 1 << 20,
+            min_source_bytes: 1,
+            max_records: 1,
+            max_batch_wait: Duration::from_secs(5),
+            turn_id_index: (indexing && competing_id)
+                .then_some(crate::materializer::TurnIdIndex { min_rows: 1 }),
+            status_index: indexing.then_some(crate::materializer::StatusIndex {
+                min_rows,
                 ..Default::default()
-            },
+            }),
+            ..Default::default()
         },
-        Acquisition {
-            owner: Uuid::new_v4(),
-            request: Uuid::new_v4(),
-            expected_epoch: state.authority.epoch,
-        },
-    )
-    .await?;
+    };
+    if competing_id {
+        // Start at a durable version that prefers status work, with neither
+        // index installed. Each warm-up is a real RF3 update and publication.
+        let (service, mut runtime) = connect_owner(&c, &storage, configuration(false)).await?;
+        let producer = producer(&service, 2).await?;
+        for sequence in 1..=3 {
+            let completed = apply(
+                &mut runtime,
+                &service,
+                &producer,
+                sequence,
+                wire(&limits, &["T"], 0, None, 1, Some(sequence as f32))?,
+            )
+            .await?;
+            runtime.publish_once_for_test().await?;
+            assert_eq!(service.observation().await.0.materialized, completed.index);
+        }
+        let base = annotation_publication::read(&c, &storage, None).await?;
+        assert_eq!(base.version_id(), 4);
+        assert!(base.load_indices().await?.is_empty());
+    }
+    let (service, mut runtime) = connect_owner(&c, &storage, configuration(true)).await?;
     let producer = producer(&service, 1).await?;
     let first = apply(
         &mut runtime,
@@ -107,15 +123,20 @@ async fn scenario(min_rows: usize, expect_maintenance: bool) -> Result<()> {
         loop {
             let base = annotation_publication::read(&c, &storage, None).await?;
             let indices = base.load_indices().await?;
-            let covered: BTreeSet<_> = indices
-                .iter()
-                .filter(|i| i.name == "lance_context_annotation_status")
-                .flat_map(|i| i.fragment_bitmap.as_ref().unwrap().iter())
-                .collect();
-            if base
-                .fragments()
-                .iter()
-                .all(|f| covered.contains(&(f.id as u32)))
+            let complete = ["lance_context_annotation_status", "lance_context_turn_id"]
+                .into_iter()
+                .filter(|name| competing_id || *name == "lance_context_annotation_status")
+                .all(|name| {
+                    let covered: BTreeSet<_> = indices
+                        .iter()
+                        .filter(|i| i.name == name)
+                        .flat_map(|i| i.fragment_bitmap.as_ref().unwrap().iter())
+                        .collect();
+                    base.fragments()
+                        .iter()
+                        .all(|f| covered.contains(&(f.id as u32)))
+                });
+            if complete
                 && annotation_publication::state(&c)
                     .await?
                     .progress
@@ -131,4 +152,25 @@ async fn scenario(min_rows: usize, expect_maintenance: bool) -> Result<()> {
     stop.send(()).unwrap();
     task.await??;
     c.shutdown().await
+}
+
+async fn connect_owner(
+    c: &network::Cluster,
+    storage: &Storage,
+    configuration: Configuration,
+) -> Result<(Service, Runtime)> {
+    let state = annotation_publication::state(c).await?;
+    Runtime::connect(
+        c.client.clone(),
+        annotation_publication::one_shard(),
+        binding(),
+        storage.clone(),
+        configuration,
+        Acquisition {
+            owner: Uuid::new_v4(),
+            request: Uuid::new_v4(),
+            expected_epoch: state.authority.epoch,
+        },
+    )
+    .await
 }

@@ -98,12 +98,20 @@ impl Publisher {
             if self.compaction_checked_version == Some(view.progress.minimum_read_version) {
                 return Ok(false);
             }
+            let body_preferred = !self
+                .prefer_annotation_index(view.progress.minimum_read_version)
+                .await?
+                && self
+                    .body_compaction_candidate(view.progress.minimum_read_version)
+                    .await?
+                    .is_some();
             // A small status-only build should not force another publication
             // ahead of a ready data batch. Bound the unindexed tail, preserve
             // ID indexing and both tables' compaction, and catch up when idle.
             // This is a scheduling deferral, not a cached no-work decision.
             // Retained plans bypass it and resolve their original preparation.
             if self.options.status_index.is_some()
+                && !body_preferred
                 && source.records != 0
                 && (source.bytes >= self.options.min_source_bytes as u64
                     || source.records >= self.options.max_records
@@ -112,20 +120,9 @@ impl Publisher {
                     .catalog
                     .has_ready_annotation_maintenance_work(view.progress.minimum_read_version)
                     .await?
-                && self
-                    .body_compaction_candidate(view.progress.minimum_read_version)
-                    .await?
-                    .is_none()
             {
                 return Ok(false);
             }
-            let body_preferred = !self
-                .prefer_annotation_index(view.progress.minimum_read_version)
-                .await?
-                && self
-                    .body_compaction_candidate(view.progress.minimum_read_version)
-                    .await?
-                    .is_some();
             let plan = if body_preferred {
                 Some(p::Plan {
                     transaction: Uuid::new_v4(),
