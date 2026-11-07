@@ -159,14 +159,29 @@ struct UploadStore {
 
 impl std::fmt::Display for UploadStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("owner immutable metadata uploads")
+        f.write_str("owner immutable file uploads")
     }
 }
 
-fn immutable_metadata(base: &Path, path: &Path) -> bool {
+fn immutable_file(base: &Path, path: &Path) -> bool {
     let Some(relative) = path.as_ref().strip_prefix(&format!("{base}/")) else {
         return false;
     };
+    if let Some(name) = relative.strip_prefix("data/") {
+        // Lance 13 gives each native data file a fresh UUID: the first three
+        // bytes are 24 binary digits, followed by 26 lowercase hex digits.
+        // Small files use one PUT, so they need the same lifetime as metadata.
+        // Exclude caller-named files and nested paths; keep the exact original
+        // payload and options until this upload succeeds or its owner stops.
+        return name.strip_suffix(".lance").is_some_and(|stem| {
+            let bytes = stem.as_bytes();
+            bytes.len() == 50
+                && bytes[..24].iter().all(|b| matches!(b, b'0' | b'1'))
+                && bytes[24..]
+                    .iter()
+                    .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
+        });
+    }
     if let Some(name) = relative.strip_prefix("_versions/") {
         // ManagedManifest gives each attempt its own UUID-suffixed object.
         // Exclude native version paths, latest pointers, and nested paths.
@@ -225,7 +240,7 @@ impl ObjectStore for UploadStore {
     ) -> object_store::Result<PutResult> {
         if !self.enabled.load(Ordering::Acquire)
             || !matches!(opts.mode, PutMode::Overwrite)
-            || !immutable_metadata(&self.base, path)
+            || !immutable_file(&self.base, path)
         {
             return self.inner.put_opts(path, payload, opts).await;
         }

@@ -3,11 +3,22 @@ use std::sync::atomic::Ordering;
 
 #[tokio::test]
 async fn metadata_upload_throttle_keeps_acks_readable_bounds_staging_and_drains() -> Result<()> {
+    throttle_and_drain(false).await
+}
+
+#[tokio::test]
+async fn data_upload_throttle_keeps_acks_readable_bounds_staging_and_drains() -> Result<()> {
+    throttle_and_drain(true).await
+}
+
+async fn throttle_and_drain(only_data: bool) -> Result<()> {
     let root = tempfile::tempdir()?;
     let c = network::Cluster::open_signed(root.path(), annotation_publication::one_shard()).await?;
-    let (storage, scope, fault) =
-        crate::annotations::metadata_upload::tests::local_storage(&root.path().join("turns.lance"))
-            .await?;
+    let (storage, scope, fault) = crate::annotations::metadata_upload::tests::local_storage(
+        &root.path().join("turns.lance"),
+        only_data,
+    )
+    .await?;
     let limits = Limits {
         retained_bytes: 256 << 10,
         retained_entries: 128,
@@ -80,6 +91,9 @@ async fn metadata_upload_throttle_keeps_acks_readable_bounds_staging_and_drains(
     {
         let calls = fault.calls.lock().unwrap();
         let attempted = calls.last().unwrap();
+        if only_data {
+            assert!(attempted.0.as_ref().contains("/data/"));
+        }
         let repeats: Vec<_> = calls
             .iter()
             .filter(|(path, _)| path == &attempted.0)

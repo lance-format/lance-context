@@ -58,7 +58,8 @@ async fn metadata_upload_classifies_real_sdk_status_without_matching_uri_text() 
 pub(crate) struct FaultStore {
     inner: Arc<dyn ObjectStore>,
     pub(crate) blocked: AtomicBool,
-    only_metadata: Option<Path>,
+    only_owned: Option<Path>,
+    only_data: bool,
     after_write: bool,
     message: &'static str,
     pub(crate) calls: Mutex<Vec<(Path, Vec<Bytes>)>>,
@@ -75,7 +76,8 @@ fn fixture(after_write: bool, message: &'static str) -> (Scope, Arc<UploadStore>
     let inner = Arc::new(FaultStore {
         inner: Arc::new(InMemory::new()),
         blocked: AtomicBool::new(true),
-        only_metadata: None,
+        only_owned: None,
+        only_data: false,
         after_write,
         message,
         calls: Mutex::new(Vec::new()),
@@ -99,18 +101,29 @@ fn fixture(after_write: bool, message: &'static str) -> (Scope, Arc<UploadStore>
     (scope, store, inner)
 }
 
+fn data_file() -> Path {
+    Path::from(format!(
+        "table/data/000000000000000000000000{}.lance",
+        &Uuid::new_v4().simple().to_string()[6..]
+    ))
+}
+
 fn manifest() -> Path {
     Path::from(format!("table/_versions/2.manifest-{}", Uuid::new_v4()))
 }
 
 #[tokio::test]
 async fn metadata_upload_reuses_original_buffers_and_path_after_503() -> Result<()> {
-    for after_write in [false, true] {
+    for (after_write, path) in [
+        (false, manifest()),
+        (true, manifest()),
+        (false, data_file()),
+        (true, data_file()),
+    ] {
         let (scope, store, fault) = fixture(
             after_write,
             "Server returned non-2xx status code: 503 Service Unavailable",
         );
-        let path = manifest();
         let parts = [Bytes::from(vec![1; 8192]), Bytes::from(vec![2; 4096])];
         let payload = parts.iter().cloned().collect::<PutPayload>();
         let uploading = {
@@ -151,7 +164,7 @@ async fn metadata_upload_owner_drop_cancels_wait_without_another_put() -> Result
     );
     let uploading = tokio::spawn(async move {
         store
-            .put(&manifest(), Bytes::from_static(b"manifest").into())
+            .put(&data_file(), Bytes::from_static(b"manifest").into())
             .await
     });
     fault.entered.notified().await;
@@ -187,6 +200,7 @@ async fn metadata_upload_does_not_repeat_non_throttles_or_other_operations() -> 
     );
     for (path, mode) in [
         (manifest(), PutMode::Create),
+        (data_file(), PutMode::Create),
         (Path::from("table/data/body.lance"), PutMode::Overwrite),
         (Path::from("table/_versions/2.manifest"), PutMode::Overwrite),
         (
@@ -206,15 +220,16 @@ async fn metadata_upload_does_not_repeat_non_throttles_or_other_operations() -> 
             .await
             .is_err());
     }
-    assert_eq!(fault.calls.lock().unwrap().len(), 4);
+    assert_eq!(fault.calls.lock().unwrap().len(), 5);
     Ok(())
 }
 
 #[test]
 fn metadata_upload_only_holds_owned_immutable_paths() {
     let base = Path::from("table");
-    assert!(immutable_metadata(&base, &manifest()));
-    assert!(immutable_metadata(
+    assert!(immutable_file(&base, &manifest()));
+    assert!(immutable_file(&base, &data_file()));
+    assert!(immutable_file(
         &base,
         &Path::from(format!("table/_indices/{}/index.lance", Uuid::new_v4()))
     ));
@@ -223,10 +238,14 @@ fn metadata_upload_only_holds_owned_immutable_paths() {
         "table/_latest.manifest",
         "table/_indices/current/index.lance",
         "table/data/data.lance",
+        "table/data/nested/00000000000000000000000012345678901234567890123456.lance",
+        "table/data/20000000000000000000000012345678901234567890123456.lance",
+        "table/data/0000000000000000000000001234567890123456789012345g.lance",
+        "table/data/00000000000000000000000012345678901234567890123456.lance-stage",
         "table-other/_versions/2.manifest",
         "table/_indices/",
     ] {
-        assert!(!immutable_metadata(&base, &Path::from(path)));
+        assert!(!immutable_file(&base, &Path::from(path)));
     }
 }
 
@@ -256,10 +275,10 @@ impl ObjectStore for FaultStore {
             .unwrap()
             .push((path.clone(), payload.iter().cloned().collect()));
         if self.blocked.load(Ordering::SeqCst)
-            && self
-                .only_metadata
-                .as_ref()
-                .is_none_or(|base| immutable_metadata(base, path))
+            && self.only_owned.as_ref().is_none_or(|base| {
+                immutable_file(base, path)
+                    && (!self.only_data || path.as_ref().starts_with(&format!("{base}/data/")))
+            })
         {
             if self.after_write {
                 self.inner.put_opts(path, payload, opts).await?;
@@ -325,12 +344,14 @@ impl ObjectStoreProvider for FaultProvider {
 
 pub(crate) async fn local_storage(
     path: &std::path::Path,
+    only_data: bool,
 ) -> Result<(Storage, Scope, Arc<FaultStore>)> {
     let registry = Arc::new(lance_io::object_store::ObjectStoreRegistry::default());
     let faults = Arc::new(FaultStore {
         inner: Arc::new(object_store::local::LocalFileSystem::new()),
         blocked: AtomicBool::new(false),
-        only_metadata: Some(Path::from_absolute_path(path)?),
+        only_owned: Some(Path::from_absolute_path(path)?),
+        only_data,
         after_write: false,
         message: "Server returned non-2xx status code: 503 Service Unavailable",
         calls: Mutex::new(Vec::new()),
