@@ -412,6 +412,27 @@ pub(super) async fn rebase_status(
     index.fragment_bitmap = Some(coverage);
     index.dataset_version = target.version_id();
     let mut change: Change = serde_json::from_slice(&descriptors.bytes)?;
+    if !change.removed.is_empty() {
+        // Native updates may remove an exhausted definition entirely. There
+        // is nothing left to retire for those UUIDs. A single surviving live
+        // segment is no longer an admitted consolidation: discard this output
+        // rather than weakening the ordinary descriptor decoder's bound.
+        let current = target.load_indices().await?;
+        change
+            .removed
+            .retain(|id| current.iter().any(|index| index.uuid == *id));
+        if change.removed.len() == 1
+            && current.iter().any(|index| {
+                index.uuid == change.removed[0]
+                    && index
+                        .fragment_bitmap
+                        .as_ref()
+                        .is_some_and(|coverage| !coverage.is_empty())
+            })
+        {
+            return Ok(None);
+        }
+    }
     change.read_version = target.version_id();
     change.index = pb::IndexMetadata::from(&index).encode_to_vec();
     let rebased = p::Descriptors::lance_index(Bytes::from(serde_json::to_vec(&change)?))?;

@@ -229,20 +229,38 @@ async fn status_rebase_rejects_foreign_table_id_result_and_competing_coverage() 
 
 #[tokio::test]
 async fn status_merge_rebase_replaces_only_current_surviving_source_coverage() -> Result<()> {
+    status_merge_after_update(4).await
+}
+
+#[tokio::test]
+async fn status_merge_rebase_discards_result_with_only_one_live_source_left() -> Result<()> {
+    status_merge_after_update(2).await
+}
+
+async fn status_merge_after_update(count: usize) -> Result<()> {
     let root = tempfile::tempdir()?;
     let uri = root.path().join("turns.lance");
     let first = write(uri.to_str().unwrap(), "A", WriteMode::Create).await?;
-    let first = install(&first, &index(&first, Key::Status).await?, Key::Status).await?;
-    let appended = write(first.uri(), "B", WriteMode::Append).await?;
-    let retained = appended.fragments()[1].id as u32;
-    let tail = prepare(&appended, Action::Build(vec![retained]), Key::Status).await?;
-    let source = install(&appended, &tail, Key::Status).await?;
+    let mut source = install(&first, &index(&first, Key::Status).await?, Key::Status).await?;
+    let mut retained = Vec::new();
+    for id in ["B", "C", "D"].into_iter().take(count - 1) {
+        let appended = write(source.uri(), id, WriteMode::Append).await?;
+        let fragment = appended.fragments().last().unwrap().id as u32;
+        let tail = prepare(&appended, Action::Build(vec![fragment]), Key::Status).await?;
+        source = install(&appended, &tail, Key::Status).await?;
+        retained.push(fragment);
+    }
     let segments = source.load_indices().await?.as_ref().clone();
-    assert_eq!(segments.len(), 2);
+    assert_eq!(segments.len(), count);
     let original = prepare(&source, Action::Merge(segments), Key::Status).await?;
     let target = update_a(&source, "'accepted'").await?;
-    let certified = rebase_status(&source, &target, &original).await?.unwrap();
-    let selected = install(&target, &certified, Key::Status).await?;
+    let certified = rebase_status(&source, &target, &original).await?;
+    let selected = if count == 2 {
+        assert!(certified.is_none());
+        target
+    } else {
+        install(&target, &certified.unwrap(), Key::Status).await?
+    };
     let indices = selected.load_indices().await?;
     assert_eq!(indices.len(), 1);
     assert_eq!(
@@ -252,13 +270,13 @@ async fn status_merge_rebase_replaces_only_current_surviving_source_coverage() -
             .unwrap()
             .iter()
             .collect::<Vec<_>>(),
-        vec![retained]
+        retained
     );
     assert_eq!(
         selected
             .count_rows(Some("status = 'pending'".into()))
             .await?,
-        1
+        count - 1
     );
     assert_eq!(
         selected
