@@ -42,6 +42,11 @@ const MAX_META: usize = 2 << 20;
 // dataset <= 4096 bytes, tenant/table <= 1024 bytes each. Leave room for the
 // scope, cut and enum framing; plans and manifest history are not returned.
 const MAX_BINDING_META: usize = 16 << 10;
+// Append replies contain only fixed scope fields, enum tags and at most one
+// u64 (accepted index, expected sequence or leader). They never contain a plan,
+// manifest, producer table or response body. Bound the existing wire encoding
+// without charging every append for a generic multi-megabyte control reply.
+const MAX_APPEND_META: usize = 256;
 const PREFIX: usize = 24;
 
 pub(super) mod observation;
@@ -142,6 +147,7 @@ impl WireRequest {
 
     fn reply_metadata_limit(&self) -> usize {
         match self {
+            Self::Append { .. } => MAX_APPEND_META,
             Self::Query {
                 query: query::Query::PublisherBinding { .. },
                 ..

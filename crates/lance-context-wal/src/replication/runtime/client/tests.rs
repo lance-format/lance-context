@@ -7,6 +7,7 @@ use crate::replication::{
 use tokio::time::sleep;
 
 mod admission;
+mod append_credit;
 mod binding_credit;
 mod binding_timing;
 mod deadline;

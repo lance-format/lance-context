@@ -37,9 +37,10 @@ impl AsyncWrite for ReadObserved {
 }
 
 /// Exercise the server handler with bounded streams and real runtime handles.
-/// Withhold bodies to hold four reservations concurrently without proposing a
+/// Withhold bodies to hold twelve reservations concurrently without proposing a
 /// mutation. Appends have no response payload to reserve in addition to those
-/// bodies; four 4 MiB requests must fit the default 64 MiB data budget.
+/// bodies or a generic control reply; twelve 4 MiB requests must fit the default
+/// 64 MiB data budget while leaving room for the next unvalidated header.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn partial_appends_share_data_credit_without_reserving_fetch_bodies() -> Result<()> {
     let directory = tempfile::tempdir()?;
@@ -65,7 +66,7 @@ async fn partial_appends_share_data_credit_without_reserving_fetch_bodies() -> R
     ))?;
     let mut tasks = JoinSet::new();
     let mut clients = Vec::new();
-    for id in 1..=4 {
+    for id in 1..=12 {
         // A second payload byte cannot be written until the server has read
         // the complete metadata and begun receiving the admitted body.
         let (client, mut server) = tokio::io::duplex(1);
@@ -85,23 +86,36 @@ async fn partial_appends_share_data_credit_without_reserving_fetch_bodies() -> R
             .await
         });
     }
-    let admitted = timeout(Duration::from_secs(3), async {
-        for client in &mut clients {
+    // Any handler may win admission first. Supply all metadata concurrently so
+    // an admitted handler can validate and release its generic reply reserve.
+    let mut writers = JoinSet::new();
+    for mut client in clients.drain(..) {
+        let metadata = metadata.clone();
+        let prefix = original.body.slice(..2);
+        writers.spawn(async move {
             client.write_all(&metadata).await?;
-            client.write_all(&original.body[..2]).await?;
+            client.write_all(&prefix).await?;
+            Ok::<_, anyhow::Error>(client)
+        });
+    }
+    let admitted = timeout(Duration::from_secs(3), async {
+        while let Some(result) = writers.join_next().await {
+            clients.push(result??);
         }
         Ok::<_, anyhow::Error>(())
     })
     .await;
     let held = budgets.data.available_permits();
     let submitted = handle.append_observation()["started"];
+    writers.abort_all();
+    while writers.join_next().await.is_some() {}
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
     let released = budgets.data.available_permits();
     drop(clients);
     c.shutdown().await?;
 
-    admitted.context("four partial appends were blocked by response admission")??;
+    admitted.context("twelve partial appends were blocked by response admission")??;
     assert!(held < available);
     assert_eq!(
         released, available,
