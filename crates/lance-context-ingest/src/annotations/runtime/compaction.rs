@@ -18,10 +18,11 @@ impl Publisher {
                 // but defer other index work and compaction until it finishes.
                 return Ok(false);
             }
-            let current = self
-                .catalog
-                .read_dataset(Some(view.progress.minimum_read_version))
-                .await?;
+            let current = materializer::compaction::read_compaction_base(
+                &self.catalog,
+                view.progress.minimum_read_version,
+            )
+            .await?;
             let descriptors = self
                 .index_preparation
                 .take()
