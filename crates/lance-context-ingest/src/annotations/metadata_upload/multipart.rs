@@ -5,39 +5,62 @@ use object_store::{
 };
 
 #[derive(Debug)]
-struct PartPolicy {
+struct Policy {
     stopped: watch::Receiver<()>,
     counters: Arc<Counters>,
+    operation: Operation,
 }
 
-struct WaitingPart(Arc<Counters>);
+#[derive(Clone, Copy, Debug)]
+enum Operation {
+    Part,
+    Completion,
+}
 
-impl Drop for WaitingPart {
+impl Operation {
+    fn waiting(self, counters: &Counters) -> &AtomicU64 {
+        match self {
+            Self::Part => &counters.waiting_part_retries,
+            Self::Completion => &counters.waiting_completion_retries,
+        }
+    }
+
+    fn decisions(self, counters: &Counters) -> &AtomicU64 {
+        match self {
+            Self::Part => &counters.part_retry_decisions,
+            Self::Completion => &counters.completion_retry_decisions,
+        }
+    }
+}
+
+struct WaitingRetry(Arc<Counters>, Operation);
+
+impl Drop for WaitingRetry {
     fn drop(&mut self) {
-        self.0.waiting_part_retries.fetch_sub(1, Ordering::Relaxed);
+        self.1.waiting(&self.0).fetch_sub(1, Ordering::Relaxed);
     }
 }
 
 #[async_trait::async_trait]
-impl RetryPolicy for PartPolicy {
+impl RetryPolicy for Policy {
     async fn retry(&self, context: RetryContext) -> bool {
         if !matches!(context.failure, RetryFailure::Status(code) if matches!(code.as_u16(), 429 | 503))
         {
             return false;
         }
-        // The SDK retains the same part ID and shared payload, and refreshes
+        // The SDK retains the same part ID or block list and shared payload, and refreshes
         // credentials when this policy permits another bounded request loop.
         let delay = Duration::from_secs((1u64 << context.attempt.saturating_sub(1).min(5)).min(30));
         let mut stopped = self.stopped.clone();
-        self.counters
-            .waiting_part_retries
+        self.operation
+            .waiting(&self.counters)
             .fetch_add(1, Ordering::Relaxed);
-        let _waiting = WaitingPart(self.counters.clone());
+        let _waiting = WaitingRetry(self.counters.clone(), self.operation);
         tokio::select! {
             biased;
             _ = stopped.changed() => false,
             _ = tokio::time::sleep(delay) => {
-                self.counters.part_retry_decisions.fetch_add(1, Ordering::Relaxed);
+                self.operation.decisions(&self.counters).fetch_add(1, Ordering::Relaxed);
                 true
             },
         }
@@ -49,10 +72,17 @@ pub(super) async fn start(
     path: &Path,
     opts: PutMultipartOptions,
 ) -> object_store::Result<Box<dyn MultipartUpload>> {
-    let opts = opts.with_retry_policy(Arc::new(PartPolicy {
-        stopped: store.stopped.clone(),
-        counters: store.counters.clone(),
-    }));
+    let opts = opts
+        .with_retry_policy(Arc::new(Policy {
+            stopped: store.stopped.clone(),
+            counters: store.counters.clone(),
+            operation: Operation::Part,
+        }))
+        .with_azure_completion_retry_policy(Arc::new(Policy {
+            stopped: store.stopped.clone(),
+            counters: store.counters.clone(),
+            operation: Operation::Completion,
+        }));
     let mut stopped = store.stopped.clone();
     let inner = tokio::select! {
         biased;

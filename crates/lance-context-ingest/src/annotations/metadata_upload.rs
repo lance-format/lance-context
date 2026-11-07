@@ -1,5 +1,5 @@
 //! Keep admitted file uploads alive through explicit storage throttling.
-//! No preparation, catalog mutation, or multipart completion is re-executed.
+//! No preparation, catalog mutation, or outer multipart call is re-executed.
 use crate::materializer::Storage;
 use anyhow::{ensure, Context, Result};
 use bytes::Bytes;
@@ -31,6 +31,8 @@ struct Counters {
     resubmissions: AtomicU64,
     waiting_part_retries: AtomicU64,
     part_retry_decisions: AtomicU64,
+    waiting_completion_retries: AtomicU64,
+    completion_retry_decisions: AtomicU64,
 }
 
 #[derive(Debug, Serialize)]
@@ -42,6 +44,8 @@ pub(crate) struct Observation {
     pub(crate) waiting_part_retries: u64,
     /// Policy approvals, not HTTP attempts inside the SDK.
     pub(crate) part_retry_decisions: u64,
+    pub(crate) waiting_completion_retries: u64,
+    pub(crate) completion_retry_decisions: u64,
 }
 
 /// Held by the owner role, never by its detached file writers. Dropping this
@@ -103,6 +107,14 @@ impl Scope {
             put_resubmissions: self.counters.resubmissions.load(Ordering::Relaxed),
             waiting_part_retries: self.counters.waiting_part_retries.load(Ordering::Relaxed),
             part_retry_decisions: self.counters.part_retry_decisions.load(Ordering::Relaxed),
+            waiting_completion_retries: self
+                .counters
+                .waiting_completion_retries
+                .load(Ordering::Relaxed),
+            completion_retry_decisions: self
+                .counters
+                .completion_retry_decisions
+                .load(Ordering::Relaxed),
         }
     }
 }
