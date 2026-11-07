@@ -56,6 +56,10 @@ struct Signals {
     snapshot_gate: Mutex<()>,
     dropped: AtomicU64,
     last_drop_tick: AtomicU64,
+    activity_dropped: AtomicU64,
+    critical_dropped: AtomicU64,
+    last_activity_drop_tick: AtomicU64,
+    last_critical_drop_tick: AtomicU64,
     started: Instant,
     started_at: u64,
     enabled: bool,
@@ -78,6 +82,10 @@ impl Signals {
             snapshot_gate: Mutex::new(()),
             dropped: AtomicU64::new(0),
             last_drop_tick: AtomicU64::new(0),
+            activity_dropped: AtomicU64::new(0),
+            critical_dropped: AtomicU64::new(0),
+            last_activity_drop_tick: AtomicU64::new(0),
+            last_critical_drop_tick: AtomicU64::new(0),
             started: Instant::now(),
             started_at: wall_millis(),
             enabled,
@@ -97,7 +105,17 @@ impl Signals {
             + 1
     }
 
-    fn drop_event(&self, now: Instant) {
+    fn drop_event(&self, now: Instant, critical: bool) {
+        // Diagnostic breakdown only: retain the conservative aggregate coverage
+        // signal. These independently sampled counters are not a request census
+        // or proof that all critical hints were captured.
+        let (count, last) = if critical {
+            (&self.critical_dropped, &self.last_critical_drop_tick)
+        } else {
+            (&self.activity_dropped, &self.last_activity_drop_tick)
+        };
+        last.fetch_max(self.tick(now), Ordering::Relaxed);
+        count.fetch_add(1, Ordering::Relaxed);
         self.last_drop_tick
             .fetch_max(self.tick(now), Ordering::Relaxed);
         self.dropped.fetch_add(1, Ordering::Relaxed);
@@ -151,13 +169,13 @@ impl Signals {
         {
             return;
         }
+        let priority = read && (status.is_server_error() || slow.is_some());
         if target.len() > MAX_TARGET {
-            self.drop_event(now);
+            self.drop_event(now, priority);
             return;
         }
-        let priority = read && (status.is_server_error() || slow.is_some());
         let Some(mut values) = self.writable_shard(&target, priority, now) else {
-            self.drop_event(now);
+            self.drop_event(now, priority);
             return;
         };
         let entry = values.entry(target).or_insert(Entry {
@@ -191,8 +209,10 @@ impl Signals {
         let dropped_before = self.dropped.load(Ordering::Relaxed);
         let mut entries = HashMap::<String, Entry>::new();
         let mut complete = true;
+        let mut skipped_shards = 0;
         for shard in self.shards.iter().chain(&self.priority_shards) {
             let Ok(values) = shard.try_lock() else {
+                skipped_shards += 1;
                 complete = false;
                 continue;
             };
@@ -221,6 +241,7 @@ impl Signals {
             )
         });
         let mut tables = Vec::new();
+        let mut truncated_rows = 0;
         let mut bytes = 1024; // Reserved envelope space, including a maximum nonce.
         for (name, entry) in entries {
             let error = entry
@@ -237,6 +258,7 @@ impl Signals {
                 "read_slow_header_millis": slow.map(|(_, _, _, millis)| millis)});
             let size = serde_json::to_vec(&row).expect("bounded scalar row").len() + 1;
             if tables.len() >= SHARDS * PER_SHARD || bytes + size > MAX_REPLY {
+                truncated_rows += 1;
                 complete = false;
                 continue;
             }
@@ -250,10 +272,21 @@ impl Signals {
         let recent_loss =
             last_drop != 0 && self.tick(now).saturating_sub(last_drop) < WINDOW.as_millis() as u64;
         complete &= dropped == dropped_before && !recent_loss;
+        let recent =
+            |tick| tick != 0 && self.tick(now).saturating_sub(tick) < WINDOW.as_millis() as u64;
+        let loss = json!({
+            "activity_dropped_total": self.activity_dropped.load(Ordering::Relaxed),
+            "critical_dropped_total": self.critical_dropped.load(Ordering::Relaxed),
+            "recent_activity_loss": recent(self.last_activity_drop_tick.load(Ordering::Relaxed)),
+            "recent_critical_loss": recent(self.last_critical_drop_tick.load(Ordering::Relaxed)),
+            "snapshot_skipped_shards": skipped_shards,
+            "snapshot_truncated_rows": truncated_rows,
+            "recording_loss_during_snapshot": dropped != dropped_before,
+        });
         let value = json!({"schema":1, "nonce":nonce,"sampled_at_unix_millis":wall_millis(),
             "coverage_started_at_unix_millis":self.started_at,"window_seconds":WINDOW.as_secs(),
             "slow_read_header_threshold_millis": SLOW_READ.as_millis() as u64,
-            "complete":complete,"dropped_total":dropped,"tables":tables});
+            "complete":complete,"dropped_total":dropped,"loss":loss,"tables":tables});
         let raw = serde_json::to_vec(&value).expect("bounded scalar envelope");
         if raw.len() > MAX_REPLY {
             return unavailable("snapshot exceeds budget");
@@ -599,9 +632,15 @@ mod tests {
         assert_eq!(v["complete"], false);
         assert_eq!(v["dropped_total"], 1);
         assert_eq!(v["tables"][0]["read_error_status"], 503);
+        assert_eq!(v["loss"]["activity_dropped_total"], 1);
+        assert_eq!(v["loss"]["critical_dropped_total"], 0);
+        assert_eq!(v["loss"]["recent_activity_loss"], true);
+        assert_eq!(v["loss"]["recent_critical_loss"], false);
+        assert_eq!(v["loss"]["snapshot_skipped_shards"], 1);
         signals.record("t".into(), true, StatusCode::OK, now, 2);
         let v = value(&signals, now).await;
         assert_eq!(v["complete"], false);
+        assert_eq!(v["loss"]["snapshot_skipped_shards"], 0);
         assert_eq!(v["tables"].as_array().unwrap().len(), 1);
         assert_eq!(value(&signals, now + WINDOW * 2).await["complete"], true);
         let _gate = signals.snapshot_gate.lock().unwrap();
@@ -792,8 +831,53 @@ mod tests {
         let v = value(&signals, now).await;
         assert_eq!(v["complete"], false);
         assert_eq!(v["dropped_total"], 1);
+        assert_eq!(v["loss"]["activity_dropped_total"], 0);
+        assert_eq!(v["loss"]["critical_dropped_total"], 1);
+        assert_eq!(v["loss"]["recent_activity_loss"], false);
+        assert_eq!(v["loss"]["recent_critical_loss"], true);
+        assert_eq!(v["loss"]["snapshot_skipped_shards"], 0);
         assert!(v["tables"].as_array().unwrap().is_empty());
         assert_eq!(value(&signals, now + WINDOW * 2).await["complete"], true);
+    }
+
+    #[tokio::test]
+    async fn loss_classes_expire_independently_without_changing_aggregate_coverage() {
+        let signals = Signals::new(true);
+        let now = Instant::now();
+        {
+            let index = Signals::shard("t");
+            let _activity = signals.shards[index].lock().unwrap();
+            let _priority = signals.priority_shards[index].lock().unwrap();
+            // A write failure is activity, not a read-error hint.
+            signals.record("t".into(), false, StatusCode::SERVICE_UNAVAILABLE, now, 1);
+            // A slow404 is critical even though it is not a server error.
+            signals.record_with_latency(
+                "t".into(),
+                true,
+                StatusCode::NOT_FOUND,
+                now + Duration::from_secs(200),
+                2,
+                Some(SLOW_READ),
+            );
+        }
+        let v = value(&signals, now + Duration::from_secs(201)).await;
+        assert_eq!(v["dropped_total"], 2);
+        assert_eq!(v["loss"]["activity_dropped_total"], 1);
+        assert_eq!(v["loss"]["critical_dropped_total"], 1);
+        assert_eq!(v["loss"]["recent_activity_loss"], true);
+        assert_eq!(v["loss"]["recent_critical_loss"], true);
+        assert_eq!(v["loss"]["snapshot_skipped_shards"], 0);
+        assert_eq!(v["loss"]["snapshot_truncated_rows"], 0);
+        assert_eq!(v["complete"], false);
+        let v = value(&signals, now + WINDOW).await;
+        assert_eq!(v["loss"]["recent_activity_loss"], false);
+        assert_eq!(v["loss"]["recent_critical_loss"], true);
+        assert_eq!(v["complete"], false);
+        let v = value(&signals, now + WINDOW + Duration::from_secs(200)).await;
+        assert_eq!(v["loss"]["recent_critical_loss"], false);
+        assert_eq!(v["complete"], true);
+        assert_eq!(v["dropped_total"], 2);
+        assert_eq!(v["loss"]["critical_dropped_total"], 1);
     }
 
     #[tokio::test]
@@ -874,6 +958,10 @@ mod tests {
         assert_eq!(v["complete"], false);
         assert!(v["dropped_total"].as_u64().unwrap() > 0);
         assert!(v["tables"].as_array().unwrap().len() < count);
+        assert_eq!(v["loss"]["critical_dropped_total"], 0);
+        assert!(v["loss"]["activity_dropped_total"].as_u64().unwrap() > 0);
+        assert!(v["loss"]["snapshot_truncated_rows"].as_u64().unwrap() > 0);
+        assert_eq!(v["loss"]["snapshot_skipped_shards"], 0);
         signals.record("fresh".into(), false, StatusCode::OK, now + WINDOW, 3);
         let v = value(&signals, now + WINDOW).await;
         assert_eq!(v["tables"].as_array().unwrap().len(), 1);
