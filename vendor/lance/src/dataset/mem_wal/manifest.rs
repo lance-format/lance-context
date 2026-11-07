@@ -563,10 +563,15 @@ impl ShardManifestStore {
     /// is higher than the local epoch, the writer has been fenced.
     #[instrument(name = "manifest_check_fenced", level = "debug", skip_all, fields(shard_id = %self.shard_id, local_epoch))]
     pub async fn check_fenced(&self, local_epoch: u64) -> Result<()> {
+        self.refresh_checked(local_epoch).await.map(|_| ())
+    }
+
+    pub(crate) async fn refresh_checked(&self, local_epoch: u64) -> Result<Option<ShardManifest>> {
         // Refreshed: a fence is another process's write, which our own
         // position can never show us.
         let current = self.refresh_latest().await?;
-        Self::check_fenced_against(&current, local_epoch, self.shard_id)
+        Self::check_fenced_against(&current, local_epoch, self.shard_id)?;
+        Ok(current)
     }
 
     /// Check fencing against a pre-read manifest (avoids redundant read).
@@ -623,6 +628,22 @@ impl ShardManifestStore {
     where
         F: Fn(&ShardManifest) -> ShardManifest,
     {
+        self.commit_update_checked(local_epoch, |current| Ok(Some(prepare_fn(current))))
+            .await
+    }
+
+    /// Validate a conditional update against the manifest used by each CAS
+    /// attempt. `None` acknowledges an already satisfied operation without
+    /// creating another manifest; refresh before accepting that acknowledgement
+    /// so a cached manifest cannot conceal a newer writer epoch.
+    pub(crate) async fn commit_update_checked<F>(
+        &self,
+        local_epoch: u64,
+        prepare_fn: F,
+    ) -> Result<ShardManifest>
+    where
+        F: Fn(&ShardManifest) -> Result<Option<ShardManifest>>,
+    {
         const MAX_RETRIES: usize = 10;
 
         for attempt in 0..MAX_RETRIES {
@@ -641,7 +662,27 @@ impl ShardManifestStore {
             Self::check_fenced_against(&Some(current.clone()), local_epoch, self.shard_id)?;
 
             // Step 3: Prepare new manifest
-            let new_manifest = prepare_fn(&current);
+            let new_manifest = match prepare_fn(&current) {
+                Ok(Some(next)) => next,
+                outcome => {
+                    // Neither a no-op nor a rejection performs a CAS, so
+                    // neither discovers a stale position through a conflict.
+                    // Re-evaluate both against storage before returning.
+                    let refreshed = self
+                        .refresh_latest()
+                        .await?
+                        .ok_or_else(|| Error::io("Shard manifest not found"))?;
+                    Self::check_fenced_against(
+                        &Some(refreshed.clone()),
+                        local_epoch,
+                        self.shard_id,
+                    )?;
+                    if refreshed.version != current.version {
+                        continue;
+                    }
+                    return outcome.map(|_| refreshed);
+                }
+            };
 
             // Check the successor against `current`, the manifest the closure
             // actually built on. The store's position is shared and moves
@@ -1149,6 +1190,86 @@ mod tests {
             result.is_err(),
             "second initialize_shard with different fields must fail"
         );
+    }
+
+    #[tokio::test]
+    async fn publication_checked_revalidates_stale_noop_and_rejection() {
+        for reject_stale in [false, true] {
+            let (store, base_path, _temp_dir) = create_local_store().await;
+            let shard_id = Uuid::new_v4();
+            let ours = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
+            let peer = ShardManifestStore::new(store, &base_path, shard_id, 2);
+            let (epoch, claimed) = ours.claim_epoch(0).await.unwrap();
+            let advanced = peer
+                .commit_update(epoch, |c| ShardManifest {
+                    version: c.next_version(),
+                    current_generation: 2,
+                    ..c.clone()
+                })
+                .await
+                .unwrap();
+            assert_eq!(ours.cached().unwrap().version, claimed.version);
+
+            let committed = ours
+                .commit_update_checked(epoch, |c| {
+                    if c.current_generation == 1 {
+                        if reject_stale {
+                            return Err(Error::invalid_input("predecessor not yet published"));
+                        }
+                        return Ok(None);
+                    }
+                    Ok(Some(ShardManifest {
+                        version: c.next_version(),
+                        current_generation: 3,
+                        ..c.clone()
+                    }))
+                })
+                .await
+                .unwrap();
+            assert_eq!(committed.version, advanced.next_version());
+            let stored = peer.read_version(committed.version).await.unwrap();
+            assert_eq!(stored.current_generation, 3);
+        }
+    }
+
+    #[tokio::test]
+    async fn publication_checked_noop_detects_new_writer_epoch() {
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let ours = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
+        let peer = ShardManifestStore::new(store, &base_path, shard_id, 2);
+        let (epoch, claimed) = ours.claim_epoch(0).await.unwrap();
+        let (next_epoch, _) = peer.claim_epoch(0).await.unwrap();
+        assert!(next_epoch > epoch);
+        assert_eq!(ours.cached().unwrap().version, claimed.version);
+        let error = ours
+            .commit_update_checked(epoch, |_| Ok(None))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("local epoch"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn publication_checked_noop_and_rejection_do_not_write() {
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let ours = ShardManifestStore::new(store, &base_path, shard_id, 2);
+        let (epoch, claimed) = ours.claim_epoch(0).await.unwrap();
+        let acknowledged = ours
+            .commit_update_checked(epoch, |_| Ok(None))
+            .await
+            .unwrap();
+        assert_eq!(acknowledged.version, claimed.version);
+        assert!(
+            ours.commit_update_checked(epoch, |_| Err(Error::invalid_input("invalid publication")))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            ours.latest().await.unwrap().unwrap().version,
+            claimed.version
+        );
+        assert!(ours.read_version(claimed.next_version()).await.is_err());
     }
 
     /// A commit closure that names the wrong version fails loudly instead of
