@@ -64,6 +64,13 @@ pub enum Query {
     PublisherBinding {
         table: Uuid,
     },
+    /// One quorum view of a bounded bucket page and its recovery boundary.
+    AcceptedBucketWithClosure {
+        table: Uuid,
+        bucket: u32,
+        after: u64,
+        limit: usize,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,6 +93,10 @@ pub enum Value {
     ProducerSlot(Option<producer::View>),
     Visibility(Option<Box<Visibility>>),
     PublisherBinding(Option<Box<PublisherBinding>>),
+    SourcePage {
+        page: Page,
+        closure: Option<Arc<source::Closed>>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -182,6 +193,12 @@ impl Query {
                 "invalid accepted query bounds"
             ),
             Self::AcceptedBucket {
+                table,
+                bucket,
+                after,
+                limit,
+            }
+            | Self::AcceptedBucketWithClosure {
                 table,
                 bucket,
                 after,
@@ -337,7 +354,9 @@ impl Query {
                     })
                 }))
             }
-            Self::Accepted { after, .. } | Self::AcceptedBucket { after, .. }
+            Self::Accepted { after, .. }
+            | Self::AcceptedBucket { after, .. }
+            | Self::AcceptedBucketWithClosure { after, .. }
                 if *after > state.applied =>
             {
                 Value::CursorAhead {
@@ -351,6 +370,15 @@ impl Query {
                 after,
                 limit,
             } => Value::Accepted(state.bucket_page(*table, *bucket, *after, *limit)?),
+            Self::AcceptedBucketWithClosure {
+                table,
+                bucket,
+                after,
+                limit,
+            } => Value::SourcePage {
+                page: state.bucket_page(*table, *bucket, *after, *limit)?,
+                closure: state.closed.get(table).cloned(),
+            },
             Self::Producer {
                 table,
                 bucket,

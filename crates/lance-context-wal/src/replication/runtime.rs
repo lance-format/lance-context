@@ -502,6 +502,10 @@ impl Handle {
                 ensure!((1..=128).contains(limit), "invalid accepted query bounds");
                 256 * limit + 1024
             }
+            query::Query::AcceptedBucketWithClosure { limit, .. } => {
+                ensure!((1..=128).contains(limit), "invalid accepted query bounds");
+                256 * limit + 1024 + source::MAX_CLOSED_BYTES
+            }
             _ => 16 * 1024,
         };
         let credit = self

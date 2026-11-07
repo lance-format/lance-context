@@ -168,6 +168,94 @@ fn bucket_query_preserves_quorum_scope_and_cursor_validation() -> Result<()> {
 }
 
 #[test]
+fn source_page_preserves_quorum_scope_and_cursor_validation() -> Result<()> {
+    let (_root, mut nodes) = nodes(Limits::default())?;
+    nodes[0].campaign(10)?;
+    pump(&mut nodes)?;
+    let batch = super::super::tests::batch(1);
+    nodes[0].propose(10, 1, batch.clone())?;
+    pump(&mut nodes)?;
+    let query = Query::AcceptedBucketWithClosure {
+        table: batch.meta.stream,
+        bucket: batch.meta.bucket,
+        after: 0,
+        limit: 128,
+    };
+    assert!(nodes[0].query(20, 2, query.clone()).is_err());
+    assert!(nodes[1].query(10, 2, query.clone()).is_err());
+    nodes[0].query(10, 2, query)?;
+    let events = nodes[0].poll()?;
+    assert!(events.reads.is_empty(), "source page bypassed the quorum");
+    for peer in [2, 3] {
+        assert_eq!(
+            events
+                .messages
+                .iter()
+                .filter(|p| {
+                    p.message.to == peer
+                        && p.message.get_msg_type() == MessageType::MsgHeartbeat
+                        && !p.message.context.is_empty()
+                })
+                .count(),
+            1
+        );
+    }
+    for packet in events.messages {
+        nodes[packet.message.to as usize - 1].step(packet)?;
+    }
+    let reads = pump(&mut nodes)?.reads;
+    let Outcome::Observed {
+        cut,
+        value: Value::SourcePage { page, closure },
+    } = &reads[0].outcome
+    else {
+        anyhow::bail!("missing quorum source page");
+    };
+    assert!(cut.quorum_index > 0 && cut.applied >= cut.quorum_index);
+    assert_eq!(page.entries, vec![(page.entries[0].0, batch.meta.clone())]);
+    assert_eq!(page.through, cut.applied);
+    assert!(closure.is_none());
+    let encoded = bincode::serialize(&reads[0].outcome)?;
+    assert_eq!(bincode::deserialize::<Outcome>(&encoded)?, reads[0].outcome);
+    for (table, limit) in [
+        (Uuid::nil(), 1),
+        (batch.meta.stream, 0),
+        (batch.meta.stream, 129),
+    ] {
+        assert!(nodes[0]
+            .query(
+                10,
+                3,
+                Query::AcceptedBucketWithClosure {
+                    table,
+                    bucket: 0,
+                    after: 0,
+                    limit,
+                }
+            )
+            .is_err());
+    }
+    nodes[0].query(
+        10,
+        3,
+        Query::AcceptedBucketWithClosure {
+            table: batch.meta.stream,
+            bucket: 0,
+            after: cut.applied + 1,
+            limit: 128,
+        },
+    )?;
+    assert!(matches!(
+        pump(&mut nodes)?.reads[0].outcome,
+        Outcome::Observed {
+            value: Value::CursorAhead { .. },
+            ..
+        }
+    ));
+    Ok(())
+}
+
+#[test]
 fn compact_visibility_uses_catalog_quorum_and_fits_control_reply_budget() -> Result<()> {
     let (_root, mut nodes) = nodes(Limits::default())?;
     nodes[0].campaign(10)?;
