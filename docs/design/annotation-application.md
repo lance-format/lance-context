@@ -210,6 +210,15 @@ failure. Such failures still report an unknown outcome and retain the original
 request identity for explicit resolution. Forwarding shares Arrow body frames
 without decoding or coalescing the complete upload.
 
+When the applier reports source-window, staging or apply-memory pressure, the
+owner refuses another update attempt with HTTP 503, `annotation_apply_capacity`
+and `operation_outcome: not_submitted`, before reading its body or appending it
+to the WAL. Reads and control operations remain available. This is a snapshot
+of local admission pressure, not a reservation: already admitted writes can
+still wait for publication. The refusal describes only this attempt; it cannot
+resolve an earlier unknown attempt with the same identity. Preserve the original
+request identity and bytes until its durable result is resolved.
+
 ### Independent physical shards
 
 For fresh mixed body/annotation bindings, each owner can use its own narrow

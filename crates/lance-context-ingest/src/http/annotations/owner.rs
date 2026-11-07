@@ -99,6 +99,15 @@ impl Owner {
                 ingress.scope.contract.max_record_bytes as usize,
                 ARROW_FILE,
             )?;
+            // A stalled applier cannot make another proposal immediately
+            // visible. Refuse this attempt before receiving or appending it,
+            // while keeping reads and control requests available.
+            if self.service.apply_backpressure().is_some() {
+                return Err(Failure::unavailable(
+                    "annotation_apply_capacity",
+                    "not_submitted",
+                ));
+            }
             let upload = if request.version() == axum::http::Version::HTTP_2 {
                 // A waiting stream can consume the connection receive window
                 // and prevent admitted uploads from finishing and freeing memory.
