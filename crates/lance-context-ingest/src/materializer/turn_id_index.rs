@@ -9,6 +9,64 @@ pub(crate) const MAX_BUILD_ROWS: usize = 1 << 20;
 const MAX_MERGE_ROWS: usize = 16 * MAX_BUILD_ROWS;
 const MERGE_FAN_IN: usize = 4;
 
+/// One admitted native job. It writes immutable index pages, never a manifest
+/// or catalog command. Only its owning publisher may select the result.
+/// Like serial preparation, cancellation leaves native writers holding their
+/// reservation until they finish. Late outputs cannot publish after fencing.
+pub(crate) struct Preparation {
+    pub(crate) source: Dataset,
+    job: tokio::task::JoinHandle<Result<p::Descriptors>>,
+}
+
+impl Preparation {
+    pub(crate) fn is_finished(&self) -> bool {
+        self.job.is_finished()
+    }
+
+    pub(crate) async fn finish(self, current: &Dataset) -> Result<p::Descriptors> {
+        let descriptors = self.job.await??;
+        session_index::rebase_turn(&self.source, current, &descriptors).await
+    }
+}
+
+pub(crate) async fn start(publisher: &Publisher, version: u64) -> Result<Option<Preparation>> {
+    let Some(options) = &publisher.options.turn_id_index else {
+        return Ok(None);
+    };
+    // Keep room for an ordinary publication; small existing configurations
+    // continue through the serial maintenance path with their original bound.
+    let publication_workspace = publisher.options.workspace(
+        &publisher.ingress.scope.contract,
+        publisher.options.max_source_bytes,
+        publisher.options.max_records,
+    )?;
+    if publisher.budget.limit() < session_index::WORKSPACE + publication_workspace {
+        return Ok(None);
+    }
+    // Match the existing maintenance preference before admitting any job.
+    if (Publisher::compaction_first(version) && compaction::has_work(publisher, version).await?)
+        || (Publisher::status_index_first(version)
+            && status_index::has_work(publisher, version).await?)
+    {
+        return Ok(None);
+    }
+    let source = compaction::read_compaction_base(publisher, version).await?;
+    let Some(action) = options.action(&source).await? else {
+        return Ok(None);
+    };
+    let Some(reservation) = publisher.budget.try_reserve(session_index::WORKSPACE) else {
+        return Ok(None);
+    };
+    let job = session_index::spawn_action(
+        source.clone(),
+        action,
+        Key::Turn,
+        reservation,
+        publisher.phases.clone(),
+    );
+    Ok(Some(Preparation { source, job }))
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TurnIdIndex {

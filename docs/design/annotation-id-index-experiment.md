@@ -26,9 +26,28 @@ annotation entry budget at most that bound. Existing oversized fragments need a
 separate migration before this option can be enabled.
 
 The owner derives index/compaction preference from the selected durable version.
-A pending maintenance plan resolves before another plan is chosen. The existing
-maintenance time window still gives waiting annotation publication its next
-turn after a long operation; the window does not preempt a native build.
+A pending maintenance plan resolves before another plan is chosen. With enough
+existing publication capacity for both the 512 MiB index estimate and an ordinary
+publication, one ID build or merge can run before taking a catalog plan. Data
+publications continue while its native I/O runs. Other maintenance waits for that
+one job; smaller budgets retain serial maintenance. No additional budget is created.
+
+Before selecting the result, the owner verifies that each covered fragment still
+has exactly the original ID file, column mapping and physical row layout. Narrow
+annotation rewrites preserve these inputs; newly appended fragments remain outside
+the result's coverage. Replaced fragments, changed ID columns, source-index
+replacement or overlapping coverage fail validation. Only after this proof is the
+ID-only metadata certified for the current snapshot and recorded through the
+existing exact-version format-3 preparation and fenced publication. Status indexes
+remain on their existing path because their values can change.
+
+Collection continues for data files, protecting the one job's original snapshot.
+Index-page collection waits until this job resolves, including files uploaded
+before their response completes. No other index job is admitted meanwhile. A crash
+before the plan leaves unselected files; a successor reconstructs current values
+from its ordinary Lance/WAL checkpoint and may rebuild the index. After preparation
+is durable, the existing exact-result recovery applies. Native writers retain
+their reservation if the caller is cancelled and cannot publish a manifest themselves.
 
 Qualification must include real owner create/patch traffic, native build and
 merge transactions, compaction, exact request-result recovery and lost Prepare

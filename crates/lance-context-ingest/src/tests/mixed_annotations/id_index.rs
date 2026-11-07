@@ -30,7 +30,7 @@ async fn indexed_owner_with_history(
             limits: limits(),
             upload_budget: MergeMemoryBudget::new(8 << 20),
             apply_budget: MergeMemoryBudget::new(8 << 20),
-            publication_budget: MergeMemoryBudget::new(512 << 20),
+            publication_budget: MergeMemoryBudget::new(1024 << 20),
             publication: Options {
                 max_source_bytes: 1 << 20,
                 min_source_bytes: 1 << 20,

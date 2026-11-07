@@ -8,6 +8,50 @@ impl Publisher {
     }
 
     pub(super) async fn compact_next(&mut self, view: &p::Table) -> Result<bool> {
+        if let Some(job) = &self.index_preparation {
+            ensure!(
+                view.progress.pending.is_none(),
+                "index job overlaps a retained plan"
+            );
+            if !job.is_finished() {
+                // Native ID I/O owns no catalog plan. Continue draining data,
+                // but defer other index work and compaction until it finishes.
+                return Ok(false);
+            }
+            let current = materializer::compaction::read_compaction_base(
+                &self.catalog,
+                view.progress.minimum_read_version,
+            )
+            .await?;
+            let descriptors = self
+                .index_preparation
+                .take()
+                .unwrap()
+                .finish(&current)
+                .await?;
+            let plan = p::Plan {
+                transaction: Uuid::new_v4(),
+                read_version: current.version_id(),
+                sources: BTreeMap::new(),
+                next_group: self.service.group()?,
+            };
+            self.catalog.record_plan(plan).await?;
+            let selected = self.catalog.state().await?;
+            let pending = selected
+                .progress
+                .pending
+                .as_ref()
+                .context("index plan missing")?;
+            self.catalog
+                .record_preparation(p::PrepareRequest {
+                    authority: self.catalog.authority().clone(),
+                    transaction: pending.plan.transaction,
+                    plan_index: pending.index,
+                    descriptors,
+                })
+                .await?;
+            return self.finish_compaction().await;
+        }
         if let Some(pending) = &view.progress.pending {
             if !pending.plan.is_maintenance() {
                 return Ok(false);
@@ -75,14 +119,14 @@ impl Publisher {
             {
                 return Ok(false);
             }
-            let plan = if !self
+            let body_preferred = !self
                 .prefer_annotation_index(view.progress.minimum_read_version)
                 .await?
                 && self
                     .body_compaction_candidate(view.progress.minimum_read_version)
                     .await?
-                    .is_some()
-            {
+                    .is_some();
+            let plan = if body_preferred {
                 Some(p::Plan {
                     transaction: Uuid::new_v4(),
                     read_version: view.progress.minimum_read_version,
@@ -114,9 +158,21 @@ impl Publisher {
             // finish, but after that pending annotations get the next turn.
             self.compaction_started
                 .get_or_insert_with(tokio::time::Instant::now);
+            if !body_preferred {
+                if let Some(job) =
+                    materializer::turn_id_index::start(&self.catalog, plan.read_version).await?
+                {
+                    self.index_preparation = Some(job);
+                    return Ok(false);
+                }
+            }
             self.catalog.retire_history(view).await?;
             self.catalog.record_plan(plan).await?;
         }
+        self.finish_compaction().await
+    }
+
+    async fn finish_compaction(&mut self) -> Result<bool> {
         // A maintenance plan already exists, so the ordinary publisher only
         // prepares that exact plan. It cannot select an ingestion append here.
         let current = self.catalog.state().await?;
