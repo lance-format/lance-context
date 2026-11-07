@@ -20,6 +20,7 @@ async fn exercise() -> Result<()> {
     let (a, runtime) = owner(&c, &narrow, &body).await?;
     let (_, _, recovery_cut) = runtime.http_binding();
     let p = producer(&a, 1).await?;
+    let updates = producer(&a, 2).await?;
     faults.body_write_failure.store(true, Ordering::SeqCst);
     let (stop, task) = annotation_runtime::run_owner(runtime);
     let first = request(&a, &p, 1, encoded(create(&["A"], &["s"], &[1])?)?).await?;
@@ -39,14 +40,14 @@ async fn exercise() -> Result<()> {
     // frozen cut must survive while later complete annotations remain active.
     let mut latest = None;
     for (sequence, status, score) in [
-        (2, Some("reviewed"), None),
-        (3, None, Some(0.9)),
-        (4, None, Some(0.8)),
-        (5, None, Some(0.7)),
+        (1, Some("reviewed"), None),
+        (2, None, Some(0.9)),
+        (3, None, Some(0.8)),
+        (4, None, Some(0.7)),
     ] {
         let update = request(
             &a,
-            &p,
+            &updates,
             sequence,
             encoded(mixed::wire::patches(
                 &patch(&["A"], status, score)?,
@@ -58,8 +59,8 @@ async fn exercise() -> Result<()> {
     }
     let waiting = request(
         &a,
-        &p,
-        6,
+        &updates,
+        5,
         encoded(mixed::wire::patches(
             &patch(&["A"], None, Some(0.6))?,
             &limits(),
