@@ -110,12 +110,13 @@ async fn exercise() -> Result<()> {
         .await??
         .unwrap_err();
     let message = format!("{error:#}");
-    // The old publisher may reach selection before observing the successor's
-    // source fence. Its stale authority is rejected at that boundary too.
+    // The old publisher may reach Plan or Prepare before observing the
+    // successor's source fence. Both replicated commands reject stale authority.
     assert!(
         message.contains("fenced")
             || message.contains("view is behind source closure")
-            || message == "publication selection rejected: Publisher(Rejected(Authority))",
+            || message == "publication selection rejected: Publisher(Rejected(Authority))"
+            || message == "materialization result rejected: Publisher(Rejected(Authority))",
         "{message}"
     );
     assert!(!abandoned.exists());
