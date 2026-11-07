@@ -298,8 +298,11 @@ impl Runtime {
         ))
     }
 
-    /// Publication/protocol failures stop this owner and its
-    /// read barriers. Restart reconciles durable plan/preparation/selection state.
+    /// Publication/protocol failures stop this owner and its read barriers.
+    /// An I/O failure writing an uncommitted body pauses publication while the
+    /// bounded applier and owned point reads remain live. It does not retry the
+    /// upload. A fenced restart reconciles the retained plan and replays its cut.
+    /// Other failures still require restart to reconcile preparation/selection.
     /// An in-flight sealed DELETE retains one bounded page while publication
     /// continues. Failed outcomes pause new publication until that sealed page
     /// clears; applied values remain readable. Only immutable DELETE requests repeat;
@@ -352,7 +355,9 @@ impl Publisher {
                     continue;
                 }
             }
-            if let Some(collector) = reclamation.as_mut().filter(|c| c.has_pending_delete()) {
+            let result = if let Some(collector) =
+                reclamation.as_mut().filter(|c| c.has_pending_delete())
+            {
                 // Only an already fenced immutable DELETE overlaps publication.
                 // Keep driving its original future even if preparation awaits
                 // workspace held by the charged deletion page. No detached tasks.
@@ -360,14 +365,25 @@ impl Publisher {
                 tokio::pin!(publication);
                 loop {
                     tokio::select! {
-                        result = &mut publication => { result?; break; }
+                        result = &mut publication => break result,
                         _ = tokio::time::sleep(Duration::from_millis(5)), if collector.has_pending_delete() => {
                             collector.poll_pending_delete(&service).await?;
                         }
                     }
                 }
             } else {
-                self.publish_next().await?;
+                self.publish_next().await
+            };
+            if let Err(error) = result {
+                if error.is::<mixed::BodyWriteFailed>() {
+                    // This upload never reached a native commit. Retain the
+                    // frozen generation and WAL instead of dropping the whole
+                    // owner. Existing apply/source limits bound later writes.
+                    // Do not create another file or resubmit a business request.
+                    eprintln!("annotation publication paused until fenced restart: {error:#}");
+                    return std::future::pending().await;
+                }
+                return Err(error);
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }

@@ -5,6 +5,7 @@ pub(super) mod frames;
 mod prepare;
 mod read;
 pub mod wire;
+pub(super) use prepare::BodyWriteFailed;
 pub use read::Turn;
 
 /// A forwarding ingress validates the explicit mixed contract but opens no

@@ -9,6 +9,8 @@ mod pressure;
 mod replay;
 mod runtime;
 mod status_index;
+#[cfg(feature = "http")]
+mod upload_failure;
 use crate::{
     annotations::{self as service, mixed, Service},
     materializer::{Acquisition, Options, Storage},
