@@ -168,9 +168,12 @@ async fn upload(store: &UploadStore) -> Result<Box<dyn MultipartUpload>> {
 async fn multipart_throttle_preserves_part_ids_shared_bytes_and_completion_order() -> Result<()> {
     let (scope, store, transport) = fixture(vec![Fault::Status(429), Fault::Status(503)], None, 0)?;
     let opts = PutMultipartOptions {
-        attributes: [(Attribute::ContentType, "application/test".into())]
-            .into_iter()
-            .collect(),
+        attributes: [(
+            Attribute::ContentType,
+            object_store::AttributeValue::from("application/test"),
+        )]
+        .into_iter()
+        .collect(),
         ..Default::default()
     };
     let mut upload = store
