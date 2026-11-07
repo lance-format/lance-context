@@ -383,15 +383,20 @@ impl SealedWalProbe {
     }
 
     pub async fn has_sealed_wal(&self, shard: &str) -> Result<bool> {
-        Ok(ShardManifestStore::new(
-            self.store.clone(),
-            &self.root,
-            derive_shard_id(Some(shard)),
-            16,
+        self.has_sealed_wal_uuid(&derive_shard_id(Some(shard)).to_string())
+            .await
+    }
+
+    /// Probe a physical shard published in durable demand, not a writer name.
+    pub async fn has_sealed_wal_uuid(&self, shard: &str) -> Result<bool> {
+        let shard = Uuid::parse_str(shard)
+            .map_err(|_| Error::invalid_input("invalid physical WAL shard UUID"))?;
+        Ok(
+            ShardManifestStore::new(self.store.clone(), &self.root, shard, 16)
+                .refresh_latest()
+                .await?
+                .is_some_and(|manifest| !manifest.sstables.is_empty()),
         )
-        .refresh_latest()
-        .await?
-        .is_some_and(|manifest| !manifest.sstables.is_empty()))
     }
 }
 

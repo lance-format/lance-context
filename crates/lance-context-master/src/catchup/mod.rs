@@ -4,6 +4,7 @@ mod grouped;
 mod kubernetes;
 mod outcome;
 mod progress;
+mod shards;
 mod staging;
 pub(crate) mod store;
 #[cfg(test)]

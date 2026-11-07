@@ -128,6 +128,20 @@ struct FilteredReadPause {
 }
 
 impl GenericStore {
+    /// Open a fresh maintenance handle for a physical WAL shard without
+    /// acquiring a writer epoch. The caller retains the normal merge fence.
+    pub async fn open_existing_for_merge_shard(
+        uri: &str,
+        options: GenericStoreOptions,
+        shard_uuid: &str,
+    ) -> LanceResult<Self> {
+        let shard = uuid::Uuid::parse_str(shard_uuid)
+            .map_err(|_| LanceError::invalid_input("invalid physical WAL shard UUID"))?;
+        let mut store = Self::open_existing(uri, options).await?;
+        store.base.write_shard = shard;
+        Ok(store)
+    }
+
     /// Create a store with `spec`, or open it if it already exists.
     ///
     /// # Errors

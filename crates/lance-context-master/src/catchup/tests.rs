@@ -421,6 +421,178 @@ async fn native_executor_preserves_live_ingestion_and_drains_sealed_shards() {
 
 #[tokio::test]
 #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+async fn durable_demand_discovers_unconfigured_writers_across_tables_and_executor_replacement() {
+    use lance_context_core::{RolloutStore, RolloutStoreOptions};
+    use lance_context_merge::demand::{DemandEvent, EventSource};
+    for mode in ["pipeline", "staging", "grouped"] {
+        let (_dir, state) = fixture().await.unwrap();
+        let mut cfg = state.config.clone();
+        cfg.catchup.enabled = false;
+        cfg.catchup.merge_memory_bytes = 8 << 20;
+        cfg.catchup.merge_max_bytes = 1 << 20;
+        cfg.merge_rollout.owned_targets = vec!["hot".into(), "other".into(), "third".into()];
+        if mode == "staging" {
+            cfg.catchup.staging_targets = cfg.merge_rollout.owned_targets.clone();
+        } else if mode == "grouped" {
+            cfg.catchup.grouped_targets = cfg.merge_rollout.owned_targets.clone();
+        }
+        // All configured historical identities are empty. Only durable demand
+        // identifies these writers; each execute constructs a fresh master.
+        assert_eq!(cfg.catchup.shards, ["worker-0", "worker-1"]);
+        for target in ["hot", "other", "third"] {
+            let uri = state.rollout_uri(target);
+            let mut writer = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    shard_id: Some("new-writer-absent-from-config".into()),
+                    merge_after_generations: Some(0),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            for wave in 0..3 {
+                let dto = serde_json::from_value(json!({
+                    "id": format!("wave-{wave}"), "rollout_id": "r", "content": mode
+                }))
+                .unwrap();
+                writer
+                    .add(&[lance_context_core::rollout_record_from_add_request(&dto)])
+                    .await
+                    .unwrap();
+                writer.flush().await.unwrap();
+                let mark = writer.own_shard_watermark().await.unwrap().unwrap();
+                assert!(mark.pending_generations > 0);
+                state
+                    .task_store
+                    .merge_coordinator()
+                    .publish_demand_event(
+                        target,
+                        &DemandEvent {
+                            v: 1,
+                            shard: mark.shard_id.to_string(),
+                            sealed_through: mark.sealed_through,
+                            sealed_bytes_through: 0,
+                            merged_through: mark.merged_through,
+                            merged_epoch: None,
+                            flushed_at_ms: chrono::Utc::now().timestamp_millis(),
+                            writer_epoch: mark.writer_epoch,
+                            source: EventSource::Writer,
+                            sealed_times: Default::default(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let mut next = cfg.clone();
+                next.catchup.target = Some(target.into());
+                next.catchup.job_name = Some(format!("shard-test-{mode}-{target}-{wave}"));
+                assert_eq!(
+                    execute(next, target).await.unwrap(),
+                    ExecuteOutcome::Completed
+                );
+                let after = writer.own_shard_watermark().await.unwrap().unwrap();
+                assert_eq!(after.pending_generations, 0);
+                assert_eq!(
+                    after.writer_epoch, mark.writer_epoch,
+                    "maintenance fenced a live writer"
+                );
+                let reader =
+                    RolloutStore::open_existing_with_options(&uri, RolloutStoreOptions::default())
+                        .await
+                        .unwrap();
+                assert_eq!(reader.list(None, None).await.unwrap().len(), wave + 1);
+            }
+            writer.close().await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires ETCD_TEST_ENDPOINTS"]
+async fn durable_demand_generic_merge_uses_physical_uuid_without_claiming_writer_epoch() {
+    use lance_context_api::schema_spec::{ColumnSpec, ColumnType, SchemaSpec};
+    use lance_context_core::{GenericStore, GenericStoreOptions};
+    use lance_context_merge::demand::{DemandEvent, EventSource};
+    let (_dir, state) = fixture().await.unwrap();
+    let uri = state.generic_uri("dynamic");
+    let mut writer = GenericStore::open(
+        &uri,
+        SchemaSpec::new(vec![
+            (
+                "id".into(),
+                ColumnSpec::required(ColumnType::String { large: false }),
+            ),
+            (
+                "text".into(),
+                ColumnSpec::new(ColumnType::String { large: true }),
+            ),
+        ]),
+        GenericStoreOptions {
+            shard_id: Some("unconfigured-generic-writer".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    for wave in 0..2 {
+        writer
+            .add(&[json!({"id": format!("wave-{wave}"), "text": "kept"})
+                .as_object()
+                .unwrap()
+                .clone()])
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        let mark = writer.own_shard_watermark().await.unwrap().unwrap();
+        state
+            .task_store
+            .merge_coordinator()
+            .publish_demand_event(
+                "generic:dynamic",
+                &DemandEvent {
+                    v: 1,
+                    shard: mark.shard_id.to_string(),
+                    sealed_through: mark.sealed_through,
+                    sealed_bytes_through: 0,
+                    merged_through: mark.merged_through,
+                    merged_epoch: None,
+                    flushed_at_ms: chrono::Utc::now().timestamp_millis(),
+                    writer_epoch: mark.writer_epoch,
+                    source: EventSource::Writer,
+                    sealed_times: Default::default(),
+                },
+            )
+            .await
+            .unwrap();
+        let mut cfg = state.config.clone();
+        cfg.catchup.enabled = false;
+        cfg.merge_rollout
+            .owned_targets
+            .push("generic:dynamic".into());
+        cfg.catchup.target = Some("generic:dynamic".into());
+        cfg.catchup.job_name = Some(format!("generic-shard-{wave}"));
+        assert_eq!(
+            execute(cfg, "generic:dynamic").await.unwrap(),
+            ExecuteOutcome::Completed
+        );
+        let after = writer.own_shard_watermark().await.unwrap().unwrap();
+        assert_eq!(after.pending_generations, 0);
+        assert_eq!(after.writer_epoch, mark.writer_epoch);
+        assert_eq!(
+            lance::Dataset::open(&uri)
+                .await
+                .unwrap()
+                .count_rows(None)
+                .await
+                .unwrap(),
+            wave + 1
+        );
+    }
+    writer.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires ETCD_TEST_ENDPOINTS"]
 async fn bulk_key_delete_native_executor_preserves_fenced_upserts_and_live_writers() {
     use lance_context_core::{RolloutStore, RolloutStoreOptions};
     for parallel in [false, true] {

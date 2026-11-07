@@ -21,33 +21,50 @@ use std::{
 /// that this shard will stay empty. Recheck all shards every fourth pass and
 /// whenever the previously productive set runs dry. State lasts one slice;
 /// another claim always starts by checking every configured writer again.
-struct ShardActivity(Vec<AtomicBool>);
+struct ShardActivity {
+    active: Vec<AtomicBool>,
+    observed: Vec<AtomicBool>,
+}
 
 impl ShardActivity {
     fn new(count: usize) -> Self {
-        Self((0..count).map(|_| AtomicBool::new(true)).collect())
+        Self {
+            active: (0..count).map(|_| AtomicBool::new(true)).collect(),
+            observed: (0..count).map(|_| AtomicBool::new(false)).collect(),
+        }
+    }
+
+    fn resize(&mut self, count: usize) {
+        self.active.resize_with(count, || AtomicBool::new(true));
+        self.observed.resize_with(count, || AtomicBool::new(false));
     }
 
     fn select(&self, pass: usize) -> Vec<usize> {
+        for observed in &self.observed {
+            observed.store(false, Ordering::Relaxed);
+        }
         let active: Vec<_> = self
-            .0
+            .active
             .iter()
             .enumerate()
             .filter_map(|(index, active)| active.load(Ordering::Relaxed).then_some(index))
             .collect();
         if pass.is_multiple_of(4) || active.is_empty() {
-            (0..self.0.len()).collect()
+            (0..self.active.len()).collect()
         } else {
             active
         }
     }
 
     fn record(&self, index: usize, reclaimed: usize) {
-        self.0[index].store(reclaimed > 0, Ordering::Relaxed);
+        self.active[index].store(reclaimed > 0, Ordering::Relaxed);
+        self.observed[index].store(true, Ordering::Relaxed);
     }
 
     fn caught_up(&self, selected: &[usize], reclaimed: usize) -> bool {
-        selected.len() == self.0.len() && reclaimed == 0
+        selected.len() == self.active.len()
+            && reclaimed == 0
+            && self.observed.iter().all(|v| v.load(Ordering::Relaxed))
     }
 }
 
@@ -206,15 +223,29 @@ pub(crate) async fn merge_local(
     // This is only an admission time slice. A progressing operation already
     // admitted may run beyond it; cancellation is based on lack of progress.
     let admit_for = Duration::from_secs(config.slice_secs);
-    let activity = ShardActivity::new(config.shards.len());
+    let mut shards: Vec<String> = config
+        .shards
+        .iter()
+        .map(|name| lance_context_core::derive_shard_id(Some(name)).to_string())
+        .collect();
+    let mut activity = ShardActivity::new(shards.len());
     // Bound each slice even under continuous ingestion. Resident masters publish
     // continuation demand before releasing their claim; no full scan is required.
     for pass in 0..16 {
+        if pass % 4 == 0 {
+            super::shards::refresh(state, target, &mut shards).await?;
+            activity.resize(shards.len());
+        }
         let selected = activity.select(pass);
         metrics::counter!("master_catchup_empty_shards_skipped_total")
-            .increment((config.shards.len() - selected.len()) as u64);
+            .increment((shards.len() - selected.len()) as u64);
         let prepare = |index: usize, reservation: Option<MergeReservation>| {
-            let shard = &config.shards[index];
+            let shard = &shards[index];
+            let log_shard = config
+                .shards
+                .get(index)
+                .map(String::as_str)
+                .unwrap_or(shard);
             let activity = &activity;
             let probe = &probe;
             let session = session.clone();
@@ -252,10 +283,10 @@ pub(crate) async fn merge_local(
                     metrics::counter!("master_catchup_generations_reclaimed_total")
                         .increment(reclaimed as u64);
                     if dedicated {
-                        tracing::info!(%target, %shard, reclaimed, prepare_secs, commit_secs,
+                        tracing::info!(%target, shard = %log_shard, reclaimed, prepare_secs, commit_secs,
                             "dedicated catch-up committed");
                     } else {
-                        tracing::info!(%target, %shard, reclaimed, prepare_secs, commit_secs,
+                        tracing::info!(%target, shard = %log_shard, reclaimed, prepare_secs, commit_secs,
                             "local WAL merge committed");
                     }
                     Ok(reclaimed)
@@ -263,23 +294,35 @@ pub(crate) async fn merge_local(
             }
         };
         let reclaimed = if config.grouped_targets.iter().any(|t| t == target) {
+            // Existing grouped indices retain their configured writer order.
+            // Discovered physical shards use the same bounded ordered pipeline
+            // and shared budget after that group; no extra parallel task pool.
+            let (configured, additional): (Vec<_>, Vec<_>) = selected
+                .iter()
+                .copied()
+                .partition(|index| *index < config.shards.len());
             let outcomes = super::grouped::run(
                 state,
                 target,
-                &selected,
+                &configured,
                 &probe,
                 session.clone(),
                 budget.clone(),
                 started + admit_for,
             )
             .await?;
-            outcomes
+            let grouped: usize = outcomes
                 .into_iter()
                 .map(|(index, reclaimed)| {
                     activity.record(index, reclaimed);
                     reclaimed
                 })
-                .sum()
+                .sum();
+            grouped
+                + run_pipeline(additional, config.pipeline_enabled, |index| {
+                    prepare(index, None)
+                })
+                .await?
         } else if config.staging_targets.iter().any(|t| t == target) {
             super::staging::run(
                 selected.iter().copied(),
@@ -304,6 +347,15 @@ pub(crate) async fn merge_local(
         }
         if activity.caught_up(&selected, reclaimed) && (total == 0 || started.elapsed() < admit_for)
         {
+            // A writer may have published its first seal while this pass ran.
+            // Never declare the old subset empty if durable demand adds a shard.
+            if super::shards::refresh(state, target, &mut shards).await? {
+                activity.resize(shards.len());
+                if started.elapsed() < admit_for {
+                    continue;
+                }
+                break;
+            }
             // Empty metadata reads can consume the admission slice too. They
             // must not create a self-sustaining chain of zero-work tasks;
             // bounded resident discovery will reassert any remaining demand.
@@ -335,7 +387,8 @@ async fn prepare_nonempty_shard(
     session: Arc<lance::session::Session>,
     budget: Arc<MergeMemoryBudget>,
 ) -> Result<Option<BoxFuture<'static, Result<usize>>>> {
-    prepare_nonempty_shard_reserved(state, target, shard, probe, session, budget, None).await
+    let physical = lance_context_core::derive_shard_id(Some(shard)).to_string();
+    prepare_nonempty_shard_reserved(state, target, &physical, probe, session, budget, None).await
 }
 
 async fn prepare_nonempty_shard_reserved(
@@ -351,7 +404,7 @@ async fn prepare_nonempty_shard_reserved(
     // Every check refreshes the manifest; an earlier empty result does not hide
     // a later flush. Errors retain the normal failure/recovery path.
     let pending = probe
-        .has_sealed_wal(shard)
+        .has_sealed_wal_uuid(shard)
         .await
         .map_err(|e| e.to_string())?;
     metrics::histogram!("master_catchup_shard_probe_seconds",
@@ -401,9 +454,10 @@ async fn prepare_shard(
             pending_generations_max: Some(0),
             ..Default::default()
         };
-        let mut store = GenericStore::open_existing(&state.generic_uri(name), options)
-            .await
-            .map_err(|e| e.to_string())?;
+        let mut store =
+            GenericStore::open_existing_for_merge_shard(&state.generic_uri(name), options, shard)
+                .await
+                .map_err(|e| e.to_string())?;
         // No resident writer was opened, so cleanup only sees sealed WAL.
         let staging = reservation.is_some();
         let prepared = match reservation {
@@ -446,7 +500,7 @@ async fn prepare_shard(
             ..Default::default()
         };
         let mut store =
-            RolloutStore::open_existing_with_options(&state.rollout_uri(target), options)
+            RolloutStore::open_existing_for_merge_shard(&state.rollout_uri(target), options, shard)
                 .await
                 .map_err(|e| e.to_string())?;
         let staging = reservation.is_some();
@@ -581,6 +635,22 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::{Notify, Semaphore};
 
+    #[test]
+    fn admission_skips_do_not_establish_empty_coverage() {
+        let mut activity = ShardActivity::new(1);
+        let first = activity.select(0);
+        activity.record(0, 0);
+        assert!(activity.caught_up(&first, 0));
+        activity.resize(2);
+        let selected = activity.select(4);
+        activity.record(0, 0);
+        assert!(!activity.caught_up(&selected, 0));
+        activity.record(1, 0);
+        assert!(activity.caught_up(&selected, 0));
+        let next = activity.select(8);
+        assert!(!activity.caught_up(&next, 0));
+    }
+
     #[tokio::test]
     #[ignore = "requires ETCD_TEST_ENDPOINTS; local metadata benchmark"]
     async fn empty_preflight_storage_benchmark() {
@@ -694,7 +764,10 @@ mod tests {
                                     .await?
                                     .unwrap_or_else(|| Box::pin(async { Ok(0) })))
                                 } else {
-                                    prepare_shard(state, target, shard, session, budget, None).await
+                                    let physical = lance_context_core::derive_shard_id(Some(shard))
+                                        .to_string();
+                                    prepare_shard(state, target, &physical, session, budget, None)
+                                        .await
                                 }
                             }
                         },

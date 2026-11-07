@@ -509,6 +509,21 @@ impl RolloutStore {
         Self::open_inner(uri, options, false).await
     }
 
+    /// Open a fresh maintenance handle for a physical WAL shard. Does not
+    /// acquire a writer epoch. The caller must retain its normal merge fence.
+    /// Unlike `options.shard_id`, `shard_uuid` is not hashed as a writer name.
+    pub async fn open_existing_for_merge_shard(
+        uri: &str,
+        options: RolloutStoreOptions,
+        shard_uuid: &str,
+    ) -> LanceResult<Self> {
+        let shard = uuid::Uuid::parse_str(shard_uuid)
+            .map_err(|_| LanceError::invalid_input("invalid physical WAL shard UUID"))?;
+        let mut store = Self::open_existing_with_options(uri, options).await?;
+        store.base.write_shard = shard;
+        Ok(store)
+    }
+
     async fn open_inner(
         uri: &str,
         options: RolloutStoreOptions,
