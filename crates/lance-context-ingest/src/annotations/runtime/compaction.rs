@@ -18,6 +18,18 @@ impl Publisher {
                 // but defer other index work and compaction until it finishes.
                 return Ok(false);
             }
+            // Preparation has not claimed a publication plan. Give a full
+            // source window the same single deferral as new maintenance below,
+            // retaining this job for rebasing after the data publication. Keep
+            // the debt until maintenance finishes so sustained writes cannot
+            // keep delaying this completed index.
+            if self.service.source_observation().records != 0
+                && self.service.apply_backpressure().is_some()
+                && !self.maintenance_deferred_for_pressure
+            {
+                self.maintenance_deferred_for_pressure = true;
+                return Ok(false);
+            }
             let current = materializer::compaction::read_compaction_base(
                 &self.catalog,
                 view.progress.minimum_read_version,
