@@ -587,8 +587,8 @@ impl Service {
         };
         let producer_slot = slot(prepared.meta(), self.ingress.client.producer_slots())?;
         // Share the upload only while its caller awaits apply. This registration
-        // proves neither acceptance nor ordering; the driver still observes both
-        // quorum barriers and reserves its workspace before using these bytes.
+        // proves neither acceptance nor ordering; the driver still checks the
+        // committed source metadata and closure, then reserves apply workspace.
         let _local = self
             .shared
             .local_payloads
