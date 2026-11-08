@@ -9,7 +9,9 @@
 //! allocation, hold outbound ownership through transmission, and implement
 //! snapshot transfer and maintenance. This module is the worker layer, not a
 //! network listener, automatic maintenance scheduler, or complete ingestion service.
-use super::{producer, publication as p, query, source, Node, Outcome, Packet, Status};
+use super::{
+    producer, publication as p, query, source, source_read, Node, Outcome, Packet, Status,
+};
 use crate::record::{Batch, RecordKind};
 use anyhow::{ensure, Context, Result};
 use protobuf::Message as _;
@@ -295,6 +297,7 @@ enum Work {
     Append(u64, Batch, Instant, Completion<Outcome>),
     Commit(u64, Box<Command>, Completion<Outcome>),
     Query(u64, query::Query, Completion<query::Outcome>),
+    ReadSource(source_read::Request, Completion<source_read::Observation>),
     Campaign(Completion<()>),
     #[cfg(feature = "peer-transport")]
     Fetch(u64, Instant, Completion<Option<Batch>>),
@@ -523,6 +526,37 @@ impl Handle {
         )?;
         Ok(Pending(receive))
     }
+    /// Consume a bounded, already applied source prefix. The observation can
+    /// lag a newer leader and is never a quorum read or publication authority.
+    pub fn read_source(
+        &self,
+        group: u64,
+        request: source_read::Request,
+    ) -> Result<Pending<source_read::Observation>> {
+        let route = self.route(group)?;
+        ensure!(
+            (1..=128).contains(&request.limit),
+            "invalid committed source bounds"
+        );
+        let credit = self
+            .shared
+            .control
+            .reserve(256 * request.limit + 1024 + source::MAX_CLOSED_BYTES)?;
+        let (reply, receive) = oneshot::channel();
+        self.enqueue(
+            route,
+            Work::ReadSource(
+                request,
+                Completion {
+                    reply,
+                    _credit: credit,
+                },
+            ),
+            false,
+        )?;
+        Ok(Pending(receive))
+    }
+
     /// Starts an election; success is not a leadership or durability receipt.
     pub fn campaign(&self, group: u64) -> Result<Pending<()>> {
         let route = self.route(group)?;
@@ -840,6 +874,11 @@ impl Worker {
                     reply.finish(Err(e));
                 }
             },
+            Work::ReadSource(request, reply) => {
+                // Like Fetch, this reads only previously durable applied state.
+                // It does not release a pending commit or fresh quorum read.
+                reply.finish(self.node.read_source(self.group, &request));
+            }
             Work::Campaign(reply) => match self.node.campaign(self.group) {
                 Ok(()) => after_poll.push(Box::new(move || reply.finish(Ok(())))),
                 Err(e) => {

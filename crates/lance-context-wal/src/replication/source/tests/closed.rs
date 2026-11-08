@@ -151,6 +151,54 @@ fn close(c: &mut Cluster, permit: ClosurePermit) -> Result<Reply> {
 }
 
 #[test]
+fn committed_source_page_captures_published_closure_and_live_suffix_after_reopen() -> Result<()> {
+    let (mut c, pin, incarnation, predecessor) = fixture()?;
+    let permit = publish(&mut c, incarnation, predecessor)?;
+    c.append(c.table, 3)?;
+    assert!(matches!(close(&mut c, permit)?, Reply::Closed { .. }));
+    for reopened in [false, true] {
+        if reopened {
+            for node in &mut c.nodes[3..] {
+                let prepared = node.prepare_checkpoint(20, Uuid::new_v4())?.run()?;
+                node.install_checkpoint(prepared)?;
+            }
+            c.reopen()?;
+        }
+        let observed = c.nodes[3].read_source(
+            20,
+            &crate::replication::source_read::Request {
+                table: c.table,
+                bucket: 1,
+                after: 0,
+                limit: 128,
+            },
+        )?;
+        let crate::replication::source_read::Value::Page { page, closure } = &observed.value else {
+            anyhow::bail!("expected a committed source page");
+        };
+        let closure = closure.as_ref().context("missing durable source closure")?;
+        assert_eq!(
+            closure.permit.closure().through,
+            pin.selection().range.through
+        );
+        assert_eq!(closure.permit.closure().incarnation, incarnation);
+        assert_eq!(page.through, observed.applied);
+        assert_eq!(page.entries.len(), 1);
+        assert!(page.entries[0].0 > pin.selection().range.through);
+        assert_eq!(page.entries[0].1.sequence, 3);
+        assert_eq!(page.entries[0].1.stream, c.table);
+        assert_eq!(page.entries[0].1.bucket, 1);
+        assert_eq!(
+            bincode::deserialize::<crate::replication::source_read::Observation>(
+                &bincode::serialize(&observed)?
+            )?,
+            observed
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn closure_retires_selected_payloads_preserves_suffix_and_rejects_delayed_pins() -> Result<()> {
     let (mut c, pin, incarnation, predecessor) = fixture()?;
     assert!(closure_permit(&mut c, pin.selection().plan_index)?.is_none());

@@ -1,4 +1,4 @@
-//! Reuse an in-flight upload only after its exact metadata is quorum-observed.
+//! Reuse an in-flight upload only after its exact metadata is committed.
 use super::*;
 use std::{collections::BTreeMap, sync::Weak};
 

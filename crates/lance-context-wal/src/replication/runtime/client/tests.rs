@@ -15,6 +15,7 @@ mod observation;
 mod publication_window;
 mod reconnect;
 mod routing;
+mod source_read;
 
 struct RpcCluster {
     net: Cluster,

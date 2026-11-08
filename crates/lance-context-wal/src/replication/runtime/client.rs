@@ -4,7 +4,7 @@
 //! capacity. Append metadata and opaque Bytes travel separately in one exchange;
 //! only the durable runtime completion produces a commit response. This is a
 //! trusted service boundary, not end-user table authorization or leader routing.
-use super::{query, Command, Handle, Outcome, Pending, Work};
+use super::{query, source_read, Command, Handle, Outcome, Pending, Work};
 use crate::{
     placement::Layout,
     record::{Batch, BatchMeta},
@@ -131,14 +131,34 @@ pub enum Request {
     Status {
         group: u64,
     },
+    /// Background replay only: an applied prefix, never proof of current state.
+    ReadSource {
+        group: u64,
+        request: source_read::Request,
+    },
 }
 #[derive(Debug, Serialize, Deserialize)]
 enum WireRequest {
-    Append { group: u64, meta: BatchMeta },
+    Append {
+        group: u64,
+        meta: BatchMeta,
+    },
     Control(Box<Command>),
-    Query { group: u64, query: query::Query },
-    Fetch { group: u64, index: u64 },
-    Status { group: u64 },
+    Query {
+        group: u64,
+        query: query::Query,
+    },
+    Fetch {
+        group: u64,
+        index: u64,
+    },
+    Status {
+        group: u64,
+    },
+    ReadSource {
+        group: u64,
+        request: source_read::Request,
+    },
 }
 impl WireRequest {
     fn data(&self) -> bool {
@@ -162,6 +182,7 @@ impl WireRequest {
             Self::Append { group, .. } => (*group, "append"),
             Self::Fetch { group, .. } => (*group, "fetch"),
             Self::Status { group } => (*group, "status"),
+            Self::ReadSource { group, .. } => (*group, "read_source"),
             Self::Control(command) => (
                 command.group(catalog),
                 match command.as_ref() {
@@ -216,6 +237,8 @@ pub enum Reply {
     /// An earlier attempt with the same identity may already have committed.
     /// This does not resolve that attempt or permit changing its identity/bytes.
     AppendNotSubmittedDiskBudget,
+    /// Distinct from Query::Observed: this carries no fresh-quorum receipt.
+    Source(source_read::Observation),
 }
 /// Holds receive credit through consumption of metadata and a fetched payload.
 /// Cloning body Bytes transfers shared ownership, so callers retaining clones
@@ -557,7 +580,9 @@ async fn serve_one<S: AsyncRead + AsyncWrite + Unpin>(
 }
 async fn execute(handle: &Handle, request: WireRequest, body: Bytes) -> Result<(Reply, Bytes)> {
     let group = match &request {
-        WireRequest::Append { group, .. } | WireRequest::Query { group, .. } => Some(*group),
+        WireRequest::Append { group, .. }
+        | WireRequest::Query { group, .. }
+        | WireRequest::ReadSource { group, .. } => Some(*group),
         WireRequest::Control(command) => Some(command.group(handle.catalog)),
         _ => None,
     };
@@ -585,6 +610,9 @@ async fn execute(handle: &Handle, request: WireRequest, body: Bytes) -> Result<(
             Reply::Commit(handle.commit(*command)?.await?)
         }
         WireRequest::Query { group, query } => Reply::Query(handle.query(group, query)?.await?),
+        WireRequest::ReadSource { group, request } => {
+            Reply::Source(handle.read_source(group, request)?.await?)
+        }
         WireRequest::Fetch { group, index } => {
             Reply::Record(handle.read_accepted(group, index)?.await?.map(|batch| {
                 output = batch.body;
@@ -809,6 +837,7 @@ impl Client {
                 Request::Append { group, .. }
                 | Request::Query { group, .. }
                 | Request::Fetch { group, .. }
+                | Request::ReadSource { group, .. }
                 | Request::Status { group } => *group,
                 Request::Commit(command) => command.group(self.catalog),
             };
@@ -861,7 +890,7 @@ impl Client {
                         let next = voters[(voters.iter().position(|id| *id == node).unwrap() + 1)
                             % voters.len()];
                         self.leaders.lock().unwrap().insert(group, next);
-                        if matches!(&request, Request::Query { .. })
+                        if matches!(&request, Request::Query { .. } | Request::ReadSource { .. })
                             && matches!(
                                 response.reply,
                                 Reply::Unknown | Reply::Query(query::Outcome::Unknown)
@@ -916,12 +945,18 @@ impl Client {
             Request::Query { group, query } => (WireRequest::Query { group, query }, Bytes::new()),
             Request::Fetch { group, index } => (WireRequest::Fetch { group, index }, Bytes::new()),
             Request::Status { group } => (WireRequest::Status { group }, Bytes::new()),
+            Request::ReadSource { group, request } => {
+                (WireRequest::ReadSource { group, request }, Bytes::new())
+            }
         };
         let data = wire.data();
         let (group, operation) = wire.diagnostic(self.catalog);
         let read_only = matches!(
             wire,
-            WireRequest::Query { .. } | WireRequest::Fetch { .. } | WireRequest::Status { .. }
+            WireRequest::Query { .. }
+                | WireRequest::Fetch { .. }
+                | WireRequest::Status { .. }
+                | WireRequest::ReadSource { .. }
         );
         let fetch = matches!(wire, WireRequest::Fetch { .. });
         let append = matches!(wire, WireRequest::Append { .. });
@@ -938,6 +973,7 @@ impl Client {
             WireRequest::Query { .. } => 1,
             WireRequest::Fetch { .. } => 2,
             WireRequest::Status { .. } => 3,
+            WireRequest::ReadSource { .. } => 4,
         };
         let expected = Scope {
             cluster: self.cluster,
@@ -1023,6 +1059,7 @@ impl Client {
                                 | (Reply::Query(_), 1)
                                 | (Reply::Record(_), 2)
                                 | (Reply::Status(_), 3)
+                                | (Reply::Source(_), 4)
                         ),
                     "unexpected response type"
                 );
