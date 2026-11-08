@@ -239,7 +239,7 @@ impl AnnotationStaging {
         {
             return Err(invalid("invalid annotation staging scope or limits"));
         }
-        let published_values = published_values::PublishedValues::new(&base);
+        let published_values = published_values::PublishedValues::new(&base, materialized);
         let (base, views) = views::Registry::new(base);
         Ok(Self {
             scope,
@@ -677,7 +677,11 @@ impl PointRead {
                 materialized,
             } => match published.get_at(turn, *materialized).await {
                 Some(value) => Ok(Some(value.value.clone())),
-                None => published.read_base(base, turn, self.value_bytes).await,
+                None => {
+                    published
+                        .read_base(base, turn, *materialized, self.value_bytes)
+                        .await
+                }
             },
         }
     }
