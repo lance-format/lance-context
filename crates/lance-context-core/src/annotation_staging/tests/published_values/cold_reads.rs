@@ -139,9 +139,13 @@ async fn cold_read_cache_eviction_and_disabled_cache_keep_native_fallback() -> R
 async fn concurrent_cold_reads_share_one_native_lookup() -> Result<()> {
     let root = tempfile::tempdir()?;
     let (base, throttle) = opened(&root.path().join("turns.lance"), 8 << 20).await?;
+    let warmup = AnnotationStaging::new(base.clone(), scope(), 0, Limits::default())?;
+    let expected = current(&warmup, "T").await?;
+    // Measure a single lookup with the same warm file metadata as the
+    // concurrent group, but a fresh annotation-value namespace.
     let reference = AnnotationStaging::new(base.clone(), scope(), 0, Limits::default())?;
     let before = throttle.ops.load(Ordering::Relaxed);
-    let expected = current(&reference, "T").await?;
+    assert_eq!(current(&reference, "T").await?, expected);
     let single_read_ops = throttle.ops.load(Ordering::Relaxed) - before;
     assert!(single_read_ops > 0);
 
@@ -172,7 +176,7 @@ async fn concurrent_cold_reads_share_one_native_lookup() -> Result<()> {
     }
     let concurrent_ops = throttle.ops.load(Ordering::Relaxed) - before;
     println!("cold_point_concurrent readers=16 single_data_operations={single_read_ops} concurrent_data_operations={concurrent_ops}");
-    assert!(concurrent_ops <= single_read_ops);
+    assert_eq!(concurrent_ops, single_read_ops);
     assert_eq!(staging.observation().await.readers, 0);
     Ok(())
 }
