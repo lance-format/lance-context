@@ -54,7 +54,7 @@ async fn delayed_cold_read_cannot_poison_a_newly_published_snapshot() -> Result<
     let (base, throttle) = opened(&root.path().join("turns.lance"), 8 << 20).await?;
     let session = base.session().clone();
     let staging = Arc::new(AnnotationStaging::new(base, scope(), 0, Limits::default())?);
-    let old = staging.capture("T").await?;
+    let old = Arc::new(staging.capture("T").await?);
     staging
         .apply(
             0,
@@ -75,7 +75,10 @@ async fn delayed_cold_read_cannot_poison_a_newly_published_snapshot() -> Result<
 
     let before = throttle.ops.load(Ordering::Relaxed);
     throttle.frozen.store(true, Ordering::Relaxed);
-    let pending = tokio::spawn(async move { old.resolve().await });
+    let pending = tokio::spawn({
+        let old = old.clone();
+        async move { old.resolve().await }
+    });
     let concurrent = async {
         tokio::time::timeout(Duration::from_secs(5), async {
             while throttle.ops.load(Ordering::Relaxed) == before {
@@ -98,10 +101,12 @@ async fn delayed_cold_read_cannot_poison_a_newly_published_snapshot() -> Result<
     let old_value = old_value.unwrap();
     assert_eq!(old_value.status.as_deref(), Some("pending"));
     assert_eq!(old_value.score, None);
+    // Populate after clear even if the cache invalidated the in-flight loader.
+    assert_eq!(old.resolve().await?, Some(old_value));
     let current = current(&staging, "T").await?;
     assert_eq!(current.status.as_deref(), Some("reviewed"));
     assert_eq!(current.score, Some(0.9));
-    drop((prepared, frozen));
+    drop((old, prepared, frozen));
     assert_eq!(staging.observation().await.retained_bytes, 0);
     assert_eq!(staging.protected_bases().await?.datasets().count(), 1);
     Ok(())
