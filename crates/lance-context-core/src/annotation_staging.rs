@@ -677,7 +677,7 @@ impl PointRead {
                 materialized,
             } => match published.get_at(turn, *materialized).await {
                 Some(value) => Ok(Some(value.value.clone())),
-                None => read_base(base, turn, self.value_bytes).await,
+                None => published.read_base(base, turn, self.value_bytes).await,
             },
         }
     }

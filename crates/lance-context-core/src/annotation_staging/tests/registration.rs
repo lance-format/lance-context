@@ -4,6 +4,7 @@ use arrow_array::UInt64Array;
 use lance::dataset::transaction::Operation;
 use lance_core::{ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION};
 
+mod cold_reads;
 mod lookup;
 mod patch_lookup;
 

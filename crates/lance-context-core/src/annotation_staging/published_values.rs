@@ -34,6 +34,34 @@ impl CacheKey for Key<'_> {
     }
 }
 
+struct SnapshotKey<'a> {
+    version: u64,
+    turn: &'a str,
+}
+
+impl CacheKey for SnapshotKey<'_> {
+    type ValueType = SnapshotValue;
+
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Owned(format!("{}/{}", self.version, self.turn))
+    }
+
+    fn type_name() -> &'static str {
+        "lance-context.snapshot-annotation"
+    }
+}
+
+struct SnapshotValue {
+    value: Option<TurnAnnotation>,
+    charge: usize,
+}
+
+impl DeepSizeOf for SnapshotValue {
+    fn deep_size_of_children(&self, _: &mut Context) -> usize {
+        self.charge
+    }
+}
+
 impl PublishedValues {
     pub fn new(base: &Dataset) -> Self {
         let session = base.session();
@@ -59,6 +87,38 @@ impl PublishedValues {
         // Warming precedes the base switch, and an older read may resolve after
         // later publications. Never substitute a future value for its base.
         (value.through <= materialized).then_some(value)
+    }
+
+    /// Cache cold point results only for their exact immutable base. This uses
+    /// the same bounded session cache and staging-instance prefix as published
+    /// values, but a separate key type: a delayed old read cannot overwrite the
+    /// current value or hide a later insertion. Entries own no base/reader pins.
+    pub async fn read_base(
+        &self,
+        base: &Dataset,
+        turn: &str,
+        value_bytes: usize,
+    ) -> Result<Option<TurnAnnotation>> {
+        let Some(cache) = &self.0 else {
+            return super::read_base(base, turn, value_bytes).await;
+        };
+        let value = cache
+            .get_or_insert_with_key(
+                SnapshotKey {
+                    version: base.version_id(),
+                    turn,
+                },
+                || async {
+                    let value = super::read_base(base, turn, value_bytes).await?;
+                    let charge = match &value {
+                        Some(value) => charge(turn, value)?,
+                        None => 512 + turn.len(),
+                    };
+                    Ok(SnapshotValue { value, charge })
+                },
+            )
+            .await?;
+        Ok(value.value.clone())
     }
 
     pub async fn remember(&self, values: &Values, through: u64) -> Result<()> {
