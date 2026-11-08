@@ -6,6 +6,7 @@ use lance_io::object_store::ObjectStoreParams;
 use std::{sync::atomic::Ordering, time::Duration};
 
 mod cold_reads;
+mod current_reads;
 mod reads;
 
 async fn opened(path: &std::path::Path, cache_bytes: usize) -> Result<(Arc<Dataset>, Throttle)> {
