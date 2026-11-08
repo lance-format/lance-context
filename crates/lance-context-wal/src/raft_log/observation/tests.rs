@@ -6,6 +6,37 @@ use raft_proto::eraftpb::{Entry, HardState};
 use std::collections::BTreeMap;
 
 #[test]
+fn sync_wait_covers_the_interval_after_acquisition_starts() {
+    let gate = std::sync::Arc::new(std::sync::Mutex::new(()));
+    let held = gate.lock().unwrap();
+    let writer_gate = gate.clone();
+    let (entered, started) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        // Signal inside acquire, after its clock starts. Merely observing the
+        // preceding disk append would race a worker not yet at the sync gate.
+        drop(acquire(Gate::Sync, || {
+            entered.send(()).unwrap();
+            writer_gate.lock().unwrap()
+        }));
+        snapshot()
+    });
+    started
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    let held_since = std::time::Instant::now();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let held_micros = held_since.elapsed().as_micros() as u64;
+    drop(held);
+    let observed = writer.join().unwrap();
+    assert_eq!(observed.sync.attempts, 1);
+    assert!(observed.sync.elapsed_micros >= held_micros);
+    assert_eq!(
+        observed.sync.elapsed_micros,
+        observed.sync.max_elapsed_micros
+    );
+}
+
+#[test]
 fn real_write_counts_each_gate_without_leaking_to_another_thread() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let layout = Layout {
