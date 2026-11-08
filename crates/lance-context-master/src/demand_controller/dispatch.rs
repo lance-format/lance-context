@@ -1390,6 +1390,104 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires isolated ETCD_TEST_ENDPOINTS"]
+    async fn small_resident_pool_rearms_without_starving_waiting_ticket() {
+        for exact in [true, false] {
+            let (_dir, mut cfg, store, leader) = setup().await;
+            cfg.local_merge.master_local_merge_auto = true;
+            cfg.local_merge.master_local_merge_targets = vec!["*".into()];
+            cfg.maintenance.fence_legacy_maintenance = true;
+            cfg.merge_rollout.fence_legacy = true;
+            if exact {
+                cfg.maintenance.wal_claim_targets = vec!["wanted".into()];
+            }
+            let receiver = TaskStore::open(&cfg).await.unwrap();
+            let mut tickets = Vec::new();
+            for executor in ["older", "waiting"] {
+                tickets.push(
+                    store
+                        .create_dispatch_ticket(
+                            serde_json::to_vec(&Ticket::new(
+                                &cfg,
+                                executor,
+                                "resident_merge",
+                                TaskKinds::MERGE_WAL,
+                                true,
+                            ))
+                            .unwrap(),
+                        )
+                        .await
+                        .unwrap(),
+                );
+            }
+            let publisher = store.discovery_publisher(&leader);
+            for round in 0..6 {
+                let wanted = store
+                    .enqueue(TaskKind::MergeWal, "wanted", vec![])
+                    .await
+                    .unwrap();
+                // Even a full cache rebuild resets both paging cursors. The
+                // actual claim must consume its ticket, allowing the other
+                // resident to win before the successful executor rearms.
+                let mut cache = list(store.etcd_client(), cfg.etcd.prefix()).await.unwrap();
+                assert!(place(&publisher, cfg.etcd.prefix(), &mut cache)
+                    .await
+                    .unwrap());
+                let chosen = round % 2;
+                let offer = offer_for(&store, &cfg, &tickets[chosen]).await;
+                assert_eq!(offer.task_id, wanted.id);
+                let admission = Arc::new(admission::Admission::default());
+                let operation = admission.try_admit_named("resident_merge").unwrap();
+                let claim = receiver
+                    .claim_assignment(
+                        &offer,
+                        TaskKinds::MERGE_WAL,
+                        Some(&["*".into()]),
+                        &operation,
+                    )
+                    .await
+                    .unwrap()
+                    .expect("eligible resident claims its exact offer");
+                assert!(
+                    store
+                        .etcd_client()
+                        .clone()
+                        .get(tickets[chosen].key(), None)
+                        .await
+                        .unwrap()
+                        .kvs()
+                        .is_empty(),
+                    "canonical claim consumes the ticket"
+                );
+                receiver
+                    .finish(claim, Ok("isolated scheduler receipt".into()))
+                    .await
+                    .unwrap();
+                let replacement = store
+                    .create_dispatch_ticket(
+                        serde_json::to_vec(&Ticket::new(
+                            &cfg,
+                            if chosen == 0 { "older" } else { "waiting" },
+                            "resident_merge",
+                            TaskKinds::MERGE_WAL,
+                            true,
+                        ))
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert!(replacement.key() > tickets[1 - chosen].key());
+                let old = std::mem::replace(&mut tickets[chosen], replacement);
+                store.release_coordination_lock(old).await.unwrap();
+            }
+            for ticket in tickets {
+                store.release_coordination_lock(ticket).await.unwrap();
+            }
+            store.release_coordination_lock(leader).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated ETCD_TEST_ENDPOINTS"]
     async fn assignment_is_exact_and_running_task_survives_leader_and_ticket_loss() {
         let (_dir, cfg, store, leader) = setup().await;
         store
