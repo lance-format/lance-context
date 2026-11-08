@@ -54,6 +54,14 @@ impl Runtime {
         self.publisher.publish_next().await
     }
 
+    #[cfg(test)]
+    pub(crate) fn index_preparation_finished_for_test(&self) -> Option<bool> {
+        self.publisher
+            .index_preparation
+            .as_ref()
+            .map(materializer::annotation_index::Preparation::is_finished)
+    }
+
     /// Enable data/manifest/transaction collection for an exclusively owned, unbranched
     /// table (both destinations for mixed ingestion). Readers must check ownership after materializing their response,
     /// as the annotation HTTP Owner does. Independently served Services, raw
