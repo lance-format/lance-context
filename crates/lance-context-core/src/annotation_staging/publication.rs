@@ -147,9 +147,10 @@ impl AnnotationStaging {
         }
         // These keys are still masked by frozen (or newer active) values.
         // Cancellation during cache insertion therefore leaves the old view
-        // valid. Only this installation writes the cache: a delayed read of an
-        // old base must never replace a newer published value. Cached copies
-        // own no staging permits or base handles.
+        // valid. Only this installation writes the current-value cache; cold
+        // reads use separate exact-snapshot keys. A delayed old read must never
+        // replace a newer published value. Neither cache owns staging permits
+        // or base handles.
         self.published_values
             .remember(&generation.values, generation.through)
             .await?;
