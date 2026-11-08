@@ -14,7 +14,7 @@ impl Publisher {
                 "index job overlaps a retained plan"
             );
             if !job.is_finished() {
-                // Native ID I/O owns no catalog plan. Continue draining data,
+                // Native index I/O owns no catalog plan. Continue draining data,
                 // but defer other index work and compaction until it finishes.
                 return Ok(false);
             }
@@ -23,12 +23,19 @@ impl Publisher {
                 view.progress.minimum_read_version,
             )
             .await?;
-            let descriptors = self
+            let Some(descriptors) = self
                 .index_preparation
                 .take()
                 .unwrap()
                 .finish(&current)
-                .await?;
+                .await?
+            else {
+                // Every status fragment changed while the job was preparing.
+                // Its unselected files may be collected; leave the latest
+                // uncovered fragments eligible for the next maintenance turn.
+                self.maintenance_deferred_for_pressure = false;
+                return Ok(false);
+            };
             let plan = p::Plan {
                 transaction: Uuid::new_v4(),
                 read_version: current.version_id(),
@@ -157,7 +164,7 @@ impl Publisher {
                 .get_or_insert_with(tokio::time::Instant::now);
             if !body_preferred {
                 if let Some(job) =
-                    materializer::turn_id_index::start(&self.catalog, plan.read_version).await?
+                    materializer::annotation_index::start(&self.catalog, plan.read_version).await?
                 {
                     self.index_preparation = Some(job);
                     return Ok(false);

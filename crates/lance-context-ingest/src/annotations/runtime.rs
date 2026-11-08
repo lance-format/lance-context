@@ -39,7 +39,7 @@ struct Publisher {
     compaction_started: Option<tokio::time::Instant>,
     compaction_checked_version: Option<u64>,
     maintenance_deferred_for_pressure: bool,
-    index_preparation: Option<materializer::turn_id_index::Preparation>,
+    index_preparation: Option<materializer::annotation_index::Preparation>,
     reclamation: Option<reclamation::Collector>,
 }
 
@@ -307,7 +307,7 @@ impl Runtime {
     /// continues. Failed outcomes pause new publication until that sealed page
     /// clears; applied values remain readable. Only immutable DELETE requests repeat;
     /// this loop never invents a request or blindly retries failed mutations.
-    /// One admitted native ID-index writer can outlive cancellation, retaining
+    /// One admitted native annotation index writer can outlive cancellation, retaining
     /// its workspace until completion. It cannot publish a manifest itself.
     pub async fn run(mut self, shutdown: impl Future<Output = ()>) -> Result<()> {
         tokio::pin!(shutdown);

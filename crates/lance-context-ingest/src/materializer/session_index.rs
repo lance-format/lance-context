@@ -374,6 +374,74 @@ pub(super) async fn rebase_turn(
     Ok(rebased)
 }
 
+/// Keep only fragments whose entire physical input is still unchanged. Status
+/// is mutable: matching IDs or equal current values cannot certify old pages.
+/// Native status indexes already mask withdrawn fragments through this bitmap.
+pub(super) async fn rebase_status(
+    source: &Dataset,
+    target: &Dataset,
+    descriptors: &p::Descriptors,
+) -> Result<Option<p::Descriptors>> {
+    ensure!(
+        source.uri() == target.uri()
+            && source.schema() == target.schema()
+            && source.version_id() <= target.version_id(),
+        "status index snapshot binding changed"
+    );
+    let Operation::CreateIndex { new_indices, .. } =
+        operation_for(source, descriptors, Key::Status).await?
+    else {
+        unreachable!("index descriptor decoder returns CreateIndex")
+    };
+    let mut index = new_indices[0].clone();
+    let mut coverage = index.fragment_bitmap.as_ref().unwrap().clone();
+    for id in index.fragment_bitmap.as_ref().unwrap().iter() {
+        let original = source
+            .get_fragment(id as usize)
+            .context("status index source fragment missing")?;
+        if !target
+            .get_fragment(id as usize)
+            .is_some_and(|current| current.metadata() == original.metadata())
+        {
+            coverage.remove(id);
+        }
+    }
+    if coverage.is_empty() {
+        return Ok(None);
+    }
+    index.fragment_bitmap = Some(coverage);
+    index.dataset_version = target.version_id();
+    let mut change: Change = serde_json::from_slice(&descriptors.bytes)?;
+    if !change.removed.is_empty() {
+        // Native updates may remove an exhausted definition entirely. There
+        // is nothing left to retire for those UUIDs. A single surviving live
+        // segment is no longer an admitted consolidation: discard this output
+        // rather than weakening the ordinary descriptor decoder's bound.
+        let current = target.load_indices().await?;
+        change
+            .removed
+            .retain(|id| current.iter().any(|index| index.uuid == *id));
+        if change.removed.len() == 1
+            && current.iter().any(|index| {
+                index.uuid == change.removed[0]
+                    && index
+                        .fragment_bitmap
+                        .as_ref()
+                        .is_some_and(|coverage| !coverage.is_empty())
+            })
+        {
+            return Ok(None);
+        }
+    }
+    change.read_version = target.version_id();
+    change.index = pb::IndexMetadata::from(&index).encode_to_vec();
+    let rebased = p::Descriptors::lance_index(Bytes::from(serde_json::to_vec(&change)?))?;
+    // Consolidation may replace only the same source UUIDs and their current
+    // surviving coverage. Also reject newly installed overlapping segments.
+    operation_for(target, &rebased, Key::Status).await?;
+    Ok(Some(rebased))
+}
+
 pub(super) async fn operation(
     dataset: &Dataset,
     descriptors: &p::Descriptors,

@@ -9,6 +9,7 @@ use object_store::path::Path as ObjectPath;
 use std::collections::{BTreeMap, HashMap};
 
 mod advance;
+pub(crate) mod annotation_index;
 mod close;
 pub(crate) mod compaction;
 pub mod observation;

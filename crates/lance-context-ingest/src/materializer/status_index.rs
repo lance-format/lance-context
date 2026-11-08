@@ -69,7 +69,11 @@ impl StatusIndex {
         Ok(None)
     }
 
-    async fn action(&self, dataset: &Dataset, min_rows: usize) -> Result<Option<Action>> {
+    pub(super) async fn action(
+        &self,
+        dataset: &Dataset,
+        min_rows: usize,
+    ) -> Result<Option<Action>> {
         TurnIdIndex::validate_base(dataset)?;
         let fragments: BTreeMap<_, _> = dataset
             .fragments()
