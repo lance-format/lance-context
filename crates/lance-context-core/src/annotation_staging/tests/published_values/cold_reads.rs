@@ -79,7 +79,7 @@ async fn delayed_cold_read_cannot_poison_a_newly_published_snapshot() -> Result<
         let old = old.clone();
         async move { old.resolve().await }
     });
-    let concurrent = async {
+    let concurrent = tokio::time::timeout(Duration::from_secs(10), async {
         tokio::time::timeout(Duration::from_secs(5), async {
             while throttle.ops.load(Ordering::Relaxed) == before {
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -93,11 +93,11 @@ async fn delayed_cold_read_cannot_poison_a_newly_published_snapshot() -> Result<
         // after this clear, exercising the cold path for the new base too.
         session.file_metadata_cache().clear().await;
         Ok::<_, Error>(())
-    }
+    })
     .await;
     throttle.frozen.store(false, Ordering::Relaxed);
     let old_value = pending.await.map_err(|e| invalid(e.to_string()))??;
-    concurrent?;
+    concurrent.map_err(|_| invalid("publication blocked behind old cold read"))??;
     let old_value = old_value.unwrap();
     assert_eq!(old_value.status.as_deref(), Some("pending"));
     assert_eq!(old_value.score, None);
