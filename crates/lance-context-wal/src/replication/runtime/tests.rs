@@ -14,6 +14,7 @@ mod images;
 #[cfg(feature = "service")]
 mod maintenance;
 mod peer_rejections;
+mod source_read;
 
 // Actual dedicated workers and durable engines. This relay deliberately drops
 // selected links; it is not the production peer transport or a throughput test.

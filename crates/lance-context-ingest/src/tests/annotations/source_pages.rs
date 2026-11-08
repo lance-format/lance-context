@@ -116,8 +116,8 @@ async fn source_pages_preserve_apply_order_pressure_and_concurrent_publication()
     drop((prepared, frozen));
 
     // A successful metadata read cannot authorize advancing an obsolete base
-    // after its required source prefix has been retired. Check this even when
-    // the two quorum observations can finish in either order.
+    // after its required source prefix has been retired. Check the closure
+    // captured with the page before fetching any payload or advancing apply.
     let error = stale_driver.step_for_test().await.unwrap_err();
     assert!(format!("{error:#}").contains("view is behind source closure"));
     assert_eq!(stale.observation().await.0.applied, stale_initial);

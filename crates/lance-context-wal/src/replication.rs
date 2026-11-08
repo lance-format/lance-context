@@ -23,6 +23,7 @@ pub mod query;
 #[cfg(feature = "runtime")]
 pub mod runtime;
 pub mod source;
+pub mod source_read;
 mod state;
 #[cfg(test)]
 mod tests;

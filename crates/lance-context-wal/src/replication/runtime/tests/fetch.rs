@@ -1,10 +1,11 @@
 use super::*;
+use crate::replication::source_read;
 
 /// A local committed read must not wait for the *next* unrelated sync. It is
 /// neither a fresh quorum observation nor an acknowledgement of a new append.
 #[test]
-fn committed_fetch_finishes_before_a_later_failed_sync_without_acknowledging_new_data() -> Result<()>
-{
+fn committed_fetch_and_source_finish_before_a_later_failed_sync_without_acknowledging_new_data(
+) -> Result<()> {
     let executor = tokio::runtime::Runtime::new()?;
     for pipeline_replication in [false, true] {
         let directory = tempfile::tempdir()?;
@@ -69,6 +70,15 @@ fn committed_fetch_finishes_before_a_later_failed_sync_without_acknowledging_new
         })?;
         let existing = handle.read_accepted(10, original_index)?;
         let uncommitted = handle.read_accepted(10, proposed_index)?;
+        let source = handle.read_source(
+            10,
+            source_read::Request {
+                table: original.meta.stream,
+                bucket: original.meta.bucket,
+                after: 0,
+                limit: 1,
+            },
+        )?;
         let held_since = Instant::now();
         thread::sleep(Duration::from_millis(20));
         let held_micros = held_since.elapsed().as_micros() as u64;
@@ -80,6 +90,7 @@ fn committed_fetch_finishes_before_a_later_failed_sync_without_acknowledging_new
 
         let existing_ready = !existing.0.is_empty();
         let uncommitted_ready = !uncommitted.0.is_empty();
+        let source_ready = !source.0.is_empty();
         let new_append_unacknowledged = pending.0.is_empty();
         let fetch = handle.observation(10)?.fetch;
         assert_eq!(fetch.completed, 2);
@@ -93,6 +104,7 @@ fn committed_fetch_finishes_before_a_later_failed_sync_without_acknowledging_new
         drop(blocked);
         let existing_result = executor.block_on(existing);
         let uncommitted_result = executor.block_on(uncommitted);
+        let source_result = executor.block_on(source);
         assert!(executor
             .block_on(async { timeout(Duration::from_secs(5), pending).await })?
             .is_err());
@@ -119,8 +131,19 @@ fn committed_fetch_finishes_before_a_later_failed_sync_without_acknowledging_new
             uncommitted_ready,
             "absent local row waited for an unrelated sync"
         );
-        assert_eq!(existing_result?, Some(original));
+        assert_eq!(existing_result?, Some(original.clone()));
         assert!(uncommitted_result?.is_none());
+        assert!(
+            source_ready,
+            "committed source waited for an unrelated sync"
+        );
+        let observed = source_result?;
+        assert!(observed.applied < proposed_index);
+        let source_read::Value::Page { page, closure } = observed.value else {
+            anyhow::bail!("expected a committed source page");
+        };
+        assert_eq!(page.entries, vec![(original_index, original.meta)]);
+        assert!(closure.is_none());
     }
     Ok(())
 }

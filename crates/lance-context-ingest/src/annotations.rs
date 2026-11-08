@@ -15,6 +15,7 @@ use lance_context_core::annotation_staging::{
     Scope as StagingScope,
 };
 use lance_context_wal::replication::publication::lance::ManagedManifest;
+use lance_context_wal::replication::source_read;
 use std::{collections::VecDeque, future::Future, sync::Mutex};
 use tokio::sync::watch;
 
@@ -677,6 +678,14 @@ impl Service {
         let query::Value::SourceClosure(closed) = value else {
             bail!("source closure unavailable");
         };
+        self.check_source_closure(closed.as_deref())?;
+        Ok(cut.quorum_index)
+    }
+
+    fn check_source_closure(
+        &self,
+        closed: Option<&lance_context_wal::replication::source::Closed>,
+    ) -> Result<()> {
         if let Some(closed) = closed {
             let closure = closed.permit.closure();
             ensure!(
@@ -687,7 +696,7 @@ impl Service {
                 "annotation view is behind source closure; reconnect to its durable checkpoint"
             );
         }
-        Ok(cut.quorum_index)
+        Ok(())
     }
 
     async fn wait_through(&self, through: u64) -> Result<()> {
@@ -771,38 +780,50 @@ impl Driver {
                 self.source_page = None;
             }
             if self.source_page.is_none() {
-                let (cut, value) = service
+                let response = service
                     .shared
                     .phases
-                    .measure(Phase::AnnotationObserve, async {
-                        // Validate both observations before consuming a page.
-                        // Its cursor belongs to its own captured cut; closure
-                        // independently checks that our recovery base is usable.
-                        let (_, observed) = tokio::try_join!(
-                            service.barrier(),
-                            reader::observe(
-                                ingress,
-                                service.group()?,
-                                query::Query::AcceptedBucket {
-                                    table: ingress.scope.table,
-                                    bucket: service.bucket(),
-                                    after,
-                                    limit: 32,
-                                },
-                            )
-                        )?;
-                        Ok::<_, anyhow::Error>(observed)
-                    })
+                    .measure(
+                        Phase::AnnotationObserve,
+                        ingress.client.request_routed(Request::ReadSource {
+                            group: service.group()?,
+                            request: source_read::Request {
+                                table: ingress.scope.table,
+                                bucket: service.bucket(),
+                                after,
+                                limit: 32,
+                            },
+                        }),
+                    )
                     .await?;
-                let query::Value::Accepted(mut page) = value else {
+                let Reply::Source(observed) = response.reply else {
                     bail!("annotation source page unavailable");
                 };
+                ensure!(
+                    observed.cluster == ingress.scope.cluster
+                        && observed.layout == ingress.scope.layout
+                        && observed.group == service.group()?,
+                    "foreign committed annotation source"
+                );
+                let (mut page, closure) = match observed.value {
+                    source_read::Value::Page { page, closure } => (page, closure),
+                    source_read::Value::CursorAhead => {
+                        ensure!(observed.applied < after, "invalid lagging source cursor");
+                        // A replica behind our cursor cannot prove catch-up.
+                        // Keep application progress and all authority checks.
+                        return Ok(());
+                    }
+                };
+                // This is a possibly old committed prefix, not a fresh quorum
+                // receipt. Page and closure share one durable applied state;
+                // check the base before fetching or advancing the cursor.
+                service.check_source_closure(closure.as_deref())?;
                 if let Some(cut) = replay_cut {
                     page.through = page.through.min(cut);
                     page.entries.retain(|(index, _)| *index <= cut);
                 }
                 ensure!(
-                    page.through >= after && page.through <= cut.applied,
+                    page.through >= after && page.through <= observed.applied,
                     "invalid annotation source cursor"
                 );
                 ensure!(page.entries.len() <= 32, "oversized annotation source page");
