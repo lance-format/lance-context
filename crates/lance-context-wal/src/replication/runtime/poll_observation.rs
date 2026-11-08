@@ -16,6 +16,9 @@ pub struct PollObservation {
     pub elapsed_micros: u64,
     pub max_elapsed_micros: u64,
     pub engine: EngineWriteObservation,
+    /// Write-path wrapper waits on this worker, sampled after a successful poll.
+    /// These are excluded from `engine` timings and overlap poll elapsed time.
+    pub storage_wait: crate::raft_log::StorageWaitObservation,
 }
 
 /// Native thread-local write totals captured after the last successful poll.
@@ -42,6 +45,7 @@ impl PollObservation {
         self.elapsed_micros = self.elapsed_micros.saturating_add(elapsed);
         self.max_elapsed_micros = self.max_elapsed_micros.max(elapsed);
         if success {
+            self.storage_wait = crate::raft_log::wait_observation();
             let native = raft_engine::get_perf_context();
             self.engine = EngineWriteObservation {
                 populate_micros: micros(native.log_populating_duration),
@@ -54,8 +58,8 @@ impl PollObservation {
         } else {
             self.failed = self.failed.saturating_add(1);
             // A native write panic can interrupt restoration of its TLS perf
-            // context. Keep the last successful snapshot; the worker stops on
-            // this error and must not present partial native timings as totals.
+            // context. Keep both last successful snapshots; the worker stops
+            // on this error and must not present partial timings as totals.
         }
     }
 }

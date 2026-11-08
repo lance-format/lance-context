@@ -32,6 +32,7 @@ fn pipelined_append_reaches_a_follower_during_blocked_leader_sync_without_ack() 
         )?;
         let handle = runtime.handle();
         let blocked = store.block_sync_for_test();
+        let before_wait = handle.observation(10)?.durable_poll.storage_wait;
         if fail_sync {
             store.fail_next_sync_for_test();
         }
@@ -76,6 +77,7 @@ fn pipelined_append_reaches_a_follower_during_blocked_leader_sync_without_ack() 
         executor.block_on(wait_for(|| {
             store.appended_index_for_test() == Some(original_index)
         }))?;
+        let held_since = Instant::now();
         // The second destination cannot bypass a held packet's node-wide slot.
         assert!(handle.peer_drops().0 > 0);
         assert_eq!(handle.shared.outgoing.slots.available_permits(), 0);
@@ -93,6 +95,7 @@ fn pipelined_append_reaches_a_follower_during_blocked_leader_sync_without_ack() 
         assert!(pending.0.is_empty(), "quorum response bypassed leader sync");
         drop(outgoing);
         assert_eq!(handle.shared.outgoing.slots.available_permits(), 1);
+        let held_micros = held_since.elapsed().as_micros() as u64;
         drop(blocked);
         let outcome =
             executor.block_on(async { timeout(Duration::from_secs(5), pending).await })?;
@@ -101,9 +104,26 @@ fn pipelined_append_reaches_a_follower_during_blocked_leader_sync_without_ack() 
             executor.block_on(wait_for(|| {
                 handle.observation(10).unwrap().stopped && handle.observation(20).unwrap().stopped
             }))?;
+            assert_eq!(
+                handle.observation(10)?.durable_poll.storage_wait,
+                before_wait,
+                "failed poll published partial storage wait counters"
+            );
             assert!(executor.block_on(runtime.shutdown()).is_err());
         } else {
             assert_eq!(index(outcome?), original_index);
+            executor.block_on(wait_for(|| {
+                handle
+                    .observation(10)
+                    .unwrap()
+                    .durable_poll
+                    .storage_wait
+                    .sync
+                    .attempts
+                    > before_wait.sync.attempts
+            }))?;
+            let observed = handle.observation(10)?.durable_poll.storage_wait;
+            assert!(observed.sync.max_elapsed_micros >= held_micros);
             executor.block_on(runtime.shutdown())?;
         }
         drop(outbox);
