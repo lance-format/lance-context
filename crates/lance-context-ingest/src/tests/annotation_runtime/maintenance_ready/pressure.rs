@@ -1,6 +1,8 @@
 use super::*;
 use crate::annotations::{ApplyBackpressure, Completed};
 
+mod prepared;
+
 async fn blocked_update(
     runtime: &mut Runtime,
     service: &Service,
