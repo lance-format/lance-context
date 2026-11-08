@@ -5,6 +5,7 @@ use raft_proto::eraftpb::{Message, MessageType};
 use uuid::Uuid;
 
 mod checkpoint_hints;
+mod checkpoint_reclamation;
 mod retired_images;
 
 fn disk() -> DiskOptions {
