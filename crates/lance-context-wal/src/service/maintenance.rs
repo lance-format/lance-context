@@ -97,6 +97,16 @@ pub(crate) async fn run(
             return Ok(());
         }
         for &group in &groups {
+            // A previous checkpoint can make native segments reclaimable.
+            // Do not defer an already due pass behind every remaining group's
+            // image capture/build/install; those files still occupy producer
+            // admission. Keep the existing cadence and joined worker lane.
+            if background.last_log.elapsed() >= Duration::from_millis(options.log_interval_ms) {
+                background.maintain().await;
+                if *background.stop.borrow() {
+                    return Ok(());
+                }
+            }
             let observed = handle.observation(group)?;
             ensure!(
                 !observed.stopped && observed.failure.is_none(),
