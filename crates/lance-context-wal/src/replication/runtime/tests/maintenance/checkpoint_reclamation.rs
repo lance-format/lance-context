@@ -41,6 +41,8 @@ fn due_log_reclamation_precedes_another_groups_checkpoint() -> Result<()> {
         Ok::<_, anyhow::Error>(c)
     })?;
     let mut records = Vec::new();
+    let mut other_value = batch(1);
+    other_value.meta.bucket = 1;
     let other = executor.block_on(async {
         for sequence in 1..=32 {
             let value = Batch::new(
@@ -52,7 +54,7 @@ fn due_log_reclamation_precedes_another_groups_checkpoint() -> Result<()> {
             );
             records.push((commit(&c.handles[&1], 10, value.clone()).await?, value));
         }
-        let other = commit(&c.handles[&1], 20, batch(1)).await?;
+        let other = commit(&c.handles[&1], 20, other_value.clone()).await?;
         let through = records.last().unwrap().0;
         wait_for(|| {
             c.handles.values().all(|h| {
@@ -137,7 +139,7 @@ fn due_log_reclamation_precedes_another_groups_checkpoint() -> Result<()> {
         for (index, expected) in &records {
             assert_eq!(node.read_accepted(10, *index)?, Some(expected.clone()));
         }
-        assert_eq!(node.read_accepted(20, other)?, Some(batch(1)));
+        assert_eq!(node.read_accepted(20, other)?, Some(other_value.clone()));
     }
     let after = reclaimed?;
     eprintln!("native bytes before={before}, after={after}; all RF3 records reopened");
