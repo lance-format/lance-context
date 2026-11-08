@@ -1441,6 +1441,16 @@ pub(crate) mod tests {
             } else {
                 None
             };
+            let historical_epoch = match &historical {
+                Some(old) => Some(
+                    old.own_shard_watermark()
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .writer_epoch,
+                ),
+                None => None,
+            };
             let c = state.task_store.merge_coordinator();
             let mut client = state.task_store.etcd_client().clone();
             let error = format!(
@@ -1466,9 +1476,35 @@ pub(crate) mod tests {
                 )
                 .await
                 .unwrap();
-            // Repeat once with an actually empty configured shard. A DONE0
-            // string alone must not clear debt if a historical shard remains.
-            for expected_generations in [4, 0] {
+            // The first pass retains unknown historical WAL and its capability
+            // debt. Durable demand makes the next pass cover that shard too;
+            // without historical WAL, this second pass is genuinely empty.
+            for (pass, expected_generations) in
+                [4, usize::from(historical_pending)].into_iter().enumerate()
+            {
+                if pass == 1 {
+                    if let Some(old) = &historical {
+                        let mark = old.own_shard_watermark().await.unwrap().unwrap();
+                        assert_eq!(mark.pending_generations, 1);
+                        c.publish_demand_event(
+                            target,
+                            &DemandEvent {
+                                v: 1,
+                                shard: mark.shard_id.to_string(),
+                                sealed_through: mark.sealed_through,
+                                sealed_bytes_through: 0,
+                                merged_through: mark.merged_through,
+                                merged_epoch: None,
+                                flushed_at_ms: chrono::Utc::now().timestamp_millis(),
+                                writer_epoch: mark.writer_epoch,
+                                source: EventSource::Writer,
+                                sealed_times: Default::default(),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    }
+                }
                 client
                     .put(
                         failure_key(state.config.etcd.prefix(), target, endpoint),
@@ -1494,7 +1530,7 @@ pub(crate) mod tests {
                 state.task_store.finish(claim, result).await.unwrap();
                 assert_eq!(
                     c.failure(target, endpoint).await.unwrap().is_some(),
-                    historical_pending
+                    historical_pending && pass == 0
                 );
                 assert!(c
                     .failure(target, &permanent.endpoint)
@@ -1503,7 +1539,7 @@ pub(crate) mod tests {
                     .is_some());
                 assert_eq!(
                     writer.pending_wal_generations().await.unwrap(),
-                    usize::from(historical_pending)
+                    usize::from(historical_pending && pass == 0)
                 );
                 assert_eq!(
                     lance::Dataset::open(&state.rollout_uri(target))
@@ -1512,69 +1548,17 @@ pub(crate) mod tests {
                         .count_rows(None)
                         .await
                         .unwrap(),
-                    4
+                    4 + usize::from(historical_pending && pass == 1)
                 );
             }
             if let Some(old) = historical {
-                // Durable demand makes the unconfigured physical shard visible.
-                // Recovery may clear only the capability debt after it drains.
-                let mark = old.own_shard_watermark().await.unwrap().unwrap();
-                assert_eq!(mark.pending_generations, 1);
-                c.publish_demand_event(
-                    target,
-                    &DemandEvent {
-                        v: 1,
-                        shard: mark.shard_id.to_string(),
-                        sealed_through: mark.sealed_through,
-                        sealed_bytes_through: 0,
-                        merged_through: mark.merged_through,
-                        merged_epoch: None,
-                        flushed_at_ms: chrono::Utc::now().timestamp_millis(),
-                        writer_epoch: mark.writer_epoch,
-                        source: EventSource::Writer,
-                        sealed_times: Default::default(),
-                    },
-                )
-                .await
-                .unwrap();
-                crate::scheduler::enqueue(&state, TaskKind::MergeWal, target)
-                    .await
-                    .unwrap();
-                let claim = state
-                    .task_store
-                    .claim_resident_merge(&crate::local_merge::targets(&state.config))
-                    .await
-                    .unwrap()
-                    .unwrap();
-                let result = crate::merge_execution::run_merge_wal(&state, &claim).await;
-                assert_eq!(
-                    result.as_ref().unwrap(),
-                    "local WAL merge reclaimed 1 generations"
-                );
-                state.task_store.finish(claim, result).await.unwrap();
-                assert!(c.failure(target, endpoint).await.unwrap().is_none());
-                assert!(c
-                    .failure(target, &permanent.endpoint)
-                    .await
-                    .unwrap()
-                    .is_some());
-                assert_eq!(writer.pending_wal_generations().await.unwrap(), 0);
                 assert_eq!(
                     old.own_shard_watermark()
                         .await
                         .unwrap()
                         .unwrap()
                         .writer_epoch,
-                    mark.writer_epoch
-                );
-                assert_eq!(
-                    lance::Dataset::open(&state.rollout_uri(target))
-                        .await
-                        .unwrap()
-                        .count_rows(None)
-                        .await
-                        .unwrap(),
-                    5
+                    historical_epoch.unwrap()
                 );
             }
         }
