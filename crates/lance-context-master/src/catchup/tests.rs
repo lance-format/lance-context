@@ -440,6 +440,13 @@ async fn durable_demand_discovers_unconfigured_writers_across_tables_and_executo
         // identifies these writers; each execute constructs a fresh master.
         assert_eq!(cfg.catchup.shards, ["worker-0", "worker-1"]);
         for target in ["hot", "other", "third"] {
+            let inventory = Inventory::new(&state);
+            let job = inventory
+                .reserve(target, "dynamic-shard-coverage", 1, 100)
+                .await
+                .unwrap()
+                .job
+                .expect("dedicated executor requires a reserved catch-up owner");
             let uri = state.rollout_uri(target);
             let mut writer = RolloutStore::open_with_options(
                 &uri,
@@ -485,7 +492,7 @@ async fn durable_demand_discovers_unconfigured_writers_across_tables_and_executo
                     .unwrap();
                 let mut next = cfg.clone();
                 next.catchup.target = Some(target.into());
-                next.catchup.job_name = Some(format!("shard-test-{mode}-{target}-{wave}"));
+                next.catchup.job_name = Some(job.clone());
                 assert_eq!(
                     execute(next, target).await.unwrap(),
                     ExecuteOutcome::Completed
@@ -503,6 +510,14 @@ async fn durable_demand_discovers_unconfigured_writers_across_tables_and_executo
                 assert_eq!(reader.list(None, None).await.unwrap().len(), wave + 1);
             }
             writer.close().await.unwrap();
+            inventory
+                .complete(
+                    &inventory.get(target).await.unwrap().unwrap(),
+                    JobOutcome::Succeeded,
+                    200,
+                )
+                .await
+                .unwrap();
         }
     }
 }
@@ -515,6 +530,12 @@ async fn durable_demand_generic_merge_uses_physical_uuid_without_claiming_writer
     use lance_context_merge::demand::{DemandEvent, EventSource};
     let (_dir, state) = fixture().await.unwrap();
     let uri = state.generic_uri("dynamic");
+    let job = Inventory::new(&state)
+        .reserve("generic:dynamic", "dynamic-shard-coverage", 1, 100)
+        .await
+        .unwrap()
+        .job
+        .expect("dedicated executor requires a reserved catch-up owner");
     let mut writer = GenericStore::open(
         &uri,
         SchemaSpec::new(vec![
@@ -570,7 +591,7 @@ async fn durable_demand_generic_merge_uses_physical_uuid_without_claiming_writer
             .owned_targets
             .push("generic:dynamic".into());
         cfg.catchup.target = Some("generic:dynamic".into());
-        cfg.catchup.job_name = Some(format!("generic-shard-{wave}"));
+        cfg.catchup.job_name = Some(job.clone());
         assert_eq!(
             execute(cfg, "generic:dynamic").await.unwrap(),
             ExecuteOutcome::Completed
