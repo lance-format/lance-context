@@ -65,6 +65,11 @@ async fn mixed_descriptor_body_reads_distinguish_warm_and_uncached_sessions() ->
         assert_eq!(faults.body_write_attempts.load(Ordering::SeqCst), writes);
         if cache_bytes == 0 {
             assert!(observations.iter().all(|(gets, _)| *gets > 0));
+        } else {
+            assert_eq!(
+                observations[1].0, 0,
+                "warm body validation must reuse cached manifests"
+            );
         }
         eprintln!(
             "{}",
@@ -74,6 +79,52 @@ async fn mixed_descriptor_body_reads_distinguish_warm_and_uncached_sessions() ->
                 "descriptor_format": 4,
             }})
         );
+        // A warmed manifest must not bypass transaction identity checks.
+        let mut foreign = prepared.annotations().merge().transaction.clone();
+        let properties = Arc::make_mut(foreign.transaction_properties.as_mut().unwrap());
+        let mut reference: BodySnapshot =
+            serde_json::from_str(&properties[BODY_SNAPSHOT_PROPERTY])?;
+        let manifest_version = reference.version;
+        reference.transaction = Uuid::new_v4().to_string();
+        properties.insert(
+            BODY_SNAPSHOT_PROPERTY.into(),
+            serde_json::to_string(&reference)?,
+        );
+        let foreign = lance_context_wal::replication::publication::Descriptors::lance_annotations(
+            bytes::Bytes::from(prost::Message::encode_to_vec(
+                &lance_table::format::pb::Transaction::from(&foreign),
+            )),
+        )?;
+        assert!(crate::annotation_publication::mixed::resolve(
+            prepared.annotations().base(),
+            &foreign,
+            &selection,
+            &narrow,
+            &body,
+        )
+        .await
+        .is_err());
+        if cache_bytes > 0 {
+            // Cache residency is not evidence that the durable manifest exists.
+            let path = ManifestNamingScheme::V2.manifest_path(
+                &Path::from_absolute_path(root.path().join("body.lance"))?,
+                manifest_version,
+            );
+            object_store::ObjectStoreExt::delete(
+                &object_store::local::LocalFileSystem::new(),
+                &path,
+            )
+            .await?;
+            assert!(crate::annotation_publication::mixed::persist_descriptors(
+                prepared.annotations(),
+                &selection,
+                &narrow,
+                &body,
+                c.client.max_descriptor_bytes(),
+            )
+            .await
+            .is_err());
+        }
         drop((prepared, frozen));
         stop.send(()).unwrap();
         task.await??;

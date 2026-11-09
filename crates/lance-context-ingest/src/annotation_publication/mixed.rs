@@ -4,6 +4,7 @@ use lance_context_core::annotation_staging::{BodySnapshot, BODY_SNAPSHOT_PROPERT
 use lance_table::format::Fragment;
 
 pub mod maintenance;
+mod reader;
 
 fn inserts(transaction: &Transaction) -> &[Fragment] {
     match &transaction.operation {
@@ -264,6 +265,7 @@ async fn load_body(
     let body = lance::dataset::builder::DatasetBuilder::from_uri(&storage.uri)
         .with_storage_options(storage.options.clone())
         .with_session(storage.session.clone())
+        .with_commit_handler(Arc::new(reader::BodyManifestReader))
         .with_version(reference.version)
         .load()
         .await?;
