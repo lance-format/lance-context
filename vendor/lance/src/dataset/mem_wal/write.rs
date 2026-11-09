@@ -1147,16 +1147,9 @@ impl BackpressureController for LocalBackpressureController {
     /// Blocks while this shard's unflushed bytes are at or above
     /// `max_unflushed_memtable_bytes`, waiting on the oldest flush.
     ///
-    /// Returns [`Error::Backpressure`] in the one case where blocking would
-    /// never end: over the ceiling with no flush outstanding and nothing
-    /// draining in the background, for `STALL_GRACE` running. Only a write
-    /// starts a flush, and this valve is what holds writes out, so the wait
-    /// would have no event to end on. The
-    /// error names the breakdown, because the two ways to get there — a flush
-    /// that failed and left its generation charged, or index memory carrying a
-    /// memtable past the ceiling while the seal trigger still sees small row
-    /// bytes — are both configuration or operational conditions an operator has
-    /// to act on rather than wait out.
+    /// Returns [`Error::Backpressure`] when no flush attempt is outstanding
+    /// for `STALL_GRACE`. Failed generations remain retained for background
+    /// retry; reject this write instead of holding it until that retry runs.
     async fn maybe_apply_backpressure(&self, shard: ShardMemory) -> Result<()> {
         let start = std::time::Instant::now();
         let mut iteration = 0u32;
@@ -1219,11 +1212,10 @@ impl BackpressureController for LocalBackpressureController {
                         continue;
                     }
                     return Err(Error::backpressure(format!(
-                        "shard is at its memtable ceiling with no flush outstanding, so waiting \
-                         cannot drain it: unflushed_bytes={}, max={}, active_bytes={} (of which \
-                         index_bytes={}), frozen_bytes={}. The active memtable seals on resident \
-                         bytes, so reaching here means a flush failed and left its generation \
-                         charged with nothing queued to retry it",
+                        "shard is at its memtable ceiling with no flush attempt outstanding: \
+                         unflushed_bytes={}, max={}, active_bytes={} (of which index_bytes={}), \
+                         frozen_bytes={}. Failed generations remain retained for retry; \
+                         retry this write after flush progress",
                         unflushed_memtable_bytes,
                         self.max_unflushed_memtable_bytes,
                         shard.active_bytes(),
