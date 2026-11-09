@@ -51,9 +51,18 @@ impl FrozenCheckpoint {
                     let prior = BodySnapshot::read(self.annotations.base())
                         .await?
                         .context("mixed base has no body reference")?;
-                    let base = Arc::new(
-                        open_body(storage, self.annotations.base(), &prior.table_instance).await?,
+                    ensure!(
+                        prior.uri == storage.uri,
+                        "body snapshot differs from the authorized destination"
                     );
+                    // This frozen base already selects the immutable body. An
+                    // update-only cut needs neither a body open nor its writer
+                    // allowance; paired publication validates the unchanged
+                    // reference and requires zero inserted narrow rows.
+                    if self.annotations.new_turns().next().is_none() {
+                        return Ok::<_, anyhow::Error>(prior);
+                    }
+                    let base = Arc::new(load_body(storage, &prior, &prior.table_instance).await?);
                     let reservation = workspace.reserve(workspace.limit() / 2).await;
                     let mut selection = BTreeMap::<u64, Vec<(u32, &str)>>::new();
                     for (turn, source) in self.annotations.new_turns() {

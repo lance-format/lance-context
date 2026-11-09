@@ -73,7 +73,41 @@ async fn mixed_body_preparation_does_not_read_back_its_successful_commit() -> Re
     drop(prepared);
     pressure::publish_frozen(&c, &a, &narrow, &body, frozen).await?;
     check(&a, "A", "s", 1, "reviewed", Some(0.9)).await?;
-    pressure::publish(&c, &a, &narrow, &body).await?;
+    let update_only = a.freeze(Uuid::new_v4()).await?.unwrap();
+    faults.manifest_gets.lock().unwrap().clear();
+    let writes = faults
+        .body_write_attempts
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let prepared = update_only
+        .prepare_mixed(&MergeMemoryBudget::new(8 << 20), 8192)
+        .await?;
+    assert!(
+        faults.manifest_gets.lock().unwrap().is_empty(),
+        "annotation-only preparation must not reopen the unchanged body snapshot"
+    );
+    assert_eq!(
+        faults
+            .body_write_attempts
+            .load(std::sync::atomic::Ordering::SeqCst),
+        writes,
+        "annotation-only preparation must not write body files"
+    );
+    let unchanged: BodySnapshot = serde_json::from_str(
+        &prepared
+            .annotations()
+            .merge()
+            .transaction
+            .transaction_properties
+            .as_ref()
+            .unwrap()[BODY_SNAPSHOT_PROPERTY],
+    )?;
+    assert_eq!(unchanged, reference);
+    drop(prepared);
+    pressure::publish_frozen(&c, &a, &narrow, &body, update_only).await?;
+    assert!(
+        faults.manifest_gets.lock().unwrap().is_empty(),
+        "annotation-only publication must keep the original body reference without reopening it"
+    );
     let latest = annotation_publication::read(&c, &narrow, None).await?;
     assert_eq!(BodySnapshot::read(&latest).await?, Some(reference));
     assert_eq!(latest.count_rows(None).await?, 1);
