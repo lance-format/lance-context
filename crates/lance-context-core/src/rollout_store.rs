@@ -8469,6 +8469,160 @@ mod tests {
         compaction_btree_maintenance(false).await;
     }
 
+    /// Local warm-filesystem microbenchmark, not a cloud throughput guarantee.
+    /// Run explicitly with --ignored --nocapture --test-threads=1.
+    #[tokio::test]
+    #[ignore]
+    async fn benchmark_prepared_incremental_btree() {
+        use lance::index::{DatasetIndexExt as _, DatasetIndexInternalExt as _};
+        use lance_index::{scalar::ScalarIndexParams, IndexType};
+
+        const BASE_ROWS: usize = 262_144;
+        const BATCH_ROWS: usize = 8192;
+        const DELTA_ROWS: usize = 2621;
+        let record = |i: usize| {
+            // Unsorted, unique fixed-width keys with more than a shared prefix.
+            let mixed = (i as u64).wrapping_mul(0x9e3779b97f4a7c15);
+            assistant_record(&format!("{mixed:016x}-rollout-benchmark-{i:016x}"))
+        };
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut writer = RolloutStore::open(uri).await.unwrap();
+        for start in (0..BASE_ROWS).step_by(BATCH_ROWS) {
+            let batch: Vec<_> = (start..start + BATCH_ROWS).map(record).collect();
+            writer.add(&batch).await.unwrap();
+            writer.flush().await.unwrap();
+            writer.cleanup_own_shard().await.unwrap();
+        }
+        writer.create_id_btree_index().await.unwrap();
+        let compact = writer
+            .prepare_compaction(CompactionConfig {
+                target_rows_per_fragment: 32_768,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(!compact.is_empty());
+        writer.commit_prepared_compaction(compact).await.unwrap();
+        writer
+            .add(
+                &(BASE_ROWS..BASE_ROWS + DELTA_ROWS)
+                    .map(record)
+                    .collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        writer.cleanup_own_shard().await.unwrap();
+        let version = writer.version();
+        let expected_rows = BASE_ROWS + DELTA_ROWS;
+        assert_eq!(
+            writer.base.dataset.count_rows(None).await.unwrap(),
+            expected_rows
+        );
+        assert_eq!(
+            writer
+                .base
+                .dataset
+                .unindexed_fragments(ROLLOUT_ID_INDEX_NAME)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let mut last_prepared = None;
+        // Alternate ordering; all runs use fresh sessions on the same immutable
+        // source snapshot. OS caches are intentionally not flushed.
+        for (sample, incremental) in [false, true, true, false, false, true]
+            .into_iter()
+            .enumerate()
+        {
+            let scope = crate::merge_write_scope::MergeWriteScope::for_legacy_file_observation();
+            let reader = scope
+                .run(RolloutStore::open_existing_with_options(
+                    uri,
+                    RolloutStoreOptions::default(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(reader.version(), version);
+            let object_store = reader.base.dataset.object_store(None).await.unwrap();
+            let tracker = object_store.io_tracker();
+            let before = tracker.stats();
+            let started = std::time::Instant::now();
+            if incremental {
+                last_prepared = Some(scope.run(reader.prepare_id_key_index()).await.unwrap());
+            } else {
+                let mut snapshot = reader.base.dataset.clone();
+                scope
+                    .run(async {
+                        snapshot
+                            .create_index_builder(
+                                &["id"],
+                                IndexType::BTree,
+                                &ScalarIndexParams::default(),
+                            )
+                            .name(ROLLOUT_ID_INDEX_NAME.to_string())
+                            .replace(true)
+                            .execute_uncommitted()
+                            .await
+                            .unwrap()
+                    })
+                    .await;
+            }
+            let elapsed = started.elapsed().as_secs_f64();
+            let after = tracker.stats();
+            assert!(after.read_bytes > before.read_bytes);
+            assert!(after.written_bytes > before.written_bytes);
+            assert_eq!(Dataset::open(uri).await.unwrap().version().version, version);
+            let memory: Vec<_> = std::fs::read_to_string("/proc/self/status")
+                .unwrap_or_default()
+                .lines()
+                .filter(|line| line.starts_with("VmRSS:") || line.starts_with("VmHWM:"))
+                .map(str::to_owned)
+                .collect();
+            println!(
+                "INDEX_BENCH {}",
+                serde_json::json!({
+                    "sample": sample, "mode": if incremental {"incremental"} else {"full"},
+                    "base_rows": BASE_ROWS, "delta_rows": DELTA_ROWS,
+                    "seconds": elapsed, "read_bytes": after.read_bytes - before.read_bytes,
+                    "written_bytes": after.written_bytes - before.written_bytes,
+                    "read_iops": after.read_iops - before.read_iops,
+                    "write_iops": after.write_iops - before.write_iops,
+                    "process_memory": memory,
+                    "memory_scope": "RSS after sample; HWM cumulative over fixture and all modes"
+                })
+            );
+        }
+        writer
+            .commit_prepared_id_key_index(last_prepared.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            writer.base.dataset.count_rows(None).await.unwrap(),
+            expected_rows
+        );
+        assert!(writer
+            .base
+            .dataset
+            .unindexed_fragments(ROLLOUT_ID_INDEX_NAME)
+            .await
+            .unwrap()
+            .is_empty());
+        for i in [
+            0,
+            BASE_ROWS / 2,
+            BASE_ROWS - 1,
+            BASE_ROWS,
+            expected_rows - 1,
+        ] {
+            let id = record(i).id;
+            assert_eq!(writer.get_by_id(&id).await.unwrap().unwrap().id, id);
+        }
+    }
+
     #[tokio::test]
     async fn prepared_compaction_retains_btree_for_prepared_incremental_maintenance() {
         compaction_btree_maintenance(true).await;
