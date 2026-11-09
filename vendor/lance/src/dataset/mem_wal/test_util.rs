@@ -35,6 +35,11 @@ pub struct FailControls {
     simulate_lost_ack: AtomicBool,
     /// WAL-entry `put_opts` attempts observed, for assertions.
     wal_put_attempts: AtomicUsize,
+    /// Fail generation-manifest publication after its data files were written.
+    generation_manifest_put_failures: AtomicUsize,
+    injected_generation_manifest_failures: AtomicUsize,
+    shard_manifest_lost_acks: AtomicUsize,
+    injected_shard_manifest_lost_acks: AtomicUsize,
     /// Every location written through this store.
     put_paths: StdMutex<Vec<String>>,
     /// Every location read through this store.
@@ -42,6 +47,24 @@ pub struct FailControls {
 }
 
 impl FailControls {
+    pub fn lose_shard_manifest_acks(&self, n: usize) {
+        self.shard_manifest_lost_acks.store(n, Ordering::SeqCst);
+    }
+
+    pub fn shard_manifest_lost_acks(&self) -> usize {
+        self.injected_shard_manifest_lost_acks
+            .load(Ordering::SeqCst)
+    }
+
+    pub fn writes_under(&self, needle: &str) -> usize {
+        self.put_paths
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.contains(needle))
+            .count()
+    }
+
     pub fn fail_wal_puts(&self, n: usize) {
         self.wal_put_failures.store(n, Ordering::SeqCst);
     }
@@ -53,6 +76,16 @@ impl FailControls {
     }
     pub fn attempts(&self) -> usize {
         self.wal_put_attempts.load(Ordering::SeqCst)
+    }
+
+    pub fn fail_generation_manifest_puts(&self, n: usize) {
+        self.generation_manifest_put_failures
+            .store(n, Ordering::SeqCst);
+    }
+
+    pub fn generation_manifest_failures(&self) -> usize {
+        self.injected_generation_manifest_failures
+            .load(Ordering::SeqCst)
     }
 
     /// Did any write land on a path containing `needle`? An open that resolved
@@ -141,6 +174,39 @@ impl OSObjectStore for FailingObjectStore {
             .lock()
             .unwrap()
             .push(location.to_string());
+        if location.as_ref().contains("/manifest/")
+            && location.as_ref().ends_with(".binpb")
+            && self
+                .controls
+                .shard_manifest_lost_acks
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+        {
+            self.inner.put_opts(location, payload, opts).await?;
+            self.controls
+                .injected_shard_manifest_lost_acks
+                .fetch_add(1, Ordering::SeqCst);
+            return Err(object_store::Error::Generic {
+                store: "failing-test-store",
+                source: "injected shard manifest lost acknowledgement".into(),
+            });
+        }
+        if location.as_ref().contains("_gen_")
+            && location.as_ref().contains("/_versions/")
+            && self
+                .controls
+                .generation_manifest_put_failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+        {
+            self.controls
+                .injected_generation_manifest_failures
+                .fetch_add(1, Ordering::SeqCst);
+            return Err(object_store::Error::Generic {
+                store: "failing-test-store",
+                source: "injected generation manifest publication failure".into(),
+            });
+        }
         if Self::is_wal_entry(location) {
             self.controls
                 .wal_put_attempts
@@ -219,7 +285,26 @@ impl OSObjectStore for FailingObjectStore {
     }
 
     async fn rename_opts(&self, from: &Path, to: &Path, opts: RenameOptions) -> OSResult<()> {
-        self.inner.rename_opts(from, to, opts).await
+        self.inner.rename_opts(from, to, opts).await?;
+        // Local conditional creates publish through rename, whereas cloud
+        // stores use put_opts. Lose the ACK only after publication succeeds.
+        if to.as_ref().contains("/manifest/")
+            && to.as_ref().ends_with(".binpb")
+            && self
+                .controls
+                .shard_manifest_lost_acks
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+        {
+            self.controls
+                .injected_shard_manifest_lost_acks
+                .fetch_add(1, Ordering::SeqCst);
+            return Err(object_store::Error::Generic {
+                store: "failing-test-store",
+                source: "injected shard manifest lost acknowledgement".into(),
+            });
+        }
+        Ok(())
     }
 }
 

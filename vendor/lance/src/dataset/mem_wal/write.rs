@@ -49,7 +49,7 @@ pub use super::memtable::scanner::MemTableScanner;
 pub use super::util::{WatchableOnceCell, WatchableOnceCellReader};
 pub use super::wal::{WalEntry, WalEntryData, WalFlushFailure, WalFlushResult, WalFlusher};
 
-use super::memtable::flush::TriggerMemTableFlush;
+use super::memtable::flush::{PreparedMemTableFlush, TriggerMemTableFlush};
 use super::observer::WalObserver;
 use super::scanner::InMemoryMemTableRef;
 use super::scanner::SsTableWarmer;
@@ -3709,9 +3709,26 @@ impl ShardWriter {
                 // an empty active memtable does *not* mean every pre-call write
                 // already reached L0. Watchers are popped as flushes settle, so
                 // whatever remains here is exactly what is still owed.
+                let mut watchers: Vec<_> = state.frozen_flush_watchers.iter().cloned().collect();
+                // A pending first attempt drains its predecessors before it
+                // settles. Only failed attempts whose watchers were already
+                // consumed need a new drain receipt here.
+                if watchers.is_empty()
+                    && state
+                        .frozen_memtables
+                        .iter()
+                        .any(|frozen| frozen.flushed_at_ms.is_none())
+                {
+                    let done = DurabilityCell::new();
+                    watchers.push(done.reader());
+                    writer_state
+                        .memtable_flush_tx
+                        .send(TriggerMemTableFlush::Drain { done })
+                        .map_err(|_| Error::io("MemTable flush channel closed during seal"))?;
+                }
                 Ok(SealFence {
                     sealed_generation,
-                    watchers: state.frozen_flush_watchers.iter().cloned().collect(),
+                    watchers,
                 })
             }
             WriterMode::WalOnly { .. } => Err(Error::invalid_input(
@@ -3747,7 +3764,10 @@ impl ShardWriter {
                 st.frozen_flush_watchers.iter().cloned().collect()
             };
             if watchers.is_empty() {
-                return Ok(());
+                let WriterMode::MemTable { writer_state, .. } = &self.mode else {
+                    unreachable!()
+                };
+                return Self::drain_retained_flushes(&writer_state.memtable_flush_tx).await;
             }
             for mut w in watchers {
                 match w.await_value().await {
@@ -3826,6 +3846,20 @@ impl ShardWriter {
                 "WAL flush handler exited before reporting durability during close",
             )),
         }
+    }
+
+    async fn drain_retained_flushes(
+        tx: &mpsc::UnboundedSender<TriggerMemTableFlush>,
+    ) -> Result<()> {
+        let done = DurabilityCell::new();
+        let mut reader = done.reader();
+        tx.send(TriggerMemTableFlush::Drain { done })
+            .map_err(|_| Error::io("MemTable flush channel closed during drain"))?;
+        reader
+            .await_value()
+            .await
+            .ok_or_else(|| Error::io("MemTable flush handler exited during drain"))?
+            .into_result()
     }
 
     fn merge_close_stage(
@@ -3943,6 +3977,9 @@ impl ShardWriter {
                         stage_result,
                     );
                 }
+                let retained = Self::drain_retained_flushes(&writer_state.memtable_flush_tx).await;
+                close_result =
+                    Self::merge_close_stage(close_result, "retained MemTable flush", retained);
             }
             WriterMode::WalOnly {
                 state,
@@ -4365,7 +4402,18 @@ impl WalFlushHandler {
 /// Freezing is done by the writer (via SharedWriterState::freeze_memtable) to ensure
 /// immediate memtable switching, so writes can continue on the new memtable while this
 /// handler flushes in the background.
+struct PendingMemTableFlush {
+    memtable: Arc<MemTable>,
+    // Consumed once, retained across retries instead of using a later WAL cursor.
+    wal_boundary: Option<std::result::Result<u64, WalFlushFailure>>,
+    prepared: Option<PreparedMemTableFlush>,
+    terminal: Option<WalFlushFailure>,
+    failed: bool,
+}
+
 struct MemTableFlushHandler {
+    pending: VecDeque<PendingMemTableFlush>,
+    retry_after: Option<tokio::time::Instant>,
     state: Arc<RwLock<WriterState>>,
     /// Shared with `SharedWriterState`; this handler re-derives it once a
     /// flush commits and the memtable set changes.
@@ -4403,6 +4451,8 @@ impl MemTableFlushHandler {
         grace: Duration,
     ) -> Self {
         Self {
+            pending: VecDeque::new(),
+            retry_after: None,
             state,
             memory,
             flusher,
@@ -4445,15 +4495,55 @@ async fn sweep_expired_frozen(
 
 #[async_trait]
 impl MessageHandler<TriggerMemTableFlush> for MemTableFlushHandler {
+    fn tickers(&mut self) -> Vec<(Duration, MessageFactory<TriggerMemTableFlush>)> {
+        // Explicit messages retry oldest first; this slow, I/O-free-when-idle
+        // backstop also recovers failures when no further writes arrive.
+        vec![(
+            Duration::from_secs(30),
+            Box::new(|| TriggerMemTableFlush::Retry),
+        )]
+    }
+
     async fn handle(&mut self, message: TriggerMemTableFlush) -> Result<()> {
         match message {
+            TriggerMemTableFlush::Retry => {
+                if self.pending.front().is_some_and(|p| p.terminal.is_none()) {
+                    self.drain_pending().await?;
+                }
+            }
+            TriggerMemTableFlush::Drain { done } => {
+                let result = self.drain_pending().await;
+                done.write(match result {
+                    Ok(_) => DurabilityResult::ok(),
+                    Err(e) => DurabilityResult::err(e.to_string()),
+                });
+            }
             TriggerMemTableFlush::Flush { memtable, done } => {
-                let result = self.flush_memtable(memtable).await;
+                self.pending.push_back(PendingMemTableFlush {
+                    memtable: memtable.clone(),
+                    wal_boundary: None,
+                    prepared: None,
+                    terminal: None,
+                    failed: false,
+                });
+                let result = self.drain_pending().await.and_then(|result| {
+                    result.ok_or_else(|| Error::internal("Flush queue produced no result"))
+                });
+                // Settle this attempt, keeping failed bytes and retry state.
+                // Background retries never pop another generation's watcher
+                // or reuse a consumed once-cell.
+                memtable.signal_memtable_flush_complete(match &result {
+                    Ok(_) => DurabilityResult::ok(),
+                    Err(e) => DurabilityResult::err(e.to_string()),
+                });
+                {
+                    let mut state = self.state.write().await;
+                    state.frozen_flush_watchers.pop_front();
+                    publish_memory(&self.memory, &state);
+                }
                 if let Some(tx) = done {
-                    // Send result through the channel - caller is waiting for it
                     let _ = tx.send(result);
                 } else {
-                    // No done channel, propagate errors
                     result?;
                 }
             }
@@ -4463,167 +4553,154 @@ impl MessageHandler<TriggerMemTableFlush> for MemTableFlushHandler {
 }
 
 impl MemTableFlushHandler {
-    /// Flush the given frozen memtable to Lance storage.
-    ///
-    /// This method waits for the WAL flush to complete (sent at freeze time),
-    /// then flushes to Lance storage. The WAL flush is already queued by
-    /// freeze_memtable to ensure strict ordering of WAL entries.
-    ///
-    /// Whether the flush succeeds or fails, the memtable's flush-completion
-    /// watcher is always signaled and the backpressure queue is always drained
-    /// for this memtable. Otherwise `wait_for_flush_drain` would observe a
-    /// dropped watch channel and return `Err` instead of the actual outcome.
-    #[instrument(name = "mt_flush", level = "info", skip_all, fields(generation = memtable.generation(), row_count = memtable.row_count()))]
-    async fn flush_memtable(
-        &mut self,
-        memtable: Arc<MemTable>,
-    ) -> Result<super::memtable::flush::FlushResult> {
-        let start = Instant::now();
-
-        let flush_result = async {
-            // Step 1: Wait for WAL flush completion (already queued at freeze time).
-            // The TriggerWalFlush message was sent by freeze_memtable to ensure
-            // strict ordering of WAL entries. If the freeze didn't trigger a
-            // flush (no pending WAL range), there's no completion cell and the
-            // memtable was already WAL-flushed by an earlier put.
-            let wal_flushed_position =
-                if let Some(mut completion_reader) = memtable.take_wal_flush_completion() {
-                    match completion_reader.await_value().await {
-                        Some(Ok(flush_result)) => flush_result.entry.map(|e| e.position),
-                        // Rebuild the typed error so a fence/poison reason
-                        // propagates to the memtable-flush caller too.
-                        Some(Err(e)) => return Err(e.into_error()),
-                        None => {
-                            return Err(Error::io(
-                                "WAL flush handler exited before reporting completion",
-                            ));
-                        }
+    /// One attempt per retained generation, stopping at the first error.
+    /// Never wait indefinitely for a failed operation to become successful.
+    async fn drain_pending(&mut self) -> Result<Option<super::memtable::flush::FlushResult>> {
+        let mut last = None;
+        while let Some(mut pending) = self.pending.pop_front() {
+            if let Some(failure) = pending.terminal.clone() {
+                self.pending.push_front(pending);
+                self.report_retry_state();
+                return Err(failure.into_error());
+            }
+            if let Some(deadline) = self.retry_after.take() {
+                tokio::time::sleep_until(deadline).await;
+            }
+            if pending.failed {
+                if let Some(observer) = &self.observer {
+                    observer.on_memtable_flush_retry();
+                }
+            }
+            let start = Instant::now();
+            match self.attempt_flush(&mut pending).await {
+                Ok(result) => {
+                    self.retire_generation(result.sstable.generation).await;
+                    self.report_retry_state();
+                    let elapsed = start.elapsed();
+                    self.stats
+                        .record_memtable_flush(elapsed, result.rows_flushed);
+                    if let Some(observer) = &self.observer {
+                        observer.on_memtable_flush(elapsed, result.rows_flushed);
                     }
-                } else {
-                    None
-                };
+                    info!(
+                        "Flushed frozen memtable generation {} ({} rows in {:?})",
+                        result.sstable.generation, result.rows_flushed, elapsed
+                    );
+                    last = Some(result);
+                }
+                Err(error) => {
+                    pending.failed = true;
+                    if let Some(observer) = &self.observer {
+                        observer.on_memtable_flush_error();
+                    }
+                    if error.fence_reason().is_some() {
+                        pending.terminal = Some(WalFlushFailure::from_error(&error));
+                    }
+                    self.pending.push_front(pending);
+                    self.report_retry_state();
+                    self.retry_after = Some(tokio::time::Instant::now() + Duration::from_secs(1));
+                    return Err(error);
+                }
+            }
+        }
+        Ok(last)
+    }
 
-            // Step 1b: Wait until index application covers this whole memtable.
-            //
-            // Freeze queues the apply and this flush on separate channels, so
-            // without waiting the export can run while the indexes are still
-            // behind the batch store. The generation's vector index would then
-            // be short of rows its own SSTable holds, and SSTable vector search
-            // is index-only -- `fast_search`, no brute-force scan -- so those
-            // rows stop answering once the frozen memtable retires.
-            //
-            // `batch_count` is fixed at freeze, so this waits for a target that
-            // cannot move, and the watcher surfaces a poisoned writer rather
-            // than blocking on a cursor that will never arrive.
+    fn report_retry_state(&self) {
+        if let Some(observer) = &self.observer {
+            // Successful successors aren't failures; only expose a retained
+            // queue while its oldest generation has actually failed.
+            let blocked = self.pending.front().is_some_and(|p| p.failed);
+            let bytes = if blocked {
+                self.pending
+                    .iter()
+                    .map(|p| in_memory_ref(&p.memtable).resident_bytes())
+                    .sum()
+            } else {
+                0
+            };
+            observer
+                .on_memtable_flush_retry_state(if blocked { self.pending.len() } else { 0 }, bytes);
+        }
+    }
+
+    async fn attempt_flush(
+        &self,
+        pending: &mut PendingMemTableFlush,
+    ) -> Result<super::memtable::flush::FlushResult> {
+        let memtable = &pending.memtable;
+        if pending.wal_boundary.is_none() {
+            let boundary = if let Some(mut reader) = memtable.take_wal_flush_completion() {
+                match reader.await_value().await {
+                    Some(Ok(result)) => Ok(result
+                        .entry
+                        .map(|e| e.position)
+                        .or_else(|| memtable.frozen_at_wal_entry_position())
+                        .unwrap_or(0)),
+                    Some(Err(failure)) => Err(failure),
+                    None => Err(WalFlushFailure::from_error(&Error::io(
+                        "WAL flush handler exited before reporting completion",
+                    ))),
+                }
+            } else {
+                Ok(memtable.frozen_at_wal_entry_position().unwrap_or(0))
+            };
+            pending.wal_boundary = Some(boundary);
+        }
+        let covered = pending
+            .wal_boundary
+            .as_ref()
+            .unwrap()
+            .clone()
+            .map_err(WalFlushFailure::into_error)?;
+        if pending.prepared.is_none() {
             if !self.index_configs.is_empty()
                 && let Some(indexes) = memtable.indexes_arc()
             {
-                let target_indexed = memtable.batch_count();
                 self.wal_flusher
-                    .track_batch(Some(indexes), target_indexed, 0)
+                    .track_batch(Some(indexes), memtable.batch_count(), 0)
                     .wait()
                     .await?;
             }
-
-            // Step 2: Flush the memtable to Lance storage. The covered WAL
-            // entry position is either the one we just appended (per-memtable,
-            // from the completion cell — authoritative even when concurrent
-            // flushes have raced ahead in `state.last_flushed_wal_entry_position`)
-            // or, when no flush was triggered at freeze time, the memtable's
-            // frozen-at marker captured at freeze. Stamping this into the
-            // manifest is what lets replay-on-reopen skip entries this
-            // generation covers.
-            let covered_wal_entry_position = wal_flushed_position
-                .or_else(|| memtable.frozen_at_wal_entry_position())
-                .unwrap_or(0);
-            // Rebuild secondary indexes on the SSTable so later
-            // queries hit an index instead of scanning. Skip the extra
-            // dataset open when there are no indexes to build. The indexed
-            // path's future is boxed to keep this async block's nesting
-            // under the type-layout recursion limit.
-            // Read the durability cursor *after* the WAL-append completion above,
-            // not before: the append that makes this memtable durable is the very
-            // thing we just waited on, so a cursor sampled earlier would still be
-            // short of it and trip the flush precondition.
             let durable = self.wal_flusher.durable();
-
-            if self.index_configs.is_empty() {
+            let prepared = if self.index_configs.is_empty() {
                 self.flusher
-                    .flush(&memtable, self.epoch, covered_wal_entry_position, durable)
-                    .await
+                    .prepare(memtable, self.epoch, covered, durable)
+                    .await?
             } else {
-                Box::pin(self.flusher.flush_with_indexes(
-                    &memtable,
+                Box::pin(self.flusher.prepare_with_indexes(
+                    memtable,
                     self.epoch,
                     &self.index_configs,
-                    covered_wal_entry_position,
+                    covered,
                     durable,
                 ))
-                .await
-            }
+                .await?
+            };
+            // Retain immutable files before awaiting publication, so lost ACKs
+            // never lead to rewriting sidecars a merger may already be reading.
+            pending.prepared = Some(prepared);
         }
-        .await;
+        self.flusher
+            .publish_prepared(pending.prepared.as_ref().unwrap(), self.epoch)
+            .await
+    }
 
-        // Step 3: Always signal completion (with the outcome) and drain
-        // backpressure state for this memtable, even on failure.
-        let durability = match &flush_result {
-            Ok(_) => DurabilityResult::ok(),
-            Err(e) => DurabilityResult::err(e.to_string()),
-        };
-        memtable.signal_memtable_flush_complete(durability);
-
-        {
-            let mut state = self.state.write().await;
-            // Backpressure drain: unconditional so `wait_for_flush_drain`
-            // sees the watcher's error signal, not a dropped channel. Which
-            // entry comes off the front does not matter — flushes complete out
-            // of order, and the snapshot re-derived at the end of this block
-            // reads the frozen queue itself rather than tracking a charge.
-            state.frozen_flush_watchers.pop_front();
-            // Retire the frozen handle on commit success, keyed by generation
-            // (non-FIFO completion is fine). Zero grace evicts here; otherwise
-            // stamp the grace clock so it lingers for multi-part as-of reads
-            // until the grace sweep. On failure leave it un-stamped: rows stay in
-            // the read union until a later flush or WAL replay, else a transient
-            // error reopens the hole.
-            if flush_result.is_ok() {
-                let sstable = memtable.generation();
-                if self.grace.is_zero() {
-                    state
-                        .frozen_memtables
-                        .retain(|frozen| frozen.memtable.generation() != sstable);
-                } else {
-                    let now = now_millis();
-                    for frozen in state.frozen_memtables.iter_mut() {
-                        if frozen.memtable.generation() == sstable {
-                            frozen.flushed_at_ms = Some(now);
-                        }
-                    }
+    async fn retire_generation(&self, generation: u64) {
+        let mut state = self.state.write().await;
+        if self.grace.is_zero() {
+            state
+                .frozen_memtables
+                .retain(|f| f.memtable.generation() != generation);
+        } else {
+            let now = now_millis();
+            for frozen in state.frozen_memtables.iter_mut() {
+                if frozen.memtable.generation() == generation {
+                    frozen.flushed_at_ms = Some(now);
                 }
             }
-            // Re-derive after both branches above. A *failed* flush leaves its
-            // memtable un-stamped and so still counted, which is the point: its
-            // bytes are resident and only another flush can reclaim them.
-            publish_memory(&self.memory, &state);
         }
-
-        let result = flush_result?;
-
-        let elapsed = start.elapsed();
-        self.stats
-            .record_memtable_flush(elapsed, result.rows_flushed);
-        if let Some(observer) = &self.observer {
-            observer.on_memtable_flush(elapsed, result.rows_flushed);
-        }
-
-        info!(
-            "Flushed frozen memtable generation {} ({} rows in {:?})",
-            result.sstable.generation,
-            result.rows_flushed,
-            start.elapsed()
-        );
-
-        Ok(result)
+        publish_memory(&self.memory, &state);
     }
 }
 
@@ -10254,6 +10331,227 @@ mod tests {
         writer_b.close().await.unwrap();
     }
 
+    #[rstest]
+    #[case::idle(false)]
+    #[case::later_active_wal(true)]
+    #[tokio::test]
+    async fn test_failed_generation_idle_retry_preserves_wal_boundary(#[case] append_tail: bool) {
+        use crate::dataset::mem_wal::test_util::observable_store_params;
+
+        let (store, base, uri, _temp) = create_local_store().await;
+        let schema = schema_with_pk();
+        let (params, controls) = observable_store_params();
+        let config = ShardWriterConfig {
+            store_params: Some(params),
+            ..memtable_config_with_pk(Uuid::new_v4())
+        };
+        let writer = ShardWriter::open(store, base, uri, config, schema.clone(), vec![])
+            .await
+            .unwrap();
+        writer
+            .put(vec![create_test_batch(&schema, 0, 3)])
+            .await
+            .unwrap();
+        controls.fail_generation_manifest_puts(1000);
+        assert!(
+            writer
+                .force_seal_active()
+                .await
+                .unwrap()
+                .wait()
+                .await
+                .is_err()
+        );
+        assert!(controls.generation_manifest_failures() > 0);
+        assert!(writer.memory().frozen_bytes() > 0);
+        let boundary = writer.wal_stats().next_wal_entry_position - 1;
+        assert!(boundary > 0);
+        if append_tail {
+            writer
+                .put(vec![create_test_batch(&schema, 3, 2)])
+                .await
+                .unwrap();
+            assert!(writer.wal_stats().next_wal_entry_position - 1 > boundary);
+        }
+        controls.fail_generation_manifest_puts(0);
+        // No seal, drain, close, or new write drives this recovery. The idle
+        // backstop must publish the retained batch with its original boundary.
+        tokio::time::timeout(Duration::from_secs(45), async {
+            while writer.memory().frozen_bytes() != 0 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("idle retry must recover without another flush request");
+        let manifest = writer.manifest().await.unwrap().unwrap();
+        assert_eq!(manifest.current_generation, 2);
+        assert_eq!(manifest.replay_after_wal_entry_position, boundary);
+        assert_eq!(manifest.sstables.len(), 1);
+        assert_eq!(manifest.sstables[0].physical_rows, Some(3));
+        assert_eq!(
+            writer.memtable_stats().await.unwrap().row_count,
+            if append_tail { 2 } else { 0 }
+        );
+        writer.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_failed_generation_retry_without_new_rows_and_bounded_close() {
+        use crate::dataset::mem_wal::test_util::observable_store_params;
+
+        for recover in [true, false] {
+            let (store, base, uri, _temp) = create_local_store().await;
+            let schema = schema_with_pk();
+            let shard = Uuid::new_v4();
+            let (params, controls) = observable_store_params();
+            let config = ShardWriterConfig {
+                store_params: Some(params),
+                ..memtable_config_with_pk(shard)
+            };
+            let writer = ShardWriter::open(store, base, uri, config, schema.clone(), vec![])
+                .await
+                .unwrap();
+            writer
+                .put(vec![create_test_batch(&schema, 0, 3)])
+                .await
+                .unwrap();
+            controls.fail_generation_manifest_puts(1000);
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    writer.force_seal_active().await.unwrap().wait()
+                )
+                .await
+                .unwrap()
+                .is_err()
+            );
+            if recover {
+                controls.fail_generation_manifest_puts(0);
+                // The active memtable is empty and the original failure watcher
+                // has settled. A fresh fence must still retry retained data.
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    writer.force_seal_active().await.unwrap().wait(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                let manifest = writer.manifest().await.unwrap().unwrap();
+                assert_eq!(manifest.current_generation, 2);
+                assert_eq!(manifest.sstables.len(), 1);
+                assert_eq!(manifest.sstables[0].physical_rows, Some(3));
+            }
+            let result = tokio::time::timeout(Duration::from_secs(10), writer.close())
+                .await
+                .expect("permanent flush errors must not make close hang");
+            assert_eq!(
+                result.is_ok(),
+                recover,
+                "close cannot silently acknowledge a retained failed generation"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_failed_generation_then_later_flush_preserves_rows_on_reopen() {
+        use crate::dataset::mem_wal::test_util::observable_store_params;
+        use std::collections::BTreeSet;
+
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = schema_with_pk();
+        let shard_id = Uuid::new_v4();
+        let (store_params, controls) = observable_store_params();
+        let config = ShardWriterConfig {
+            store_params: Some(store_params),
+            ..memtable_config_with_pk(shard_id)
+        };
+        let writer = ShardWriter::open(
+            store.clone(),
+            base_path.clone(),
+            base_uri.clone(),
+            config.clone(),
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+        writer
+            .put(vec![create_test_batch(&schema, 0, 3)])
+            .await
+            .unwrap();
+        controls.fail_generation_manifest_puts(1);
+        let first = tokio::time::timeout(
+            Duration::from_secs(10),
+            writer.force_seal_active().await.unwrap().wait(),
+        )
+        .await
+        .expect("a transient publication failure must not hang the seal");
+        // A future automatic retry may make this fence succeed. Either way,
+        // verify that the intended storage failure actually happened.
+        if let Err(error) = first {
+            assert!(
+                error
+                    .to_string()
+                    .contains("injected generation manifest publication failure"),
+                "unexpected first-seal error: {error}"
+            );
+        }
+        assert_eq!(controls.generation_manifest_failures(), 1);
+        controls.fail_generation_manifest_puts(0);
+
+        writer
+            .put(vec![create_test_batch(&schema, 3, 2)])
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            writer.force_seal_active().await.unwrap().wait(),
+        )
+        .await
+        .expect("the later seal must settle")
+        .unwrap();
+        // Simulate loss of the original process's frozen-memory read union.
+        drop(writer);
+
+        let reopened =
+            ShardWriter::open(store, base_path, base_uri.clone(), config, schema, vec![])
+                .await
+                .unwrap();
+        let mut ids = BTreeSet::new();
+        let mut collect = |batch: &RecordBatch| {
+            let column = batch.column_by_name("id").unwrap();
+            let values = column.as_any().downcast_ref::<Int32Array>().unwrap();
+            ids.extend(values.values().iter().copied());
+        };
+        collect(
+            &reopened
+                .scan()
+                .await
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap(),
+        );
+        let manifest = reopened.manifest().await.unwrap().unwrap();
+        for generation in manifest.sstables {
+            let uri = format!("{base_uri}/_mem_wal/{shard_id}/{}", generation.path);
+            let dataset = Dataset::open(&uri).await.unwrap();
+            let mut scan = dataset.scan();
+            scan.project(&["id"]).unwrap();
+            collect(&scan.try_into_batch().await.unwrap());
+        }
+        assert_eq!(
+            ids,
+            BTreeSet::from([0, 1, 2, 3, 4]),
+            "later publication must not make reopening skip the failed generation's rows"
+        );
+        reopened.close().await.unwrap();
+    }
+
+    /// The same rotation, driven by `max_memtable_rows` instead of the batch cap.
+    ///
+    /// Replay builds the final memtable's indexes itself, so a WAL holding more
+    /// rows than one memtable's capacity has to rotate for `open()` to succeed.
     /// Regression: a transient flush failure must NOT reopen the
     /// concurrent-read-vs-flush hole. The sealed generation stays in the
     /// queryable set (rows intact) until a later flush or WAL replay.

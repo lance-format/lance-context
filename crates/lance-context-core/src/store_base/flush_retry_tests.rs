@@ -1,0 +1,312 @@
+//! Exercise failed flush recovery through the service's pinned Lance dependency.
+use super::*;
+use arrow_array::StringArray;
+use arrow_schema::{DataType, Field};
+use futures::stream::BoxStream;
+use object_store::path::Path;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::time::Duration;
+
+#[derive(Debug)]
+struct FaultStore {
+    inner: Arc<dyn object_store::ObjectStore>,
+    mode: Arc<AtomicU8>,
+}
+#[derive(Debug)]
+struct Wrapper(Arc<AtomicU8>);
+impl lance_io::object_store::WrappingObjectStore for Wrapper {
+    fn wrap(
+        &self,
+        _: &str,
+        inner: Arc<dyn object_store::ObjectStore>,
+    ) -> Arc<dyn object_store::ObjectStore> {
+        Arc::new(FaultStore {
+            inner,
+            mode: self.0.clone(),
+        })
+    }
+    fn wrap_paginated(
+        &self,
+        _: &str,
+        _: Arc<dyn object_store::list::PaginatedListStore>,
+    ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+        None
+    }
+}
+impl std::fmt::Display for FaultStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "flush fault")
+    }
+}
+fn fault() -> object_store::Error {
+    object_store::Error::Generic {
+        store: "flush retry test",
+        source: "injected publication failure".into(),
+    }
+}
+#[async_trait::async_trait]
+impl object_store::ObjectStore for FaultStore {
+    async fn put_opts(
+        &self,
+        path: &Path,
+        payload: object_store::PutPayload,
+        options: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        if self.mode.load(Ordering::SeqCst) == 3
+            && path.as_ref().contains("/_mem_wal/")
+            && path.as_ref().contains("/_versions/")
+        {
+            return Err(fault());
+        }
+        self.inner.put_opts(path, payload, options).await
+    }
+    async fn put_multipart_opts(
+        &self,
+        path: &Path,
+        options: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(path, options).await
+    }
+
+    async fn get_opts(
+        &self,
+        path: &Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.inner.get_opts(path, options).await
+    }
+    fn delete_stream(
+        &self,
+        paths: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        self.inner.delete_stream(paths)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        let mode = self.mode.load(Ordering::SeqCst);
+        if matches!(mode, 1 | 2)
+            && to.as_ref().contains("/manifest/")
+            && to.as_ref().ends_with(".binpb")
+        {
+            if mode == 2 {
+                self.inner.copy_opts(from, to, options).await?;
+            }
+            return Err(fault());
+        }
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+#[test]
+#[cfg(feature = "metrics")]
+fn failed_flush_recovers_without_new_rows_and_reports_retry_metrics() {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let gauge = |name: &str| -> f64 {
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(key, _, _, value)| {
+                if key.key().name() == name {
+                    if let DebugValue::Gauge(value) = value {
+                        return Some(value.into_inner());
+                    }
+                }
+                None
+            })
+            .expect("metric must be emitted, including zero")
+    };
+    metrics::with_local_recorder(&recorder, || {
+        runtime.block_on(async {
+            for failure_mode in [1, 2, 3] {
+                let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
+                let batch = RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(StringArray::from(vec!["preserve-this-row"]))],
+                )
+                .unwrap();
+                let dir = tempfile::TempDir::new().unwrap();
+                let uri = format!("file://{}", dir.path().display());
+                let schema = batch.schema();
+                let mut base = StorageBase::open(
+                    &uri,
+                    StorageBaseOptions {
+                        storage_options: None,
+                        shard_id: Some("recovery-fault-test".into()),
+                        merge_after_generations: None,
+                        merge_max_generations: None,
+                        merge_max_bytes: None,
+                        key_index_type: Default::default(),
+                        pending_generations_warn: None,
+                        pending_generations_max: None,
+                        merge_budget: None,
+                        session: None,
+                        schema: schema.clone(),
+                        key_column: "id".into(),
+                        latest_schema: None,
+                        seal_on_put: false,
+                    },
+                    true,
+                )
+                .await
+                .unwrap();
+
+                let mode = Arc::new(AtomicU8::new(0));
+                let params = ObjectStoreParams {
+                    object_store_wrapper: Some(Arc::new(Wrapper(mode.clone()))),
+                    ..Default::default()
+                };
+                base.dataset = DatasetBuilder::from_uri(&uri)
+                    .with_store_params(params.clone())
+                    .load()
+                    .await
+                    .unwrap();
+                let config = ShardWriterConfig {
+                    shard_id: base.write_shard,
+                    observer: Some(Arc::new(crate::metrics::MemtableFlushMetrics::default())),
+                    store_params: Some(params),
+                    ..Default::default()
+                };
+                let writer = Arc::new(
+                    ShardWriter::open(
+                        base.dataset.object_store(None).await.unwrap(),
+                        base.dataset.branch_location().path.clone(),
+                        uri,
+                        config,
+                        schema,
+                        vec![],
+                    )
+                    .await
+                    .unwrap(),
+                );
+                writer.put(vec![batch.clone()]).await.unwrap();
+                *base.write_writer.lock().await = Some(writer.clone());
+                mode.store(failure_mode, Ordering::SeqCst);
+                assert!(
+                    base.flush().await.is_err(),
+                    "injected failure mode {failure_mode} must be surfaced"
+                );
+                assert!(writer.memory().frozen_bytes() > 0);
+                assert_eq!(gauge("rollout_memtable_flush_retry_generations"), 1.0);
+                assert!(gauge("rollout_memtable_flush_retry_bytes") > 0.0);
+                // A second failure must not inflate the gauge or discard the batch.
+                if failure_mode != 2 {
+                    assert!(base.flush().await.is_err());
+                    assert_eq!(gauge("rollout_memtable_flush_retry_generations"), 1.0);
+                }
+                let boundary = writer.wal_stats().next_wal_entry_position - 1;
+                if failure_mode == 3 {
+                    // A newer active WAL append must not move this failed
+                    // generation's original replay boundary when it retries.
+                    writer.put(vec![batch]).await.unwrap();
+                    assert!(writer.wal_stats().next_wal_entry_position - 1 > boundary);
+                }
+                mode.store(0, Ordering::SeqCst);
+                if failure_mode == 2 {
+                    // The ACK was lost after publication. A real merge can
+                    // already consume the generation before the writer retries.
+                    let (store, manifest, prepared) =
+                        base.prepare_merge_if_ready(1).await.unwrap().unwrap();
+                    assert_eq!(
+                        base.commit_prepared_merge(&store, &manifest, prepared)
+                            .await
+                            .unwrap(),
+                        1
+                    );
+                    assert!(store
+                        .refresh_latest()
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .sstables
+                        .is_empty());
+                }
+                if failure_mode == 3 {
+                    // No new flush request: the periodic retry must recover.
+                    tokio::time::timeout(Duration::from_secs(40), async {
+                        while writer.memory().frozen_bytes() != 0 {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                    })
+                    .await
+                    .expect("idle retry must recover retained data");
+                } else {
+                    tokio::time::timeout(Duration::from_secs(10), base.flush())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                }
+                assert_eq!(writer.memory().frozen_bytes(), 0);
+                assert_eq!(gauge("rollout_memtable_flush_retry_generations"), 0.0);
+                assert_eq!(gauge("rollout_memtable_flush_retry_bytes"), 0.0);
+                let manifest = writer.manifest().await.unwrap().unwrap();
+                assert_eq!(manifest.replay_after_wal_entry_position, boundary);
+                let rows = if failure_mode == 2 {
+                    assert!(
+                        manifest.sstables.is_empty(),
+                        "retry must not republish a merged generation"
+                    );
+                    base.dataset.scan().try_into_batch().await.unwrap()
+                } else {
+                    assert_eq!(manifest.sstables.len(), 1);
+                    assert_eq!(manifest.sstables[0].physical_rows, Some(1));
+                    let generation_uri = format!(
+                        "{}/_mem_wal/{}/{}",
+                        base.uri(),
+                        base.write_shard,
+                        manifest.sstables[0].path
+                    );
+                    DatasetBuilder::from_uri(generation_uri)
+                        .load()
+                        .await
+                        .unwrap()
+                        .scan()
+                        .try_into_batch()
+                        .await
+                        .unwrap()
+                };
+                assert_eq!(rows.num_rows(), 1);
+                assert_eq!(
+                    rows.column_by_name("id")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap()
+                        .value(0),
+                    "preserve-this-row"
+                );
+                drop(writer);
+                base.close().await.unwrap();
+            }
+        })
+    });
+    let counters = snapshotter.snapshot().into_vec();
+    assert!(counters.iter().any(|(key, _, _, value)| key.key().name()
+        == "rollout_memtable_flush_retries_total"
+        && matches!(value, DebugValue::Counter(n) if *n >= 3)));
+}

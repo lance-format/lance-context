@@ -766,7 +766,12 @@ impl StorageBase {
                 crate::metrics::ROLLOUT_ADD_DURATION,
                 timer_elapsed!(started),
             ),
-            Err(_) => count!(crate::metrics::ROLLOUT_ADD_ERRORS),
+            Err(error) => {
+                count!(crate::metrics::ROLLOUT_ADD_ERRORS);
+                if matches!(error, lance_core::Error::Backpressure { .. }) {
+                    count!("rollout_memtable_flush_backpressure_rejections_total");
+                }
+            }
         }
         result
     }
@@ -811,6 +816,8 @@ impl StorageBase {
         }
         let config = ShardWriterConfig {
             shard_id: self.write_shard,
+            #[cfg(feature = "metrics")]
+            observer: Some(Arc::new(crate::metrics::MemtableFlushMetrics::default())),
             ..Default::default()
         };
         let writer = Arc::new(
@@ -3448,3 +3455,6 @@ mod cold_recovery_tests {
         assert!(store.own_shard_watermark().await.unwrap().is_none());
     }
 }
+
+#[cfg(all(test, feature = "metrics"))]
+mod flush_retry_tests;

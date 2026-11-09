@@ -623,6 +623,22 @@ impl ShardManifestStore {
     where
         F: Fn(&ShardManifest) -> ShardManifest,
     {
+        self.commit_update_checked(local_epoch, |current| Ok(Some(prepare_fn(current))))
+            .await
+    }
+
+    /// Validate a conditional update against the manifest used by each CAS
+    /// attempt. `None` acknowledges an already satisfied operation without
+    /// creating another manifest; refresh before accepting that acknowledgement
+    /// so a cached manifest cannot conceal a newer writer epoch.
+    pub(crate) async fn commit_update_checked<F>(
+        &self,
+        local_epoch: u64,
+        prepare_fn: F,
+    ) -> Result<ShardManifest>
+    where
+        F: Fn(&ShardManifest) -> Result<Option<ShardManifest>>,
+    {
         const MAX_RETRIES: usize = 10;
 
         for attempt in 0..MAX_RETRIES {
@@ -641,7 +657,27 @@ impl ShardManifestStore {
             Self::check_fenced_against(&Some(current.clone()), local_epoch, self.shard_id)?;
 
             // Step 3: Prepare new manifest
-            let new_manifest = prepare_fn(&current);
+            let new_manifest = match prepare_fn(&current) {
+                Ok(Some(next)) => next,
+                outcome => {
+                    // Neither a no-op nor a rejection performs a CAS, so
+                    // neither discovers a stale position through a conflict.
+                    // Re-evaluate both against storage before returning.
+                    let refreshed = self
+                        .refresh_latest()
+                        .await?
+                        .ok_or_else(|| Error::io("Shard manifest not found"))?;
+                    Self::check_fenced_against(
+                        &Some(refreshed.clone()),
+                        local_epoch,
+                        self.shard_id,
+                    )?;
+                    if refreshed.version != current.version {
+                        continue;
+                    }
+                    return outcome.map(|_| refreshed);
+                }
+            };
 
             // Check the successor against `current`, the manifest the closure
             // actually built on. The store's position is shared and moves
