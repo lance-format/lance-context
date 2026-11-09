@@ -346,7 +346,7 @@ impl Handle {
         self.shared.appends.last_disk_refusal()
     }
     /// From receipt of the complete body to execution ending, including worker
-    /// queue, proposal validation and quorum completion. Not pure disk time;
+    /// pre-enqueue validation, worker queue, proposal and quorum completion. Not pure disk time;
     /// excludes request transport/admission and sending the reply.
     pub fn append_execution_timing(&self) -> timing::Observation {
         self.shared.appends.execution.snapshot()

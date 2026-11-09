@@ -7,8 +7,9 @@ use std::time::{Duration, Instant};
 
 /// Same-request, nonoverlapping wall intervals for completed appends only.
 /// Concurrent requests overlap. Maxima are not percentiles and cannot be added.
-/// Excludes RPC transport, runtime credit admission, reply delivery, and owner
-/// staging application. Queued/in-flight work dropped on shutdown is absent;
+/// Excludes RPC transport, runtime credit admission, pre-enqueue payload
+/// validation, reply delivery, and owner staging application. The RPC execution
+/// timing also includes pre-enqueue validation. Queued/in-flight work dropped on shutdown is absent;
 /// caller cancellation alone does not remove a worker's eventual completion.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct AppendIntervals {
@@ -16,7 +17,8 @@ pub struct AppendIntervals {
     /// Enqueue attempt to dequeue, including time blocked behind a durable poll.
     pub queue_micros: u64,
     pub queue_max_micros: u64,
-    /// Node::propose: validation, disk reservation, and local Raft proposal.
+    /// Worker-side scope checks, disk reservation, and local Raft proposal.
+    /// Raw submissions also validate the payload here; prevalidated RPCs do not.
     pub proposal_micros: u64,
     pub proposal_max_micros: u64,
     /// Proposal return to worker completion: scheduling, local persistence,
