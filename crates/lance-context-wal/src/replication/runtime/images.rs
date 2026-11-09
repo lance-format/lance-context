@@ -52,6 +52,7 @@ impl SnapshotFeedback {
 
 impl Outbound {
     /// Local attempt identity for transport observation, outside the wire protocol.
+    #[cfg(feature = "peer-transport")]
     pub(super) fn snapshot_attempt(&self) -> Option<u64> {
         self.snapshot_feedback
             .as_ref()
