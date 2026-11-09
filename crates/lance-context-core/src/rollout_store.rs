@@ -8464,6 +8464,144 @@ mod tests {
         });
     }
 
+    #[tokio::test]
+    async fn prepared_compaction_retains_btree_for_incremental_maintenance() {
+        use lance::index::DatasetIndexInternalExt as _;
+
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut store = RolloutStore::open(uri).await.unwrap();
+        for i in 0..4 {
+            store
+                .add(&[assistant_record(&format!("key-{i}"))])
+                .await
+                .unwrap();
+            store.flush().await.unwrap();
+            store.cleanup_own_shard().await.unwrap();
+        }
+        store.create_id_btree_index().await.unwrap();
+        let indices = store.base.dataset.load_indices().await.unwrap();
+        let original = indices
+            .iter()
+            .find(|i| i.name == ROLLOUT_ID_INDEX_NAME)
+            .unwrap()
+            .uuid;
+        let before = store.version();
+        let prepared = store
+            .prepare_compaction(CompactionConfig::default())
+            .await
+            .unwrap();
+        assert!(!prepared.is_empty());
+        assert_eq!(Dataset::open(uri).await.unwrap().version().version, before);
+
+        // An append after preparation must remain visible and uncovered, while
+        // the rewritten indexed fragments retain their deferred address map.
+        store.add(&[assistant_record("appended")]).await.unwrap();
+        store.flush().await.unwrap();
+        store.cleanup_own_shard().await.unwrap();
+        let metrics = store.commit_prepared_compaction(prepared).await.unwrap();
+        assert_eq!(metrics.fragments_removed, 4);
+        let indices = store.base.dataset.load_indices().await.unwrap();
+        assert_eq!(
+            indices
+                .iter()
+                .find(|i| i.name == ROLLOUT_ID_INDEX_NAME)
+                .unwrap()
+                .uuid,
+            original
+        );
+        assert_eq!(
+            store
+                .base
+                .dataset
+                .unindexed_fragments(ROLLOUT_ID_INDEX_NAME)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        for id in ["key-0", "key-1", "key-2", "key-3", "appended"] {
+            assert_eq!(store.get_by_id(id).await.unwrap().unwrap().id, id);
+        }
+        assert_eq!(store.extend_id_btree_index().await.unwrap(), 1);
+        assert!(store
+            .base
+            .dataset
+            .unindexed_fragments(ROLLOUT_ID_INDEX_NAME)
+            .await
+            .unwrap()
+            .is_empty());
+        let indexed_version = store.version();
+        assert_eq!(store.extend_id_btree_index().await.unwrap(), 0);
+        assert_eq!(
+            store.version(),
+            indexed_version,
+            "complete coverage needs no index commit"
+        );
+
+        // Exercise old-row deletion and a newer value after the deferred map
+        // has been consumed by incremental maintenance.
+        let mut newer = assistant_record("key-0");
+        newer.content = Some("newer value".into());
+        store.add(&[newer]).await.unwrap();
+        store.flush().await.unwrap();
+        store.cleanup_own_shard().await.unwrap();
+        let mut dataset = Dataset::open(uri).await.unwrap();
+        dataset.delete("id = 'key-1'").await.unwrap();
+        let mut maintenance =
+            RolloutStore::open_existing_with_options(uri, RolloutStoreOptions::default())
+                .await
+                .unwrap();
+        let prepared = maintenance
+            .prepare_compaction(CompactionConfig::default())
+            .await
+            .unwrap();
+        assert!(!prepared.is_empty());
+        maintenance
+            .commit_prepared_compaction(prepared)
+            .await
+            .unwrap();
+        maintenance.extend_id_btree_index().await.unwrap();
+        let reader = RolloutStore::open_existing_with_options(uri, RolloutStoreOptions::default())
+            .await
+            .unwrap();
+        assert!(reader.get_by_id("key-1").await.unwrap().is_none());
+        assert_eq!(
+            reader
+                .get_by_id("key-0")
+                .await
+                .unwrap()
+                .unwrap()
+                .content
+                .as_deref(),
+            Some("newer value")
+        );
+        let mut ids: Vec<_> = reader
+            .list(None, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, ["appended", "key-0", "key-2", "key-3"]);
+        assert!(reader
+            .base
+            .dataset
+            .unindexed_fragments(ROLLOUT_ID_INDEX_NAME)
+            .await
+            .unwrap()
+            .is_empty());
+        let mut scan = reader.base.dataset.scan();
+        scan.filter("id = 'key-0'").unwrap();
+        assert!(scan
+            .explain_plan(false)
+            .await
+            .unwrap()
+            .contains("ScalarIndex"));
+        store.close().await.unwrap();
+    }
+
     /// Reads open every flushed generation pending merge. Past the cap the
     /// read is refused with a recognizable error (the server maps it to 503)
     /// instead of holding a worker's memory hostage; at the cap it passes.
