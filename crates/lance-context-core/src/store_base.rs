@@ -136,16 +136,25 @@ impl PreparedCompaction {
     }
 }
 
-/// Immutable index files built against one snapshot. The publishing handle
-/// must be opened separately under commit ownership; no authorization or
+/// Immutable index files, or a no-work result, prepared against one snapshot.
+/// A no-work result retains the same source and index identity checks.
+/// The publishing handle must be opened separately under commit ownership; no authorization or
 /// mutable dataset handle escapes preparation.
 #[derive(Debug)]
 pub struct PreparedKeyIndex {
     uri: String,
     schema: Schema,
     fragments: Vec<lance_table::format::Fragment>,
-    index: lance_table::format::IndexMetadata,
+    index: Option<lance_table::format::IndexMetadata>,
     replaced: Vec<lance_table::format::IndexMetadata>,
+}
+
+impl PreparedKeyIndex {
+    /// The existing single BTree already covers this snapshot, including
+    /// deferred compaction remapping. No files or manifest need publication.
+    pub fn is_empty(&self) -> bool {
+        self.index.is_none()
+    }
 }
 
 /// Execute only the first `max_source_fragments` from a Lance compaction plan.
@@ -1882,6 +1891,15 @@ impl StorageBase {
             });
         let index = if reusable_btree {
             let uncovered = snapshot.unindexed_fragments(ID_INDEX_NAME).await?;
+            if uncovered.is_empty() && replaced.len() == 1 {
+                return Ok(PreparedKeyIndex {
+                    uri: snapshot.uri().to_owned(),
+                    schema: Schema::from(snapshot.schema()),
+                    fragments: snapshot.manifest().fragments.as_ref().clone(),
+                    index: None,
+                    replaced,
+                });
+            }
             let mut segments = replaced.clone();
             if !uncovered.is_empty() {
                 let fragments = uncovered
@@ -1927,7 +1945,7 @@ impl StorageBase {
             uri: snapshot.uri().to_owned(),
             schema: Schema::from(snapshot.schema()),
             fragments: snapshot.manifest().fragments.as_ref().clone(),
-            index,
+            index: Some(index),
             replaced,
         })
     }
@@ -1982,7 +2000,7 @@ impl StorageBase {
         let current = self.dataset.load_indices().await?;
         let replaced: Vec<_> = current
             .iter()
-            .filter(|index| index.name == prepared.index.name)
+            .filter(|index| index.name == ID_INDEX_NAME)
             .cloned()
             .collect();
         if replaced != prepared.replaced {
@@ -1990,10 +2008,16 @@ impl StorageBase {
                 MaintenanceErrorCode::StalePreparation.tag("index metadata changed; reprepare"),
             ));
         }
+        let Some(index) = prepared.index else {
+            // The checks above still reject changed sources or index identity.
+            // Concurrent appends can remain uncovered, exactly as with a real
+            // prepared index. Nothing from this snapshot is published here.
+            return Ok(());
+        };
         let transaction = Transaction::new(
-            prepared.index.dataset_version,
+            index.dataset_version,
             Operation::CreateIndex {
-                new_indices: vec![prepared.index],
+                new_indices: vec![index],
                 removed_indices: prepared.replaced,
             },
             None,

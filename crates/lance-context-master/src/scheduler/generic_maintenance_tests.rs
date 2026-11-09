@@ -143,6 +143,42 @@ async fn exercise(prepared: bool, owned: bool, index_type: KeyIndexType) {
         .await
         .unwrap()
         .is_none());
+    if prepared && matches!(index_type, KeyIndexType::Btree) {
+        let version = dataset.version().version;
+        let task = enqueue(&state, TaskKind::IndexId, "generic:gs")
+            .await
+            .unwrap();
+        let claim = state
+            .task_store
+            .claim_next_of_kinds(TaskKinds::GENERAL.without_compact())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(claim.preparing_maintenance());
+        assert_eq!(claim.task.target, "generic:gs");
+        run_task(&state, claim, TaskClaimTiming::default()).await;
+        let done = state.task_store.get(&task.id).await.unwrap().unwrap();
+        assert_eq!(done.state, TaskState::Done, "{done:?}");
+        assert_eq!(
+            done.detail.as_deref(),
+            Some("existing BTree covers the prepared snapshot; no index publication")
+        );
+        assert_eq!(
+            lance::Dataset::open(&state.generic_uri("gs"))
+                .await
+                .unwrap()
+                .version()
+                .version,
+            version
+        );
+        assert!(state
+            .task_store
+            .merge_coordinator()
+            .get("generic:gs")
+            .await
+            .unwrap()
+            .is_none());
+    }
     // Compaction no-op hints must use the canonical generic identity/URI.
     if prepared {
         let task = enqueue(&state, TaskKind::Compact, "generic:gs")
@@ -199,6 +235,12 @@ async fn generic_maintenance_owned_compact_and_index() {
 #[ignore = "requires ETCD_TEST_ENDPOINTS"]
 async fn generic_maintenance_prepared_owned_compact_and_index() {
     exercise(true, true, KeyIndexType::Zonemap).await;
+}
+
+#[tokio::test]
+#[ignore = "requires ETCD_TEST_ENDPOINTS"]
+async fn generic_maintenance_prepared_owned_btree_noop() {
+    exercise(true, true, KeyIndexType::Btree).await;
 }
 
 #[tokio::test]

@@ -1151,8 +1151,8 @@ mod tests {
             })
             .await;
         assert!(
-            scope.completed_steps() > 0,
-            "index file IO must advance the idle watchdog"
+            prepared.is_empty() || scope.completed_steps() > 0,
+            "nonempty index file IO must advance the idle watchdog"
         );
         prepared
     }
@@ -1455,6 +1455,94 @@ mod tests {
                 .contains("unexpected preparation manifest commit"),
             "{error}"
         );
+        assert_eq!(Dataset::open(uri).await.unwrap().version().version, before);
+    }
+
+    #[tokio::test]
+    async fn prepared_index_skips_complete_deferred_btree_coverage() {
+        use lance::index::DatasetIndexInternalExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let (_writer, _) = prepared_compaction_fixture(uri).await;
+        let mut publisher =
+            RolloutStore::open_existing_with_options(uri, RolloutStoreOptions::default())
+                .await
+                .unwrap();
+        publisher.create_id_btree_index().await.unwrap();
+        publisher.compact(None).await.unwrap();
+        let compacted = Dataset::open(uri).await.unwrap();
+        assert_eq!(compacted.manifest().fragments.len(), 1);
+        assert!(compacted
+            .unindexed_fragments(crate::store_base::ID_INDEX_NAME)
+            .await
+            .unwrap()
+            .is_empty());
+
+        let scope = crate::merge_write_scope::MergeWriteScope::with_preparation_authorizer(
+            Arc::new(NoPreparationCommit),
+        );
+        let reader = scope
+            .run(RolloutStore::open_existing_with_options(
+                uri,
+                RolloutStoreOptions::default(),
+            ))
+            .await
+            .unwrap();
+        // A no-work result must survive a deny-all publication authorizer and
+        // preserve the table version. Coverage includes deferred remapping.
+        let prepared = scope.run(reader.prepare_id_key_index()).await.unwrap();
+        assert!(prepared.is_empty());
+        assert_eq!(
+            Dataset::open(uri).await.unwrap().version().version,
+            compacted.version().version
+        );
+
+        put(&publisher, "after-prepare", 4096).await;
+        publisher.cleanup_own_shard().await.unwrap();
+        Dataset::open(uri)
+            .await
+            .unwrap()
+            .delete("id = 'seed-1'")
+            .await
+            .unwrap();
+        let before = Dataset::open(uri).await.unwrap().version().version;
+        crate::merge_write_scope::MergeWriteScope::with_pinned_authorizer(Arc::new(
+            NoPreparationCommit,
+        ))
+        .run(async {
+            let mut fenced =
+                RolloutStore::open_existing_with_options(uri, RolloutStoreOptions::default())
+                    .await
+                    .unwrap();
+            fenced.commit_prepared_id_key_index(prepared).await.unwrap();
+        })
+        .await;
+        let current = Dataset::open(uri).await.unwrap();
+        assert_eq!(current.version().version, before);
+        assert_eq!(
+            current
+                .unindexed_fragments(crate::store_base::ID_INDEX_NAME)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let reader = RolloutStore::open_existing_with_options(uri, RolloutStoreOptions::default())
+            .await
+            .unwrap();
+        assert!(reader.get_blob("seed-1").await.unwrap().is_none());
+        for id in ["seed-0", "seed-2", "seed-3", "after-prepare"] {
+            assert_eq!(reader.get_blob(id).await.unwrap(), Some(vec![42; 4096]));
+        }
+        assert_eq!(rows(uri).await, 4);
+
+        publisher.create_id_btree_index().await.unwrap();
+        let stale = prepare_index_without_commit(uri, crate::KeyIndexType::Btree).await;
+        assert!(stale.is_empty());
+        publisher.create_id_btree_index().await.unwrap();
+        let before = Dataset::open(uri).await.unwrap().version().version;
+        assert!(publisher.commit_prepared_id_key_index(stale).await.is_err());
         assert_eq!(Dataset::open(uri).await.unwrap().version().version, before);
     }
 

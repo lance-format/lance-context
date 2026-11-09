@@ -844,10 +844,12 @@ async fn run_prepared_index(
             error = watch_maintenance_preparation(state, claim, &scope) => return Err(error),
         }
     };
+    let already_covered = prepared.is_empty();
     metrics::histogram!("master_index_phase_duration_seconds", "phase" => "prepare")
         .record(began.elapsed().as_secs_f64());
     tracing::info!(task = %claim.task.id, target = %claim.task.target,
-        seconds = began.elapsed().as_secs_f64(), "index files ready; waiting for commit ownership");
+        seconds = began.elapsed().as_secs_f64(), already_covered,
+        "index preparation complete; waiting for commit ownership");
     let waiting = std::time::Instant::now();
     crate::merge_capacity::phase("waiting_maintenance_commit");
     wait_for_maintenance_commit(state, claim).await?;
@@ -863,10 +865,14 @@ async fn run_prepared_index(
             .commit_prepared_id_key_index(prepared)
             .await
             .map_err(|e| e.to_string())?;
-        Ok(format!(
-            "built {} index on id (prepared outside write lock)",
-            state.config.key_index_type.as_str()
-        ))
+        Ok(if already_covered {
+            "existing BTree covers the prepared snapshot; no index publication".to_string()
+        } else {
+            format!(
+                "built {} index on id (prepared outside write lock)",
+                state.config.key_index_type.as_str()
+            )
+        })
     })
     .await;
     metrics::histogram!("master_index_phase_duration_seconds", "phase" => "commit")
@@ -4691,6 +4697,35 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none());
+            if matches!(kind, lance_context_core::KeyIndexType::Btree) {
+                let before = lance::Dataset::open(&uri).await.unwrap().version().version;
+                let task = enqueue(&state, TaskKind::IndexId, "exp").await.unwrap();
+                let claim = state
+                    .task_store
+                    .claim_next_of_kinds(TaskKinds::GENERAL.without_compact())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(claim.preparing_maintenance());
+                run_task(&state, claim, TaskClaimTiming::default()).await;
+                let status = state.task_store.get(&task.id).await.unwrap().unwrap();
+                assert_eq!(status.state, TaskState::Done, "{status:?}");
+                assert_eq!(
+                    status.detail.as_deref(),
+                    Some("existing BTree covers the prepared snapshot; no index publication")
+                );
+                assert_eq!(
+                    lance::Dataset::open(&uri).await.unwrap().version().version,
+                    before
+                );
+                assert!(state
+                    .task_store
+                    .merge_coordinator()
+                    .get("exp")
+                    .await
+                    .unwrap()
+                    .is_none());
+            }
         }
     }
 
