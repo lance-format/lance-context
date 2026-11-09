@@ -180,7 +180,11 @@ impl MemTable<VacantAllocator> {
 }
 
 impl<A: AllocatorTrait> MemTable<A> {
-    fn rewrite_size_hint(&self, append_watermark: Option<FileSeq>) -> Option<usize> {
+    fn rewrite_size_hint(
+        &self,
+        append_watermark: Option<FileSeq>,
+        rewrite_queue: bool,
+    ) -> Option<usize> {
         // Include framing even if each item is emitted in its own batch. The
         // per-group allowance covers framing and atomic-group markers for both
         // the rewrite-queue and append-queue portions of one maintenance pass.
@@ -188,10 +192,12 @@ impl<A: AllocatorTrait> MemTable<A> {
             .entry_indexes
             .iter()
             .filter(|entry| {
-                append_watermark.is_none_or(|watermark| {
-                    entry.entries.is_none_or(|block| {
-                        block.id.queue == LogQueue::Rewrite || block.id.seq <= watermark
-                    })
+                entry.entries.is_none_or(|block| {
+                    if block.id.queue == LogQueue::Rewrite {
+                        rewrite_queue
+                    } else {
+                        append_watermark.is_none_or(|watermark| block.id.seq <= watermark)
+                    }
                 })
             })
             .try_fold(1024usize, |size, entry| {
@@ -200,9 +206,11 @@ impl<A: AllocatorTrait> MemTable<A> {
         self.kvs
             .iter()
             .filter(|(_, (_, file))| {
-                append_watermark.is_none_or(|watermark| {
-                    file.queue == LogQueue::Rewrite || file.seq <= watermark
-                })
+                if file.queue == LogQueue::Rewrite {
+                    rewrite_queue
+                } else {
+                    append_watermark.is_none_or(|watermark| file.seq <= watermark)
+                }
             })
             .try_fold(entries, |size, (key, (value, _))| {
                 size.checked_add(key.len())?
@@ -1058,8 +1066,16 @@ impl<A: AllocatorTrait> MemTableAccessor<A> {
         &self,
         append_watermark: Option<FileSeq>,
     ) -> Option<usize> {
+        self.selected_rewrite_size_hint(append_watermark, true)
+    }
+
+    pub(crate) fn selected_rewrite_size_hint(
+        &self,
+        append_watermark: Option<FileSeq>,
+        rewrite_queue: bool,
+    ) -> Option<usize> {
         let live = self.fold(Some(0usize), |size, table| {
-            size?.checked_add(table.rewrite_size_hint(append_watermark)?)
+            size?.checked_add(table.rewrite_size_hint(append_watermark, rewrite_queue)?)
         })?;
         let tombstones = self.removed_memtables.lock().len().checked_mul(128)?;
         // A pass rewrites the rewrite queue before the append queue. The latter
