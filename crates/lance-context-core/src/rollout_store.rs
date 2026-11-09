@@ -8466,6 +8466,15 @@ mod tests {
 
     #[tokio::test]
     async fn prepared_compaction_retains_btree_for_incremental_maintenance() {
+        compaction_btree_maintenance(false).await;
+    }
+
+    #[tokio::test]
+    async fn prepared_compaction_retains_btree_for_prepared_incremental_maintenance() {
+        compaction_btree_maintenance(true).await;
+    }
+
+    async fn compaction_btree_maintenance(prepared_index: bool) {
         use lance::index::DatasetIndexInternalExt as _;
 
         let dir = TempDir::new().unwrap();
@@ -8523,7 +8532,14 @@ mod tests {
         for id in ["key-0", "key-1", "key-2", "key-3", "appended"] {
             assert_eq!(store.get_by_id(id).await.unwrap().unwrap().id, id);
         }
-        assert_eq!(store.extend_id_btree_index().await.unwrap(), 1);
+        if prepared_index {
+            let before = store.version();
+            let index = store.prepare_id_key_index().await.unwrap();
+            assert_eq!(Dataset::open(uri).await.unwrap().version().version, before);
+            store.commit_prepared_id_key_index(index).await.unwrap();
+        } else {
+            assert_eq!(store.extend_id_btree_index().await.unwrap(), 1);
+        }
         assert!(store
             .base
             .dataset
@@ -8561,7 +8577,17 @@ mod tests {
             .commit_prepared_compaction(prepared)
             .await
             .unwrap();
-        maintenance.extend_id_btree_index().await.unwrap();
+        if prepared_index {
+            let before = maintenance.version();
+            let index = maintenance.prepare_id_key_index().await.unwrap();
+            assert_eq!(Dataset::open(uri).await.unwrap().version().version, before);
+            maintenance
+                .commit_prepared_id_key_index(index)
+                .await
+                .unwrap();
+        } else {
+            maintenance.extend_id_btree_index().await.unwrap();
+        }
         let reader = RolloutStore::open_existing_with_options(uri, RolloutStoreOptions::default())
             .await
             .unwrap();

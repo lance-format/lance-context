@@ -1851,9 +1851,11 @@ impl StorageBase {
     /// Build files only. Callers must open this handle in a preparation-only
     /// write scope so even an unexpected metadata write is rejected.
     pub async fn prepare_key_index(&self) -> LanceResult<PreparedKeyIndex> {
+        use lance::index::DatasetIndexInternalExt as _;
+
         self.ensure_writable()?;
         let mut snapshot = self.dataset.clone();
-        let replaced = snapshot
+        let replaced: Vec<_> = snapshot
             .load_indices()
             .await?
             .iter()
@@ -1864,16 +1866,63 @@ impl StorageBase {
             crate::KeyIndexType::Btree => IndexType::BTree,
             crate::KeyIndexType::Zonemap => IndexType::ZoneMap,
         };
-        let index = snapshot
-            .create_index_builder(
-                &[self.key_column.as_str()],
-                kind,
-                &ScalarIndexParams::default(),
-            )
-            .name(ID_INDEX_NAME.to_string())
-            .replace(true)
-            .execute_uncommitted()
-            .await?;
+        let key_field = snapshot
+            .schema()
+            .field(&self.key_column)
+            .ok_or_else(|| LanceError::invalid_input("configured index key column is missing"))?;
+        let reusable_btree = matches!(self.key_index_type, crate::KeyIndexType::Btree)
+            && !replaced.is_empty()
+            && replaced.iter().all(|index| {
+                index.fields == [key_field.id]
+                    && index.covering_fields.is_empty()
+                    && index
+                        .index_details
+                        .as_ref()
+                        .is_some_and(|details| details.type_url.ends_with("BTreeIndexDetails"))
+            });
+        let index = if reusable_btree {
+            let uncovered = snapshot.unindexed_fragments(ID_INDEX_NAME).await?;
+            let mut segments = replaced.clone();
+            if !uncovered.is_empty() {
+                let fragments = uncovered
+                    .iter()
+                    .map(|fragment| {
+                        u32::try_from(fragment.id).map_err(|_| {
+                            LanceError::invalid_input("index fragment id exceeds row-address range")
+                        })
+                    })
+                    .collect::<LanceResult<Vec<_>>>()?;
+                segments.push(
+                    snapshot
+                        .create_index_builder(
+                            &[self.key_column.as_str()],
+                            kind,
+                            &ScalarIndexParams::default(),
+                        )
+                        .name(ID_INDEX_NAME.to_string())
+                        .replace(true)
+                        .fragments(fragments)
+                        .execute_uncommitted()
+                        .await?,
+                );
+            }
+            // Merge index files and apply deferred fragment-reuse mappings
+            // without publishing metadata. A single resulting segment retains
+            // compaction's ability to coalesce its covered fragments. Publication
+            // still uses the original source/index checks and fenced handle.
+            snapshot.merge_existing_index_segments(segments).await?
+        } else {
+            snapshot
+                .create_index_builder(
+                    &[self.key_column.as_str()],
+                    kind,
+                    &ScalarIndexParams::default(),
+                )
+                .name(ID_INDEX_NAME.to_string())
+                .replace(true)
+                .execute_uncommitted()
+                .await?
+        };
         Ok(PreparedKeyIndex {
             uri: snapshot.uri().to_owned(),
             schema: Schema::from(snapshot.schema()),

@@ -1459,6 +1459,132 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepared_incremental_index_preserves_publication_guards() {
+        for mutation in ["append_delete", "restore", "index", "compact", "revoke"] {
+            let dir = tempfile::tempdir().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let (_writer, _) = prepared_compaction_fixture(uri).await;
+            let mut publisher =
+                RolloutStore::open_existing_with_options(uri, RolloutStoreOptions::default())
+                    .await
+                    .unwrap();
+            publisher.create_id_btree_index().await.unwrap();
+            publisher
+                .compact(Some(crate::CompactionConfig {
+                    target_rows_per_fragment: 1024,
+                    ..Default::default()
+                }))
+                .await
+                .unwrap();
+            put(&publisher, "uncovered", 4096).await;
+            publisher.cleanup_own_shard().await.unwrap();
+            let before_delete = Dataset::open(uri).await.unwrap();
+            if mutation == "restore" {
+                let mut deleted = before_delete.clone();
+                deleted.delete("id = 'seed-0'").await.unwrap();
+            }
+            let before = Dataset::open(uri).await.unwrap().version().version;
+            // This helper rejects every manifest commit during preparation.
+            let prepared = prepare_index_without_commit(uri, crate::KeyIndexType::Btree).await;
+            assert_eq!(Dataset::open(uri).await.unwrap().version().version, before);
+            if mutation == "append_delete" {
+                put(&publisher, "seed-0", 8192).await;
+                publisher.cleanup_own_shard().await.unwrap();
+                Dataset::open(uri)
+                    .await
+                    .unwrap()
+                    .delete("id = 'seed-1'")
+                    .await
+                    .unwrap();
+                publisher
+                    .commit_prepared_id_key_index(prepared)
+                    .await
+                    .unwrap();
+                let reader =
+                    RolloutStore::open_existing_with_options(uri, RolloutStoreOptions::default())
+                        .await
+                        .unwrap();
+                assert_eq!(
+                    reader.get_blob("seed-0").await.unwrap(),
+                    Some(vec![42; 8192])
+                );
+                assert!(reader.get_blob("seed-1").await.unwrap().is_none());
+                for id in ["seed-2", "seed-3", "uncovered"] {
+                    assert_eq!(reader.get_blob(id).await.unwrap(), Some(vec![42; 4096]));
+                }
+                assert_eq!(rows(uri).await, 4);
+                continue;
+            }
+            match mutation {
+                "restore" => {
+                    let mut restored = Dataset::open(uri)
+                        .await
+                        .unwrap()
+                        .checkout_version(before_delete.version().version)
+                        .await
+                        .unwrap();
+                    restored.restore().await.unwrap();
+                }
+                "index" => publisher.create_id_btree_index().await.unwrap(),
+                "compact" => {
+                    // Covered and uncovered fragments cannot be coalesced
+                    // together. Force a real rewrite of a covered source,
+                    // rather than assuming a compaction request rewrites it.
+                    let mut deleted = Dataset::open(uri).await.unwrap();
+                    deleted.delete("id = 'seed-0'").await.unwrap();
+                    let sources = deleted.manifest().fragments.clone();
+                    publisher.compact(None).await.unwrap();
+                    assert_ne!(
+                        Dataset::open(uri).await.unwrap().manifest().fragments,
+                        sources,
+                        "compaction must change the prepared source fragments"
+                    );
+                }
+                "revoke" => {}
+                _ => unreachable!(),
+            }
+            let before = Dataset::open(uri).await.unwrap().version().version;
+            if mutation == "revoke" {
+                let error = crate::merge_write_scope::MergeWriteScope::with_pinned_authorizer(
+                    Arc::new(NoPreparationCommit),
+                )
+                .run(async {
+                    let mut fenced = RolloutStore::open_existing_with_options(
+                        uri,
+                        RolloutStoreOptions::default(),
+                    )
+                    .await
+                    .unwrap();
+                    fenced
+                        .commit_prepared_id_key_index(prepared)
+                        .await
+                        .unwrap_err()
+                })
+                .await;
+                assert!(
+                    error
+                        .to_string()
+                        .contains("unexpected preparation manifest commit"),
+                    "{error}"
+                );
+            } else {
+                assert!(
+                    publisher
+                        .commit_prepared_id_key_index(prepared)
+                        .await
+                        .is_err(),
+                    "{mutation} must invalidate preparation"
+                );
+            }
+            assert_eq!(
+                Dataset::open(uri).await.unwrap().version().version,
+                before,
+                "{mutation}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn prepared_compaction_preserves_append_and_watermarks_in_both_orders() {
         for merge_first in [true, false] {
             let dir = tempfile::tempdir().unwrap();
