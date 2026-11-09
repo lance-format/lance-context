@@ -104,6 +104,10 @@ async fn mixed_body_preparation_does_not_read_back_its_successful_commit() -> Re
     assert_eq!(unchanged, reference);
     drop(prepared);
     pressure::publish_frozen(&c, &a, &narrow, &body, update_only).await?;
+    assert!(
+        faults.manifest_gets.lock().unwrap().is_empty(),
+        "annotation-only publication must keep the original body reference without reopening it"
+    );
     let latest = annotation_publication::read(&c, &narrow, None).await?;
     assert_eq!(BodySnapshot::read(&latest).await?, Some(reference));
     assert_eq!(latest.count_rows(None).await?, 1);
