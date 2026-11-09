@@ -1,5 +1,5 @@
 use super::*;
-use crate::replication::ProposalRejection;
+use crate::replication::{source_read::Request, ProposalRejection};
 
 #[test]
 fn cancelled_validation_keeps_credit_until_the_blocking_task_releases_its_payload() -> Result<()> {
@@ -59,7 +59,7 @@ fn cancelled_validation_keeps_credit_until_the_blocking_task_releases_its_payloa
     ));
     let response = handle.read_source(
         10,
-        source_read::Request {
+        Request {
             table: batch(1).meta.stream,
             bucket: 0,
             after: 0,
