@@ -32,6 +32,14 @@ impl BodyManifestReader {
 
 #[async_trait::async_trait]
 impl CommitHandler for BodyManifestReader {
+    async fn resolve_latest_location(
+        &self,
+        base: &Path,
+        store: &ObjectStore,
+    ) -> lance::Result<ManifestLocation> {
+        self.0.resolve_latest_location(base, store).await
+    }
+
     async fn resolve_version_location(
         &self,
         base: &Path,
