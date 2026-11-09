@@ -1,4 +1,5 @@
 use super::*;
+use crate::replication::ProposalRejection;
 
 #[test]
 fn cancelled_validation_keeps_credit_until_the_blocking_task_releases_its_payload() -> Result<()> {
