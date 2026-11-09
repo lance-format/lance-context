@@ -93,11 +93,15 @@ async fn append_disk_refusal_retains_decision_after_reservations_release() -> Re
         group: 10,
         batch: batch(1),
     };
-    // Populate both kinds of reservation. Control headroom permits holding the
+    // Populate all reservation kinds. Control headroom permits holding the
     // producer window without racing heartbeat accounting at its exact limit.
     let file = budget.reserve_files(&[4097])?;
+    let rewrite = budget.reserve_rewrite(16 << 10)?;
     let view = budget.snapshot();
-    let proposal_bytes = view.data_limit - view.accounted_disk_bytes - view.reserved_file_bytes;
+    let proposal_bytes = view.data_limit
+        - view.accounted_disk_bytes
+        - view.reserved_file_bytes
+        - view.reserved_rewrite_bytes;
     let proposal = budget.reserve(proposal_bytes as usize, false)?;
     assert!(matches!(
         c.client.request(leader, request.clone()).await?.reply,
@@ -106,7 +110,8 @@ async fn append_disk_refusal_retains_decision_after_reservations_release() -> Re
     let decision = handle.last_append_disk_refusal().unwrap();
     assert_eq!(decision.limit_bytes, view.data_limit);
     assert_eq!(decision.reserved_file_bytes, 8192);
-    assert!(decision.reserved_proposal_bytes >= proposal_bytes);
+    assert_eq!(decision.reserved_rewrite_bytes, 16 << 10);
+    assert!(decision.reserved_proposal_bytes >= proposal_bytes + decision.reserved_rewrite_bytes);
     assert!(decision.requested_bytes > 0);
     assert!(
         decision.accounted_bytes
@@ -118,9 +123,11 @@ async fn append_disk_refusal_retains_decision_after_reservations_release() -> Re
     assert_eq!(producer(&c.client, leader, &batch(1)).await?, None);
 
     drop(proposal);
+    drop(rewrite);
     drop(file);
     budget.refresh()?;
     assert_eq!(budget.snapshot().reserved_file_bytes, 0);
+    assert_eq!(budget.snapshot().reserved_rewrite_bytes, 0);
     let retry = c.client.request(leader, request.clone()).await?;
     let index = accepted(&retry);
     drop(retry);

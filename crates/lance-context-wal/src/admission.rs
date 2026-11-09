@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 pub struct DiskBudgetExhausted {
     pub accounted_bytes: u64,
     pub reserved_proposal_bytes: u64,
+    /// Native rewrite allowance, already included in reserved_proposal_bytes.
+    pub reserved_rewrite_bytes: u64,
     pub reserved_file_bytes: u64,
     pub requested_bytes: u64,
     pub limit_bytes: u64,
@@ -25,10 +27,12 @@ impl std::fmt::Display for DiskBudgetExhausted {
         write!(
             f,
             "node proposal disk budget exhausted; data admission preserves control window \
-             (accounted_bytes={}, reserved_proposal_bytes={}, reserved_file_bytes={}, \
+             (accounted_bytes={}, reserved_proposal_bytes={}, \
+             reserved_rewrite_bytes={}, reserved_file_bytes={}, \
              requested_bytes={}, limit_bytes={})",
             self.accounted_bytes,
             self.reserved_proposal_bytes,
+            self.reserved_rewrite_bytes,
             self.reserved_file_bytes,
             self.requested_bytes,
             self.limit_bytes,
@@ -42,6 +46,9 @@ pub struct Snapshot {
     pub measured_disk_bytes: u64,
     pub accounted_disk_bytes: u64,
     pub reserved_proposal_bytes: u64,
+    /// Subset of reserved_proposal_bytes, not an additional disk charge.
+    #[serde(default)]
+    pub reserved_rewrite_bytes: u64,
     pub reserved_file_bytes: u64,
     pub data_limit: u64,
     pub file_limit: u64,
@@ -53,6 +60,15 @@ struct Accounting {
     counter_at_measurement: u64,
     pending: u64,
     pending_files: u64,
+    pending_rewrite: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Purpose {
+    Proposal,
+    File,
+    #[cfg(feature = "raft-log")]
+    Rewrite,
 }
 #[derive(Debug)]
 pub struct Budget {
@@ -97,6 +113,7 @@ impl Budget {
                 counter_at_measurement: counter,
                 pending: 0,
                 pending_files: 0,
+                pending_rewrite: 0,
             }),
         }))
     }
@@ -125,7 +142,7 @@ impl Budget {
     /// write counts include peer traffic and control/HardState writes across all
     /// groups; pending proposals are charged atomically on top of that baseline.
     pub fn reserve(self: &Arc<Self>, bytes: usize, data: bool) -> Result<Reservation> {
-        self.reserve_below(bytes, false, || {
+        self.reserve_below(bytes, Purpose::Proposal, || {
             if data {
                 self.data_limit.load(Ordering::Acquire)
             } else {
@@ -133,10 +150,18 @@ impl Budget {
             }
         })
     }
+
+    /// Same total ceiling and charge as reserve(bytes, false), with its native
+    /// rewrite share retained in snapshots and refused-admission observations.
+    #[cfg(feature = "raft-log")]
+    pub(crate) fn reserve_rewrite(self: &Arc<Self>, bytes: usize) -> Result<Reservation> {
+        self.reserve_below(bytes, Purpose::Rewrite, || self.max)
+    }
+
     fn reserve_below(
         self: &Arc<Self>,
         bytes: usize,
-        file: bool,
+        purpose: Purpose,
         limit: impl FnOnce() -> u64,
     ) -> Result<Reservation> {
         let bytes = u64::try_from(bytes)?;
@@ -157,19 +182,23 @@ impl Budget {
             DiskBudgetExhausted {
                 accounted_bytes,
                 reserved_proposal_bytes: state.pending - state.pending_files,
+                reserved_rewrite_bytes: state.pending_rewrite,
                 reserved_file_bytes: state.pending_files,
                 requested_bytes: bytes,
                 limit_bytes,
             }
         );
         state.pending += bytes;
-        if file {
-            state.pending_files += bytes;
+        match purpose {
+            Purpose::File => state.pending_files += bytes,
+            #[cfg(feature = "raft-log")]
+            Purpose::Rewrite => state.pending_rewrite += bytes,
+            Purpose::Proposal => {}
         }
         Ok(Reservation {
             budget: self.clone(),
             bytes,
-            file,
+            purpose,
         })
     }
 
@@ -203,7 +232,7 @@ impl Budget {
         })?;
         Ok(FileReservation(self.reserve_below(
             usize::try_from(bytes)?,
-            true,
+            Purpose::File,
             || self.file_limit.load(Ordering::Acquire),
         )?))
     }
@@ -242,6 +271,7 @@ impl Budget {
             measured_disk_bytes: state.measured,
             accounted_disk_bytes: self.accounted(&state),
             reserved_proposal_bytes: state.pending - state.pending_files,
+            reserved_rewrite_bytes: state.pending_rewrite,
             reserved_file_bytes: state.pending_files,
             data_limit: self.data_limit.load(Ordering::Acquire),
             file_limit: self.file_limit.load(Ordering::Acquire),
@@ -273,14 +303,17 @@ impl Drop for FileReservation {
 pub struct Reservation {
     budget: Arc<Budget>,
     bytes: u64,
-    file: bool,
+    purpose: Purpose,
 }
 impl Drop for Reservation {
     fn drop(&mut self) {
         let mut state = self.budget.accounting.lock().unwrap();
         state.pending -= self.bytes;
-        if self.file {
-            state.pending_files -= self.bytes;
+        match self.purpose {
+            Purpose::File => state.pending_files -= self.bytes,
+            #[cfg(feature = "raft-log")]
+            Purpose::Rewrite => state.pending_rewrite -= self.bytes,
+            Purpose::Proposal => {}
         }
     }
 }

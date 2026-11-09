@@ -123,7 +123,7 @@ impl LogMaintenance {
                                 .checked_add(live)
                         })
                         .context("native rewrite reservation overflow")?;
-                    budget.reserve(bytes, false)
+                    budget.reserve_rewrite(bytes)
                 })
                 .transpose()?;
             if let Err(error) = self.node.sync_locked() {
