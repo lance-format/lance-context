@@ -265,7 +265,7 @@ async fn load_body(
     let body = lance::dataset::builder::DatasetBuilder::from_uri(&storage.uri)
         .with_storage_options(storage.options.clone())
         .with_session(storage.session.clone())
-        .with_commit_handler(Arc::new(reader::BodyManifestReader))
+        .with_commit_handler(Arc::new(reader::BodyManifestReader::new(storage).await?))
         .with_version(reference.version)
         .load()
         .await?;
