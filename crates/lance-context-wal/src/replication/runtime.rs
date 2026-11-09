@@ -295,6 +295,13 @@ impl<T> Completion<T> {
 enum Work {
     // Keep the data lane inline; only larger control metadata needs boxing.
     Append(u64, Batch, Instant, Completion<Outcome>),
+    #[cfg(feature = "peer-transport")]
+    ValidatedAppend(
+        u64,
+        crate::record::ValidatedBatch,
+        Instant,
+        Completion<Outcome>,
+    ),
     Commit(u64, Box<Command>, Completion<Outcome>),
     Query(u64, query::Query, Completion<query::Outcome>),
     ReadSource(source_read::Request, Completion<source_read::Observation>),
@@ -463,6 +470,39 @@ impl Handle {
         let group = command.group(self.catalog);
         let route = self.route(group)?;
         let data = matches!(command, Command::Append { .. });
+        let (work, pending) = self.prepare_write(command)?;
+        self.enqueue(route, work, data)?;
+        Ok(pending)
+    }
+
+    /// Keep CPU validation out of the serial group worker. Admission precedes
+    /// spawning, and the task owns the runtime credit even if its caller drops.
+    /// The resulting pending write still waits for durable consensus and apply.
+    #[cfg(feature = "peer-transport")]
+    async fn append(&self, group: u64, batch: Batch) -> Result<Pending<Outcome>> {
+        let route = self.route(group)?;
+        let (work, pending) = self.prepare_write(Command::Append { group, batch })?;
+        let limit = self.max_record;
+        let work = tokio::task::spawn_blocking(move || {
+            let Work::Append(token, batch, _, completion) = work else {
+                unreachable!("prepared append changed command kind")
+            };
+            let validated = crate::record::ValidatedBatch::new(batch, limit)?;
+            Ok::<_, anyhow::Error>(Work::ValidatedAppend(
+                token,
+                validated,
+                Instant::now(),
+                completion,
+            ))
+        })
+        .await
+        .context("append validation task failed")??;
+        self.enqueue(route, work, true)?;
+        Ok(pending)
+    }
+
+    fn prepare_write(&self, command: Command) -> Result<(Work, Pending<Outcome>)> {
+        let data = matches!(command, Command::Append { .. });
         if let Command::Append { batch, .. } = &command {
             ensure!(
                 batch.meta.kind == RecordKind::Data,
@@ -491,8 +531,7 @@ impl Handle {
             Command::Append { batch, .. } => Work::Append(token, batch, Instant::now(), completion),
             control => Work::Commit(token, Box::new(control), completion),
         };
-        self.enqueue(route, work, data)?;
-        Ok(Pending(receive))
+        Ok((work, Pending(receive)))
     }
     pub fn query(&self, group: u64, query: query::Query) -> Result<Pending<query::Outcome>> {
         let route = self.route(group)?;
@@ -845,6 +884,20 @@ impl Worker {
             Work::Append(token, batch, queued, reply) => {
                 let dequeued = Instant::now();
                 let result = self.node.propose(self.group, token, batch);
+                let pending = PendingWrite {
+                    reply,
+                    append: Some(AppendTiming {
+                        queued,
+                        dequeued,
+                        proposed: Instant::now(),
+                    }),
+                };
+                self.track_write(token, pending, result);
+            }
+            #[cfg(feature = "peer-transport")]
+            Work::ValidatedAppend(token, batch, queued, reply) => {
+                let dequeued = Instant::now();
+                let result = self.node.propose_validated(self.group, token, batch);
                 let pending = PendingWrite {
                     reply,
                     append: Some(AppendTiming {

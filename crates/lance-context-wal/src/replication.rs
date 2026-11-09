@@ -728,6 +728,26 @@ impl Node {
     /// Ok means queued locally, NOT durable or committed. A token may have only
     /// one unresolved request on this node. No retry result bypasses consensus.
     pub fn propose(&mut self, group: u64, request: u64, batch: Batch) -> Result<()> {
+        self.propose_inner(group, request, batch, true)
+    }
+
+    #[cfg(feature = "peer-transport")]
+    fn propose_validated(
+        &mut self,
+        group: u64,
+        request: u64,
+        batch: crate::record::ValidatedBatch,
+    ) -> Result<()> {
+        self.propose_inner(group, request, batch.into_inner(), false)
+    }
+
+    fn propose_inner(
+        &mut self,
+        group: u64,
+        request: u64,
+        batch: Batch,
+        validate_digest: bool,
+    ) -> Result<()> {
         self.healthy()?;
         ensure!(
             !self.request_pending(request),
@@ -739,7 +759,7 @@ impl Node {
             &self.limits,
             &batch.meta,
             &batch.body,
-            true,
+            validate_digest,
         )?;
         let g = self.groups.get_mut(&group).context("unhosted group")?;
         ensure!(

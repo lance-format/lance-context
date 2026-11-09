@@ -37,6 +37,23 @@ pub struct Batch {
     pub body: Bytes,
 }
 
+/// Local evidence that these exact immutable bytes match their metadata.
+/// This grants no routing, producer, disk admission, or durability authority.
+#[cfg(feature = "peer-transport")]
+pub(crate) struct ValidatedBatch(Batch);
+
+#[cfg(feature = "peer-transport")]
+impl ValidatedBatch {
+    pub(crate) fn new(batch: Batch, limit: usize) -> Result<Self, ValidationError> {
+        batch.validate(limit)?;
+        Ok(Self(batch))
+    }
+
+    pub(crate) fn into_inner(self) -> Batch {
+        self.0
+    }
+}
+
 /// Record domains used by the ingestion experiments. Control payloads have
 /// their own command validation and smaller limits at the replication layer.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

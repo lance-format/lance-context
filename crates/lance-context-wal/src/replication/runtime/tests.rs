@@ -14,6 +14,8 @@ mod images;
 #[cfg(feature = "service")]
 mod maintenance;
 mod peer_rejections;
+#[cfg(feature = "peer-transport")]
+mod prevalidation;
 mod source_read;
 
 // Actual dedicated workers and durable engines. This relay deliberately drops

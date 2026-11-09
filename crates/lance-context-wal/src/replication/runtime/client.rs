@@ -594,14 +594,9 @@ async fn execute(handle: &Handle, request: WireRequest, body: Bytes) -> Result<(
     }
     let mut output = Bytes::new();
     let reply = match request {
-        WireRequest::Append { group, meta } => Reply::Commit(
-            handle
-                .commit(Command::Append {
-                    group,
-                    batch: Batch { meta, body },
-                })?
-                .await?,
-        ),
+        WireRequest::Append { group, meta } => {
+            Reply::Commit(handle.append(group, Batch { meta, body }).await?.await?)
+        }
         WireRequest::Control(command) => {
             ensure!(
                 !matches!(*command, Command::Append { .. }),

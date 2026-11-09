@@ -38,6 +38,11 @@ fn pipelined_append_reaches_a_follower_during_blocked_leader_sync_without_ack() 
         }
         let body = batch(1);
         let pointer = body.body.as_ptr();
+        // Service builds exercise the same prevalidation path as client RPCs.
+        // Runtime-only builds retain coverage of the raw synchronous API.
+        #[cfg(feature = "peer-transport")]
+        let pending = executor.block_on(handle.append(10, body.clone()))?;
+        #[cfg(not(feature = "peer-transport"))]
         let pending = handle.commit(Command::Append {
             group: 10,
             batch: body.clone(),
