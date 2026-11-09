@@ -7,6 +7,7 @@ mod publication_failure;
 
 enum Failure {
     Sigkill,
+    SigkillStaging,
     #[cfg(unix)]
     Publication,
 }
@@ -15,6 +16,12 @@ enum Failure {
 #[ignore = "requires INGEST_TEST_BIN and ETCD_TEST_ENDPOINTS; real mixed owner/ingress processes"]
 async fn mixed_executable_recovers_acked_import_and_annotations_after_sigkill() -> Result<()> {
     tokio::time::timeout(Duration::from_secs(60), exercise(Failure::Sigkill)).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires INGEST_TEST_BIN and ETCD_TEST_ENDPOINTS; real mixed owner/ingress processes"]
+async fn mixed_executable_reads_recovered_annotations_before_publication() -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(60), exercise(Failure::SigkillStaging)).await?
 }
 
 #[cfg(unix)]
@@ -197,6 +204,10 @@ async fn exercise(failure: Failure) -> Result<()> {
     )?)?;
     let patched = update(&client, &bases[2], &producer, 2, patch).await?;
     reclaimed(&c, patched.completion.index).await?;
+    let materialized_version = annotation_publication::read(&c, &narrow, None)
+        .await?
+        .version_id();
+    let materialized_cut = annotation_publication::state(&c).await?.progress.checkpoint;
     let (suffix, current_status, current_score) = if matches!(failure, Failure::Sigkill) {
         (fixture::create(&["U"], &["s"], &[2])?, "reviewed", 0.9)
     } else {
@@ -254,7 +265,7 @@ async fn exercise(failure: Failure) -> Result<()> {
         Reply::Record(Some(_))
     ));
     let (through, next_sequence) = match failure {
-        Failure::Sigkill => {
+        Failure::Sigkill | Failure::SigkillStaging => {
             owner.0.kill()?;
             ensure!(!owner.0.wait()?.success(), "owner SIGKILL failed");
             (imported.completion.index, 4)
@@ -302,9 +313,12 @@ async fn exercise(failure: Failure) -> Result<()> {
         Ok::<_, anyhow::Error>(())
     })
     .await??;
-    // The replacement must drain the retained suffix while no new business
-    // request is arriving, through the ordinary low-volume publication timer.
-    config.worker.publication.max_batch_wait = Duration::from_millis(20);
+    // Keep the existing two-record window for the staging-read case. A single
+    // retained update must be readable while the native version is unchanged.
+    // The other cases exercise automatic drain with no new business requests.
+    if !matches!(failure, Failure::SigkillStaging) {
+        config.worker.publication.max_batch_wait = Duration::from_millis(20);
+    }
     std::fs::write(&files[0], serde_json::to_vec(&config)?)?;
     let mut replacement = Process::spawn(
         &binary,
@@ -314,17 +328,47 @@ async fn exercise(failure: Failure) -> Result<()> {
     )?;
     ready(&client, &bases[0], TOKEN, &mut replacement).await?;
     for base in &bases[1..=2] {
-        let visible: TurnAnnotation = post(&client, base, "read")
-            .json(&PointRequest { turn: "U".into() })
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        assert_eq!(visible.status.as_deref(), Some("pending"));
+        if !matches!(failure, Failure::SigkillStaging) {
+            let visible: TurnAnnotation = post(&client, base, "read")
+                .json(&PointRequest { turn: "U".into() })
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            assert_eq!(visible.status.as_deref(), Some("pending"));
+        }
         let current = read(&client, base).await?;
         assert_eq!(current.status.as_deref(), Some(current_status));
         assert_eq!(current.score, Some(current_score));
+    }
+    if matches!(failure, Failure::SigkillStaging) {
+        // Check after both reads: a recovery that published first must not
+        // accidentally satisfy a claim about visibility from recovered staging.
+        assert_eq!(
+            annotation_publication::read(&c, &narrow, None)
+                .await?
+                .version_id(),
+            materialized_version
+        );
+        assert_eq!(
+            annotation_publication::state(&c).await?.progress.checkpoint,
+            materialized_cut
+        );
+        assert!(matches!(
+            c.client
+                .request_routed(Request::Fetch {
+                    group: 10,
+                    index: imported.completion.index
+                })
+                .await?
+                .reply,
+            Reply::Record(Some(_))
+        ));
+        a.stop().await?;
+        b.stop().await?;
+        replacement.stop().await?;
+        return c.shutdown().await;
     }
     reclaimed(&c, through).await?;
     assert!(annotation_publication::state(&c).await?.authority.epoch > authority.epoch);
