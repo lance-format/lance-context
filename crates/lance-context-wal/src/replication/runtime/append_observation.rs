@@ -9,8 +9,9 @@ use std::time::{Duration, Instant};
 /// Concurrent requests overlap. Maxima are not percentiles and cannot be added.
 /// Excludes RPC transport, runtime credit admission, pre-enqueue payload
 /// validation, reply delivery, and owner staging application. The RPC execution
-/// timing also includes pre-enqueue validation. Queued/in-flight work dropped on shutdown is absent;
-/// caller cancellation alone does not remove a worker's eventual completion.
+/// timing also includes pre-enqueue validation. Queued/in-flight work dropped on
+/// shutdown is absent; caller cancellation alone does not remove a worker's
+/// eventual completion.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct AppendIntervals {
     pub completed: u64,

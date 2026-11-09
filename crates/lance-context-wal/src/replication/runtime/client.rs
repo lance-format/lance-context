@@ -345,9 +345,9 @@ impl Handle {
     pub fn last_append_disk_refusal(&self) -> Option<crate::admission::DiskBudgetExhausted> {
         self.shared.appends.last_disk_refusal()
     }
-    /// From receipt of the complete body to execution ending, including worker
-    /// pre-enqueue validation, worker queue, proposal and quorum completion. Not pure disk time;
-    /// excludes request transport/admission and sending the reply.
+    /// From receipt of the complete body to execution ending, including
+    /// pre-enqueue validation, worker queue, proposal and quorum completion.
+    /// Not pure disk time; excludes request transport/admission and reply sending.
     pub fn append_execution_timing(&self) -> timing::Observation {
         self.shared.appends.execution.snapshot()
     }
