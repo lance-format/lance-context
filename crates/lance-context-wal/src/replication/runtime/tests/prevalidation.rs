@@ -46,15 +46,41 @@ fn cancelled_validation_keeps_credit_until_the_blocking_task_releases_its_payloa
         error.downcast_ref::<SubmissionFailure>(),
         Some(SubmissionFailure::RequestCredits)
     ));
-    // A group worker can still serve local data reads while CPU work is queued.
-    assert!(executor
-        .block_on(async { handle.read_accepted(10, 1)?.await })?
-        .is_none());
+    // Data reads share the occupied request allowance. Control metadata reads
+    // still reach the group worker while validation waits on the blocking pool.
+    assert!(matches!(
+        handle
+            .read_accepted(10, 1)
+            .err()
+            .context("data read bypassed admission")?
+            .downcast_ref::<SubmissionFailure>(),
+        Some(SubmissionFailure::RequestCredits)
+    ));
+    let response = handle.read_source(
+        10,
+        source_read::Request {
+            table: batch(1).meta.stream,
+            bucket: 0,
+            after: 0,
+            limit: 1,
+        },
+    )?;
+    let error = executor
+        .block_on(async { timeout(Duration::from_secs(5), response).await })?
+        .err()
+        .context("unelected node served source metadata")?;
+    assert!(matches!(
+        error.downcast_ref::<ProposalRejection>(),
+        Some(ProposalRejection::NotLeader)
+    ));
     drop(release);
     executor.block_on(blocked)?;
     executor.block_on(wait_for(|| handle.admission().data.used_requests == 0))?;
     assert_eq!(handle.admission().data.used_bytes, 0);
     assert_eq!(handle.observation(10)?.status.accepted_records, 0);
+    assert!(executor
+        .block_on(async { handle.read_accepted(10, 1)?.await })?
+        .is_none());
     executor.block_on(runtime.shutdown())?;
     Ok(())
 }
