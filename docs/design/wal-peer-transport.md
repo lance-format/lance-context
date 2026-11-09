@@ -30,6 +30,23 @@ messages and must leave runtime byte capacity for another voter. Disconnected
 destinations discard queued traffic; Raft retransmits it. A slow follower cannot
 retain the entire physical runtime outbox's byte allowance.
 
+Within that same destination budget, queues with at least two slots reserve
+one quarter of their slots (between one and four) for small Raft progress
+messages. Only entry-free, snapshot-free heartbeats, append responses and
+vote/pre-vote requests or responses with a charge of at most 1 KiB qualify.
+All Appends, including empty Appends, retain their order in the data queue.
+The sender serves at most four control messages before a ready data message.
+This lets a small ACK enter a destination whose data queue is full without
+increasing the total queue capacity or opening another connection.
+
+Each reserved slot also reserves up to 1 KiB from the existing destination
+byte allowance, capped so the configured maximum frame still fits. With no
+spare bytes, both lanes share the existing cap without a byte reserve; a
+one-slot queue keeps its original behavior. Runtime and destination credits
+remain held through the actual send. This reservation cannot preempt a frame
+already being transmitted or bypass upstream runtime admission, and does not
+guarantee delivery when the control lane or shared byte allowance is full.
+
 Handshake and complete-frame deadlines close uncertain connections; partially
 written frames are never reused. Reconnects have a bounded delay. Receive-frame
 credits remain held until runtime admission has acquired its own credits. These
@@ -64,5 +81,12 @@ leader, continues on the surviving quorum, kills all nodes, reopens the original
 logs, verifies exact retry indices and reads every payload from all three logs.
 These tests establish the exercised correctness cases, not network throughput
 or production readiness.
+
+Queue tests fill the data lane before admitting a Raft ACK, keep control
+traffic arriving while checking Append order and progress, and exhaust byte
+credits while retaining an in-flight packet. They also check payload sharing,
+closed-queue credit release, oversized control contexts and the single-slot
+and maximum-frame cases. End-to-end throughput, tail latency, refusal rate
+and materialization backlog still require a matched workload comparison.
 
 Tracking: #378.
