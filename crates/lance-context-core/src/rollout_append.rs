@@ -1547,6 +1547,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepared_incremental_index_commits_after_prior_index_publication() {
+        use lance::index::DatasetIndexInternalExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let (_writer, _) = prepared_compaction_fixture(uri).await;
+        let mut publisher =
+            RolloutStore::open_existing_with_options(uri, RolloutStoreOptions::default())
+                .await
+                .unwrap();
+        publisher.create_id_btree_index().await.unwrap();
+        let indexed = Dataset::open(uri).await.unwrap();
+        let indices = indexed.load_indices().await.unwrap();
+        let prior = indices.iter().find(|i| i.name == crate::store_base::ID_INDEX_NAME).unwrap();
+        assert!(prior.dataset_version < indexed.version().version);
+        // No intervening compaction remapping: reusing this segment preserves
+        // its old provenance version, which must not become the commit base.
+        put(&publisher, "new-delta", 4096).await;
+        publisher.cleanup_own_shard().await.unwrap();
+        let prepared = prepare_index_without_commit(uri, crate::KeyIndexType::Btree).await;
+        assert!(!prepared.is_empty());
+        publisher.commit_prepared_id_key_index(prepared).await.unwrap();
+        let current = Dataset::open(uri).await.unwrap();
+        assert!(current.unindexed_fragments(crate::store_base::ID_INDEX_NAME).await.unwrap().is_empty());
+        let reader = RolloutStore::open_existing_with_options(uri, RolloutStoreOptions::default())
+            .await.unwrap();
+        for id in ["seed-0", "seed-1", "seed-2", "seed-3", "new-delta"] {
+            assert_eq!(reader.get_blob(id).await.unwrap(), Some(vec![42; 4096]));
+        }
+        assert_eq!(rows(uri).await, 5);
+    }
+
+    #[tokio::test]
     async fn prepared_incremental_index_preserves_publication_guards() {
         for mutation in ["append_delete", "restore", "index", "compact", "revoke"] {
             let dir = tempfile::tempdir().unwrap();

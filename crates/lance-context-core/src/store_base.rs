@@ -143,6 +143,9 @@ impl PreparedCompaction {
 #[derive(Debug)]
 pub struct PreparedKeyIndex {
     uri: String,
+    // The preparation snapshot is the transaction boundary. Reused segment
+    // metadata retains an older dataset_version for coverage provenance.
+    read_version: u64,
     schema: Schema,
     fragments: Vec<lance_table::format::Fragment>,
     index: Option<lance_table::format::IndexMetadata>,
@@ -1894,6 +1897,7 @@ impl StorageBase {
             if uncovered.is_empty() && replaced.len() == 1 {
                 return Ok(PreparedKeyIndex {
                     uri: snapshot.uri().to_owned(),
+                    read_version: snapshot.version().version,
                     schema: Schema::from(snapshot.schema()),
                     fragments: snapshot.manifest().fragments.as_ref().clone(),
                     index: None,
@@ -1943,6 +1947,7 @@ impl StorageBase {
         };
         Ok(PreparedKeyIndex {
             uri: snapshot.uri().to_owned(),
+            read_version: snapshot.version().version,
             schema: Schema::from(snapshot.schema()),
             fragments: snapshot.manifest().fragments.as_ref().clone(),
             index: Some(index),
@@ -2015,7 +2020,7 @@ impl StorageBase {
             return Ok(());
         };
         let transaction = Transaction::new(
-            index.dataset_version,
+            prepared.read_version,
             Operation::CreateIndex {
                 new_indices: vec![index],
                 removed_indices: prepared.replaced,
