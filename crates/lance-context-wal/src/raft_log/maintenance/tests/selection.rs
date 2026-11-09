@@ -63,7 +63,7 @@ fn an_idle_rewrite_queue_has_live_bytes_but_no_native_copy() -> Result<()> {
 }
 
 #[test]
-fn an_idle_rewrite_queue_maintenance_fits_rotation_headroom() -> Result<()> {
+fn an_idle_rewrite_queue_maintenance_does_not_require_another_live_copy() -> Result<()> {
     let root = tempfile::tempdir()?;
     let layout = layout();
     let log = PhysicalLog::open_with_file_size(root.path(), &layout, 1, 64 << 10)?;
@@ -104,13 +104,15 @@ fn an_idle_rewrite_queue_maintenance_fits_rotation_headroom() -> Result<()> {
     .snapshot()
     .accounted_disk_bytes;
     let measured = usize::try_from(measured)?;
+    let max_bytes = measured + measured / 2;
     group.configure_disk(DiskOptions {
-        max_bytes: measured + (256 << 10),
-        data_bytes: measured + (128 << 10),
-        headroom_bytes: 128 << 10,
+        max_bytes,
+        data_bytes: max_bytes - max_bytes / 4,
+        headroom_bytes: max_bytes / 4,
     })?;
-    // This pass copies neither queue. Retain two-file rotation headroom,
-    // but do not require a second copy of the unchanged live rewrite queue.
+    // Keep the normal data/control split and more than two-file rotation
+    // headroom. This pass copies neither queue, so the remaining space need
+    // not fit another complete copy of the unchanged live rewrite queue.
     group.maintenance().run()?;
     let snapshot = group.disk_budget().unwrap().snapshot();
     assert_eq!(snapshot.reserved_rewrite_bytes, 0);
