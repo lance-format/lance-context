@@ -35,6 +35,11 @@ mod checkpoint;
 pub use budget::{DiskMeasurement, DiskOptions};
 mod maintenance;
 pub use maintenance::LogMaintenance;
+mod observation;
+#[cfg(feature = "runtime")]
+pub(crate) use observation::snapshot as wait_observation;
+#[cfg(feature = "runtime")]
+pub use observation::{StorageWaitObservation, WaitInterval};
 #[cfg(test)]
 mod fault_tests;
 
@@ -91,10 +96,10 @@ impl NodeEngine {
     }
 
     fn write(&self, batch: &mut LogBatch) -> Result<()> {
-        let _maintenance = self
-            .maintenance_gate
-            .read()
-            .map_err(|_| anyhow::anyhow!("maintenance gate poisoned"))?;
+        let _maintenance = observation::acquire(observation::Gate::Maintenance, || {
+            self.maintenance_gate.read()
+        })
+        .map_err(|_| anyhow::anyhow!("maintenance gate poisoned"))?;
         let result = self.append_and_sync(batch);
         if result.is_err() {
             self.failed.store(true, Ordering::Release);
@@ -105,29 +110,25 @@ impl NodeEngine {
     fn append_and_sync(&self, batch: &mut LogBatch) -> Result<()> {
         let observed;
         {
-            let _append = self
-                .append_gate
-                .read()
-                .map_err(|_| anyhow::anyhow!("append gate poisoned"))?;
+            let _append =
+                observation::acquire(observation::Gate::Append, || self.append_gate.read())
+                    .map_err(|_| anyhow::anyhow!("append gate poisoned"))?;
             self.check()?;
             self.engine_write(batch, false)?;
             // Capture while holding the read gate. A later generation can only
             // be published by a sync that began after this append completed.
             observed = self.synced.load(Ordering::Acquire);
         }
-        let _sync = self
-            .sync_gate
-            .lock()
+        let _sync = observation::acquire(observation::Gate::Sync, || self.sync_gate.lock())
             .map_err(|_| anyhow::anyhow!("sync gate poisoned"))?;
         self.check()?;
         if self.synced.load(Ordering::Acquire) == observed {
             // raft-engine 0.4.2 panics on sync failure. Isolate the syncing write
             // from native write coalescing: another group must not return a
             // successful result while the native group leader is unwinding.
-            let _exclusive = self
-                .append_gate
-                .write()
-                .map_err(|_| anyhow::anyhow!("append gate poisoned"))?;
+            let _exclusive =
+                observation::acquire(observation::Gate::Exclusive, || self.append_gate.write())
+                    .map_err(|_| anyhow::anyhow!("append gate poisoned"))?;
             self.check()?;
             self.sync_locked()?;
         }
