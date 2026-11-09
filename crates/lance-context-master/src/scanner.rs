@@ -837,9 +837,8 @@ fn note_pending_drift(name: &str, previous: i64, current: usize) {
 
 /// Observe one generic store. Only the fields the WAL-merge sweep and the UI
 /// need: version (for the skip-if-unchanged shortcut), base row count,
-/// fragment count and pending MemWAL generations. Compaction counters stay at
-/// their carried-over values because the master does not compact generic
-/// stores.
+/// fragment count and pending MemWAL generations. Compaction counters carry
+/// forward the scheduler's last successful maintenance observation.
 #[cfg(test)]
 async fn observe_generic(
     name: &str,

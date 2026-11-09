@@ -23,6 +23,7 @@
 //! another. A global [`Semaphore`] bounds how many run at once.
 
 use crate::admission_telemetry::{Context as AdmissionContext, Origin};
+use crate::maintenance_store::{self, MaintenanceStore};
 #[cfg(test)]
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -207,6 +208,9 @@ async fn run_task(state: &Arc<MasterState>, mut claim: TaskClaim, timing: TaskCl
         tracing::warn!(task = %task.id, target = %task.target, error, "task failed");
         if !matches!(task.kind, TaskKind::Repair | TaskKind::MergeWal)
             && is_missing_fragment_error(error)
+            // Repair only supports rollout schemas. Keep generic failures
+            // visible instead of chaining them behind an unsupported repair.
+            && parse_target(&task.target).0 == StoreKind::Rollout
         {
             // The manifest names a file storage does not have. No retry and
             // no cooldown changes that; a repair does, so enqueue one now
@@ -225,16 +229,10 @@ async fn run_task(state: &Arc<MasterState>, mut claim: TaskClaim, timing: TaskCl
         // hold up the next writer, but stays inside the caller's task/compact
         // permits so slow refreshes cannot create unbounded background work.
         let started = std::time::Instant::now();
-        let (_, name) = parse_target(&task.target);
-        match RolloutStore::open_existing_with_options(
-            &state.rollout_uri(name),
-            state.rollout_store_options(),
-        )
-        .await
-        {
-            Ok(store) => update_stats_after_compaction(state, name, &store).await,
+        match MaintenanceStore::open(state, &task.target).await {
+            Ok(store) => update_stats_after_compaction(state, &task.target, &store).await,
             Err(error) => {
-                tracing::warn!(store = %name, error = %error, "post-compaction stats open failed");
+                tracing::warn!(store = %task.target, error = %error, "post-compaction stats open failed");
             }
         }
         metrics::histogram!("master_compaction_phase_duration_seconds", "phase" => "stats_refresh")
@@ -697,8 +695,7 @@ async fn run_prepared_compaction(
 ) -> Result<(String, bool), String> {
     crate::merge_capacity::phase("preparing_compaction");
     let target = claim.task.target.clone();
-    let (_, name) = parse_target(&target);
-    let uri = state.rollout_uri(name);
+    let uri = maintenance_store::uri(state, &target);
     let scope = lance_context_core::merge_write_scope::MergeWriteScope::with_preparation_authorizer(
         Arc::new(PreparationOnly),
     );
@@ -706,10 +703,9 @@ async fn run_prepared_compaction(
     tracing::info!(task = %claim.task.id, target = %claim.task.target, "compaction file preparation started without table ownership");
     let prepared = {
         let work = scope.run(async {
-            let store =
-                RolloutStore::open_existing_with_options(&uri, state.rollout_store_options())
-                    .await
-                    .map_err(|e| e.to_string())?;
+            let store = MaintenanceStore::open(state, &target)
+                .await
+                .map_err(|e| e.to_string())?;
             store
                 .prepare_compaction(state.compaction_config())
                 .await
@@ -730,7 +726,7 @@ async fn run_prepared_compaction(
             Duration::from_secs(3),
             state
                 .task_store
-                .record_compact_noop(name, &uri, prepared.read_version(), &options),
+                .record_compact_noop(&target, &uri, prepared.read_version(), &options),
         )
         .await;
         return Ok(("compaction snapshot needs no rewrite".into(), false));
@@ -746,10 +742,9 @@ async fn run_prepared_compaction(
     crate::maintenance_execution::reconcile_previous(state, claim).await?;
     let started = std::time::Instant::now();
     let outcome = crate::maintenance_execution::run(state, claim, async {
-        let mut store =
-            RolloutStore::open_existing_with_options(&uri, state.rollout_store_options())
-                .await
-                .map_err(|e| e.to_string())?;
+        let mut store = MaintenanceStore::open(state, &target)
+            .await
+            .map_err(|e| e.to_string())?;
         let metrics = store
             .commit_prepared_compaction(prepared)
             .await
@@ -771,14 +766,7 @@ async fn run_prepared_compaction(
 /// per-target lock and lets the index wait its turn behind the queue. Skipped
 /// when nothing was rewritten and when `index_after_compaction` is off.
 async fn run_compaction(state: &Arc<MasterState>, task: &TaskRecord) -> Result<String, String> {
-    let (kind, name) = parse_target(&task.target);
-    if kind != StoreKind::Rollout {
-        // Base-table compaction of generic stores is not scheduled by the
-        // master yet; only WAL merges are. Refuse rather than open the store
-        // through the rollout code path with the wrong URI and schema.
-        return Err(format!("compaction is not scheduled for {kind:?} stores"));
-    }
-    let metrics = compact_inner(state, name).await?;
+    let metrics = compact_inner(state, &task.target).await?;
     finish_compaction(state, task, metrics).await
 }
 
@@ -812,16 +800,11 @@ async fn finish_compaction(
 /// `Compact` for the same experiment never commit concurrently (`CreateIndex`
 /// vs `Rewrite` can conflict). Distinct experiments index concurrently.
 async fn run_index_id(state: &Arc<MasterState>, target: &str) -> Result<String, String> {
-    let (kind, name) = parse_target(target);
-    if kind != StoreKind::Rollout {
-        return Err(format!("id indexing is not scheduled for {kind:?} stores"));
-    }
-    index_id_inner(state, name).await
+    index_id_inner(state, target).await
 }
 
-async fn index_id_inner(state: &Arc<MasterState>, name: &str) -> Result<String, String> {
-    let uri = state.rollout_uri(name);
-    let mut store = RolloutStore::open_existing_with_options(&uri, state.rollout_store_options())
+async fn index_id_inner(state: &Arc<MasterState>, target: &str) -> Result<String, String> {
+    let mut store = MaintenanceStore::open(state, target)
         .await
         .map_err(|e| e.to_string())?;
     store
@@ -839,7 +822,7 @@ async fn run_prepared_index(
     claim: &mut TaskClaim,
 ) -> Result<String, String> {
     crate::merge_capacity::phase("preparing_index");
-    let uri = state.rollout_uri(&claim.task.target);
+    let target = claim.task.target.clone();
     let scope = lance_context_core::merge_write_scope::MergeWriteScope::with_preparation_authorizer(
         Arc::new(PreparationOnly),
     );
@@ -848,10 +831,9 @@ async fn run_prepared_index(
         "index file preparation started without table ownership");
     let prepared = {
         let work = scope.run(async {
-            let store =
-                RolloutStore::open_existing_with_options(&uri, state.rollout_store_options())
-                    .await
-                    .map_err(|e| e.to_string())?;
+            let store = MaintenanceStore::open(state, &target)
+                .await
+                .map_err(|e| e.to_string())?;
             store
                 .prepare_id_key_index()
                 .await
@@ -874,10 +856,9 @@ async fn run_prepared_index(
     crate::maintenance_execution::reconcile_previous(state, claim).await?;
     let started = std::time::Instant::now();
     let result = crate::maintenance_execution::run(state, claim, async {
-        let mut store =
-            RolloutStore::open_existing_with_options(&uri, state.rollout_store_options())
-                .await
-                .map_err(|e| e.to_string())?;
+        let mut store = MaintenanceStore::open(state, &target)
+            .await
+            .map_err(|e| e.to_string())?;
         store
             .commit_prepared_id_key_index(prepared)
             .await
@@ -897,10 +878,10 @@ async fn compact_inner(
     state: &Arc<MasterState>,
     name: &str,
 ) -> Result<lance::dataset::optimize::CompactionMetrics, String> {
-    let uri = state.rollout_uri(name);
+    let uri = maintenance_store::uri(state, name);
     let config = state.compaction_config();
 
-    let mut store = RolloutStore::open_existing_with_options(&uri, state.rollout_store_options())
+    let mut store = MaintenanceStore::open(state, name)
         .await
         .map_err(|e| e.to_string())?;
     let options = compact_options_key(&config);
@@ -956,7 +937,11 @@ pub(crate) fn compact_options_key(config: &CompactionConfig) -> String {
 /// round refreshes the row anyway, so this never waits long for the
 /// `stats-writer` lock: a holder mid-maintenance would otherwise pin this
 /// task's concurrency slot on every master for as long as it runs.
-async fn update_stats_after_compaction(state: &Arc<MasterState>, name: &str, store: &RolloutStore) {
+async fn update_stats_after_compaction(
+    state: &Arc<MasterState>,
+    name: &str,
+    store: &MaintenanceStore,
+) {
     let guard = match tokio::time::timeout(
         STATS_REFRESH_LOCK_WAIT,
         // This refresh is optional: leave a busy writer to the next scan.
@@ -1001,7 +986,7 @@ async fn update_stats_after_compaction(state: &Arc<MasterState>, name: &str, sto
     };
     let row = StatRow {
         name: name.to_string(),
-        uri: state.rollout_uri(name),
+        uri: maintenance_store::uri(state, name),
         row_count: obs.row_count,
         fragment_count: obs.fragment_count,
         last_updated: obs.last_updated,
@@ -1069,10 +1054,6 @@ async fn sweep_candidates_inner(
     let mut queued = 0;
     // Batch only advisory suppression metadata. Active-task reads and enqueue
     // CAS stay per candidate, preserving task accounting and publisher fencing.
-    let rows: Vec<_> = rows
-        .into_iter()
-        .filter(|row| parse_target(&row.name).0 == StoreKind::Rollout)
-        .collect();
     'pages: for page in rows.chunks(crate::task_store::COMPACT_PREFLIGHT_BATCH) {
         if queued >= MAX_SWEEP_ENQUEUE {
             break;
@@ -1086,7 +1067,11 @@ async fn sweep_candidates_inner(
             if hint.cooling_down()? {
                 continue;
             }
-            if hint.unchanged(&state.rollout_uri(&row.name), row.version, &options)? {
+            if hint.unchanged(
+                &maintenance_store::uri(state, &row.name),
+                row.version,
+                &options,
+            )? {
                 metrics::counter!("master_compact_noop_suppressed_total").increment(1);
                 continue;
             }
@@ -1670,7 +1655,7 @@ mod tests {
     use lance_context_core::generate_id;
     use tempfile::TempDir;
 
-    fn config(dir: &TempDir) -> MasterConfig {
+    pub(super) fn config(dir: &TempDir) -> MasterConfig {
         MasterConfig {
             legacy_retirement_request: None,
             local_merge: Default::default(),
@@ -2450,7 +2435,7 @@ mod tests {
             None
         };
         let start = std::time::Instant::now();
-        update_stats_after_compaction(&state, "exp", &store).await;
+        update_stats_after_compaction(&state, "exp", &MaintenanceStore::Rollout(store)).await;
         let elapsed = start.elapsed();
         let count = if let Some(before) = before {
             Some(grants().await - before)
@@ -2541,7 +2526,7 @@ mod tests {
                 .await
                 .unwrap();
             // A later uncontended refresh still updates the row normally.
-            update_stats_after_compaction(&state, "exp", &store).await;
+            update_stats_after_compaction(&state, "exp", &MaintenanceStore::Rollout(store)).await;
             let stats = state.stats.lock().await.get("exp").await.unwrap().unwrap();
             assert_eq!(stats.total_compactions, 1);
             assert_eq!(stats.row_count, 4);
@@ -5826,12 +5811,11 @@ mod tests {
         worker.abort();
     }
 
-    /// The compaction sweep must not enqueue generic rows: the master does not
-    /// compact generic stores, and `run_compaction` would otherwise open the
-    /// wrong URI through the rollout code path.
+    /// Generic and rollout rows share bounded scheduling but retain distinct
+    /// task identities, even when their bare names are identical.
     #[tokio::test]
     #[ignore = "requires ETCD_TEST_ENDPOINTS"]
-    async fn compaction_sweep_skips_generic_rows() {
+    async fn generic_maintenance_sweep_includes_both_kinds() {
         use crate::stats_store::StatRow;
 
         let dir = TempDir::new().unwrap();
@@ -5855,14 +5839,15 @@ mod tests {
                 .await
                 .unwrap();
             stats
-                .upsert(&seed(generic_target("g"), state.generic_uri("g")))
+                .upsert(&seed(generic_target("r"), state.generic_uri("r")))
                 .await
                 .unwrap();
         }
         let queued = sweep_candidates(&state).await.unwrap();
-        assert_eq!(queued, 1, "only the rollout row is compacted");
+        assert_eq!(queued, 2);
         let tasks = state.task_store.list().await.unwrap();
-        assert!(tasks.iter().all(|t| t.target == "r"), "{tasks:?}");
+        assert!(tasks.iter().any(|t| t.target == "r"), "{tasks:?}");
+        assert!(tasks.iter().any(|t| t.target == "generic:r"), "{tasks:?}");
     }
 
     /// A `Compact` runs even while every `MergeWal` slot is occupied by slow
@@ -6923,3 +6908,7 @@ mod preparation_ownership_tests {
         assert_eq!(calls, 2);
     }
 }
+
+#[cfg(test)]
+#[path = "scheduler/generic_maintenance_tests.rs"]
+mod generic_maintenance_tests;

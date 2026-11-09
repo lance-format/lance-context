@@ -121,10 +121,8 @@ pub fn claim_shape(
         _ => &[],
     };
     let maintenance = matches!(kind, TaskKind::Compact | TaskKind::IndexId);
-    let preparing = maintenance
-        && !is_generic(target)
-        && !policy.rollout.draining(target)
-        && listed(preparation_targets, target);
+    let preparing =
+        maintenance && !policy.rollout.draining(target) && listed(preparation_targets, target);
     let sharing_opt_in: &[String] = match kind {
         TaskKind::Repair if lance_context_core::validate_store_name(target).is_ok() => {
             policy.repair_validate_only_targets
@@ -348,7 +346,7 @@ mod tests {
     }
 
     #[test]
-    fn claim_shape_prepares_only_opted_in_maintenance_on_live_rollouts() {
+    fn claim_shape_prepares_only_opted_in_maintenance_on_live_targets() {
         let rollout = rollout(&["t", "d"], &["d"]);
         let compact = strings(&["t", "d"]);
         let index = strings(&["*"]);
@@ -369,8 +367,13 @@ mod tests {
         );
         let shape = claim_shape(TaskKind::IndexId, "generic:x", &policy, false);
         assert!(
+            shape.preparing && !shape.write_claim,
+            "generic index preparation honors the wildcard"
+        );
+        let shape = claim_shape(TaskKind::Compact, "generic:x", &policy, false);
+        assert!(
             !shape.preparing && shape.write_claim,
-            "generic never prepares"
+            "unlisted generic stays exclusive"
         );
         let shape = claim_shape(TaskKind::IndexId, "anything", &policy, false);
         assert!(shape.preparing, "wildcard applies");
