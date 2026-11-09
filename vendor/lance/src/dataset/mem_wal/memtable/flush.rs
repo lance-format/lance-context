@@ -44,6 +44,14 @@ pub struct FlushResult {
     pub covered_wal_entry_position: u64,
 }
 
+/// Immutable files retained across publication retries. Once publication has
+/// been attempted, retry only the manifest CAS, never rewrite visible files.
+pub(crate) struct PreparedMemTableFlush {
+    result: FlushResult,
+    size: FlushedSize,
+    attempted_versions: std::sync::Mutex<Vec<u64>>,
+}
+
 /// Build the within-generation deletion vector for forward-written flush data.
 ///
 /// `batches` are in on-disk (insert) order, so the newest version of each
@@ -277,7 +285,6 @@ impl MemTableFlusher {
     /// WAL entries this generation captures. Pass 0 only for shards that
     /// have not yet appended any WAL entry — non-zero positions are
     /// 1-based (see `FIRST_WAL_ENTRY_POSITION`).
-    #[instrument(name = "mt_flush_storage", level = "info", skip_all, fields(shard_id = %self.shard_id, epoch, generation = memtable.generation(), row_count = memtable.row_count()))]
     pub async fn flush(
         &self,
         memtable: &MemTable,
@@ -285,6 +292,20 @@ impl MemTableFlusher {
         covered_wal_entry_position: u64,
         durable: usize,
     ) -> Result<FlushResult> {
+        let prepared = self
+            .prepare(memtable, epoch, covered_wal_entry_position, durable)
+            .await?;
+        self.publish_prepared(&prepared, epoch).await
+    }
+
+    #[instrument(name = "mt_flush_storage", level = "info", skip_all, fields(shard_id = %self.shard_id, epoch, generation = memtable.generation(), row_count = memtable.row_count()))]
+    pub(crate) async fn prepare(
+        &self,
+        memtable: &MemTable,
+        epoch: u64,
+        covered_wal_entry_position: u64,
+        durable: usize,
+    ) -> Result<PreparedMemTableFlush> {
         self.manifest_store.check_fenced(epoch).await?;
 
         if memtable.row_count() == 0 {
@@ -336,25 +357,14 @@ impl MemTableFlusher {
         let warm_uri = self.path_to_uri(&gen_path);
         self.warm_generation(&warm_uri).await;
 
-        let new_manifest = self
-            .update_manifest(
-                epoch,
-                generation,
-                &gen_folder_name,
+        Ok(PreparedMemTableFlush {
+            result: FlushResult {
+                sstable: size.sstable(generation, gen_folder_name),
+                rows_flushed,
                 covered_wal_entry_position,
-                size,
-            )
-            .await?;
-
-        info!(
-            "Flushed SSTable {} for shard {} (manifest version {})",
-            generation, self.shard_id, new_manifest.version
-        );
-
-        Ok(FlushResult {
-            sstable: size.sstable(generation, gen_folder_name),
-            rows_flushed,
-            covered_wal_entry_position,
+            },
+            size,
+            attempted_versions: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -538,7 +548,6 @@ impl MemTableFlusher {
     ///
     /// See [`MemTableFlusher::flush`] for `covered_wal_entry_position`
     /// semantics.
-    #[instrument(name = "mt_flush_with_indexes", level = "info", skip_all, fields(shard_id = %self.shard_id, epoch, generation = memtable.generation(), row_count = memtable.row_count(), index_count = index_configs.len()))]
     pub async fn flush_with_indexes(
         &self,
         memtable: &MemTable,
@@ -547,6 +556,27 @@ impl MemTableFlusher {
         covered_wal_entry_position: u64,
         durable: usize,
     ) -> Result<FlushResult> {
+        let prepared = self
+            .prepare_with_indexes(
+                memtable,
+                epoch,
+                index_configs,
+                covered_wal_entry_position,
+                durable,
+            )
+            .await?;
+        self.publish_prepared(&prepared, epoch).await
+    }
+
+    #[instrument(name = "mt_flush_with_indexes", level = "info", skip_all, fields(shard_id = %self.shard_id, epoch, generation = memtable.generation(), row_count = memtable.row_count(), index_count = index_configs.len()))]
+    pub(crate) async fn prepare_with_indexes(
+        &self,
+        memtable: &MemTable,
+        epoch: u64,
+        index_configs: &[MemIndexConfig],
+        covered_wal_entry_position: u64,
+        durable: usize,
+    ) -> Result<PreparedMemTableFlush> {
         self.manifest_store.check_fenced(epoch).await?;
 
         if memtable.row_count() == 0 {
@@ -669,25 +699,14 @@ impl MemTableFlusher {
         let warm_uri = self.path_to_uri(&gen_path);
         self.warm_generation(&warm_uri).await;
 
-        let new_manifest = self
-            .update_manifest(
-                epoch,
-                generation,
-                &gen_folder_name,
+        Ok(PreparedMemTableFlush {
+            result: FlushResult {
+                sstable: size.sstable(generation, gen_folder_name),
+                rows_flushed: memtable.row_count(),
                 covered_wal_entry_position,
-                size,
-            )
-            .await?;
-
-        info!(
-            "Flushed SSTable {} for shard {} (manifest version {})",
-            generation, self.shard_id, new_manifest.version
-        );
-
-        Ok(FlushResult {
-            sstable: size.sstable(generation, gen_folder_name),
-            rows_flushed: memtable.row_count(),
-            covered_wal_entry_position,
+            },
+            size,
+            attempted_versions: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -1219,6 +1238,74 @@ impl MemTableFlusher {
     }
 
     /// Update the shard manifest with the new SSTable.
+    #[instrument(name = "mt_publish_prepared", level = "info", skip_all, fields(shard_id = %self.shard_id, epoch, generation = prepared.result.sstable.generation))]
+    pub(crate) async fn publish_prepared(
+        &self,
+        prepared: &PreparedMemTableFlush,
+        epoch: u64,
+    ) -> Result<FlushResult> {
+        self.manifest_store.check_fenced(epoch).await?;
+        let attempted = prepared.attempted_versions.lock().unwrap().clone();
+        if !attempted.is_empty() {
+            // A committed generation may already have been merged out of the
+            // latest manifest. Read our exact CAS candidate versions; a later
+            // generation or an absent SSTable alone is not a commit receipt.
+            let latest = self.manifest_store.refresh_latest().await?.ok_or_else(|| {
+                Error::io("Shard manifest missing during publication reconciliation")
+            })?;
+            for version in attempted.iter().filter(|v| **v <= latest.version) {
+                let manifest = self.manifest_store.read_version(*version).await?;
+                if manifest.writer_epoch == epoch
+                    && Self::matches_publication(
+                        &manifest,
+                        prepared.result.sstable.generation,
+                        &prepared.result.sstable.path,
+                        prepared.result.covered_wal_entry_position,
+                        prepared.size,
+                    )
+                {
+                    return Ok(prepared.result.clone());
+                }
+            }
+            // These existing versions belong to competing commits. An absent
+            // future candidate remains uncertain until its CAS is reconciled.
+            prepared
+                .attempted_versions
+                .lock()
+                .unwrap()
+                .retain(|v| *v > latest.version);
+        }
+        self.update_manifest_recording(
+            epoch,
+            prepared.result.sstable.generation,
+            &prepared.result.sstable.path,
+            prepared.result.covered_wal_entry_position,
+            prepared.size,
+            Some(&prepared.attempted_versions),
+        )
+        .await?;
+        Ok(prepared.result.clone())
+    }
+
+    fn matches_publication(
+        manifest: &ShardManifest,
+        generation: u64,
+        path: &str,
+        covered_wal_entry_position: u64,
+        size: FlushedSize,
+    ) -> bool {
+        manifest.current_generation > generation
+            && manifest.replay_after_wal_entry_position >= covered_wal_entry_position
+            && manifest.sstables.iter().any(|existing| {
+                existing.generation == generation
+                    && existing.path == path
+                    && existing.in_memory_bytes == size.in_memory_bytes
+                    && existing.physical_rows == size.physical_rows
+                    && existing.primary_key_bytes == size.primary_key_bytes
+            })
+    }
+
+    #[cfg(test)]
     async fn update_manifest(
         &self,
         epoch: u64,
@@ -1227,23 +1314,76 @@ impl MemTableFlusher {
         covered_wal_entry_position: u64,
         size: FlushedSize,
     ) -> Result<ShardManifest> {
+        self.update_manifest_recording(
+            epoch,
+            generation,
+            gen_path,
+            covered_wal_entry_position,
+            size,
+            None,
+        )
+        .await
+    }
+
+    async fn update_manifest_recording(
+        &self,
+        epoch: u64,
+        generation: u64,
+        gen_path: &str,
+        covered_wal_entry_position: u64,
+        size: FlushedSize,
+        attempted_versions: Option<&std::sync::Mutex<Vec<u64>>>,
+    ) -> Result<ShardManifest> {
         let gen_path = gen_path.to_string();
 
         self.manifest_store
-            .commit_update(epoch, |current| {
+            .commit_update_checked(epoch, |current| {
+                // A failed predecessor still owns the replay boundary. These
+                // checks belong inside the CAS closure, not in an earlier
+                // read that another manifest commit can invalidate.
+                if current.sstables.iter().any(|s| s.generation == generation) {
+                    if Self::matches_publication(current, generation, &gen_path, covered_wal_entry_position, size) {
+                        return Ok(None);
+                    }
+                    return Err(Error::invalid_input(format!(
+                        "generation {generation} is already registered with different publication metadata"
+                    )));
+                }
+                if generation != current.current_generation {
+                    return Err(Error::invalid_input(format!(
+                        "cannot publish generation {generation}: the next unpublished generation is {}; \
+                         replay must not skip an unpublished predecessor or republish a retired generation",
+                        current.current_generation
+                    )));
+                }
+                if covered_wal_entry_position < current.replay_after_wal_entry_position {
+                    return Err(Error::invalid_input(format!(
+                        "generation {generation} would move replay backwards from {} to {covered_wal_entry_position}",
+                        current.replay_after_wal_entry_position
+                    )));
+                }
+                let next_generation = generation
+                    .checked_add(1)
+                    .ok_or_else(|| Error::invalid_input("memtable generation overflow"))?;
+                if let Some(attempts) = attempted_versions {
+                    let mut attempts = attempts.lock().unwrap();
+                    if !attempts.contains(&current.next_version()) {
+                        attempts.push(current.next_version());
+                    }
+                }
                 let mut sstables = current.sstables.clone();
                 sstables.push(size.sstable(generation, gen_path.clone()));
 
-                ShardManifest {
+                Ok(Some(ShardManifest {
                     version: current.next_version(),
                     replay_after_wal_entry_position: covered_wal_entry_position,
                     wal_entry_position_last_seen: current
                         .wal_entry_position_last_seen
                         .max(covered_wal_entry_position),
-                    current_generation: generation + 1,
+                    current_generation: next_generation,
                     sstables,
                     ..current.clone()
-                }
+                }))
             })
             .await
     }
@@ -1251,6 +1391,12 @@ impl MemTableFlusher {
 
 /// Message driving the background memtable-flush task.
 pub enum TriggerMemTableFlush {
+    /// Idle retry backstop; does no storage I/O when nothing is retained.
+    Retry,
+    /// Retry retained failures once before a graceful close reports success.
+    Drain {
+        done: super::super::write::DurabilityCell,
+    },
     /// Flush a frozen memtable to Lance storage.
     Flush {
         /// The frozen memtable to flush.
@@ -1263,6 +1409,8 @@ pub enum TriggerMemTableFlush {
 impl std::fmt::Debug for TriggerMemTableFlush {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Retry => f.write_str("TriggerMemTableFlush::Retry"),
+            Self::Drain { .. } => f.write_str("TriggerMemTableFlush::Drain"),
             Self::Flush { memtable, done } => f
                 .debug_struct("TriggerMemTableFlush::Flush")
                 .field("memtable_gen", &memtable.generation())

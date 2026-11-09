@@ -194,3 +194,64 @@ macro_rules! observe_phase {
 pub(crate) use {
     count, observe_duration, observe_phase, observe_value, timer_elapsed, timer_start,
 };
+
+/// Per-writer bridge from actual background flush attempts to process metrics.
+/// No store/shard labels: use Pod tags for charts and structured logs for identity.
+#[cfg(feature = "metrics")]
+#[derive(Debug)]
+pub(crate) struct MemtableFlushMetrics {
+    // Gauges are additive across resident retry queues in this process.
+    pending: std::sync::Mutex<(usize, usize)>,
+}
+
+#[cfg(feature = "metrics")]
+impl Default for MemtableFlushMetrics {
+    fn default() -> Self {
+        for result in ["ok", "error"] {
+            ::metrics::counter!("rollout_memtable_flush_attempts_total", "result" => result)
+                .increment(0);
+        }
+        ::metrics::counter!("rollout_memtable_flush_retries_total").increment(0);
+        ::metrics::counter!("rollout_memtable_flush_backpressure_rejections_total").increment(0);
+        ::metrics::gauge!("rollout_memtable_flush_retry_generations").increment(0.0);
+        ::metrics::gauge!("rollout_memtable_flush_retry_bytes").increment(0.0);
+        Self {
+            pending: std::sync::Mutex::new((0, 0)),
+        }
+    }
+}
+
+#[cfg(feature = "metrics")]
+impl lance::dataset::mem_wal::observer::WalObserver for MemtableFlushMetrics {
+    fn on_memtable_flush(&self, _duration: std::time::Duration, _rows: usize) {
+        ::metrics::counter!("rollout_memtable_flush_attempts_total", "result" => "ok").increment(1);
+    }
+
+    fn on_memtable_flush_error(&self) {
+        ::metrics::counter!("rollout_memtable_flush_attempts_total", "result" => "error")
+            .increment(1);
+    }
+
+    fn on_memtable_flush_retry(&self) {
+        ::metrics::counter!("rollout_memtable_flush_retries_total").increment(1);
+    }
+
+    fn on_memtable_flush_retry_state(&self, generations: usize, bytes: usize) {
+        let mut previous = self.pending.lock().unwrap();
+        ::metrics::gauge!("rollout_memtable_flush_retry_generations")
+            .increment(generations as f64 - previous.0 as f64);
+        ::metrics::gauge!("rollout_memtable_flush_retry_bytes")
+            .increment(bytes as f64 - previous.1 as f64);
+        *previous = (generations, bytes);
+    }
+}
+
+#[cfg(feature = "metrics")]
+impl Drop for MemtableFlushMetrics {
+    fn drop(&mut self) {
+        // These gauges describe live retry queues, not a durable recovery ledger.
+        let (generations, bytes) = *self.pending.get_mut().unwrap();
+        ::metrics::gauge!("rollout_memtable_flush_retry_generations").decrement(generations as f64);
+        ::metrics::gauge!("rollout_memtable_flush_retry_bytes").decrement(bytes as f64);
+    }
+}

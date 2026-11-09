@@ -27,4 +27,15 @@ pub trait WalObserver: Send + Sync + Debug {
     /// A frozen memtable became an L0 SSTable. Orders of magnitude longer
     /// than a WAL flush.
     fn on_memtable_flush(&self, _duration: Duration, _rows: usize) {}
+
+    /// A generation flush attempt failed (including background retries).
+    fn on_memtable_flush_error(&self) {}
+
+    /// An already-failed generation is being retried.
+    fn on_memtable_flush_retry(&self) {}
+
+    /// Current retained retry queue, including successors blocked behind its
+    /// oldest failure. Bytes are resident payload/index bytes, not WAL bytes.
+    /// A generation remains counted while its retry is in flight.
+    fn on_memtable_flush_retry_state(&self, _generations: usize, _bytes: usize) {}
 }
