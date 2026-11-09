@@ -447,11 +447,12 @@ where
     /// forbidden from copying it. Keep the existing append-prefix, metadata and
     /// framing allowance; callers still reserve file rotation headroom.
     #[cfg(feature = "internals")]
-    pub fn estimated_rewrite_bytes_for(&self, boundary: &crate::purge::PurgeBoundary) -> Option<usize> {
-        self.memtables.selected_rewrite_size_hint(
-            Some(boundary.append_watermark),
-            boundary.rewrite_queue,
-        )
+    pub fn estimated_rewrite_bytes_for(
+        &self,
+        boundary: &crate::purge::PurgeBoundary,
+    ) -> Option<usize> {
+        self.memtables
+            .selected_rewrite_size_hint(Some(boundary.append_watermark), boundary.rewrite_queue)
     }
 
     /// Conservative allowance for reclaiming only the rewrite queue.

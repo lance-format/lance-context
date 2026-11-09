@@ -113,17 +113,11 @@ where
     }
 
     #[cfg(feature = "internals")]
-    pub fn purge_expired_files_before(
-        &self,
-        boundary: PurgeBoundary,
-    ) -> Result<Vec<u64>> {
+    pub fn purge_expired_files_before(&self, boundary: PurgeBoundary) -> Result<Vec<u64>> {
         self.purge_expired_files_inner(Some(boundary))
     }
 
-    fn purge_expired_files_inner(
-        &self,
-        boundary: Option<PurgeBoundary>,
-    ) -> Result<Vec<u64>> {
+    fn purge_expired_files_inner(&self, boundary: Option<PurgeBoundary>) -> Result<Vec<u64>> {
         let _t = StopWatch::new(&*ENGINE_PURGE_DURATION_HISTOGRAM);
         let guard = self.force_rewrite_candidates.try_lock();
         if guard.is_none() {
@@ -153,18 +147,17 @@ where
                         l.first_file_not_ready_for_purge(LogQueue::Append)
                             .map_or(barrier, |f| std::cmp::min(f, barrier))
                     });
-                let (rewrite_watermark, compact_watermark) =
-                    if let Some(boundary) = boundary {
-                        let before = boundary.append_barrier;
-                        let cap = boundary.append_watermark;
-                        append_queue_barrier = append_queue_barrier.min(before).max(first_append);
-                        (
-                            rewrite_watermark.min(before.saturating_sub(1)).min(cap),
-                            compact_watermark.min(before.saturating_sub(1)).min(cap),
-                        )
-                    } else {
-                        (rewrite_watermark, compact_watermark)
-                    };
+                let (rewrite_watermark, compact_watermark) = if let Some(boundary) = boundary {
+                    let before = boundary.append_barrier;
+                    let cap = boundary.append_watermark;
+                    append_queue_barrier = append_queue_barrier.min(before).max(first_append);
+                    (
+                        rewrite_watermark.min(before.saturating_sub(1)).min(cap),
+                        compact_watermark.min(before.saturating_sub(1)).min(cap),
+                    )
+                } else {
+                    (rewrite_watermark, compact_watermark)
+                };
 
                 // Ordering
                 // 1. Must rewrite tombstones AFTER acquiring `append_queue_barrier`, or
