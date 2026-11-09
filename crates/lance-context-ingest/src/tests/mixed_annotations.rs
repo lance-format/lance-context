@@ -6,6 +6,7 @@ mod id_index;
 mod lost_prepare;
 mod prefetch;
 mod pressure;
+mod publication_io;
 mod replay;
 mod runtime;
 mod snapshot;

@@ -43,6 +43,8 @@ pub(in crate::tests) struct Faults {
     pub data_listings: Mutex<Vec<Path>>,
     pub manifest_reads: AtomicUsize,
     pub manifest_gets: Mutex<Vec<Path>>,
+    pub get_requests: Mutex<Vec<(Path, bool)>>,
+    manifest_get_pause: Mutex<Option<PausedManifestGet>>,
     remote: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     index_write: Mutex<Option<PausedIndexWrite>>,
 }
@@ -50,6 +52,13 @@ pub(in crate::tests) struct Faults {
 #[derive(Debug)]
 struct PausedIndexWrite {
     entered: oneshot::Sender<Path>,
+    resume: oneshot::Receiver<()>,
+}
+
+#[derive(Debug)]
+struct PausedManifestGet {
+    path: Path,
+    entered: oneshot::Sender<()>,
     resume: oneshot::Receiver<()>,
 }
 
@@ -69,6 +78,22 @@ struct FailedListing {
 }
 
 impl Faults {
+    pub fn pause_manifest_get(&self, path: Path) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (entered, observed) = oneshot::channel();
+        let (resume, waiting) = oneshot::channel();
+        assert!(self
+            .manifest_get_pause
+            .lock()
+            .unwrap()
+            .replace(PausedManifestGet {
+                path,
+                entered,
+                resume: waiting
+            })
+            .is_none());
+        (observed, resume)
+    }
+
     fn body_write(&self, path: &Path) -> object_store::Result<()> {
         if path.as_ref().contains("/data/") {
             self.body_write_attempts.fetch_add(1, Ordering::SeqCst);
@@ -320,9 +345,24 @@ impl ObjectStore for FaultStore {
         }))
     }
     async fn get_opts(&self, path: &Path, opts: GetOptions) -> object_store::Result<GetResult> {
+        self.faults
+            .get_requests
+            .lock()
+            .unwrap()
+            .push((path.clone(), opts.head));
         if !opts.head && path.as_ref().contains("/_versions/") {
             self.faults.manifest_reads.fetch_add(1, Ordering::Relaxed);
             self.faults.manifest_gets.lock().unwrap().push(path.clone());
+            let pause = self
+                .faults
+                .manifest_get_pause
+                .lock()
+                .unwrap()
+                .take_if(|pause| pause.path == *path);
+            if let Some(pause) = pause {
+                let _ = pause.entered.send(());
+                pause.resume.await.map_err(|_| failure())?;
+            }
         }
         self.inner.get_opts(path, opts).await
     }
