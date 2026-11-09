@@ -132,7 +132,8 @@ fn rewrite_allowance_excludes_later_snapshot_entries_and_tombstones() -> Result<
         maintain.join().unwrap()?;
         return Err(error.context("fixture did not reach rewrite sync"));
     }
-    let reserved_before = budget.snapshot().reserved_proposal_bytes;
+    let before = budget.snapshot();
+    let reserved_before = before.reserved_proposal_bytes;
     let mut snapshot = Snapshot::default();
     snapshot.mut_metadata().index = 65;
     snapshot.mut_metadata().term = 2;
@@ -174,7 +175,8 @@ fn rewrite_allowance_excludes_later_snapshot_entries_and_tombstones() -> Result<
             .capture_append_boundary()
             .1
     });
-    let reserved_after = budget.snapshot().reserved_proposal_bytes;
+    let after = budget.snapshot();
+    let reserved_after = after.reserved_proposal_bytes;
     drop(pause);
     maintain.join().unwrap()?;
     install.join().unwrap();
@@ -182,6 +184,8 @@ fn rewrite_allowance_excludes_later_snapshot_entries_and_tombstones() -> Result<
     assert!(installed_before_release);
     assert!(reserved_before > 0 && reserved_before < 2 << 20);
     assert_eq!(reserved_after, reserved_before);
+    assert_eq!(before.reserved_rewrite_bytes, reserved_before);
+    assert_eq!(after.reserved_rewrite_bytes, reserved_before);
     assert_eq!(pending_before_release, Some(1));
     assert_eq!(
         group
@@ -203,6 +207,7 @@ fn rewrite_allowance_excludes_later_snapshot_entries_and_tombstones() -> Result<
         "late 4 MiB suffix entered the old rewrite allowance: {rewrite_bytes}"
     );
     assert_eq!(budget.snapshot().reserved_proposal_bytes, 0);
+    assert_eq!(budget.snapshot().reserved_rewrite_bytes, 0);
     group.maintenance().run()?;
     drop((group, budget, log));
     let reopened = PhysicalLog::open(root.path(), &layout, 1)?;
