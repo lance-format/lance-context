@@ -46,13 +46,28 @@ and row bounds by scanning only their key and real stable row IDs and training
 native BTree pages in that same domain. Existing segments need no full-table
 rebuild. New logical indexes still use the Lance 14 builder and address domain.
 The persisted descriptor decoder rejects mixed domains. This compatibility
-path still requires cross-version fixture validation before deployment.
+path also uses the native page merger for version-0 segments, filtering them
+with the stable IDs in their current fragment coverage. This excludes stale
+postings after a status column rewrite without reading turn bodies.
 
-The upgrade is not ready to deploy until managed compaction retains those
-remaps through prepared publication and the existing-index transition is
-validated. The current compaction regression intentionally continues requiring
-ID index coverage on the replacement fragment. Falling back to a scan is not
-an acceptable substitute for that coverage guarantee.
+Managed compaction prepares native index remaps before publication, without
+committing or reserving a manifest version. The prepared transaction contains
+the exact remapped files; recovery validates and reuses that transaction. It
+does not rerun remapping to resolve an uncertain publish. Both new address
+indexes and existing stable-ID indexes retain coverage on replacement fragments.
+
+The compatibility tests use a fixture written by the actual Lance 13 builder.
+They cover append, incremental indexing, segment merging, compaction, reopening,
+and status rewrites that withdraw old index coverage while retaining body files.
+Publication tests cover concurrent updates, old readers, uncertain results,
+process termination, and reclamation.
+
+Performance still requires separate qualification. The native version-1 BTree
+remapper retrains all pages in each affected segment, even when only some of
+its covered fragments are compacted. Bounding the source data rewrite therefore
+does not alone bound the total index I/O. Compare remap cost and sustained mixed
+ingestion before adopting Lance 14 performance defaults; these compatibility
+tests establish correctness, not a throughput improvement.
 
 Validation must cover the existing real Lance flush failure and replay-boundary
 regressions, concurrent annotation publication, indexed reads, task cancellation,
