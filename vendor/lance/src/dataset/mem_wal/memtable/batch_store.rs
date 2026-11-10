@@ -302,7 +302,8 @@ impl BatchStore {
     }
 
     pub(crate) fn record_wal_entry_position(&self, position: u64) {
-        self.wal_entry_position.fetch_max(position, Ordering::Release);
+        self.wal_entry_position
+            .fetch_max(position, Ordering::Release);
     }
 
     pub(crate) fn wal_entry_position(&self) -> Option<u64> {
