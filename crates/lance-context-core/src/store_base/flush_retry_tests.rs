@@ -11,6 +11,7 @@ use std::time::Duration;
 struct FaultStore {
     inner: Arc<dyn object_store::ObjectStore>,
     mode: Arc<AtomicU8>,
+    gate: Option<Arc<WalGate>>,
 }
 #[derive(Debug)]
 struct Wrapper(Arc<AtomicU8>);
@@ -23,6 +24,35 @@ impl lance_io::object_store::WrappingObjectStore for Wrapper {
         Arc::new(FaultStore {
             inner,
             mode: self.0.clone(),
+            gate: None,
+        })
+    }
+    fn wrap_paginated(
+        &self,
+        _: &str,
+        _: Arc<dyn object_store::list::PaginatedListStore>,
+    ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+        None
+    }
+}
+#[derive(Debug, Default)]
+struct WalGate {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    used: std::sync::atomic::AtomicBool,
+}
+#[derive(Debug)]
+struct GateWrapper(Arc<WalGate>);
+impl lance_io::object_store::WrappingObjectStore for GateWrapper {
+    fn wrap(
+        &self,
+        _: &str,
+        inner: Arc<dyn object_store::ObjectStore>,
+    ) -> Arc<dyn object_store::ObjectStore> {
+        Arc::new(FaultStore {
+            inner,
+            mode: Arc::new(AtomicU8::new(0)),
+            gate: Some(self.0.clone()),
         })
     }
     fn wrap_paginated(
@@ -52,6 +82,14 @@ impl object_store::ObjectStore for FaultStore {
         payload: object_store::PutPayload,
         options: object_store::PutOptions,
     ) -> object_store::Result<object_store::PutResult> {
+        if path.as_ref().contains("/wal/") {
+            if let Some(gate) = &self.gate {
+                if !gate.used.swap(true, Ordering::SeqCst) {
+                    gate.entered.notify_one();
+                    gate.release.notified().await;
+                }
+            }
+        }
         if self.mode.load(Ordering::SeqCst) == 3
             && path.as_ref().contains("/_mem_wal/")
             && path.as_ref().contains("/_versions/")
@@ -309,4 +347,96 @@ fn failed_flush_recovers_without_new_rows_and_reports_retry_metrics() {
     assert!(counters.iter().any(|(key, _, _, value)| key.key().name()
         == "rollout_memtable_flush_retries_total"
         && matches!(value, DebugValue::Counter(n) if *n >= 3)));
+}
+
+#[tokio::test]
+async fn coalesced_wal_flush_preserves_each_generation_boundary() {
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
+    let dir = tempfile::TempDir::new().unwrap();
+    let uri = format!("file://{}", dir.path().display());
+    let gate = Arc::new(WalGate::default());
+    let params = ObjectStoreParams {
+        object_store_wrapper: Some(Arc::new(GateWrapper(gate.clone()))),
+        ..Default::default()
+    };
+    let (store, path) = lance_io::object_store::ObjectStore::from_uri_and_params(
+        Arc::new(lance_io::object_store::ObjectStoreRegistry::default()),
+        &uri,
+        &params,
+    )
+    .await
+    .unwrap();
+    let shard_id = uuid::Uuid::new_v4();
+    let writer = ShardWriter::open(
+        store,
+        path,
+        uri.clone(),
+        ShardWriterConfig {
+            shard_id,
+            store_params: Some(params),
+            durable_write: false,
+            max_wal_buffer_size: 1024,
+            max_wal_flush_interval: None,
+            ..Default::default()
+        },
+        schema.clone(),
+        vec![],
+    )
+    .await
+    .unwrap();
+    let batch = |value: &str| {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec![value]))],
+        )
+        .unwrap()
+    };
+    // The small first generation is flushed only by its seal. Hold that WAL PUT
+    // while the second generation queues both a size-trigger and its own seal.
+    writer.put(vec![batch("first")]).await.unwrap();
+    let first = writer.force_seal_active().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+        .await
+        .unwrap();
+    let second_value = "x".repeat(4096);
+    writer.put(vec![batch(&second_value)]).await.unwrap();
+    let second = writer.force_seal_active().await.unwrap();
+    gate.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(15), first.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(15), second.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    let manifest = writer.manifest().await.unwrap().unwrap();
+    assert_eq!(manifest.replay_after_wal_entry_position, 2);
+    assert_eq!(manifest.sstables.len(), 2);
+    for (generation, expected) in manifest
+        .sstables
+        .iter()
+        .zip(["first", second_value.as_str()])
+    {
+        let rows =
+            DatasetBuilder::from_uri(format!("{}/_mem_wal/{}/{}", uri, shard_id, generation.path))
+                .load()
+                .await
+                .unwrap()
+                .scan()
+                .try_into_batch()
+                .await
+                .unwrap();
+        assert_eq!(rows.num_rows(), 1);
+        assert_eq!(
+            rows.column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            expected
+        );
+    }
+    writer.close().await.unwrap();
 }
