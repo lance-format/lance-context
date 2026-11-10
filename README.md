@@ -122,6 +122,26 @@ store = await AsyncRolloutStore.connect_or_create("http://localhost:8080", "rl-r
 await store.add({"rollout_id": "traj-1", "role": "assistant", "reward": 1.0})
 ```
 
+## Automatic JSON shredding
+
+`DocumentStore` discovers useful scalar fields automatically, stores extracted
+values in typed columns, and removes them from the residual JSON. Reads restore
+the complete logical document; callers do not declare shredding paths.
+
+```python
+from lance_context import DocumentStore
+
+store = DocumentStore.create("documents.lance")
+ids = store.add([{"body": "otters swim upstream", "source": "wiki"}])
+hits = store.search("otters")
+document = store.get(ids[0])
+```
+
+This initial embedded API uses direct Lance commits with one writer per dataset.
+The first text search after layout growth prepares historical values and indexes.
+See [automatic shredding](docs/design/automatic-shredding.md) for policy limits,
+logical field queries, versioned reads, and current array/indexing boundaries.
+
 ## Rust
 
 The engine is written in Rust and usable directly:

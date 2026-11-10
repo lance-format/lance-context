@@ -2,10 +2,10 @@
 
 Tracking issue: [#832](https://github.com/lance-format/lance-context/issues/832).
 
-The `shredding` module selects scalar object paths automatically. Callers supply
-JSON values and resource limits, not extraction paths. Its first increment is a
-storage-independent codec; persistent document access and search are subsequent
-increments tracked in the parent issue.
+The `shredding` module and `DocumentStore` select scalar object paths
+automatically. Callers supply JSON values and resource limits, not extraction
+paths. The embedded Rust and Python APIs persist the layout, reconstruct complete
+documents, filter logical fields, and prepare native full-text indexes.
 
 ## Selection
 
@@ -66,7 +66,7 @@ the document and is independent of the store's generated ID.
 use lance_context::{DocumentStore, shredding::ShredPolicy};
 use serde_json::json;
 
-# async fn example() -> Result<(), lance_context_core::LanceError> {
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
 let mut store = DocumentStore::create("documents.lance", ShredPolicy::default(), None).await?;
 let ids = store.add(vec![json!({"body": "some text", "metadata": {"source": "wiki"}})]).await?;
 let document = store.get(&ids[0]).await?;
@@ -121,3 +121,36 @@ commit retries. A stale rewrite fails instead of rebasing over newer appends.
 The backfill marker and data are published together; failed index creation can
 be retried. Pinned snapshots can search if already prepared, but cannot trigger
 backfill or index creation. Retained versions continue to hold their old bytes.
+
+
+## Python API
+
+```python
+from lance_context import DocumentStore
+
+store = DocumentStore.create("documents.lance")
+ids = store.add([
+    {"body": "otters swim upstream", "metadata": {"source": "wiki"}},
+    {"body": "otters dive underwater", "metadata": {"source": "notes"}},
+])
+
+assert store.get(ids[0])["body"] == "otters swim upstream"
+assert store.get_path(ids[0], ["metadata", "source"]) == "wiki"
+hits = store.search("otters")
+matching_ids = store.filter_eq(["metadata", "source"], "wiki")
+reopened = DocumentStore.open("documents.lance")
+```
+
+Paths in reads and filters are literal key sequences, not extraction settings.
+The Python API raises `KeyError` for a missing document/path and returns `None`
+for an explicit JSON null. `add` accepts a sequence of documents, including root
+arrays/scalars/null, and returns generated IDs. JSON nesting is limited to 127
+container levels so accepted records remain readable. Residual floating-point
+values use round-trip precision. Python integers must fit signed or unsigned
+64 bits; larger integers, non-finite floats, and non-string object keys are
+rejected before writing instead of silently changing their values.
+
+Use `policy={"max_columns": 16}` or other `ShredPolicy` limits at creation to tune
+selection without naming fields. The persisted policy is reused on open. The
+first search can perform a substantial rewrite/index build; call
+`prepare_text_search()` before serving latency-sensitive searches when needed.

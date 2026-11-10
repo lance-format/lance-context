@@ -4297,6 +4297,7 @@ dependencies = [
  "lance-context-core",
  "openssl",
  "pyo3",
+ "serde",
  "serde_json",
  "tokio",
 ]

@@ -22,6 +22,7 @@ from .api import (  # pyright: ignore[reportMissingImports]
     datagen_event_id,
     generate_id,
 )
+from .documents import DocumentStore
 from .embeddings import (  # pyright: ignore[reportMissingImports]
     MultiModalEmbeddingProvider,
 )
@@ -38,6 +39,7 @@ __all__ = [
     "DatagenStore",
     "DatagenStreamWriter",
     "GenericStore",
+    "DocumentStore",
     "EmbeddingProvider",
     "InternalError",
     "InvalidRequestError",
