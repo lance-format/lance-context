@@ -1146,11 +1146,24 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
     async fn native_failure_retirement_preserves_new_debt_and_lost_ownership() {
-        let (c, mut client, proof, _) = fixture().await;
         let endpoint = "http://worker:3000";
         let error =
             format!("error sending request for url ({endpoint}/api/v1/internal/merge-executor)");
-        c.record_failure(&proof, "table", endpoint, &error)
+        assert_native_failure_retirement_preserves_new_debt_and_lost_ownership(&error).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn native_retirement_identity_failure_preserves_new_debt_and_lost_ownership() {
+        assert_native_failure_retirement_preserves_new_debt_and_lost_ownership(
+            "Internal(\"LanceError(IO): Invalid WAL retirement generation identity, crates/lance-context-core/src/wal_retirement.rs:71:28\")",
+        ).await;
+    }
+
+    async fn assert_native_failure_retirement_preserves_new_debt_and_lost_ownership(error: &str) {
+        let (c, mut client, proof, _) = fixture().await;
+        let endpoint = "http://worker:3000";
+        c.record_failure(&proof, "table", endpoint, error)
             .await
             .unwrap();
         let observed = c
@@ -1168,7 +1181,7 @@ mod tests {
         reserved.maintenance = Some(MaintenanceKind::Catchup);
         assert!(c.reserve(&proof, &reserved).await.unwrap());
         let running = c.start(&reserved).await.unwrap().unwrap();
-        c.record_failure(&proof, "table", endpoint, &error)
+        c.record_failure(&proof, "table", endpoint, error)
             .await
             .unwrap();
         assert!(!c
@@ -1200,6 +1213,21 @@ mod tests {
                 .consecutive_attempts,
             2
         );
+        let unrelated_endpoint = "http://other-worker:3000";
+        c.record_failure(&proof, "table", unrelated_endpoint, "schema mismatch")
+            .await
+            .unwrap();
+        let unrelated = c
+            .target_failure_observations("table")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.failure.endpoint == unrelated_endpoint)
+            .unwrap();
+        assert!(c
+            .clear_observed_failure_after_native_recovery(&proof, &running, &unrelated)
+            .await
+            .is_err());
         assert!(c
             .clear_observed_failure_after_native_recovery(&proof, &running, &fresh)
             .await
@@ -1210,6 +1238,10 @@ mod tests {
             .clear_observed_failure_after_native_recovery(&proof, &running, &fresh)
             .await
             .unwrap());
+        let retained = c.target_failure_observations("table").await.unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].revision, unrelated.revision);
+        assert_eq!(retained[0].failure.last_error, "schema mismatch");
         client
             .delete(
                 format!("{}/", c.prefix),
