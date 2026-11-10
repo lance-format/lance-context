@@ -123,6 +123,9 @@ jobs:
               for backport in ["vendor/lance-io/src/object_store/throttle.rs",
                                "vendor/lance-core/src/utils/tokio.rs",
                                "vendor/lance/src/io/exec/filtered_read.rs",
+                               "vendor/lance/src/dataset/blob/file.rs",
+                               "vendor/lance/src/dataset/mem_wal/write.rs",
+                               "vendor/lance/src/dataset/mem_wal/memtable/flush.rs",
                                "vendor/lance-encoding/src/decoder.rs",
                                "vendor/lance-io/src/scheduler.rs"]:
                   patched = source.extractfile(f"{root}/{backport}")
