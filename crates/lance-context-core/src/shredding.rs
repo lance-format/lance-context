@@ -79,7 +79,11 @@ impl ShredType {
             Value::Bool(_) => Some(Self::Bool),
             Value::Number(n) if n.is_i64() => Some(Self::Int64),
             Value::Number(n) if n.is_u64() => Some(Self::UInt64),
-            Value::Number(_) => Some(Self::Float64),
+            Value::Number(number) => number
+                .as_f64()
+                .and_then(serde_json::Number::from_f64)
+                .filter(|round_trip| round_trip == number)
+                .map(|_| Self::Float64),
             _ => None,
         }
     }

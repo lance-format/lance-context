@@ -53,3 +53,43 @@ The codec removes duplication between residual and extracted values. Indexes,
 replication, WAL, and retained dataset versions still have their normal storage
 costs. Whole-document reconstruction must read the extracted text too; storage
 and latency claims need end-to-end measurements.
+
+## Persistent document store
+
+`DocumentStore::create(uri, policy, storage_options)` creates a versioned Lance
+dataset; `open` reads the persisted policy and field mappings. `add` discovers
+additional fields automatically, writes extracted values into typed columns,
+and returns generated document IDs. An `id` key inside the JSON remains part of
+the document and is independent of the store's generated ID.
+
+```rust,no_run
+use lance_context::{DocumentStore, shredding::ShredPolicy};
+use serde_json::json;
+
+# async fn example() -> Result<(), lance_context_core::LanceError> {
+let mut store = DocumentStore::create("documents.lance", ShredPolicy::default(), None).await?;
+let ids = store.add(vec![json!({"body": "some text", "metadata": {"source": "wiki"}})]).await?;
+let document = store.get(&ids[0]).await?;
+let body = store.get_path(&ids[0], &["body".into()]).await?;
+# Ok(())
+# }
+```
+
+The initial adapter is embedded and uses direct Lance commits with one writer
+per dataset. It does not attach a MemWAL or expose an HTTP endpoint. Integrating
+automatic schema evolution with resident WAL writers requires coordination that
+the existing immutable-schema GenericStore does not provide.
+
+Promotion adds nullable columns with their logical-path/type metadata in one
+schema transaction. Older rows receive physical nulls while their logical values
+remain in the residual. The next transaction appends the new documents atomically.
+An interrupted append may leave unused columns, but cannot leave half a document.
+Columns have deterministic path/type-derived names to avoid interpreting a stale
+writer's data with a different logical mapping. Concurrent schema changes can
+still conflict; this API does not claim coordinated multi-writer evolution.
+
+`get_path` reads a typed column directly when populated, falling back to document
+reconstruction for historical residual values, type mismatches, and container
+paths. Explicit null and missing remain distinct. `checkout` pins both the layout
+and documents to a read-only version; `refresh` restores the latest view. Field
+selection, projection, and round-trip semantics are covered by real Lance tests.
