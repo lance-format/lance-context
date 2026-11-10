@@ -265,27 +265,35 @@ pub(super) async fn prepare(
                 phases.measure(Phase::NativeCompaction, task.execute(&dataset)),
             )
             .await?;
-        if !indices.is_empty() {
-            // The catalog fixes the read and target versions and fences other
-            // writers. Persist real IDs now so bitmap maintenance sees the same
-            // IDs as the selected manifest, without a separate reservation commit.
-            for (ordinal, fragment) in result.new_fragments.iter_mut().enumerate() {
-                ensure!(
-                    fragment.id == 0,
-                    "native compaction assigned unexpected fragment IDs"
-                );
-                fragment.id = next_fragment_id(&dataset, ordinal)?;
-            }
+        // The catalog fixes the read and target versions and fences other
+        // writers. Persist real IDs now, including unindexed native rewrites,
+        // without a separate reservation commit.
+        for (ordinal, fragment) in result.new_fragments.iter_mut().enumerate() {
+            ensure!(
+                fragment.id == 0,
+                "native compaction assigned unexpected fragment IDs"
+            );
+            fragment.id = next_fragment_id(&dataset, ordinal)?;
         }
         validate_result(&dataset, &result).await?;
+        // Address evidence is consumed by the native remapper. Do not encode
+        // that potentially large bitmap as JSON only to discard the encoding.
+        if result.row_addrs.is_some() {
+            return if annotations {
+                crate::annotation_publication::compaction::descriptors(
+                    &dataset, result, &selection, &storage, maximum,
+                )
+                .await
+            } else {
+                native_descriptors(&dataset, result, &selection, &storage, maximum).await
+            };
+        }
         let bytes = serde_json::to_vec(&result)?;
-        if annotations && (result.row_addrs.is_some() || bytes.len() as u64 > maximum) {
+        if annotations && bytes.len() as u64 > maximum {
             crate::annotation_publication::compaction::descriptors(
                 &dataset, result, &selection, &storage, maximum,
             )
             .await
-        } else if result.row_addrs.is_some() {
-            native_descriptors(&dataset, result, &selection, &storage, maximum).await
         } else {
             p::Descriptors::lance_compaction(Bytes::from(bytes))
         }
