@@ -877,7 +877,7 @@ mod test {
     /// dropped and recreated at the same URI restarts them at 0 while sharing the
     /// cache namespace of its predecessor (see #7645). The two generations must
     /// still be told apart.
-    #[rstest]
+    #[rstest::rstest]
     #[case::physical_etag(false)]
     #[case::logical_identity(true)]
     #[tokio::test]
