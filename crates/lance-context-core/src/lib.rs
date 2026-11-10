@@ -6,6 +6,7 @@ mod api_impl;
 mod context;
 mod datagen;
 mod datagen_store;
+mod document_store;
 pub mod etcd;
 mod eval;
 mod export;
@@ -63,6 +64,7 @@ pub use datagen::{
     DatagenWriteContext, FieldOp, FoldedDatagenItem, DATAGEN_SCHEMA_VERSION,
 };
 pub use datagen_store::{datagen_log_schema, DatagenStore, DatagenStoreOptions};
+pub use document_store::DocumentStore;
 pub use eval::{
     AbReport, EvalConfig, EvalQuery, EvalQuerySet, EvalReport, MetricScores, QueryEval,
     RelevanceLabel, RetrievalMode,
