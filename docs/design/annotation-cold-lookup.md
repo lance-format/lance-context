@@ -231,3 +231,37 @@ original persistent directories first observed the old materialized cut, then
 all 4096 replayed entries before publication. Recovery passed point reads, full
 value/index checks, source GC and final drain. This qualifies process termination
 with retained storage, not power failure or loss of all replica disks.
+
+## Point scans with an uncovered ID-index tail
+
+A scalar ID index can cover historical fragments while recent fragments remain
+unindexed. Point reads must also search that tail, both to find newly appended
+turns and to reject duplicate IDs spanning indexed and unindexed data. The
+two-match result limit does not bound the number of input rows examined.
+
+Point scans now use 2048-row vectors. The annotation projection, two-match
+limit, captured base, reader admission and published-value cache are unchanged.
+Mutation lookup vectors remain 128 rows. Larger vectors amortize filtering work
+on uncovered fragments; they do not reduce the bytes fetched or replace index
+maintenance. They can increase native decoding workspace, which remains
+separate from staging's retained-value budget.
+
+A native scanner comparison used 1,048,576 initial narrow annotation rows,
+256 distinct keys per observation and eight concurrent reads. Every observation
+used a fresh native Session; three rounds rotated execution order. With an
+artificial 5 ms delay on data-file I/O, median total elapsed times were:
+
+| Index state | 128-row vectors | 2048-row vectors |
+| --- | ---: | ---: |
+| Fully covered | 396.6 ms | 394.4 ms |
+| 4096-row uncovered tail | 458.2 ms | 410.4 ms |
+| 32768-row uncovered tail | 1300.8 ms | 528.9 ms |
+| Index caught up again | 397.0 ms | 399.4 ms |
+
+The comparison checked values, missing keys, appended keys and duplicates
+spanning index coverage. It excluded staging admission/value caching, concurrent
+publication, HTTP and WAL replication. Artificial delay is not measured blob
+latency, and these results do not establish an ingestion throughput gain or a
+process memory bound.
+
+Refs #378.

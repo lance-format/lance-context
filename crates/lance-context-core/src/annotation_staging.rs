@@ -709,9 +709,10 @@ async fn read_base(base: &Dataset, turn: &str, max_bytes: usize) -> Result<Optio
     scan.project(&["labels", "status", "score"])?;
     scan.filter_expr(col("id").eq(lit(turn)));
     scan.limit(Some(2), None)?;
-    // The two-row result limit detects duplicates. Scan vectors can be larger
-    // without returning more matches or projecting the turn body.
-    scan.batch_size(COLD_LOOKUP_ROWS);
+    // The two-row result limit detects duplicates, including an indexed match
+    // repeated in an uncovered tail. Larger scan vectors amortize that tail's
+    // filtering work without returning more matches or projecting the body.
+    scan.batch_size(COLD_POINT_SCAN_ROWS);
     let mut stream = scan.try_into_stream().await?;
     let mut value = None;
     while let Some(batch) = stream.try_next().await? {
@@ -726,10 +727,12 @@ async fn read_base(base: &Dataset, turn: &str, max_bytes: usize) -> Result<Optio
 }
 
 // Scanner vectors and query key windows are independent. A 2048-row mutation
-// batch needs at most one cold query, while point reads retain small vectors.
+// batch needs at most one cold query. Point scans use larger vectors to check
+// uncovered index tails, but still return at most two matching rows.
 // Values are decoded in mutation order; slices share projected Arrow buffers.
 const COLD_LOOKUP_ROWS: usize = 128;
 const COLD_LOOKUP_KEYS: usize = 2048;
+const COLD_POINT_SCAN_ROWS: usize = 2048;
 
 async fn read_bases<'a>(
     base: &Dataset,
