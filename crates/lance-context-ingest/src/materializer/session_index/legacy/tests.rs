@@ -211,15 +211,30 @@ async fn legacy_status_merge_discards_values_from_withdrawn_fragment_coverage() 
         .await??;
         base = commit(&base, operation_for(&base, &descriptor, Key::Status).await?).await?;
     }
-    base = lance::dataset::UpdateBuilder::new(Arc::new(base))
-        .update_where("id IN ('A', 'B')")?
-        .set("status", "'reviewed'")?
-        .build()?
-        .execute()
-        .await?
-        .new_dataset
-        .as_ref()
-        .clone();
+    let update = RecordBatch::try_from_iter([
+        (
+            "id",
+            Arc::new(StringArray::from(vec!["A", "B"])) as arrow_array::ArrayRef,
+        ),
+        (
+            "status",
+            Arc::new(StringArray::from(vec!["reviewed", "reviewed"])) as arrow_array::ArrayRef,
+        ),
+    ])?;
+    // Use the same column rewrite as annotation publication. A general row
+    // update may instead delete/reinsert rows and retain fragment coverage.
+    let rewrite =
+        lance::dataset::MergeInsertBuilder::try_new(Arc::new(base.clone()), vec!["id".into()])?
+            .when_matched(lance::dataset::WhenMatched::UpdateAll)
+            .when_not_matched(lance::dataset::WhenNotMatched::DoNothing)
+            .write_mode(lance::dataset::MergeInsertWriteMode::RewriteColumns)
+            .conflict_retries(0)
+            .skip_auto_cleanup(true)
+            .try_build()?
+            .execute_uncommitted_batches(vec![update])
+            .await?;
+    assert_eq!(rewrite.stats.num_updated_rows, 2);
+    base = commit(&base, rewrite.transaction.operation).await?;
     let segments: Vec<_> = base
         .load_indices()
         .await?
