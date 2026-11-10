@@ -170,3 +170,85 @@ pub async fn prepare_rewrite(
         frag_reuse_index: None,
     })
 }
+
+/// Validate persisted index remaps without writing files or rerunning a remap.
+/// The caller separately validates the rewrite's source fragments, assigned IDs,
+/// row counts, and publication identity against this same snapshot.
+pub async fn validate_index_remaps(base: &Dataset, operation: &Operation) -> Result<()> {
+    let invalid = |message: &str| Error::invalid_input(message.to_owned());
+    let Operation::Rewrite {
+        groups,
+        rewritten_indices,
+        frag_reuse_index: None,
+    } = operation
+    else {
+        return Err(invalid("unsupported prepared native compaction"));
+    };
+    if groups.len() != 1 || groups[0].old_fragments.is_empty() {
+        return Err(invalid(
+            "prepared native compaction has no single source group",
+        ));
+    }
+    let indices = base.load_indices().await?;
+    let mut required = HashSet::new();
+    let old_ids = groups[0]
+        .old_fragments
+        .iter()
+        .map(|fragment| {
+            u32::try_from(fragment.id)
+                .map_err(|_| invalid("prepared compaction source exceeds the address domain"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for index in indices.iter() {
+        if lance_index::is_system_index(index) {
+            return Err(invalid("prepared compaction cannot bypass a system index"));
+        }
+        let coverage = index
+            .fragment_bitmap
+            .as_ref()
+            .ok_or_else(|| invalid("prepared compaction index coverage is unknown"))?;
+        let covered = coverage.contains(old_ids[0]);
+        if old_ids.iter().any(|id| coverage.contains(*id) != covered) {
+            return Err(invalid("prepared compaction mixes index coverage"));
+        }
+        if covered && index.results_are_row_addrs() {
+            if !index.supports_eager_remap() {
+                return Err(invalid(
+                    "prepared compaction cannot preserve this address index",
+                ));
+            }
+            required.insert(index.uuid);
+        }
+    }
+    let mut new_ids = HashSet::new();
+    for remap in rewritten_indices {
+        let original = indices
+            .iter()
+            .find(|index| index.uuid == remap.old_id)
+            .ok_or_else(|| invalid("prepared compaction remaps an unknown index"))?;
+        if !required.remove(&remap.old_id)
+            || remap.new_id.is_nil()
+            || indices.iter().any(|index| index.uuid == remap.new_id)
+            || !new_ids.insert(remap.new_id)
+            || remap.new_index_version != original.index_version
+            || !original
+                .index_details
+                .as_ref()
+                .is_some_and(|details| details.type_url == remap.new_index_details.type_url)
+            || remap
+                .new_index_files
+                .as_ref()
+                .is_none_or(|files| files.is_empty())
+        {
+            return Err(invalid(
+                "prepared compaction changed index identity or omitted its files",
+            ));
+        }
+    }
+    if !required.is_empty() {
+        return Err(invalid(
+            "prepared compaction omitted a required index remap",
+        ));
+    }
+    Ok(())
+}

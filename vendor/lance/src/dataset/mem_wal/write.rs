@@ -10889,10 +10889,10 @@ mod tests {
         assert!(result.entry.is_some(), "the append must write an entry");
     }
 
-    /// A memtable frozen after its batches were appended, but before the
-    /// writer state recorded that append, flushes with a covered position
-    /// short of the append. Reopen replays that entry and skips it by its
-    /// generation, restoring only the generation after it.
+    /// Reopen a historical manifest whose covered position lags its SSTable.
+    /// Replay skips the covered generation and restores only the next one.
+    /// Current writers retain per-store receipts even before state bookkeeping,
+    /// so inject the historical cursor explicitly after stopping the writer.
     #[tokio::test]
     async fn test_reopen_after_flush_with_stale_covered_position() {
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
@@ -10921,15 +10921,14 @@ mod tests {
             .await
             .unwrap();
         append_active_without_state_update(&writer_a).await;
-        // The freeze finds nothing left to append, so it triggers no append
-        // whose position it could take.
+        // The freeze must recover the existing receipt despite no new append.
         writer_a.force_freeze_active().await.unwrap();
         writer_a.wait_for_flush_drain().await.unwrap();
 
         let manifest = writer_a.manifest().await.unwrap().unwrap();
         assert_eq!(
-            manifest.replay_after_wal_entry_position, 0,
-            "the covered position must miss WAL entry 1 for reopen to replay it"
+            manifest.replay_after_wal_entry_position, 1,
+            "the frozen store must retain its own completed WAL receipt"
         );
 
         // Fill the next generation to just under the cap, then crash.
@@ -10940,6 +10939,27 @@ mod tests {
         append_active_without_state_update(&writer_a).await;
         writer_a.abort().await.unwrap();
         drop(writer_a);
+
+        let manifest_store =
+            super::super::ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
+        let (epoch, _) = manifest_store.claim_epoch(shard_id).await.unwrap();
+        manifest_store
+            .commit_update(epoch, |current| super::super::ShardManifest {
+                version: current.next_version(),
+                replay_after_wal_entry_position: 0,
+                ..current.clone()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            manifest_store
+                .latest()
+                .await
+                .unwrap()
+                .unwrap()
+                .replay_after_wal_entry_position,
+            0
+        );
 
         let writer_b = ShardWriter::open(
             store,

@@ -1,9 +1,6 @@
 //! Body maintenance shares the owner's plan, budgets and selected narrow head.
 use super::*;
-use lance::dataset::{
-    transaction::{Operation, RewriteGroup, Transaction},
-    CommitBuilder,
-};
+use lance::dataset::{transaction::Transaction, CommitBuilder};
 use lance_context_core::annotation_staging::BodySnapshot;
 
 impl Publisher {
@@ -72,14 +69,12 @@ impl Publisher {
         .await?;
         let mut transaction = Transaction::new_from_version(
             body_base.version_id(),
-            Operation::Rewrite {
-                groups: vec![RewriteGroup {
-                    old_fragments: result.original_fragments,
-                    new_fragments: result.new_fragments,
-                }],
-                rewritten_indices: Vec::new(),
-                frag_reuse_index: None,
-            },
+            lance_context_core::native_compaction::prepare_rewrite(
+                &body_base,
+                result,
+                publication::metadata::MAX_NATIVE_BYTES,
+            )
+            .await?,
         );
         transaction.uuid = pending.plan.transaction.to_string();
         transaction.transaction_properties = Some(Arc::new(std::collections::HashMap::from([(

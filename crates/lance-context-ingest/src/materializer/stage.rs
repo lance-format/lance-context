@@ -180,7 +180,22 @@ pub(crate) async fn publish(
     prepared
         .descriptors
         .validate(publisher.ingress.client.max_descriptor_bytes())?;
-    let transaction = if matches!(
+    let transaction = if publisher.ingress.scope.contract.policy == WritePolicy::ImmutableUniqueIds
+        && pending.plan.is_maintenance()
+        && matches!(prepared.descriptors.format, 4 | 5)
+    {
+        super::compaction::native_transaction(
+            &base,
+            &prepared.descriptors,
+            &crate::annotation_publication::Selection {
+                table: publisher.authority.table,
+                incarnation: publisher.ingress.scope.incarnation,
+                pending: pending.clone(),
+            },
+            &publisher.storage,
+        )
+        .await?
+    } else if matches!(
         publisher.ingress.scope.contract.policy,
         WritePolicy::TurnAnnotations | WritePolicy::TurnIngestion
     ) {

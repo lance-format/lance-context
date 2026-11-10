@@ -3,11 +3,12 @@
 use super::*;
 use lance::dataset::{
     optimize::{CompactionMode, CompactionOptions, CompactionTask, RewriteResult, TaskData},
-    transaction::{Operation, RewriteGroup},
+    transaction::{Operation, RewriteGroup, Transaction},
 };
 use lance::index::DatasetIndexExt;
 use lance_file::version::ConcreteFileVersion;
 use lance_table::format::{Fragment, IndexMetadata};
+use prost::Message;
 use std::collections::BTreeSet;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -278,11 +279,13 @@ pub(super) async fn prepare(
         }
         validate_result(&dataset, &result).await?;
         let bytes = serde_json::to_vec(&result)?;
-        if annotations && bytes.len() as u64 > maximum {
+        if annotations && (result.row_addrs.is_some() || bytes.len() as u64 > maximum) {
             crate::annotation_publication::compaction::descriptors(
                 &dataset, result, &selection, &storage, maximum,
             )
             .await
+        } else if result.row_addrs.is_some() {
+            native_descriptors(&dataset, result, &selection, &storage, maximum).await
         } else {
             p::Descriptors::lance_compaction(Bytes::from(bytes))
         }
@@ -357,8 +360,7 @@ pub(crate) async fn validate_result(dataset: &Dataset, result: &RewriteResult) -
         result.read_version == dataset.version().version
             && result.original_fragments.len() >= 2
             && !result.new_fragments.is_empty()
-            && result.new_fragments.len() < result.original_fragments.len()
-            && result.row_addrs.is_none(),
+            && result.new_fragments.len() < result.original_fragments.len(),
         "invalid or ineffective compaction result"
     );
     let indices = supported_indices(dataset).await?;
@@ -429,12 +431,114 @@ pub(super) async fn operation(
     );
     let result: RewriteResult = serde_json::from_slice(&descriptors.bytes)?;
     validate_result(dataset, &result).await?;
-    Ok(Operation::Rewrite {
+    ensure!(
+        result.row_addrs.is_none(),
+        "legacy compaction descriptors cannot omit index remaps"
+    );
+    let operation = Operation::Rewrite {
         groups: vec![RewriteGroup {
             old_fragments: result.original_fragments,
             new_fragments: result.new_fragments,
         }],
         rewritten_indices: Vec::new(),
         frag_reuse_index: None,
-    })
+    };
+    lance_context_core::native_compaction::validate_index_remaps(dataset, &operation).await?;
+    Ok(operation)
+}
+
+async fn native_descriptors(
+    base: &Dataset,
+    result: RewriteResult,
+    selection: &crate::annotation_publication::Selection,
+    storage: &Storage,
+    maximum: u64,
+) -> Result<p::Descriptors> {
+    let mut transaction = Transaction::new_from_version(
+        base.version_id(),
+        lance_context_core::native_compaction::prepare_rewrite(
+            base,
+            result,
+            crate::annotation_publication::metadata::MAX_NATIVE_BYTES,
+        )
+        .await?,
+    );
+    transaction.uuid = selection.pending.plan.transaction.to_string();
+    validate_native_transaction(base, &transaction, &selection.pending).await?;
+    crate::annotation_publication::persist_transaction(
+        base,
+        &transaction,
+        selection,
+        storage,
+        maximum,
+    )
+    .await
+}
+
+/// Decode the exact persisted operation; never remap indexes during publication
+/// or when reconciling its result after a lost response.
+pub(super) async fn native_transaction(
+    base: &Dataset,
+    descriptors: &p::Descriptors,
+    selection: &crate::annotation_publication::Selection,
+    storage: &Storage,
+) -> Result<Transaction> {
+    descriptors.validate(p::MAX_DESCRIPTOR_BYTES as u64)?;
+    let bytes = match descriptors.format {
+        4 => descriptors.bytes.clone(),
+        5 => {
+            crate::annotation_publication::metadata::load(base, storage, selection, descriptors)
+                .await?
+        }
+        _ => anyhow::bail!("not native compaction descriptors"),
+    };
+    ensure!(
+        bytes.len() <= crate::annotation_publication::metadata::MAX_NATIVE_BYTES,
+        "native compaction metadata too large"
+    );
+    let transaction = Transaction::try_from(lance_table::format::pb::Transaction::decode(bytes)?)?;
+    validate_native_transaction(base, &transaction, &selection.pending).await?;
+    Ok(transaction)
+}
+
+async fn validate_native_transaction(
+    base: &Dataset,
+    transaction: &Transaction,
+    pending: &p::PendingPlan,
+) -> Result<()> {
+    ensure!(
+        pending.plan.is_maintenance()
+            && transaction.read_version == base.version_id()
+            && transaction.read_version == pending.plan.read_version
+            && transaction.uuid == pending.plan.transaction.to_string()
+            && transaction.tag.is_none()
+            && transaction.transaction_properties.is_none(),
+        "foreign native compaction identity"
+    );
+    let Operation::Rewrite {
+        groups,
+        frag_reuse_index: None,
+        ..
+    } = &transaction.operation
+    else {
+        anyhow::bail!("native compaction is not a plain rewrite");
+    };
+    ensure!(
+        groups.len() == 1,
+        "native compaction requires one source group"
+    );
+    validate_result(
+        base,
+        &RewriteResult {
+            metrics: Default::default(),
+            read_version: transaction.read_version,
+            original_fragments: groups[0].old_fragments.clone(),
+            new_fragments: groups[0].new_fragments.clone(),
+            row_addrs: None,
+        },
+    )
+    .await?;
+    lance_context_core::native_compaction::validate_index_remaps(base, &transaction.operation)
+        .await?;
+    Ok(())
 }

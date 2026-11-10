@@ -2,7 +2,6 @@
 use super::*;
 use lance::dataset::optimize::RewriteResult;
 use lance_context_core::annotation_staging::RESULTS_PROPERTY;
-use lance_table::transaction::RewriteGroup;
 
 pub(crate) async fn descriptors(
     base: &Dataset,
@@ -13,18 +12,12 @@ pub(crate) async fn descriptors(
 ) -> Result<p::Descriptors> {
     let mut transaction = Transaction::new_from_version(
         base.version_id(),
-        Operation::Rewrite {
-            groups: vec![RewriteGroup {
-                old_fragments: result.original_fragments,
-                new_fragments: result.new_fragments,
-            }],
-            rewritten_indices: Vec::new(),
-            frag_reuse_index: None,
-        },
-    );
-    ensure!(
-        result.read_version == base.version_id() && result.row_addrs.is_none(),
-        "foreign narrow compaction result"
+        lance_context_core::native_compaction::prepare_rewrite(
+            base,
+            result,
+            metadata::MAX_NATIVE_BYTES,
+        )
+        .await?,
     );
     transaction.uuid = selection.pending.plan.transaction.to_string();
     transaction.transaction_properties = base
@@ -80,14 +73,14 @@ pub(super) async fn validate(
     )?;
     let Operation::Rewrite {
         groups,
-        rewritten_indices,
         frag_reuse_index,
+        ..
     } = &transaction.operation
     else {
         anyhow::bail!("narrow maintenance is not a native rewrite");
     };
     ensure!(
-        groups.len() == 1 && rewritten_indices.is_empty() && frag_reuse_index.is_none(),
+        groups.len() == 1 && frag_reuse_index.is_none(),
         "unsupported narrow rewrite operation"
     );
     crate::materializer::compaction::validate_result(
@@ -100,5 +93,8 @@ pub(super) async fn validate(
             row_addrs: None,
         },
     )
-    .await
+    .await?;
+    lance_context_core::native_compaction::validate_index_remaps(base, &transaction.operation)
+        .await?;
+    Ok(())
 }

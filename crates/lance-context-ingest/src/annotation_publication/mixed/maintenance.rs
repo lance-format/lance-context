@@ -131,14 +131,14 @@ pub(super) async fn validate(
     );
     let Operation::Rewrite {
         groups,
-        rewritten_indices,
         frag_reuse_index,
+        ..
     } = &native.operation
     else {
         anyhow::bail!("body maintenance is not a native rewrite");
     };
     ensure!(
-        groups.len() == 1 && rewritten_indices.is_empty() && frag_reuse_index.is_none(),
+        groups.len() == 1 && frag_reuse_index.is_none(),
         "unsupported body rewrite operation"
     );
     let group = &groups[0];
@@ -150,6 +150,8 @@ pub(super) async fn validate(
         row_addrs: None,
     };
     crate::materializer::compaction::validate_result(&previous, &result).await?;
+    lance_context_core::native_compaction::validate_index_remaps(&previous, &native.operation)
+        .await?;
     ensure!(
         next.manifest().fragments.len()
             == previous.manifest().fragments.len() - result.original_fragments.len()

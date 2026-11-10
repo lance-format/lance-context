@@ -20,7 +20,7 @@ use uuid::Uuid;
 use crate::materializer::Storage;
 
 pub(crate) mod compaction;
-mod metadata;
+pub(crate) mod metadata;
 pub mod mixed;
 
 /// The first annotation publisher covers one shard in one source group. A
@@ -141,7 +141,7 @@ async fn persist_native(
     persist_transaction(prepared.base(), transaction, selection, storage, maximum).await
 }
 
-async fn persist_transaction(
+pub(crate) async fn persist_transaction(
     base: &Dataset,
     transaction: &Transaction,
     selection: &Selection,

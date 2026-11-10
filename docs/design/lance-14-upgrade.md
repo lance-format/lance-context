@@ -23,10 +23,13 @@ publication validates the original ID column and index coverage without the
 Lance 13 file-mapping repair. Only labels, status, and score may be rewritten;
 fragment membership and unrelated physical columns must remain unchanged.
 
-This dependency update does not change the distributed WAL protocol, staging
-budgets, publication batch sizes, or select the experimental Lance 2.3 file
-format. It does not migrate existing datasets or establish a mixed-version
-rolling-upgrade guarantee. The preparation instructions in
+Staging budgets and publication batch sizes are unchanged, and the experimental
+Lance 2.3 file format is not selected. Indexed maintenance now persists the
+native rewrite and its remapped index files using existing descriptor formats
+4/5, including for immutable ingestion tables. All catalog voters and publishers
+must support this maintenance policy before it is used; older binaries reject
+that path. This does not establish a mixed-version rolling-upgrade guarantee.
+The preparation instructions in
 [the Lance 13 upgrade notes](lance-13-upgrade.md) still apply to generations
 written before field-ID preservation.
 
