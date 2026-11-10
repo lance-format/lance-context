@@ -214,9 +214,11 @@ mod tests {
             assert_eq!(store.list(None, None).await.unwrap().len(), 2);
             store.close().await.unwrap();
 
-            // Metadata-only negative fixture: deliberately publish an FRI entry
-            // with no mapping file. A query-facing load_indices would try to
-            // open the mapping; this diagnostic must report unknown without it.
+            // Metadata-only negative fixture: deliberately publish a legacy FRI
+            // entry with no mapping file. A query-facing load_indices would try
+            // to open the mapping; this diagnostic must report unknown without
+            // it. Version 1 is a tagged history in Lance 14 and cannot be forged
+            // through CreateIndex; this fixture exercises the legacy file reader.
             let dataset = Arc::new(lance::Dataset::open(uri).await.unwrap());
             let object_store = dataset.object_store(None).await.unwrap();
             let raw = lance_table::io::manifest::read_manifest_indexes(
@@ -233,7 +235,7 @@ mod tests {
             mapping.covering_fields.clear();
             mapping.fragment_bitmap = None;
             mapping.index_details = None;
-            mapping.index_version = 1;
+            mapping.index_version = 0;
             mapping.files = None;
             let transaction = lance::dataset::transaction::Transaction::new(
                 dataset.version().version,
