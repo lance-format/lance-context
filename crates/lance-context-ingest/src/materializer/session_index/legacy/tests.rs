@@ -185,6 +185,17 @@ async fn legacy_status_merge_discards_values_from_withdrawn_fragment_coverage() 
         &path,
     )?;
     let mut base = Dataset::open(path.to_str().unwrap()).await?;
+    // The stored compatibility fixture has only index keys. Add an immutable
+    // body so the annotation update is a genuine narrow column rewrite.
+    base.add_columns(
+        lance::dataset::NewColumnTransform::SqlExpressions(vec![(
+            "body".into(),
+            "repeat('body', 1024)".into(),
+        )]),
+        None,
+        None,
+    )
+    .await?;
     let budget = MergeMemoryBudget::new(WORKSPACE);
     // Merge the old fragment-0 pages with fragment 1 before adding fragment 2.
     // A later status rewrite withdraws only part of that first merged segment.
@@ -211,6 +222,21 @@ async fn legacy_status_merge_discards_values_from_withdrawn_fragment_coverage() 
         .await??;
         base = commit(&base, operation_for(&base, &descriptor, Key::Status).await?).await?;
     }
+    let body_field = base.schema().field_id("body")?;
+    let body_files = |dataset: &Dataset| {
+        dataset
+            .fragments()
+            .iter()
+            .flat_map(|fragment| {
+                fragment
+                    .files
+                    .iter()
+                    .filter(|file| file.fields.contains(&body_field))
+                    .map(|file| (fragment.id, file.clone()))
+            })
+            .collect::<Vec<_>>()
+    };
+    let original_bodies = body_files(&base);
     let update = RecordBatch::try_from_iter([
         (
             "id",
@@ -235,6 +261,7 @@ async fn legacy_status_merge_discards_values_from_withdrawn_fragment_coverage() 
             .await?;
     assert_eq!(rewrite.stats.num_updated_rows, 2);
     base = commit(&base, rewrite.transaction.operation).await?;
+    assert_eq!(body_files(&base), original_bodies);
     let segments: Vec<_> = base
         .load_indices()
         .await?
