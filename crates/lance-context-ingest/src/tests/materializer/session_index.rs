@@ -140,10 +140,9 @@ async fn index_recovers_prepared_and_selected_files_then_compacts_with_a_visible
     else {
         anyhow::bail!("expected indexed rewrite");
     };
-    assert_eq!(rewritten_indices.len(), 1);
-    assert_eq!(rewritten_indices[0].old_id, index_uuid);
-    let remapped_index_uuid = rewritten_indices[0].new_id;
-    assert_ne!(remapped_index_uuid, index_uuid);
+    // The managed index contains stable IDs: compaction updates its fragment
+    // coverage while preserving its exact native pages and UUID.
+    assert!(rewritten_indices.is_empty());
     groups[0].new_fragments[0].id = 0;
     invalid.descriptors = p::Descriptors::lance_annotations(Bytes::from(
         lance_table::format::pb::Transaction::try_from(&transaction)?.encode_to_vec(),
@@ -170,8 +169,8 @@ async fn index_recovers_prepared_and_selected_files_then_compacts_with_a_visible
     assert_eq!(compacted.get_fragments().len(), 2);
     let indices = compacted.load_indices().await?;
     assert_eq!(indices.len(), 1);
-    assert_eq!(indices[0].uuid, remapped_index_uuid);
-    assert_eq!(indices[0].index_version, 1);
+    assert_eq!(indices[0].uuid, index_uuid);
+    assert_eq!(indices[0].index_version, 0);
     let indexed = compacted
         .manifest()
         .fragments
@@ -212,7 +211,7 @@ async fn index_recovers_prepared_and_selected_files_then_compacts_with_a_visible
     assert_eq!(recovered.state().await?.progress.checkpoint, checkpoint);
     let indices = recovered.read_dataset(None).await?.load_indices().await?;
     assert_eq!(indices.len(), 2);
-    assert!(indices.iter().any(|i| i.uuid == remapped_index_uuid));
+    assert!(indices.iter().any(|i| i.uuid == index_uuid));
     let before_merge = recovered.read_dataset(None).await?;
     assert!(recovered.run_once().await?.unwrap().sources.is_empty());
     assert_eq!(recovered.state().await?.progress.checkpoint, checkpoint);
