@@ -36,9 +36,10 @@ impl Descriptors {
         Self::new(3, bytes)
     }
 
-    /// Native narrow-column annotation update metadata. The application must
-    /// validate the operation and its source cut before publishing. Replicas
-    /// enforce the table's annotation policy, length and digest only.
+    /// Native annotation update or maintenance-compaction metadata. The
+    /// application validates the exact operation and source before publication.
+    /// Immutable ingestion accepts this only for source-free maintenance.
+    /// Replicas enforce policy, length and digest without decoding native files.
     /// Enable only after all voters and publishers support format 4.
     pub fn lance_annotations(bytes: Bytes) -> Result<Self> {
         Self::new(4, bytes)
@@ -62,11 +63,7 @@ impl Descriptors {
 
     pub(super) fn matches_plan(&self, plan: &Plan, policy: &WritePolicy) -> bool {
         if plan.is_maintenance() {
-            matches!(self.format, 2 | 3)
-                || (matches!(
-                    policy,
-                    WritePolicy::TurnAnnotations | WritePolicy::TurnIngestion
-                ) && matches!(self.format, 4 | 5))
+            matches!(self.format, 2..=5)
         } else {
             match policy {
                 WritePolicy::ImmutableUniqueIds => self.format == 1,

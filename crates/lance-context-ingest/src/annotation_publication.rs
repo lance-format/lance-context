@@ -20,7 +20,7 @@ use uuid::Uuid;
 use crate::materializer::Storage;
 
 pub(crate) mod compaction;
-mod metadata;
+pub(crate) mod metadata;
 pub mod mixed;
 
 /// The first annotation publisher covers one shard in one source group. A
@@ -96,7 +96,7 @@ pub fn descriptors(
         "frozen annotation cut differs from source selection"
     );
     p::Descriptors::lance_annotations(Bytes::from(
-        pb::Transaction::from(transaction).encode_to_vec(),
+        pb::Transaction::try_from(transaction)?.encode_to_vec(),
     ))
 }
 
@@ -141,7 +141,7 @@ async fn persist_native(
     persist_transaction(prepared.base(), transaction, selection, storage, maximum).await
 }
 
-async fn persist_transaction(
+pub(crate) async fn persist_transaction(
     base: &Dataset,
     transaction: &Transaction,
     selection: &Selection,
@@ -153,7 +153,7 @@ async fn persist_transaction(
         "invalid native descriptor destination/budget"
     );
     selection.identity()?;
-    let native = pb::Transaction::from(transaction);
+    let native = pb::Transaction::try_from(transaction)?;
     ensure!(
         native.encoded_len() <= metadata::MAX_NATIVE_BYTES,
         "native annotation preparation exceeds metadata limit"

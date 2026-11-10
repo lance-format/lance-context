@@ -41,8 +41,8 @@ openai = ["openai>=1.0"]
 sentence-transformers = ["sentence-transformers>=2.0"]
 graph = ["lance-graph==0.5.4"]
 lance-python = [
-    "pylance>=13.0.0,<14",
-    "lance-namespace>=0.11.1,<0.12",
+    "pylance>=14.0.2,<15",
+    "lance-namespace>=0.13.0,<0.14",
     "lancedb==0.27.1",
 ]
 # `moto[server]` pulls in flask + flask-cors so moto.server can be launched
@@ -54,8 +54,8 @@ tests = [
     "moto[s3,server]",
     "boto3",
     "botocore",
-    "pylance>=13.0.0,<14",
-    "lance-namespace>=0.11.1,<0.12",
+    "pylance>=14.0.2,<15",
+    "lance-namespace>=0.13.0,<0.14",
     "lancedb==0.27.1",
 ]
 dev = ["ruff", "pyright"]

@@ -172,16 +172,44 @@ async fn mixed_id_index_gc_collects_abandoned_native_preparation() -> Result<()>
     assert!(old
         .iter()
         .all(|p| p.parent().unwrap().ends_with(abandoned.uuid.to_string())));
-    let (a, runtime) = indexed_owner_with_history(&c, &narrow, &body, true, 4).await?;
+    // This case inspects retained metadata to distinguish published pages from
+    // the abandoned index. Keep this finite fixture inside its history window:
+    // enumerating catalog versions does not register readers that pin them.
+    // The test above separately exercises retirement with a four-version window.
+    let history = 64;
+    let (a, runtime) = indexed_owner_with_history(&c, &narrow, &body, true, history).await?;
     let (stop, task) = annotation_runtime::run_owner(collecting(runtime)?);
     let selected = fully_indexed(&c, &narrow, 3, 1).await?;
     let live = referenced(&selected, &path).await?;
-    wait_files(&path, &live).await?;
-    assert!(old.is_disjoint(&live));
+    // Address-index compaction creates new native pages. The pre-compaction
+    // pages remain live while their selected versions are in durable history;
+    // they are distinct from the never-published index created above.
+    let manifests = annotation_publication::state(&c).await?.manifests.unwrap();
+    assert!(manifests.head - manifests.initial_version < history as u64);
+    assert_eq!(
+        manifests.history_boundary().retained_from,
+        manifests.initial_version + 1
+    );
+    let mut protected = live.clone();
+    for version in manifests
+        .versions
+        .keys()
+        .filter(|version| **version != manifests.initial_version)
+    {
+        let retained = annotation_publication::read(&c, &narrow, Some(*version)).await?;
+        protected.extend(referenced(&retained, &path).await?);
+        assert_eq!(retained.count_rows(Some("id = 'A'".into())).await?, 1);
+    }
+    assert!(old.is_disjoint(&protected));
+    wait_files(&path, &protected).await?;
+    assert!(old.iter().all(|file| !file.exists()));
     for (id, value) in [("A", 1), ("B", 2), ("C", 3)] {
         check(&a, id, "s", value, "pending", None).await?;
     }
     assert_eq!(a.submit(&last, Duration::from_secs(10)).await?, last_result);
+    let after = annotation_publication::state(&c).await?.manifests.unwrap();
+    assert!(after.head - after.initial_version < history as u64);
+    assert_eq!(after.history_boundary(), manifests.history_boundary());
     stop.send(()).unwrap();
     task.await??;
     c.shutdown().await

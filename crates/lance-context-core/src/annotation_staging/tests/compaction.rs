@@ -1,6 +1,8 @@
 use super::*;
-use lance::dataset::optimize::{CompactionMode, CompactionOptions, CompactionTask, TaskData};
-use lance_table::transaction::{Operation, RewriteGroup, Transaction};
+use lance::dataset::optimize::{
+    CompactionMode, CompactionOptions, CompactionTask, RewriteResult, TaskData,
+};
+use lance_table::transaction::Transaction;
 
 async fn initialized(path: &std::path::Path) -> Result<(AnnotationStaging, Arc<Dataset>)> {
     let mut base = (*fixture(path).await?).clone();
@@ -31,7 +33,7 @@ async fn initialized(path: &std::path::Path) -> Result<(AnnotationStaging, Arc<D
     Ok((staging, base))
 }
 
-pub(super) async fn compact(base: &Dataset) -> Result<Transaction> {
+async fn rewrite(base: &Dataset) -> Result<RewriteResult> {
     let task = CompactionTask {
         task: TaskData {
             fragments: base.manifest().fragments.as_ref().clone(),
@@ -52,16 +54,14 @@ pub(super) async fn compact(base: &Dataset) -> Result<Transaction> {
     for (ordinal, fragment) in rewritten.new_fragments.iter_mut().enumerate() {
         fragment.id = u64::from(base.manifest().max_fragment_id.unwrap()) + 1 + ordinal as u64;
     }
+    Ok(rewritten)
+}
+
+pub(super) async fn compact(base: &Dataset) -> Result<Transaction> {
+    let rewritten = rewrite(base).await?;
     let mut transaction = Transaction::new_from_version(
         base.version_id(),
-        Operation::Rewrite {
-            groups: vec![RewriteGroup {
-                old_fragments: rewritten.original_fragments,
-                new_fragments: rewritten.new_fragments,
-            }],
-            rewritten_indices: Vec::new(),
-            frag_reuse_index: None,
-        },
+        crate::native_compaction::prepare_rewrite(base, rewritten, 1 << 20).await?,
     );
     transaction.transaction_properties = base
         .read_transaction()
@@ -69,6 +69,57 @@ pub(super) async fn compact(base: &Dataset) -> Result<Transaction> {
         .unwrap()
         .transaction_properties;
     Ok(transaction)
+}
+
+#[tokio::test]
+async fn native_compaction_requires_complete_bounded_address_evidence() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let (_, base) = initialized(&root.path().join("turns.lance")).await?;
+    let result = rewrite(&base).await?;
+    let mapping_bytes = result.row_addrs.as_ref().unwrap().len();
+    let mut missing = result.clone();
+    missing.row_addrs = None;
+    assert!(
+        crate::native_compaction::prepare_rewrite(&base, missing, 1 << 20)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("mapping")
+    );
+    assert!(
+        crate::native_compaction::prepare_rewrite(&base, result.clone(), mapping_bytes - 1)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("oversized")
+    );
+    let mut incomplete = result.clone();
+    let mut addresses = roaring::RoaringTreemap::new();
+    addresses.insert(result.original_fragments[0].id << 32);
+    let mut bytes = Vec::new();
+    addresses.serialize_into(&mut bytes)?;
+    incomplete.row_addrs = Some(bytes);
+    assert!(
+        crate::native_compaction::prepare_rewrite(&base, incomplete, 1 << 20)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("source rows")
+    );
+    // No failed preparation may publish a version or alter the selected values.
+    assert_eq!(
+        Dataset::open(base.uri()).await?.version_id(),
+        base.version_id()
+    );
+    assert_eq!(
+        read_base(&base, "T", 4096)
+            .await?
+            .unwrap()
+            .status
+            .as_deref(),
+        Some("reviewed")
+    );
+    Ok(())
 }
 
 pub(super) async fn select(base: Arc<Dataset>, transaction: &Transaction) -> Result<Arc<Dataset>> {

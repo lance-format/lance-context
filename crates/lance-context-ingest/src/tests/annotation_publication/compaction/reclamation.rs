@@ -204,7 +204,8 @@ async fn collect_bootstrap(hold_reader: bool) -> Result<()> {
     let selected = read(&c, &storage, None).await?;
     let indices = selected.load_indices().await?;
     assert_eq!(indices.len(), 1);
-    assert_eq!(indices[0].uuid, index_id);
+    assert_ne!(indices[0].uuid, index_id);
+    assert_eq!(indices[0].index_version, 1);
     assert!(indices[0]
         .fragment_bitmap
         .as_ref()

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 // This bounds one metadata fetch and protobuf decode. It is separate from dirty
 // staging, upload admission and Lance's own execution memory.
-pub(super) const MAX_NATIVE_BYTES: usize = 64 << 20;
+pub(crate) const MAX_NATIVE_BYTES: usize = 64 << 20;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -83,7 +83,7 @@ pub(super) async fn persist(
     Ok(descriptors)
 }
 
-pub(super) async fn load(
+pub(crate) async fn load(
     base: &Dataset,
     storage: &Storage,
     selection: &Selection,

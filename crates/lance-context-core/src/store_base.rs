@@ -843,7 +843,7 @@ impl StorageBase {
     }
 
     /// Materialize the active memtable into a flushed, queryable generation:
-    /// `force_seal_active` freezes it and hands it to the background flusher,
+    /// `force_freeze_active` freezes it and hands it to the background flusher,
     /// then `wait_for_flush_drain` blocks until every frozen memtable has landed
     /// in the shard manifest (and is therefore visible to reads on every
     /// instance).
@@ -926,7 +926,7 @@ impl StorageBase {
         let Some(writer) = writer else {
             return Ok(FlushOutcome::Noop);
         };
-        let fence = match writer.force_seal_active().await {
+        let fence = match writer.force_freeze_active().await {
             Ok(fence) => fence,
             // A fence means a merge superseded our epoch; the next `put` reopens
             // and replays. Nothing to flush against the dead epoch.

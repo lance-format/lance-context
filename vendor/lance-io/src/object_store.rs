@@ -541,7 +541,11 @@ fn expand_path(str_path: impl AsRef<str>) -> Result<std::path::PathBuf> {
     let expanded = expand_tilde_path(str_path).unwrap_or_else(|| str_path.into());
 
     let mut expanded_path = path_abs::PathAbs::new(expanded)
-        .unwrap()
+        .map_err(|err| {
+            Error::invalid_input(format!(
+                "Invalid table location: '{str_path}' could not be resolved to an absolute path: {err}"
+            ))
+        })?
         .as_path()
         .to_path_buf();
     // path_abs::PathAbs::new(".") returns an empty string.
@@ -799,6 +803,15 @@ impl ObjectStore {
 
     pub fn block_size(&self) -> usize {
         self.block_size
+    }
+
+    /// Bytes one multipart upload of `total_bytes` to this store can hold in
+    /// memory at once. See [`crate::object_writer::upload_memory_bound_bytes`].
+    pub fn upload_memory_bound_bytes(&self, total_bytes: u64) -> u64 {
+        crate::object_writer::upload_memory_bound_bytes(
+            total_bytes,
+            self.use_constant_size_upload_parts,
+        )
     }
 
     pub fn max_iop_size(&self) -> u64 {
@@ -1248,6 +1261,57 @@ impl ObjectStore {
         destination_store: &Self,
         destination_path: &Path,
     ) -> Result<WriteResult> {
+        self.copy_via_stream_inner(source_path, destination_store, destination_path)
+            .await
+    }
+
+    /// Copy within this store without replacing an existing destination.
+    ///
+    /// This uses the provider's native conditional copy. An existing destination
+    /// with the same size is treated as a successful retry.
+    pub async fn copy_if_not_exists(
+        &self,
+        source_path: &Path,
+        destination_path: &Path,
+    ) -> Result<WriteResult> {
+        let source_size = self.size(source_path).await?;
+        match self
+            .inner
+            .copy_if_not_exists(source_path, destination_path)
+            .await
+        {
+            Ok(()) => {}
+            Err(
+                object_store::Error::AlreadyExists { .. }
+                | object_store::Error::Precondition { .. },
+            ) => {
+                let destination_size = self.size(destination_path).await?;
+                if source_size != destination_size {
+                    return Err(Error::io(format!(
+                        "destination {destination_path} already exists with size \
+                         {destination_size}, but source {source_path} has size {source_size}"
+                    )));
+                }
+            }
+            Err(error) => return Err(Error::io(error.to_string())),
+        }
+
+        Ok(WriteResult {
+            size: usize::try_from(source_size).map_err(|_| {
+                Error::io(format!(
+                    "source {source_path} size {source_size} does not fit in usize"
+                ))
+            })?,
+            e_tag: None,
+        })
+    }
+
+    async fn copy_via_stream_inner(
+        &self,
+        source_path: &Path,
+        destination_store: &Self,
+        destination_path: &Path,
+    ) -> Result<WriteResult> {
         let started_at = Instant::now();
         if self.has_direct_local_paths() && destination_store.has_direct_local_paths() {
             let source_size = std::fs::metadata(super::local::to_local_path(source_path))
@@ -1499,11 +1563,18 @@ impl ObjectStore {
         Ok(self.inner.list_with_delimiter(prefix).await?)
     }
 
+    /// List objects recursively. On unordered stores, a retryable failure after
+    /// the first entry is returned to the caller because resuming by lexical
+    /// offset could silently omit entries.
     pub fn list(
         &self,
         path: Option<Path>,
     ) -> Pin<Box<dyn Stream<Item = Result<ObjectMeta>> + Send>> {
-        Box::pin(ListRetryStream::new(self.inner.clone(), path, 5).map(|m| m.map_err(|e| e.into())))
+        Box::pin(
+            ListRetryStream::new(self.inner.clone(), path, 5)
+                .with_lexical_ordering(self.list_is_lexically_ordered)
+                .map(|m| m.map_err(|e| e.into())),
+        )
     }
 
     /// Read all files (start from base directory) recursively
@@ -1690,6 +1761,64 @@ impl FromStr for LanceConfigKey {
 pub struct StorageOptions(pub HashMap<String, String>);
 
 impl StorageOptions {
+    #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+    fn as_cloud_options<K>(&self) -> HashMap<K, String>
+    where
+        K: FromStr + AsRef<str> + Eq + std::hash::Hash,
+    {
+        let mut options: HashMap<K, (&str, &str)> = HashMap::new();
+        for (source_key, value) in &self.0 {
+            let Ok(config_key) = K::from_str(&source_key.to_ascii_lowercase()) else {
+                continue;
+            };
+            let source_key = source_key.as_str();
+            let canonical_key = config_key.as_ref();
+            // Rank spellings so conflicting aliases cannot depend on HashMap iteration order.
+            if let Some((selected_key, _)) = options.get(&config_key)
+                && (
+                    !source_key.eq_ignore_ascii_case(canonical_key),
+                    source_key != canonical_key,
+                    source_key,
+                ) >= (
+                    !selected_key.eq_ignore_ascii_case(canonical_key),
+                    *selected_key != canonical_key,
+                    *selected_key,
+                )
+            {
+                continue;
+            }
+            options.insert(config_key, (source_key, value.as_str()));
+        }
+        options
+            .into_iter()
+            .map(|(key, (_, value))| (key, value.to_string()))
+            .collect()
+    }
+
+    #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+    fn merge_env_options(
+        &mut self,
+        env_options: impl IntoIterator<
+            Item = (impl AsRef<std::ffi::OsStr>, impl AsRef<std::ffi::OsStr>),
+        >,
+        canonical_key: impl Fn(&str) -> Option<String>,
+    ) {
+        // Aliases must block environment defaults without rewriting the caller's keys.
+        let mut configured_keys: HashSet<String> = self
+            .0
+            .keys()
+            .filter_map(|key| canonical_key(&key.to_ascii_lowercase()))
+            .collect();
+        for (key, value) in env_options {
+            if let (Some(key), Some(value)) = (key.as_ref().to_str(), value.as_ref().to_str())
+                && let Some(config_key) = canonical_key(&key.to_ascii_lowercase())
+                && configured_keys.insert(config_key.clone())
+            {
+                self.0.insert(config_key, value.to_string());
+            }
+        }
+    }
+
     /// Create a new instance of [`StorageOptions`]
     pub fn new(options: HashMap<String, String>) -> Self {
         let mut options = options;
@@ -1935,6 +2064,57 @@ mod tests {
     use std::ops::Range;
     use std::path::Path as StdPath;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+    fn canonical_test_config_key<K: FromStr + AsRef<str>>(key: &str) -> Option<String> {
+        K::from_str(key).ok().map(|key| key.as_ref().to_string())
+    }
+
+    #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+    #[rstest]
+    #[cfg_attr(feature = "aws", case::aws("region", "aws_region", canonical_test_config_key::<object_store::aws::AmazonS3ConfigKey>))]
+    #[cfg_attr(feature = "azure", case::azure("account_name", "azure_storage_account_name", canonical_test_config_key::<object_store::azure::AzureConfigKey>))]
+    #[cfg_attr(feature = "gcp", case::gcp("service_account_path", "google_service_account", canonical_test_config_key::<object_store::gcp::GoogleConfigKey>))]
+    fn test_merge_env_options(
+        #[case] alias: &str,
+        #[case] canonical: &str,
+        #[case] canonical_key: fn(&str) -> Option<String>,
+        #[values(false, true)] use_alias: bool,
+        #[values(false, true)] uppercase: bool,
+        #[values(None, Some(""), Some("explicit"))] explicit_value: Option<&str>,
+    ) {
+        let key = if use_alias { alias } else { canonical };
+        let key = if uppercase {
+            key.to_ascii_uppercase()
+        } else {
+            key.to_string()
+        };
+        let mut expected = HashMap::from([("lance_custom_option".into(), "unchanged".into())]);
+        if let Some(value) = explicit_value {
+            expected.insert(key, value.to_string());
+        }
+        let mut options = StorageOptions(expected.clone());
+        if explicit_value.is_none() {
+            expected.insert(canonical.to_string(), "environment".to_string());
+        }
+        let env_options = [
+            (canonical.to_ascii_uppercase(), "environment"),
+            (alias.to_string(), "second_environment_alias"),
+            ("lance_custom_option".to_string(), "ignored"),
+            ("unrecognized_env_option".to_string(), "ignored"),
+        ];
+
+        options.merge_env_options(
+            env_options.iter().map(|(key, value)| (key, value)),
+            canonical_key,
+        );
+        assert_eq!(options.0, expected);
+        options.merge_env_options(
+            env_options.iter().map(|(key, value)| (key, value)),
+            canonical_key,
+        );
+        assert_eq!(options.0, expected);
+    }
 
     /// Write test content to file.
     fn write_to_file(path_str: &str, contents: &str) -> std::io::Result<()> {
@@ -2216,8 +2396,14 @@ mod tests {
         )
         .unwrap();
 
+        // The working directory is process state, and this one is about to be
+        // removed with the temp dir, so put it back as soon as the call that
+        // needs it returns.
+        let original_dir = std::env::current_dir().unwrap();
         set_current_dir(StdPath::new(tmp_path.as_ref())).expect("Error changing current dir");
-        let (store, path) = ObjectStore::from_uri("./bar/foo.lance").await.unwrap();
+        let opened = ObjectStore::from_uri("./bar/foo.lance").await;
+        set_current_dir(&original_dir).expect("Error restoring current dir");
+        let (store, path) = opened.unwrap();
 
         let contents = read_from_store(store.as_ref(), &path.clone().join("test_file"))
             .await
@@ -3029,6 +3215,60 @@ mod tests {
         assert_eq!(
             store.read_one_all(&destination).await.unwrap().as_ref(),
             contents
+        );
+    }
+
+    #[tokio::test]
+    async fn test_copy_if_not_exists_accepts_equal_size_local_retry() {
+        let directory = TempStdDir::default();
+        let (store, base_path) = ObjectStore::from_uri(directory.to_str().unwrap())
+            .await
+            .unwrap();
+        let source = base_path.clone().join("source.bin");
+        let destination = base_path.join("destination.bin");
+        store.put(&source, b"new").await.unwrap();
+        store.put(&destination, b"old").await.unwrap();
+
+        let result = store
+            .copy_if_not_exists(&source, &destination)
+            .await
+            .unwrap();
+
+        assert_eq!(result.size, 3);
+        assert_eq!(
+            store.read_one_all(&destination).await.unwrap().as_ref(),
+            b"old"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_copy_if_not_exists_uses_native_copy() {
+        let observations = Arc::new(MultipartObservations::default());
+        let mut store = ObjectStore::memory();
+        store.inner = Arc::new(ObservedMultipartStore {
+            inner: InMemory::new(),
+            observations: observations.clone(),
+            fail_parts: false,
+            destination_size_adjustment: 0,
+        });
+
+        let source = Path::from("source.bin");
+        let destination = Path::from("destination.bin");
+        let contents = vec![42; crate::object_writer::initial_upload_size() + 1];
+        store.put(&source, &contents).await.unwrap();
+        observations.part_count.store(0, Ordering::SeqCst);
+
+        let result = store
+            .copy_if_not_exists(&source, &destination)
+            .await
+            .unwrap();
+
+        assert_eq!(result.size, contents.len());
+        assert_eq!(observations.native_copy_count.load(Ordering::SeqCst), 1);
+        assert_eq!(observations.part_count.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            store.read_one_all(&destination).await.unwrap().as_ref(),
+            contents.as_slice()
         );
     }
 

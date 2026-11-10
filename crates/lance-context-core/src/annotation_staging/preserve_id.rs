@@ -2,10 +2,10 @@ use super::*;
 use lance_table::transaction::{Operation, UpdateMode};
 use std::collections::BTreeSet;
 
-/// The ID is a merge key, never an annotation mutation. Lance 13's narrow
-/// merge writes it again and marks its index stale. Keep its original physical
-/// column instead. Do not restore index metadata over a replaced column.
-pub(super) fn preserve_id(base: &Dataset, operation: &mut Operation) -> Result<()> {
+/// The ID is a merge key, never an annotation mutation. Lance 14 preserves join
+/// columns in existing fragments. Verify that only annotation columns changed;
+/// do not repair file mappings or restore index metadata over a replaced column.
+pub(super) fn validate_preserved_id(base: &Dataset, operation: &Operation) -> Result<()> {
     let Operation::Update {
         removed_fragment_ids,
         updated_fragments,
@@ -31,7 +31,7 @@ pub(super) fn preserve_id(base: &Dataset, operation: &mut Operation) -> Result<(
     let id = base.schema().field_id("id")?;
     let expected_fields: BTreeSet<_> = base
         .schema()
-        .project(&["id", "labels", "status", "score"])?
+        .project(&["labels", "status", "score"])?
         .field_ids()
         .into_iter()
         .map(|f| f as u32)
@@ -62,9 +62,9 @@ pub(super) fn preserve_id(base: &Dataset, operation: &mut Operation) -> Result<(
         {
             return Err(invalid("annotation merge changed physical row layout"));
         }
-        let (old_files, new_files) = updated.files.split_at_mut(original.files.len());
-        let new_file = &mut new_files[0];
-        if new_file.fields.iter().filter(|&&f| f == id).count() != 1
+        let (old_files, new_files) = updated.files.split_at(original.files.len());
+        let new_file = &new_files[0];
+        if new_file.fields.contains(&id)
             || new_file
                 .fields
                 .iter()
@@ -76,7 +76,7 @@ pub(super) fn preserve_id(base: &Dataset, operation: &mut Operation) -> Result<(
         {
             return Err(invalid("unexpected annotation column file"));
         }
-        for (old, original) in old_files.iter_mut().zip(&original.files) {
+        for (old, original) in old_files.iter().zip(&original.files) {
             let mut expected = original.clone();
             expected.fields = original
                 .fields
@@ -87,22 +87,7 @@ pub(super) fn preserve_id(base: &Dataset, operation: &mut Operation) -> Result<(
             if *old != expected {
                 return Err(invalid("annotation merge changed an original column file"));
             }
-            // Restore only the original ID slot; all annotation tombstones stay.
-            old.fields = old
-                .fields
-                .iter()
-                .zip(original.fields.iter())
-                .map(|(field, original)| if *original == id { id } else { *field })
-                .collect::<Vec<_>>()
-                .into();
         }
-        new_file.fields = new_file
-            .fields
-            .iter()
-            .map(|&field| if field == id { -2 } else { field })
-            .collect::<Vec<_>>()
-            .into();
     }
-    fields_modified.retain(|&field| field != id as u32);
     Ok(())
 }

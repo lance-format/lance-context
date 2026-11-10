@@ -83,19 +83,20 @@ Freezing moves the active map into an immutable generation without copying its
 values. The caller supplies the publication UUID, allowing reconstruction of a
 pending cut with its original identity. Further updates use a new active map.
 For existing turns, frozen preparation builds narrow
-Arrow batches and explicitly selects Lance 13 `RewriteColumns`, with automatic
+Arrow batches and explicitly selects native `RewriteColumns`, with automatic
 conflict retries and cleanup disabled. It rejects a result that does not update
 exactly the frozen keys, and records scoped coverage in the native transaction
 properties. Repeated preparation calls share the same transaction/file set.
 
-Lance 13's narrow merge also writes the `id` join key, which would invalidate
-the ID index on every touched fragment. Preparation retains the original ID
-file/column mapping and tombstones the unused ID mapping in the new narrow file.
-Only then does it remove ID from the transaction's modified fields. Annotation
-indexes still lose coverage where their values changed. The adjustment accepts
-only the expected column rewrite with unchanged physical rows and original file
-descriptors; it does not rebuild an index or override index metadata. The writer
-still emits the unused ID bytes, so this is not a claim of eliminating that I/O.
+Lance 14's narrow merge preserves the `id` join-key column itself. Preparation
+validates that its original physical mapping is unchanged and that only labels,
+status and score are modified. Annotation indexes still lose coverage where
+their values changed. The previous Lance 13 mapping repair is no longer applied;
+the validation does not rebuild an index or override its coverage. Physical
+compaction is a separate operation: new address-based BTree indexes require
+native remaps retained with the prepared rewrite. See the
+[Lance 14 upgrade notes](lance-14-upgrade.md) for old-index compatibility,
+publication recovery and the index I/O qualification gate.
 
 The caller must durably preserve this identity, source coverage and descriptors,
 publish through the fenced managed-manifest path, and reconcile the original

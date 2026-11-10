@@ -270,7 +270,7 @@ async fn recover_at(stage: u8, root: &Path, crash_boundary: bool) -> Result<()> 
         let view = state(&c).await?;
         let pending = view.progress.pending.as_ref().unwrap();
         let prepared = prepared.as_ref().unwrap();
-        let original = if prepared.descriptors.format == 5 {
+        let original = if matches!(prepared.descriptors.format, 4 | 5) {
             annotations::resolve_transaction(
                 &base,
                 &prepared.descriptors,

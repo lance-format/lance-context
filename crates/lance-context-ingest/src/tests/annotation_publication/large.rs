@@ -247,7 +247,7 @@ async fn recover_inner(
         .await?;
     let original = prepared.annotations().merge().transaction.clone();
     let base = prepared.annotations().base().clone();
-    let native_bytes = pb::Transaction::from(&original).encoded_len();
+    let native_bytes = pb::Transaction::try_from(&original)?.encoded_len();
     assert!(native_bytes as u64 > c.client.max_descriptor_bytes());
     let inline = annotations::descriptors(prepared.annotations(), &selection);
     if fragments == 4096 {

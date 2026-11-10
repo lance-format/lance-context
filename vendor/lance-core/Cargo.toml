@@ -10,11 +10,10 @@
 # See Cargo.toml.orig for the original contents.
 
 [package]
-exclude = [".cargo_vcs_info.json", "Cargo.toml.orig"]
 edition = "2024"
-rust-version = "1.91.0"
+rust-version = "1.94.0"
 name = "lance-core"
-version = "13.0.0"
+version = "14.0.2"
 authors = ["Lance Devs <dev@lance.org>"]
 build = false
 autolib = false
@@ -39,6 +38,8 @@ categories = [
 ]
 license = "Apache-2.0"
 repository = "https://github.com/lance-format/lance"
+# Preserve official provenance without using Cargo's reserved sdist filenames.
+exclude = ["Cargo.toml.orig", ".cargo_vcs_info.json"]
 
 [features]
 backtrace = []
@@ -93,10 +94,10 @@ optional = true
 version = "0.3"
 
 [dependencies.lance-arrow]
-version = "=13.0.0"
+version = "=14.0.2"
 
 [dependencies.lance-derive]
-version = "=13.0.0"
+version = "=14.0.2"
 
 [dependencies.libc]
 version = "0.2.176"
@@ -118,7 +119,7 @@ features = [
 version = "1.0"
 
 [dependencies.object_store]
-version = "0.14.1"
+version = "0.14.2"
 
 [dependencies.pin-project]
 version = "1.0"
@@ -220,3 +221,8 @@ unsafe_op_in_unsafe_fn = "allow"
 level = "warn"
 priority = 0
 check-cfg = ["cfg(coverage,coverage_nightly)"]
+
+[patch.crates-io]
+object_store = { git = "https://github.com/beinan/arrow-rs-object-store", rev = "1149230d06b87d2b458a1b6a886e0b8224498338" }
+lance-encoding = { path = "../lance-encoding" }
+lance-io = { path = "../lance-io" }
