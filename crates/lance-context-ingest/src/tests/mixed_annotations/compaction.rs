@@ -4,6 +4,8 @@ use std::collections::BTreeMap;
 
 #[cfg(feature = "service")]
 mod narrow_metadata;
+#[cfg(feature = "http")]
+mod pressure;
 mod reclamation;
 #[cfg(feature = "service")]
 mod recovery;
