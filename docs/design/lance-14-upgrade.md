@@ -30,6 +30,20 @@ rolling-upgrade guarantee. The preparation instructions in
 [the Lance 13 upgrade notes](lance-13-upgrade.md) still apply to generations
 written before field-ID preservation.
 
+Lance 14 does change the native BTree index row domain: new version-1 segments
+store physical row addresses, while Lance 13 version-0 segments store row IDs.
+Stable dataset row IDs therefore do not by themselves preserve a new BTree's
+coverage after compaction. A rewrite must carry the native index remap before
+publication; otherwise Lance drops the replaced fragments from index coverage.
+Likewise, an incremental index build must not combine old row-ID segments with
+new row-address segments under the same logical index.
+
+The upgrade is not ready to deploy until managed compaction retains those
+remaps through prepared publication and the existing-index transition is
+validated. The current compaction regression intentionally continues requiring
+ID index coverage on the replacement fragment. Falling back to a scan is not
+an acceptable substitute for that coverage guarantee.
+
 Validation must cover the existing real Lance flush failure and replay-boundary
 regressions, concurrent annotation publication, indexed reads, task cancellation,
 SDK completion retries, and Python source-distribution rebuilds. Performance
