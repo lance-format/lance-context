@@ -121,7 +121,7 @@ async fn exercise(selected: bool) -> Result<()> {
     use prost::Message;
     let inline = |transaction: &Transaction| {
         p::Descriptors::lance_annotations(Bytes::from(
-            lance_table::format::pb::Transaction::from(transaction).encode_to_vec(),
+            lance_table::format::pb::Transaction::try_from(transaction)?.encode_to_vec(),
         ))
     };
     assert_eq!(

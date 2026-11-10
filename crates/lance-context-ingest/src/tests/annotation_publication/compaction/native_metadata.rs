@@ -59,7 +59,7 @@ pub(super) async fn verify(
             }
         }
         let descriptors = p::Descriptors::lance_annotations(Bytes::from(
-            pb::Transaction::from(&changed).encode_to_vec(),
+            pb::Transaction::try_from(&changed)?.encode_to_vec(),
         ))?;
         assert!(
             annotations::resolve_transaction(base, &descriptors, &selection, storage)

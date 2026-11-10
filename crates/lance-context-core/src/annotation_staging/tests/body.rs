@@ -310,7 +310,7 @@ async fn bound_body_reference_survives_publication_suffix_and_reopen() -> Result
             .is_err());
         drop(repeated);
         let transaction = prepared.merge().transaction.clone();
-        let exact = Transaction::try_from(pb::Transaction::from(&transaction))?;
+        let exact = Transaction::try_from(pb::Transaction::try_from(&transaction)?)?;
         assert_eq!(exact, transaction);
         let selected = Arc::new(
             CommitBuilder::new(narrow.clone())

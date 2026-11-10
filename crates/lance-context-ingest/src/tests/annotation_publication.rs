@@ -887,7 +887,7 @@ fn rejects_foreign_preparation(
             }
         }
         let bad = p::Descriptors::lance_annotations(
-            pb::Transaction::from(&changed).encode_to_vec().into(),
+            pb::Transaction::try_from(&changed)?.encode_to_vec().into(),
         )?;
         assert!(annotations::transaction(base, &bad, selection).is_err());
     }
