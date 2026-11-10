@@ -889,6 +889,10 @@ impl WalFlusher {
         // lifted into the writer's coordinate space before it is published —
         // otherwise a fresh memtable's small local end would be compared against a
         // cursor carrying a previous memtable's larger one.
+        // A later coalesced flush can be a no-op. Keep this store's own WAL
+        // receipt before waking waiters; a writer-global cursor can already
+        // include a different generation by the time the receipt is consumed.
+        batch_store.record_wal_entry_position(append_result.entry_position);
         self.advance_durable(batch_store.global_offset() + end_batch_position);
         self.signal_wal_flush_complete();
 

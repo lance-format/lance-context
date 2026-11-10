@@ -2740,6 +2740,9 @@ impl ShardWriter {
         //
         // `global_end()` is the writer-global batch count through this memtable,
         // since its coordinate continues where the last sealed generation ended.
+        memtable
+            .batch_store()
+            .record_wal_entry_position(next_wal_position.saturating_sub(1));
         wal_flusher.advance_durable(memtable.batch_store().global_end());
 
         wal_flusher
@@ -4622,20 +4625,27 @@ impl MemTableFlushHandler {
     ) -> Result<super::memtable::flush::FlushResult> {
         let memtable = &pending.memtable;
         if pending.wal_boundary.is_none() {
+            // The freeze-time snapshot can predate an in-flight WAL append.
+            // Its queued request can then coalesce to entry=None, so even after
+            // awaiting completion that snapshot is not this generation's WAL
+            // boundary. Read the receipt attached to this store instead.
+            let receipt = || {
+                memtable.batch_store().wal_entry_position().ok_or_else(|| {
+                    WalFlushFailure::from_error(&Error::io(
+                        "frozen memtable has no WAL entry receipt",
+                    ))
+                })
+            };
             let boundary = if let Some(mut reader) = memtable.take_wal_flush_completion() {
                 match reader.await_value().await {
-                    Some(Ok(result)) => Ok(result
-                        .entry
-                        .map(|e| e.position)
-                        .or_else(|| memtable.frozen_at_wal_entry_position())
-                        .unwrap_or(0)),
+                    Some(Ok(_)) => receipt(),
                     Some(Err(failure)) => Err(failure),
                     None => Err(WalFlushFailure::from_error(&Error::io(
                         "WAL flush handler exited before reporting completion",
                     ))),
                 }
             } else {
-                Ok(memtable.frozen_at_wal_entry_position().unwrap_or(0))
+                receipt()
             };
             pending.wal_boundary = Some(boundary);
         }

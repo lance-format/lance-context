@@ -44,7 +44,7 @@ use std::cell::UnsafeCell;
 use std::collections::HashSet;
 use std::mem::MaybeUninit;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use arrow::array::ArrayData;
 use arrow_array::RecordBatch;
@@ -224,6 +224,11 @@ pub struct BatchStore {
     /// particular store.
     global_offset: usize,
 
+    /// Last WAL entry written from this store. Published before the durable
+    /// batch cursor, so a freeze cannot observe durability with a stale entry.
+    /// Zero means no entry (a replayed active store is seeded on open).
+    wal_entry_position: AtomicU64,
+
     /// Final generation/data-file identity for batches in this store.
     target: Option<MemTableDataTarget>,
 }
@@ -291,8 +296,19 @@ impl BatchStore {
             retained_bytes: AtomicUsize::new(0),
             retained_buffers: Mutex::new(HashSet::new()),
             global_offset,
+            wal_entry_position: AtomicU64::new(0),
             target,
         }
+    }
+
+    pub(crate) fn record_wal_entry_position(&self, position: u64) {
+        self.wal_entry_position
+            .fetch_max(position, Ordering::Release);
+    }
+
+    pub(crate) fn wal_entry_position(&self) -> Option<u64> {
+        let position = self.wal_entry_position.load(Ordering::Acquire);
+        (position != 0).then_some(position)
     }
 
     /// Calculate recommended capacity from memtable size configuration.
