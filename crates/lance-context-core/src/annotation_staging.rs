@@ -560,14 +560,22 @@ impl AnnotationStaging {
     /// even if publication retires frozen before the storage read completes.
     /// This does not establish a distributed read barrier by itself.
     pub async fn capture(&self, turn: &str) -> Result<PointRead> {
-        Ok(self.capture_inner(turn, false).await?.0)
+        Ok(self.capture_inner(turn, false, false).await?.0)
+    }
+
+    /// Wait for a read-view permit before capturing the current compatible view.
+    /// Callers must bound concurrent waiters and include admission in their read
+    /// deadline. Waiting holds no staging lock, value or base snapshot; dropping
+    /// the future cancels its semaphore admission.
+    pub async fn capture_when_available(&self, turn: &str) -> Result<PointRead> {
+        Ok(self.capture_inner(turn, false, true).await?.0)
     }
 
     /// Capture annotation and body location under the same view lock. The
     /// service still establishes a read barrier and retains the referenced WAL
     /// frame before releasing its ordered source-window gate.
     pub async fn capture_turn(&self, turn: &str) -> Result<TurnRead> {
-        let (annotations, source) = self.capture_inner(turn, true).await?;
+        let (annotations, source) = self.capture_inner(turn, true, false).await?;
         Ok(TurnRead {
             annotations,
             source: source.expect("full capture includes body source"),
@@ -578,11 +586,20 @@ impl AnnotationStaging {
         &self,
         turn: &str,
         body: bool,
+        wait_for_reader: bool,
     ) -> Result<(PointRead, Option<body::CapturedBody>)> {
         if turn.is_empty() || turn.len() > self.limits.value_bytes {
             return Err(invalid("invalid annotation turn key"));
         }
-        let permit = reserve(&self.readers, 1)?;
+        let permit = if wait_for_reader {
+            self.readers
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| invalid("annotation read admission closed"))?
+        } else {
+            reserve(&self.readers, 1)?
+        };
         let state = self.state.read().await;
         let value = state.active.get(turn).cloned().or_else(|| {
             state
