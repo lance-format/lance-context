@@ -1,0 +1,24 @@
+{
+  "fragments": 3,
+  "indices": [
+    {
+      "coverage": [
+        0
+      ],
+      "name": "lance_context_turn_id",
+      "uuid": "11fb5b10-da70-429e-9b17-83ac54897f44",
+      "version": 0
+    },
+    {
+      "coverage": [
+        0
+      ],
+      "name": "lance_context_annotation_status",
+      "uuid": "f0225c79-22d0-4020-accf-fcaed11e8d70",
+      "version": 0
+    }
+  ],
+  "lance": "13.0.0",
+  "rows": 6,
+  "version": 3
+}
