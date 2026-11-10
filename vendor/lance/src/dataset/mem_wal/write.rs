@@ -10942,7 +10942,10 @@ mod tests {
 
         let manifest_store =
             super::super::ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
-        let (epoch, _) = manifest_store.claim_epoch(shard_id).await.unwrap();
+        let (epoch, _) = manifest_store
+            .claim_epoch(manifest.shard_spec_id)
+            .await
+            .unwrap();
         manifest_store
             .commit_update(epoch, |current| super::super::ShardManifest {
                 version: current.next_version(),
