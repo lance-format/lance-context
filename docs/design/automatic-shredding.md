@@ -93,3 +93,31 @@ reconstruction for historical residual values, type mismatches, and container
 paths. Explicit null and missing remain distinct. `checkout` pins both the layout
 and documents to a read-only version; `refresh` restores the latest view. Field
 selection, projection, and round-trip semantics are covered by real Lance tests.
+
+## Logical queries and text search
+
+`filter_eq(path, value, limit)` returns matching generated IDs. A compatible
+scalar predicate runs against its typed column, while rows with physical nulls
+are checked through reconstructed JSON. The fallback covers values written
+before promotion, type changes, containers, and explicit nulls. Missing is not
+equal to JSON null. Results have no ordering guarantee.
+
+`search(query, limit)` searches the automatically selected string paths and
+returns IDs with native Lance full-text scores. It uses a lowercase simple
+tokenizer without stemming or stop-word removal. Arrays, root scalar documents,
+and paths outside the extraction budget are not full-text indexed in this
+increment; they remain available through document reads and logical filtering.
+
+The first search after layout growth automatically backfills historical values
+and builds missing inverted indexes. `prepare_text_search` performs that work in
+advance. Preparation can be expensive: it streams a rewrite of the dataset and
+creates an index for each selected string path. Subsequent appends with the same
+layout use Lance's indexed-plus-unindexed-tail search. Selection is automatic;
+this initial indexing policy deliberately favors correctness over maintenance
+cost. Query-aware index selection and asynchronous maintenance remain follow-ups.
+
+Backfill retains generated document IDs and publishes an overwrite with zero
+commit retries. A stale rewrite fails instead of rebasing over newer appends.
+The backfill marker and data are published together; failed index creation can
+be retried. Pinned snapshots can search if already prepared, but cannot trigger
+backfill or index creation. Retained versions continue to hold their old bytes.

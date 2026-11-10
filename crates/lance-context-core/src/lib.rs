@@ -64,7 +64,7 @@ pub use datagen::{
     DatagenWriteContext, FieldOp, FoldedDatagenItem, DATAGEN_SCHEMA_VERSION,
 };
 pub use datagen_store::{datagen_log_schema, DatagenStore, DatagenStoreOptions};
-pub use document_store::DocumentStore;
+pub use document_store::{DocumentSearchHit, DocumentStore};
 pub use eval::{
     AbReport, EvalConfig, EvalQuery, EvalQuerySet, EvalReport, MetricScores, QueryEval,
     RelevanceLabel, RetrievalMode,
