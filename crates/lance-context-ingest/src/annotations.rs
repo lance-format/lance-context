@@ -660,7 +660,16 @@ impl Service {
         self.validate_turn(turn)?;
         tokio::time::timeout(deadline, async {
             self.wait_through(recovery_cut).await?;
-            Ok(self.shared.staging.capture(turn).await?.resolve().await?)
+            // HTTP admission already bounds these requests. A transient lack
+            // of staging readers must wait within the same request deadline,
+            // without holding an old read view or blocking ordered apply.
+            Ok(self
+                .shared
+                .staging
+                .capture_when_available(turn)
+                .await?
+                .resolve()
+                .await?)
         })
         .await
         .context("annotation owned read deadline expired")?

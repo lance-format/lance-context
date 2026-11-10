@@ -18,6 +18,7 @@ mod batches;
 mod cold_io;
 mod mixed;
 mod pressure;
+mod read_admission;
 mod read_cut;
 mod shards;
 mod source_admission;
