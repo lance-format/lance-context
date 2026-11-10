@@ -1,4 +1,5 @@
 use super::*;
+use lance::index::DatasetIndexInternalExt;
 
 fn batch(ids: Vec<String>, status: &str) -> Result<RecordBatch> {
     let rows = ids.len();
