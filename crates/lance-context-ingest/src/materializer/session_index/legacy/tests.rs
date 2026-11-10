@@ -6,6 +6,8 @@ use lance::dataset::{
     CommitBuilder, WriteParams,
 };
 
+mod cross_version;
+
 async fn commit(base: &Dataset, operation: Operation) -> Result<Dataset> {
     Ok(CommitBuilder::new(Arc::new(base.clone()))
         .with_max_retries(0)
