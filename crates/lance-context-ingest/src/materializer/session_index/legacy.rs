@@ -151,7 +151,10 @@ pub(super) async fn build(
             Box::pin(RecordBatchStreamAdapter::new(schema, stream)),
             &store,
             DEFAULT_BTREE_BATCH_SIZE,
-            Some(ids),
+            // Each segment already has its own UUID directory. Fragment
+            // coverage lives in its manifest metadata; no partition-prefixed
+            // page names are needed for this canonical native segment.
+            None,
             None,
         )
         .await?,

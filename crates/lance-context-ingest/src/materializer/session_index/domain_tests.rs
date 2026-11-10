@@ -134,6 +134,16 @@ async fn exercise(existing_address_index: bool) -> Result<()> {
         let directories =
             std::fs::read_dir(uri.join("_indices"))?.collect::<std::io::Result<Vec<_>>>()?;
         assert_eq!(directories.len(), 1);
+        let files = std::fs::read_dir(directories[0].path())?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<std::io::Result<BTreeSet<_>>>()?;
+        assert_eq!(
+            files,
+            ["page_data.lance", "page_lookup.lance"]
+                .map(std::ffi::OsString::from)
+                .into_iter()
+                .collect()
+        );
         // Fragments 1 and 2 have stable row IDs that differ from their physical
         // addresses; this catches wrongly relabeling an address-trained index.
         base = managed(&base, Action::Build(vec![1, 2]), key).await?;
