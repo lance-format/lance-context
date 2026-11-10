@@ -33,6 +33,9 @@ during retry backoff. Context calls the renamed force_freeze_active API.
 Upstream's new already-published shortcut is not used: a retired generation
 alone is insufficient evidence of this prepared publication's selected cut.
 The corresponding test reuses the prepared publication and checks its receipt.
+The upstream stale-covered-position replay test explicitly installs its old
+cursor after writer shutdown: the retained per-store receipt now closes the
+original writer-bookkeeping window. It also checks the correct normal cursor.
 
 These patches remain necessary for context's existing flush-retry, replay-boundary,
 publication-loss, scalar-index, and task-lifetime regressions. They do not add a

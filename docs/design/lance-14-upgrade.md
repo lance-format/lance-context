@@ -41,6 +41,13 @@ publication; otherwise Lance drops the replaced fragments from index coverage.
 Likewise, an incremental index build must not combine old row-ID segments with
 new row-address segments under the same logical index.
 
+Existing version-0 managed indexes are extended within the existing fragment
+and row bounds by scanning only their key and real stable row IDs and training
+native BTree pages in that same domain. Existing segments need no full-table
+rebuild. New logical indexes still use the Lance 14 builder and address domain.
+The persisted descriptor decoder rejects mixed domains. This compatibility
+path still requires cross-version fixture validation before deployment.
+
 The upgrade is not ready to deploy until managed compaction retains those
 remaps through prepared publication and the existing-index transition is
 validated. The current compaction regression intentionally continues requiring
