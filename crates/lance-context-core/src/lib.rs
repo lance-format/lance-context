@@ -26,6 +26,7 @@ mod rollout;
 pub mod rollout_append;
 mod rollout_store;
 pub mod serde;
+pub mod shredding;
 mod storage;
 mod store;
 mod store_base;
