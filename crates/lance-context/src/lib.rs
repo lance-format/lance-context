@@ -15,7 +15,7 @@ pub use lance_context_core::{
     RolloutRecord, SearchResult, Snapshot, StateMetadata, DATAGEN_SCHEMA_VERSION, LIFECYCLE_ACTIVE,
     LIFECYCLE_CONTRADICTED,
 };
-pub use lance_context_core::{serde, shredding, DocumentStore};
+pub use lance_context_core::{serde, shredding, DocumentSearchHit, DocumentStore};
 
 pub use lance_context_api::{
     trace_schema, AddDatagenEventsRequest, AddDatagenEventsResponse, AddRecordRequest,

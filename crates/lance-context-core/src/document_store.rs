@@ -406,5 +406,10 @@ fn validate_depth(value: &Value, depth: usize) -> Result<()> {
     Ok(())
 }
 
+mod query;
+pub use query::DocumentSearchHit;
+
+#[cfg(test)]
+mod query_tests;
 #[cfg(test)]
 mod tests;
