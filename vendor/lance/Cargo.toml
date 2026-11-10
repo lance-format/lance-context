@@ -10,11 +10,10 @@
 # See Cargo.toml.orig for the original contents.
 
 [package]
-exclude = [".cargo_vcs_info.json", "Cargo.toml.orig"]
 edition = "2024"
-rust-version = "1.91.0"
+rust-version = "1.94.0"
 name = "lance"
-version = "13.0.0"
+version = "14.0.2"
 authors = ["Lance Devs <dev@lance.org>"]
 build = "build.rs"
 autolib = false
@@ -39,6 +38,8 @@ categories = [
 ]
 license = "Apache-2.0"
 repository = "https://github.com/lance-format/lance"
+# Preserve official provenance without using Cargo's reserved sdist filenames.
+exclude = ["Cargo.toml.orig", ".cargo_vcs_info.json"]
 
 [package.metadata.docs.rs]
 features = ["metrics"]
@@ -113,6 +114,11 @@ path = "src/bin/lq.rs"
 required-features = ["cli"]
 
 [[test]]
+name = "arrow_ordering"
+path = "tests/arrow_ordering.rs"
+test = false
+
+[[test]]
 name = "integration_tests"
 path = "tests/integration_tests.rs"
 
@@ -123,6 +129,15 @@ path = "tests/resource_tests.rs"
 [[test]]
 name = "scalar_index_spill"
 path = "tests/scalar_index_spill.rs"
+
+[[test]]
+name = "scan_scheduler_deadlock"
+path = "tests/scan_scheduler_deadlock.rs"
+
+[[bench]]
+name = "cdf"
+path = "benches/cdf.rs"
+harness = false
 
 [[bench]]
 name = "concurrent_append"
@@ -152,6 +167,11 @@ harness = false
 [[bench]]
 name = "hamming"
 path = "benches/hamming.rs"
+harness = false
+
+[[bench]]
+name = "hamming_ivf_training"
+path = "benches/hamming_ivf_training.rs"
 harness = false
 
 [[bench]]
@@ -227,6 +247,11 @@ harness = false
 [[bench]]
 name = "merge_insert"
 path = "benches/merge_insert.rs"
+harness = false
+
+[[bench]]
+name = "nullable_vector_training"
+path = "benches/nullable_vector_training.rs"
 harness = false
 
 [[bench]]
@@ -412,6 +437,9 @@ features = ["levenshtein"]
 [dependencies.futures]
 version = "0.3"
 
+[dependencies.hex]
+version = "0.4.3"
+
 [dependencies.humantime]
 version = "2.2.0"
 
@@ -419,46 +447,47 @@ version = "2.2.0"
 version = "0.14"
 
 [dependencies.lance-arrow]
-version = "=13.0.0"
+version = "=14.0.2"
 
 [dependencies.lance-bitpacking]
-version = "=13.0.0"
+version = "=14.0.2"
 
 [dependencies.lance-core]
 path = "../lance-core"
-version = "=13.0.0"
+version = "=14.0.2"
 
 [dependencies.lance-datafusion]
-version = "=13.0.0"
+version = "=14.0.2"
 
 [dependencies.lance-encoding]
 path = "../lance-encoding"
-version = "=13.0.0"
+version = "=14.0.2"
 
 [dependencies.lance-file]
-version = "=13.0.0"
+version = "=14.0.2"
 
 [dependencies.lance-index]
-version = "=13.0.0"
+version = "=14.0.2"
 
 [dependencies.lance-io]
-version = "=13.0.0"
+path = "../lance-io"
+version = "=14.0.2"
 default-features = false
 
 [dependencies.lance-linalg]
-version = "=13.0.0"
+version = "=14.0.2"
 
 [dependencies.lance-namespace]
-version = "=13.0.0"
+version = "=14.0.2"
 
 [dependencies.lance-select]
-version = "=13.0.0"
+version = "=14.0.2"
 
 [dependencies.lance-table]
-version = "=13.0.0"
+version = "=14.0.2"
 
 [dependencies.lance-tokenizer]
-version = "=13.0.0"
+version = "=14.0.2"
 
 [dependencies.log]
 version = "0.4"
@@ -470,8 +499,11 @@ features = [
     "sync",
 ]
 
+[dependencies.num-traits]
+version = "0.2"
+
 [dependencies.object_store]
-version = "0.14.1"
+version = "0.14.2"
 
 [dependencies.permutation]
 version = "0.4.0"
@@ -599,27 +631,34 @@ features = [
 ]
 default-features = false
 
+[dev-dependencies.lance-arrow-scalar]
+version = "=58.0.0"
+
+[dev-dependencies.lance-arrow-stats]
+version = "=58.0.0"
+
 [dev-dependencies.lance-datafusion]
-version = "=13.0.0"
+version = "=14.0.2"
 features = ["datagen"]
 
 [dev-dependencies.lance-datagen]
-version = "=13.0.0"
+version = "=14.0.2"
 
 [dev-dependencies.lance-index]
-version = "=13.0.0"
+version = "=14.0.2"
 features = ["test-oracle"]
 
 [dev-dependencies.lance-io]
-version = "=13.0.0"
+path = "../lance-io"
+version = "=14.0.2"
 features = ["test-util"]
 default-features = false
 
 [dev-dependencies.lance-test-macros]
-version = "=13.0.0"
+version = "=14.0.2"
 
 [dev-dependencies.lance-testing]
-version = "=13.0.0"
+version = "=14.0.2"
 
 [dev-dependencies.libc]
 version = "0.2.176"
@@ -639,10 +678,10 @@ default-features = false
 version = "1.4.0"
 
 [dev-dependencies.reqwest]
-version = "0.12"
+version = "0.13"
 features = [
     "json",
-    "rustls-tls",
+    "rustls",
 ]
 default-features = false
 
@@ -720,3 +759,9 @@ unsafe_op_in_unsafe_fn = "allow"
 level = "warn"
 priority = 0
 check-cfg = ["cfg(coverage,coverage_nightly)"]
+
+[patch.crates-io]
+object_store = { git = "https://github.com/beinan/arrow-rs-object-store", rev = "1149230d06b87d2b458a1b6a886e0b8224498338" }
+lance-core = { path = "../lance-core" }
+lance-encoding = { path = "../lance-encoding" }
+lance-io = { path = "../lance-io" }

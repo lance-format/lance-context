@@ -114,6 +114,14 @@ impl AwsStoreProvider {
         )
         .await?;
 
+        // Published object_store requires an explicit mechanism for conditional
+        // S3 copies. Multipart completion uses If-None-Match without replacing
+        // an existing destination; preserve provider-specific overrides.
+        resolved_s3_options
+            .options
+            .entry(AmazonS3ConfigKey::CopyIfNotExists)
+            .or_insert_with(|| "multipart".to_string());
+
         // Set S3Express flag if detected
         if is_s3_express {
             resolved_s3_options
@@ -152,6 +160,7 @@ impl AwsStoreProvider {
         &self,
         base_path: &Url,
         storage_options: &StorageOptions,
+        aws_credentials: Option<&AwsCredentialProvider>,
     ) -> Result<Arc<dyn OSObjectStore>> {
         let bucket = base_path
             .host_str()
@@ -169,6 +178,16 @@ impl AwsStoreProvider {
                 "OpendalStore does not currently support an explicit provider_scheme (currently set to {:?})",
                 provider_scheme
             )));
+        }
+
+        // The provider reaches the native store through the params, which this
+        // arm does not pass on, so a request here would be signed with whatever
+        // credentials OpenDAL resolves for itself instead.
+        if aws_credentials.is_some() {
+            return Result::Err(Error::not_supported(
+                "OpendalStore does not currently support an explicit aws_credentials provider"
+                    .to_string(),
+            ));
         }
 
         // Set required OpenDAL configuration
@@ -227,8 +246,12 @@ impl ObjectStoreProvider for AwsStoreProvider {
             // Use OpenDAL implementation
             // Listed in full: no paginated lister covers OpenDAL yet.
             (
-                self.build_opendal_s3_store(&base_path, &storage_options)
-                    .await?,
+                self.build_opendal_s3_store(
+                    &base_path,
+                    &storage_options,
+                    params.aws_credentials.as_ref(),
+                )
+                .await?,
                 None,
             )
         } else {
@@ -614,29 +637,35 @@ impl AwsCredentialAdapter {
 impl StorageOptions {
     /// Add values from the environment to storage options.
     ///
-    /// Only adds keys that are not already present, so explicitly-set options
-    /// (including empty-string sentinels) always take precedence over env vars.
+    /// Explicitly-set options (including aliases, case variants, and empty-string
+    /// sentinels) always take precedence over env vars.
     pub fn with_env_s3(&mut self) {
-        for (os_key, os_value) in std::env::vars_os() {
-            if let (Some(key), Some(value)) = (os_key.to_str(), os_value.to_str())
-                && let Ok(config_key) = AmazonS3ConfigKey::from_str(&key.to_ascii_lowercase())
-                && !self.0.contains_key(config_key.as_ref())
-            {
-                self.0
-                    .insert(config_key.as_ref().to_string(), value.to_string());
-            }
-        }
+        self.merge_env_options(std::env::vars_os(), |key| {
+            AmazonS3ConfigKey::from_str(key)
+                .ok()
+                .map(|key| key.as_ref().to_string())
+        });
     }
 
-    /// Subset of options relevant for s3 storage
+    /// Return options recognized by [`AmazonS3ConfigKey`], ignoring unknown keys.
+    ///
+    /// When aliases conflict, the exact canonical name (such as `aws_region`)
+    /// wins, followed by case variants of that name. Remaining ties use the
+    /// lexicographically smallest original key. Empty values are preserved.
+    ///
+    /// ```
+    /// use std::collections::HashMap;
+    /// use lance_io::object_store::StorageOptions;
+    /// use object_store::aws::AmazonS3ConfigKey;
+    ///
+    /// let options = StorageOptions(HashMap::from([
+    ///     ("region".into(), "us-east-1".into()),
+    ///     ("aws_region".into(), "eu-west-1".into()),
+    /// ]));
+    /// assert_eq!(options.as_s3_options()[&AmazonS3ConfigKey::Region], "eu-west-1");
+    /// ```
     pub fn as_s3_options(&self) -> HashMap<AmazonS3ConfigKey, String> {
-        self.0
-            .iter()
-            .filter_map(|(key, value)| {
-                let s3_key = AmazonS3ConfigKey::from_str(&key.to_ascii_lowercase()).ok()?;
-                Some((s3_key, value.clone()))
-            })
-            .collect()
+        self.as_cloud_options()
     }
 
     /// Parse the `aws_provider_scheme` storage option, if set.
@@ -684,10 +713,182 @@ mod tests {
     use aws_config::profile::profile_file::{ProfileFileKind, ProfileFiles};
     use aws_credential_types::provider::error::CredentialsError;
     use mock_instant::thread_local::MockClock;
-    use object_store::path::Path;
+    use object_store::{ObjectStoreExt, path::Path};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
+
+    #[rstest::rstest]
+    #[case::default(None, false)]
+    #[case::explicit_multipart(Some("multipart"), false)]
+    #[case::existing_destination(None, true)]
+    #[tokio::test]
+    async fn test_s3_conditional_copy(
+        #[case] copy_option: Option<&str>,
+        #[case] destination_exists: bool,
+    ) {
+        let server = MockServer::start().await;
+        let metadata = ResponseTemplate::new(200)
+            .insert_header("content-length", "3")
+            .insert_header("last-modified", "Wed, 21 Oct 2015 07:28:00 GMT")
+            .insert_header("etag", "\"source\"");
+        Mock::given(method("HEAD"))
+            .and(path("/bucket/staging.lance"))
+            .respond_with(metadata.clone())
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/bucket/final.lance"))
+            .and(query_param("uploads", ""))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<InitiateMultipartUploadResult><UploadId>upload-1</UploadId></InitiateMultipartUploadResult>",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(query_param("uploadId", "upload-1"))
+            .and(query_param("partNumber", "1"))
+            .and(header("x-amz-copy-source", "bucket/staging.lance"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("<CopyPartResult><ETag>\"part\"</ETag></CopyPartResult>"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let completion = if destination_exists {
+            ResponseTemplate::new(412).set_body_string(
+                "<Error><Code>PreconditionFailed</Code><Message>exists</Message></Error>",
+            )
+        } else {
+            ResponseTemplate::new(200).set_body_string(
+                "<CompleteMultipartUploadResult><ETag>\"destination\"</ETag></CompleteMultipartUploadResult>",
+            )
+        };
+        Mock::given(method("POST"))
+            .and(query_param("uploadId", "upload-1"))
+            .and(header("if-none-match", "*"))
+            .respond_with(completion)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("HEAD"))
+            .and(path("/bucket/final.lance"))
+            .respond_with(metadata)
+            .expect(u64::from(destination_exists))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(query_param("uploadId", "upload-1"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(u64::from(destination_exists))
+            .mount(&server)
+            .await;
+
+        let mut options = HashMap::from([
+            ("aws_access_key_id".into(), "test".into()),
+            ("aws_secret_access_key".into(), "test".into()),
+            ("aws_region".into(), "us-east-1".into()),
+            ("aws_endpoint".into(), server.uri()),
+            ("aws_allow_http".into(), "true".into()),
+        ]);
+        if let Some(value) = copy_option {
+            options.insert("aws_copy_if_not_exists".into(), value.into());
+        }
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                options,
+            ))),
+            ..Default::default()
+        };
+        let (store, _) = ObjectStore::from_uri_and_params(
+            Arc::new(ObjectStoreRegistry::default()),
+            "s3://bucket",
+            &params,
+        )
+        .await
+        .unwrap();
+        let result = store
+            .copy_if_not_exists(&Path::from("staging.lance"), &Path::from("final.lance"))
+            .await
+            .unwrap();
+        assert_eq!(result.size, 3);
+    }
+
+    #[tokio::test]
+    async fn test_s3_conditional_copy_preserves_explicit_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/bucket/final.lance"))
+            .and(header("x-amz-copy-source", "bucket/staging.lance"))
+            .and(header("custom-condition", "absent"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<CopyObjectResult><ETag>\"destination\"</ETag></CopyObjectResult>",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let options = StorageOptions(HashMap::from([
+            ("aws_access_key_id".into(), "test".into()),
+            ("aws_secret_access_key".into(), "test".into()),
+            ("aws_region".into(), "us-east-1".into()),
+            ("aws_endpoint".into(), server.uri()),
+            ("aws_allow_http".into(), "true".into()),
+            (
+                "aws_copy_if_not_exists".into(),
+                "header:custom-condition:absent".into(),
+            ),
+        ]));
+        let store = AwsStoreProvider
+            .build_amazon_s3_store(
+                &mut Url::parse("s3://bucket").unwrap(),
+                &ObjectStoreParams::default(),
+                &options,
+                ResolvedS3StorageOptions::new(options.as_s3_options(), None),
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .copy_if_not_exists(&Path::from("staging.lance"), &Path::from("final.lance"))
+            .await
+            .unwrap();
+    }
+
+    #[rstest::rstest]
+    #[case::canonical("aws_region", "region")]
+    #[case::canonical_over_case_variant("aws_region", "AWS_REGION")]
+    #[case::canonical_case_tie("AWS_REGION", "Aws_Region")]
+    #[case::case_variant_over_alias("AWS_REGION", "region")]
+    #[case::lexical_alias("REGION", "region")]
+    fn test_storage_options_alias_precedence(
+        #[case] preferred_key: &str,
+        #[case] conflicting_key: &str,
+        #[values("preferred", "")] preferred_value: &str,
+        #[values(false, true)] is_reversed: bool,
+    ) {
+        // Exercise fresh hash seeds as well as both insertion orders.
+        for _ in 0..16 {
+            let mut entries = [
+                (preferred_key.to_string(), preferred_value.to_string()),
+                (conflicting_key.to_string(), "conflicting".to_string()),
+                ("lance_custom_option".to_string(), "ignored".to_string()),
+            ];
+            if is_reversed {
+                entries.reverse();
+            }
+            let options = StorageOptions(HashMap::from(entries));
+            assert_eq!(
+                options.as_s3_options(),
+                HashMap::from([(AmazonS3ConfigKey::Region, preferred_value.to_string())])
+            );
+        }
+    }
 
     #[derive(Debug, Default)]
     struct MockAwsCredentialsProvider {
@@ -1073,6 +1274,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store.scheme, "s3");
+    }
+
+    /// A credential provider handed to the OpenDAL arm would be dropped, and
+    /// the requests signed from the environment instead.
+    #[tokio::test]
+    async fn test_use_opendal_rejects_an_explicit_credential_provider() {
+        use crate::object_store::StorageOptionsAccessor;
+        let provider = AwsStoreProvider;
+        let url = Url::parse("s3://test-bucket/path").unwrap();
+        let params = ObjectStoreParams {
+            aws_credentials: Some(
+                Arc::new(MockAwsCredentialsProvider::default()) as AwsCredentialProvider
+            ),
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([
+                    ("use_opendal".to_string(), "true".to_string()),
+                    ("region".to_string(), "us-west-2".to_string()),
+                ]),
+            ))),
+            ..Default::default()
+        };
+
+        let err = provider.new_store(url, &params).await.unwrap_err();
+        assert!(
+            matches!(err, Error::NotSupported { .. }),
+            "got: {err:?}, expected NotSupported"
+        );
+        assert!(err.to_string().contains("aws_credentials"), "got: {err}");
     }
 
     /// S3 Express ignores `start-after` and does not list in key order, but it does hand back

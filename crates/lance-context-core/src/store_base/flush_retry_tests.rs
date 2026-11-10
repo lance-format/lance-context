@@ -394,13 +394,13 @@ async fn coalesced_wal_flush_preserves_each_generation_boundary() {
     // The small first generation is flushed only by its seal. Hold that WAL PUT
     // while the second generation queues both a size-trigger and its own seal.
     writer.put(vec![batch("first")]).await.unwrap();
-    let first = writer.force_seal_active().await.unwrap();
+    let first = writer.force_freeze_active().await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
         .await
         .unwrap();
     let second_value = "x".repeat(4096);
     writer.put(vec![batch(&second_value)]).await.unwrap();
-    let second = writer.force_seal_active().await.unwrap();
+    let second = writer.force_freeze_active().await.unwrap();
     gate.release.notify_one();
     tokio::time::timeout(Duration::from_secs(15), first.wait())
         .await

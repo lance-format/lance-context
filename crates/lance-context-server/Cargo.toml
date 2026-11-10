@@ -39,7 +39,7 @@ uuid = { version = "1", features = ["v4"] }
 [dev-dependencies]
 async-trait = "0.1.92"
 tokio = { version = "1", features = ["test-util", "io-util"] }
-lance = "13.0.0"
+lance = "14.0.2"
 tower = { version = "0.5", features = ["util"] }
 lance-context-client = { version = "0.6.7", path = "../lance-context-client" }
 etcd-client = { version = "0.19", features = ["tls"] }

@@ -25,8 +25,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive", "env"] }
 etcd-client = { version = "0.19", features = ["tls"] }
 futures = "0.3"
-lance = "13.0.0"
-lance-table = "13.0.0"
+lance = "14.0.2"
+lance-table = "14.0.2"
 lru = "0.12"
 metrics = "0.24"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
@@ -39,7 +39,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 async-trait = "0.1.92"
-lance-io = { version = "13.0.0", path = "../../vendor/lance-io" }
+lance-io = { version = "14.0.2", path = "../../vendor/lance-io" }
 object_store = "0.14.2"
 tower = { version = "0.5", features = ["util"] }
 tempfile = "3"

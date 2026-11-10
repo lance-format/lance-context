@@ -11,9 +11,9 @@
 
 [package]
 edition = "2024"
-rust-version = "1.91.0"
+rust-version = "1.94.0"
 name = "lance-io"
-version = "13.0.0"
+version = "14.0.2"
 authors = ["Lance Devs <dev@lance.org>"]
 build = false
 autolib = false
@@ -38,8 +38,7 @@ categories = [
 ]
 license = "Apache-2.0"
 repository = "https://github.com/lance-format/lance"
-# Retain the published manifest for provenance, but Cargo reserves this name
-# when maturin repackages this path dependency into a source distribution.
+# Preserve official provenance without using Cargo's reserved sdist filenames.
 exclude = ["Cargo.toml.orig", ".cargo_vcs_info.json"]
 
 [features]
@@ -124,6 +123,14 @@ name = "goosefs_integration"
 path = "tests/goosefs_integration.rs"
 
 [[test]]
+name = "missing_working_directory"
+path = "tests/missing_working_directory.rs"
+
+[[test]]
+name = "scheduler_io_counters"
+path = "tests/scheduler_io_counters.rs"
+
+[[test]]
 name = "tos_integration"
 path = "tests/tos_integration.rs"
 
@@ -184,10 +191,10 @@ version = "1.1.0"
 
 [dependencies.lance-core]
 path = "../lance-core"
-version = "=13.0.0"
+version = "=14.0.2"
 
 [dependencies.lance-namespace]
-version = "=13.0.0"
+version = "=14.0.2"
 
 [dependencies.log]
 version = "0.4"
@@ -204,7 +211,7 @@ features = [
 ]
 
 [dependencies.object_store]
-version = "0.14.1"
+version = "0.14.2"
 
 [dependencies.object_store_opendal]
 version = "0.60.2"
@@ -227,6 +234,10 @@ version = "1.0"
 
 [dependencies.prost]
 version = "0.14.1"
+
+[dependencies.quick-xml]
+version = "0.41"
+optional = true
 
 [dependencies.rand]
 version = "0.9.1"
@@ -286,7 +297,7 @@ features = [
 ]
 
 [dev-dependencies.lance-testing]
-version = "=13.0.0"
+version = "=14.0.2"
 
 [dev-dependencies.metrics-util]
 version = "0.19"
@@ -363,11 +374,7 @@ level = "warn"
 priority = 0
 check-cfg = ["cfg(coverage,coverage_nightly)"]
 
-[dependencies.quick-xml]
-version = "0.41"
-optional = true
-
-# Match the workspace patch when running this backport's standalone tests.
 [patch.crates-io]
+object_store = { git = "https://github.com/beinan/arrow-rs-object-store", rev = "1149230d06b87d2b458a1b6a886e0b8224498338" }
 lance-core = { path = "../lance-core" }
-object_store = { git = "https://github.com/beinan/arrow-rs-object-store", rev = "09b0593d4702ba390bab1710b3e67f86fd7defcb" }
+lance-encoding = { path = "../lance-encoding" }
