@@ -333,7 +333,7 @@ impl FrozenAnnotations {
             ));
         }
         if updated_rows != 0 {
-            super::preserve_id::preserve_id(&self.0.base, &mut merge.transaction.operation)?;
+            super::preserve_id::validate_preserved_id(&self.0.base, &merge.transaction.operation)?;
         }
         if inserted_rows != 0 {
             registration::validate_target(&self.0.base)?;
@@ -359,7 +359,7 @@ impl FrozenAnnotations {
                 merge.transaction.operation = Operation::Append { fragments };
             } else if let Operation::Update { new_fragments, .. } = &mut merge.transaction.operation
             {
-                // preserve_id already checked the update-only preparation.
+                // validate_preserved_id already checked the update-only preparation.
                 *new_fragments = fragments;
             } else {
                 return Err(invalid("unexpected mixed annotation preparation"));

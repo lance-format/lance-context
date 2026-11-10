@@ -18,6 +18,11 @@ attempts, along with the exact WAL receipt and prepared publication. An absent
 retired generation alone does not confirm the outcome of an uncertain publish.
 Existing scalar-index coverage masks are also retained.
 
+Lance 14's column rewrite now preserves join-key columns itself. Annotation
+publication validates the original ID column and index coverage without the
+Lance 13 file-mapping repair. Only labels, status, and score may be rewritten;
+fragment membership and unrelated physical columns must remain unchanged.
+
 This dependency update does not change the distributed WAL protocol, staging
 budgets, publication batch sizes, or select the experimental Lance 2.3 file
 format. It does not migrate existing datasets or establish a mixed-version

@@ -671,6 +671,16 @@ async fn check_index_publication(deleted: bool, stable: bool) -> Result<()> {
         {
             assert_eq!(original.id, updated.id);
             assert_eq!(original.row_id_meta, updated.row_id_meta);
+            assert_eq!(
+                updated
+                    .files
+                    .iter()
+                    .flat_map(|file| file.fields.iter())
+                    .filter(|&&field| field == id_field)
+                    .count(),
+                1,
+                "the merge key must retain exactly one physical column mapping"
+            );
             let original_file = original
                 .files
                 .iter()
