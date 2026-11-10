@@ -28,7 +28,9 @@ Lance 2.3 file format is not selected. Indexed maintenance now persists the
 native rewrite and its remapped index files using existing descriptor formats
 4/5, including for immutable ingestion tables. All catalog voters and publishers
 must support this maintenance policy before it is used; older binaries reject
-that path. This does not establish a mixed-version rolling-upgrade guarantee.
+that path. Readers that open native Lance tables must also support version-1
+BTree address semantics. This does not establish a mixed-version rolling-upgrade
+guarantee.
 The preparation instructions in
 [the Lance 13 upgrade notes](lance-13-upgrade.md) still apply to generations
 written before field-ID preservation.
