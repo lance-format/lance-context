@@ -14,6 +14,7 @@ mod compaction;
 mod compaction_body;
 mod concurrent_reads;
 mod index;
+mod point_scan;
 mod published_values;
 mod reclamation;
 mod registration;
