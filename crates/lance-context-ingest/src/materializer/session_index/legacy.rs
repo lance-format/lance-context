@@ -10,6 +10,7 @@ use lance::dataset::scanner::ColumnOrdering;
 use lance_datafusion::exec::{execute_plan, LanceExecutionOptions};
 use lance_index::scalar::{
     btree::{train_btree_index, DEFAULT_BTREE_BATCH_SIZE},
+    index_files_to_table,
     lance_format::LanceIndexStore,
 };
 
@@ -109,10 +110,10 @@ pub(super) async fn build(
     index.created_at = None;
     let store = LanceIndexStore::new(
         dataset.object_store(None).await?,
-        dataset.indices_dir().child(index.uuid.to_string()),
+        dataset.indices_dir().join(index.uuid.to_string()),
         Arc::new(dataset.session().file_metadata_cache().clone()),
     );
-    index.files = Some(
+    index.files = Some(index_files_to_table(
         train_btree_index(
             Box::pin(RecordBatchStreamAdapter::new(schema, stream)),
             &store,
@@ -121,6 +122,6 @@ pub(super) async fn build(
             None,
         )
         .await?,
-    );
+    ));
     Ok(index)
 }
