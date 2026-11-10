@@ -1,5 +1,7 @@
 use super::*;
 
+mod peers;
+
 fn hold_worker(handle: &Handle) -> Result<(mpsc::Receiver<()>, mpsc::Sender<()>)> {
     hold_lane(handle, false)
 }
