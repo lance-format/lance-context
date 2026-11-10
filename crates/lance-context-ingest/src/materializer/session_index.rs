@@ -288,7 +288,14 @@ pub(super) fn spawn_action(
                         .await?)
                 }
                 Action::Merge(segments) => {
-                    Ok(dataset.merge_existing_index_segments(segments).await?)
+                    if segments
+                        .first()
+                        .is_some_and(|index| index.index_version == 0)
+                    {
+                        legacy::merge(&dataset, key, segments).await
+                    } else {
+                        Ok(dataset.merge_existing_index_segments(segments).await?)
+                    }
                 }
             }
         };

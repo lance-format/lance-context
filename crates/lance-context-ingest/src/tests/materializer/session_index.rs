@@ -279,7 +279,7 @@ async fn backlog_allows_index_and_compaction_to_progress_across_takeover() -> Re
     let mut writer = compaction::acquire(&ingress, &storage, &budget, 3, options).await?;
     let before = writer.read_dataset(None).await?;
     let prepared = writer.prepare_next().await?.unwrap();
-    assert_eq!(prepared.descriptors.format, 2);
+    assert_eq!(prepared.descriptors.format, 4);
     assert!(writer.run_once().await?.unwrap().sources.is_empty());
     let after = writer.read_dataset(None).await?;
     assert!(after.get_fragments().len() < before.get_fragments().len());

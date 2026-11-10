@@ -14,8 +14,10 @@ use lance_index::scalar::{
     lance_format::LanceIndexStore,
 };
 
+mod merge;
 #[cfg(test)]
 mod tests;
+pub(super) use merge::merge;
 
 pub(super) async fn build(
     dataset: &Dataset,

@@ -175,3 +175,74 @@ async fn legacy_extension_merge_compaction_and_reopen_keep_stable_ids_and_nulls(
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn legacy_status_merge_discards_values_from_withdrawn_fragment_coverage() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("turns.lance");
+    cross_version::copy_fixture(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lance13-btree"),
+        &path,
+    )?;
+    let mut base = Dataset::open(path.to_str().unwrap()).await?;
+    let budget = MergeMemoryBudget::new(WORKSPACE);
+    // Merge the old fragment-0 pages with fragment 1 before adding fragment 2.
+    // A later status rewrite withdraws only part of that first merged segment.
+    for action in 0..3 {
+        let action = match action {
+            0 => Action::Build(vec![1]),
+            1 => Action::Merge(
+                base.load_indices()
+                    .await?
+                    .iter()
+                    .filter(|index| index.name == Key::Status.name())
+                    .cloned()
+                    .collect(),
+            ),
+            _ => Action::Build(vec![2]),
+        };
+        let descriptor = spawn_action(
+            base.clone(),
+            action,
+            Key::Status,
+            budget.reserve(WORKSPACE).await,
+            Arc::default(),
+        )
+        .await??;
+        base = commit(&base, operation_for(&base, &descriptor, Key::Status).await?).await?;
+    }
+    base = lance::dataset::UpdateBuilder::new(Arc::new(base))
+        .update_where("id IN ('A', 'B')")?
+        .set("status", "'reviewed'")?
+        .build()?
+        .execute()
+        .await?
+        .new_dataset
+        .as_ref()
+        .clone();
+    let segments: Vec<_> = base
+        .load_indices()
+        .await?
+        .iter()
+        .filter(|index| index.name == Key::Status.name())
+        .cloned()
+        .collect();
+    assert_eq!(segments.len(), 2);
+    assert!(segments
+        .iter()
+        .all(|index| !index.fragment_bitmap.as_ref().unwrap().contains(0)));
+    let descriptor = spawn_action(
+        base.clone(),
+        Action::Merge(segments),
+        Key::Status,
+        budget.reserve(WORKSPACE).await,
+        Arc::default(),
+    )
+    .await??;
+    base = commit(&base, operation_for(&base, &descriptor, Key::Status).await?).await?;
+    let reopened = Dataset::open(base.uri()).await?;
+    query(&reopened, "status = 'ready'", &["E"]).await?;
+    query(&reopened, "status IS NULL", &["D"]).await?;
+    query(&reopened, "status = 'reviewed'", &["A", "B"]).await?;
+    Ok(())
+}

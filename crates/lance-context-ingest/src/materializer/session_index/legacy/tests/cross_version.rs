@@ -3,7 +3,7 @@ use super::*;
 use lance::dataset::WriteMode;
 use std::path::Path;
 
-fn copy_fixture(source: &Path, destination: &Path) -> Result<()> {
+pub(super) fn copy_fixture(source: &Path, destination: &Path) -> Result<()> {
     std::fs::create_dir(destination)?;
     for entry in std::fs::read_dir(source)? {
         let entry = entry?;
