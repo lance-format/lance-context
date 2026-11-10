@@ -46,6 +46,7 @@ def test_literal_keys_numeric_precision_and_input_errors(tmp_path):
     document = {
         "a.b": {"/~": ""},
         "integer": 2**64 - 1,
+        "escaped": 'quote " newline\n tab\t backslash \\ 中文 🦦',
         "residual": [51.248178375505404, 2.0030397744267762e-253],
     }
     record_id = store.add([document])[0]

@@ -23,6 +23,46 @@ fn json_to_py(py: Python<'_>, value: &impl Serialize) -> PyResult<PyObject> {
         .unbind())
 }
 
+// Large text should cross into Python once, without JSON escaping and reparsing.
+fn document_to_py(py: Python<'_>, value: &Value) -> PyResult<PyObject> {
+    match value {
+        Value::Null => Ok(py.None()),
+        Value::Bool(value) => Ok(PyBool::new(py, *value).to_owned().into_any().unbind()),
+        Value::String(value) => Ok(PyString::new(py, value).into_any().unbind()),
+        Value::Number(number) => {
+            if let Some(number) = number.as_i64() {
+                return Ok(number.into_pyobject(py)?.into_any().unbind());
+            }
+            if let Some(number) = number.as_u64() {
+                return Ok(number.into_pyobject(py)?.into_any().unbind());
+            }
+            if let Some(float) = number
+                .as_f64()
+                .filter(|float| serde_json::Number::from_f64(*float).as_ref() == Some(number))
+            {
+                return Ok(PyFloat::new(py, float).into_any().unbind());
+            }
+            // Preserve json.loads semantics for residual arbitrary-precision
+            // numbers written with additional serde_json features.
+            json_to_py(py, value)
+        }
+        Value::Array(values) => {
+            let values = values
+                .iter()
+                .map(|value| document_to_py(py, value))
+                .collect::<PyResult<Vec<_>>>()?;
+            Ok(PyList::new(py, values)?.into_any().unbind())
+        }
+        Value::Object(values) => {
+            let object = PyDict::new(py);
+            for (key, value) in values {
+                object.set_item(key, document_to_py(py, value)?)?;
+            }
+            Ok(object.into_any().unbind())
+        }
+    }
+}
+
 // Keep Python integers exact and reject non-JSON values before mutating storage.
 // The generic dumps/parser helper can round integers outside the JSON codec's
 // 64-bit range, so document inputs use a strict conversion instead.
@@ -136,7 +176,7 @@ impl DocumentStore {
             .allow_threads(|| self.runtime.block_on(self.store.get(id)))
             .map_err(to_py_err)?
             .ok_or_else(|| PyKeyError::new_err(id.to_owned()))?;
-        json_to_py(py, &value)
+        document_to_py(py, &value)
     }
 
     fn get_path(&self, py: Python<'_>, id: &str, path: Vec<String>) -> PyResult<PyObject> {
@@ -146,7 +186,7 @@ impl DocumentStore {
             .ok_or_else(|| {
                 PyKeyError::new_err(format!("missing document or path: {id}, {path:?}"))
             })?;
-        json_to_py(py, &value)
+        document_to_py(py, &value)
     }
 
     #[pyo3(signature = (path, value, limit=100))]
