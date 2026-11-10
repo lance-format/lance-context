@@ -1,7 +1,6 @@
 use super::*;
 use crate::materializer::SessionIndex;
 use lance::index::DatasetIndexExt;
-use prost::Message;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn index_recovers_prepared_and_selected_files_then_compacts_with_a_visible_wal_tail(
@@ -126,27 +125,19 @@ async fn index_recovers_prepared_and_selected_files_then_compacts_with_a_visible
         .prepare_next()
         .await?
         .context("compaction not prepared")?;
-    assert_eq!(rewrite.descriptors.format, 4);
+    assert_eq!(rewrite.descriptors.format, 2);
     let rewrite_plan = recovered.state().await?.progress.pending.clone().unwrap();
     let mut invalid = rewrite.as_ref().clone();
-    let mut transaction = lance::dataset::transaction::Transaction::try_from(
-        lance_table::format::pb::Transaction::decode(invalid.descriptors.bytes.clone())?,
-    )?;
-    let lance::dataset::transaction::Operation::Rewrite {
-        groups,
-        rewritten_indices,
-        ..
-    } = &mut transaction.operation
-    else {
-        anyhow::bail!("expected indexed rewrite");
-    };
+    let mut result: lance::dataset::optimize::RewriteResult =
+        serde_json::from_slice(&invalid.descriptors.bytes)?;
     // The managed index contains stable IDs: compaction updates its fragment
     // coverage while preserving its exact native pages and UUID.
-    assert!(rewritten_indices.is_empty());
-    groups[0].new_fragments[0].id = 0;
-    invalid.descriptors = p::Descriptors::lance_annotations(Bytes::from(
-        lance_table::format::pb::Transaction::try_from(&transaction)?.encode_to_vec(),
-    ))?;
+    assert!(result.row_addrs.is_none());
+    assert_eq!(result.original_fragments.len(), 4);
+    assert_eq!(result.new_fragments.len(), 1);
+    result.new_fragments[0].id = 0;
+    invalid.descriptors =
+        p::Descriptors::lance_compaction(Bytes::from(serde_json::to_vec(&result)?))?;
     let view = recovered.state().await?;
     let predecessor = &view.manifests.as_ref().unwrap().versions[&rewrite_plan.plan.read_version];
     assert!(crate::materializer::stage::publish(
@@ -278,7 +269,7 @@ async fn backlog_allows_index_and_compaction_to_progress_across_takeover() -> Re
     let mut writer = compaction::acquire(&ingress, &storage, &budget, 3, options).await?;
     let before = writer.read_dataset(None).await?;
     let prepared = writer.prepare_next().await?.unwrap();
-    assert_eq!(prepared.descriptors.format, 4);
+    assert_eq!(prepared.descriptors.format, 2);
     assert!(writer.run_once().await?.unwrap().sources.is_empty());
     let after = writer.read_dataset(None).await?;
     assert!(after.get_fragments().len() < before.get_fragments().len());
