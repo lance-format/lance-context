@@ -27,11 +27,8 @@ async fn successful_slow_snapshot(
     let original = checkpoint(&leader, 10).await?;
     let original_index = original.snapshot()?.get_metadata().index;
     drop(original);
-    c.net.start(
-        root.path(),
-        follower,
-        TcpListener::bind(c.net.addresses[&follower]).await?,
-    )?;
+    c.net
+        .start(root.path(), follower, c.net.listener(follower)?)?;
     let marker = root.path().join("received-first-chunk");
     c.attach_options(
         follower,

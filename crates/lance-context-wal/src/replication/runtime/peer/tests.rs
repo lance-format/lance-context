@@ -83,6 +83,10 @@ pub(crate) struct Cluster {
     pub(crate) nodes: BTreeMap<u64, Running>,
     pub(crate) tls: BTreeMap<u64, Tls>,
     pub(crate) addresses: BTreeMap<u64, SocketAddr>,
+    // Reserve peer ports across downtime, just like the snapshot fixture.
+    // Other fixtures and outgoing connections must not acquire a stopped
+    // peer's ephemeral port before its original engine is restarted.
+    listeners: BTreeMap<u64, std::net::TcpListener>,
     network_options: Options,
 }
 impl Cluster {
@@ -95,18 +99,22 @@ impl Cluster {
         for id in 1..=3 {
             let listener = TcpListener::bind("127.0.0.1:0").await?;
             addresses.insert(id, listener.local_addr()?);
-            listeners.insert(id, listener);
+            listeners.insert(id, listener.into_std()?);
         }
         let mut c = Self {
             nodes: BTreeMap::new(),
             tls: certificates()?,
             addresses,
+            listeners,
             network_options,
         };
-        for (id, listener) in listeners {
-            c.start(root, id, listener)?;
+        for id in 1..=3 {
+            c.start(root, id, c.listener(id)?)?;
         }
         Ok(c)
+    }
+    fn listener(&self, id: u64) -> Result<TcpListener> {
+        Ok(TcpListener::from_std(self.listeners[&id].try_clone()?)?)
     }
     fn start(&mut self, root: &Path, id: u64, listener: TcpListener) -> Result<()> {
         let node = Node::open(&root.join(id.to_string()), layout(), id, Limits::default())?
@@ -196,7 +204,7 @@ async fn a_follower_that_stops_reading_cannot_consume_the_healthy_quorums_outbox
     // Complete valid mutual TLS, then retain the sockets without consuming
     // application bytes. Its 60-second I/O timeout must not be what permits the
     // other two durable replicas to finish the test's 20-second deadline.
-    let listener = TcpListener::bind(c.addresses[&slow]).await?;
+    let listener = c.listener(slow)?;
     let acceptor = TlsAcceptor::from(c.tls[&slow].server.clone());
     let expected = c.tls[&leader].certificate;
     let connected = Arc::new(AtomicBool::new(false));
@@ -342,7 +350,7 @@ async fn mutual_tls_replication_reconnects_and_retains_exact_payloads_after_all_
         Bytes::from(vec![0x5a; 2 << 20]),
     );
     let k = append(&c.nodes[&successor].handle, 10, second.clone()).await?;
-    let listener = TcpListener::bind(c.addresses[&leader]).await?;
+    let listener = c.listener(leader)?;
     c.start(dir.path(), leader, listener)?;
     wait_for(|| {
         c.nodes
