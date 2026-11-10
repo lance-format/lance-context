@@ -45,6 +45,7 @@ pub(in crate::tests) struct Faults {
     pub manifest_gets: Mutex<Vec<Path>>,
     remote: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     index_write: Mutex<Option<PausedIndexWrite>>,
+    data_write: Mutex<Option<PausedIndexWrite>>,
 }
 
 #[derive(Debug)]
@@ -95,6 +96,33 @@ impl Faults {
             })
             .is_none());
         (observed, resume)
+    }
+
+    #[cfg(feature = "http")]
+    pub fn pause_data_write(&self) -> (oneshot::Receiver<Path>, oneshot::Sender<()>) {
+        let (entered, observed) = oneshot::channel();
+        let (resume, waiting) = oneshot::channel();
+        assert!(self
+            .data_write
+            .lock()
+            .unwrap()
+            .replace(PausedIndexWrite {
+                entered,
+                resume: waiting
+            })
+            .is_none());
+        (observed, resume)
+    }
+
+    async fn data_written(&self, path: &Path) -> object_store::Result<()> {
+        if path.as_ref().contains("/data/") {
+            let pause = self.data_write.lock().unwrap().take();
+            if let Some(pause) = pause {
+                let _ = pause.entered.send(path.clone());
+                pause.resume.await.map_err(|_| failure())?;
+            }
+        }
+        Ok(())
     }
 
     async fn index_written(&self, path: &Path) -> object_store::Result<()> {
@@ -305,6 +333,7 @@ impl ObjectStore for FaultStore {
     ) -> object_store::Result<PutResult> {
         self.faults.body_write(path)?;
         let result = self.inner.put_opts(path, payload, opts).await?;
+        self.faults.data_written(path).await?;
         self.faults.index_written(path).await?;
         Ok(result)
     }
@@ -500,6 +529,7 @@ impl MultipartUpload for IndexUpload {
 
     async fn complete(&mut self) -> object_store::Result<PutResult> {
         let result = self.inner.complete().await?;
+        self.faults.data_written(&self.path).await?;
         self.faults.index_written(&self.path).await?;
         Ok(result)
     }

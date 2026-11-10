@@ -158,8 +158,7 @@ impl Images {
         self.net.stop(id).await
     }
     async fn start(&mut self, root: &Path, id: u64) -> Result<()> {
-        self.net
-            .start(root, id, TcpListener::bind(self.net.addresses[&id]).await?)?;
+        self.net.start(root, id, self.net.listener(id)?)?;
         self.attach(id, self.listener(id)?)
     }
     async fn shutdown(mut self) -> Result<()> {
@@ -333,11 +332,8 @@ async fn stalled_tls_snapshot_does_not_block_healthy_quorum_and_recovers_after_d
     };
     // The follower handles ordinary Raft messages, but its separate image socket is a
     // correctly authenticated peer that never grants receive admission.
-    c.net.start(
-        root.path(),
-        follower,
-        TcpListener::bind(c.net.addresses[&follower]).await?,
-    )?;
+    c.net
+        .start(root.path(), follower, c.net.listener(follower)?)?;
     let listener = c.listener(follower)?;
     let acceptor = TlsAcceptor::from(image_tls(&c.net.tls[&follower]).1);
     let connected = Arc::new(AtomicBool::new(false));
@@ -815,11 +811,8 @@ async fn snapshot_file_worker_panic_stops_service_and_allows_original_engine_rec
     c.stop(follower).await?;
     let (index, expected) = append(&c.net.nodes[&leader_id].handle, 10, 1).await?;
     drop(checkpoint(&c.net.nodes[&leader_id].handle, 10).await?);
-    c.net.start(
-        root.path(),
-        follower,
-        TcpListener::bind(c.net.addresses[&follower]).await?,
-    )?;
+    c.net
+        .start(root.path(), follower, c.net.listener(follower)?)?;
     c.attach_with(follower, c.listener(follower)?, Arc::new(PanicAdmission))?;
     wait_for(|| {
         c.services[&follower]
@@ -842,6 +835,14 @@ async fn snapshot_file_worker_panic_stops_service_and_allows_original_engine_rec
         0
     );
     c.net.stop(follower).await?;
+    // A competing fixture cannot take the peer's address during downtime.
+    assert_eq!(
+        TcpListener::bind(c.net.addresses[&follower])
+            .await
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::AddrInUse
+    );
     c.start(root.path(), follower).await?;
     wait_for(|| {
         c.net.nodes[&follower]
