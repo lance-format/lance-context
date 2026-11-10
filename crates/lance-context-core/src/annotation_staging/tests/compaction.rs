@@ -2,7 +2,7 @@ use super::*;
 use lance::dataset::optimize::{
     CompactionMode, CompactionOptions, CompactionTask, RewriteResult, TaskData,
 };
-use lance_table::transaction::{Operation, Transaction};
+use lance_table::transaction::Transaction;
 
 async fn initialized(path: &std::path::Path) -> Result<(AnnotationStaging, Arc<Dataset>)> {
     let mut base = (*fixture(path).await?).clone();

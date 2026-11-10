@@ -33,6 +33,8 @@ impl Key {
 const MAX_ROWS: usize = 1 << 20;
 pub(super) const WORKSPACE: usize = 512 << 20;
 
+mod legacy;
+
 #[cfg(test)]
 mod rebase_tests;
 
@@ -136,6 +138,7 @@ pub(super) fn validate_metadata(dataset: &Dataset, index: &IndexMetadata, key: K
             && index.covering_fields.is_empty()
             && !index.uuid.is_nil()
             && index.base_id.is_none()
+            && matches!(index.index_version, 0 | 1)
             && index.dataset_version <= dataset.version().version
             && index
                 .index_details
@@ -259,7 +262,20 @@ pub(super) fn spawn_action(
         let native = async {
             match action {
                 Action::Build(ids) | Action::BuildReplacingEmpty { fragments: ids, .. } => {
-                    dataset
+                    let indices = dataset.load_indices().await?;
+                    if let Some(template) = indices.iter().find(|i| i.name == key.name()) {
+                        for index in indices.iter().filter(|i| i.name == key.name()) {
+                            validate_metadata(&dataset, index, key)?;
+                            ensure!(
+                                index.index_version == template.index_version,
+                                "managed index mixes row domains"
+                            );
+                        }
+                        if template.index_version == 0 {
+                            return legacy::build(&dataset, key, ids, template).await;
+                        }
+                    }
+                    Ok(dataset
                         .create_index_builder(
                             &[key.column()],
                             IndexType::BTree,
@@ -269,9 +285,11 @@ pub(super) fn spawn_action(
                         .replace(true)
                         .fragments(ids)
                         .execute_uncommitted()
-                        .await
+                        .await?)
                 }
-                Action::Merge(segments) => dataset.merge_existing_index_segments(segments).await,
+                Action::Merge(segments) => {
+                    Ok(dataset.merge_existing_index_segments(segments).await?)
+                }
             }
         };
         let index = phases
@@ -513,6 +531,10 @@ async fn decode_operation(
         .filter(|i| i.name == key.name())
     {
         validate_metadata(dataset, old, key)?;
+        ensure!(
+            old.index_version == index.index_version,
+            "index publication mixes row domains"
+        );
         ensure!(
             old.uuid != index.uuid,
             "index reused an existing segment identity"

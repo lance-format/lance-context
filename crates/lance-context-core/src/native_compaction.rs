@@ -230,7 +230,7 @@ pub async fn validate_index_remaps(base: &Dataset, operation: &Operation) -> Res
             || remap.new_id.is_nil()
             || indices.iter().any(|index| index.uuid == remap.new_id)
             || !new_ids.insert(remap.new_id)
-            || remap.new_index_version != original.index_version
+            || u32::try_from(original.index_version).ok() != Some(remap.new_index_version)
             || !original
                 .index_details
                 .as_ref()
