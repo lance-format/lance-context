@@ -176,8 +176,23 @@ async fn mixed_id_index_gc_collects_abandoned_native_preparation() -> Result<()>
     let (stop, task) = annotation_runtime::run_owner(collecting(runtime)?);
     let selected = fully_indexed(&c, &narrow, 3, 1).await?;
     let live = referenced(&selected, &path).await?;
-    wait_files(&path, &live).await?;
-    assert!(old.is_disjoint(&live));
+    // Address-index compaction creates new native pages. The pre-compaction
+    // pages remain live while their selected versions are in durable history;
+    // they are distinct from the never-published index created above.
+    let manifests = annotation_publication::state(&c).await?.manifests.unwrap();
+    let mut protected = live.clone();
+    for version in manifests
+        .versions
+        .keys()
+        .filter(|version| **version != manifests.initial_version)
+    {
+        let retained = annotation_publication::read(&c, &narrow, Some(*version)).await?;
+        protected.extend(referenced(&retained, &path).await?);
+        assert_eq!(retained.count_rows(Some("id = 'A'".into())).await?, 1);
+    }
+    assert!(old.is_disjoint(&protected));
+    wait_files(&path, &protected).await?;
+    assert!(old.iter().all(|file| !file.exists()));
     for (id, value) in [("A", 1), ("B", 2), ("C", 3)] {
         check(&a, id, "s", value, "pending", None).await?;
     }
