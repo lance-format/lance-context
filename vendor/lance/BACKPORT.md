@@ -33,6 +33,10 @@ Existing correctness patches are retained as well:
   This avoids rebuilding managed-table mappings without adding object-store
   HEAD requests or changing persisted data. Recreate/deletion regressions and
   a real RF3 publication test cover generation isolation and repeated reuse.
+  This changes only the row-ID mapping cache, not the native manifest cache.
+  The annotation owner uses a fresh Session for each acquisition and binds it
+  to one table incarnation; generic callers reusing a Session across recreated
+  tables at the same URI are outside this validation.
 
 The 14.0.2 index plugin/schema API is retained: each queued generation carries
 its own index specifications. The close cancellation token remains effective
