@@ -10057,7 +10057,10 @@ mod tests {
             .await
             .unwrap();
         let second = writer.force_freeze_active().await.unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Context settles each failed attempt while retaining both generations.
+        // Clearing the fault must not turn either old failure receipt into success.
+        assert!(first.wait().await.is_err());
+        assert!(second.wait().await.is_err());
         let manifest = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2)
             .latest()
             .await
@@ -10069,8 +10072,7 @@ mod tests {
         );
 
         controls.clear_write_failures();
-        first.wait().await.unwrap();
-        second.wait().await.unwrap();
+        writer.wait_for_flush_drain().await.unwrap();
         // Crash: drop without close.
         drop(writer);
 
