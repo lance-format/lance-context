@@ -26,6 +26,13 @@ Existing correctness patches are retained as well:
   predecessor (#824). The finite-attempt/idle-retry behavior is preserved.
 - memtable/batch_store.rs and wal.rs preserve each store's WAL receipt through
   coalesced flushes (#827). A later writer-global position is not its receipt.
+- dataset/rowids.rs admits the commit handler's manifest-record identity into
+  the bounded row-ID mapping cache when a physical ETag is unavailable. The
+  cache key keeps logical identity and physical ETag in separate fields, along
+  with version and deletion mode. With neither token, mappings remain private.
+  This avoids rebuilding managed-table mappings without adding object-store
+  HEAD requests or changing persisted data. Recreate/deletion regressions and
+  a real RF3 publication test cover generation isolation and repeated reuse.
 
 The 14.0.2 index plugin/schema API is retained: each queued generation carries
 its own index specifications. The close cancellation token remains effective

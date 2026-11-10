@@ -223,15 +223,17 @@ pub(crate) async fn get_row_id_index_with(
     // and recreated there restarts at version 1. Without a token for this
     // manifest generation a cached index could be the old generation's, so
     // build a private one instead of sharing.
-    let Some(e_tag) = dataset.manifest_location.e_tag.as_deref() else {
+    let location = &dataset.manifest_location;
+    if location.e_tag.is_none() && location.identity.is_none() {
         return Ok(Some(Arc::new(
             load_row_id_index(dataset, with_deletions).await?,
         )));
-    };
+    }
     let key = RowIdIndexKey {
         version: dataset.manifest.version,
         with_deletions,
-        e_tag: Some(e_tag),
+        e_tag: location.e_tag.as_deref(),
+        identity: location.identity.as_deref(),
     };
     let index = dataset
         .metadata_cache
@@ -671,9 +673,10 @@ mod test {
         let mut dataset = Dataset::write(reader, "memory://", Some(write_params))
             .await
             .unwrap();
-        // Without an e-tag the version-only key could alias a dataset recreated
-        // at the same URI, so the index must be built privately, never cached.
+        // Without either generation token the version-only key could alias a
+        // dataset recreated at the same URI. Build privately in this case.
         dataset.manifest_location.e_tag = None;
+        dataset.manifest_location.identity = None;
         let session = dataset.session();
         let entries_before = session.metadata_cache_stats().await.num_entries;
         let first = get_row_id_index(&dataset).await.unwrap().unwrap();
@@ -687,6 +690,50 @@ mod test {
             second.get(9).unwrap(),
             Some(RowAddress::new_from_parts(0, 9))
         );
+    }
+
+    #[tokio::test]
+    async fn test_row_id_index_logical_identity_preserves_deletion_modes() {
+        let batch = sequence_batch(0..10);
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.delete("id = 3").await.unwrap();
+        dataset.manifest_location.e_tag = None;
+        dataset.manifest_location.identity = Some("deleted-generation".into());
+        let live = get_row_id_index_with(&dataset, true)
+            .await
+            .unwrap()
+            .unwrap();
+        let physical = get_row_id_index_with(&dataset, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!Arc::ptr_eq(&live, &physical));
+        assert_eq!(live.get(3).unwrap(), None);
+        assert_eq!(
+            physical.get(3).unwrap(),
+            Some(RowAddress::new_from_parts(0, 3))
+        );
+        for (with_deletions, expected) in [(true, live), (false, physical)] {
+            let again = get_row_id_index_with(&dataset, with_deletions)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(Arc::ptr_eq(&expected, &again));
+            assert_eq!(
+                again.get(9).unwrap(),
+                Some(RowAddress::new_from_parts(0, 9))
+            );
+        }
     }
 
     #[tokio::test]
@@ -830,8 +877,11 @@ mod test {
     /// dropped and recreated at the same URI restarts them at 0 while sharing the
     /// cache namespace of its predecessor (see #7645). The two generations must
     /// still be told apart.
+    #[rstest]
+    #[case::physical_etag(false)]
+    #[case::logical_identity(true)]
     #[tokio::test]
-    async fn test_row_ids_recreate_at_same_uri() {
+    async fn test_row_ids_recreate_at_same_uri(#[case] logical_identity: bool) {
         let temp_dir = lance_core::utils::tempfile::TempStrDir::default();
         let tmp_path = &temp_dir;
         // Shared so the cache stays warm across the drop, as it would for a host
@@ -852,15 +902,19 @@ mod test {
             }
         };
 
-        let dataset = write(0..100).await;
+        let mut dataset = write(0..100).await;
+        if logical_identity {
+            dataset.manifest_location.e_tag = None;
+            dataset.manifest_location.identity = Some("first-generation".into());
+        }
         let sequence = load_row_id_sequence(&dataset, &dataset.manifest.fragments[0])
             .await
             .unwrap();
         assert_eq!(sequence.len(), 100);
-        // Leave this generation's index in the session cache: `RowIdIndexKey`
-        // is scoped by version alone, so the recreated dataset below reaches
-        // the same key, and no sequence load may be answered from it.
-        get_row_id_index(&dataset).await.unwrap().unwrap();
+        // Keep the old generation cached across the drop and recreation.
+        let old_index = get_row_id_index(&dataset).await.unwrap().unwrap();
+        let again = get_row_id_index(&dataset).await.unwrap().unwrap();
+        assert!(Arc::ptr_eq(&old_index, &again));
 
         // Reloading the unchanged fragment must still hit: keying on contents has
         // to leave the sequence cacheable, not just make it distinguishable.
@@ -875,7 +929,11 @@ mod test {
 
         // Shorter than the dataset it replaces, so a stale hit is observable: an
         // equal-length sequence would be byte-identical and harmless.
-        let dataset = write(0..60).await;
+        let mut dataset = write(0..60).await;
+        if logical_identity {
+            dataset.manifest_location.e_tag = None;
+            dataset.manifest_location.identity = Some("second-generation".into());
+        }
         assert_eq!(dataset.manifest.fragments[0].id, 0);
 
         let sequence = load_row_id_sequence(&dataset, &dataset.manifest.fragments[0])
@@ -889,6 +947,10 @@ mod test {
         // The same goes for the index: row id 60 exists only in the dropped
         // generation, whose index is still in the session cache.
         let index = get_row_id_index(&dataset).await.unwrap().unwrap();
+        assert!(!Arc::ptr_eq(&old_index, &index));
+        let again = get_row_id_index(&dataset).await.unwrap().unwrap();
+        assert!(Arc::ptr_eq(&index, &again));
+        assert!(old_index.get(60).unwrap().is_some());
         assert!(index.get(60).unwrap().is_none());
         assert_eq!(
             index.get(59).unwrap(),
