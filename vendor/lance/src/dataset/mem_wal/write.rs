@@ -10947,7 +10947,7 @@ mod tests {
             .await
             .unwrap();
         manifest_store
-            .commit_update(epoch, |current| super::super::ShardManifest {
+            .commit_update(epoch, |current| ShardManifest {
                 version: current.next_version(),
                 replay_after_wal_entry_position: 0,
                 ..current.clone()
