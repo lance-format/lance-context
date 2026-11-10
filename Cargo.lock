@@ -4169,6 +4169,7 @@ dependencies = [
  "metrics",
  "metrics-util",
  "object_store 0.14.2",
+ "roaring",
  "serde",
  "serde_json",
  "tempfile",
