@@ -7,6 +7,7 @@ use datafusion_common::DataFusionError;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use futures::TryStreamExt;
 use lance::dataset::scanner::ColumnOrdering;
+use lance_datafusion::exec::{execute_plan, LanceExecutionOptions};
 use lance_index::scalar::{
     btree::{train_btree_index, DEFAULT_BTREE_BATCH_SIZE},
     lance_format::LanceIndexStore,
@@ -76,26 +77,31 @@ pub(super) async fn build(
     // Both Arrow arrays are shared; this adapter copies no value buffers.
     let batch_schema = schema.clone();
     let column = key.column();
-    let stream = scan
-        .try_into_stream()
-        .await?
-        .map_err(|error| DataFusionError::External(Box::new(error)))
-        .and_then(move |batch| {
-            let result = (|| {
-                let values = batch
-                    .column_by_name(column)
-                    .context("legacy index value column missing")?;
-                let ids = batch
-                    .column_by_name("_rowid")
-                    .context("legacy index stable IDs missing")?;
-                Ok::<_, anyhow::Error>(RecordBatch::try_new(
-                    batch_schema.clone(),
-                    vec![values.clone(), ids.clone()],
-                )?)
-            })()
-            .map_err(|error| DataFusionError::External(error.into()));
-            std::future::ready(result)
-        });
+    let stream = execute_plan(
+        scan.create_plan().await?,
+        LanceExecutionOptions {
+            use_spilling: true,
+            mem_pool_size: Some((WORKSPACE / 2) as u64),
+            max_temp_directory_size: Some(WORKSPACE as u64),
+            ..Default::default()
+        },
+    )?
+    .and_then(move |batch| {
+        let result = (|| {
+            let values = batch
+                .column_by_name(column)
+                .context("legacy index value column missing")?;
+            let ids = batch
+                .column_by_name("_rowid")
+                .context("legacy index stable IDs missing")?;
+            Ok::<_, anyhow::Error>(RecordBatch::try_new(
+                batch_schema.clone(),
+                vec![values.clone(), ids.clone()],
+            )?)
+        })()
+        .map_err(|error| DataFusionError::External(error.into()));
+        std::future::ready(result)
+    });
     let mut index = template.clone();
     index.uuid = Uuid::new_v4();
     index.dataset_version = dataset.version_id();

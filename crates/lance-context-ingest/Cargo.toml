@@ -12,7 +12,7 @@ worker = ["materializer", "dep:etcd-client"]
 http = ["dep:axum", "dep:http-body-util", "dep:arrow-ipc"]
 http-client = ["http", "dep:reqwest", "lance-context-wal/client-journal"]
 lance-io-metrics = ["lance-context-core/lance-io-metrics", "dep:lance-context-metrics"]
-materializer = ["lance-context-wal/lance-integration", "dep:lance", "dep:lance-table", "dep:lance-io", "dep:lance-index", "dep:lance-file", "dep:datafusion-common", "dep:datafusion-physical-plan", "dep:prost", "dep:object_store", "dep:futures", "dep:async-stream", "dep:async-trait"]
+materializer = ["lance-context-wal/lance-integration", "dep:lance", "dep:lance-table", "dep:lance-io", "dep:lance-index", "dep:lance-file", "dep:lance-datafusion", "dep:datafusion-common", "dep:datafusion-physical-plan", "dep:prost", "dep:object_store", "dep:futures", "dep:async-stream", "dep:async-trait"]
 
 [dependencies]
 async-trait = { version = "0.1.92", optional = true }
@@ -26,6 +26,7 @@ lance-table = { version = "14.0.2", optional = true }
 lance-io = { version = "14.0.2", optional = true }
 lance-index = { version = "14.0.2", optional = true }
 lance-file = { version = "14.0.2", optional = true }
+lance-datafusion = { version = "14.0.2", optional = true }
 datafusion-common = { version = "54", optional = true, default-features = false }
 datafusion-physical-plan = { version = "54", optional = true }
 prost = { version = "0.14", optional = true }
