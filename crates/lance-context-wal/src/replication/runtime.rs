@@ -9,6 +9,13 @@
 //! allocation, hold outbound ownership through transmission, and implement
 //! snapshot transfer and maintenance. This module is the worker layer, not a
 //! network listener, automatic maintenance scheduler, or complete ingestion service.
+//!
+//! Service JSON accepts `runtime.raft_max_inflight_msgs` (1–256, default 16).
+//! It bounds unacknowledged AppendEntries messages per follower per group and
+//! can change on restart without migrating durable policy. It does not raise
+//! transport byte credits or the uncommitted-byte limit. Size experiments against
+//! replication bandwidth and durable-ack latency; monitor queueing, memory,
+//! refusals and ACK tails as well as throughput.
 use super::{
     producer, publication as p, query, source, source_read, Node, Outcome, Packet, Status,
 };
@@ -69,6 +76,9 @@ pub struct Options {
     /// replies, snapshots and client completions retain their existing barriers.
     /// Experimental; disabled until a controlled comparison supports it.
     pub pipeline_replication: bool,
+    /// Maximum unacknowledged AppendEntries messages per follower and group.
+    /// This local tuning does not change durable policy or byte admission limits.
+    pub raft_max_inflight_msgs: usize,
 }
 impl Default for Options {
     fn default() -> Self {
@@ -83,6 +93,7 @@ impl Default for Options {
             batch_requests: 32,
             batch_time: Duration::from_millis(1),
             pipeline_replication: false,
+            raft_max_inflight_msgs: 16,
         }
     }
 }
@@ -100,6 +111,7 @@ impl Options {
         }
         ensure!(
             (1..=256).contains(&self.batch_requests)
+                && (1..=256).contains(&self.raft_max_inflight_msgs)
                 && (Duration::from_millis(1)..=Duration::from_secs(1)).contains(&self.batch_time)
                 && self.tick_interval >= Duration::from_millis(10)
                 && self.tick_interval <= Duration::from_secs(1),
@@ -641,9 +653,22 @@ impl Runtime {
     /// Pass an already opened, configured node with any required signing keys.
     /// Queue credits do not establish physical disk bounds. Configure the Node's
     /// shared disk admission, maintenance and snapshot transfer before ingress.
-    pub fn spawn(node: Node, options: Options) -> Result<(Self, async_mpsc::Receiver<Outbound>)> {
+    pub fn spawn(
+        mut node: Node,
+        options: Options,
+    ) -> Result<(Self, async_mpsc::Receiver<Outbound>)> {
         options.validate()?;
         node.healthy()?;
+        // Membership is static. Apply the local window to every hosted peer
+        // before ownership moves to workers; raft-rs retains it across elections.
+        for (group, state) in &mut node.groups {
+            for &peer in &node.layout.groups[group] {
+                state
+                    .raw
+                    .raft
+                    .adjust_max_inflight_msgs(peer, options.raft_max_inflight_msgs);
+            }
+        }
         let shared = Arc::new(Shared {
             #[cfg(feature = "peer-transport")]
             appends: client::observation::Counters::default(),
