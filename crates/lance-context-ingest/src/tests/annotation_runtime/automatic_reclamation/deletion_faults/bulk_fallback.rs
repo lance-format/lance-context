@@ -3,8 +3,8 @@ use super::*;
 use object_store::{
     azure::MicrosoftAzureBuilder,
     client::{
-        HttpClient, HttpConnector, HttpError, HttpRequest, HttpResponse, HttpResponseBody,
-        HttpService,
+        HttpClient, HttpConnector, HttpError, HttpErrorKind, HttpRequest, HttpResponse,
+        HttpResponseBody, HttpService,
     },
     local::LocalFileSystem,
     path::Path,
@@ -106,10 +106,9 @@ impl HttpService for AzureDelete {
         if lost && paths.iter().any(|p| targets.contains(p)) {
             // The request may have removed some files before its reply failed.
             remove(&targets[0]).await;
-            return Ok(response(
-                503,
-                "<Error><Code>ServerBusy</Code></Error>".into(),
-                false,
+            return Err(HttpError::new(
+                HttpErrorKind::Timeout,
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "lost bulk deletion response"),
             ));
         }
         let mut reply = String::new();
@@ -160,7 +159,8 @@ async fn failed_azure_bulk_deletion_falls_back_and_drains_real_lance() -> Result
         let mut faults = Faults::default();
         faults.azure_delete = Some(Arc::new(sdk));
         let storage = fault_store::storage(&directory, Arc::new(faults)).await?;
-        let (first, original, abandoned) = acknowledged_orphans(&c, &storage, &directory).await?;
+        let (first, original, abandoned) =
+            acknowledged_orphan_count(&c, &storage, &directory, 4).await?;
         let targets = abandoned
             .iter()
             .map(Path::from_absolute_path)
@@ -168,10 +168,10 @@ async fn failed_azure_bulk_deletion_falls_back_and_drains_real_lance() -> Result
         transport.state.lock().unwrap().targets = targets.clone();
         let (service, runtime) = owned(&c, &storage, &limits()).await?;
         let (stop, task) = run_owner(whole_page(runtime)?);
-        let expected = if lost_batch_reply { 2 } else { 1 };
+        let expected = if lost_batch_reply { 4 } else { 1 };
         let check = async {
             tokio::time::timeout(Duration::from_secs(30), async {
-                while transport.inflight.load(Ordering::SeqCst) < expected {
+                while transport.inflight.load(Ordering::SeqCst) < expected.min(2) {
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
             })
@@ -185,7 +185,7 @@ async fn failed_azure_bulk_deletion_falls_back_and_drains_real_lance() -> Result
             ensure!(value.status.as_deref() == Some("acknowledged"));
             {
                 let state = transport.state.lock().unwrap();
-                ensure!(state.bulk.len() == 1 && state.bulk[0].len() == 2);
+                ensure!(state.bulk.len() == 1 && state.bulk[0].len() == 4);
                 ensure!(state.singles.is_empty(), "held deletes completed early");
             }
             transport.gate.add_permits(2);
@@ -207,13 +207,16 @@ async fn failed_azure_bulk_deletion_falls_back_and_drains_real_lance() -> Result
                     .collect();
                 let required: BTreeSet<_> = targets
                     .iter()
-                    .skip(usize::from(!lost_batch_reply))
+                    .enumerate()
+                    .filter(|(index, _)| lost_batch_reply || *index == 1)
+                    .map(|(_, p)| p)
                     .cloned()
                     .collect();
                 ensure!(retried == required, "retry changed the unresolved path set");
                 if lost_batch_reply {
                     ensure!(state.singles.contains(&(targets[0].clone(), 404)));
                 }
+                ensure!(transport.peak.load(Ordering::SeqCst) <= 2);
             }
             ensure!(service.submit(&first, Duration::from_secs(30)).await? == original);
             let producer = producer(&service, 2).await?;
