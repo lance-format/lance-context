@@ -10,6 +10,8 @@ mod document_store;
 pub mod etcd;
 mod eval;
 mod export;
+#[cfg(feature = "metrics")]
+pub mod flush_health;
 pub mod generic_codec;
 mod generic_store;
 mod id;
