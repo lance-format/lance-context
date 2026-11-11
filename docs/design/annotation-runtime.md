@@ -68,6 +68,15 @@ reissues only unresolved DELETE requests from that original page. Successful pat
 removed; an absent path resolves a lost reply. An unknown whole-batch response
 retains all paths in that batch. Paths are never added after sealing.
 
+Healthy Azure collection uses SDK batches of up to 256 paths. Once a sealed
+Azure page fails, its subsequent attempts use native single-object DELETE,
+bounded by the same `delete_parallelism`. The pinned object_store SDK sends a
+singleton stream to that endpoint; `ObjectStoreExt::delete` in the previous SDK
+still used Blob Batch and would not provide this fallback. Only unresolved paths
+are retried, and a 404 resolves an already removed object. If native DELETE also
+fails, the same page and publication backpressure remain. Other backends keep
+their existing batching. This does not extend timeouts or retry mutations.
+
 This behavior covers any DELETE error, including a permission failure: it does
 not guess whether an opaque SDK error is transient. A persistent failure keeps
 publication paused, exposes pending object/byte and failure counters, and requires
