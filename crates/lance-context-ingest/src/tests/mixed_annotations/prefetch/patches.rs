@@ -54,6 +54,7 @@ async fn patch_lookup_preserves_ack_freeze_and_interleaved_create_order() -> Res
                 create(&["D"], &["s"], &[4])?,
                 update(&["D"], Some("created-then-updated"), Some(0.7))?,
                 update(&["B"], Some("later-base"), Some(0.5))?,
+                create(&["E"], &["s"], &[8])?,
             ],
         )
         .await?,
@@ -74,9 +75,9 @@ async fn patch_lookup_preserves_ack_freeze_and_interleaved_create_order() -> Res
     })
     .await?;
     driver.step_for_test().await?;
-    assert_eq!(completed(&a, "annotation_decode"), 6);
+    assert_eq!(completed(&a, "annotation_decode"), 7);
     assert_eq!(completed(&a, "annotation_patch_lookup"), 1);
-    assert_eq!(completed(&a, "annotation_registration_lookup"), 0);
+    assert_eq!(completed(&a, "annotation_registration_lookup"), 1);
     assert_eq!(a.observation().await.0.applied, inputs[0].1);
     assert_eq!(a.source_observation().records, 1);
     assert!(
@@ -101,6 +102,7 @@ async fn patch_lookup_preserves_ack_freeze_and_interleaved_create_order() -> Res
     check(&a, "B", "s", 7, "later-base", Some(0.5)).await?;
     check(&a, "C", "s", 7, "pending", None).await?;
     check(&a, "D", "s", 4, "created-then-updated", Some(0.7)).await?;
+    check(&a, "E", "s", 8, "pending", None).await?;
     for (offset, (input, index)) in inputs.iter().enumerate() {
         let result = a.submit(input, Duration::from_secs(5)).await?;
         assert_eq!(result.index, *index);

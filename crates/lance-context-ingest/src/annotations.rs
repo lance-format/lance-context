@@ -115,7 +115,7 @@ pub struct Driver {
     service: Service,
     pending: Option<Pending>,
     lookahead: VecDeque<Pending>,
-    lookup: Option<prefetch::Lookup>,
+    lookup: prefetch::Lookup,
     source_page: Option<lance_context_wal::replication::Page>,
     staging_pressure: Option<(u64, usize, usize)>,
 }
@@ -410,7 +410,7 @@ impl Service {
             service: service.clone(),
             pending: None,
             lookahead: VecDeque::new(),
-            lookup: None,
+            lookup: prefetch::Lookup::default(),
             source_page: None,
             staging_pressure: None,
         };
@@ -777,7 +777,7 @@ impl Driver {
         if self.pending.is_none() {
             self.pending = self.lookahead.pop_front();
             if self.pending.is_none() {
-                self.lookup = None;
+                self.lookup = prefetch::Lookup::default();
             }
         }
         if self.pending.is_none() {
@@ -937,8 +937,8 @@ impl Driver {
                     .shared
                     .phases
                     .measure(Phase::AnnotationPatch, async {
-                        match &self.lookup {
-                            Some(prefetch::Lookup::Patches(lookup)) => {
+                        match &self.lookup.patches {
+                            Some(lookup) => {
                                 service
                                     .shared
                                     .staging
@@ -974,8 +974,8 @@ impl Driver {
                     .shared
                     .phases
                     .measure(Phase::AnnotationCreate, async {
-                        match &self.lookup {
-                            Some(prefetch::Lookup::Registrations(lookup)) => {
+                        match &self.lookup.registrations {
+                            Some(lookup) => {
                                 service
                                     .shared
                                     .staging

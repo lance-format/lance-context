@@ -34,6 +34,8 @@ workspace. The lookup holds a protected base and carries no application progress
 Each request still applies and acknowledges independently in WAL order. Current
 active/frozen values win, and a changed base falls back to the ordinary lookup.
 The `annotation_patch_lookup` phase reports this read work separately from apply.
+Mixed prefixes also retain the existing registration lookup. Both optional reads
+can run concurrently under the same workspace and read-view budgets.
 
 The upload, apply and publication budgets are independent. Publication admission
 must accommodate a fully occupied dirty-value generation and result metadata;
