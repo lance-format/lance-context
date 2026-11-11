@@ -3,6 +3,7 @@
 
 //! Consumer-supplied sink for MemWAL write-path events.
 
+use lance_core::Error;
 use std::fmt::Debug;
 use std::time::Duration;
 
@@ -27,6 +28,15 @@ pub trait WalObserver: Send + Sync + Debug {
     /// A frozen memtable became an L0 SSTable. Orders of magnitude longer
     /// than a WAL flush.
     fn on_memtable_flush(&self, _duration: Duration, _rows: usize) {}
+
+    /// A MemTable flush attempt failed. Called once per attempt, so a
+    /// generation that keeps failing is reported on every retry.
+    fn on_memtable_flush_failure(&self, _generation: u64, _error: &Error) {}
+
+    /// Coarse durable checkpoints for one generation. `started` is only an
+    /// attempt notification; `wal_durable` and `prepared` report completed work.
+    /// Repeating a checkpoint on retry must not be interpreted as new progress.
+    fn on_memtable_flush_stage(&self, _generation: u64, _stage: &'static str) {}
 
     /// A generation flush attempt failed (including background retries).
     fn on_memtable_flush_error(&self) {}

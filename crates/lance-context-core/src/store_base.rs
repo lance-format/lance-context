@@ -817,7 +817,10 @@ impl StorageBase {
         let config = ShardWriterConfig {
             shard_id: self.write_shard,
             #[cfg(feature = "metrics")]
-            observer: Some(Arc::new(crate::metrics::MemtableFlushMetrics::default())),
+            observer: Some(Arc::new(crate::metrics::MemtableFlushMetrics::new(
+                self.uri(),
+                self.write_shard,
+            ))),
             ..Default::default()
         };
         let writer = Arc::new(

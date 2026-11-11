@@ -226,7 +226,10 @@ fn failed_flush_recovers_without_new_rows_and_reports_retry_metrics() {
                     .unwrap();
                 let config = ShardWriterConfig {
                     shard_id: base.write_shard,
-                    observer: Some(Arc::new(crate::metrics::MemtableFlushMetrics::default())),
+                    observer: Some(Arc::new(crate::metrics::MemtableFlushMetrics::new(
+                        &uri,
+                        base.write_shard,
+                    ))),
                     store_params: Some(params),
                     ..Default::default()
                 };
@@ -252,6 +255,16 @@ fn failed_flush_recovers_without_new_rows_and_reports_retry_metrics() {
                 assert!(writer.memory().frozen_bytes() > 0);
                 assert_eq!(gauge("rollout_memtable_flush_retry_generations"), 1.0);
                 assert!(gauge("rollout_memtable_flush_retry_bytes") > 0.0);
+                let health = crate::flush_health::snapshot();
+                let failed = health
+                    .active
+                    .iter()
+                    .find(|row| row.shard == base.write_shard.to_string())
+                    .unwrap();
+                assert_eq!(failed.retry_generations, 1);
+                assert!(failed.failure_age_seconds.is_some());
+                assert!(!failed.terminal);
+                assert!(matches!(failed.checkpoint, "wal_durable" | "prepared"));
                 // A second failure must not inflate the gauge or discard the batch.
                 if failure_mode != 2 {
                     assert!(base.flush().await.is_err());
@@ -302,6 +315,10 @@ fn failed_flush_recovers_without_new_rows_and_reports_retry_metrics() {
                 assert_eq!(writer.memory().frozen_bytes(), 0);
                 assert_eq!(gauge("rollout_memtable_flush_retry_generations"), 0.0);
                 assert_eq!(gauge("rollout_memtable_flush_retry_bytes"), 0.0);
+                assert!(!crate::flush_health::snapshot()
+                    .active
+                    .iter()
+                    .any(|row| row.shard == base.write_shard.to_string()));
                 let manifest = writer.manifest().await.unwrap().unwrap();
                 assert_eq!(manifest.replay_after_wal_entry_position, boundary);
                 let rows = if failure_mode == 2 {
