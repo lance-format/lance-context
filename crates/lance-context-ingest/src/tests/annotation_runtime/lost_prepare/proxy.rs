@@ -36,6 +36,9 @@ pub(in crate::tests) struct Proxy {
     pub advances: Arc<AtomicUsize>,
     pub appends: Arc<AtomicUsize>,
     pub closes: Arc<AtomicUsize>,
+    pub unknown_closes: Arc<AtomicBool>,
+    pub close_permits:
+        Arc<std::sync::Mutex<Vec<lance_context_wal::replication::source::ClosurePermit>>>,
     pub committed: Arc<Notify>,
     pub release: Arc<Notify>,
     _tasks: JoinSet<Result<()>>,
@@ -310,6 +313,8 @@ impl Proxy {
         let advances = Arc::new(AtomicUsize::new(0));
         let appends = Arc::new(AtomicUsize::new(0));
         let closes = Arc::new(AtomicUsize::new(0));
+        let unknown_closes = Arc::new(AtomicBool::new(false));
+        let close_permits = Arc::new(std::sync::Mutex::new(Vec::new()));
         let committed = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
         let mut tasks = JoinSet::new();
@@ -349,6 +354,8 @@ impl Proxy {
             let advances = advances.clone();
             let appends = appends.clone();
             let closes = closes.clone();
+            let unknown_closes = unknown_closes.clone();
+            let close_permits = close_permits.clone();
             let committed = committed.clone();
             let release = release.clone();
             tasks.spawn(async move {
@@ -365,6 +372,8 @@ impl Proxy {
                             let advances = advances.clone();
                             let appends = appends.clone();
                             let closes = closes.clone();
+                            let unknown_closes = unknown_closes.clone();
+                            let close_permits = close_permits.clone();
                             connections.spawn(async move {
                                 let mut downstream = acceptor.accept(socket).await?;
                                 let mut upstream = connector.connect(name, TcpStream::connect(address).await?).await?;
@@ -388,7 +397,17 @@ impl Proxy {
                                             continue;
                                         }
                                     }
-                                    if hold && matches!(point, Point::Close { .. }) { closes.fetch_add(1, Ordering::SeqCst); }
+                                    if hold && matches!(point, Point::Close { .. }) {
+                                        closes.fetch_add(1, Ordering::SeqCst);
+                                        let (_, _, command): (WireScope, u32, Command) = codec().reject_trailing_bytes().deserialize(&request.meta)?;
+                                        let Command::Close(permit) = command else { bail!("expected a Close command"); };
+                                        close_permits.lock().unwrap().push(permit);
+                                        if unknown_closes.load(Ordering::SeqCst) {
+                                            dropped.fetch_add(1, Ordering::SeqCst);
+                                            request.unknown_reply()?.write(&mut downstream).await?;
+                                            continue;
+                                        }
+                                    }
                                     if hold && matches!(point, Point::Append { execute: false } | Point::Close { execute: false }) && armed.swap(false, Ordering::SeqCst) {
                                         committed.notify_one(); release.notified().await;
                                         dropped.fetch_add(1, Ordering::SeqCst);
@@ -471,6 +490,8 @@ impl Proxy {
             advances,
             appends,
             closes,
+            unknown_closes,
+            close_permits,
             committed,
             release,
             _tasks: tasks,
