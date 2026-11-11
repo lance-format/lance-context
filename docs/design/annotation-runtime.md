@@ -18,8 +18,14 @@ publisher releases its frozen/prepared handles before awaiting source retirement
 Their dirty-value and workspace permits must not keep the next update waiting
 on a slow closure RPC. Other held readers or handles keep their own charges.
 WAL reclamation still requires the existing durable closure authorization and
-advancement proofs. An unknown retirement result still stops the owner; recovery
-uses the selected value/result checkpoint and retained WAL suffix.
+advancement proofs. After an unknown source `Close`, an exact quorum proof
+resolves a lost reply without resubmission. If the proof is absent for the first
+source range, or covers exactly the preceding range, the owner can submit the
+original `Close` once more after freshly checking the same catalog closure and
+publisher authority. The original signed permit is unchanged; the WAL state
+machine applies an identical closure idempotently. A foreign proof, changed
+publication, fenced owner, or unresolved second attempt still stops the owner.
+Recovery uses the selected value/result checkpoint and retained WAL suffix.
 
 The upload, apply and publication budgets are independent. Publication admission
 must accommodate a fully occupied dirty-value generation and result metadata;
