@@ -11,7 +11,7 @@ use crate::{
 use lance::dataset::builder::DatasetBuilder;
 use lance_context_api::annotation::TurnAnnotation;
 use lance_context_core::annotation_staging::{
-    AnnotationStaging, ApplyOutcome, Limits, Mutation, RegistrationLookup, Rejection,
+    AnnotationStaging, ApplyOutcome, Limits, Mutation, PatchLookup, RegistrationLookup, Rejection,
     Scope as StagingScope,
 };
 use lance_context_wal::replication::publication::lance::ManagedManifest;
@@ -115,7 +115,7 @@ pub struct Driver {
     service: Service,
     pending: Option<Pending>,
     lookahead: VecDeque<Pending>,
-    registration_lookup: Option<RegistrationLookup>,
+    lookup: prefetch::Lookup,
     source_page: Option<lance_context_wal::replication::Page>,
     staging_pressure: Option<(u64, usize, usize)>,
 }
@@ -410,7 +410,7 @@ impl Service {
             service: service.clone(),
             pending: None,
             lookahead: VecDeque::new(),
-            registration_lookup: None,
+            lookup: prefetch::Lookup::default(),
             source_page: None,
             staging_pressure: None,
         };
@@ -777,7 +777,7 @@ impl Driver {
         if self.pending.is_none() {
             self.pending = self.lookahead.pop_front();
             if self.pending.is_none() {
-                self.registration_lookup = None;
+                self.lookup = prefetch::Lookup::default();
             }
         }
         if self.pending.is_none() {
@@ -869,7 +869,7 @@ impl Driver {
                 // Keep the entry until fetch/decode succeeds. Cancellation or
                 // admission pressure must not skip the next committed record.
                 self.source_page.as_mut().unwrap().entries.remove(0);
-                self.registration_lookup = prefetch::prepare(
+                self.lookup = prefetch::prepare(
                     service,
                     self.pending.as_ref().unwrap(),
                     self.source_page.as_mut().unwrap(),
@@ -936,13 +936,29 @@ impl Driver {
                 service
                     .shared
                     .phases
-                    .measure(
-                        Phase::AnnotationPatch,
-                        service
-                            .shared
-                            .staging
-                            .apply_committed(after, pending.index, &mutations),
-                    )
+                    .measure(Phase::AnnotationPatch, async {
+                        match &self.lookup.patches {
+                            Some(lookup) => {
+                                service
+                                    .shared
+                                    .staging
+                                    .apply_committed_with_lookup(
+                                        after,
+                                        pending.index,
+                                        &mutations,
+                                        lookup,
+                                    )
+                                    .await
+                            }
+                            _ => {
+                                service
+                                    .shared
+                                    .staging
+                                    .apply_committed(after, pending.index, &mutations)
+                                    .await
+                            }
+                        }
+                    })
                     .await?
             }
             mixed::Decoded::Creates { rows, .. } => {
@@ -958,7 +974,7 @@ impl Driver {
                     .shared
                     .phases
                     .measure(Phase::AnnotationCreate, async {
-                        match &self.registration_lookup {
+                        match &self.lookup.registrations {
                             Some(lookup) => {
                                 service
                                     .shared
@@ -971,7 +987,7 @@ impl Driver {
                                     )
                                     .await
                             }
-                            None => {
+                            _ => {
                                 service
                                     .shared
                                     .staging

@@ -8,6 +8,12 @@ const MAX_REQUESTS: usize = 8;
 const MAX_ROWS: usize = 2048;
 const MAX_PAYLOAD_BYTES: u64 = 32 << 20;
 
+#[derive(Default)]
+pub(super) struct Lookup {
+    pub(super) registrations: Option<RegistrationLookup>,
+    pub(super) patches: Option<PatchLookup>,
+}
+
 pub(super) async fn fetch(
     service: &Service,
     index: u64,
@@ -92,13 +98,12 @@ pub(super) async fn prepare(
     head: &Pending,
     page: &mut lance_context_wal::replication::Page,
     queued: &mut VecDeque<Pending>,
-) -> Result<Option<RegistrationLookup>> {
+) -> Result<Lookup> {
     if head.meta.body_bytes > MAX_PAYLOAD_BYTES
         || head.decoded.rows() > MAX_ROWS
-        || !matches!(head.decoded, mixed::Decoded::Creates { .. })
         || !service.shared.window.lock().unwrap().admits(&head.meta)
     {
-        return Ok(None);
+        return Ok(Lookup::default());
     }
     let mut rows = head.decoded.rows();
     let mut payload_bytes = head.meta.body_bytes;
@@ -120,28 +125,65 @@ pub(super) async fn prepare(
         page.entries.remove(0);
     }
     if queued.is_empty() || rows > MAX_ROWS {
-        return Ok(None);
+        return Ok(Lookup::default());
     }
-    let mut requests = 0;
+    let mut registrations = 0;
+    let mut patches = 0;
     let mut turns = Vec::new();
+    let mut patch_turns = Vec::new();
     for pending in std::iter::once(head).chain(queued.iter()) {
-        if let mixed::Decoded::Creates { rows, .. } = &pending.decoded {
-            requests += 1;
-            turns.extend(rows.iter().map(|row| row.turn.as_str()));
+        match &pending.decoded {
+            mixed::Decoded::Patches(rows) => {
+                patches += 1;
+                patch_turns.extend(rows.iter().map(|row| row.turn.as_str()));
+            }
+            mixed::Decoded::Creates { rows, .. } => {
+                registrations += 1;
+                turns.extend(rows.iter().map(|row| row.turn.as_str()));
+            }
         }
     }
-    if requests < 2 {
-        return Ok(None);
-    }
-    Ok(service
-        .shared
-        .phases
-        .measure(
-            Phase::AnnotationRegistrationLookup,
-            service
-                .shared
-                .staging
-                .prepare_registration_lookup(&turns, &service.apply_budget),
-        )
-        .await?)
+    // Keep registration sharing even when the head is a patch. The two optional
+    // lookups share the existing workspace/read admission and total key bound.
+    // Each captures a protected base without applying any request.
+    // Ordered application rechecks active/frozen values and base identity, so
+    // interleaved creates, later patches and publication cannot reuse stale values.
+    let registration_lookup = async {
+        if registrations < 2 {
+            return Ok(None);
+        }
+        service
+            .shared
+            .phases
+            .measure(
+                Phase::AnnotationRegistrationLookup,
+                service
+                    .shared
+                    .staging
+                    .prepare_registration_lookup(&turns, &service.apply_budget),
+            )
+            .await
+    };
+    let patch_lookup = async {
+        if patches < 2 {
+            return Ok(None);
+        }
+        service
+            .shared
+            .phases
+            .measure(
+                Phase::AnnotationPatchLookup,
+                service
+                    .shared
+                    .staging
+                    .prepare_patch_lookup(&patch_turns, &service.apply_budget),
+            )
+            .await
+    };
+    let (registrations, patches) =
+        futures::future::try_join(registration_lookup, patch_lookup).await?;
+    Ok(Lookup {
+        registrations,
+        patches,
+    })
 }
