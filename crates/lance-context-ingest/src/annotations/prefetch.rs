@@ -8,6 +8,11 @@ const MAX_REQUESTS: usize = 8;
 const MAX_ROWS: usize = 2048;
 const MAX_PAYLOAD_BYTES: u64 = 32 << 20;
 
+pub(super) enum Lookup {
+    Registrations(RegistrationLookup),
+    Patches(PatchLookup),
+}
+
 pub(super) async fn fetch(
     service: &Service,
     index: u64,
@@ -92,10 +97,9 @@ pub(super) async fn prepare(
     head: &Pending,
     page: &mut lance_context_wal::replication::Page,
     queued: &mut VecDeque<Pending>,
-) -> Result<Option<RegistrationLookup>> {
+) -> Result<Option<Lookup>> {
     if head.meta.body_bytes > MAX_PAYLOAD_BYTES
         || head.decoded.rows() > MAX_ROWS
-        || !matches!(head.decoded, mixed::Decoded::Creates { .. })
         || !service.shared.window.lock().unwrap().admits(&head.meta)
     {
         return Ok(None);
@@ -124,24 +128,51 @@ pub(super) async fn prepare(
     }
     let mut requests = 0;
     let mut turns = Vec::new();
+    let patches = matches!(head.decoded, mixed::Decoded::Patches(_));
     for pending in std::iter::once(head).chain(queued.iter()) {
-        if let mixed::Decoded::Creates { rows, .. } = &pending.decoded {
-            requests += 1;
-            turns.extend(rows.iter().map(|row| row.turn.as_str()));
+        match &pending.decoded {
+            mixed::Decoded::Patches(rows) if patches => {
+                requests += 1;
+                turns.extend(rows.iter().map(|row| row.turn.as_str()));
+            }
+            mixed::Decoded::Creates { rows, .. } if !patches => {
+                requests += 1;
+                turns.extend(rows.iter().map(|row| row.turn.as_str()));
+            }
+            _ => {}
         }
     }
     if requests < 2 {
         return Ok(None);
     }
-    Ok(service
-        .shared
-        .phases
-        .measure(
-            Phase::AnnotationRegistrationLookup,
-            service
-                .shared
-                .staging
-                .prepare_registration_lookup(&turns, &service.apply_budget),
-        )
-        .await?)
+    // Both lookups capture one protected base without applying any request.
+    // Ordered application rechecks active/frozen values and base identity, so
+    // interleaved creates, later patches and publication cannot reuse stale values.
+    if patches {
+        Ok(service
+            .shared
+            .phases
+            .measure(
+                Phase::AnnotationPatchLookup,
+                service
+                    .shared
+                    .staging
+                    .prepare_patch_lookup(&turns, &service.apply_budget),
+            )
+            .await?
+            .map(Lookup::Patches))
+    } else {
+        Ok(service
+            .shared
+            .phases
+            .measure(
+                Phase::AnnotationRegistrationLookup,
+                service
+                    .shared
+                    .staging
+                    .prepare_registration_lookup(&turns, &service.apply_budget),
+            )
+            .await?
+            .map(Lookup::Registrations))
+    }
 }

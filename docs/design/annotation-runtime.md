@@ -27,6 +27,14 @@ machine applies an identical closure idempotently. A foreign proof, changed
 publication, fenced owner, or unresolved second attempt still stops the owner.
 Recovery uses the selected value/result checkpoint and retained WAL suffix.
 
+The applier can share one bounded base-annotation lookup across a queued prefix
+of separate patch requests. It uses the existing limits of eight requests,
+2,048 rows and 32 MiB of payload, and never waits for more requests or lookup
+workspace. The lookup holds a protected base and carries no application progress.
+Each request still applies and acknowledges independently in WAL order. Current
+active/frozen values win, and a changed base falls back to the ordinary lookup.
+The `annotation_patch_lookup` phase reports this read work separately from apply.
+
 The upload, apply and publication budgets are independent. Publication admission
 must accommodate a fully occupied dirty-value generation and result metadata;
 waiting uploads cannot consume its workspace. There is at most one publishing

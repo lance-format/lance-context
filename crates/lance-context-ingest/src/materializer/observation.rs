@@ -82,8 +82,10 @@ pub enum Phase {
     NativeTurnIdIndex,
     /// Native status index build or segment merge, within BlobWrite.
     NativeStatusIndex,
+    /// A shared narrow-value lookup for separately applied patch requests.
+    AnnotationPatchLookup,
 }
-const NAMES: [&str; 45] = [
+const NAMES: [&str; 46] = [
     "claim",
     "acquire",
     "state",
@@ -129,6 +131,7 @@ const NAMES: [&str; 45] = [
     "native_session_index",
     "native_turn_id_index",
     "native_status_index",
+    "annotation_patch_lookup",
 ];
 pub const PHASE_COUNT: usize = NAMES.len();
 
