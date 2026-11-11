@@ -9,6 +9,54 @@ pub(super) enum Gate {
     Exclusive,
 }
 
+/// Successful engine submissions on one thread, excluding native rewrites.
+/// Append bytes are engine-reported encoded bytes, not producer payload bytes.
+/// Sync barriers count explicit marker writes, not filesystem sync calls: file
+/// rotation can sync separately. A barrier can cover appends on other threads.
+#[cfg(feature = "runtime")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct StorageWriteObservation {
+    pub append_batches: u64,
+    pub append_bytes: u64,
+    pub sync_barriers: u64,
+    pub sync_marker_bytes: u64,
+}
+
+#[cfg(feature = "runtime")]
+thread_local! {
+    static WRITES: std::cell::Cell<StorageWriteObservation> = const {
+        std::cell::Cell::new(StorageWriteObservation {
+            append_batches: 0,
+            append_bytes: 0,
+            sync_barriers: 0,
+            sync_marker_bytes: 0,
+        })
+    };
+}
+
+#[cfg(not(feature = "runtime"))]
+pub(super) fn record_write(_: usize, _: bool) {}
+
+#[cfg(feature = "runtime")]
+pub(super) fn record_write(bytes: usize, sync: bool) {
+    WRITES.with(|writes| {
+        let mut value = writes.get();
+        let (batches, total_bytes) = if sync {
+            (&mut value.sync_barriers, &mut value.sync_marker_bytes)
+        } else {
+            (&mut value.append_batches, &mut value.append_bytes)
+        };
+        *batches = batches.saturating_add(1);
+        *total_bytes = total_bytes.saturating_add(bytes as u64);
+        writes.set(value);
+    });
+}
+
+#[cfg(feature = "runtime")]
+pub(crate) fn write_snapshot() -> StorageWriteObservation {
+    WRITES.with(std::cell::Cell::get)
+}
+
 #[cfg(not(feature = "runtime"))]
 pub(super) fn acquire<T>(_: Gate, acquire: impl FnOnce() -> T) -> T {
     acquire()

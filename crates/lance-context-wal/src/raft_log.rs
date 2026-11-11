@@ -39,7 +39,9 @@ mod observation;
 #[cfg(feature = "runtime")]
 pub(crate) use observation::snapshot as wait_observation;
 #[cfg(feature = "runtime")]
-pub use observation::{StorageWaitObservation, WaitInterval};
+pub(crate) use observation::write_snapshot as write_observation;
+#[cfg(feature = "runtime")]
+pub use observation::{StorageWaitObservation, StorageWriteObservation, WaitInterval};
 #[cfg(test)]
 mod fault_tests;
 
@@ -169,6 +171,7 @@ impl NodeEngine {
                     self.failed.store(true, Ordering::Release);
                     anyhow::bail!("physical write counter exhausted; reopen the node log");
                 }
+                observation::record_write(bytes, sync);
                 Ok(())
             }
             Ok(Err(error)) => {
