@@ -845,6 +845,11 @@ pub(crate) fn spawn(state: &Arc<MasterState>) -> tokio::task::JoinHandle<()> {
         let policy = serde_json::to_vec(&Policy::from_config(&state.config))
             .expect("serialize discovery policy");
         let store = &state.task_store;
+        let mut handoff = state
+            .config
+            .handoff_expected_token
+            .clone()
+            .zip(state.config.handoff_expected_revision);
         metrics::gauge!("master_demand_controller_leader").set(0.0);
         metrics::gauge!("master_task_queue_depth").set(0.0);
         loop {
@@ -864,7 +869,25 @@ pub(crate) fn spawn(state: &Arc<MasterState>) -> tokio::task::JoinHandle<()> {
                     "{}/demand-controller/leader-v2",
                     state.config.etcd.prefix().trim_end_matches('/')
                 );
-                become_leader(store, &session, &key).await?;
+                // Consume before the request: reconnects must never repeat an
+                // operator-selected transfer, including after an unknown result.
+                let transferred = if let Some((token, revision)) = handoff.take() {
+                    let transferred = store
+                        .handoff_discovery_leader(&session, &token, revision)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    tracing::info!(
+                        transferred,
+                        expected_revision = revision,
+                        "controller handoff attempted"
+                    );
+                    transferred
+                } else {
+                    false
+                };
+                if !transferred {
+                    become_leader(store, &session, &key).await?;
+                }
                 metrics::gauge!("master_demand_controller_leader").set(1.0);
                 // The exact leader-key watcher stops discovery promptly
                 // if our lease expires. Publication also has a CAS fence.
@@ -904,6 +927,182 @@ mod tests {
 
     fn config() -> MasterConfig {
         MasterConfig::parse_from(["test"])
+    }
+
+    #[test]
+    fn handoff_requires_complete_positive_observation() {
+        assert!(config().handoff_expected_token.is_none());
+        for args in [
+            vec!["test", "--handoff-expected-token=owner"],
+            vec!["test", "--handoff-expected-revision=1"],
+            vec![
+                "test",
+                "--handoff-expected-token=owner",
+                "--handoff-expected-revision=0",
+            ],
+        ] {
+            assert!(MasterConfig::try_parse_from(args).is_err());
+        }
+        let cfg = MasterConfig::try_parse_from([
+            "test",
+            "--handoff-expected-token=owner",
+            "--handoff-expected-revision=42",
+        ])
+        .unwrap();
+        assert_eq!(cfg.handoff_expected_token.as_deref(), Some("owner"));
+        assert_eq!(cfg.handoff_expected_revision, Some(42));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated ETCD_TEST_ENDPOINTS"]
+    async fn handoff_fences_old_controller_and_preserves_running_tasks() {
+        let (_dir, cfg, store) = fixture().await;
+        let policy = serde_json::to_vec(&Policy::from_config(&cfg)).unwrap();
+        let old = store.discovery_session(policy.clone()).await.unwrap();
+        assert!(store.elect_discovery_leader(&old).await.unwrap());
+        let old_token = old.token().to_string();
+        let old_publisher = store.discovery_publisher(&old);
+        let observed = store
+            .etcd_client()
+            .clone()
+            .get(old.key(), None)
+            .await
+            .unwrap();
+        let revision = observed.kvs()[0].mod_revision();
+        let new = store.discovery_session(policy.clone()).await.unwrap();
+        let third = store.discovery_session(policy).await.unwrap();
+
+        store
+            .enqueue(TaskKind::Compact, "running", vec![])
+            .await
+            .unwrap();
+        let running = store.claim_next().await.unwrap().unwrap();
+        let running_id = running.task.id.clone();
+        store
+            .enqueue(TaskKind::Compact, "queued", vec![])
+            .await
+            .unwrap();
+        let before = serde_json::to_value(store.list().await.unwrap()).unwrap();
+        store
+            .merge_coordinator()
+            .request_merge("fresh")
+            .await
+            .unwrap();
+        let cache = list(store.etcd_client(), cfg.etcd.prefix()).await.unwrap();
+
+        assert!(!store
+            .handoff_discovery_leader(&new, "different-owner", revision)
+            .await
+            .unwrap());
+        assert!(!store
+            .handoff_discovery_leader(&new, &old_token, revision + 1)
+            .await
+            .unwrap());
+        assert!(store.owns_discovery_leadership(&old).await.unwrap());
+        assert!(store
+            .handoff_discovery_leader(&new, &old_token, revision)
+            .await
+            .unwrap());
+        // This is also the ownership reconciliation used after an uncertain
+        // transaction response; no second transfer is needed to establish it.
+        assert!(store.owns_discovery_leadership(&new).await.unwrap());
+        assert!(!store.owns_discovery_leadership(&old).await.unwrap());
+        assert!(!store
+            .handoff_discovery_leader(&third, &old_token, revision)
+            .await
+            .unwrap());
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_vacancy(store.etcd_client(), old.key(), Some(&old_token)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        for (key, entry) in &cache.entries {
+            reconcile(&old_publisher, cfg.etcd.prefix(), &cache, key, entry)
+                .await
+                .unwrap();
+        }
+        assert!(store
+            .merge_coordinator()
+            .get_merge_request("fresh")
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            before,
+            serde_json::to_value(store.list().await.unwrap()).unwrap()
+        );
+
+        // Releasing the old discovery lease must not delete the successor key
+        // or invalidate a separately leased execution already in progress.
+        store.release_coordination_lock(old).await.unwrap();
+        assert!(store.owns_discovery_leadership(&new).await.unwrap());
+        store
+            .finish(running, Ok("completed across handoff".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get(&running_id).await.unwrap().unwrap().state,
+            TaskState::Done
+        );
+        let next = store.claim_next().await.unwrap().unwrap();
+        assert_eq!(next.task.target, "queued");
+        store
+            .finish(next, Ok("still admitted".into()))
+            .await
+            .unwrap();
+        let publisher = store.discovery_publisher(&new);
+        let cache = list(store.etcd_client(), cfg.etcd.prefix()).await.unwrap();
+        for (key, entry) in &cache.entries {
+            reconcile(&publisher, cfg.etcd.prefix(), &cache, key, entry)
+                .await
+                .unwrap();
+        }
+        assert!(store
+            .merge_coordinator()
+            .get_merge_request("fresh")
+            .await
+            .unwrap()
+            .is_none());
+        store.release_coordination_lock(third).await.unwrap();
+        store.release_coordination_lock(new).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated ETCD_TEST_ENDPOINTS"]
+    async fn handoff_rejects_unregistered_successor() {
+        let (_dir, cfg, store) = fixture().await;
+        let policy = serde_json::to_vec(&Policy::from_config(&cfg)).unwrap();
+        let old = store.discovery_session(policy.clone()).await.unwrap();
+        assert!(store.elect_discovery_leader(&old).await.unwrap());
+        let observed = store
+            .etcd_client()
+            .clone()
+            .get(old.key(), None)
+            .await
+            .unwrap();
+        let new = store.discovery_session(policy).await.unwrap();
+        store
+            .etcd_client()
+            .clone()
+            .delete(
+                format!(
+                    "{}/demand-controller/members/{}",
+                    cfg.etcd.prefix(),
+                    new.token()
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(!store
+            .handoff_discovery_leader(&new, old.token(), observed.kvs()[0].mod_revision())
+            .await
+            .unwrap());
+        assert!(store.owns_discovery_leadership(&old).await.unwrap());
+        store.release_coordination_lock(new).await.unwrap();
+        store.release_coordination_lock(old).await.unwrap();
     }
 
     pub(super) async fn fixture() -> (tempfile::TempDir, MasterConfig, TaskStore) {

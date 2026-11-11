@@ -1672,6 +1672,8 @@ mod tests {
 
     fn config(dir: &TempDir) -> MasterConfig {
         MasterConfig {
+            handoff_expected_token: None,
+            handoff_expected_revision: None,
             legacy_retirement_request: None,
             local_merge: Default::default(),
             append: Default::default(),

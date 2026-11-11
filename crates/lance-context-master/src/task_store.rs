@@ -1708,6 +1708,79 @@ impl TaskStore {
         Ok(response.succeeded())
     }
 
+    /// Replace one exact observed controller without touching executor leases,
+    /// task claims, tickets, or demand. Old publishers are fenced by their token.
+    pub(crate) async fn handoff_discovery_leader(
+        &self,
+        session: &CoordinationGuard,
+        expected_token: &str,
+        expected_revision: i64,
+    ) -> lance::Result<bool> {
+        let key = format!("{}/demand-controller/leader-v2", self.inner.prefix);
+        if expected_token.is_empty()
+            || expected_token == session.token
+            || expected_revision <= 0
+            || session.key != key
+            || !session.is_live()
+        {
+            return Err(lance::Error::io("invalid controller handoff"));
+        }
+        let member = format!(
+            "{}/demand-controller/members/{}",
+            self.inner.prefix, session.token
+        );
+        let result = self
+            .inner
+            .client
+            .clone()
+            .txn(
+                Txn::new()
+                    .when([
+                        Compare::value(key.as_str(), CompareOp::Equal, expected_token),
+                        Compare::mod_revision(key.as_str(), CompareOp::Equal, expected_revision),
+                        Compare::lease(member, CompareOp::Equal, session.lease_id),
+                    ])
+                    .and_then([TxnOp::put(
+                        key,
+                        session.token.as_str(),
+                        Some(PutOptions::new().with_lease(session.lease_id)),
+                    )]),
+            )
+            .observed(Operation::DispatchWrite)
+            .await;
+        match result {
+            Ok(response) => Ok(response.succeeded()),
+            Err(error) => {
+                tracing::warn!(%error, "controller handoff response uncertain; reconciling exact ownership");
+                // A lost response is not a failed transaction. Read our exact
+                // lease-bound ownership before deciding; never replay the CAS.
+                if self.owns_discovery_leadership(session).await? {
+                    Ok(true)
+                } else {
+                    Err(etcd_error("handoff discovery leader")(error))
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn owns_discovery_leadership(
+        &self,
+        session: &CoordinationGuard,
+    ) -> lance::Result<bool> {
+        let response = self
+            .inner
+            .client
+            .clone()
+            .get(session.key.as_str(), None)
+            .observed(Operation::DispatchRead)
+            .await
+            .map_err(etcd_error("observe controller handoff outcome"))?;
+        Ok(session.is_live()
+            && response.kvs().first().is_some_and(|kv| {
+                kv.value() == session.token.as_bytes() && kv.lease() == session.lease_id
+            }))
+    }
+
     pub(crate) fn discovery_publisher(&self, session: &CoordinationGuard) -> Self {
         let mut publisher = self.clone();
         publisher.publication_fence = Some(PublicationFence {
@@ -4656,6 +4729,74 @@ pub(crate) mod tests {
         }
     }
 
+    #[tokio::test]
+    #[ignore = "requires isolated loopback ETCD_TEST_ENDPOINTS"]
+    async fn controller_handoff_recovers_lost_response_without_replaying() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        let upstream = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+        let proxy = LeaseTestProxy::start(&upstream).await;
+        let mut observer = Client::connect([upstream], None).await.unwrap();
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.etcd.etcd_endpoints = vec![proxy.endpoint.clone()];
+        cfg.etcd.etcd_prefix = format!("/controller-handoff-response-loss/{}", generate_id());
+        // Keep both leases alive beyond the real client's 10-second RPC
+        // deadline while this test withholds server responses for 12 seconds.
+        cfg.etcd_lease_ttl_secs = 60;
+        let store = TaskStore::open(&cfg).await.unwrap();
+        let old = store.discovery_session(b"{}".to_vec()).await.unwrap();
+        assert!(store.elect_discovery_leader(&old).await.unwrap());
+        let old_token = old.token().to_string();
+        let key = old.key().to_string();
+        let revision = observer.get(key.clone(), None).await.unwrap().kvs()[0].mod_revision();
+        let new = store.discovery_session(b"{}".to_vec()).await.unwrap();
+        let new_token = new.token().to_string();
+        proxy.responses.send(false).unwrap();
+        let candidate = store.clone();
+        let transfer = tokio::spawn(async move {
+            let result = candidate
+                .handoff_discovery_leader(&new, &old_token, revision)
+                .await;
+            (result, new)
+        });
+        let committed_revision = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let response = observer.get(key.clone(), None).await.unwrap();
+                if response.kvs()[0].value() == new_token.as_bytes() {
+                    break response.kvs()[0].mod_revision();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !transfer.is_finished(),
+            "Successful transaction response was not withheld"
+        );
+        tokio::time::sleep(Duration::from_secs(12)).await;
+        assert!(
+            !transfer.is_finished(),
+            "Outcome reconciliation did not wait for transport recovery"
+        );
+        proxy.responses.send(true).unwrap();
+        let (result, new) = tokio::time::timeout(Duration::from_secs(10), transfer)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.unwrap());
+        let after = observer.get(key, None).await.unwrap();
+        assert_eq!(after.kvs()[0].value(), new_token.as_bytes());
+        assert_eq!(
+            after.kvs()[0].mod_revision(),
+            committed_revision,
+            "Reconciliation must not repeat or replace the committed transfer"
+        );
+        store.release_coordination_lock(old).await.unwrap();
+        assert!(store.owns_discovery_leadership(&new).await.unwrap());
+        store.release_coordination_lock(new).await.unwrap();
+    }
+
     async fn lease_proxy_store() -> (TempDir, LeaseTestProxy, TaskStore, Client) {
         let _ = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::INFO)
@@ -6790,6 +6931,8 @@ pub(crate) mod tests {
 
     fn config(dir: &TempDir) -> MasterConfig {
         MasterConfig {
+            handoff_expected_token: None,
+            handoff_expected_revision: None,
             legacy_retirement_request: None,
             local_merge: Default::default(),
             append: Default::default(),

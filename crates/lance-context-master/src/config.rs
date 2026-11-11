@@ -6,6 +6,20 @@ use clap::Parser;
 #[derive(Debug, Clone, Parser)]
 #[command(name = "lance-context-master", version)]
 pub struct MasterConfig {
+    /// Attempt one controller handoff from this exact observed owner at startup.
+    /// Executor admission and running tasks are unaffected. Omit for normal election.
+    #[arg(
+        long,
+        env = "MASTER_HANDOFF_EXPECTED_TOKEN",
+        requires = "handoff_expected_revision"
+    )]
+    pub handoff_expected_token: Option<String>,
+
+    /// Exact etcd modification revision paired with the expected controller token.
+    #[arg(long, env = "MASTER_HANDOFF_EXPECTED_REVISION", requires = "handoff_expected_token",
+          value_parser = clap::value_parser!(i64).range(1..))]
+    pub handoff_expected_revision: Option<i64>,
+
     /// Run one identity-verified legacy retirement request from JSON and exit.
     /// Uses the existing master's service account; starts no scheduler or scans.
     #[arg(long)]
