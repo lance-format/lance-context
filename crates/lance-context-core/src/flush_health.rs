@@ -63,7 +63,7 @@ impl WriterHealth {
 
     fn stage_at(&self, generation: u64, stage: &str, now: Instant) {
         let mut state = self.state.lock().unwrap();
-        let active = state.active.get_or_insert_with(|| Active {
+        let active = state.active.get_or_insert(Active {
             generation,
             started: now,
             progress: now,
