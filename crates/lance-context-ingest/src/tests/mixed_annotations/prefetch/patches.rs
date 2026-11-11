@@ -17,14 +17,16 @@ async fn populated(
     let (stop, task) = run(driver);
     // Bootstrap owns slot 0; the lookahead backlog uses slots 1 through 10.
     let producer = producer(&a, 15).await?;
-    let input = request(
-        &a,
-        &producer,
-        1,
-        encoded(create(ids, &vec!["s"; ids.len()], &vec![7; ids.len()])?)?,
-    )
-    .await?;
-    a.submit(&input, Duration::from_secs(5)).await?;
+    for (offset, ids) in ids.chunks(binding().max_rows as usize).enumerate() {
+        let input = request(
+            &a,
+            &producer,
+            offset as u64 + 1,
+            encoded(create(ids, &vec!["s"; ids.len()], &vec![7; ids.len()])?)?,
+        )
+        .await?;
+        a.submit(&input, Duration::from_secs(5)).await?;
+    }
     pressure::publish(c, &a, narrow, body).await?;
     stop.send(()).unwrap();
     task.await??;
