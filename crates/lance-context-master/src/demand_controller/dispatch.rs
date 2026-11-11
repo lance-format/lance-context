@@ -429,6 +429,7 @@ struct TargetTickets {
 
 impl TargetTickets {
     fn page(&mut self) -> Vec<Vec<u8>> {
+        let previous = self.cursor.clone();
         let start = self.cursor.take().map_or(Bound::Unbounded, Bound::Excluded);
         let mut keys: Vec<_> = self
             .keys
@@ -439,7 +440,14 @@ impl TargetTickets {
         if keys.is_empty() {
             keys = self.keys.iter().take(64).cloned().collect();
         }
-        self.cursor = (keys.len() == 64).then(|| keys.last().unwrap().clone());
+        // A failed offer or temporarily ineligible target must not reset a
+        // small scope to its oldest ticket. Larger scopes still advance their
+        // bounded scan so unavailable pages cannot hide later capacity.
+        self.cursor = if self.keys.len() <= 64 {
+            previous
+        } else {
+            (keys.len() == 64).then(|| keys.last().unwrap().clone())
+        };
         keys.into_iter().map(|key| key.to_vec()).collect()
     }
 
@@ -740,7 +748,17 @@ pub(super) async fn place(
         // malformed, draining, busy or otherwise ineligible capacity is skipped
         // before considering ordinary fallback. This never reads etcd or reserves work for an
         // unavailable executor.
-        let preferred_keys = if task.kind == TaskKind::MergeWal {
+        let (preferred_keys, preferred_cursors) = if task.kind == TaskKind::MergeWal {
+            let cursors: Vec<_> = [task.target.as_str(), "*"]
+                .into_iter()
+                .filter_map(|scope| {
+                    cache
+                        .placement
+                        .target_tickets
+                        .get(scope)
+                        .map(|tickets| (scope.to_owned(), tickets.cursor.clone()))
+                })
+                .collect();
             let mut keys = cache
                 .placement
                 .target_tickets
@@ -752,9 +770,9 @@ pub(super) async fn place(
                     keys.extend(wildcard.page());
                 }
             }
-            keys
+            (keys, cursors)
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
         let preferred = preferred_keys.into_iter().find_map(|key| {
             if cache.entries.contains_key(
@@ -785,6 +803,19 @@ pub(super) async fn place(
         }) else {
             continue;
         };
+        if resident {
+            // Finding eligible capacity is not an assignment. Keep the prior
+            // rotation through dependency waits and rejected/failed CAS calls;
+            // only a committed offer below advances past the selected ticket.
+            // Pages with no eligible resident still retain scan progress.
+            for (scope, cursor) in preferred_cursors {
+                if let Some(tickets) = cache.placement.target_tickets.get_mut(&scope) {
+                    if tickets.keys.contains(ticket_key.as_slice()) {
+                        tickets.cursor = cursor;
+                    }
+                }
+            }
+        }
         if task.kind == TaskKind::MergeWal
             && !resident
             && cache
@@ -1119,6 +1150,24 @@ mod tests {
     }
 
     #[test]
+    fn resident_rotation_retains_ready_peer_after_unsuccessful_probe() {
+        for count in [2, 3, 63, 64] {
+            let mut tickets = TargetTickets::default();
+            for i in 0..count {
+                tickets
+                    .keys
+                    .insert(Arc::from(format!("{i:04}").into_bytes()));
+            }
+            tickets.offered(b"0000");
+            // A stale queue revision or a temporary target lock can prevent
+            // an offer. Probing alone must not forget the last actual winner.
+            for _ in 0..3 {
+                assert_eq!(tickets.page()[0], b"0001", "candidate count {count}");
+            }
+        }
+    }
+
+    #[test]
     fn resident_rotation_tracks_selected_peer_and_tolerates_membership_changes() {
         let mut tickets = TargetTickets::default();
         for key in ["a", "b", "c", "d"] {
@@ -1139,7 +1188,13 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires isolated ETCD_TEST_ENDPOINTS"]
     async fn resident_rotation_distributes_sparse_tasks_across_persistent_tickets() {
-        for exact in [true, false] {
+        for (exact, count, unleased) in [
+            (true, 2, 0),
+            (false, 2, 0),
+            (true, 65, 0),
+            (false, 65, 0),
+            (true, 65, 64),
+        ] {
             let (_dir, cfg, store, leader) = setup().await;
             let publisher = store.discovery_publisher(&leader);
             let mut local = cfg.clone();
@@ -1151,10 +1206,36 @@ mod tests {
             }
             let mut tickets = Vec::new();
             let mut policies = Vec::new();
-            for name in ["older", "newer"] {
+            for i in 0..count {
+                let name = format!("resident-{i:04}");
                 let value = serde_json::to_vec(&Ticket::new(
                     &local,
-                    name,
+                    &name,
+                    "resident_merge",
+                    TaskKinds::MERGE_WAL,
+                    true,
+                ))
+                .unwrap();
+                tickets.push(store.create_dispatch_ticket(value.clone()).await.unwrap());
+                policies.push(value);
+            }
+            let mut order: Vec<_> = (0..count).collect();
+            order.sort_by_key(|i| tickets[*i].key());
+            if unleased > 0 {
+                // An unavailable exact page must not be revisited forever just
+                // because a wildcard candidate's assignment was rejected.
+                for &i in order.iter().take(unleased) {
+                    store
+                        .etcd_client()
+                        .clone()
+                        .put(tickets[i].key(), policies[i].clone(), None)
+                        .await
+                        .unwrap();
+                }
+                local.maintenance.wal_claim_targets.clear();
+                let value = serde_json::to_vec(&Ticket::new(
+                    &local,
+                    "wildcard",
                     "resident_merge",
                     TaskKinds::MERGE_WAL,
                     true,
@@ -1166,8 +1247,8 @@ mod tests {
             let mut cache = list(store.etcd_client(), cfg.etcd.prefix()).await.unwrap();
             let admission = Arc::new(admission::Admission::default());
             let operation = admission.try_admit_named("merge").unwrap();
-            let mut served = [0; 2];
-            for _ in 0..8 {
+            let mut served = vec![0; tickets.len()];
+            for _ in 0..if count == 2 { 8 } else { 2 } {
                 let task = store
                     .enqueue(TaskKind::MergeWal, "wanted", vec![])
                     .await
@@ -1191,6 +1272,27 @@ mod tests {
                         .unwrap();
                     cache.entries.get_mut(&key).unwrap().lease_id = entry.lease_id;
                 }
+                // Exercise a failed fenced publication before the real offer.
+                // Watch delivery can expose a queued record before its latest
+                // revision; this retry must preserve the previous winner.
+                let queue_key = format!("{}/queue/{}", cfg.etcd.prefix(), task.id).into_bytes();
+                let revision = cache.entries[&queue_key].revision;
+                assert!(revision > 1);
+                cache.entries.get_mut(&queue_key).unwrap().revision = revision - 1;
+                while place(&publisher, cfg.etcd.prefix(), &mut cache)
+                    .await
+                    .unwrap()
+                {}
+                for ticket in &tickets {
+                    let result = store
+                        .etcd_client()
+                        .clone()
+                        .get(ticket.key().replace("/tickets/", "/offers/"), None)
+                        .await
+                        .unwrap();
+                    assert!(result.kvs().is_empty(), "stale revision must not publish");
+                }
+                cache.entries.get_mut(&queue_key).unwrap().revision = revision;
                 while place(&publisher, cfg.etcd.prefix(), &mut cache)
                     .await
                     .unwrap()
@@ -1226,7 +1328,18 @@ mod tests {
                     .await
                     .unwrap();
             }
-            assert_eq!(served, [4, 4], "exact scope: {exact}");
+            let mut expected = vec![0; tickets.len()];
+            if unleased > 0 {
+                expected[order[unleased]] = 2;
+            } else {
+                for i in order.into_iter().take(2) {
+                    expected[i] = if count == 2 { 4 } else { 1 };
+                }
+            }
+            assert_eq!(
+                served, expected,
+                "exact scope: {exact}, candidates: {count}, unleased: {unleased}"
+            );
             for ticket in tickets {
                 store.release_coordination_lock(ticket).await.unwrap();
             }
