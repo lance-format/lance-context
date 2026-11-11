@@ -11,6 +11,7 @@ mod early;
 #[cfg(feature = "peer-transport")]
 mod fetch;
 mod images;
+mod inflight;
 #[cfg(feature = "service")]
 mod maintenance;
 mod peer_rejections;
