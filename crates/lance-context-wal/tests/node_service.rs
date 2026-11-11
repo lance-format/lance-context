@@ -172,6 +172,10 @@ async fn run_cluster(f: &Fixture) -> Result<()> {
     assert!(poll["completed"].as_u64().unwrap() > 0);
     assert_eq!(poll["failed"], 0);
     assert!(poll["engine"]["sync_micros"].as_u64().unwrap() > 0);
+    let writes = &poll["storage_write"];
+    assert!(writes["append_batches"].as_u64().unwrap() > 0);
+    assert!(writes["append_bytes"].as_u64().unwrap() > 0);
+    assert!(writes["sync_barriers"].as_u64().unwrap() > 0);
     for field in [
         "peer_dropped_outbound",
         "peer_enqueue_not_ready",

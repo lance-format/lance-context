@@ -179,7 +179,7 @@ fn concurrent_appends_share_one_real_sync() -> Result<()> {
         .map(|id| {
             let group = log.group(id).unwrap();
             std::thread::spawn(move || {
-                group.persist(
+                let result = group.persist(
                     &[Entry {
                         index: 1,
                         term: 1,
@@ -192,7 +192,10 @@ fn concurrent_appends_share_one_real_sync() -> Result<()> {
                         commit: 1,
                         ..Default::default()
                     }),
-                )
+                );
+                #[cfg(feature = "runtime")]
+                let result = result.map(|()| observation::write_snapshot());
+                result
             })
         })
         .collect();
@@ -206,8 +209,24 @@ fn concurrent_appends_share_one_real_sync() -> Result<()> {
     }
     assert_eq!(node.fault.sync_calls.load(Ordering::Relaxed), before);
     drop(gate);
+    #[cfg(feature = "runtime")]
+    let mut submissions = (0, 0, 0);
     for writer in writers {
-        writer.join().unwrap()?;
+        let result = writer.join().unwrap();
+        #[cfg(feature = "runtime")]
+        {
+            let observed = result?;
+            submissions.0 += observed.append_batches;
+            submissions.1 += observed.sync_barriers;
+            submissions.2 += observed.append_bytes;
+        }
+        #[cfg(not(feature = "runtime"))]
+        result?;
+    }
+    #[cfg(feature = "runtime")]
+    {
+        assert_eq!((submissions.0, submissions.1), (2, 1));
+        assert!(submissions.2 >= 8192);
     }
     assert_eq!(node.fault.sync_calls.load(Ordering::Relaxed) - before, 1);
     for id in [10, 20] {
