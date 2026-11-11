@@ -830,7 +830,8 @@ impl Client {
     /// the same read-only query with backoff within that deadline. Mutation
     /// outcomes are never replayed.
     /// Read-only pooled disconnects may reconnect once per exchange, within this
-    /// method's single overall deadline.
+    /// method's single overall deadline. Queries and source reads can also move
+    /// to another configured voter after a disconnect or refused connection.
     pub async fn request_routed(&self, request: Request) -> Result<Response> {
         timeout(self.options.timeout, async {
             let group = match &request {
@@ -858,6 +859,22 @@ impl Client {
                         let next = voters[(voters.iter().position(|id| *id == node).unwrap() + 1)
                             % voters.len()];
                         self.leaders.lock().unwrap().insert(group, next);
+                        if matches!(&request, Request::Query { .. } | Request::ReadSource { .. })
+                            && (disconnected(&error)
+                                || error.downcast_ref::<std::io::Error>().is_some_and(|e| {
+                                    e.kind() == std::io::ErrorKind::ConnectionRefused
+                                }))
+                        {
+                            // Only retry the same read. Exchange has released its
+                            // connection and byte credits; the outer deadline still
+                            // bounds all voters. Protocol and identity errors escape.
+                            node = next;
+                            if visited.len() == voters.len() {
+                                visited.clear();
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                            }
+                            continue;
+                        }
                         return Err(error);
                     }
                 };

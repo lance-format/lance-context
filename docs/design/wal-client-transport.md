@@ -53,6 +53,15 @@ source-fetch API returns local committed data; a quorum-confirmed source pin and
 matching metadata are required before materialization. Missing local data does
 not prove that an uncertain append was rejected.
 
+A disconnected or refused connection to a cached voter also lets routed quorum
+queries and source reads try another configured voter. The same overall deadline
+bounds all attempts, with a 20 ms pause after exhausting the voters. Each failed
+exchange releases its connection and byte credits before the next attempt.
+Successful quorum queries still carry the normal validated observation; a leader
+hint alone is insufficient. Invalid identities, scopes, framing and other protocol
+errors remain errors. Appends and publication commands keep their unknown-outcome
+contract and are never automatically resubmitted after a transport error.
+
 With `lance-integration`, `Client::manifest_catalog()` implements the actual
 `ManagedManifest` catalog interface over these RPCs. This supplies networked
 quorum reads and durable manifest reservations. The complete HTTP/core ingestion
