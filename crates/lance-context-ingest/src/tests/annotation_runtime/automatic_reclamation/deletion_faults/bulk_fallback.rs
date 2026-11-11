@@ -11,7 +11,7 @@ use object_store::{
     ClientOptions, ObjectStoreExt, RetryConfig,
 };
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Mutex,
 };
 use tokio::sync::Semaphore;
@@ -30,6 +30,7 @@ struct AzureDelete {
     gate: Arc<Semaphore>,
     inflight: Arc<AtomicUsize>,
     peak: Arc<AtomicUsize>,
+    fail_singles: Arc<AtomicBool>,
 }
 
 impl HttpConnector for AzureDelete {
@@ -74,7 +75,11 @@ impl HttpService for AzureDelete {
             let count = self.inflight.fetch_add(1, Ordering::SeqCst) + 1;
             self.peak.fetch_max(count, Ordering::SeqCst);
             let permit = self.gate.acquire().await.unwrap();
-            let status = remove(&path).await;
+            let status = if self.fail_singles.load(Ordering::SeqCst) {
+                503
+            } else {
+                remove(&path).await
+            };
             self.state.lock().unwrap().singles.push((path, status));
             self.inflight.fetch_sub(1, Ordering::SeqCst);
             drop(permit);
@@ -145,6 +150,7 @@ async fn failed_azure_bulk_deletion_falls_back_and_drains_real_lance() -> Result
             gate: Arc::new(Semaphore::new(0)),
             inflight: Arc::new(AtomicUsize::new(0)),
             peak: Arc::new(AtomicUsize::new(0)),
+            fail_singles: Arc::new(AtomicBool::new(true)),
         };
         let sdk = MicrosoftAzureBuilder::new()
             .with_account("account")
@@ -156,8 +162,7 @@ async fn failed_azure_bulk_deletion_falls_back_and_drains_real_lance() -> Result
             })
             .with_http_connector(transport.clone())
             .build()?;
-        let mut faults = Faults::default();
-        faults.azure_delete = Some(Arc::new(sdk));
+        let faults = Faults::with_azure_delete(Arc::new(sdk));
         let storage = fault_store::storage(&directory, Arc::new(faults)).await?;
         let (first, original, abandoned) =
             acknowledged_orphan_count(&c, &storage, &directory, 4).await?;
@@ -189,6 +194,18 @@ async fn failed_azure_bulk_deletion_falls_back_and_drains_real_lance() -> Result
                 ensure!(state.singles.is_empty(), "held deletes completed early");
             }
             transport.gate.add_permits(2);
+            // Native DELETE can fail too: retain the same finite page and
+            // publication backpressure, while acknowledged values stay readable.
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while service.reclamation_observation().delete_failures < 2 * expected as u64 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await?;
+            ensure!(service.reclamation_observation().pending_objects == expected);
+            let value = service.get("T", Duration::from_secs(5)).await?.unwrap();
+            ensure!(value.status.as_deref() == Some("acknowledged"));
+            transport.fail_singles.store(false, Ordering::SeqCst);
             tokio::time::timeout(Duration::from_secs(30), async {
                 while abandoned.iter().any(|p| p.exists())
                     || service.reclamation_observation().pending_objects != 0
@@ -241,6 +258,7 @@ async fn failed_azure_bulk_deletion_falls_back_and_drains_real_lance() -> Result
         }
         .await;
         transport.gate.add_permits(2);
+        transport.fail_singles.store(false, Ordering::SeqCst);
         let _ = stop.send(());
         let stopped = task.await?;
         let cold = if check.is_ok() {

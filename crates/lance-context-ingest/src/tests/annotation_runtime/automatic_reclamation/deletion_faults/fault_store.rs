@@ -71,6 +71,13 @@ struct FailedListing {
 }
 
 impl Faults {
+    pub(super) fn with_azure_delete(store: Arc<dyn ObjectStore>) -> Self {
+        Self {
+            azure_delete: Some(store),
+            ..Default::default()
+        }
+    }
+
     fn body_write(&self, path: &Path) -> object_store::Result<()> {
         if path.as_ref().contains("/data/") {
             self.body_write_attempts.fetch_add(1, Ordering::SeqCst);
