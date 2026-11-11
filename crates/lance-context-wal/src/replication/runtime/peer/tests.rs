@@ -14,6 +14,7 @@ use rustls::{
 };
 use std::{net::SocketAddr, path::Path};
 
+mod batching;
 mod enqueue;
 mod idle;
 mod process;
@@ -193,6 +194,7 @@ async fn a_follower_that_stops_reading_cannot_consume_the_healthy_quorums_outbox
         dir.path(),
         Options {
             io_timeout: Duration::from_secs(60),
+            send_batch_frames: 8,
             ..Options::default()
         },
     )
@@ -312,7 +314,14 @@ async fn append(handle: &Handle, group: u64, batch: Batch) -> Result<u64> {
 async fn mutual_tls_replication_reconnects_and_retains_exact_payloads_after_all_engines_reopen(
 ) -> Result<()> {
     let dir = tempfile::tempdir()?;
-    let mut c = Cluster::open(dir.path()).await?;
+    let mut c = Cluster::with_options(
+        dir.path(),
+        Options {
+            send_batch_frames: 8,
+            ..Options::default()
+        },
+    )
+    .await?;
     c.nodes[&1].handle.campaign(10)?.await?;
     c.nodes[&2].handle.campaign(20)?.await?;
     let leader = c.leader(10).await?;
