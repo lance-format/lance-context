@@ -1,7 +1,7 @@
 use super::*;
 use crate::replication::runtime::Credits;
 
-fn queued() -> Result<(Queued, Credits, Arc<Semaphore>, Bytes)> {
+pub(super) fn queued() -> Result<(Queued, Credits, Arc<Semaphore>, Bytes)> {
     let body = Bytes::from(vec![0xa5; 1024]);
     let mut message = Message {
         from: 1,
@@ -57,7 +57,11 @@ async fn blocked_send_separates_queue_wait_and_keeps_both_credits() -> Result<()
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert_eq!(statistics.queue_wait.snapshot().finished, 0);
     let (mut write, mut read) = tokio::io::duplex(64);
-    let mut send = Box::pin(send_queued(&mut write, &queued, &statistics));
+    let mut send = Box::pin(send_queued(
+        &mut write,
+        std::slice::from_ref(&queued),
+        &statistics,
+    ));
     // Borrowing the future preserves the blocked send after the observer timeout.
     assert!(timeout(Duration::from_millis(10), send.as_mut())
         .await
@@ -103,7 +107,7 @@ async fn cancelled_partial_send_records_time_without_success_or_credit_leak() ->
     let (mut write, _blocked_read) = tokio::io::duplex(64);
     assert!(timeout(
         Duration::from_millis(10),
-        send_queued(&mut write, &queued, &statistics),
+        send_queued(&mut write, std::slice::from_ref(&queued), &statistics),
     )
     .await
     .is_err());
