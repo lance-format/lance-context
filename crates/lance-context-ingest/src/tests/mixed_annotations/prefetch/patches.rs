@@ -15,7 +15,8 @@ async fn populated(
     seed(c, narrow, body).await?;
     let (a, driver) = with_budget(c, narrow, body, budget.clone()).await?;
     let (stop, task) = run(driver);
-    let producer = producer(&a, 0).await?;
+    // Bootstrap owns slot 0; the lookahead backlog uses slots 1 through 10.
+    let producer = producer(&a, 15).await?;
     let input = request(
         &a,
         &producer,
