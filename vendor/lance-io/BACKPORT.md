@@ -20,7 +20,7 @@ alone is not a throttle signal. Only explicit provider/status signals restart
 the throttle layer. Context's SDK error-boundary regressions cover this.
 
 The workspace and standalone regression graph retain object_store 0.14.2 at
-7a165a5690fc0875610521b1a063c3d9149553a3. That revision includes the Azure Latest
+6e5253a3a9c0565c2b5b07ea304023d23422f8a1. That revision includes the Azure Latest
 block-list response-loss fix and the owner-scoped completion hook. Completion
 retries retain the original serialized request and do not replay outer
 publication or upload parts again.

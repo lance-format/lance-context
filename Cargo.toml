@@ -31,4 +31,4 @@ lance = { path = "vendor/lance" }
 lance-encoding = { path = "vendor/lance-encoding" }
 # Azure completion response-loss and singleton DELETE fixes; same object_store 0.14.2.
 # See vendor/lance-io/BACKPORT.md.
-object_store = { git = "https://github.com/beinan/arrow-rs-object-store", rev = "7a165a5690fc0875610521b1a063c3d9149553a3" }
+object_store = { git = "https://github.com/beinan/arrow-rs-object-store", rev = "6e5253a3a9c0565c2b5b07ea304023d23422f8a1" }
