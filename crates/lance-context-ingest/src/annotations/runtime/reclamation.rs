@@ -32,7 +32,8 @@ pub struct Options {
     pub max_objects: usize,
     pub max_bytes: usize,
     /// Concurrent SDK delete calls. S3/Azure calls contain at most 256 paths;
-    /// other backends retain one path per call.
+    /// Failed Azure pages retry one path per call through native DELETE;
+    /// other backends retain their original batch size.
     pub delete_parallelism: usize,
     /// Minimum delay after a completed collection pass. Slow object storage I/O
     /// does not consume this cooldown. Reference and data listings yield after
@@ -95,6 +96,7 @@ struct SealedPage {
     store: Arc<dyn object_store::ObjectStore>,
     paths: Vec<(Path, u64)>,
     batch_size: usize,
+    single_delete_retry: bool,
     failed: bool,
     _workspace: MergeReservation,
 }
@@ -560,7 +562,7 @@ impl Collector {
         // subsequent owner enumerates again; it never guesses the old outcome.
         // Each cloud chunk fits a single native batch (Azure: 256, S3: 1000).
         // Keep the same sealed page and configured call concurrency. Passing
-        // one path to ObjectStoreExt::delete would defeat SDK bulk deletion.
+        // one path uses native Azure DELETE in the pinned SDK.
         let batch_size = if matches!(object_store.scheme(), "az" | "s3") {
             256
         } else {
@@ -570,6 +572,7 @@ impl Collector {
             store,
             paths: candidates.into_iter().collect(),
             batch_size,
+            single_delete_retry: object_store.scheme() == "az",
             failed: false,
             _workspace: workspace,
         });
@@ -586,7 +589,14 @@ impl Collector {
             let page = self.sealed.as_mut().unwrap();
             let paths = std::mem::take(&mut page.paths);
             let store = page.store.clone();
-            let batch_size = page.batch_size;
+            // Retry only unresolved paths from this sealed page. Azure's
+            // singleton SDK path bypasses Blob Batch; do not bypass the page's
+            // fences, cooldown, memory budget or publication backpressure.
+            let batch_size = if page.failed && page.single_delete_retry {
+                1
+            } else {
+                page.batch_size
+            };
             let parallelism = self.options.delete_parallelism;
             let phases = service.shared.phases.clone();
             *self.deleting.get_mut().unwrap() = Some(Box::pin(async move {

@@ -101,16 +101,13 @@ async fn ambiguous_azure_put_does_not_start_read_and_attempts_cleanup() {
         drop(socket);
         let mut cleanup = accept(&listener).await;
         let delete = request(&mut cleanup).await;
-        // ObjectStoreExt::delete is transported by this SDK as an Azure
-        // multipart batch, even when it contains only one registration.
-        assert!(delete.starts_with("POST "));
-        assert!(delete.lines().next().unwrap().contains("comp=batch"));
-        let operations: Vec<_> = delete
-            .lines()
-            .filter(|line| line.starts_with("DELETE "))
-            .collect();
-        assert_eq!(operations.len(), 1);
-        assert!(operations[0].contains(&key), "{}", operations[0]);
+        // The pinned SDK uses native DELETE for this one registration.
+        // Cleanup must target exactly the registration whose PUT was uncertain.
+        assert_eq!(
+            delete.lines().next().unwrap(),
+            format!("DELETE {key} HTTP/1.1")
+        );
+        assert!(delete.split_once("\r\n\r\n").unwrap().1.is_empty());
         // Cleanup is best effort. A failed cleanup still cannot authorize the
         // rejected read; the abandoned registration must expire separately.
         respond(

@@ -5335,7 +5335,7 @@ dependencies = [
 [[package]]
 name = "object_store"
 version = "0.14.2"
-source = "git+https://github.com/beinan/arrow-rs-object-store?rev=1149230d06b87d2b458a1b6a886e0b8224498338#1149230d06b87d2b458a1b6a886e0b8224498338"
+source = "git+https://github.com/beinan/arrow-rs-object-store?rev=6e5253a3a9c0565c2b5b07ea304023d23422f8a1#6e5253a3a9c0565c2b5b07ea304023d23422f8a1"
 dependencies = [
  "async-trait",
  "aws-lc-rs",

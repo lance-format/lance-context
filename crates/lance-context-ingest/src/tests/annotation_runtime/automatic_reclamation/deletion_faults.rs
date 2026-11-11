@@ -3,6 +3,7 @@ use crate::annotations::Completed;
 use std::path::{Path as FsPath, PathBuf};
 use tokio::sync::oneshot;
 
+mod bulk_fallback;
 pub(in crate::tests) mod fault_store;
 mod listing;
 mod manifest_cache;
@@ -36,12 +37,21 @@ async fn acknowledged_orphans(
     storage: &Storage,
     path: &FsPath,
 ) -> Result<(PreparedAppend, Completed, Vec<PathBuf>)> {
+    acknowledged_orphan_count(c, storage, path, 2).await
+}
+
+async fn acknowledged_orphan_count(
+    c: &network::Cluster,
+    storage: &Storage,
+    path: &FsPath,
+    count: usize,
+) -> Result<(PreparedAppend, Completed, Vec<PathBuf>)> {
     let limits = limits();
     annotation_publication::seed_contract(c, storage, Service::contract(&binding(), &limits)?)
         .await?;
     let original = files(path)?;
     let mut first = None;
-    for _ in 0..2 {
+    for _ in 0..count {
         let (service, driver) = connect(c, storage, &limits).await?;
         let (stop, task) = run(driver);
         let producer = producer(&service, 1).await?;
@@ -66,7 +76,7 @@ async fn acknowledged_orphans(
         first = Some((request, completed));
     }
     let abandoned: Vec<_> = files(path)?.difference(&original).cloned().collect();
-    assert_eq!(abandoned.len(), 2, "two real abandoned native preparations");
+    assert_eq!(abandoned.len(), count, "real abandoned native preparations");
     let (request, completed) = first.unwrap();
     Ok((request, completed, abandoned))
 }
