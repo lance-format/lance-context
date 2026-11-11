@@ -72,10 +72,9 @@ struct FailedListing {
 
 impl Faults {
     pub(super) fn with_azure_delete(store: Arc<dyn ObjectStore>) -> Self {
-        Self {
-            azure_delete: Some(store),
-            ..Default::default()
-        }
+        let mut faults = Self::default();
+        faults.azure_delete = Some(store);
+        faults
     }
 
     fn body_write(&self, path: &Path) -> object_store::Result<()> {
