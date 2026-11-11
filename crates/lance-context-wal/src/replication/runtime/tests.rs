@@ -15,6 +15,7 @@ mod images;
 mod maintenance;
 mod peer_rejections;
 mod source_read;
+mod sync_election;
 
 // Actual dedicated workers and durable engines. This relay deliberately drops
 // selected links; it is not the production peer transport or a throughput test.
