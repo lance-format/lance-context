@@ -3,6 +3,7 @@ use crate::annotations::Completed;
 use std::path::{Path as FsPath, PathBuf};
 use tokio::sync::oneshot;
 
+mod bulk_fallback;
 pub(in crate::tests) mod fault_store;
 mod listing;
 mod manifest_cache;

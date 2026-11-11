@@ -375,6 +375,6 @@ priority = 0
 check-cfg = ["cfg(coverage,coverage_nightly)"]
 
 [patch.crates-io]
-object_store = { git = "https://github.com/beinan/arrow-rs-object-store", rev = "1149230d06b87d2b458a1b6a886e0b8224498338" }
+object_store = { git = "https://github.com/beinan/arrow-rs-object-store", rev = "7a165a5690fc0875610521b1a063c3d9149553a3" }
 lance-core = { path = "../lance-core" }
 lance-encoding = { path = "../lance-encoding" }
