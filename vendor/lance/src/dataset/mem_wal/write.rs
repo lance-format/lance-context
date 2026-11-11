@@ -5089,6 +5089,9 @@ impl MemTableFlushHandler {
         pending: &mut PendingMemTableFlush,
     ) -> Result<super::memtable::flush::FlushResult> {
         let memtable = &pending.memtable;
+        if let Some(observer) = &self.observer {
+            observer.on_memtable_flush_stage(memtable.generation(), "started");
+        }
         if pending.wal_boundary.is_none() {
             // The freeze-time snapshot can predate an in-flight WAL append.
             // Its queued request can then coalesce to entry=None, so even after
@@ -5120,6 +5123,9 @@ impl MemTableFlushHandler {
             .unwrap()
             .clone()
             .map_err(WalFlushFailure::into_error)?;
+        if let Some(observer) = &self.observer {
+            observer.on_memtable_flush_stage(memtable.generation(), "wal_durable");
+        }
         if pending.prepared.is_none() {
             if !pending.index_specs.is_empty()
                 && let Some(indexes) = memtable.indexes_arc()
@@ -5147,6 +5153,9 @@ impl MemTableFlushHandler {
             // Retain immutable files before awaiting publication, so lost ACKs
             // never lead to rewriting sidecars a merger may already be reading.
             pending.prepared = Some(prepared);
+        }
+        if let Some(observer) = &self.observer {
+            observer.on_memtable_flush_stage(memtable.generation(), "prepared");
         }
         self.flusher
             .publish_prepared(pending.prepared.as_ref().unwrap(), self.epoch)
