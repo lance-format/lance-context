@@ -45,6 +45,31 @@ impl AnnotationStaging {
         limit: usize,
         response_bytes: usize,
     ) -> Result<StatusRead> {
+        self.capture_status_inner(status, limit, response_bytes, false)
+            .await
+    }
+
+    /// Wait for reader admission before capturing base and progress. Callers
+    /// must bound concurrent waiters and include admission in their deadline.
+    /// Waiting holds no staging lock or base snapshot; cancellation removes
+    /// the semaphore waiter.
+    pub async fn capture_status_when_available(
+        &self,
+        status: Option<String>,
+        limit: usize,
+        response_bytes: usize,
+    ) -> Result<StatusRead> {
+        self.capture_status_inner(status, limit, response_bytes, true)
+            .await
+    }
+
+    async fn capture_status_inner(
+        &self,
+        status: Option<String>,
+        limit: usize,
+        response_bytes: usize,
+        wait_for_reader: bool,
+    ) -> Result<StatusRead> {
         if !(1..=MAX_STATUS_MATCHES).contains(&limit)
             || status
                 .as_ref()
@@ -53,7 +78,15 @@ impl AnnotationStaging {
         {
             return Err(invalid("invalid status filter bounds"));
         }
-        let reader = reserve(&self.readers, 1)?;
+        let reader = if wait_for_reader {
+            self.readers
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| invalid("annotation read admission closed"))?
+        } else {
+            reserve(&self.readers, 1)?
+        };
         let state = self.state.read().await;
         Ok(StatusRead {
             base: state.base.clone(),

@@ -31,10 +31,12 @@ impl Service {
     ) -> Result<Option<(StatusMatches, MergeReservation)>> {
         tokio::time::timeout(deadline, async {
             self.wait_through(recovery_cut).await?;
+            // HTTP admission bounds these waiters. Acquire the shared reader
+            // before capturing a base, within the original request deadline.
             let read = self
                 .shared
                 .staging
-                .capture_status(status, limit, response_bytes)
+                .capture_status_when_available(status, limit, response_bytes)
                 .await?;
             let workspace = read.workspace_bytes()?;
             ensure!(
