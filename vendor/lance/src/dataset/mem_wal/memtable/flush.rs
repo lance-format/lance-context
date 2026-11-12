@@ -1279,7 +1279,7 @@ impl MemTableFlusher {
                         prepared.size,
                     )
                 {
-                    info!(
+                    tracing::info!(
                         manifest_version = manifest.version,
                         "memtable flush publication reconciled from manifest"
                     );
@@ -1303,7 +1303,7 @@ impl MemTableFlusher {
             Some(&prepared.attempted_versions),
         )
         .await?;
-        info!("memtable flush publication completed");
+        tracing::info!("memtable flush publication completed");
         Ok(prepared.result.clone())
     }
 
