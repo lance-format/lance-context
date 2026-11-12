@@ -1,5 +1,8 @@
 use super::*;
-use lance_table::transaction::{Operation, Transaction};
+use lance_table::{
+    format::pb,
+    transaction::{Operation, Transaction},
+};
 
 #[tokio::test]
 async fn indexed_publication_preserves_prepared_patch_values_without_io() -> Result<()> {
@@ -38,7 +41,19 @@ async fn indexed_publication_preserves_prepared_patch_values_without_io() -> Res
         .await?
         .unwrap()
         .transaction_properties;
+    // Use the durable transaction representation, as the publication path does.
+    // Native index creation timestamps are stored with millisecond precision.
+    let transaction = Transaction::try_from(pb::Transaction::try_from(&transaction)?)?;
     let selected = compaction::select(base.clone(), &transaction).await?;
+    assert_eq!(transaction.read_version, base.version_id());
+    assert_eq!(selected.uri(), base.uri());
+    assert_eq!(selected.version_id(), base.version_id() + 1);
+    assert_eq!(selected.schema(), base.schema());
+    assert_eq!(selected.manifest().fragments, base.manifest().fragments);
+    assert_eq!(
+        selected.read_transaction().await?.as_ref(),
+        Some(&transaction)
+    );
     staging
         .install_indexed(&transaction, selected.clone())
         .await?;
