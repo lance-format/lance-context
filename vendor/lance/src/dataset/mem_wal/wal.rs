@@ -822,6 +822,10 @@ impl WalFlusher {
         source: &WalFlushSource,
         end_batch_position: usize,
     ) -> Result<WalFlushResult> {
+        // Timer and size triggers can already be queued when a prior flush
+        // poisons this writer. Recovery belongs to a successor, not another
+        // append from the failed writer's retained buffer.
+        self.check_poisoned()?;
         let result = match source {
             WalFlushSource::BatchStore { batch_store } => {
                 self.flush_from_batch_store(batch_store, end_batch_position)
