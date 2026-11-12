@@ -663,12 +663,18 @@ impl Service {
             // HTTP admission already bounds these requests. A transient lack
             // of staging readers must wait within the same request deadline,
             // without holding an old read view or blocking ordered apply.
+            let view = self
+                .shared
+                .phases
+                .measure(
+                    Phase::AnnotationPointCapture,
+                    self.shared.staging.capture_when_available(turn),
+                )
+                .await?;
             Ok(self
                 .shared
-                .staging
-                .capture_when_available(turn)
-                .await?
-                .resolve()
+                .phases
+                .measure(Phase::AnnotationPointResolve, view.resolve())
                 .await?)
         })
         .await
