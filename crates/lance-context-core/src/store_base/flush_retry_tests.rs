@@ -120,6 +120,12 @@ impl object_store::ObjectStore for FaultStore {
         path: &Path,
         options: object_store::GetOptions,
     ) -> object_store::Result<object_store::GetResult> {
+        if self.mode.load(Ordering::SeqCst) == 6
+            && path.as_ref().contains("/_mem_wal/")
+            && path.as_ref().contains("/manifest/")
+        {
+            return Err(fault());
+        }
         self.inner.get_opts(path, options).await
     }
     fn delete_stream(
@@ -545,7 +551,7 @@ async fn fenced_writer_reopen_replays_wal_and_releases_old_tasks() {
                         observer: Some(observer),
                         store_params: Some(params),
                         max_wal_persist_retries: 0,
-                        max_wal_flush_interval: None,
+                        max_wal_flush_interval: Some(Duration::from_millis(10)),
                         ..Default::default()
                     },
                     schema.clone(),
@@ -570,6 +576,22 @@ async fn fenced_writer_reopen_replays_wal_and_releases_old_tasks() {
                     error.fence_reason(),
                     Some(lance_core::error::FenceReason::PersistenceFailure)
                 );
+                // Repeated reopen failures must not erase the resident slot:
+                // the periodic flusher needs to find it again without a put.
+                mode.store(6, Ordering::SeqCst);
+                for _ in 0..2 {
+                    assert!(
+                        tokio::time::timeout(Duration::from_secs(10), base.flush_inner())
+                            .await
+                            .unwrap()
+                            .is_err()
+                    );
+                    assert!(Arc::ptr_eq(
+                        base.write_writer.lock().await.as_ref().unwrap(),
+                        &writer
+                    ));
+                }
+                mode.store(0, Ordering::SeqCst);
                 assert_eq!(
                     tokio::time::timeout(Duration::from_secs(10), base.flush_inner())
                         .await
@@ -587,7 +609,7 @@ async fn fenced_writer_reopen_replays_wal_and_releases_old_tasks() {
                 .unwrap();
                 base.flush().await.unwrap();
             }
-            let successor = base.resident_writer().await.unwrap();
+            let successor = base.resident_writer(None).await.unwrap();
             assert!(!Arc::ptr_eq(&writer, &successor));
             let manifest = successor.manifest().await.unwrap().unwrap();
             assert_eq!(manifest.writer_epoch, old_epoch + 1);

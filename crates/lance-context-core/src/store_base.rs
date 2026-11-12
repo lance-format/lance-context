@@ -513,8 +513,8 @@ pub(crate) struct StorageBase {
     deleted: bool,
     /// Resident MemWAL writer for this instance's shard, wrapped for `&self`
     /// concurrent access. The [`tokio::sync::Mutex`] is held only to
-    /// fetch-or-open and clone the `Arc` (see [`Self::resident_writer`]) and to
-    /// invalidate a fenced writer (see [`Self::invalidate_writer`]); it is
+    /// fetch-or-open and clone the `Arc`, including replacement of a fenced
+    /// writer (see [`Self::resident_writer`]); it is
     /// **never** held across `put`, so steady-state appends run concurrently.
     write_writer: tokio::sync::Mutex<Option<Arc<ShardWriter>>>,
 }
@@ -747,8 +747,9 @@ impl StorageBase {
     /// connection is pooled, rather than paying a cold DNS resolution + TCP/TLS
     /// handshake + epoch claim per append.
     ///
-    /// Retried exactly once on a fence: a fence means a merge superseded our
-    /// epoch, and invalidating + reopening re-claims the current one. Rows are
+    /// Retried exactly once on a fence: either this writer self-fenced after a
+    /// persistence failure or a successor superseded its epoch. Reopening
+    /// claims a new epoch and replays durable WAL. Rows are
     /// de-duplicated by the key column at read time, so a retried append can
     /// never double-count.
     pub async fn put(&self, batches: Vec<RecordBatch>) -> LanceResult<()> {
@@ -790,7 +791,7 @@ impl StorageBase {
     }
 
     async fn put_inner(&self, batches: Vec<RecordBatch>) -> LanceResult<()> {
-        let writer = self.resident_writer().await?;
+        let writer = self.resident_writer(None).await?;
         match writer.put(batches.clone()).await {
             Ok(_) => Ok(()),
             Err(err) if is_fenced_error(&err) => {
@@ -799,8 +800,7 @@ impl StorageBase {
                     "reopening fenced writer after put failure; replaying durable WAL");
                 // Last-owner drop cancels the old background tasks without
                 // trying to flush against its dead epoch. Reopen replays WAL.
-                self.invalidate_writer(&writer).await;
-                let writer = self.resident_writer().await?;
+                let writer = self.resident_writer(Some(&writer)).await?;
                 writer.put(batches).await?;
                 Ok(())
             }
@@ -812,10 +812,18 @@ impl StorageBase {
     /// held only to read-or-open and clone the `Arc`; it is released before the
     /// caller `put`s, so steady-state appends run concurrently. Opening under the
     /// lock serializes only the (rare) first open / post-fence reopen.
-    async fn resident_writer(&self) -> LanceResult<Arc<ShardWriter>> {
+    /// When replacing a fence, reuse an already-installed successor. Keep the
+    /// old slot until opening succeeds so a failed or cancelled reopen remains
+    /// visible to the next periodic flush, even without another append.
+    async fn resident_writer(
+        &self,
+        replace: Option<&Arc<ShardWriter>>,
+    ) -> LanceResult<Arc<ShardWriter>> {
         let mut guard = self.write_writer.lock().await;
         if let Some(writer) = guard.as_ref() {
-            return Ok(writer.clone());
+            if replace.is_none_or(|stale| !Arc::ptr_eq(writer, stale)) {
+                return Ok(writer.clone());
+            }
         }
         let config = ShardWriterConfig {
             shard_id: self.write_shard,
@@ -833,19 +841,6 @@ impl StorageBase {
         );
         *guard = Some(writer.clone());
         Ok(writer)
-    }
-
-    /// Invalidate a fenced writer so the next [`Self::resident_writer`] reopens.
-    /// Identity-checked: only clears the slot if it still holds `stale`, so when
-    /// N concurrent appends all fence on the same writer, the first
-    /// clears+reopens and the rest observe a fresh writer and reuse it — exactly
-    /// one reopen, and no append installs a writer another append just
-    /// invalidated.
-    async fn invalidate_writer(&self, stale: &Arc<ShardWriter>) {
-        let mut guard = self.write_writer.lock().await;
-        if guard.as_ref().is_some_and(|cur| Arc::ptr_eq(cur, stale)) {
-            *guard = None;
-        }
     }
 
     /// Materialize the active memtable into a flushed, queryable generation:
@@ -917,7 +912,7 @@ impl StorageBase {
         // this writer remains resident. One indivisible entry can exceed the
         // configured soft memory ceiling.
         info!(shard = %self.write_shard, "recovering own WAL before cleanup merge");
-        self.resident_writer().await?;
+        self.resident_writer(None).await?;
         // Keep the recovered writer resident so concurrent ingest shares it;
         // a later cheap flush can also finish sealing if this caller is cancelled.
         self.flush().await?;
@@ -941,8 +936,7 @@ impl StorageBase {
                 warn!(uri = %self.uri(), shard = %self.write_shard,
                     fence_reason = ?err.fence_reason(), error = %err,
                     "reopening fenced writer after flush failure; replaying durable WAL");
-                self.invalidate_writer(&writer).await;
-                let writer = self.resident_writer().await?;
+                let writer = self.resident_writer(Some(&writer)).await?;
                 writer.force_seal_active().await?.wait().await?;
                 Ok(FlushOutcome::RecoveredFence)
             }
