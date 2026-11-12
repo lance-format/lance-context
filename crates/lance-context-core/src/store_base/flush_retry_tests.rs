@@ -84,16 +84,12 @@ impl object_store::ObjectStore for FaultStore {
     ) -> object_store::Result<object_store::PutResult> {
         if path.as_ref().contains("/wal/") {
             let mode = self.mode.load(Ordering::SeqCst);
-            if matches!(mode, 4 | 5)
+            if mode == 4
                 && self
                     .mode
                     .compare_exchange(mode, 0, Ordering::SeqCst, Ordering::SeqCst)
                     .is_ok()
             {
-                if mode == 5 {
-                    // The write landed, but its acknowledgement was lost.
-                    self.inner.put_opts(path, payload, options).await?;
-                }
                 return Err(fault());
             }
             if let Some(gate) = &self.gate {
@@ -154,6 +150,19 @@ impl object_store::ObjectStore for FaultStore {
         options: object_store::CopyOptions,
     ) -> object_store::Result<()> {
         let mode = self.mode.load(Ordering::SeqCst);
+        if mode == 5
+            && to.as_ref().contains("/wal/")
+            && self
+                .mode
+                .compare_exchange(5, 0, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            // Local atomic create writes a temporary object, then publishes it
+            // with rename-if-absent. Lose the ACK of the final WAL publication,
+            // not the earlier temporary-file PUT.
+            self.inner.copy_opts(from, to, options).await?;
+            return Err(fault());
+        }
         if matches!(mode, 1 | 2)
             && to.as_ref().contains("/manifest/")
             && to.as_ref().ends_with(".binpb")
