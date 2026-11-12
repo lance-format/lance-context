@@ -83,6 +83,15 @@ impl object_store::ObjectStore for FaultStore {
         options: object_store::PutOptions,
     ) -> object_store::Result<object_store::PutResult> {
         if path.as_ref().contains("/wal/") {
+            let mode = self.mode.load(Ordering::SeqCst);
+            if mode == 4
+                && self
+                    .mode
+                    .compare_exchange(mode, 0, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            {
+                return Err(fault());
+            }
             if let Some(gate) = &self.gate {
                 if !gate.used.swap(true, Ordering::SeqCst) {
                     gate.entered.notify_one();
@@ -111,6 +120,12 @@ impl object_store::ObjectStore for FaultStore {
         path: &Path,
         options: object_store::GetOptions,
     ) -> object_store::Result<object_store::GetResult> {
+        if self.mode.load(Ordering::SeqCst) == 6
+            && path.as_ref().contains("/_mem_wal/")
+            && path.as_ref().contains("/manifest/")
+        {
+            return Err(fault());
+        }
         self.inner.get_opts(path, options).await
     }
     fn delete_stream(
@@ -141,6 +156,19 @@ impl object_store::ObjectStore for FaultStore {
         options: object_store::CopyOptions,
     ) -> object_store::Result<()> {
         let mode = self.mode.load(Ordering::SeqCst);
+        if mode == 5
+            && to.as_ref().contains("/wal/")
+            && self
+                .mode
+                .compare_exchange(5, 0, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            // Local atomic create writes a temporary object, then publishes it
+            // with rename-if-absent. Lose the ACK of the final WAL publication,
+            // not the earlier temporary-file PUT.
+            self.inner.copy_opts(from, to, options).await?;
+            return Err(fault());
+        }
         if matches!(mode, 1 | 2)
             && to.as_ref().contains("/manifest/")
             && to.as_ref().ends_with(".binpb")
@@ -456,4 +484,179 @@ async fn coalesced_wal_flush_preserves_each_generation_boundary() {
         );
     }
     writer.close().await.unwrap();
+}
+
+/// Exercise the service reopen path, not just WalAppender retry: previously
+/// acknowledged rows must survive and the predecessor's tasks must release
+/// their observer, including when a WAL PUT landed but its ACK was lost.
+#[tokio::test]
+#[cfg(feature = "metrics")]
+async fn fenced_writer_reopen_replays_wal_and_releases_old_tasks() {
+    for failure_mode in [4, 5] {
+        for recover_on_flush in [false, true] {
+            let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
+            let batch = |value: &str| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(StringArray::from(vec![value]))],
+                )
+                .unwrap()
+            };
+            let dir = tempfile::TempDir::new().unwrap();
+            let uri = format!("file://{}", dir.path().display());
+            let mut base = StorageBase::open(
+                &uri,
+                StorageBaseOptions {
+                    storage_options: None,
+                    shard_id: Some("fenced-lifetime-test".into()),
+                    merge_after_generations: None,
+                    merge_max_generations: None,
+                    merge_max_bytes: None,
+                    key_index_type: Default::default(),
+                    pending_generations_warn: None,
+                    pending_generations_max: None,
+                    merge_budget: None,
+                    session: None,
+                    schema: schema.clone(),
+                    key_column: "id".into(),
+                    latest_schema: None,
+                    seal_on_put: false,
+                },
+                true,
+            )
+            .await
+            .unwrap();
+            let mode = Arc::new(AtomicU8::new(0));
+            let params = ObjectStoreParams {
+                object_store_wrapper: Some(Arc::new(Wrapper(mode.clone()))),
+                ..Default::default()
+            };
+            base.dataset = DatasetBuilder::from_uri(&uri)
+                .with_store_params(params.clone())
+                .load()
+                .await
+                .unwrap();
+            let observer = Arc::new(crate::metrics::MemtableFlushMetrics::new(
+                &uri,
+                base.write_shard,
+            ));
+            let old_observer = Arc::downgrade(&observer);
+            let writer = Arc::new(
+                ShardWriter::open(
+                    base.dataset.object_store(None).await.unwrap(),
+                    base.dataset.branch_location().path.clone(),
+                    uri.clone(),
+                    ShardWriterConfig {
+                        shard_id: base.write_shard,
+                        observer: Some(observer),
+                        store_params: Some(params),
+                        max_wal_persist_retries: 0,
+                        max_wal_flush_interval: Some(Duration::from_millis(10)),
+                        ..Default::default()
+                    },
+                    schema.clone(),
+                    vec![],
+                )
+                .await
+                .unwrap(),
+            );
+            *base.write_writer.lock().await = Some(writer.clone());
+            base.put(vec![batch("acknowledged-before-failure")])
+                .await
+                .unwrap();
+            let old_epoch = writer.manifest().await.unwrap().unwrap().writer_epoch;
+            mode.store(failure_mode, Ordering::SeqCst);
+            if recover_on_flush {
+                // No subsequent put: a periodic flush must reopen/replay too.
+                let error = writer
+                    .put(vec![batch("ambiguous-write")])
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    error.fence_reason(),
+                    Some(lance_core::error::FenceReason::PersistenceFailure)
+                );
+                // Repeated reopen failures must not erase the resident slot:
+                // the periodic flusher needs to find it again without a put.
+                mode.store(6, Ordering::SeqCst);
+                for _ in 0..2 {
+                    assert!(
+                        tokio::time::timeout(Duration::from_secs(10), base.flush_inner())
+                            .await
+                            .unwrap()
+                            .is_err()
+                    );
+                    assert!(Arc::ptr_eq(
+                        base.write_writer.lock().await.as_ref().unwrap(),
+                        &writer
+                    ));
+                }
+                mode.store(0, Ordering::SeqCst);
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(10), base.flush_inner())
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    FlushOutcome::RecoveredFence,
+                );
+            } else {
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    base.put(vec![batch("ambiguous-write")]),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                base.flush().await.unwrap();
+            }
+            let successor = base.resident_writer(None).await.unwrap();
+            assert!(!Arc::ptr_eq(&writer, &successor));
+            let manifest = successor.manifest().await.unwrap().unwrap();
+            assert_eq!(manifest.writer_epoch, old_epoch + 1);
+            assert!(manifest.replay_after_wal_entry_position > 0);
+
+            // Validate actual committed content before asserting task release.
+            let mut rows = std::collections::BTreeSet::new();
+            for generation in &manifest.sstables {
+                let ds = DatasetBuilder::from_uri(format!(
+                    "{}/_mem_wal/{}/{}",
+                    uri, base.write_shard, generation.path
+                ))
+                .load()
+                .await
+                .unwrap();
+                let records = ds.scan().try_into_batch().await.unwrap();
+                let ids = records
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                rows.extend(ids.iter().map(|value| value.unwrap().to_owned()));
+            }
+            assert!(rows.contains("acknowledged-before-failure"));
+            assert_eq!(
+                rows.contains("ambiguous-write"),
+                !recover_on_flush || failure_mode == 5
+            );
+            assert_eq!(
+                rows.len(),
+                if !recover_on_flush || failure_mode == 5 {
+                    2
+                } else {
+                    1
+                }
+            );
+            drop(writer);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while old_observer.upgrade().is_some() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("old dispatcher must release its observer and retained state");
+            drop(successor);
+            base.close().await.unwrap();
+        }
+    }
 }

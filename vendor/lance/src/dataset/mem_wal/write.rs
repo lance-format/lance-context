@@ -695,6 +695,17 @@ impl Default for TaskExecutor {
     }
 }
 
+impl Drop for TaskExecutor {
+    fn drop(&mut self) {
+        // A handler can retain a sender into its own mailbox (notably the WAL
+        // flusher), so dropping the writer does not close those channels.
+        // Stop dispatching after the current operation settles. Do not abort
+        // an in-flight storage commit or delete WAL: acknowledged rows remain
+        // recoverable by the next writer. Call close() for a graceful flush.
+        self.cancellation_token.cancel();
+    }
+}
+
 // ============================================================================
 // Durability and Backpressure Types
 // ============================================================================
