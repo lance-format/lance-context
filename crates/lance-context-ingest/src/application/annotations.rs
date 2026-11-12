@@ -188,15 +188,38 @@ pub async fn serve_ingress(
         .router()
         .layer(middleware::from_fn_with_state(auth, authorize));
     let draining = gateway.clone();
-    let result = axum::serve(listener.tap_io(configure_http_stream), app)
-        .with_graceful_shutdown(async move {
-            shutdown.await;
-            draining.shutdown().await;
-        })
-        .await;
+    let serving = async move {
+        axum::serve(listener.tap_io(configure_http_stream), app)
+            .with_graceful_shutdown(async move {
+                shutdown.await;
+                draining.shutdown().await;
+            })
+            .await
+    };
+    tokio::pin!(serving);
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let result = loop {
+        tokio::select! {
+            result = &mut serving => break result,
+            _ = tick.tick() => observe_ingress(&gateway),
+        }
+    };
     gateway.shutdown().await;
+    observe_ingress(&gateway);
     result?;
     Ok(())
+}
+
+fn observe_ingress(gateway: &Forwarder) {
+    eprintln!(
+        "{}",
+        serde_json::json!({"annotation_ingress": {
+            "observed_unix_ms": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis()),
+            "http": gateway.observation(),
+        }})
+    );
 }
 
 /// One process owns one table/shard. Competing starts must acquire the existing
