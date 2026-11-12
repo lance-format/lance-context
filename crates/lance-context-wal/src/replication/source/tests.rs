@@ -286,12 +286,12 @@ fn disjoint_groups_pin_their_full_prefix_and_recover_original_index() -> Result<
     assert_ne!(permit.cut, refreshed.cut);
     assert_eq!(c.pin(refreshed)?, result);
     c.append(c.table, 3)?; // Suffix stays outside the immutable pin.
-    for n in 0..6 {
+    for (n, node) in c.nodes[..6].iter_mut().enumerate() {
         let group = if n < 3 { 10 } else { 20 };
-        let image = c.nodes[n]
+        let image = node
             .prepare_checkpoint(group, Uuid::from_u128(300 + n as u128))?
             .run()?;
-        c.nodes[n].install_checkpoint(image)?;
+        node.install_checkpoint(image)?;
     }
     c.reopen()?;
     let refreshed = c.permit(plan)?;
@@ -358,12 +358,12 @@ fn maximum_publication_window_survives_catalog_and_source_checkpoints() -> Resul
     let result = c.pin(permit)?;
     assert!(matches!(result, Reply::Pinned { .. }));
     c.append(c.table, publication::MAX_INPUTS as u64 + 1)?;
-    for n in 0..6 {
+    for (n, node) in c.nodes[..6].iter_mut().enumerate() {
         let group = if n < 3 { 10 } else { 20 };
-        let image = c.nodes[n]
+        let image = node
             .prepare_checkpoint(group, Uuid::from_u128(500 + n as u128))?
             .run()?;
-        c.nodes[n].install_checkpoint(image)?;
+        node.install_checkpoint(image)?;
     }
     c.reopen()?;
     let recovered = c.permit(index)?;
