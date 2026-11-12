@@ -2856,6 +2856,23 @@ mod tests {
             .expect("watcher hung after a poisoning flush")
             .expect_err("watcher must surface the poison");
         assert_eq!(waited.fence_reason(), Some(FenceReason::PersistenceFailure));
+
+        // A queued timer tick must not retry a terminally failed append even
+        // after storage recovers. Only a successor may reopen and replay.
+        let attempts = controls.attempts();
+        let durable = flusher.durable_watermark();
+        controls.recover();
+        let queued = flusher.flush(&source, batch_store.len()).await;
+        assert!(
+            queued.is_err(),
+            "a poisoned flusher must reject a queued flush after storage recovery"
+        );
+        assert_eq!(
+            queued.unwrap_err().fence_reason(),
+            Some(FenceReason::PersistenceFailure)
+        );
+        assert_eq!(controls.attempts(), attempts, "no further WAL PUT is allowed");
+        assert_eq!(flusher.durable_watermark(), durable);
     }
 
     // A panic under the `terminal_error` lock must not cost the writer its
