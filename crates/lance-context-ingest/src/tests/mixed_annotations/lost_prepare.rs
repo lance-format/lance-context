@@ -103,9 +103,11 @@ async fn exercise() -> Result<()> {
     assert!(pending.plan.sources[&10].through < score_result.index.min(status_result.index));
 
     proxy.release.notify_one();
-    let error = tokio::time::timeout(Duration::from_secs(30), task)
+    // The proxy blocks all voter observations for the unchanged 30-second RPC deadline.
+    let error = tokio::time::timeout(Duration::from_secs(45), task)
         .await??
         .unwrap_err();
+    proxy.restore_observations();
     assert_eq!(proxy.dropped.load(Ordering::SeqCst), 1);
     let context = format!("{error:#}");
     assert!(

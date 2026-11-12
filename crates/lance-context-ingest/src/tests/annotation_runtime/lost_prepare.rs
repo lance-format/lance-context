@@ -136,11 +136,13 @@ async fn exercise(confirm: bool) -> Result<()> {
         drop(proxy);
         return c.shutdown().await;
     }
-    let error = tokio::time::timeout(Duration::from_secs(30), task)
+    // The proxy blocks all voter observations for the unchanged 30-second RPC deadline.
+    let error = tokio::time::timeout(Duration::from_secs(45), task)
         .await??
         .unwrap_err();
+    proxy.restore_observations();
     assert_eq!(proxy.dropped.load(Ordering::SeqCst), 1);
-    assert_eq!(proxy.blocked_reads.load(Ordering::SeqCst), 1);
+    assert!(proxy.blocked_reads.load(Ordering::SeqCst) >= 3);
     let context = format!("{error:#}");
     assert!(
         context.contains("WAL RPC prepare") && context.contains("outcome unknown"),
