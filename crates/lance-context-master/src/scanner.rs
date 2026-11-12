@@ -507,7 +507,7 @@ async fn scan_once_inner(
                     }
                 };
                 match observed {
-                    Ok((row, skipped, shard_max)) => {
+                    Ok((row, skipped, shard_max, store)) => {
                         shard_counts
                             .lock()
                             .unwrap()
@@ -522,15 +522,8 @@ async fn scan_once_inner(
                         // rollout, `generic:<name>` for generic stores.
                         let target = entry.name.clone();
                         if state.admission.is_accepting() {
-                            crate::demand_publish::spawn_scan_demand(
-                                state.clone(),
-                                target,
-                                entry.uri.clone(),
-                                entry.kind,
-                                rollout_options,
-                                generic_options,
-                            )
-                            .await;
+                            crate::demand_publish::spawn_scan_demand(state.clone(), target, store)
+                                .await;
                         }
                         (entry.name, Some(result))
                     }
@@ -848,7 +841,7 @@ async fn observe_generic(
 ) -> lance::Result<(StatRow, bool)> {
     observe_generic_with_shards(name, uri, previous, options)
         .await
-        .map(|(row, skipped, _)| (row, skipped))
+        .map(|(row, skipped, _, _)| (row, skipped))
 }
 
 async fn observe_generic_with_shards(
@@ -856,7 +849,12 @@ async fn observe_generic_with_shards(
     uri: &str,
     previous: Option<&StatRow>,
     mut options: GenericStoreOptions,
-) -> lance::Result<(StatRow, bool, usize)> {
+) -> lance::Result<(
+    StatRow,
+    bool,
+    usize,
+    crate::demand_publish::ObservedScanStore,
+)> {
     // Metadata observation must see shards over the worker read cap.
     options.pending_generations_max = Some(0);
     let open = GenericStore::open_existing(uri, options);
@@ -886,7 +884,12 @@ async fn observe_generic_with_shards(
             row.uri = uri.to_string();
             row.pending_wal_generations = pending as i64;
             row.scanned_at = Utc::now().timestamp_millis();
-            return Ok((row, true, shard_max));
+            return Ok((
+                row,
+                true,
+                shard_max,
+                crate::demand_publish::ObservedScanStore::Generic(store),
+            ));
         }
     }
 
@@ -925,6 +928,7 @@ async fn observe_generic_with_shards(
         },
         false,
         shard_max,
+        crate::demand_publish::ObservedScanStore::Generic(store),
     ))
 }
 
@@ -936,7 +940,7 @@ async fn observe_one(
 ) -> lance::Result<(StatRow, bool)> {
     observe_one_with_shards(name, uri, previous, options)
         .await
-        .map(|(row, skipped, _)| (row, skipped))
+        .map(|(row, skipped, _, _)| (row, skipped))
 }
 
 async fn observe_one_with_shards(
@@ -944,7 +948,12 @@ async fn observe_one_with_shards(
     uri: &str,
     previous: Option<&StatRow>,
     options: RolloutStoreOptions,
-) -> lance::Result<(StatRow, bool, usize)> {
+) -> lance::Result<(
+    StatRow,
+    bool,
+    usize,
+    crate::demand_publish::ObservedScanStore,
+)> {
     let open = RolloutStore::open_existing_with_options(uri, options);
     let store = match tokio::time::timeout(OBSERVE_TIMEOUT, open).await {
         Ok(Ok(store)) => store,
@@ -969,7 +978,12 @@ async fn observe_one_with_shards(
             row.uri = uri.to_string();
             row.pending_wal_generations = pending as i64;
             row.scanned_at = Utc::now().timestamp_millis();
-            return Ok((row, true, shard_max));
+            return Ok((
+                row,
+                true,
+                shard_max,
+                crate::demand_publish::ObservedScanStore::Rollout(store),
+            ));
         }
     }
 
@@ -1006,6 +1020,7 @@ async fn observe_one_with_shards(
         },
         false,
         obs.max_pending_wal_generations_per_shard.max(0) as usize,
+        crate::demand_publish::ObservedScanStore::Rollout(store),
     ))
 }
 
