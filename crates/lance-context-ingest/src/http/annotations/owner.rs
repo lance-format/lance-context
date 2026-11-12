@@ -159,7 +159,14 @@ impl Owner {
                             outcome: "rejected",
                         }
                     }
-                    _ => Failure::unavailable("annotation_outcome_unknown", "unknown"),
+                    _ => {
+                        let meta = prepared.meta();
+                        eprintln!(
+                            "annotation mutation outcome unknown: table={} bucket={} producer={} sequence={}: {error:#}",
+                            meta.stream, meta.bucket, meta.producer, meta.sequence
+                        );
+                        Failure::unavailable("annotation_outcome_unknown", "unknown")
+                    }
                 })?;
             let accepted = AcceptedAppend {
                 scope: ingress.scope.clone(),
