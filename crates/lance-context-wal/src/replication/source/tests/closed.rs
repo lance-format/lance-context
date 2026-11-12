@@ -227,12 +227,10 @@ fn closure_retires_selected_payloads_preserves_suffix_and_rejects_delayed_pins()
         state.closed[&c.table].permit.closure().through,
         pin.selection().range.through
     );
-    for n in 0..6 {
+    for (n, node) in c.nodes[..6].iter_mut().enumerate() {
         let group = if n < 3 { 10 } else { 20 };
-        let image = c.nodes[n]
-            .prepare_checkpoint(group, Uuid::new_v4())?
-            .run()?;
-        c.nodes[n].install_checkpoint(image)?;
+        let image = node.prepare_checkpoint(group, Uuid::new_v4())?.run()?;
+        node.install_checkpoint(image)?;
     }
     c.reopen()?;
     c.acquire(1)?;

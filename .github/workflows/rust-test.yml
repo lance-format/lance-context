@@ -218,7 +218,7 @@ jobs:
       - name: Rollout materialization through the WAL client
         run: |
           cargo clippy -p lance-context-ingest --features materializer --all-targets -- -D warnings
-          cargo test -p lance-context-ingest --features materializer --lib
+          cargo test -p lance-context-ingest --features materializer --lib --test stable_index_selection
       - name: HTTP ingestion and recoverable producer journal
         run: |
           cargo clippy -p lance-context-ingest --features http --all-targets -- -D warnings
