@@ -565,6 +565,7 @@ async fn fenced_writer_reopen_replays_wal_and_releases_old_tasks() {
                 .await
                 .unwrap();
             let old_epoch = writer.manifest().await.unwrap().unwrap().writer_epoch;
+            let next_wal_position = writer.wal_stats().next_wal_entry_position;
             mode.store(failure_mode, Ordering::SeqCst);
             if recover_on_flush {
                 // No subsequent put: a periodic flush must reopen/replay too.
@@ -575,6 +576,15 @@ async fn fenced_writer_reopen_replays_wal_and_releases_old_tasks() {
                 assert_eq!(
                     error.fence_reason(),
                     Some(lance_core::error::FenceReason::PersistenceFailure)
+                );
+                // Let several periodic ticks run while the failed writer is
+                // still resident and storage has recovered. They must not
+                // publish its retained batch or advance its WAL cursor.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                assert_eq!(
+                    writer.wal_stats().next_wal_entry_position,
+                    next_wal_position,
+                    "a terminally failed writer must not append on later ticks"
                 );
                 // Repeated reopen failures must not erase the resident slot:
                 // the periodic flusher needs to find it again without a put.
