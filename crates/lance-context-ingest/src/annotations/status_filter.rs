@@ -33,20 +33,24 @@ impl Service {
             self.wait_through(recovery_cut).await?;
             // HTTP admission bounds these waiters. Acquire the shared reader
             // before capturing a base, within the original request deadline.
-            let read = self
+            let mut read = self
                 .shared
                 .staging
                 .capture_status_when_available(status, limit, response_bytes)
                 .await?;
-            let workspace = read.workspace_bytes()?;
-            ensure!(
-                workspace <= self.ingress.budget.limit(),
-                "status filter workspace exceeds budget"
-            );
+            read.cap_scan_workspace(self.ingress.budget.limit())?;
             // Optional filtering must not queue a large reservation ahead of
-            // ingestion. Refuse promptly when shared capacity is occupied.
-            let Some(reservation) = self.ingress.budget.try_reserve(workspace) else {
-                return Ok(None);
+            // ingestion. Try smaller batches while other work owns capacity;
+            // refuse if even the original minimum cannot be admitted. This
+            // loop only probes memory permits, before any native scan starts.
+            let reservation = loop {
+                let workspace = read.workspace_bytes()?;
+                if let Some(reservation) = self.ingress.budget.try_reserve(workspace) {
+                    break reservation;
+                }
+                if !read.reduce_scan_batch() {
+                    return Ok(None);
+                }
             };
             // Native query tasks may outlive cancellation of an HTTP request.
             // Keep their base pin and reservation until the actual work ends.
