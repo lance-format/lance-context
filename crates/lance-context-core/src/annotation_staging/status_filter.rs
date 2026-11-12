@@ -128,8 +128,22 @@ impl StatusRead {
         if rows < MIN_SCAN_ROWS {
             return Err(invalid("status filter workspace exceeds budget"));
         }
-        self.scan_rows = self.scan_rows.min(rows);
+        // Keep whole batch sizes instead of expanding a partial batch to fill
+        // every remaining byte of the shared budget.
+        while self.scan_rows > rows {
+            self.scan_rows /= 2;
+        }
         Ok(())
+    }
+
+    /// Trade scan throughput for a smaller nonblocking reservation. The caller
+    /// can fall back to the previous minimum while other work holds capacity.
+    pub fn reduce_scan_batch(&mut self) -> bool {
+        if self.scan_rows <= MIN_SCAN_ROWS {
+            return false;
+        }
+        self.scan_rows /= 2;
+        true
     }
 
     /// Admission estimate for response storage and narrow scanner vectors.
