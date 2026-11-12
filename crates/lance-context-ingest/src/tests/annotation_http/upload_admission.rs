@@ -118,18 +118,22 @@ async fn exercise() -> Result<()> {
         },
     ));
     let owner_server = Server::start(router, None).await?;
+    let ingress_budget = MergeMemoryBudget::new(64 << 20);
     let ingress = annotations::connect_ingress(
         c.client.clone(),
         annotation_publication::one_shard(),
         binding,
         &limits,
-        MergeMemoryBudget::new(64 << 20),
+        ingress_budget.clone(),
     )
     .await?;
     let gateway = Forwarder::new(
         vec![(ingress, owner_server.uri())],
         keys()?,
-        options(),
+        http::Options {
+            admission_timeout: Duration::from_millis(100),
+            ..options()
+        },
         TOKEN.into(),
     )?;
     let front = Server::start(gateway.router(), None).await?;
@@ -174,6 +178,8 @@ async fn exercise() -> Result<()> {
     let refusal: serde_json::Value = b_response.json().await?;
     assert_eq!(refusal["error"], "memory_capacity");
     assert_eq!(refusal["operation_outcome"], "not_submitted");
+    assert_eq!(owner.observation().local_write_memory_refusals, 1);
+    assert_eq!(gateway.observation().local_write_memory_refusals, 0);
     a_tx.send(body.slice(16384..)).await?;
     drop(a_tx);
     let a_reply: MutationReply = a_task.await??.error_for_status()?.json().await?;
@@ -205,6 +211,35 @@ async fn exercise() -> Result<()> {
         connection_count, 1,
         "both updates must share one owner HTTP/2 connection"
     );
+    // A later refusal at the ingress must not be attributed to the owner.
+    let occupied = ingress_budget.reserve(ingress_budget.limit()).await;
+    let refused = update(&client, &front, &b, 2, body.len())
+        .body(body.clone())
+        .send()
+        .await?;
+    assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let refusal: serde_json::Value = refused.json().await?;
+    assert_eq!(refusal["error"], "memory_capacity");
+    assert_eq!(refusal["operation_outcome"], "not_submitted");
+    assert_eq!(gateway.observation().local_write_memory_refusals, 1);
+    assert_eq!(owner.observation().local_write_memory_refusals, 1);
+    drop(occupied);
+    let admitted: MutationReply = update(&client, &front, &b, 2, body.len())
+        .body(body)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(
+        admitted.completion.result,
+        annotations::MutationResult::Applied
+    );
+    assert!(admitted.completion.index > b_reply.completion.index);
+    assert_eq!(gateway.observation().local_write_memory_refusals, 1);
+    assert_eq!(owner.observation().local_write_memory_refusals, 1);
+    assert_eq!(gateway.observation().local_status_memory_refusals, 0);
+    assert_eq!(owner.observation().local_status_memory_refusals, 0);
     gateway.shutdown().await;
     front.shutdown().await?;
     owner.shutdown().await;
