@@ -115,14 +115,14 @@ impl Owner {
                     .try_reserve_upload(length)
                     .await
                     .map_err(|_| Failure::bad("invalid_upload_size"))?
-                    .ok_or_else(|| Failure::unavailable("memory_capacity", "not_submitted"))?
+                    .ok_or_else(|| self.gate.write_memory_refusal())?
             } else {
                 tokio::time::timeout(
                     options.admission_timeout,
                     self.service.reserve_upload(length),
                 )
                 .await
-                .map_err(|_| Failure::unavailable("memory_capacity", "not_submitted"))?
+                .map_err(|_| self.gate.write_memory_refusal())?
                 .map_err(|_| Failure::bad("invalid_upload_size"))?
             };
             let bytes = self
