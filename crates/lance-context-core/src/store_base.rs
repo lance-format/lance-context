@@ -245,8 +245,8 @@ pub(crate) enum FlushOutcome {
     Sealed,
     /// No resident writer, so nothing to seal (the common case).
     Noop,
-    /// The writer's epoch was superseded by a merge; nothing to flush.
-    Fenced,
+    /// A fenced writer was reopened and its durable WAL replayed and sealed.
+    RecoveredFence,
 }
 
 /// Which physical sources a read scans.
@@ -513,8 +513,8 @@ pub(crate) struct StorageBase {
     deleted: bool,
     /// Resident MemWAL writer for this instance's shard, wrapped for `&self`
     /// concurrent access. The [`tokio::sync::Mutex`] is held only to
-    /// fetch-or-open and clone the `Arc` (see [`Self::resident_writer`]) and to
-    /// invalidate a fenced writer (see [`Self::invalidate_writer`]); it is
+    /// fetch-or-open and clone the `Arc`, including replacement of a fenced
+    /// writer (see [`Self::resident_writer`]); it is
     /// **never** held across `put`, so steady-state appends run concurrently.
     write_writer: tokio::sync::Mutex<Option<Arc<ShardWriter>>>,
 }
@@ -747,8 +747,9 @@ impl StorageBase {
     /// connection is pooled, rather than paying a cold DNS resolution + TCP/TLS
     /// handshake + epoch claim per append.
     ///
-    /// Retried exactly once on a fence: a fence means a merge superseded our
-    /// epoch, and invalidating + reopening re-claims the current one. Rows are
+    /// Retried exactly once on a fence: either this writer self-fenced after a
+    /// persistence failure or a successor superseded its epoch. Reopening
+    /// claims a new epoch and replays durable WAL. Rows are
     /// de-duplicated by the key column at read time, so a retried append can
     /// never double-count.
     pub async fn put(&self, batches: Vec<RecordBatch>) -> LanceResult<()> {
@@ -790,14 +791,16 @@ impl StorageBase {
     }
 
     async fn put_inner(&self, batches: Vec<RecordBatch>) -> LanceResult<()> {
-        let writer = self.resident_writer().await?;
+        let writer = self.resident_writer(None).await?;
         match writer.put(batches.clone()).await {
             Ok(_) => Ok(()),
             Err(err) if is_fenced_error(&err) => {
-                // Drop the fenced writer without close() — its epoch is already
-                // dead — and reopen against the current epoch for a single retry.
-                self.invalidate_writer(&writer).await;
-                let writer = self.resident_writer().await?;
+                warn!(uri = %self.uri(), shard = %self.write_shard,
+                    fence_reason = ?err.fence_reason(), error = %err,
+                    "reopening fenced writer after put failure; replaying durable WAL");
+                // Last-owner drop cancels the old background tasks without
+                // trying to flush against its dead epoch. Reopen replays WAL.
+                let writer = self.resident_writer(Some(&writer)).await?;
                 writer.put(batches).await?;
                 Ok(())
             }
@@ -809,10 +812,18 @@ impl StorageBase {
     /// held only to read-or-open and clone the `Arc`; it is released before the
     /// caller `put`s, so steady-state appends run concurrently. Opening under the
     /// lock serializes only the (rare) first open / post-fence reopen.
-    async fn resident_writer(&self) -> LanceResult<Arc<ShardWriter>> {
+    /// When replacing a fence, reuse an already-installed successor. Keep the
+    /// old slot until opening succeeds so a failed or cancelled reopen remains
+    /// visible to the next periodic flush, even without another append.
+    async fn resident_writer(
+        &self,
+        replace: Option<&Arc<ShardWriter>>,
+    ) -> LanceResult<Arc<ShardWriter>> {
         let mut guard = self.write_writer.lock().await;
         if let Some(writer) = guard.as_ref() {
-            return Ok(writer.clone());
+            if replace.is_none_or(|stale| !Arc::ptr_eq(writer, stale)) {
+                return Ok(writer.clone());
+            }
         }
         let config = ShardWriterConfig {
             shard_id: self.write_shard,
@@ -830,19 +841,6 @@ impl StorageBase {
         );
         *guard = Some(writer.clone());
         Ok(writer)
-    }
-
-    /// Invalidate a fenced writer so the next [`Self::resident_writer`] reopens.
-    /// Identity-checked: only clears the slot if it still holds `stale`, so when
-    /// N concurrent appends all fence on the same writer, the first
-    /// clears+reopens and the rest observe a fresh writer and reuse it — exactly
-    /// one reopen, and no append installs a writer another append just
-    /// invalidated.
-    async fn invalidate_writer(&self, stale: &Arc<ShardWriter>) {
-        let mut guard = self.write_writer.lock().await;
-        if guard.as_ref().is_some_and(|cur| Arc::ptr_eq(cur, stale)) {
-            *guard = None;
-        }
     }
 
     /// Materialize the active memtable into a flushed, queryable generation:
@@ -867,7 +865,7 @@ impl StorageBase {
                     "outcome" => match _outcome {
                         FlushOutcome::Sealed => "sealed",
                         FlushOutcome::Noop => "noop",
-                        FlushOutcome::Fenced => "fenced",
+                        FlushOutcome::RecoveredFence => "recovered_fence",
                     },
                 );
             }
@@ -914,7 +912,7 @@ impl StorageBase {
         // this writer remains resident. One indivisible entry can exceed the
         // configured soft memory ceiling.
         info!(shard = %self.write_shard, "recovering own WAL before cleanup merge");
-        self.resident_writer().await?;
+        self.resident_writer(None).await?;
         // Keep the recovered writer resident so concurrent ingest shares it;
         // a later cheap flush can also finish sealing if this caller is cancelled.
         self.flush().await?;
@@ -929,24 +927,27 @@ impl StorageBase {
         let Some(writer) = writer else {
             return Ok(FlushOutcome::Noop);
         };
-        let fence = match writer.force_freeze_active().await {
-            Ok(fence) => fence,
-            // A fence means a merge superseded our epoch; the next `put` reopens
-            // and replays. Nothing to flush against the dead epoch.
+        let seal = async { writer.force_freeze_active().await?.wait().await }.await;
+        match seal {
+            Ok(()) => Ok(FlushOutcome::Sealed),
+            // Either the freeze or its asynchronous flush can discover a fence.
+            // Recover here, even when no new put arrives to reopen the writer.
             Err(err) if is_fenced_error(&err) => {
-                self.invalidate_writer(&writer).await;
-                return Ok(FlushOutcome::Fenced);
+                warn!(uri = %self.uri(), shard = %self.write_shard,
+                    fence_reason = ?err.fence_reason(), error = %err,
+                    "reopening fenced writer after flush failure; replaying durable WAL");
+                let writer = self.resident_writer(Some(&writer)).await?;
+                writer.force_freeze_active().await?.wait().await?;
+                Ok(FlushOutcome::RecoveredFence)
             }
-            Err(err) => return Err(err),
-        };
-        fence.wait().await?;
-        Ok(FlushOutcome::Sealed)
+            Err(err) => Err(err),
+        }
     }
 
     /// Gracefully close the resident writer, draining its background tasks.
     ///
-    /// [`ShardWriter`] has no `Drop`, so its background tasks are only reclaimed
-    /// by an explicit `close().await`. Call this before dropping a store on a
+    /// Dropping the last writer cancels its tasks but does not seal its WAL.
+    /// Call this before dropping a store on a
     /// path that can `await` (e.g. an LRU eviction that owns the last handle).
     /// Idempotent: a no-op when no writer is resident.
     pub async fn close(&mut self) -> LanceResult<()> {
@@ -3107,8 +3108,8 @@ impl StorageBase {
 impl Drop for StorageBase {
     /// Best-effort drain of a still-resident writer's background tasks.
     ///
-    /// [`ShardWriter`] has no `Drop`, so dropping it without `close().await`
-    /// leaks its background tasks. The graceful path is [`Self::close`], but a
+    /// Dropping the last writer cancels its tasks without sealing its WAL.
+    /// The graceful path is [`Self::close`], but a
     /// store can also be dropped without an `await` (e.g. LRU eviction). When a
     /// Tokio runtime is available we move the writer into a detached task that
     /// closes it; otherwise we can only drop it.
@@ -3143,7 +3144,8 @@ impl Drop for StorageBase {
                             tracing::debug!(
                                 shard = %shard,
                                 "dropped writer is still shared by an in-flight append; \
-                                 close deferred to the last Arc holder"
+                                 task cancellation deferred to the last Arc holder; \
+                                 unsealed rows require WAL replay"
                             );
                         }
                     }
@@ -3151,8 +3153,8 @@ impl Drop for StorageBase {
             } else {
                 warn!(
                     shard = %shard,
-                    "writer dropped with no Tokio runtime available; its background tasks \
-                     leak and unflushed rows remain invisible until the next WAL replay"
+                    "writer dropped with no Tokio runtime available for close; \
+                     unflushed rows remain invisible until the next WAL replay"
                 );
             }
         }
