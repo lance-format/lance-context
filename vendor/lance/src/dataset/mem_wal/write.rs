@@ -2939,7 +2939,7 @@ impl ShardWriter {
         // Epoch 1 is a fresh shard with no predecessor to fence.
         if epoch >= 2 {
             let sentinel_position = wal_appender.write_fence_sentinel().await?;
-            info!(uri = %base_uri, %shard_id, epoch, sentinel_position,
+            tracing::info!(uri = %base_uri, %shard_id, epoch, sentinel_position,
                 "WAL predecessor fence persisted before replay");
         }
 
@@ -3088,7 +3088,7 @@ impl ShardWriter {
         // it is a hint for other readers, and `position_hint_seed` already
         // tolerates it lagging behind `replay_after_wal_entry_position`.
         let replayed_through = next_wal_position.saturating_sub(1);
-        info!(uri = %base_uri, %shard_id, epoch,
+        tracing::info!(uri = %base_uri, %shard_id, epoch,
             replay_after = manifest.replay_after_wal_entry_position,
             replayed_through, active_generation = memtable.generation(),
             active_rows = memtable.row_count(),
