@@ -548,10 +548,11 @@ impl Service {
             });
             drop(decoded);
             // Validation owns decoded patches only inside this blocking task.
-            // Keep the existing encoded-body allowance through WAL submission
-            // and applied visibility, but release the discarded decode workspace.
+            // The prepared batch and local apply registration share these Bytes.
+            // WAL transport and apply decoding have their own reservations, so
+            // only the original payload remains charged to the upload budget.
             let mut reservation = upload.reservation;
-            reservation.shrink_to(body.len() * 3);
+            reservation.shrink_to(body.len());
             Ok(PreparedAppend {
                 batch: Batch::new(upload.scope.table, bucket, producer, sequence, body),
                 rows,
