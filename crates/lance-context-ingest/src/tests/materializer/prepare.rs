@@ -79,8 +79,8 @@ async fn exercise(case: Case) -> Result<()> {
     }
     let authority = publisher.authority().clone();
     if matches!(case, Case::Unobservable) {
-        // Warm every destination: the confirmation must still fail after the
-        // client's allowed reconnect of a disconnected pooled read.
+        // Warm every destination: the confirmation must still fail after
+        // reconnecting and trying every voter within its original deadline.
         for node in 1..=3 {
             proxy
                 .client
@@ -107,7 +107,10 @@ async fn exercise(case: Case) -> Result<()> {
         }
         proxy.release.notify_one();
     }
-    let result = tokio::time::timeout(Duration::from_secs(10), operation).await??;
+    let result = tokio::time::timeout(Duration::from_secs(45), operation).await??;
+    if matches!(case, Case::Unobservable) {
+        proxy.restore_observations();
+    }
     assert_eq!(
         result.is_ok(),
         matches!(case, Case::Committed),
@@ -119,10 +122,9 @@ async fn exercise(case: Case) -> Result<()> {
         "Prepare was resubmitted"
     );
     assert_eq!(proxy.dropped.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        proxy.blocked_reads.load(Ordering::SeqCst),
-        usize::from(matches!(case, Case::Unobservable))
-    );
+    if !matches!(case, Case::Unobservable) {
+        assert_eq!(proxy.blocked_reads.load(Ordering::SeqCst), 0);
+    }
     let response = direct
         .request_routed(Request::Query {
             group: authority.group,

@@ -242,9 +242,11 @@ async fn exercise() -> Result<()> {
     // Drop exactly the already committed Prepare response, after both ingress
     // paths have returned later successes. Reuse the durable native pair.
     proxy.release.notify_one();
-    let error = tokio::time::timeout(Duration::from_secs(30), task)
+    // The proxy blocks all voter observations for the unchanged 30-second RPC deadline.
+    let error = tokio::time::timeout(Duration::from_secs(45), task)
         .await??
         .unwrap_err();
+    proxy.restore_observations();
     assert!(format!("{error:#}").contains("outcome unknown"));
     c.client = direct;
     let (new_service, runtime) = fixture::owner(&c, &narrow, &body).await?;

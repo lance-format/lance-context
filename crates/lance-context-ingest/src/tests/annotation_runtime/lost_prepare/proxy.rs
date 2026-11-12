@@ -33,6 +33,8 @@ pub(in crate::tests) struct Proxy {
     pub plans: Arc<AtomicUsize>,
     pub prepares: Arc<AtomicUsize>,
     pub blocked_reads: Arc<AtomicUsize>,
+    blocked_nodes: Arc<std::sync::Mutex<std::collections::BTreeSet<u64>>>,
+    observations_restored: Arc<AtomicBool>,
     pub advances: Arc<AtomicUsize>,
     pub appends: Arc<AtomicUsize>,
     pub closes: Arc<AtomicUsize>,
@@ -222,6 +224,16 @@ impl Frame {
 }
 
 impl Proxy {
+    /// Restore catalog reads only after the owner has observed the full outage.
+    pub fn restore_observations(&self) {
+        assert_eq!(
+            *self.blocked_nodes.lock().unwrap(),
+            [1, 2, 3].into_iter().collect()
+        );
+        assert!(self.blocked_reads.load(Ordering::SeqCst) >= 3);
+        self.observations_restored.store(true, Ordering::SeqCst);
+    }
+
     pub async fn open_append(c: &network::Cluster, root: &FsPath, execute: bool) -> Result<Self> {
         Self::open_at(c, root, Point::Append { execute }).await
     }
@@ -310,6 +322,8 @@ impl Proxy {
         let plans = Arc::new(AtomicUsize::new(0));
         let prepares = Arc::new(AtomicUsize::new(0));
         let blocked_reads = Arc::new(AtomicUsize::new(0));
+        let blocked_nodes = Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
+        let observations_restored = Arc::new(AtomicBool::new(false));
         let advances = Arc::new(AtomicUsize::new(0));
         let appends = Arc::new(AtomicUsize::new(0));
         let closes = Arc::new(AtomicUsize::new(0));
@@ -351,6 +365,8 @@ impl Proxy {
             let plans = plans.clone();
             let prepares = prepares.clone();
             let blocked_reads = blocked_reads.clone();
+            let blocked_nodes = blocked_nodes.clone();
+            let observations_restored = observations_restored.clone();
             let advances = advances.clone();
             let appends = appends.clone();
             let closes = closes.clone();
@@ -369,6 +385,8 @@ impl Proxy {
                             let plans = plans.clone();
                             let prepares = prepares.clone();
                             let blocked_reads = blocked_reads.clone();
+                            let blocked_nodes = blocked_nodes.clone();
+                            let observations_restored = observations_restored.clone();
                             let advances = advances.clone();
                             let appends = appends.clone();
                             let closes = closes.clone();
@@ -377,17 +395,17 @@ impl Proxy {
                             connections.spawn(async move {
                                 let mut downstream = acceptor.accept(socket).await?;
                                 let mut upstream = connector.connect(name, TcpStream::connect(address).await?).await?;
-                                let mut used = false;
                                 while let Some(mut request) = Frame::read(&mut downstream, matches!(point, Point::Append { .. })).await? {
                                     if matches!(point, Point::Append { .. }) { request.payload(&mut downstream, true).await?; }
-                                    if matches!(point, Point::Prepare { observe: false, .. }) && dropped.load(Ordering::SeqCst) > 0 && request.publisher_query()? && blocked_reads.load(Ordering::SeqCst) == 0 {
-                                        // A pooled read may reconnect once. Keep the fault armed
-                                        // until its fresh connection also fails, so one logical
-                                        // confirmation is unavailable even with a warm pool.
-                                        if !used { blocked_reads.store(1, Ordering::SeqCst); }
+                                    if matches!(point, Point::Prepare { observe: false, .. }) && dropped.load(Ordering::SeqCst) > 0 && request.publisher_query()? && !observations_restored.load(Ordering::SeqCst) {
+                                        // Keep every voter unavailable across reconnects and
+                                        // rerouting until the original query deadline expires.
+                                        // A single dropped connection now permits confirmation
+                                        // through another healthy voter.
+                                        blocked_reads.fetch_add(1, Ordering::SeqCst);
+                                        blocked_nodes.lock().unwrap().insert(id);
                                         return Ok(());
                                     }
-                                    used = true;
                                     let hold = request.matches_command(point)?;
                                     if hold && matches!(point, Point::Prepare { .. }) {
                                         prepares.fetch_add(1, Ordering::SeqCst);
@@ -487,6 +505,8 @@ impl Proxy {
             plans,
             prepares,
             blocked_reads,
+            blocked_nodes,
+            observations_restored,
             advances,
             appends,
             closes,

@@ -262,9 +262,11 @@ async fn lost_prepare() -> Result<()> {
     let through = retained.progress.checkpoint[&10];
     assert!(updated.index > through && inserted.index > through);
     proxy.release.notify_one();
-    let error = tokio::time::timeout(Duration::from_secs(30), task)
+    // The proxy blocks all voter observations for the unchanged 30-second RPC deadline.
+    let error = tokio::time::timeout(Duration::from_secs(45), task)
         .await??
         .unwrap_err();
+    proxy.restore_observations();
     assert!(format!("{error:#}").contains("outcome unknown"));
     assert_eq!(proxy.dropped.load(Ordering::SeqCst), 1);
     assert_eq!(
