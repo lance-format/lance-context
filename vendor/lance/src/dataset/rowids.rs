@@ -271,28 +271,28 @@ pub(crate) async fn translate_addr_treemap_to_row_ids(
             }
             RowAddrSelection::Partial(offsets) => {
                 let deletion_vector = file_fragment.get_deletion_vector().await?;
-                for physical_offset in offsets.iter() {
-                    // A deletion does not compact the row id sequence; the deleted row keeps
-                    // its slot (the deletion vector tracks it separately). So a physical offset
-                    // is a direct index into the sequence, regardless of any deletions below it.
-                    // A stale offset that points at a deleted row has no live counterpart and is
-                    // not part of any answer, so it contributes no id to the block/take set.
-                    let deleted = deletion_vector
+                // Deletions leave physical slots in the sequence. Filter them without
+                // renumbering the remaining offsets, which are already sorted.
+                let live_offsets = offsets.iter().filter(|physical_offset| {
+                    !deletion_vector
                         .as_ref()
-                        .is_some_and(|dv| dv.contains(physical_offset));
-                    if deleted {
-                        continue;
-                    }
-                    // A selected offset with no sequence entry points past the fragment's rows.
-                    // Silently dropping it would let a stale index result escape masking, so
-                    // treat the mismatch as corruption.
-                    let id = sequence.get(physical_offset as usize).ok_or_else(|| {
-                        Error::internal(format!(
+                        .is_some_and(|dv| dv.contains(*physical_offset))
+                });
+                // select() omits out-of-bounds offsets. Keep the corruption check:
+                // validating the greatest live offset covers the entire sorted input.
+                if let Some(physical_offset) = live_offsets.clone().next_back() {
+                    let sequence_len = sequence.len();
+                    if u64::from(physical_offset) >= sequence_len {
+                        return Err(Error::internal(format!(
                             "fragment_id={fragment_id} row-id sequence has no entry at \
                              physical_offset={physical_offset} (sequence len={})",
-                            sequence.len()
-                        ))
-                    })?;
+                            sequence_len
+                        )));
+                    }
+                }
+                // Reuse the sequence cursor instead of restarting bitmap/range
+                // traversal for every match. No intermediate ID vector is needed.
+                for id in sequence.select(live_offsets.map(|offset| offset as usize)) {
                     row_ids.insert(id);
                 }
             }
