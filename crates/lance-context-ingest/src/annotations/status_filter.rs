@@ -33,11 +33,12 @@ impl Service {
             self.wait_through(recovery_cut).await?;
             // HTTP admission bounds these waiters. Acquire the shared reader
             // before capturing a base, within the original request deadline.
-            let read = self
+            let mut read = self
                 .shared
                 .staging
                 .capture_status_when_available(status, limit, response_bytes)
                 .await?;
+            read.cap_scan_workspace(self.ingress.budget.limit())?;
             let workspace = read.workspace_bytes()?;
             ensure!(
                 workspace <= self.ingress.budget.limit(),

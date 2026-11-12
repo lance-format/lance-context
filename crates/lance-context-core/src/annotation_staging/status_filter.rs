@@ -4,7 +4,8 @@ use lance::index::DatasetIndexExt;
 use std::collections::BTreeSet;
 
 pub const MAX_STATUS_MATCHES: usize = 1024;
-const SCAN_ROWS: usize = 32;
+const SCAN_ROWS: usize = 1024;
+const MIN_SCAN_ROWS: usize = 32;
 
 #[derive(Clone, Debug, PartialEq, Eq, ::serde::Serialize, ::serde::Deserialize)]
 pub struct StatusMatches {
@@ -32,6 +33,7 @@ pub struct StatusRead {
     limit: usize,
     response_bytes: usize,
     value_bytes: usize,
+    scan_rows: usize,
     _reader: OwnedSemaphorePermit,
 }
 
@@ -105,17 +107,36 @@ impl AnnotationStaging {
             limit,
             response_bytes,
             value_bytes: self.limits.value_bytes,
+            scan_rows: SCAN_ROWS,
             _reader: reader,
         })
     }
 }
 
 impl StatusRead {
+    /// Reduce the scan batch when the caller's total workspace budget cannot
+    /// accommodate the preferred batch. Keep the previous 32-row minimum so
+    /// existing small budgets can still serve queries without tiny scan batches.
+    pub fn cap_scan_workspace(&mut self, budget: usize) -> Result<()> {
+        let rows = self
+            .response_bytes
+            .checked_add(64 << 10)
+            .and_then(|fixed| budget.checked_sub(fixed))
+            .zip(self.value_bytes.checked_mul(2))
+            .and_then(|(bytes, row_bytes)| bytes.checked_div(row_bytes))
+            .unwrap_or(0);
+        if rows < MIN_SCAN_ROWS {
+            return Err(invalid("status filter workspace exceeds budget"));
+        }
+        self.scan_rows = self.scan_rows.min(rows);
+        Ok(())
+    }
+
     /// Admission estimate for response storage and narrow scanner vectors.
     /// This is not a hard cap on native index/query allocations or total I/O.
     pub fn workspace_bytes(&self) -> Result<usize> {
         self.value_bytes
-            .checked_mul(SCAN_ROWS * 2)
+            .checked_mul(self.scan_rows * 2)
             .and_then(|n| n.checked_add(self.response_bytes))
             .and_then(|n| n.checked_add(64 << 10))
             .ok_or_else(|| invalid("status filter workspace overflow"))
@@ -166,7 +187,7 @@ impl StatusRead {
             |status| col("status").eq(lit(status.clone())),
         ));
         scan.limit(Some(self.limit as i64 + 1), None)?;
-        scan.batch_size(SCAN_ROWS)
+        scan.batch_size(self.scan_rows)
             .batch_readahead(1)
             .fragment_readahead(1);
         let mut stream = scan.try_into_stream().await?;
