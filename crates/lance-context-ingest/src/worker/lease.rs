@@ -109,13 +109,23 @@ impl Claims {
                 tokio::select! {
                     _ = stopped.changed() => break,
                     _ = tick.tick() => {
+                        let started = tokio::time::Instant::now();
                         let result = tokio::time::timeout(timeout, async {
-                            keeper.keep_alive().await?;
-                            let response = stream.message().await?.context("lease renewal stream closed")?;
-                            ensure!(response.id() == lease && response.ttl() > 0, "lease expired");
+                            keeper.keep_alive().await.context("sending lease renewal")?;
+                            let response = stream.message().await
+                                .context("receiving lease renewal")?
+                                .context("lease renewal stream closed")?;
+                            ensure!(response.id() == lease, "unexpected lease renewal response ID");
+                            ensure!(response.ttl() > 0, "lease expired");
                             Ok::<_, anyhow::Error>(())
-                        }).await;
-                        if !matches!(result, Ok(Ok(()))) { break; }
+                        }).await.context("lease renewal deadline").and_then(|result| result);
+                        if let Err(error) = result {
+                            eprintln!(
+                                "materializer lease renewal stopped: lease={lease} elapsed_ms={} timeout_ms={}: {error:#}",
+                                started.elapsed().as_millis(), timeout.as_millis(),
+                            );
+                            break;
+                        }
                     }
                 }
             }
