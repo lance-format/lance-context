@@ -300,7 +300,7 @@ impl MemTableFlusher {
         self.publish_prepared(&prepared, epoch).await
     }
 
-    #[instrument(name = "mt_flush_storage", level = "info", skip_all, fields(shard_id = %self.shard_id, epoch, generation = memtable.generation(), row_count = memtable.row_count()))]
+    #[instrument(name = "mt_flush_storage", level = "info", skip_all, fields(uri = %self.base_uri, shard_id = %self.shard_id, epoch, covered_wal_entry_position, generation = memtable.generation(), row_count = memtable.row_count()))]
     pub(crate) async fn prepare(
         &self,
         memtable: &MemTable,
@@ -308,7 +308,12 @@ impl MemTableFlusher {
         covered_wal_entry_position: u64,
         durable: usize,
     ) -> Result<PreparedMemTableFlush> {
-        self.manifest_store.check_fenced(epoch).await?;
+        self.manifest_store
+            .check_fenced(epoch)
+            .await
+            .inspect_err(|error| {
+                tracing::warn!(%error, "memtable flush fence check failed before storage operation");
+            })?;
 
         if memtable.row_count() == 0 {
             return Err(Error::invalid_input("Cannot flush empty MemTable"));
@@ -581,7 +586,7 @@ impl MemTableFlusher {
         self.publish_prepared(&prepared, epoch).await
     }
 
-    #[instrument(name = "mt_flush_with_indexes", level = "info", skip_all, fields(shard_id = %self.shard_id, epoch, generation = memtable.generation(), row_count = memtable.row_count(), index_count = index_specs.len()))]
+    #[instrument(name = "mt_flush_with_indexes", level = "info", skip_all, fields(uri = %self.base_uri, shard_id = %self.shard_id, epoch, covered_wal_entry_position, generation = memtable.generation(), row_count = memtable.row_count(), index_count = index_specs.len()))]
     pub(crate) async fn prepare_with_indexes(
         &self,
         memtable: &MemTable,
@@ -590,7 +595,12 @@ impl MemTableFlusher {
         covered_wal_entry_position: u64,
         durable: usize,
     ) -> Result<PreparedMemTableFlush> {
-        self.manifest_store.check_fenced(epoch).await?;
+        self.manifest_store
+            .check_fenced(epoch)
+            .await
+            .inspect_err(|error| {
+                tracing::warn!(%error, "memtable flush fence check failed before storage operation");
+            })?;
 
         if memtable.row_count() == 0 {
             return Err(Error::invalid_input("Cannot flush empty MemTable"));
@@ -780,13 +790,18 @@ impl MemTableFlusher {
     }
 
     /// Update the shard manifest with the new SSTable.
-    #[instrument(name = "mt_publish_prepared", level = "info", skip_all, fields(shard_id = %self.shard_id, epoch, generation = prepared.result.sstable.generation))]
+    #[instrument(name = "mt_publish_prepared", level = "info", skip_all, fields(uri = %self.base_uri, shard_id = %self.shard_id, epoch, generation = prepared.result.sstable.generation, covered_wal_entry_position = prepared.result.covered_wal_entry_position, path = %prepared.result.sstable.path))]
     pub(crate) async fn publish_prepared(
         &self,
         prepared: &PreparedMemTableFlush,
         epoch: u64,
     ) -> Result<FlushResult> {
-        self.manifest_store.check_fenced(epoch).await?;
+        self.manifest_store
+            .check_fenced(epoch)
+            .await
+            .inspect_err(|error| {
+                tracing::warn!(%error, "memtable flush fence check failed before storage operation");
+            })?;
         let attempted = prepared.attempted_versions.lock().unwrap().clone();
         if !attempted.is_empty() {
             // A committed generation may already have been merged out of the
@@ -806,6 +821,10 @@ impl MemTableFlusher {
                         prepared.size,
                     )
                 {
+                    info!(
+                        manifest_version = manifest.version,
+                        "memtable flush publication reconciled from manifest"
+                    );
                     return Ok(prepared.result.clone());
                 }
             }
@@ -826,6 +845,7 @@ impl MemTableFlusher {
             Some(&prepared.attempted_versions),
         )
         .await?;
+        info!("memtable flush publication completed");
         Ok(prepared.result.clone())
     }
 

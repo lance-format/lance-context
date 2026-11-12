@@ -91,7 +91,7 @@ impl WriterHealth {
         let active = state.active.as_mut().unwrap();
         active.failed_at.get_or_insert_with(Instant::now);
         active.terminal |= terminal;
-        tracing::warn!(uri = %state.uri, shard = %state.shard, generation,
+        tracing::warn!(writer_id = self.id, uri = %state.uri, shard = %state.shard, generation,
             terminal, error, "memtable flush failed; data retained for recovery");
     }
 
@@ -117,7 +117,8 @@ impl Drop for WriterHealth {
         let state = self.state.lock().unwrap();
         if state.generations > 0 {
             metrics::counter!("rollout_memtable_flush_unresolved_writer_drops_total").increment(1);
-            tracing::warn!(uri = %state.uri, shard = %state.shard,
+            tracing::warn!(writer_id = self.id, uri = %state.uri, shard = %state.shard,
+                active_generation = ?state.active.as_ref().map(|active| active.generation),
                 generations = state.generations, bytes = state.bytes,
                 "writer dropped with unresolved flushes; recovery is not verified");
         }
