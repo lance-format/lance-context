@@ -84,8 +84,12 @@ pub enum Phase {
     NativeStatusIndex,
     /// A shared narrow-value lookup for separately applied patch requests.
     AnnotationPatchLookup,
+    /// Waiting for reader admission and capturing a compatible point-read view.
+    AnnotationPointCapture,
+    /// Resolving a captured point view from staging, cache, or narrow Lance data.
+    AnnotationPointResolve,
 }
-const NAMES: [&str; 46] = [
+const NAMES: [&str; 48] = [
     "claim",
     "acquire",
     "state",
@@ -132,6 +136,8 @@ const NAMES: [&str; 46] = [
     "native_turn_id_index",
     "native_status_index",
     "annotation_patch_lookup",
+    "annotation_point_capture",
+    "annotation_point_resolve",
 ];
 pub const PHASE_COUNT: usize = NAMES.len();
 
