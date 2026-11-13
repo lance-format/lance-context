@@ -5,6 +5,14 @@ use std::{ops::Deref, sync::Weak};
 
 pub(super) struct Base {
     pub dataset: Arc<Dataset>,
+    // Only validated index-only publications retain this identity. Data
+    // publication, compaction and another staging instance invalidate lookups.
+    values_identity: Arc<()>,
+}
+impl Base {
+    pub(super) fn same_values(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.values_identity, &other.values_identity)
+    }
 }
 impl Deref for Base {
     type Target = Dataset;
@@ -16,14 +24,32 @@ impl Deref for Base {
 pub(super) struct Registry(Vec<Weak<Base>>);
 impl Registry {
     pub fn new(dataset: Arc<Dataset>) -> (Arc<Base>, Self) {
-        let base = Arc::new(Base { dataset });
+        let base = Arc::new(Base {
+            dataset,
+            values_identity: Arc::new(()),
+        });
         let registry = Self(vec![Arc::downgrade(&base)]);
         (base, registry)
     }
 
     pub fn install(&mut self, dataset: Arc<Dataset>) -> Arc<Base> {
+        self.install_with_values(dataset, Arc::new(()))
+    }
+
+    pub fn install_indexed(&mut self, dataset: Arc<Dataset>, source: &Base) -> Arc<Base> {
+        self.install_with_values(dataset, source.values_identity.clone())
+    }
+
+    fn install_with_values(
+        &mut self,
+        dataset: Arc<Dataset>,
+        values_identity: Arc<()>,
+    ) -> Arc<Base> {
         self.0.retain(|base| base.strong_count() != 0);
-        let base = Arc::new(Base { dataset });
+        let base = Arc::new(Base {
+            dataset,
+            values_identity,
+        });
         self.0.push(Arc::downgrade(&base));
         base
     }
