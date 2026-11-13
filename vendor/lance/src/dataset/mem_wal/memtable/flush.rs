@@ -300,7 +300,7 @@ impl MemTableFlusher {
         self.publish_prepared(&prepared, epoch).await
     }
 
-    #[instrument(name = "mt_flush_storage", level = "info", skip_all, fields(uri = %self.base_uri, shard_id = %self.shard_id, epoch, covered_wal_entry_position, generation = memtable.generation(), row_count = memtable.row_count()))]
+    #[instrument(name = "mt_flush_storage", level = "info", skip_all, fields(uri = %self.base_uri, shard_id = %self.shard_id, epoch = epoch, covered_wal_entry_position = covered_wal_entry_position, generation = memtable.generation(), row_count = memtable.row_count()))]
     pub(crate) async fn prepare(
         &self,
         memtable: &MemTable,
@@ -586,7 +586,7 @@ impl MemTableFlusher {
         self.publish_prepared(&prepared, epoch).await
     }
 
-    #[instrument(name = "mt_flush_with_indexes", level = "info", skip_all, fields(uri = %self.base_uri, shard_id = %self.shard_id, epoch, covered_wal_entry_position, generation = memtable.generation(), row_count = memtable.row_count(), index_count = index_specs.len()))]
+    #[instrument(name = "mt_flush_with_indexes", level = "info", skip_all, fields(uri = %self.base_uri, shard_id = %self.shard_id, epoch = epoch, covered_wal_entry_position = covered_wal_entry_position, generation = memtable.generation(), row_count = memtable.row_count(), index_count = index_specs.len()))]
     pub(crate) async fn prepare_with_indexes(
         &self,
         memtable: &MemTable,
@@ -790,7 +790,7 @@ impl MemTableFlusher {
     }
 
     /// Update the shard manifest with the new SSTable.
-    #[instrument(name = "mt_publish_prepared", level = "info", skip_all, fields(uri = %self.base_uri, shard_id = %self.shard_id, epoch, generation = prepared.result.sstable.generation, covered_wal_entry_position = prepared.result.covered_wal_entry_position, path = %prepared.result.sstable.path))]
+    #[instrument(name = "mt_publish_prepared", level = "info", skip_all, fields(uri = %self.base_uri, shard_id = %self.shard_id, epoch = epoch, generation = prepared.result.sstable.generation, covered_wal_entry_position = prepared.result.covered_wal_entry_position, path = %prepared.result.sstable.path))]
     pub(crate) async fn publish_prepared(
         &self,
         prepared: &PreparedMemTableFlush,
@@ -1192,7 +1192,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_flusher_success() {
-        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let (store, base_path, base_uri, temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
         let manifest_store = Arc::new(ShardManifestStore::new(
             store.clone(),
@@ -1222,7 +1222,32 @@ mod tests {
             shard_id,
             manifest_store.clone(),
         );
-        let result = flusher.flush(&memtable, epoch, 1, durable).await.unwrap();
+        use tracing::instrument::WithSubscriber;
+        let log_path = temp_dir.path().join("flush.log");
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(
+                std::fs::File::create(&log_path).unwrap(),
+            ))
+            .finish();
+        let result = flusher
+            .flush(&memtable, epoch, 1, durable)
+            .with_subscriber(subscriber)
+            .await
+            .unwrap();
+        let logs = std::fs::read_to_string(log_path).unwrap();
+        let publication = logs
+            .lines()
+            .find(|line| line.contains("memtable flush publication completed"))
+            .expect("successful publication emits its correlation fields");
+        assert!(
+            publication.contains(&format!("epoch={epoch}")),
+            "{publication}"
+        );
+        assert!(publication.contains(&format!(
+            "covered_wal_entry_position={}",
+            result.covered_wal_entry_position
+        )));
 
         assert_eq!(result.sstable.generation, 1);
         assert_eq!(result.rows_flushed, 10);
