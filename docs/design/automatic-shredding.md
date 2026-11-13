@@ -135,6 +135,10 @@ value larger than 32 KiB uses existing compression instead of a raw constant
 page. This prevents bounded backfill batches from expanding large compressed
 documents without changing the file format or the automatic selection policy.
 
+The [November 2026 measurements](../benchmarks/automatic-shredding-2026-11/README.md)
+include raw samples, before/after regressions, live and retained storage, and
+the remaining synchronous preparation and memory costs.
+
 
 ## Python API
 
