@@ -64,3 +64,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util"] }
 [[example]]
 name = "annotation_column_update"
 required-features = ["lance-io-metrics"]
+
+[[example]]
+name = "automatic_shredding"
+required-features = ["lance-io-metrics"]
