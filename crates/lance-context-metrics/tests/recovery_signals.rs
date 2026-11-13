@@ -97,6 +97,22 @@ async fn middleware_records_inflight_demand_and_read_failures_without_payloads()
                     serde_json::Value::Null
                 }
             );
+            assert_eq!(
+                v["tables"][0]["read_error_method"],
+                if finished {
+                    serde_json::json!("GET")
+                } else {
+                    serde_json::Value::Null
+                }
+            );
+            assert_eq!(
+                v["tables"][0]["read_error_route"],
+                if finished {
+                    serde_json::json!("/api/v1/rollouts/{name}/records/{id}")
+                } else {
+                    serde_json::Value::Null
+                }
+            );
         } else {
             assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         }
@@ -144,6 +160,8 @@ async fn middleware_records_inflight_demand_and_read_failures_without_payloads()
             .unwrap();
         assert_eq!(slow["read_error_status"], serde_json::Value::Null);
         assert_eq!(slow["read_slow_status"], 404);
+        assert_eq!(slow["read_slow_method"], "GET");
+        assert_eq!(slow["read_slow_route"], "/api/v1/rollouts/{name}/records");
         assert!(slow["read_slow_header_millis"].as_u64().unwrap() >= 5000);
     }
     let invalid = app
