@@ -368,7 +368,7 @@ pub async fn http_metrics_layer(req: Request<axum::body::Body>, next: Next) -> R
     let recovery_target = recovery_signals::target(req.uri().path(), &path, &method);
     let response = next.run(req).await;
     let elapsed = start.elapsed();
-    recovery_signals::record(recovery_target, response.status(), elapsed);
+    recovery_signals::record(recovery_target, response.status(), elapsed, &method, &path);
 
     let status = response.status().as_u16().to_string();
     let elapsed = elapsed.as_secs_f64();
