@@ -137,3 +137,75 @@ async fn stale_backfill_cannot_overwrite_a_newer_append() {
         Some(json!({"text": "second"}))
     );
 }
+#[tokio::test]
+async fn projected_residual_filters_preserve_containers_ancestors_and_batch_boundaries() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("projected.lance");
+    let mut store = DocumentStore::create(uri.to_str().unwrap(), ShredPolicy::default(), None)
+        .await
+        .unwrap();
+    // Select a scalar ancestor before its later object-shaped values arrive.
+    let first = store
+        .add(vec![
+            json!({"node": "scalar", "body": "large unrelated text"}),
+        ])
+        .await
+        .unwrap();
+    let documents: Vec<_> = (0..1030)
+        .map(|i| {
+            json!({
+                "body": "unrelated payload ".repeat(64),
+                "node": {"child": i, "sibling": true},
+                "tags": [i], "nullable": null,
+            })
+        })
+        .collect();
+    let ids = store.add(documents.clone()).await.unwrap();
+    let last = documents.last().unwrap();
+    assert_eq!(
+        store
+            .filter_eq(&["tags".into()], &json!([1029]), 10)
+            .await
+            .unwrap(),
+        vec![ids[1029].clone()]
+    );
+    assert_eq!(
+        store
+            .filter_eq(&["node".into()], &last["node"], 10)
+            .await
+            .unwrap(),
+        vec![ids[1029].clone()]
+    );
+    assert_eq!(
+        store.filter_eq(&[], last, 10).await.unwrap(),
+        vec![ids[1029].clone()]
+    );
+    assert_eq!(
+        store
+            .filter_eq(&["node".into()], &json!("scalar"), 10)
+            .await
+            .unwrap(),
+        first
+    );
+    assert_eq!(
+        store
+            .filter_eq(&["nullable".into()], &Value::Null, 2000)
+            .await
+            .unwrap()
+            .len(),
+        ids.len()
+    );
+    assert!(store
+        .filter_eq(&["absent".into()], &Value::Null, 2000)
+        .await
+        .unwrap()
+        .is_empty());
+    let version = store.version();
+    store.backfill().await.unwrap();
+    for (id, expected) in ids.iter().zip(&documents).step_by(127) {
+        assert_eq!(store.get(id).await.unwrap().as_ref(), Some(expected));
+    }
+    assert_eq!(store.get(&ids[1029]).await.unwrap().as_ref(), Some(last));
+    store.checkout(version).await.unwrap();
+    assert_eq!(store.get(&ids[1029]).await.unwrap().as_ref(), Some(last));
+}

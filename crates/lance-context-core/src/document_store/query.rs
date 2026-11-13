@@ -55,12 +55,29 @@ impl DocumentStore {
         if let Some(field) = field {
             scanner.filter_expr(col(column_name(field)).is_null());
         }
-        scanner.batch_size(1).batch_readahead(1);
+        // Reconstruct only the queried subtree and its scalar ancestors. Other
+        // extracted fields can hold megabytes of text unrelated to this filter.
+        let projected_layout = ShredLayout {
+            fields: self
+                .layout
+                .fields
+                .iter()
+                .filter(|field| field.path.starts_with(path) || path.starts_with(&field.path))
+                .cloned()
+                .collect(),
+        };
+        let mut columns = vec![ID.to_string(), RESIDUAL.to_string()];
+        columns.extend(projected_layout.fields.iter().map(column_name));
+        scanner.project(&columns)?;
+        scanner
+            .batch_size(1024)
+            .batch_size_bytes(4 * 1024 * 1024)
+            .batch_readahead(1);
         let mut stream = scanner.try_into_stream().await?;
         while let Some(batch) = stream.try_next().await? {
             let batch_ids = batch_ids(&batch)?;
             for (row, id) in batch_ids.into_iter().enumerate() {
-                let document = decode(&batch, row, &self.layout)?;
+                let document = decode(&batch, row, &projected_layout)?;
                 if logical_value(&document, path) == Some(value) {
                     ids.push(id);
                     if ids.len() == limit {
@@ -73,7 +90,8 @@ impl DocumentStore {
     }
 
     /// Re-shred historical residual values with the current layout in a single
-    /// overwrite commit. Streams one record at a time; original IDs are retained.
+    /// overwrite commit. Streams batches targeting 4 MiB and at most 1024 rows;
+    /// a single oversized record can exceed the byte target. IDs are retained.
     /// Historical dataset versions still retain their original bytes.
     pub async fn backfill(&mut self) -> Result<()> {
         if self.pinned {
@@ -87,7 +105,10 @@ impl DocumentStore {
         schema = schema.with_metadata(metadata);
         let schema = Arc::new(schema);
         let mut scanner = self.dataset.scan();
-        scanner.batch_size(1).batch_readahead(1);
+        scanner
+            .batch_size(1024)
+            .batch_size_bytes(4 * 1024 * 1024)
+            .batch_readahead(1);
         let source = scanner.try_into_stream().await?;
         let layout = self.layout.clone();
         let output_schema = schema.clone();

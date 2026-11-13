@@ -174,7 +174,8 @@ jobs:
           sudo apt-get "${apt_options[@]}" install -y clang libclang-dev protobuf-compiler
       - name: Optional Lance object-store metrics
         run: |
-          cargo test -p lance-context-core --features lance-io-metrics --test lance_io_metrics
+          cargo test -p lance-context-core --features lance-io-metrics --test lance_io_metrics --test document_store_io
+          cargo clippy -p lance-context-core --features lance-io-metrics --test document_store_io --test document_store_backfill -- -D warnings
           cargo test -p lance-context-core --all-features --lib latency_histograms_carry_only_bounded_labels
           cargo check -p lance-context-server --features lance-io-metrics
           cargo check -p lance-context-core --no-default-features
