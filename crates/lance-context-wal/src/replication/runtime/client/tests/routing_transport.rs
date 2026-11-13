@@ -38,6 +38,94 @@ fn query() -> Request {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_moves_past_a_refused_initial_or_cached_voter() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let c = RpcCluster::open(dir.path(), Options::default()).await?;
+    let original = batch(1);
+    let response = c
+        .client
+        .request_routed(Request::Append {
+            group: 10,
+            batch: original.clone(),
+        })
+        .await?;
+    let index = accepted(&response);
+    drop(response);
+    // Establish the exact retained record on each real replica before testing
+    // transport routing. A local missing record is not a quorum absence proof.
+    for node in 1..=3 {
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let response = c
+                    .client
+                    .request(node, Request::Fetch { group: 10, index })
+                    .await?;
+                if matches!(&response.reply, Reply::Record(Some(meta)) if meta == &original.meta) {
+                    assert_eq!(response.body, original.body);
+                    return Ok::<_, anyhow::Error>(());
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await??;
+    }
+    for (failed, cached) in [(1, false), (3, true)] {
+        let unavailable = TcpListener::bind("127.0.0.1:0").await?;
+        let mut endpoints = c.endpoints.clone();
+        endpoints.get_mut(&failed).unwrap().data_address = unavailable.local_addr()?.to_string();
+        let client = client(&c, endpoints, Duration::from_secs(1))?;
+        if cached {
+            client.leaders.lock().unwrap().insert(10, failed);
+        }
+        drop(unavailable);
+        let response = client
+            .request_routed(Request::Fetch { group: 10, index })
+            .await?;
+        assert!(matches!(&response.reply, Reply::Record(Some(meta)) if meta == &original.meta));
+        assert_eq!(response.body, original.body);
+        drop(response);
+        assert_eq!(
+            client.budgets.data.available_permits(),
+            client.options.data_bytes
+        );
+    }
+    c.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unavailable_voters_share_the_original_fetch_deadline() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let c = RpcCluster::open(dir.path(), Options::default()).await?;
+    let mut endpoints = c.endpoints.clone();
+    let mut unavailable = Vec::new();
+    for endpoint in endpoints.values_mut() {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        endpoint.data_address = listener.local_addr()?.to_string();
+        unavailable.push(listener);
+    }
+    let deadline = Duration::from_millis(200);
+    let client = client(&c, endpoints, deadline)?;
+    drop(unavailable);
+    let started = tokio::time::Instant::now();
+    let result = timeout(
+        Duration::from_secs(2),
+        client.request_routed(Request::Fetch {
+            group: 10,
+            index: 1,
+        }),
+    )
+    .await?;
+    let error = result.err().context("unavailable fetch returned success")?;
+    assert!(error.to_string().contains("routed exchange timed out"));
+    assert!(started.elapsed() >= deadline);
+    assert_eq!(
+        client.budgets.data.available_permits(),
+        client.options.data_bytes
+    );
+    c.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn query_moves_past_a_refused_cached_voter() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let c = RpcCluster::open(dir.path(), Options::default()).await?;
