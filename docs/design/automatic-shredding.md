@@ -102,6 +102,13 @@ are checked through reconstructed JSON. The fallback covers values written
 before promotion, type changes, containers, and explicit nulls. Missing is not
 equal to JSON null. Results have no ordering guarantee.
 
+Residual predicates read IDs, residual JSON, and extracted fields related to the
+queried path (its subtree and scalar ancestors). Unrelated extracted text is not
+read or reconstructed. Text still inside a historical residual must be read with
+that residual. Fallback scans and backfill target batches of 4 MiB and at most
+1,024 rows with one batch of readahead. The byte target is approximate; one large
+document can exceed it, and it is not a process memory limit.
+
 `search(query, limit)` searches the automatically selected string paths and
 returns IDs with native Lance full-text scores. It uses a lowercase simple
 tokenizer without stemming or stop-word removal. Arrays, root scalar documents,
@@ -121,6 +128,12 @@ commit retries. A stale rewrite fails instead of rebasing over newer appends.
 The backfill marker and data are published together; failed index creation can
 be retried. Pinned snapshots can search if already prepared, but cannot trigger
 backfill or index creation. Retained versions continue to hold their old bytes.
+
+The vendored Lance 2.2 encoder has a small singleton compression guard (see
+[`BACKPORT.md`](../../vendor/lance-encoding/BACKPORT.md)): a single text/binary
+value larger than 32 KiB uses existing compression instead of a raw constant
+page. This prevents bounded backfill batches from expanding large compressed
+documents without changing the file format or the automatic selection policy.
 
 
 ## Python API

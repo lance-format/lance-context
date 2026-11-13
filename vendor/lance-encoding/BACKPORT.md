@@ -13,4 +13,14 @@ The existing scoped child-task propagation is retained in src/decoder.rs and
 array_encoding/{logical/{list,primitive},physical/{binary,dictionary,packed_struct}}.rs.
 It uses the task group documented in ../lance-core/BACKPORT.md and preserves
 existing cancellation and handle behavior. The remaining upstream source,
-including the 14.0.2 sliced-validity fix, is unchanged.
+including the 14.0.2 sliced-validity fix, is unchanged except for the singleton
+compression guard below.
+
+`encodings/logical/primitive/structural_encoder.rs` lets a single variable-width
+value larger than 32 KiB fall through constant-page selection to the existing
+compression strategy. A constant page stores its scalar raw; for a singleton
+there is no repetition to eliminate. This prevents DocumentStore backfill from
+expanding compressed 20 MiB text into uncompressed pages when streaming bounded
+batches. Existing multi-value constants (including null-padded large values),
+small scalars, and the on-disk format are unchanged. Regressions cover compressed
+UTF-8/binary singletons with both offset widths and DocumentStore rewrite/reopen.
