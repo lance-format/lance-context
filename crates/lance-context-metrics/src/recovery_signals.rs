@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::Query;
@@ -28,11 +28,20 @@ const MAX_TARGET: usize = 1032;
 const SLOW_READ: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
+struct ReadRequest {
+    method: Method,
+    // Axum's matched template, never the incoming URI or its parameters.
+    route: Arc<str>,
+}
+
+#[derive(Clone)]
 struct Entry {
     touched: Instant,
     active_at: u64,
     read_error: Option<(Instant, u64, u16)>,
     read_slow: Option<(Instant, u64, u16, u64)>,
+    read_error_request: Option<ReadRequest>,
+    read_slow_request: Option<ReadRequest>,
 }
 
 impl Entry {
@@ -43,9 +52,11 @@ impl Entry {
         }
         if other.read_error.map(|v| v.0) > self.read_error.map(|v| v.0) {
             self.read_error = other.read_error;
+            self.read_error_request = other.read_error_request.clone();
         }
         if other.read_slow.map(|v| v.0) > self.read_slow.map(|v| v.0) {
             self.read_slow = other.read_slow;
+            self.read_slow_request = other.read_slow_request.clone();
         }
     }
 }
@@ -104,7 +115,7 @@ impl Signals {
     }
 
     fn record(&self, target: String, read: bool, status: StatusCode, now: Instant, wall: u64) {
-        self.record_with_latency(target, read, status, now, wall, None);
+        self.record_with_latency(target, read, status, now, wall, None, None);
     }
 
     fn writable_shard(
@@ -133,6 +144,7 @@ impl Signals {
         None
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record_with_latency(
         &self,
         target: String,
@@ -141,6 +153,7 @@ impl Signals {
         now: Instant,
         wall: u64,
         elapsed: Option<Duration>,
+        request: Option<(&Method, &str)>,
     ) {
         let slow = elapsed.filter(|elapsed| read && *elapsed >= SLOW_READ);
         if !self.enabled
@@ -165,11 +178,18 @@ impl Signals {
             active_at: wall,
             read_error: None,
             read_slow: None,
+            read_error_request: None,
+            read_slow_request: None,
         });
         entry.touched = now;
         entry.active_at = wall;
+        let request = request.map(|(method, route)| ReadRequest {
+            method: method.clone(),
+            route: route.into(),
+        });
         if read && status.is_server_error() {
             entry.read_error = Some((now, wall, status.as_u16()));
+            entry.read_error_request = request.clone();
         }
         if let Some(elapsed) = slow {
             entry.read_slow = Some((
@@ -178,6 +198,7 @@ impl Signals {
                 status.as_u16(),
                 elapsed.as_millis().min(u64::MAX as u128) as u64,
             ));
+            entry.read_slow_request = request;
         }
     }
 
@@ -229,12 +250,18 @@ impl Signals {
             let slow = entry
                 .read_slow
                 .filter(|(at, _, _, _)| now.saturating_duration_since(*at) < WINDOW);
+            let error_request = error.and(entry.read_error_request.as_ref());
+            let slow_request = slow.and(entry.read_slow_request.as_ref());
             let row = json!({"name": name, "active_at_unix_millis": entry.active_at,
                 "read_error_at_unix_millis": error.map(|(_, at, _)| at),
                 "read_error_status": error.map(|(_, _, status)| status),
+                "read_error_method": error_request.map(|r| r.method.as_str()),
+                "read_error_route": error_request.map(|r| r.route.as_ref()),
                 "read_slow_at_unix_millis": slow.map(|(_, at, _, _)| at),
                 "read_slow_status": slow.map(|(_, _, status, _)| status),
-                "read_slow_header_millis": slow.map(|(_, _, _, millis)| millis)});
+                "read_slow_header_millis": slow.map(|(_, _, _, millis)| millis),
+                "read_slow_method": slow_request.map(|r| r.method.as_str()),
+                "read_slow_route": slow_request.map(|r| r.route.as_ref())});
             let size = serde_json::to_vec(&row).expect("bounded scalar row").len() + 1;
             if tables.len() >= SHARDS * PER_SHARD || bytes + size > MAX_REPLY {
                 complete = false;
@@ -381,7 +408,13 @@ fn parse_target(path: &str, matched: &str, method: &Method) -> Option<(String, b
     Some((format!("{kind}{name}"), read))
 }
 
-pub(super) fn record(target: Option<(String, bool)>, status: StatusCode, elapsed: Duration) {
+pub(super) fn record(
+    target: Option<(String, bool)>,
+    status: StatusCode,
+    elapsed: Duration,
+    method: &Method,
+    matched_route: &str,
+) {
     if let Some((name, true)) = target {
         if status.is_server_error() || elapsed >= SLOW_READ {
             global().record_with_latency(
@@ -391,6 +424,7 @@ pub(super) fn record(target: Option<(String, bool)>, status: StatusCode, elapsed
                 Instant::now(),
                 wall_millis(),
                 Some(elapsed),
+                Some((method, matched_route)),
             );
         }
     }
@@ -636,7 +670,7 @@ mod tests {
             ),
             ("write", false, StatusCode::OK, Duration::from_secs(241)),
         ] {
-            signals.record_with_latency(name.into(), read, status, now, 100, Some(elapsed));
+            signals.record_with_latency(name.into(), read, status, now, 100, Some(elapsed), None);
         }
         // Continued activity and a successful read must not erase either hint.
         signals.record(
@@ -653,6 +687,7 @@ mod tests {
             now + Duration::from_secs(200),
             200,
             Some(Duration::from_millis(1)),
+            None,
         );
         let v = value(&signals, now + Duration::from_secs(201)).await;
         let rows = v["tables"].as_array().unwrap();
@@ -696,6 +731,7 @@ mod tests {
                 now,
                 1,
                 Some(SLOW_READ),
+                None,
             );
         }
         let v = value(&signals, now).await;
@@ -740,6 +776,8 @@ mod tests {
     async fn priority_and_activity_entries_merge_without_losing_newer_hints() {
         let signals = Signals::new(true);
         let now = Instant::now();
+        let blob_route = "/api/v1/rollouts/{name}/records/{id}/blob";
+        let search_route = "/api/v1/rollouts/{name}/search";
         {
             let _held = signals.shards[Signals::shard("t")].lock().unwrap();
             signals.record_with_latency(
@@ -749,14 +787,17 @@ mod tests {
                 now,
                 1,
                 Some(SLOW_READ),
+                Some((&Method::GET, blob_route)),
             );
         }
-        signals.record(
+        signals.record_with_latency(
             "t".into(),
             true,
             StatusCode::INTERNAL_SERVER_ERROR,
             now + Duration::from_secs(1),
             2,
+            Some(Duration::from_millis(1)),
+            Some((&Method::POST, search_route)),
         );
         signals.record(
             "t".into(),
@@ -771,12 +812,20 @@ mod tests {
         assert_eq!(rows[0]["active_at_unix_millis"], 3);
         assert_eq!(rows[0]["read_error_status"], 500);
         assert_eq!(rows[0]["read_error_at_unix_millis"], 2);
+        assert_eq!(rows[0]["read_error_method"], "POST");
+        assert_eq!(rows[0]["read_error_route"], search_route);
         assert_eq!(rows[0]["read_slow_status"], 503);
         assert_eq!(rows[0]["read_slow_at_unix_millis"], 1);
+        assert_eq!(rows[0]["read_slow_method"], "GET");
+        assert_eq!(rows[0]["read_slow_route"], blob_route);
         assert_eq!(v["complete"], true);
         let expired = value(&signals, now + WINDOW).await;
         assert_eq!(expired["tables"][0]["read_slow_status"], Value::Null);
+        assert_eq!(expired["tables"][0]["read_slow_method"], Value::Null);
+        assert_eq!(expired["tables"][0]["read_slow_route"], Value::Null);
         assert_eq!(expired["tables"][0]["read_error_status"], 500);
+        assert_eq!(expired["tables"][0]["read_error_method"], "POST");
+        assert_eq!(expired["tables"][0]["read_error_route"], search_route);
     }
 
     #[tokio::test]
@@ -852,6 +901,7 @@ mod tests {
             now,
             1,
             Some(SLOW_READ),
+            None,
         );
         for n in 0..20_000 {
             signals.record(
