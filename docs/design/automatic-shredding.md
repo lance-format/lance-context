@@ -154,3 +154,49 @@ Use `policy={"max_columns": 16}` or other `ShredPolicy` limits at creation to tu
 selection without naming fields. The persisted policy is reused on open. The
 first search can perform a substantial rewrite/index build; call
 `prepare_text_search()` before serving latency-sensitive searches when needed.
+
+## Reproducible performance comparison
+
+The `automatic_shredding` Rust example compares three representations using the
+same release executable and Lance dependency tree: complete JSON (`json`), JSON
+plus duplicated `body` and `late_text` columns (`duplicated`), and the public
+automatic `DocumentStore` (`shredded`). It rejects debug builds and existing
+output directories. Run each arm in a separate process so peak RSS is independent:
+
+```bash
+cargo build --release -p lance-context-core --example automatic_shredding \
+  --features lance-io-metrics
+target/release/examples/automatic_shredding --mode json \
+  --output /tmp/shred-json --rows 128 --body-bytes 262144 --samples 15
+target/release/examples/automatic_shredding --mode duplicated \
+  --output /tmp/shred-duplicated --rows 128 --body-bytes 262144 --samples 15
+target/release/examples/automatic_shredding --mode shredded \
+  --output /tmp/shred-automatic --rows 128 --body-bytes 262144 --samples 15
+```
+
+Use the same worker count, row count and body size for each arm. Repeat with fresh
+directories, rotate arm order, and include small records and tens-of-MB records.
+Save the source revision, compiler version, executable checksum and machine/resource
+limits alongside results. Synthetic text uses a deterministic 4,096-token
+vocabulary; it does not represent every application's compression or search costs.
+
+Each directory contains `result.json` with individual samples and median/p95
+latencies, requested object-store bytes, current and retained data bytes, index
+bytes, and total directory bytes. Linux peak RSS covers the entire process,
+including fixture generation, ingestion, validation and index construction;
+it is not a per-operation allocation measurement. I/O counters measure logical
+storage requests, not physical disk traffic. Reads run with warm OS caches;
+the first read after reopen resets handle caches but does not flush the OS cache.
+
+Correctness checks cover reconstruction, projected reads, residual filtering,
+search, layout growth and reopen outside measured phases. No arm has an ID index.
+The duplicated baseline materializes both text columns upfront, while automatic
+shredding promotes the rare historical `late_text` only on a later write. Initial
+index preparation and preparation after layout growth are measured separately
+from steady-state search. JSON-only FTS is omitted because it has no equivalent
+native text index. These are local embedded measurements, not cloud or service
+capacity guarantees.
+
+Both baseline arms store serialized JSON in a `LargeUtf8` column. This isolates
+extraction and duplication costs using the same string encoding as the document
+residual; it is not a benchmark of Lance's JSONB extension or Arrow Variant.
