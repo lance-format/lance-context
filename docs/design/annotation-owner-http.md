@@ -23,6 +23,19 @@ After an ambiguous 503 or transport failure, the caller retains the original
 credential, sequence, and bytes. The forwarding layer sends each operation once;
 it does not invent a new mutation or automatically retry an uncertain outcome.
 
+Within that owner call, an uncertain WAL append is resolved by a fresh quorum
+observation of the exact producer identity. If it is not yet accepted, the owner
+may resubmit the original prepared append once, within the caller's original
+deadline. The producer credential, sequence, metadata and Arrow bytes stay
+unchanged; the payload is not prepared or encoded again. Absence is not proof of
+failure: WAL deduplication returns the original position if the first proposal
+commits late. Conflicting or unavailable observations do not permit resubmission.
+If the second attempt fails, its outcome remains unknown unless a final quorum
+observation confirms exact acceptance, even if that attempt was explicitly
+refused. An accepted request still waits for its applied mutation result before
+success. Apply timeouts do not resubmit the mutation, and successful appends gain
+no additional RPC.
+
 At acquisition, the runtime captures a quorum position after fencing its
 predecessor. Owned reads wait for application through that recovery position,
 then capture the current narrow staging/base view. This prevents a replacement
@@ -48,14 +61,16 @@ are bounded separately, request/reply memory is reserved, and response bytes hol
 admission until released by HTTP. Both routers require the application's existing
 authentication boundary; credentials alone do not authorize a table.
 
-A quorum-confirmed WAL capacity refusal returns HTTP 503 with `error=wal_capacity`
+On the initial append attempt, a quorum-confirmed WAL capacity refusal returns
+HTTP 503 with `error=wal_capacity`
 and `operation_outcome=rejected`. The update was not accepted and its producer
 sequence was not consumed. After capacity is reclaimed, the caller may submit
 the same identity and bytes. Exact retained requests still return their original
 result at capacity because WAL deduplication precedes the capacity decision.
-Transport failures and apply timeouts remain unknown outcomes; the server does
-not automatically retry either case. This distinction does not eliminate waits
-for updates already accepted while native publication is stalled.
+An unresolved append or expired apply deadline remains an unknown outcome.
+A refusal after an earlier uncertain attempt does not establish that the earlier
+request was rejected. These distinctions do not eliminate waits for updates
+already accepted while native publication is stalled.
 
 Local WAL disk admission is a separate boundary. A proven refusal before Raft
 proposal returns HTTP 503 with `error=wal_disk_capacity` and
