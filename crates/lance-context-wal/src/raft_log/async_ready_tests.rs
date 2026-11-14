@@ -1,6 +1,6 @@
 //! Mechanism experiment for raft-rs's actual asynchronous Ready contract.
-//! Real GroupLog files and fsync, with test-only MemStorage as the readable
-//! cache. This does not enable asynchronous persistence in the product, or
+//! Real GroupLog files and fsync, with bounded BufferedLog as the readable
+//! pending view. This does not enable asynchronous persistence in the runtime, or
 //! cover its snapshot/GC, query, admission or application integration.
 use super::*;
 use std::collections::VecDeque;
@@ -8,14 +8,10 @@ use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use raft::{storage::MemStorage, RawNode, StateRole};
+use super::buffered::{BufferedLog, Persisted, Window, WriteTask};
+use raft::{RawNode, StateRole};
 use raft_proto::eraftpb::{Message as RaftMessage, MessageType};
 
-struct Write {
-    number: u64,
-    entries: Vec<Entry>,
-    hard: Option<HardState>,
-}
 struct Deferred {
     number: u64,
     messages: Vec<RaftMessage>,
@@ -23,10 +19,10 @@ struct Deferred {
     bytes: usize,
 }
 struct Peer {
-    raw: RawNode<MemStorage>,
+    raw: RawNode<BufferedLog>,
     log: GroupLog,
-    tx: Option<mpsc::SyncSender<Write>>,
-    rx: mpsc::Receiver<(u64, Result<()>)>,
+    tx: Option<mpsc::SyncSender<WriteTask>>,
+    rx: mpsc::Receiver<(u64, Result<Persisted>)>,
     worker: Option<JoinHandle<()>>,
     pending: VecDeque<Deferred>,
     pending_bytes: usize,
@@ -36,7 +32,14 @@ impl Peer {
     fn open(directory: &Path, layout: &Layout, id: u64) -> Result<Self> {
         let physical = PhysicalLog::open(directory, layout, id)?;
         let log = physical.group(10)?;
-        let cache = MemStorage::new_with_conf_state(log.initial_state()?.conf_state);
+        let cache = BufferedLog::new(
+            log.clone(),
+            Window {
+                readies: 64,
+                entries: 4096,
+                bytes: 8 << 20,
+            },
+        )?;
         let config = raft::Config {
             id,
             election_tick: 10,
@@ -51,14 +54,14 @@ impl Peer {
             cache,
             &slog::Logger::root(slog::Discard, slog::o!()),
         )?;
-        let (tx, writes) = mpsc::sync_channel::<Write>(64);
+        let (tx, writes) = mpsc::sync_channel::<WriteTask>(64);
         let (done, rx) = mpsc::channel();
-        let store = log.clone();
         let worker = thread::spawn(move || {
             while let Ok(write) = writes.recv() {
-                let result = store.persist(&write.entries, write.hard.as_ref());
+                let number = write.number();
+                let result = write.persist();
                 let failed = result.is_err();
-                if done.send((write.number, result)).is_err() || failed {
+                if done.send((number, result)).is_err() || failed {
                     break;
                 }
             }
@@ -79,7 +82,7 @@ impl Peer {
         while let Ok((number, result)) = self.rx.try_recv() {
             // A failed sync cannot advance Raft, release durable messages or
             // make the test application's committed value visible.
-            result?;
+            ensure!(self.raw.mut_store().complete(result?)? == number);
             let done = self
                 .pending
                 .pop_front()
@@ -111,14 +114,10 @@ impl Peer {
             );
             // RawNode must read every appended update BEFORE async advance.
             // Entry::data uses shared Bytes; cache append keeps the same body.
-            {
-                let mut cache = self.raw.mut_store().wl();
-                cache.append(&entries)?;
-                if let Some(hard) = hard.clone() {
-                    cache.set_hardstate(hard);
-                }
-            }
-            if let Some(entry) = entries.last() {
+            let number = ready.number();
+            let last = entries.last().cloned();
+            let write = self.raw.mut_store().stage(number, entries, hard)?;
+            if let Some(entry) = last.as_ref() {
                 let cached = self.raw.store().entries(
                     entry.index,
                     entry.index + 1,
@@ -131,7 +130,6 @@ impl Peer {
                     "cache copied the body"
                 );
             }
-            let number = ready.number();
             messages.extend(ready.take_messages());
             let deferred = Deferred {
                 number,
@@ -145,11 +143,7 @@ impl Peer {
             self.tx
                 .as_ref()
                 .context("writer stopped")?
-                .try_send(Write {
-                    number,
-                    entries,
-                    hard,
-                })?;
+                .try_send(write)?;
         }
         Ok(messages)
     }
