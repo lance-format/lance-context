@@ -43,8 +43,8 @@ mod wal_read_lifetime;
 mod wal_retirement;
 mod wal_watermarks;
 pub use store_base::{
-    is_pending_generations_exceeded, PreparedShardMerge, ShardWatermark,
-    DEFAULT_PENDING_GENERATIONS_MAX, PENDING_GENERATIONS_EXCEEDED,
+    is_pending_generations_exceeded, FlushOutcome, PreparedShardMerge, ShardWatermark, StorageBase,
+    StorageBaseOptions, DEFAULT_PENDING_GENERATIONS_MAX, PENDING_GENERATIONS_EXCEEDED,
 };
 pub use wal_watermarks::read_demand_watermarks;
 
