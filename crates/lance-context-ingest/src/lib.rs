@@ -475,7 +475,10 @@ impl Ingress {
             Reply::Commit(Outcome::Committed(Applied::ProducerFenced)) => {
                 return Err(AppendFailure::ProducerFenced.into())
             }
-            _ => return Err(AppendFailure::Unknown.into()),
+            reply => {
+                return Err(anyhow::Error::new(AppendFailure::Unknown)
+                    .context(format!("append returned {reply:?}")))
+            }
         };
         ensure!(index > 0 && index < u64::MAX, "invalid accepted index");
         Ok(AcceptedAppend {

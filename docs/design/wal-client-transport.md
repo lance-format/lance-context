@@ -60,7 +60,10 @@ exchange releases its connection and byte credits before the next attempt.
 Successful quorum queries still carry the normal validated observation; a leader
 hint alone is insufficient. Invalid identities, scopes, framing and other protocol
 errors remain errors. Appends and publication commands keep their unknown-outcome
-contract and are never automatically resubmitted after a transport error.
+contract and are never automatically resubmitted by this transport after a
+transport error. The higher-level annotation owner separately implements one
+bounded exact-request resolution after a fresh quorum observation, as described
+in [Annotation HTTP routing](annotation-owner-http.md).
 
 With `lance-integration`, `Client::manifest_catalog()` implements the actual
 `ManagedManifest` catalog interface over these RPCs. This supplies networked

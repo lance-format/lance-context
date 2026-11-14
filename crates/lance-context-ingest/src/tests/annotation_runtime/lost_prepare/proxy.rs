@@ -28,6 +28,8 @@ struct WireScope {
     _node: u64,
 }
 
+type RecordedAppends = Arc<std::sync::Mutex<Vec<(BatchMeta, Vec<u8>)>>>;
+
 pub(in crate::tests) struct Proxy {
     pub client: Arc<Client>,
     pub dropped: Arc<AtomicUsize>,
@@ -48,6 +50,10 @@ pub(in crate::tests) struct Proxy {
     pub pause_uncommitted_advance: Arc<AtomicBool>,
     pub block_advance_observations: Arc<AtomicBool>,
     pub appends: Arc<AtomicUsize>,
+    pub append_requests: RecordedAppends,
+    pub unknown_appends: Arc<AtomicBool>,
+    pub pause_append_retry: Arc<AtomicBool>,
+    pub lose_append_retry_reply: Arc<AtomicBool>,
     pub closes: Arc<AtomicUsize>,
     pub unknown_closes: Arc<AtomicBool>,
     pub close_permits:
@@ -383,6 +389,10 @@ impl Proxy {
         let pause_uncommitted_advance = Arc::new(AtomicBool::new(false));
         let block_advance_observations = Arc::new(AtomicBool::new(false));
         let appends = Arc::new(AtomicUsize::new(0));
+        let append_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let unknown_appends = Arc::new(AtomicBool::new(false));
+        let pause_append_retry = Arc::new(AtomicBool::new(false));
+        let lose_append_retry_reply = Arc::new(AtomicBool::new(false));
         let closes = Arc::new(AtomicUsize::new(0));
         let unknown_closes = Arc::new(AtomicBool::new(false));
         let close_permits = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -436,6 +446,10 @@ impl Proxy {
             let pause_uncommitted_advance = pause_uncommitted_advance.clone();
             let block_advance_observations = block_advance_observations.clone();
             let appends = appends.clone();
+            let append_requests = append_requests.clone();
+            let unknown_appends = unknown_appends.clone();
+            let pause_append_retry = pause_append_retry.clone();
+            let lose_append_retry_reply = lose_append_retry_reply.clone();
             let closes = closes.clone();
             let unknown_closes = unknown_closes.clone();
             let close_permits = close_permits.clone();
@@ -466,6 +480,10 @@ impl Proxy {
             let pause_uncommitted_advance = pause_uncommitted_advance.clone();
             let block_advance_observations = block_advance_observations.clone();
                             let appends = appends.clone();
+            let append_requests = append_requests.clone();
+            let unknown_appends = unknown_appends.clone();
+            let pause_append_retry = pause_append_retry.clone();
+            let lose_append_retry_reply = lose_append_retry_reply.clone();
                             let closes = closes.clone();
                             let unknown_closes = unknown_closes.clone();
                             let close_permits = close_permits.clone();
@@ -484,6 +502,21 @@ impl Proxy {
                                         return Ok(());
                                     }
                                     let hold = request.matches_command(point)?;
+                                    if hold && matches!(point, Point::Append { .. }) {
+                                        let (_, _, _, meta): (WireScope, u32, u64, BatchMeta) = codec().reject_trailing_bytes().deserialize(&request.meta)?;
+                                        append_requests.lock().unwrap().push((meta, request.body.clone()));
+                                        if dropped.load(Ordering::SeqCst) > 0 {
+                                            if pause_append_retry.swap(false, Ordering::SeqCst) {
+                                                committed.notify_one();
+                                                release.notified().await;
+                                            }
+                                            if unknown_appends.load(Ordering::SeqCst) {
+                                                dropped.fetch_add(1, Ordering::SeqCst);
+                                                request.unknown_reply()?.write(&mut downstream).await?;
+                                                continue;
+                                            }
+                                        }
+                                    }
                                     if hold && matches!(point, Point::Pin { .. }) {
                                         let (_, _, command): (WireScope, u32, Command) = codec().reject_trailing_bytes().deserialize(&request.meta)?;
                                         let Command::Pin(permit) = command else { bail!("expected a Pin command"); };
@@ -573,6 +606,11 @@ impl Proxy {
                                         if hold && response.successful_reply(point)? { appends.fetch_add(1, Ordering::SeqCst); }
                                     }
                                     ensure!(response.fixed[8..16] == request.fixed[8..16], "proxy response ID changed");
+                                    if hold && matches!(point, Point::Append { .. }) && dropped.load(Ordering::SeqCst) > 0 && response.successful_reply(point)? && lose_append_retry_reply.swap(false, Ordering::SeqCst) {
+                                        dropped.fetch_add(1, Ordering::SeqCst);
+                                        request.unknown_reply()?.write(&mut downstream).await?;
+                                        continue;
+                                    }
                                     if hold && response.successful_reply(point)? && armed.swap(false, Ordering::SeqCst) {
                                         committed.notify_one();
                                         release.notified().await;
@@ -644,6 +682,10 @@ impl Proxy {
             pause_uncommitted_advance,
             block_advance_observations,
             appends,
+            append_requests,
+            unknown_appends,
+            pause_append_retry,
+            lose_append_retry_reply,
             closes,
             unknown_closes,
             close_permits,

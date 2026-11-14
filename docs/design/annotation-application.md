@@ -184,7 +184,10 @@ the table with the existing durable scope/owner/request tuple. Acquisition reads
 the WAL epoch before validating the etcd lease, preventing a paused candidate
 from using a successor's epoch. A busy candidate exits without acquiring an
 epoch. Lease loss or a runtime/listener error ends the role; a process supervisor
-may replace it. This does not automatically retry uncertain user mutations.
+may replace it. Process replacement does not resubmit uncertain client requests.
+Within a live call, the annotation owner can resolve one uncertain WAL append
+using the unchanged prepared request; see the bounded resolution contract in
+[Annotation HTTP routing](annotation-owner-http.md).
 
 The owner address may name a stable Kubernetes Service. Every ingress forwards
 to that address and opens neither Lance nor a local applier. Both roles install
