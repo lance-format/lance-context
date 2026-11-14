@@ -32,6 +32,7 @@ pub(in crate::tests) struct Proxy {
     pub dropped: Arc<AtomicUsize>,
     pub plans: Arc<AtomicUsize>,
     pub prepares: Arc<AtomicUsize>,
+    pub confirms: Arc<AtomicUsize>,
     pub blocked_reads: Arc<AtomicUsize>,
     blocked_nodes: Arc<std::sync::Mutex<std::collections::BTreeSet<u64>>>,
     observations_restored: Arc<AtomicBool>,
@@ -80,6 +81,9 @@ enum Point {
         execute: bool,
     },
     Advance {
+        execute: bool,
+    },
+    Confirm {
         execute: bool,
     },
 }
@@ -159,6 +163,7 @@ impl Frame {
                 | (Point::Close { .. }, Command::Close(_))
                 | (Point::Plan { .. }, Command::Plan(_))
                 | (Point::Advance { .. }, Command::Advance(_))
+                | (Point::Confirm { .. }, Command::Confirm(_))
         ))
     }
     fn publisher_query(&self) -> Result<bool> {
@@ -211,6 +216,11 @@ impl Frame {
             ) | (
                 Point::Advance { .. },
                 Reply::Commit(Outcome::Committed(Applied::Publisher(p::Reply::Advanced(
+                    _
+                ))))
+            ) | (
+                Point::Confirm { .. },
+                Reply::Commit(Outcome::Committed(Applied::Publisher(p::Reply::Published(
                     _
                 ))))
             ) | (
@@ -289,6 +299,10 @@ impl Proxy {
         Self::open_at(c, root, Point::Advance { execute }).await
     }
 
+    pub async fn open_confirm(c: &network::Cluster, root: &FsPath, execute: bool) -> Result<Self> {
+        Self::open_at(c, root, Point::Confirm { execute }).await
+    }
+
     async fn open_at(c: &network::Cluster, root: &FsPath, point: Point) -> Result<Self> {
         Self::open_at_with_timeout(c, root, point, Duration::from_secs(30)).await
     }
@@ -321,6 +335,7 @@ impl Proxy {
         let dropped = Arc::new(AtomicUsize::new(0));
         let plans = Arc::new(AtomicUsize::new(0));
         let prepares = Arc::new(AtomicUsize::new(0));
+        let confirms = Arc::new(AtomicUsize::new(0));
         let blocked_reads = Arc::new(AtomicUsize::new(0));
         let blocked_nodes = Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
         let observations_restored = Arc::new(AtomicBool::new(false));
@@ -364,6 +379,7 @@ impl Proxy {
             let dropped = dropped.clone();
             let plans = plans.clone();
             let prepares = prepares.clone();
+            let confirms = confirms.clone();
             let blocked_reads = blocked_reads.clone();
             let blocked_nodes = blocked_nodes.clone();
             let observations_restored = observations_restored.clone();
@@ -384,6 +400,7 @@ impl Proxy {
                                 (acceptor.clone(), connector.clone(), name.clone(), address.clone(), armed.clone(), dropped.clone(), committed.clone(), release.clone());
                             let plans = plans.clone();
                             let prepares = prepares.clone();
+                            let confirms = confirms.clone();
                             let blocked_reads = blocked_reads.clone();
                             let blocked_nodes = blocked_nodes.clone();
                             let observations_restored = observations_restored.clone();
@@ -407,6 +424,16 @@ impl Proxy {
                                         return Ok(());
                                     }
                                     let hold = request.matches_command(point)?;
+                                    if hold && matches!(point, Point::Confirm { .. }) {
+                                        confirms.fetch_add(1, Ordering::SeqCst);
+                                        if matches!(point, Point::Confirm { execute: false }) && armed.swap(false, Ordering::SeqCst) {
+                                            committed.notify_one();
+                                            release.notified().await;
+                                            dropped.fetch_add(1, Ordering::SeqCst);
+                                            request.unknown_reply()?.write(&mut downstream).await?;
+                                            continue;
+                                        }
+                                    }
                                     if hold && matches!(point, Point::Prepare { .. }) {
                                         prepares.fetch_add(1, Ordering::SeqCst);
                                         if matches!(point, Point::Prepare { execute: false, .. }) && armed.swap(false, Ordering::SeqCst) {
@@ -452,7 +479,7 @@ impl Proxy {
                                         committed.notify_one();
                                         release.notified().await;
                                         dropped.fetch_add(1, Ordering::SeqCst);
-                                        if matches!(point, Point::Plan { .. } | Point::Advance { .. } | Point::Append { .. } | Point::Prepare { structured: true, .. }) {
+                                        if matches!(point, Point::Plan { .. } | Point::Advance { .. } | Point::Confirm { .. } | Point::Append { .. } | Point::Prepare { structured: true, .. }) {
                                             request.unknown_reply()?.write(&mut downstream).await?;
                                             continue;
                                         }
@@ -504,6 +531,7 @@ impl Proxy {
             dropped,
             plans,
             prepares,
+            confirms,
             blocked_reads,
             blocked_nodes,
             observations_restored,
