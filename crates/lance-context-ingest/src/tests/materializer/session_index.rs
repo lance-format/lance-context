@@ -1,7 +1,6 @@
 use super::*;
 use crate::materializer::SessionIndex;
 use lance::index::DatasetIndexExt;
-use prost::Message;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn index_recovers_prepared_and_selected_files_then_compacts_with_a_visible_wal_tail(
@@ -126,28 +125,19 @@ async fn index_recovers_prepared_and_selected_files_then_compacts_with_a_visible
         .prepare_next()
         .await?
         .context("compaction not prepared")?;
-    assert_eq!(rewrite.descriptors.format, 4);
+    assert_eq!(rewrite.descriptors.format, 2);
     let rewrite_plan = recovered.state().await?.progress.pending.clone().unwrap();
     let mut invalid = rewrite.as_ref().clone();
-    let mut transaction = lance::dataset::transaction::Transaction::try_from(
-        lance_table::format::pb::Transaction::decode(invalid.descriptors.bytes.clone())?,
-    )?;
-    let lance::dataset::transaction::Operation::Rewrite {
-        groups,
-        rewritten_indices,
-        ..
-    } = &mut transaction.operation
-    else {
-        anyhow::bail!("expected indexed rewrite");
-    };
-    assert_eq!(rewritten_indices.len(), 1);
-    assert_eq!(rewritten_indices[0].old_id, index_uuid);
-    let remapped_index_uuid = rewritten_indices[0].new_id;
-    assert_ne!(remapped_index_uuid, index_uuid);
-    groups[0].new_fragments[0].id = 0;
-    invalid.descriptors = p::Descriptors::lance_annotations(Bytes::from(
-        lance_table::format::pb::Transaction::try_from(&transaction)?.encode_to_vec(),
-    ))?;
+    let mut result: lance::dataset::optimize::RewriteResult =
+        serde_json::from_slice(&invalid.descriptors.bytes)?;
+    // The managed index contains stable IDs: compaction updates its fragment
+    // coverage while preserving its exact native pages and UUID.
+    assert!(result.row_addrs.is_none());
+    assert_eq!(result.original_fragments.len(), 4);
+    assert_eq!(result.new_fragments.len(), 1);
+    result.new_fragments[0].id = 0;
+    invalid.descriptors =
+        p::Descriptors::lance_compaction(Bytes::from(serde_json::to_vec(&result)?))?;
     let view = recovered.state().await?;
     let predecessor = &view.manifests.as_ref().unwrap().versions[&rewrite_plan.plan.read_version];
     assert!(crate::materializer::stage::publish(
@@ -170,8 +160,8 @@ async fn index_recovers_prepared_and_selected_files_then_compacts_with_a_visible
     assert_eq!(compacted.get_fragments().len(), 2);
     let indices = compacted.load_indices().await?;
     assert_eq!(indices.len(), 1);
-    assert_eq!(indices[0].uuid, remapped_index_uuid);
-    assert_eq!(indices[0].index_version, 1);
+    assert_eq!(indices[0].uuid, index_uuid);
+    assert_eq!(indices[0].index_version, 0);
     let indexed = compacted
         .manifest()
         .fragments
@@ -212,7 +202,7 @@ async fn index_recovers_prepared_and_selected_files_then_compacts_with_a_visible
     assert_eq!(recovered.state().await?.progress.checkpoint, checkpoint);
     let indices = recovered.read_dataset(None).await?.load_indices().await?;
     assert_eq!(indices.len(), 2);
-    assert!(indices.iter().any(|i| i.uuid == remapped_index_uuid));
+    assert!(indices.iter().any(|i| i.uuid == index_uuid));
     let before_merge = recovered.read_dataset(None).await?;
     assert!(recovered.run_once().await?.unwrap().sources.is_empty());
     assert_eq!(recovered.state().await?.progress.checkpoint, checkpoint);
@@ -279,7 +269,7 @@ async fn backlog_allows_index_and_compaction_to_progress_across_takeover() -> Re
     let mut writer = compaction::acquire(&ingress, &storage, &budget, 3, options).await?;
     let before = writer.read_dataset(None).await?;
     let prepared = writer.prepare_next().await?.unwrap();
-    assert_eq!(prepared.descriptors.format, 4);
+    assert_eq!(prepared.descriptors.format, 2);
     assert!(writer.run_once().await?.unwrap().sources.is_empty());
     let after = writer.read_dataset(None).await?;
     assert!(after.get_fragments().len() < before.get_fragments().len());

@@ -36,6 +36,8 @@ pub(super) const WORKSPACE: usize = 512 << 20;
 mod legacy;
 
 #[cfg(test)]
+mod domain_tests;
+#[cfg(test)]
 mod rebase_tests;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -274,6 +276,11 @@ pub(super) fn spawn_action(
                         if template.index_version == 0 {
                             return legacy::build(&dataset, key, ids, template).await;
                         }
+                    } else {
+                        // Managed tables already preserve stable row IDs. Keep
+                        // new indexes in that domain so a bounded data rewrite
+                        // does not also retrain an entire address-index segment.
+                        return legacy::build_new(&dataset, key, ids).await;
                     }
                     Ok(dataset
                         .create_index_builder(
