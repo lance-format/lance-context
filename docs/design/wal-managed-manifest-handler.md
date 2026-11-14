@@ -1,7 +1,7 @@
 # Lance manifest publication through the WAL catalog
 
 `replication::publication::lance::ManagedManifest`, behind `lance-integration`,
-is a reusable Lance 13 `CommitHandler`. It moves the actual reader/writer adapter
+is a reusable Lance 14.0.2 `CommitHandler`. It moves the actual reader/writer adapter
 out of the process-test fixture. The handler uploads a unique manifest object and
 returns a location only after the catalog commits its exact reservation. Readers
 resolve both current and specific versions from quorum queries to that catalog.
@@ -36,9 +36,17 @@ which staged path is visible.
 - A canceled call, unknown outcome, rejected authority, or lost reservation reply
   leaves its staging object intact. Recover the original plan and query its outcome;
   do not manufacture a new producer identity or publication target.
-- An exact retry may return the previously selected object instead of the object
-  just uploaded. Validate its incarnation-derived identity, transaction, target,
-  preparation positions and descriptor digest before returning success.
+- On an unknown reservation result or transport error, query the same fixed target
+  at a validated quorum cut. A matching selected record resolves the original
+  call without another reservation. Validate its incarnation-derived identity,
+  transaction, target, preparation positions, descriptor digest and complete
+  original object reference before returning success.
+- If that query establishes absence, submit at most one identical reservation.
+  This reuses the original manifest path and bytes; it uploads no new manifest
+  or data files. If the second result is also uncertain or refused, query the
+  original target once more. A second refusal does not determine the first
+  attempt's outcome. Unavailable or foreign observations never authorize a
+  resubmission. Normal successful reservations need no extra query.
 - A foreign quorum scope, invalid record identity, retired version or unknown read
   outcome returns an error. Retired and unknown results are not reported as absence.
 - Lance's conservative defaults for ambiguous commit errors and non-definitive
@@ -64,8 +72,13 @@ old-owner suspension after manifest upload, retained manifest history beyond its
 cap, and producer-slot reuse, with actual Lance payload verification. Focused
 adapter tests inject foreign read scopes, invalid identities, unknown/retired
 results and history gaps, and verify that ambiguous reservations retain an actual
-in-memory object-store manifest. The tests do not establish cloud throughput or
-loss of a quorum's persistent volumes.
+in-memory object-store manifest. Reservation-response tests cover committed and
+uncommitted uncertainty, transport loss, late original commitment after a second
+refusal, unavailable/foreign observations and reuse of exactly one uploaded
+manifest. Native RF3 compaction tests hold a reservation while a concurrent turn
+update succeeds and is readable, then resolve publication, drain, verify bodies
+and stable IDs, and reopen. The tests do not establish cloud throughput or loss
+of a quorum's persistent volumes.
 
 Tracking: [#378](https://github.com/lance-format/lance-context/issues/378).
 

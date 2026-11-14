@@ -103,7 +103,7 @@ async fn resume(stage: u8) -> Result<()> {
         let commit = annotation_publication::save(&c, &selection, descriptors.clone()).await?;
         if stage == 2 {
             let result = crate::annotation_publication::mixed::publish(
-                Arc::new(annotation_publication::LostReply(Arc::new(
+                Arc::new(annotation_publication::LostReply::new(Arc::new(
                     c.client.manifest_catalog(),
                 ))),
                 &annotation_publication::one_shard(),

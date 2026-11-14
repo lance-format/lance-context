@@ -103,6 +103,9 @@ enum Point {
     Advance {
         execute: bool,
     },
+    Reserve {
+        execute: bool,
+    },
     Confirm {
         execute: bool,
     },
@@ -184,6 +187,7 @@ impl Frame {
                 | (Point::Close { .. }, Command::Close(_))
                 | (Point::Plan { .. }, Command::Plan(_))
                 | (Point::Advance { .. }, Command::Advance(_))
+                | (Point::Reserve { .. }, Command::Reserve(_))
                 | (Point::Confirm { .. }, Command::Confirm(_))
         ))
     }
@@ -248,6 +252,11 @@ impl Frame {
                 Reply::Commit(Outcome::Committed(Applied::Publisher(p::Reply::Advanced(
                     _
                 ))))
+            ) | (
+                Point::Reserve { .. },
+                Reply::Commit(Outcome::Committed(Applied::Publisher(
+                    p::Reply::ManifestReserved(_)
+                )))
             ) | (
                 Point::Confirm { .. },
                 Reply::Commit(Outcome::Committed(Applied::Publisher(p::Reply::Published(
@@ -336,6 +345,10 @@ impl Proxy {
 
     pub async fn open_advance(c: &network::Cluster, root: &FsPath, execute: bool) -> Result<Self> {
         Self::open_at(c, root, Point::Advance { execute }).await
+    }
+
+    pub async fn open_reserve(c: &network::Cluster, root: &FsPath, execute: bool) -> Result<Self> {
+        Self::open_at(c, root, Point::Reserve { execute }).await
     }
 
     pub async fn open_confirm(c: &network::Cluster, root: &FsPath, execute: bool) -> Result<Self> {
@@ -569,7 +582,7 @@ impl Proxy {
                                             continue;
                                         }
                                     }
-                                    if hold && matches!(point, Point::Append { execute: false } | Point::Close { execute: false }) && armed.swap(false, Ordering::SeqCst) {
+                                    if hold && matches!(point, Point::Append { execute: false } | Point::Close { execute: false } | Point::Reserve { execute: false }) && armed.swap(false, Ordering::SeqCst) {
                                         committed.notify_one(); release.notified().await;
                                         dropped.fetch_add(1, Ordering::SeqCst);
                                         request.unknown_reply()?.write(&mut downstream).await?;
@@ -615,7 +628,7 @@ impl Proxy {
                                         committed.notify_one();
                                         release.notified().await;
                                         dropped.fetch_add(1, Ordering::SeqCst);
-                                        if matches!(point, Point::Plan { .. } | Point::Advance { .. } | Point::Confirm { .. } | Point::Append { .. } | Point::Pin { .. } | Point::Prepare { structured: true, .. }) {
+                                        if matches!(point, Point::Plan { .. } | Point::Advance { .. } | Point::Reserve { .. } | Point::Confirm { .. } | Point::Append { .. } | Point::Pin { .. } | Point::Prepare { structured: true, .. }) {
                                             request.unknown_reply()?.write(&mut downstream).await?;
                                             continue;
                                         }

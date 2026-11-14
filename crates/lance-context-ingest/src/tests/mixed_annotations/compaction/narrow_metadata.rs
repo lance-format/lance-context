@@ -198,7 +198,7 @@ async fn exercise(selected: bool) -> Result<()> {
             target: pending.plan.target_version()?,
         };
         assert!(publication::mixed::publish(
-            Arc::new(annotation_publication::LostReply(Arc::new(
+            Arc::new(annotation_publication::LostReply::new(Arc::new(
                 c.client.manifest_catalog()
             ))),
             &annotation_publication::one_shard(),

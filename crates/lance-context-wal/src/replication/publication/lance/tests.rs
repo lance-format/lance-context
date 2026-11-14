@@ -4,6 +4,8 @@ use futures::TryStreamExt;
 use object_store::ObjectStoreExt;
 use std::{collections::BTreeMap, sync::Mutex};
 
+mod reservation;
+
 mod external_transaction;
 
 #[derive(Debug)]
