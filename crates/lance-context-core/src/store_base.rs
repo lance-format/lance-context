@@ -1329,6 +1329,16 @@ impl StorageBase {
         if let Some(high) = marks.get(&self.write_shard) {
             manifest.sstables.retain(|g| g.generation > *high);
         }
+        crate::wal_retirement::unique_generations(manifest.sstables.iter().map(|g| {
+            crate::rollout_append::Generation {
+                number: g.generation,
+                path: g.path.clone(),
+            }
+        }))?;
+        // A manifest retry can repeat an immutable generation reference. Read
+        // its payload once, retaining the existing byte/count admission bounds.
+        let mut seen = HashSet::new();
+        manifest.sstables.retain(|g| seen.insert(g.generation));
         manifest.sstables.sort_by_key(|g| g.generation);
         let manifest = &manifest;
         if manifest.sstables.is_empty() {
@@ -1474,15 +1484,16 @@ impl StorageBase {
         // writer now owns the shard.
         let epoch = manifest.writer_epoch;
 
-        let retiring: Vec<_> = manifest
-            .sstables
-            .iter()
-            .filter(|g| merged_generations.contains(&g.generation))
-            .map(|g| crate::rollout_append::Generation {
-                number: g.generation,
-                path: g.path.clone(),
-            })
-            .collect();
+        let retiring = crate::wal_retirement::unique_generations(
+            manifest
+                .sstables
+                .iter()
+                .filter(|g| merged_generations.contains(&g.generation))
+                .map(|g| crate::rollout_append::Generation {
+                    number: g.generation,
+                    path: g.path.clone(),
+                }),
+        )?;
         if retiring.len() != merged_generations.len()
             || retiring.iter().any(|g| !merged_paths.contains(&g.path))
         {
