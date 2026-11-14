@@ -1408,6 +1408,21 @@ pub(crate) mod tests {
     #[tokio::test]
     #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn native_takeover_retires_capability_failure_only_after_all_wal_drains() {
+        assert_native_takeover_retires_failure_only_after_all_wal_drains(
+            "error sending request for url (http://worker:3000/api/v1/internal/merge-executor)",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn native_takeover_retires_retirement_identity_failure_only_after_all_wal_drains() {
+        assert_native_takeover_retires_failure_only_after_all_wal_drains(
+            "Internal(\"LanceError(IO): Invalid WAL retirement generation identity, crates/lance-context-core/src/wal_retirement.rs:71:28\")",
+        ).await;
+    }
+
+    async fn assert_native_takeover_retires_failure_only_after_all_wal_drains(error: &str) {
         use lance_context_merge::failure::{failure_key, ShardFailure};
         for historical_pending in [false, true] {
             let (_dir, initial) = generic_fixture_with_auto(true).await;
@@ -1442,9 +1457,6 @@ pub(crate) mod tests {
             };
             let c = state.task_store.merge_coordinator();
             let mut client = state.task_store.etcd_client().clone();
-            let error = format!(
-                "error sending request for url ({endpoint}/api/v1/internal/merge-executor)"
-            );
             let failure = |endpoint: &str, error: &str| ShardFailure {
                 target: target.into(),
                 endpoint: endpoint.into(),
@@ -1453,9 +1465,10 @@ pub(crate) mod tests {
                 last_error: error.into(),
                 last_failure_ms: 1,
                 next_retry_ms: 2,
-                needs_attention: false,
+                needs_attention: lance_context_merge::failure::classify(error)
+                    == lance_context_merge::failure::FailureClass::DataOrConfiguration,
             };
-            let transient = failure(endpoint, &error);
+            let transient = failure(endpoint, error);
             let permanent = failure("http://permanent:3000", "invalid schema");
             client
                 .put(
