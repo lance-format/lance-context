@@ -60,8 +60,8 @@ pub struct Options {
     pub tick_interval: Duration,
     /// Maximum commands from each lane before polling durable Raft progress.
     pub batch_requests: usize,
-    /// Bound the control prefix, then end the batch after a peer/data round
-    /// consumes this wall-time budget. Every batch visits peer/data at least once.
+    /// Bound each initial control and peer prefix separately, then end the batch
+    /// after a peer/data round consumes this wall-time budget. Data is always visited.
     /// Cannot preempt a single operation or bound a poll's persistence latency.
     #[cfg_attr(feature = "service", serde(with = "crate::service::duration_millis"))]
     pub batch_time: Duration,
@@ -908,6 +908,7 @@ impl Worker {
         while !self.shared.stopped.load(Ordering::Acquire) {
             let mut activity = false;
             let mut peer_credits = Vec::new();
+            let mut peers_processed = 0;
             let mut after_poll = Vec::new();
             let batch_started = Instant::now();
             for round in 0..self.options.batch_requests {
@@ -934,7 +935,16 @@ impl Worker {
                         }
                     }
                 }
-                if let Ok(peer) = self.peers.try_recv() {
+                // Drain a bounded peer prefix before a slow proposal can end
+                // this batch. Otherwise every queued response, including a
+                // durable follower ACK, can wait behind another data operation.
+                // Give this prefix its own time bound after the control prefix;
+                // the total peer count still cannot exceed batch_requests.
+                let peer_started = Instant::now();
+                while peers_processed < self.options.batch_requests {
+                    let Ok(peer) = self.peers.try_recv() else {
+                        break;
+                    };
                     let from = peer.packet.message.from;
                     if let Err(error) = self.node.step(peer.packet) {
                         self.shared
@@ -947,7 +957,11 @@ impl Worker {
                             .fetch_add(1, Ordering::Relaxed);
                     }
                     peer_credits.push(peer.credit);
+                    peers_processed += 1;
                     any = true;
+                    if round != 0 || peer_started.elapsed() >= self.options.batch_time {
+                        break;
+                    }
                 }
                 if let Ok(work) = self.data.try_recv() {
                     self.work(work, &mut after_poll);
