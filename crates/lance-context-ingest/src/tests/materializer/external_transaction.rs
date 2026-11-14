@@ -23,7 +23,7 @@ async fn exercise() -> Result<()> {
     .await?;
     let budget = MergeMemoryBudget::new(32 << 20);
     let mut publisher = publisher(&ingress, &storage, &budget, 1).await?;
-    let (body, _) = append(
+    let (body, receipt) = append(
         &ingress,
         &ProducerOpen {
             bucket: 0,
@@ -87,6 +87,23 @@ async fn exercise() -> Result<()> {
     assert_eq!(selected.read_transaction().await?, Some(transaction));
     publisher.commit_pending().await?.unwrap();
     publisher.finish_pending().await?.unwrap();
+    assert_eq!(
+        ingress.publication_status(&receipt).await?,
+        PublicationStatus::Published {
+            minimum_read_version: target
+        }
+    );
+    assert!(matches!(
+        cluster
+            .client
+            .request_routed(Request::Fetch {
+                group: receipt.position().group,
+                index: receipt.position().index,
+            })
+            .await?
+            .reply,
+        Reply::Record(None)
+    ));
     let mut expected = BTreeMap::new();
     remember(&mut expected, body)?;
     verify(&publisher, &expected, target).await?;
