@@ -10,6 +10,8 @@ mod advance;
 mod close;
 mod compaction;
 #[cfg(feature = "service")]
+mod confirm;
+#[cfg(feature = "service")]
 mod plan;
 #[cfg(feature = "service")]
 mod prepare;
