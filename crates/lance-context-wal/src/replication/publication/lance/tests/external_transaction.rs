@@ -9,7 +9,11 @@ async fn external_transaction_identity_is_checked_before_upload_or_reservation()
         let (handler, catalog, store) = fixture()?;
         let scope = handler.scope.as_ref().unwrap();
         let filename = format!("{}-{}.txn", scope.target - 1, scope.transaction);
-        let path = handler.base.child("_transactions").child(filename.as_str());
+        let path = handler
+            .base
+            .clone()
+            .join("_transactions")
+            .join(filename.as_str());
         let mut transaction = lance_table::format::pb::Transaction {
             read_version: scope.target - 1,
             uuid: scope.transaction.to_string(),

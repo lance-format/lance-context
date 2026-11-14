@@ -1,6 +1,7 @@
 //! Validate the existing Lance transaction identity when it is not inlined.
 use super::*;
 use bytes::Bytes;
+use object_store::ObjectStoreExt;
 use prost::Message;
 
 // Match the native preparation metadata bound. Ordinary WAL replicas do not
@@ -36,7 +37,7 @@ pub(super) async fn matches(
     }
     // Construct the path from the bound publication, never an arbitrary path
     // supplied by the manifest. The filename alone does not prove its contents.
-    let path = base.child("_transactions").child(expected);
+    let path = base.clone().join("_transactions").join(expected);
     let object = store.inner.get(&path).await?;
     let size = object.meta.size;
     ensure!(
