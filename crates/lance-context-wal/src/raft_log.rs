@@ -40,6 +40,8 @@ mod observation;
 pub(crate) use observation::snapshot as wait_observation;
 #[cfg(feature = "runtime")]
 pub use observation::{StorageWaitObservation, WaitInterval};
+#[cfg(all(test, feature = "runtime"))]
+mod async_ready_tests;
 #[cfg(test)]
 mod fault_tests;
 
