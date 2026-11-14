@@ -9,6 +9,39 @@ ID. Found rows are returned once in first-requested order, including flushed
 WAL updates. See [batch lookup](../../docs/benchmarks/batch-get.md) for the HTTP
 and Rust client APIs, visibility rules, and a reproducible benchmark.
 
+## Application-owned schemas
+
+Use `StorageBase` when an application owns its Arrow schema and needs the shared
+WAL, consistent-read, merge, and indexing machinery. It accepts a custom merge
+key instead of requiring a built-in record type. Domain events, their ordering
+and validation, and application HTTP APIs remain in the consuming crate.
+
+Start with `StorageBaseOptions::new(schema, "entry_key")`, set a distinct, stable
+`shard_id` for each live writer, and call `StorageBase::open` (or `from_dataset`
+for an already-open dataset). Share a bounded `Session` through the options when
+opening many stores. The options default to `seal_on_put = true`: a successful
+nonempty `put` durably writes and publishes its rows before returning. Setting
+this to `false` defers visibility until an explicit or background flush.
+
+Read through `read_consistent(ListSource::All, ...)`, building the scan with
+`lsm_scanner_for_dataset` from the dataset and shard snapshots passed into the
+callback. This includes published WAL and refreshes the base/WAL view together;
+scanning `dataset()` alone sees only base fragments. Use `key_column()` when
+building the scanner. The dataset, shard identity and credentials cannot be
+replaced through public fields after opening a store.
+
+`flush()` preserves the existing publication API. `flush_with_outcome()` also
+reports `Sealed`, `Noop`, or `RecoveredFence` for callers that need to distinguish
+maintenance results. These outcomes are not per-request receipts or publication
+watermarks, and do not resolve an unknown append result by themselves. Application
+retries and writer handoff still need their own protocol; a writer identity does
+not provide distributed ownership. Close writers gracefully with `close()`.
+
+The [external-consumer test](tests/storage_base_api.rs) demonstrates a custom
+key and binary payloads, a reader opened before writes, identical retries,
+filtered projections, base/WAL reads across merge, reopening, and deferred
+publication without using any built-in application schema.
+
 Enable the optional `lance-io-metrics` feature to record Lance 13 object-store
 request counts, bytes, durations, errors, in-flight requests and cloud retryable
 responses through the application's existing `metrics` recorder. Embedded users

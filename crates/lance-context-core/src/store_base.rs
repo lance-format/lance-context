@@ -238,9 +238,14 @@ pub fn is_pending_generations_exceeded(err: &LanceError) -> bool {
     err.to_string().contains(PENDING_GENERATIONS_EXCEEDED)
 }
 
-/// What a [`StorageBase::flush`] actually did, for the `outcome` metric label.
+/// Result of a [`StorageBase::flush_with_outcome`] operation.
+///
+/// This describes the writer operation, not a receipt for a particular append
+/// or a publication watermark. In particular, recovery does not identify which
+/// in-flight requests were included in the replayed WAL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FlushOutcome {
+#[non_exhaustive]
+pub enum FlushOutcome {
     /// A memtable was sealed and drained into a flushed generation.
     Sealed,
     /// No resident writer, so nothing to seal (the common case).
@@ -384,7 +389,8 @@ impl PreparedMerge {
 
 /// Configuration for opening a [`StorageBase`].
 #[derive(Clone)]
-pub(crate) struct StorageBaseOptions {
+#[non_exhaustive]
+pub struct StorageBaseOptions {
     /// Object-store credentials/config (e.g. S3), forwarded to Lance.
     pub storage_options: Option<HashMap<String, String>>,
     /// Stable identity of the writing server instance. Writes go to the MemWAL
@@ -455,23 +461,54 @@ pub(crate) struct StorageBaseOptions {
     pub seal_on_put: bool,
 }
 
-/// Schema-agnostic Lance storage: dataset handle, MemWAL write path, WAL merge,
-/// compaction, indexing, and LSM reads. See the module docs.
-pub(crate) struct StorageBase {
+impl StorageBaseOptions {
+    /// Configure an application-owned Arrow schema and merge key.
+    ///
+    /// Writes seal before returning by default. Set `seal_on_put = false` only
+    /// when the application drives publication separately. Concurrent writer
+    /// instances must supply distinct, stable `shard_id` values.
+    pub fn new(schema: Arc<Schema>, key_column: impl Into<String>) -> Self {
+        Self {
+            storage_options: None,
+            shard_id: None,
+            merge_after_generations: None,
+            merge_max_generations: None,
+            merge_max_bytes: None,
+            key_index_type: crate::KeyIndexType::default(),
+            pending_generations_warn: None,
+            pending_generations_max: None,
+            merge_budget: None,
+            session: None,
+            schema,
+            key_column: key_column.into(),
+            latest_schema: None,
+            seal_on_put: true,
+        }
+    }
+}
+
+/// Schema-agnostic storage for applications that own their Arrow schema and
+/// domain logic. Provides WAL writes, consistent base/WAL reads and maintenance.
+///
+/// Each live writer must own a distinct, stable shard identity. Configure it
+/// with [`StorageBaseOptions::shard_id`]; opening a successor writer is not a
+/// distributed ownership protocol. Reads should use [`Self::read_consistent`]
+/// to include published WAL and refresh the base manifest together.
+pub struct StorageBase {
     /// The base table. `pub(crate)` because concrete stores build their own
     /// schema-specific scans and projections directly against it.
-    pub dataset: Dataset,
+    pub(crate) dataset: Dataset,
     /// MemWAL shard this instance writes to (derived from `shard_id`).
-    pub write_shard: Uuid,
+    pub(crate) write_shard: Uuid,
     /// Object-store options, retained so a self-merge can re-append flushed
     /// generation data into the base table with the same credentials.
-    pub storage_options: Option<HashMap<String, String>>,
+    pub(crate) storage_options: Option<HashMap<String, String>>,
     /// Shared Lance session used for the base dataset and every reload
     /// (compact, index, generation reads), so all resident stores share one
     /// capacity-bounded cache.
-    pub session: Option<Arc<Session>>,
+    pub(crate) session: Option<Arc<Session>>,
     /// Merge/primary key column; the LSM dedup key and indexed column.
-    pub key_column: String,
+    pub(crate) key_column: String,
     /// Latest expected schema for merge-time evolution; see the option.
     latest_schema: Option<Arc<Schema>>,
     /// Whether `put` seals before returning; see [`StorageBaseOptions::seal_on_put`].
@@ -674,6 +711,19 @@ impl StorageBase {
         self.dataset.uri()
     }
 
+    /// Base-table handle for metadata inspection. Its fragments alone do not
+    /// include pending WAL; use `read_consistent` for a complete read view.
+    #[must_use]
+    pub fn dataset(&self) -> &Dataset {
+        &self.dataset
+    }
+
+    /// Column used to deduplicate WAL and base-table rows.
+    #[must_use]
+    pub fn key_column(&self) -> &str {
+        &self.key_column
+    }
+
     /// Current base dataset manifest version.
     #[must_use]
     pub fn version(&self) -> u64 {
@@ -852,6 +902,13 @@ impl StorageBase {
     /// This is the visibility half of the write path, decoupled from the durable
     /// append in [`Self::put`]. A no-op when no writer is resident.
     pub async fn flush(&self) -> LanceResult<()> {
+        self.flush_with_outcome().await.map(|_| ())
+    }
+
+    /// Publish the resident writer's buffered rows and report whether it sealed,
+    /// had no resident writer, or recovered a fenced writer. This has the same
+    /// publication behavior as [`Self::flush`]; see [`FlushOutcome`] for limits.
+    pub async fn flush_with_outcome(&self) -> LanceResult<FlushOutcome> {
         let started = timer_start!();
         let result = self.flush_inner().await;
         // `outcome` is worth its cardinality: the three paths differ by orders of
@@ -871,7 +928,7 @@ impl StorageBase {
             }
             Err(_) => count!(crate::metrics::ROLLOUT_FLUSH_ERRORS),
         }
-        result.map(|_| ())
+        result
     }
 
     /// Recover a restarted instance's durable WAL before its cleanup merge.
