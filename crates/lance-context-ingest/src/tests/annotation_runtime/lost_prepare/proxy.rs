@@ -32,6 +32,9 @@ pub(in crate::tests) struct Proxy {
     pub dropped: Arc<AtomicUsize>,
     pub plans: Arc<AtomicUsize>,
     pub prepares: Arc<AtomicUsize>,
+    pub unknown_prepares: Arc<AtomicBool>,
+    pub pause_uncommitted_prepare: Arc<AtomicBool>,
+    pub prepare_requests: Arc<std::sync::Mutex<Vec<p::PrepareRequest>>>,
     pub confirms: Arc<AtomicUsize>,
     pub blocked_reads: Arc<AtomicUsize>,
     blocked_nodes: Arc<std::sync::Mutex<std::collections::BTreeSet<u64>>>,
@@ -335,6 +338,9 @@ impl Proxy {
         let dropped = Arc::new(AtomicUsize::new(0));
         let plans = Arc::new(AtomicUsize::new(0));
         let prepares = Arc::new(AtomicUsize::new(0));
+        let unknown_prepares = Arc::new(AtomicBool::new(false));
+        let pause_uncommitted_prepare = Arc::new(AtomicBool::new(false));
+        let prepare_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let confirms = Arc::new(AtomicUsize::new(0));
         let blocked_reads = Arc::new(AtomicUsize::new(0));
         let blocked_nodes = Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
@@ -379,6 +385,9 @@ impl Proxy {
             let dropped = dropped.clone();
             let plans = plans.clone();
             let prepares = prepares.clone();
+            let unknown_prepares = unknown_prepares.clone();
+            let pause_uncommitted_prepare = pause_uncommitted_prepare.clone();
+            let prepare_requests = prepare_requests.clone();
             let confirms = confirms.clone();
             let blocked_reads = blocked_reads.clone();
             let blocked_nodes = blocked_nodes.clone();
@@ -400,6 +409,9 @@ impl Proxy {
                                 (acceptor.clone(), connector.clone(), name.clone(), address.clone(), armed.clone(), dropped.clone(), committed.clone(), release.clone());
                             let plans = plans.clone();
                             let prepares = prepares.clone();
+                            let unknown_prepares = unknown_prepares.clone();
+                            let pause_uncommitted_prepare = pause_uncommitted_prepare.clone();
+                            let prepare_requests = prepare_requests.clone();
                             let confirms = confirms.clone();
                             let blocked_reads = blocked_reads.clone();
                             let blocked_nodes = blocked_nodes.clone();
@@ -436,7 +448,15 @@ impl Proxy {
                                     }
                                     if hold && matches!(point, Point::Prepare { .. }) {
                                         prepares.fetch_add(1, Ordering::SeqCst);
-                                        if matches!(point, Point::Prepare { execute: false, .. }) && armed.swap(false, Ordering::SeqCst) {
+                                        let (_, _, command): (WireScope, u32, Command) = codec().reject_trailing_bytes().deserialize(&request.meta)?;
+                                        let Command::Prepare(preparation) = command else { bail!("expected a Prepare command"); };
+                                        prepare_requests.lock().unwrap().push(preparation);
+                                        let persistent = unknown_prepares.load(Ordering::SeqCst);
+                                        if persistent || (matches!(point, Point::Prepare { execute: false, .. }) && armed.swap(false, Ordering::SeqCst)) {
+                                            if !persistent && pause_uncommitted_prepare.load(Ordering::SeqCst) {
+                                                committed.notify_one();
+                                                release.notified().await;
+                                            }
                                             dropped.fetch_add(1, Ordering::SeqCst);
                                             request.unknown_reply()?.write(&mut downstream).await?;
                                             continue;
@@ -531,6 +551,9 @@ impl Proxy {
             dropped,
             plans,
             prepares,
+            unknown_prepares,
+            pause_uncommitted_prepare,
+            prepare_requests,
             confirms,
             blocked_reads,
             blocked_nodes,
