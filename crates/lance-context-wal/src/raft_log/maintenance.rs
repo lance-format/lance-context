@@ -113,7 +113,7 @@ impl LogMaintenance {
                     let live = if force_rewrite {
                         self.node.engine.estimated_rewrite_queue_bytes()
                     } else {
-                        self.node.engine.estimated_rewrite_bytes_through(boundary.2)
+                        self.node.engine.estimated_rewrite_bytes_for(&boundary)
                     };
                     let bytes = live
                         .and_then(|live| {
@@ -141,7 +141,11 @@ impl LogMaintenance {
         result
     }
 
-    fn run_native(&self, force_rewrite: bool, boundary: (u64, usize, u64)) -> Result<Vec<u64>> {
+    fn run_native(
+        &self,
+        force_rewrite: bool,
+        boundary: raft_engine::internals::PurgeBoundary,
+    ) -> Result<Vec<u64>> {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if force_rewrite {
                 self.node.engine.purge_manager().reclaim_rewrite_queue()?;

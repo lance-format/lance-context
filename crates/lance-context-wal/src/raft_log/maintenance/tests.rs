@@ -6,6 +6,7 @@ mod pressure;
 mod pressure_admission;
 mod rewrite_allowance;
 mod rewrite_pause;
+mod selection;
 
 fn layout() -> Layout {
     Layout {
