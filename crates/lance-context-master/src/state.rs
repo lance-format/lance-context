@@ -291,12 +291,13 @@ impl MasterState {
         join_uri(&self.base_uri, &format!("{}.generic.lance", name))
     }
 
-    /// Options for every generic store opened by the master (read-only
-    /// observation; the master never writes a generic store's WAL).
+    /// Options for generic observation and maintenance. The master never
+    /// writes a generic store's WAL; worker read caps must not hide backlog.
     pub(crate) fn generic_store_options(&self) -> GenericStoreOptions {
         GenericStoreOptions {
             session: self.rollout_session.clone(),
             key_index_type: self.config.key_index_type,
+            pending_generations_max: Some(0),
             ..Default::default()
         }
     }
