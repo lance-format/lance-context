@@ -106,6 +106,7 @@ async fn exercise(execute: bool, persistent: bool, restart: bool) -> Result<()> 
         proxy.unknown_confirms.store(true, Ordering::SeqCst);
     }
     proxy.release.notify_one();
+    let mut pressure_ack = None;
     if persistent {
         tokio::select! {
             result = &mut task => bail!("uncertain Confirm killed owner: {result:?}"),
@@ -129,10 +130,37 @@ async fn exercise(execute: bool, persistent: bool, restart: bool) -> Result<()> 
             current
         );
         if !restart {
+            // A third source record cannot be ACKed while the two-record
+            // active budget is full behind the held frozen publication.
+            let queued = request(
+                &service,
+                &a,
+                2,
+                wire(&limits, &["T"], 1, Some("approved"), 0, None)?,
+            )
+            .await?;
+            let queued = service.submit(&queued, Duration::from_secs(30));
+            tokio::pin!(queued);
+            tokio::select! {
+                result = &mut queued => bail!("full source window ACKed another mutation: {result:?}"),
+                result = &mut task => bail!("owner exited during backpressure: {result:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(250)) => {},
+            }
+            assert_eq!(service.source_observation().records, 2);
+            assert_eq!(
+                service
+                    .get_owned("T", score.index.max(status.index), Duration::from_secs(10))
+                    .await?
+                    .unwrap(),
+                current
+            );
             proxy.unknown_confirms.store(false, Ordering::SeqCst);
+            let ack = queued.await?;
+            assert_eq!(ack.result, MutationResult::Applied);
+            pressure_ack = Some(ack.index);
         }
     }
-    let through = score.index.max(status.index);
+    let through = score.index.max(status.index).max(pressure_ack.unwrap_or(0));
     if !restart {
         tokio::select! {
             result = drained(&c, &service, through) => result?,

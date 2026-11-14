@@ -4,20 +4,30 @@ use std::sync::atomic::Ordering;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn materializer_unknown_confirm_finishes_original_publication() -> Result<()> {
-    tokio::time::timeout(Duration::from_secs(30), exercise(false)).await?
+    tokio::time::timeout(Duration::from_secs(30), exercise(false, true)).await?
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn materializer_unknown_confirm_cannot_bypass_owner_fencing() -> Result<()> {
-    tokio::time::timeout(Duration::from_secs(30), exercise(true)).await?
+    tokio::time::timeout(Duration::from_secs(30), exercise(true, true)).await?
 }
 
-async fn exercise(fenced: bool) -> Result<()> {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn materializer_uncommitted_confirm_resumes_exact_selected_publication() -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(30), exercise(false, false)).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn materializer_uncommitted_confirm_does_not_resubmit_after_fencing() -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(30), exercise(true, false)).await?
+}
+
+async fn exercise(fenced: bool, execute: bool) -> Result<()> {
     let root = tempfile::tempdir()?;
     let path = root.path().join("confirm.lance");
     let mut cluster = network::Cluster::open_signed(root.path(), layout()).await?;
     bootstrap(&cluster, &path, &binding()).await?;
-    let proxy = Proxy::open_confirm(&cluster, root.path(), true).await?;
+    let proxy = Proxy::open_confirm(&cluster, root.path(), execute).await?;
     let direct = std::mem::replace(&mut cluster.client, proxy.client.clone());
     let ingress = connect(&cluster, binding()).await?;
     let storage = Storage::resolve(
@@ -63,7 +73,12 @@ async fn exercise(fenced: bool) -> Result<()> {
         publisher.finish_pending().await?.unwrap();
         verify(&publisher, &expected, 2).await?;
     }
-    assert_eq!(proxy.confirms.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        proxy.confirms.load(Ordering::SeqCst),
+        if !fenced && !execute { 2 } else { 1 }
+    );
+    let requests = proxy.confirm_requests.lock().unwrap().clone();
+    assert!(requests.iter().all(|r| r == &requests[0]));
     assert_eq!(proxy.dropped.load(Ordering::SeqCst), 1);
     drop(publisher);
     cluster.client = direct;
