@@ -67,8 +67,19 @@ async fn uncertain_fence(execute: bool) -> Result<()> {
     assert!(abandoned.iter().all(|p| p.exists()));
     assert_eq!(files(&path)?, before_files);
     assert_eq!(metadata_files(&path)?, before_metadata);
-    let (observation, pressured) = service.observation().await;
-    assert!(pressured);
+    // RPC fault counts do not synchronize with the independent apply loop.
+    // Wait for that loop to observe the blocked write before checking its cut.
+    let observation = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            assert!(!task.is_finished(), "uncertain GC fence killed the owner");
+            let (observation, pressured) = service.observation().await;
+            if pressured {
+                return observation;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
     assert_eq!(observation.applied, suffix_result.index);
     assert!(observation.applied < accepted.position.index);
     assert_eq!(service.source_observation().records, 2);
