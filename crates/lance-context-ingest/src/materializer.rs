@@ -14,6 +14,7 @@ mod close;
 pub(crate) mod compaction;
 mod confirm;
 pub mod observation;
+mod pin;
 mod pipeline;
 mod plan;
 mod prepare;
@@ -720,11 +721,7 @@ impl Publisher {
                             && selected.range == pending.plan.sources[&group],
                         "pin differs from selected prefix"
                     );
-                    let reply = commit(&self.ingress.client, Command::Pin(*permit)).await?;
-                    ensure!(
-                        matches!(reply, Applied::Source(source::Reply::Pinned { .. })),
-                        "source pin rejected: {reply:?}"
-                    );
+                    self.pin_source(*permit).await?;
                     Ok::<_, anyhow::Error>(())
                 }),
         )
