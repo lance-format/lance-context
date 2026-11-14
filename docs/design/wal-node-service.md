@@ -30,8 +30,12 @@ All paths relative to a configuration file resolve against its containing
 directory. The executable reads at most 1 MiB of configuration.
 
 Each advertised node has distinct peer, snapshot, data and control addresses, a
-TLS server name and a SHA-256 leaf-certificate pin. Addresses are stable service
-names; changing the durable layout is a migration. Listeners may bind wildcard
+TLS server name and a SHA-256 leaf-certificate pin. Prefer stable service names.
+Actual connection addresses in `endpoints` may be updated after Pod replacement;
+keep the original `layout`, node IDs, certificate pins and persistent directories.
+The layout's original addresses remain part of its durable identity and are not
+rewritten to match new Pod IPs. This does not add voters, transfer ownership or
+rotate certificates. Changing the durable layout is a migration. Listeners may bind wildcard
 addresses, but must have distinct, nonzero ports. Only voters sharing a hosted
 group have peer queues and certificate authorization on a physical node; adding
 unrelated groups does not create a full mesh of peer tasks.

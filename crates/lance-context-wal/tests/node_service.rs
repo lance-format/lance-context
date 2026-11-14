@@ -35,7 +35,10 @@ fn configuration_rejects_missing_signers_unknown_fields_and_listener_aliases() -
     bad.listen.snapshot = bad.listen.peer;
     assert!(bad.validate().is_err());
     let mut bad = original.clone();
-    bad.endpoints.get_mut(&1).unwrap().peer = "foreign:7000".into();
+    bad.endpoints.get_mut(&1).unwrap().peer = bad.endpoints[&2].peer.clone();
+    assert!(bad.validate().is_err());
+    let mut bad = original.clone();
+    bad.endpoints.remove(&1);
     assert!(bad.validate().is_err());
     let mut json = serde_json::to_value(original)?;
     json["ignored_typo"] = true.into();
@@ -105,16 +108,16 @@ async fn leader(f: &Fixture, group: u64) -> Result<u64> {
     .await?
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn actual_node_binaries_maintain_two_disjoint_groups_catch_up_and_restart() -> Result<()> {
-    let f = Fixture::new()?;
-    let result = run_cluster(&f).await;
+async fn actual_node_binaries_maintain_two_disjoint_groups_catch_up_and_relocate() -> Result<()> {
+    let mut f = Fixture::new()?;
+    let result = run_cluster(&mut f).await;
     if result.is_err() {
         let path = f.root.keep();
         eprintln!("failed service fixture retained at {}", path.display());
     }
     result
 }
-async fn run_cluster(f: &Fixture) -> Result<()> {
+async fn run_cluster(f: &mut Fixture) -> Result<()> {
     let mut children = (1..=6)
         .map(|node| Ok((node, f.spawn(node, 1)?)))
         .collect::<Result<BTreeMap<_, _>>>()?;
@@ -326,6 +329,10 @@ async fn run_cluster(f: &Fixture) -> Result<()> {
     for child in children.values_mut() {
         child.terminate().await?;
     }
+    // All six processes move to new peer/snapshot/client/health endpoints while
+    // retaining their original directories, durable layout and TLS identities.
+    // The same acknowledged records and producer sequences must still recover.
+    f.rebind()?;
     for node in 1..=6 {
         children.insert(node, f.spawn(node, 3)?);
     }
