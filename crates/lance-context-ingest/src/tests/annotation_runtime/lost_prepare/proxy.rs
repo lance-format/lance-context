@@ -43,6 +43,10 @@ pub(in crate::tests) struct Proxy {
     blocked_nodes: Arc<std::sync::Mutex<std::collections::BTreeSet<u64>>>,
     observations_restored: Arc<AtomicBool>,
     pub advances: Arc<AtomicUsize>,
+    pub advance_requests: Arc<std::sync::Mutex<Vec<p::AdvancePublication>>>,
+    pub unknown_advances: Arc<AtomicBool>,
+    pub pause_uncommitted_advance: Arc<AtomicBool>,
+    pub block_advance_observations: Arc<AtomicBool>,
     pub appends: Arc<AtomicUsize>,
     pub closes: Arc<AtomicUsize>,
     pub unknown_closes: Arc<AtomicBool>,
@@ -374,6 +378,10 @@ impl Proxy {
         let blocked_nodes = Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
         let observations_restored = Arc::new(AtomicBool::new(false));
         let advances = Arc::new(AtomicUsize::new(0));
+        let advance_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let unknown_advances = Arc::new(AtomicBool::new(false));
+        let pause_uncommitted_advance = Arc::new(AtomicBool::new(false));
+        let block_advance_observations = Arc::new(AtomicBool::new(false));
         let appends = Arc::new(AtomicUsize::new(0));
         let closes = Arc::new(AtomicUsize::new(0));
         let unknown_closes = Arc::new(AtomicBool::new(false));
@@ -423,6 +431,10 @@ impl Proxy {
             let blocked_nodes = blocked_nodes.clone();
             let observations_restored = observations_restored.clone();
             let advances = advances.clone();
+            let advance_requests = advance_requests.clone();
+            let unknown_advances = unknown_advances.clone();
+            let pause_uncommitted_advance = pause_uncommitted_advance.clone();
+            let block_advance_observations = block_advance_observations.clone();
             let appends = appends.clone();
             let closes = closes.clone();
             let unknown_closes = unknown_closes.clone();
@@ -449,6 +461,10 @@ impl Proxy {
                             let blocked_nodes = blocked_nodes.clone();
                             let observations_restored = observations_restored.clone();
                             let advances = advances.clone();
+            let advance_requests = advance_requests.clone();
+            let unknown_advances = unknown_advances.clone();
+            let pause_uncommitted_advance = pause_uncommitted_advance.clone();
+            let block_advance_observations = block_advance_observations.clone();
                             let appends = appends.clone();
                             let closes = closes.clone();
                             let unknown_closes = unknown_closes.clone();
@@ -458,7 +474,7 @@ impl Proxy {
                                 let mut upstream = connector.connect(name, TcpStream::connect(address).await?).await?;
                                 while let Some(mut request) = Frame::read(&mut downstream, matches!(point, Point::Append { .. })).await? {
                                     if matches!(point, Point::Append { .. }) { request.payload(&mut downstream, true).await?; }
-                                    if matches!(point, Point::Prepare { observe: false, .. } | Point::Pin { observe: false, .. }) && dropped.load(Ordering::SeqCst) > 0 && request.observation_query(point)? && !observations_restored.load(Ordering::SeqCst) {
+                                    if (matches!(point, Point::Prepare { observe: false, .. } | Point::Pin { observe: false, .. }) || (matches!(point, Point::Advance { .. }) && block_advance_observations.load(Ordering::SeqCst))) && dropped.load(Ordering::SeqCst) > 0 && request.observation_query(point)? && !observations_restored.load(Ordering::SeqCst) {
                                         // Keep every voter unavailable across reconnects and
                                         // rerouting until the original query deadline expires.
                                         // A single dropped connection now permits confirmation
@@ -526,10 +542,25 @@ impl Proxy {
                                         request.unknown_reply()?.write(&mut downstream).await?;
                                         continue;
                                     }
-                                    if hold && matches!(point, Point::Plan { .. } | Point::Advance { .. }) {
-                                        let submissions = if matches!(point, Point::Plan { .. }) { &plans } else { &advances };
-                                        submissions.fetch_add(1, Ordering::SeqCst);
-                                        if matches!(point, Point::Plan { execute: false } | Point::Advance { execute: false }) && armed.swap(false, Ordering::SeqCst) {
+                                    if hold && matches!(point, Point::Advance { .. }) {
+                                        advances.fetch_add(1, Ordering::SeqCst);
+                                        let (_, _, command): (WireScope, u32, Command) = codec().reject_trailing_bytes().deserialize(&request.meta)?;
+                                        let Command::Advance(advance) = command else { bail!("expected an Advance command"); };
+                                        advance_requests.lock().unwrap().push(advance);
+                                        let persistent = unknown_advances.load(Ordering::SeqCst);
+                                        if persistent || (matches!(point, Point::Advance { execute: false }) && armed.swap(false, Ordering::SeqCst)) {
+                                            if !persistent && pause_uncommitted_advance.load(Ordering::SeqCst) {
+                                                committed.notify_one();
+                                                release.notified().await;
+                                            }
+                                            dropped.fetch_add(1, Ordering::SeqCst);
+                                            request.unknown_reply()?.write(&mut downstream).await?;
+                                            continue;
+                                        }
+                                    }
+                                    if hold && matches!(point, Point::Plan { .. }) {
+                                        plans.fetch_add(1, Ordering::SeqCst);
+                                        if matches!(point, Point::Plan { execute: false }) && armed.swap(false, Ordering::SeqCst) {
                                             dropped.fetch_add(1, Ordering::SeqCst);
                                             request.unknown_reply()?.write(&mut downstream).await?;
                                             continue;
@@ -608,6 +639,10 @@ impl Proxy {
             blocked_nodes,
             observations_restored,
             advances,
+            advance_requests,
+            unknown_advances,
+            pause_uncommitted_advance,
+            block_advance_observations,
             appends,
             closes,
             unknown_closes,
