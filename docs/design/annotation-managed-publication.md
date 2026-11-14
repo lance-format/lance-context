@@ -47,6 +47,25 @@ operation. Separate runtime and application process tests exercise SIGKILL and
 replacement with retained storage. Sustained-load qualification requires its own
 workload, latency and drain measurements.
 
+## Resolving an uncertain confirmation
+
+A structured unknown Confirm holds the current publishing generation while the
+owner resolves that exact publication. It first reads the quorum catalog under
+the same authority and table incarnation. An existing matching publication
+receipt completes the call. Otherwise, only the unchanged pending plan, durable
+descriptors and selected manifest allow resubmitting the identical idempotent
+Confirm, with 100 ms between unresolved attempts. It does not upload files again,
+create a new generation or resubmit an annotation mutation. The bounded applier
+and owned point reads remain live while confirmation waits; source/staging
+pressure still prevents acknowledging unapplied writes. Cancellation preserves
+the selected files and retained WAL for fenced restart. Explicit rejection,
+changed identity and failed quorum observation keep their error behavior.
+
+Native tests cover committed and uncommitted confirmation, fencing during each,
+concurrent status/score updates, sustained uncertainty with source backpressure
+and owned reads, and cancellation followed by recovery of the original files.
+These tests do not establish sustained mixed-load throughput.
+
 ## Preparations spanning many fragments
 
 The native transaction grows with the fragments it updates, independently of
