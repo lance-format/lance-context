@@ -2,6 +2,7 @@
 //! withhold one completion reply or return an uncertain control outcome.
 use super::*;
 use bincode::Options as _;
+use lance_context_wal::replication::source;
 use std::path::Path as FsPath;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::Notify;
@@ -35,6 +36,8 @@ pub(in crate::tests) struct Proxy {
     pub unknown_prepares: Arc<AtomicBool>,
     pub pause_uncommitted_prepare: Arc<AtomicBool>,
     pub prepare_requests: Arc<std::sync::Mutex<Vec<p::PrepareRequest>>>,
+    pub pin_requests: Arc<std::sync::Mutex<Vec<source::Permit>>>,
+    pub unknown_pins: Arc<AtomicBool>,
     pub confirms: Arc<AtomicUsize>,
     pub blocked_reads: Arc<AtomicUsize>,
     blocked_nodes: Arc<std::sync::Mutex<std::collections::BTreeSet<u64>>>,
@@ -69,6 +72,10 @@ struct Frame {
 
 #[derive(Clone, Copy)]
 enum Point {
+    Pin {
+        execute: bool,
+        observe: bool,
+    },
     Prepare {
         execute: bool,
         observe: bool,
@@ -163,13 +170,14 @@ impl Frame {
         Ok(matches!(
             (point, command),
             (Point::Prepare { .. }, Command::Prepare(_))
+                | (Point::Pin { .. }, Command::Pin(_))
                 | (Point::Close { .. }, Command::Close(_))
                 | (Point::Plan { .. }, Command::Plan(_))
                 | (Point::Advance { .. }, Command::Advance(_))
                 | (Point::Confirm { .. }, Command::Confirm(_))
         ))
     }
-    fn publisher_query(&self) -> Result<bool> {
+    fn observation_query(&self, point: Point) -> Result<bool> {
         let (_, kind): (WireScope, u32) = codec().allow_trailing_bytes().deserialize(&self.meta)?;
         if kind != 2 {
             return Ok(false);
@@ -183,7 +191,11 @@ impl Frame {
         Ok(matches!(
             query,
             lance_context_wal::replication::query::Query::Publisher { .. }
-        ))
+        ) || (matches!(point, Point::Pin { .. })
+            && matches!(
+                query,
+                lance_context_wal::replication::query::Query::SourcePin { .. }
+            )))
     }
     fn unknown_reply(&self) -> Result<Self> {
         let (scope, _): (WireScope, u32) =
@@ -204,6 +216,11 @@ impl Frame {
         Ok(matches!(
             (point, reply),
             (
+                Point::Pin { .. },
+                Reply::Commit(Outcome::Committed(Applied::Source(
+                    source::Reply::Pinned { .. }
+                )))
+            ) | (
                 Point::Append { .. },
                 Reply::Commit(Outcome::Committed(Applied::Accepted { .. }))
             ) | (
@@ -237,6 +254,15 @@ impl Frame {
 }
 
 impl Proxy {
+    pub async fn open_pin(
+        c: &network::Cluster,
+        root: &FsPath,
+        execute: bool,
+        observe: bool,
+    ) -> Result<Self> {
+        Self::open_at(c, root, Point::Pin { execute, observe }).await
+    }
+
     /// Restore catalog reads only after the owner has observed the full outage.
     pub fn restore_observations(&self) {
         assert_eq!(
@@ -341,6 +367,8 @@ impl Proxy {
         let unknown_prepares = Arc::new(AtomicBool::new(false));
         let pause_uncommitted_prepare = Arc::new(AtomicBool::new(false));
         let prepare_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pin_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let unknown_pins = Arc::new(AtomicBool::new(false));
         let confirms = Arc::new(AtomicUsize::new(0));
         let blocked_reads = Arc::new(AtomicUsize::new(0));
         let blocked_nodes = Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
@@ -388,6 +416,8 @@ impl Proxy {
             let unknown_prepares = unknown_prepares.clone();
             let pause_uncommitted_prepare = pause_uncommitted_prepare.clone();
             let prepare_requests = prepare_requests.clone();
+            let pin_requests = pin_requests.clone();
+            let unknown_pins = unknown_pins.clone();
             let confirms = confirms.clone();
             let blocked_reads = blocked_reads.clone();
             let blocked_nodes = blocked_nodes.clone();
@@ -412,6 +442,8 @@ impl Proxy {
                             let unknown_prepares = unknown_prepares.clone();
                             let pause_uncommitted_prepare = pause_uncommitted_prepare.clone();
                             let prepare_requests = prepare_requests.clone();
+                            let pin_requests = pin_requests.clone();
+                            let unknown_pins = unknown_pins.clone();
                             let confirms = confirms.clone();
                             let blocked_reads = blocked_reads.clone();
                             let blocked_nodes = blocked_nodes.clone();
@@ -426,7 +458,7 @@ impl Proxy {
                                 let mut upstream = connector.connect(name, TcpStream::connect(address).await?).await?;
                                 while let Some(mut request) = Frame::read(&mut downstream, matches!(point, Point::Append { .. })).await? {
                                     if matches!(point, Point::Append { .. }) { request.payload(&mut downstream, true).await?; }
-                                    if matches!(point, Point::Prepare { observe: false, .. }) && dropped.load(Ordering::SeqCst) > 0 && request.publisher_query()? && !observations_restored.load(Ordering::SeqCst) {
+                                    if matches!(point, Point::Prepare { observe: false, .. } | Point::Pin { observe: false, .. }) && dropped.load(Ordering::SeqCst) > 0 && request.observation_query(point)? && !observations_restored.load(Ordering::SeqCst) {
                                         // Keep every voter unavailable across reconnects and
                                         // rerouting until the original query deadline expires.
                                         // A single dropped connection now permits confirmation
@@ -436,6 +468,21 @@ impl Proxy {
                                         return Ok(());
                                     }
                                     let hold = request.matches_command(point)?;
+                                    if hold && matches!(point, Point::Pin { .. }) {
+                                        let (_, _, command): (WireScope, u32, Command) = codec().reject_trailing_bytes().deserialize(&request.meta)?;
+                                        let Command::Pin(permit) = command else { bail!("expected a Pin command"); };
+                                        pin_requests.lock().unwrap().push(permit);
+                                        let persistent = unknown_pins.load(Ordering::SeqCst);
+                                        if persistent || (matches!(point, Point::Pin { execute: false, .. }) && armed.swap(false, Ordering::SeqCst)) {
+                                            if !persistent {
+                                                committed.notify_one();
+                                                release.notified().await;
+                                            }
+                                            dropped.fetch_add(1, Ordering::SeqCst);
+                                            request.unknown_reply()?.write(&mut downstream).await?;
+                                            continue;
+                                        }
+                                    }
                                     if hold && matches!(point, Point::Confirm { .. }) {
                                         confirms.fetch_add(1, Ordering::SeqCst);
                                         if matches!(point, Point::Confirm { execute: false }) && armed.swap(false, Ordering::SeqCst) {
@@ -499,7 +546,7 @@ impl Proxy {
                                         committed.notify_one();
                                         release.notified().await;
                                         dropped.fetch_add(1, Ordering::SeqCst);
-                                        if matches!(point, Point::Plan { .. } | Point::Advance { .. } | Point::Confirm { .. } | Point::Append { .. } | Point::Prepare { structured: true, .. }) {
+                                        if matches!(point, Point::Plan { .. } | Point::Advance { .. } | Point::Confirm { .. } | Point::Append { .. } | Point::Pin { .. } | Point::Prepare { structured: true, .. }) {
                                             request.unknown_reply()?.write(&mut downstream).await?;
                                             continue;
                                         }
@@ -554,6 +601,8 @@ impl Proxy {
             unknown_prepares,
             pause_uncommitted_prepare,
             prepare_requests,
+            pin_requests,
+            unknown_pins,
             confirms,
             blocked_reads,
             blocked_nodes,
