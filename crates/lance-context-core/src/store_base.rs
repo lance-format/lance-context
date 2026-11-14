@@ -2759,6 +2759,13 @@ impl StorageBase {
     /// Payload retries similarly start at the first missing-file failure: a
     /// slow initial read must still be able to recover WAL reclaimed by a merge.
     /// The retry budget limits starting another attempt, not a valid scan.
+    ///
+    /// The callback must complete the actual read before its future returns:
+    /// await `try_collect` or fully consume any stream inside the callback.
+    /// Do not return a lazy scanner, stream, or future, or retain the captured
+    /// dataset or shard snapshots for later reads. Read protection and retries
+    /// do not cover reads performed after the callback returns. The callback
+    /// may be invoked more than once, so keep it free of business side effects.
     pub async fn read_consistent<T, F, Fut>(&self, source: ListSource, read: F) -> LanceResult<T>
     where
         F: FnMut(Dataset, Vec<ShardSnapshot>) -> Fut,

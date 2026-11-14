@@ -25,7 +25,14 @@ this to `false` defers visibility until an explicit or background flush.
 
 Read through `read_consistent(ListSource::All, ...)`, building the scan with
 `lsm_scanner_for_dataset` from the dataset and shard snapshots passed into the
-callback. This includes published WAL and refreshes the base/WAL view together;
+callback. Complete the read inside the callback: await `try_collect` or fully
+consume the stream before returning. Do not return a lazy scanner, stream, or
+future, or retain the captured dataset or shard snapshots for later reads.
+Read protection and retries do not cover reads performed after the callback
+returns. The callback may run more than once, so keep it free of business side
+effects.
+
+This includes published WAL and refreshes the base/WAL view together;
 scanning `dataset()` alone sees only base fragments. Use `key_column()` when
 building the scanner. The dataset, shard identity and credentials cannot be
 replaced through public fields after opening a store.
