@@ -87,6 +87,7 @@ pub(crate) async fn run(
         tick,
         last_log: Instant::now(),
         suggested: BTreeSet::new(),
+        rewrite_blocked: false,
     };
     loop {
         tokio::select! { _ = background.stop.changed() => return Ok(()), _ = background.tick.tick() => {} }
@@ -124,8 +125,14 @@ pub(crate) async fn run(
             // still act on native hints immediately.
             let suggested =
                 options.checkpoint_trailing_bytes == 0 && background.suggested.contains(&group);
+            // A refused native rewrite may still include an applied prefix
+            // that a fresh image can replace. Do not retain that prefix until
+            // the ordinary age/entry threshold while reclamation lacks room.
+            // This uses the same bounded builder and disk admission; it never
+            // enlarges headroom or rebuilds an already checkpointed cut.
             if new == 0
                 || (!suggested
+                    && !background.rewrite_blocked
                     && new < options.checkpoint_entries
                     && checkpoints[&group].elapsed()
                         < Duration::from_millis(options.checkpoint_interval_ms))
@@ -198,6 +205,7 @@ struct Background<'a> {
     tick: tokio::time::Interval,
     last_log: Instant,
     suggested: BTreeSet<u64>,
+    rewrite_blocked: bool,
 }
 impl Background<'_> {
     async fn collect_images(&mut self) -> Result<bool> {
@@ -272,6 +280,7 @@ impl Background<'_> {
             .await;
             match result {
                 Ok(next) => {
+                    self.rewrite_blocked = false;
                     self.last_log = Instant::now();
                     self.suggested
                         .extend(next.into_iter().filter(|group| self.groups.contains(group)));
@@ -279,7 +288,12 @@ impl Background<'_> {
                     p.log_passes = p.log_passes.saturating_add(1);
                     p.log_micros = p.log_micros.saturating_add(micros(start));
                 }
-                Err(e) => error(self.progress, e),
+                Err(e) => {
+                    if e.is::<crate::admission::DiskBudgetExhausted>() {
+                        self.rewrite_blocked = true;
+                    }
+                    error(self.progress, e);
+                }
             }
         }
         if *self.stop.borrow() {
