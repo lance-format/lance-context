@@ -4357,6 +4357,7 @@ dependencies = [
  "lance-table",
  "libc",
  "object_store 0.14.2",
+ "prost",
  "protobuf",
  "raft",
  "raft-engine",

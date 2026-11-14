@@ -24,6 +24,8 @@ use object_store::path::Path;
 use std::{fmt::Debug, sync::Arc};
 use uuid::Uuid;
 
+mod transaction;
+
 /// A trusted, bounded transport adapter. A local replica read is not sufficient.
 #[async_trait::async_trait]
 pub trait ManifestCatalog: Debug + Send + Sync {
@@ -353,9 +355,9 @@ impl CommitHandler for ManagedManifest {
             .as_ref()
             .ok_or_else(|| ::lance::Error::not_supported("read-only managed manifest handler"))?;
         if manifest.version != scope.target
-            || transaction
-                .as_ref()
-                .is_none_or(|tx| tx.as_pb().uuid != scope.transaction.to_string())
+            || !transaction::matches(scope, manifest, base, store, transaction.as_ref())
+                .await
+                .map_err(error)?
         {
             return Err(CommitError::CommitConflict);
         }
