@@ -41,6 +41,8 @@ pub(in crate::tests) struct Proxy {
     pub pin_requests: Arc<std::sync::Mutex<Vec<source::Permit>>>,
     pub unknown_pins: Arc<AtomicBool>,
     pub confirms: Arc<AtomicUsize>,
+    pub confirm_requests: Arc<std::sync::Mutex<Vec<p::ConfirmPublication>>>,
+    pub unknown_confirms: Arc<AtomicBool>,
     pub blocked_reads: Arc<AtomicUsize>,
     blocked_nodes: Arc<std::sync::Mutex<std::collections::BTreeSet<u64>>>,
     observations_restored: Arc<AtomicBool>,
@@ -407,6 +409,8 @@ impl Proxy {
         let pin_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let unknown_pins = Arc::new(AtomicBool::new(false));
         let confirms = Arc::new(AtomicUsize::new(0));
+        let confirm_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let unknown_confirms = Arc::new(AtomicBool::new(false));
         let blocked_reads = Arc::new(AtomicUsize::new(0));
         let blocked_nodes = Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
         let observations_restored = Arc::new(AtomicBool::new(false));
@@ -465,6 +469,8 @@ impl Proxy {
             let pin_requests = pin_requests.clone();
             let unknown_pins = unknown_pins.clone();
             let confirms = confirms.clone();
+            let confirm_requests = confirm_requests.clone();
+            let unknown_confirms = unknown_confirms.clone();
             let blocked_reads = blocked_reads.clone();
             let blocked_nodes = blocked_nodes.clone();
             let observations_restored = observations_restored.clone();
@@ -500,6 +506,8 @@ impl Proxy {
                             let pin_requests = pin_requests.clone();
                             let unknown_pins = unknown_pins.clone();
                             let confirms = confirms.clone();
+            let confirm_requests = confirm_requests.clone();
+            let unknown_confirms = unknown_confirms.clone();
                             let blocked_reads = blocked_reads.clone();
                             let blocked_nodes = blocked_nodes.clone();
                             let observations_restored = observations_restored.clone();
@@ -564,6 +572,14 @@ impl Proxy {
                                     }
                                     if hold && matches!(point, Point::Confirm { .. }) {
                                         confirms.fetch_add(1, Ordering::SeqCst);
+                                        let (_, _, command): (WireScope, u32, Command) = codec().reject_trailing_bytes().deserialize(&request.meta)?;
+                                        let Command::Confirm(confirm) = command else { bail!("expected Confirm"); };
+                                        confirm_requests.lock().unwrap().push(confirm);
+                                        if unknown_confirms.load(Ordering::SeqCst) {
+                                            dropped.fetch_add(1, Ordering::SeqCst);
+                                            request.unknown_reply()?.write(&mut downstream).await?;
+                                            continue;
+                                        }
                                         if matches!(point, Point::Confirm { execute: false }) && armed.swap(false, Ordering::SeqCst) {
                                             committed.notify_one();
                                             release.notified().await;
@@ -708,6 +724,8 @@ impl Proxy {
             pin_requests,
             unknown_pins,
             confirms,
+            confirm_requests,
+            unknown_confirms,
             blocked_reads,
             blocked_nodes,
             observations_restored,

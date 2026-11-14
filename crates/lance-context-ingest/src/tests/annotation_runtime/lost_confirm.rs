@@ -5,15 +5,25 @@ use std::sync::atomic::Ordering;
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn committed_unknown_confirm_keeps_owner_live_and_preserves_concurrent_updates() -> Result<()>
 {
-    tokio::time::timeout(Duration::from_secs(60), exercise(true)).await?
+    tokio::time::timeout(Duration::from_secs(60), exercise(true, false, false)).await?
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn uncommitted_unknown_confirm_retains_recovery_evidence_and_acked_suffix() -> Result<()> {
-    tokio::time::timeout(Duration::from_secs(60), exercise(false)).await?
+async fn uncommitted_unknown_confirm_keeps_owner_live_and_drains() -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(60), exercise(false, false, false)).await?
 }
 
-async fn exercise(execute: bool) -> Result<()> {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn persistent_unknown_confirm_preserves_reads_and_eventually_drains() -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(60), exercise(false, true, false)).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_unknown_confirm_recovers_original_files_and_acked_suffix() -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(60), exercise(false, true, true)).await?
+}
+
+async fn exercise(execute: bool, persistent: bool, restart: bool) -> Result<()> {
     let root = tempfile::tempdir()?;
     let storage = Storage::resolve(
         root.path().join("turns.lance").to_str().unwrap().into(),
@@ -92,9 +102,38 @@ async fn exercise(execute: bool) -> Result<()> {
     let current = service.get("T", Duration::from_secs(10)).await?.unwrap();
     assert_eq!(current.status.as_deref(), Some("approved"));
     assert_eq!(current.score, Some(0.9));
+    if persistent {
+        proxy.unknown_confirms.store(true, Ordering::SeqCst);
+    }
     proxy.release.notify_one();
+    if persistent {
+        tokio::select! {
+            result = &mut task => bail!("uncertain Confirm killed owner: {result:?}"),
+            result = tokio::time::timeout(Duration::from_secs(5), async {
+                while proxy.confirms.load(Ordering::SeqCst) < 3 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }) => result?,
+        }
+        let view = annotation_publication::state(&c).await?;
+        assert_eq!(view.progress.pending, Some(pending.clone()));
+        assert_eq!(view.progress.prepared, Some(prepared.clone()));
+        assert!(view.progress.published.is_none());
+        assert_eq!(view.progress.checkpoint, retained.progress.checkpoint);
+        let requests = proxy.confirm_requests.lock().unwrap().clone();
+        assert!(requests.len() >= 3);
+        assert!(requests.iter().all(|r| r == &requests[0]));
+        assert_eq!(service.source_observation().records, 2);
+        assert_eq!(
+            service.get("T", Duration::from_secs(10)).await?.unwrap(),
+            current
+        );
+        if !restart {
+            proxy.unknown_confirms.store(false, Ordering::SeqCst);
+        }
+    }
     let through = score.index.max(status.index);
-    if execute {
+    if !restart {
         tokio::select! {
             result = drained(&c, &service, through) => result?,
             stopped = &mut task => bail!("owner exited before draining confirmed publication: {stopped:?}"),
@@ -111,12 +150,20 @@ async fn exercise(execute: bool) -> Result<()> {
             Some(transaction),
             "reconciliation must keep the original transaction and prepared files"
         );
-        assert_eq!(proxy.dropped.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            proxy.confirms.load(Ordering::SeqCst),
-            2,
-            "one original Confirm and one suffix Confirm; no resubmission"
-        );
+        if !persistent {
+            assert_eq!(proxy.dropped.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                proxy.confirms.load(Ordering::SeqCst),
+                if execute { 2 } else { 3 }
+            );
+        }
+        let requests = proxy.confirm_requests.lock().unwrap().clone();
+        let original: Vec<_> = requests
+            .iter()
+            .filter(|r| r.transaction == pending.plan.transaction)
+            .collect();
+        assert!(!original.is_empty());
+        assert!(original.iter().all(|r| *r == original[0]));
         stop.send(()).unwrap();
         task.await??;
         c.client = direct;
@@ -124,12 +171,9 @@ async fn exercise(execute: bool) -> Result<()> {
         return c.shutdown().await;
     }
 
-    let error = tokio::time::timeout(Duration::from_secs(10), task)
-        .await??
-        .unwrap_err();
-    assert!(format!("{error:#}").contains("outcome unknown"));
-    assert_eq!(proxy.dropped.load(Ordering::SeqCst), 1);
-    assert_eq!(proxy.confirms.load(Ordering::SeqCst), 1);
+    // Cancelling a held confirmation must retain its durable plan and suffix.
+    stop.send(()).unwrap();
+    task.await??;
     let stopped = annotation_publication::state(&c).await?;
     assert_eq!(stopped.progress.pending, Some(pending));
     assert_eq!(stopped.progress.prepared, Some(prepared));
