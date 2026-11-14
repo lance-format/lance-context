@@ -28,6 +28,8 @@ struct WireScope {
     _node: u64,
 }
 
+type RecordedAppends = Arc<std::sync::Mutex<Vec<(BatchMeta, Vec<u8>)>>>;
+
 pub(in crate::tests) struct Proxy {
     pub client: Arc<Client>,
     pub dropped: Arc<AtomicUsize>,
@@ -48,7 +50,7 @@ pub(in crate::tests) struct Proxy {
     pub pause_uncommitted_advance: Arc<AtomicBool>,
     pub block_advance_observations: Arc<AtomicBool>,
     pub appends: Arc<AtomicUsize>,
-    pub append_requests: Arc<std::sync::Mutex<Vec<(BatchMeta, Vec<u8>)>>>,
+    pub append_requests: RecordedAppends,
     pub unknown_appends: Arc<AtomicBool>,
     pub pause_append_retry: Arc<AtomicBool>,
     pub lose_append_retry_reply: Arc<AtomicBool>,
