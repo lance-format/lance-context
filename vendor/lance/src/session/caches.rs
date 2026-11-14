@@ -208,20 +208,20 @@ pub struct RowIdIndexKey<'a> {
     /// A dataset dropped and recreated at the same URI restarts its version
     /// history at 1, so a long-lived session's cache can otherwise return the
     /// previous incarnation's index for a version number the new incarnation
-    /// now also holds. The e-tag disambiguates generations the same way
-    /// [`ManifestKey::e_tag`] does. Callers without one must not share the
-    /// cached index at all (see `get_row_id_index`).
+    /// now also holds. The e-tag disambiguates physical object generations.
     pub e_tag: Option<&'a str>,
+    /// The commit handler's manifest-record identity also distinguishes a
+    /// recreated dataset. Keep it separate from the physical e-tag namespace.
+    /// Callers without either token must build privately (`get_row_id_index`).
+    pub identity: Option<&'a str>,
 }
 
 impl CacheKey for RowIdIndexKey<'_> {
     type ValueType = RowIdIndex;
     fn key(&self) -> Cow<'_, str> {
         Cow::Owned(format!(
-            "row_id_index/{}/{}/{}",
-            self.version,
-            self.with_deletions,
-            self.e_tag.unwrap_or("")
+            "row_id_index/{}/{}/{:?}/{:?}",
+            self.version, self.with_deletions, self.e_tag, self.identity
         ))
     }
     fn type_name() -> &'static str {
@@ -229,7 +229,7 @@ impl CacheKey for RowIdIndexKey<'_> {
     }
 
     fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.dataset.row-id-index-key", 1)
+        CacheKeySchema::new("lance.dataset.row-id-index-key", 2)
     }
 
     fn write_key(&self, builder: &mut KeyBuilder) {
@@ -239,6 +239,13 @@ impl CacheKey for RowIdIndexKey<'_> {
             Some(e_tag) => {
                 builder.write_some();
                 builder.write_str(e_tag);
+            }
+            None => builder.write_none(),
+        }
+        match self.identity {
+            Some(identity) => {
+                builder.write_some();
+                builder.write_str(identity);
             }
             None => builder.write_none(),
         }
@@ -435,6 +442,7 @@ mod tests {
             version: 5,
             with_deletions: true,
             e_tag: Some("first-etag"),
+            identity: None,
         };
         cache
             .insert_with_key(&key, Arc::new(RowIdIndex::new(&[]).unwrap()))
@@ -447,9 +455,44 @@ mod tests {
                     version: 5,
                     with_deletions: true,
                     e_tag: Some("second-etag"),
+                    identity: None,
                 })
                 .await
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn row_id_index_key_separates_logical_and_physical_tokens() {
+        let cache = LanceCache::with_capacity(4096);
+        let key = RowIdIndexKey {
+            version: 5,
+            with_deletions: true,
+            e_tag: None,
+            identity: Some("record-token"),
+        };
+        cache
+            .insert_with_key(&key, Arc::new(RowIdIndex::new(&[]).unwrap()))
+            .await;
+        assert!(cache.get_with_key(&key).await.is_some());
+        for (version, with_deletions, e_tag, identity) in [
+            (5, true, None, Some("another-record")),
+            (5, true, Some("record-token"), None),
+            (6, true, None, Some("record-token")),
+            (5, false, None, Some("record-token")),
+            (5, true, None, None),
+        ] {
+            assert!(
+                cache
+                    .get_with_key(&RowIdIndexKey {
+                        version,
+                        with_deletions,
+                        e_tag,
+                        identity,
+                    })
+                    .await
+                    .is_none()
+            );
+        }
     }
 }

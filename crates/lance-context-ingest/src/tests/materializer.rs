@@ -9,6 +9,7 @@ mod advance;
 #[cfg(feature = "service")]
 mod close;
 mod compaction;
+mod managed_rowid_cache;
 #[cfg(feature = "service")]
 mod confirm;
 mod external_transaction;
