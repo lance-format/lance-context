@@ -9,16 +9,22 @@ pub(in crate::tests) mod proxy;
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn annotation_unknown_prepare_preserves_acked_suffix_and_reuses_original_files() -> Result<()>
 {
-    tokio::time::timeout(Duration::from_secs(60), exercise(false)).await?
+    tokio::time::timeout(Duration::from_secs(60), exercise(false, true)).await?
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn committed_unknown_prepare_keeps_owner_live_and_preserves_concurrent_updates() -> Result<()>
 {
-    tokio::time::timeout(Duration::from_secs(60), exercise(true)).await?
+    tokio::time::timeout(Duration::from_secs(60), exercise(true, true)).await?
 }
 
-async fn exercise(confirm: bool) -> Result<()> {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unrecorded_prepare_resumes_original_files_and_preserves_concurrent_updates() -> Result<()>
+{
+    tokio::time::timeout(Duration::from_secs(60), exercise(true, false)).await?
+}
+
+async fn exercise(confirm: bool, recorded: bool) -> Result<()> {
     let mut builder = tempfile::Builder::new();
     builder.prefix("annotation-lost-prepare-");
     let root = if let Ok(parent) = std::env::var("INGEST_TEST_ARTIFACTS") {
@@ -45,10 +51,15 @@ async fn exercise(confirm: bool) -> Result<()> {
         .await?;
     let base = annotation_publication::read(&c, &storage, None).await?;
     let proxy = if confirm {
-        proxy::Proxy::open_prepare(&c, root.path(), true, true).await?
+        proxy::Proxy::open_prepare(&c, root.path(), recorded, true).await?
     } else {
         proxy::Proxy::open(&c, root.path()).await?
     };
+    if !recorded {
+        proxy
+            .pause_uncommitted_prepare
+            .store(true, Ordering::SeqCst);
+    }
     let direct = std::mem::replace(&mut c.client, proxy.client.clone());
     let (service, runtime) = owner(&c, &storage, &limits).await?;
     let (stop, task) = run_owner(runtime);
@@ -66,7 +77,7 @@ async fn exercise(confirm: bool) -> Result<()> {
     assert_eq!(first_result.result, MutationResult::Applied);
     tokio::time::timeout(Duration::from_secs(30), proxy.committed.notified()).await?;
 
-    // The publisher is waiting for its actual committed Prepare response.
+    // The publisher waits for its Prepare outcome, committed or not yet recorded.
     // Apply remains live, and both later field updates must be ACKed now.
     let score = request(
         &service,
@@ -95,11 +106,16 @@ async fn exercise(confirm: bool) -> Result<()> {
     assert_eq!(current.score, Some(0.9));
     let retained = annotation_publication::state(&c).await?;
     let pending = retained.progress.pending.clone().unwrap();
-    let prepared = retained.progress.prepared.clone().unwrap();
+    let prepared = retained.progress.prepared.clone();
+    assert_eq!(prepared.is_some(), recorded);
+    let preparation = proxy.prepare_requests.lock().unwrap()[0].clone();
+    if let Some(prepared) = &prepared {
+        assert_eq!(prepared.descriptors, preparation.descriptors);
+    }
     let target = pending.plan.target_version()?;
     let expected_transaction = publication::transaction(
         &base,
-        &prepared.descriptors,
+        &preparation.descriptors,
         &publication::Selection {
             table: binding().table,
             incarnation: binding().incarnation,
@@ -129,6 +145,13 @@ async fn exercise(confirm: bool) -> Result<()> {
             "confirmation must reuse the original prepared files and transaction"
         );
         assert_eq!(proxy.dropped.load(Ordering::SeqCst), 1);
+        let preparations = proxy.prepare_requests.lock().unwrap().clone();
+        let original: Vec<_> = preparations
+            .iter()
+            .filter(|p| p.transaction == preparation.transaction)
+            .collect();
+        assert_eq!(original.len(), if recorded { 1 } else { 2 });
+        assert!(original.iter().all(|p| **p == preparation));
         assert_eq!(proxy.blocked_reads.load(Ordering::SeqCst), 0);
         stop.send(()).unwrap();
         task.await??;
@@ -136,6 +159,7 @@ async fn exercise(confirm: bool) -> Result<()> {
         drop(proxy);
         return c.shutdown().await;
     }
+    let prepared = prepared.unwrap();
     // The proxy blocks all voter observations for the unchanged 30-second RPC deadline.
     let error = tokio::time::timeout(Duration::from_secs(45), task)
         .await??

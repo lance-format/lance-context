@@ -7,6 +7,8 @@ use std::sync::atomic::Ordering;
 enum Case {
     Committed,
     Absent,
+    AbsentFenced,
+    PersistentUnknown,
     DifferentContent,
     DifferentPlan,
     DifferentTransaction,
@@ -27,6 +29,11 @@ async fn exercise(case: Case) -> Result<()> {
         !matches!(case, Case::Unobservable),
     )
     .await?;
+    if matches!(case, Case::AbsentFenced | Case::PersistentUnknown) {
+        proxy
+            .pause_uncommitted_prepare
+            .store(true, Ordering::SeqCst);
+    }
     let direct = std::mem::replace(&mut cluster.client, proxy.client.clone());
     let ingress = connect(&cluster, binding()).await?;
     let storage = Storage::resolve(
@@ -97,13 +104,16 @@ async fn exercise(case: Case) -> Result<()> {
         }
     }
     let operation = tokio::spawn(async move { publisher.record_preparation(request).await });
-    if execute {
+    if execute || matches!(case, Case::AbsentFenced | Case::PersistentUnknown) {
         tokio::time::timeout(Duration::from_secs(10), proxy.committed.notified()).await?;
-        if matches!(case, Case::Fenced) {
+        if matches!(case, Case::Fenced | Case::AbsentFenced) {
             cluster.client = direct.clone();
             let ingress = connect(&cluster, binding()).await?;
             let successor = super::publisher(&ingress, &storage, &budget, authority.epoch).await?;
             assert_ne!(successor.authority(), &authority);
+        }
+        if matches!(case, Case::PersistentUnknown) {
+            proxy.unknown_prepares.store(true, Ordering::SeqCst);
         }
         proxy.release.notify_one();
     }
@@ -113,15 +123,32 @@ async fn exercise(case: Case) -> Result<()> {
     }
     assert_eq!(
         result.is_ok(),
-        matches!(case, Case::Committed),
+        matches!(case, Case::Committed | Case::Absent),
         "{result:?}"
     );
     assert_eq!(
         proxy.prepares.load(Ordering::SeqCst),
-        1,
-        "Prepare was resubmitted"
+        if matches!(case, Case::Absent | Case::PersistentUnknown) {
+            2
+        } else {
+            1
+        },
+        "unexpected Prepare submissions"
     );
-    assert_eq!(proxy.dropped.load(Ordering::SeqCst), 1);
+    let requests = proxy.prepare_requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), proxy.prepares.load(Ordering::SeqCst));
+    assert!(
+        requests.iter().all(|request| request == &requests[0]),
+        "original preparation changed"
+    );
+    assert_eq!(
+        proxy.dropped.load(Ordering::SeqCst),
+        if matches!(case, Case::PersistentUnknown) {
+            2
+        } else {
+            1
+        }
+    );
     if !matches!(case, Case::Unobservable) {
         assert_eq!(proxy.blocked_reads.load(Ordering::SeqCst), 0);
     }
@@ -141,7 +168,7 @@ async fn exercise(case: Case) -> Result<()> {
         bail!("missing test state");
     };
     assert_eq!(view.manifests.as_ref().unwrap().head, plan.read_version);
-    if matches!(case, Case::Absent) {
+    if matches!(case, Case::AbsentFenced | Case::PersistentUnknown) {
         assert!(view.progress.prepared.is_none());
     } else {
         let prepared = view.progress.prepared.as_ref().unwrap();
@@ -159,7 +186,7 @@ async fn committed_unknown_preparation_is_observed_without_resubmission() -> Res
     exercise(Case::Committed).await
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn absent_unknown_preparation_remains_unknown() -> Result<()> {
+async fn absent_unknown_preparation_resumes_exact_descriptors() -> Result<()> {
     exercise(Case::Absent).await
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -181,4 +208,13 @@ async fn unknown_preparation_cannot_bypass_owner_fencing() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unavailable_preparation_observation_preserves_failure() -> Result<()> {
     exercise(Case::Unobservable).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unrecorded_preparation_is_not_resubmitted_after_owner_fencing() -> Result<()> {
+    exercise(Case::AbsentFenced).await
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn repeatedly_unknown_preparation_stops_after_one_exact_resubmission() -> Result<()> {
+    exercise(Case::PersistentUnknown).await
 }
