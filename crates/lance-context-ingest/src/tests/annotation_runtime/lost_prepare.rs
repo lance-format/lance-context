@@ -3,6 +3,7 @@
 use super::*;
 use std::sync::atomic::Ordering;
 
+mod advance;
 mod close;
 pub(in crate::tests) mod proxy;
 
