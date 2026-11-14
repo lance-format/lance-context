@@ -46,6 +46,14 @@ replicas; source private keys cover exactly the groups hosted by each node.
 
 Provision files through per-node mounted configuration and secrets. A node
 requires its original persistent directory across process/Pod replacement.
+Loss of that directory requires a replica replacement protocol, which is not
+yet implemented. Do not restart the same voter ID on an empty replacement
+volume: other voters may retain progress for its previous log, while its own
+durable term/vote state is missing. Keep that voter offline; an available durable
+majority can continue serving requests. Snapshot catch-up and retained-directory
+restart tests do not establish safe replacement of lost storage. See the
+[checkpoint recovery boundary](raft-log-checkpoints.md).
+
 For Kubernetes, use stable DNS, persistent volumes, and a termination grace
 period sufficient for the largest native maintenance operation. Startup must
 permit all voters to resolve each other before readiness; a headless service
