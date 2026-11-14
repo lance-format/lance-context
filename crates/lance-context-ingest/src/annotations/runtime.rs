@@ -673,28 +673,21 @@ impl Publisher {
                 Ok::<_, anyhow::Error>((selected, record.identity))
             })
             .await?;
-        let reply = phases
+        phases
             .measure(
                 Phase::AnnotationCommitConfirm,
-                materializer::commit(
-                    &self.service.ingress.client,
-                    Command::Confirm(p::ConfirmPublication {
-                        authority: self.catalog.authority().clone(),
-                        incarnation: self.service.ingress.scope.incarnation,
-                        transaction: pending.plan.transaction,
-                        plan_index: pending.index,
-                        prepared_index: prepared.index,
-                        descriptor_digest: prepared.descriptors.digest,
-                        target,
-                        manifest_identity,
-                    }),
-                ),
+                self.catalog.confirm_publication(p::ConfirmPublication {
+                    authority: self.catalog.authority().clone(),
+                    incarnation: self.service.ingress.scope.incarnation,
+                    transaction: pending.plan.transaction,
+                    plan_index: pending.index,
+                    prepared_index: prepared.index,
+                    descriptor_digest: prepared.descriptors.digest,
+                    target,
+                    manifest_identity,
+                }),
             )
             .await?;
-        ensure!(
-            matches!(reply, Applied::Publisher(p::Reply::Published(_))),
-            "annotation confirmation rejected: {reply:?}"
-        );
         Ok(selected)
     }
 }

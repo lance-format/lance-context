@@ -12,6 +12,7 @@ mod advance;
 pub(crate) mod annotation_index;
 mod close;
 pub(crate) mod compaction;
+mod confirm;
 pub mod observation;
 mod pipeline;
 mod plan;
@@ -600,9 +601,8 @@ impl Publisher {
                 && selected.descriptor_digest == prepared.descriptors.digest,
             "fixed target belongs to another publication"
         );
-        let reply = commit(
-            &self.ingress.client,
-            Command::Confirm(p::ConfirmPublication {
+        let published = self
+            .confirm_publication(p::ConfirmPublication {
                 authority: self.authority.clone(),
                 incarnation: self.ingress.scope.incarnation,
                 transaction: pending.plan.transaction,
@@ -611,12 +611,8 @@ impl Publisher {
                 descriptor_digest: prepared.descriptors.digest,
                 target,
                 manifest_identity: selected.identity,
-            }),
-        )
-        .await?;
-        let Applied::Publisher(p::Reply::Published(published)) = reply else {
-            bail!("publication confirmation rejected: {reply:?}");
-        };
+            })
+            .await?;
         Ok(Some(published))
     }
 
