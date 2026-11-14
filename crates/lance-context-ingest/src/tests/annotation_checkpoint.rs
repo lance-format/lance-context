@@ -270,7 +270,7 @@ async fn roundtrip(lost_reply: bool) -> Result<()> {
     .await?;
     let suffix_result = service.submit(&suffix, Duration::from_secs(5)).await?;
     let catalog: Arc<dyn p::lance::ManifestCatalog> = if lost_reply {
-        Arc::new(annotation_publication::LostReply(Arc::new(
+        Arc::new(annotation_publication::LostReply::new(Arc::new(
             c.client.manifest_catalog(),
         )))
     } else {

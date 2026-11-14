@@ -24,6 +24,7 @@ use object_store::path::Path;
 use std::{fmt::Debug, sync::Arc};
 use uuid::Uuid;
 
+mod reservation;
 mod transaction;
 
 /// A trusted, bounded transport adapter. A local replica read is not sufficient.
@@ -374,29 +375,7 @@ impl CommitHandler for ManagedManifest {
             v2_names: naming == ManifestNamingScheme::V2,
         };
         object.validate(scope.target).map_err(error)?;
-        let outcome = self
-            .catalog
-            .reserve_manifest(scope.request(object))
-            .await
-            .map_err(error)?;
-        let Outcome::Committed(Applied::Publisher(super::Reply::ManifestReserved(record))) =
-            outcome
-        else {
-            return Err(
-                error("manifest reservation unavailable; reconcile original publication").into(),
-            );
-        };
-        self.validate_record(&record).map_err(error)?;
-        if record.version != scope.target
-            || record.transaction != scope.transaction
-            || record.plan_index != scope.plan_index
-            || record.prepared_index != scope.prepared_index
-            || record.descriptor_digest != scope.descriptor_digest
-            || record.index <= record.prepared_index
-        {
-            return Err(error("manifest reservation returned a different publication").into());
-        }
-        // An exact retry may select an earlier attempt's immutable object.
+        let record = self.reserve(scope, object).await?;
         Ok(self.location(&record)?)
     }
     async fn forget_version(&self, _: &Path, _: u64, _: &str) -> ::lance::Result<()> {

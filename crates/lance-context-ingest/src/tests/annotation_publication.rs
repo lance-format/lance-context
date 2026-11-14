@@ -495,17 +495,34 @@ pub(super) async fn finish(c: &network::Cluster) -> Result<()> {
 }
 
 #[derive(Debug)]
-pub(super) struct LostReply(pub(super) Arc<dyn p::lance::ManifestCatalog>);
+pub(super) struct LostReply {
+    catalog: Arc<dyn p::lance::ManifestCatalog>,
+    lost: std::sync::atomic::AtomicBool,
+}
+impl LostReply {
+    pub(super) fn new(catalog: Arc<dyn p::lance::ManifestCatalog>) -> Self {
+        Self {
+            catalog,
+            lost: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
 #[async_trait::async_trait]
 impl p::lance::ManifestCatalog for LostReply {
     async fn read_manifest(&self, table: Uuid, version: Option<u64>) -> Result<query::Outcome> {
-        self.0.read_manifest(table, version).await
+        // These restart tests stop before publication can be reconciled. Hold
+        // observations as well as the reply so live resolution cannot finish.
+        if self.lost.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(query::Outcome::Unknown);
+        }
+        self.catalog.read_manifest(table, version).await
     }
     async fn reserve_manifest(&self, request: p::ReserveManifest) -> Result<Outcome> {
         assert!(matches!(
-            self.0.reserve_manifest(request).await?,
+            self.catalog.reserve_manifest(request).await?,
             Outcome::Committed(Applied::Publisher(p::Reply::ManifestReserved(_)))
         ));
+        self.lost.store(true, std::sync::atomic::Ordering::SeqCst);
         Ok(Outcome::Unknown)
     }
 }
@@ -571,7 +588,7 @@ async fn restart_at(stop: Stop) -> Result<()> {
     apply(&c, &view, &second).await?;
     if stop != Stop::Prepared {
         assert!(annotations::publish(
-            Arc::new(LostReply(Arc::new(c.client.manifest_catalog()))),
+            Arc::new(LostReply::new(Arc::new(c.client.manifest_catalog()))),
             &one_shard(),
             &storage,
             commit.clone(),

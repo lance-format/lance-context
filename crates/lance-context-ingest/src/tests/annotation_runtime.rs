@@ -179,7 +179,7 @@ async fn resume(stage: u8) -> Result<()> {
         let original = prepared.annotations().merge().transaction.clone();
         if stage == 2 {
             let result = publication::publish(
-                Arc::new(annotation_publication::LostReply(Arc::new(
+                Arc::new(annotation_publication::LostReply::new(Arc::new(
                     c.client.manifest_catalog(),
                 ))),
                 &annotation_publication::one_shard(),

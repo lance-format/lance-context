@@ -282,7 +282,7 @@ async fn recover_inner(
     assert_eq!(current.score, Some(0.9));
     if stage != Stop::Prepared {
         assert!(annotations::publish(
-            Arc::new(LostReply(Arc::new(c.client.manifest_catalog()))),
+            Arc::new(LostReply::new(Arc::new(c.client.manifest_catalog()))),
             &one_shard(),
             &storage,
             commit.clone(),

@@ -291,7 +291,7 @@ async fn recover_at(stage: u8, root: &Path, crash_boundary: bool) -> Result<()> 
             .await?
         };
         let handler = p::lance::ManagedManifest::new(
-            Arc::new(LostReply(Arc::new(c.client.manifest_catalog()))),
+            Arc::new(LostReply::new(Arc::new(c.client.manifest_catalog()))),
             storage.base.clone(),
             &one_shard(),
             p::lance::ManifestCommit {

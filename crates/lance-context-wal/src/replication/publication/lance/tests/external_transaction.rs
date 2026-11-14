@@ -53,10 +53,13 @@ async fn external_transaction_identity_is_checked_before_upload_or_reservation()
         // The fixture deliberately returns Unknown for every reservation. Only
         // the valid case may upload a manifest and reach that catalog boundary.
         assert!(result.is_err());
-        assert_eq!(
-            catalog.reservations.lock().unwrap().len(),
-            usize::from(case == 5)
-        );
+        {
+            let reservations = catalog.reservations.lock().unwrap();
+            assert_eq!(reservations.len(), if case == 5 { 2 } else { 0 });
+            if case == 5 {
+                assert_eq!(reservations[0], reservations[1]);
+            }
+        }
         let objects = store.inner.list(None).try_collect::<Vec<_>>().await?;
         assert!(objects.iter().any(|object| object.location == path));
         assert_eq!(objects.len(), if case == 5 { 2 } else { 1 });
