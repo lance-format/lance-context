@@ -375,7 +375,7 @@ pub(super) struct Tracker {
     incarnation: Uuid,
     next: u64,
     pending: BTreeMap<[u8; 32], ReadBatch>,
-    /// Only queries admitted before the next poll can join this batch.
+    /// Unsent next batch; never extend a barrier already sent to Raft.
     queued: Option<[u8; 32]>,
     requests: usize,
 }
@@ -432,6 +432,14 @@ impl Tracker {
         Ok(())
     }
     pub fn take_barrier(&mut self, term: u64) -> Option<Vec<u8>> {
+        let context = self.queued?;
+        if self
+            .pending
+            .iter()
+            .any(|(key, batch)| *key != context && batch.term == term && batch.confirmed.is_none())
+        {
+            return None;
+        }
         let context = self.queued.take()?;
         (self.pending[&context].term == term).then(|| context.to_vec())
     }

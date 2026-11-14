@@ -24,6 +24,15 @@ representation. An ahead-of-state cursor returns `CursorAhead` after the quorum
 read, without fencing the node. Source placement and catalog-group routing are
 validated before admission.
 
+Each group has at most one unconfirmed read-index round. Requests arriving while
+it is outstanding join a separate, unsent batch within the same `max_pending`
+limit. Its fresh barrier is issued as soon as the preceding round confirms, in
+that same poll; no timer or later request is needed to start it. The first round's
+quorum never confirms the later arrivals. Confirmed queries still wait for apply,
+and leadership loss retires both the sent round and its queued successor.
+This reduces overlapping read rounds, but sequential reads still require fresh
+quorums. It adds no lease, batching timer or persistent format.
+
 Each group's reader uses a new incarnation UUID on reopen and a never-reused
 monotonic context counter. Caller token reuse cannot match an earlier context.
 Confirmed reads wait for apply; term or leadership loss yields `Unknown` for
