@@ -314,7 +314,9 @@ impl Runtime {
     /// An in-flight sealed DELETE retains one bounded page while publication
     /// continues. Failed outcomes pause new publication until that sealed page
     /// clears; applied values remain readable. Only immutable DELETE requests repeat;
-    /// this loop never invents a request or blindly retries failed mutations.
+    /// an uncertain deletion fence first repeats its exact monotonic catalog
+    /// retirement, with no DELETE or new publication until confirmed. This loop
+    /// never invents a request or blindly retries failed business mutations.
     /// One admitted native annotation index writer can outlive cancellation, retaining
     /// its workspace until completion. It cannot publish a manifest itself.
     pub async fn run(mut self, shutdown: impl Future<Output = ()>) -> Result<()> {
@@ -383,6 +385,13 @@ impl Publisher {
                 self.publish_next().await
             };
             if let Err(error) = result {
+                if error.is::<materializer::retirement::HistoryUnknown>() {
+                    // Retirement runs before freezing or preparing a new
+                    // publication. Keep the bounded apply/read path alive;
+                    // the next iteration captures fresh catalog authority.
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    continue;
+                }
                 if error.is::<mixed::BodyWriteFailed>() {
                     // This upload never reached a native commit. Retain the
                     // frozen generation and WAL instead of dropping the whole

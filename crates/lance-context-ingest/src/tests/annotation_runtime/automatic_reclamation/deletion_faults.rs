@@ -532,3 +532,6 @@ async fn annotation_collector_recovers_after_delete_sigkill() -> Result<()> {
 
 #[cfg(feature = "http")]
 mod blocked;
+
+#[cfg(feature = "service")]
+mod retirement;

@@ -56,6 +56,7 @@ pub(in crate::tests) struct Proxy {
     pub lose_append_retry_reply: Arc<AtomicBool>,
     pub closes: Arc<AtomicUsize>,
     pub unknown_closes: Arc<AtomicBool>,
+    pub unknown_retirements: Arc<AtomicBool>,
     pub close_permits:
         Arc<std::sync::Mutex<Vec<lance_context_wal::replication::source::ClosurePermit>>>,
     pub committed: Arc<Notify>,
@@ -104,6 +105,9 @@ enum Point {
         execute: bool,
     },
     Reserve {
+        execute: bool,
+    },
+    Retire {
         execute: bool,
     },
     Confirm {
@@ -188,6 +192,7 @@ impl Frame {
                 | (Point::Plan { .. }, Command::Plan(_))
                 | (Point::Advance { .. }, Command::Advance(_))
                 | (Point::Reserve { .. }, Command::Reserve(_))
+                | (Point::Retire { .. }, Command::RetireHistory(_))
                 | (Point::Confirm { .. }, Command::Confirm(_))
         ))
     }
@@ -256,6 +261,11 @@ impl Frame {
                 Point::Reserve { .. },
                 Reply::Commit(Outcome::Committed(Applied::Publisher(
                     p::Reply::ManifestReserved(_)
+                )))
+            ) | (
+                Point::Retire { .. },
+                Reply::Commit(Outcome::Committed(Applied::Publisher(
+                    p::Reply::ManifestHistory(_)
                 )))
             ) | (
                 Point::Confirm { .. },
@@ -351,6 +361,10 @@ impl Proxy {
         Self::open_at(c, root, Point::Reserve { execute }).await
     }
 
+    pub async fn open_retire(c: &network::Cluster, root: &FsPath, execute: bool) -> Result<Self> {
+        Self::open_at(c, root, Point::Retire { execute }).await
+    }
+
     pub async fn open_confirm(c: &network::Cluster, root: &FsPath, execute: bool) -> Result<Self> {
         Self::open_at(c, root, Point::Confirm { execute }).await
     }
@@ -408,6 +422,7 @@ impl Proxy {
         let lose_append_retry_reply = Arc::new(AtomicBool::new(false));
         let closes = Arc::new(AtomicUsize::new(0));
         let unknown_closes = Arc::new(AtomicBool::new(false));
+        let unknown_retirements = Arc::new(AtomicBool::new(false));
         let close_permits = Arc::new(std::sync::Mutex::new(Vec::new()));
         let committed = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
@@ -465,6 +480,7 @@ impl Proxy {
             let lose_append_retry_reply = lose_append_retry_reply.clone();
             let closes = closes.clone();
             let unknown_closes = unknown_closes.clone();
+            let unknown_retirements = unknown_retirements.clone();
             let close_permits = close_permits.clone();
             let committed = committed.clone();
             let release = release.clone();
@@ -499,6 +515,7 @@ impl Proxy {
             let lose_append_retry_reply = lose_append_retry_reply.clone();
                             let closes = closes.clone();
                             let unknown_closes = unknown_closes.clone();
+            let unknown_retirements = unknown_retirements.clone();
                             let close_permits = close_permits.clone();
                             connections.spawn(async move {
                                 let mut downstream = acceptor.accept(socket).await?;
@@ -582,7 +599,12 @@ impl Proxy {
                                             continue;
                                         }
                                     }
-                                    if hold && matches!(point, Point::Append { execute: false } | Point::Close { execute: false } | Point::Reserve { execute: false }) && armed.swap(false, Ordering::SeqCst) {
+                                    if hold && matches!(point, Point::Retire { .. }) && unknown_retirements.load(Ordering::SeqCst) {
+                                        dropped.fetch_add(1, Ordering::SeqCst);
+                                        request.unknown_reply()?.write(&mut downstream).await?;
+                                        continue;
+                                    }
+                                    if hold && matches!(point, Point::Append { execute: false } | Point::Close { execute: false } | Point::Reserve { execute: false } | Point::Retire { execute: false }) && armed.swap(false, Ordering::SeqCst) {
                                         committed.notify_one(); release.notified().await;
                                         dropped.fetch_add(1, Ordering::SeqCst);
                                         request.unknown_reply()?.write(&mut downstream).await?;
@@ -628,7 +650,7 @@ impl Proxy {
                                         committed.notify_one();
                                         release.notified().await;
                                         dropped.fetch_add(1, Ordering::SeqCst);
-                                        if matches!(point, Point::Plan { .. } | Point::Advance { .. } | Point::Reserve { .. } | Point::Confirm { .. } | Point::Append { .. } | Point::Pin { .. } | Point::Prepare { structured: true, .. }) {
+                                        if matches!(point, Point::Plan { .. } | Point::Advance { .. } | Point::Reserve { .. } | Point::Retire { .. } | Point::Confirm { .. } | Point::Append { .. } | Point::Pin { .. } | Point::Prepare { structured: true, .. }) {
                                             request.unknown_reply()?.write(&mut downstream).await?;
                                             continue;
                                         }
@@ -701,6 +723,7 @@ impl Proxy {
             lose_append_retry_reply,
             closes,
             unknown_closes,
+            unknown_retirements,
             close_permits,
             committed,
             release,

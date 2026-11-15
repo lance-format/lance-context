@@ -19,6 +19,7 @@ mod pipeline;
 mod plan;
 mod prepare;
 mod read_policy;
+pub(crate) mod retirement;
 mod session_index;
 pub(crate) mod stage;
 pub(crate) mod status_index;
@@ -742,19 +743,15 @@ impl Publisher {
             .head
             .saturating_sub(self.options.retained_manifest_versions as u64 - 2)
             .max(manifests.initial_version);
-        let reply = commit(
+        retirement::retire(
             &self.ingress.client,
-            Command::RetireHistory(p::RetireManifestHistory {
+            p::RetireManifestHistory {
                 authority: self.authority.clone(),
                 incarnation: self.ingress.scope.incarnation,
                 retain_from,
-            }),
+            },
         )
         .await?;
-        ensure!(
-            matches!(reply, Applied::Publisher(p::Reply::ManifestHistory(_))),
-            "manifest history retirement rejected: {reply:?}"
-        );
         Ok(())
     }
     async fn select(&mut self, view: &p::Table) -> Result<Option<p::Plan>> {
