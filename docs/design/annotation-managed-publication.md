@@ -47,6 +47,18 @@ operation. Separate runtime and application process tests exercise SIGKILL and
 replacement with retained storage. Sustained-load qualification requires its own
 workload, latency and drain measurements.
 
+## Resolving an uncertain source pin
+
+Both `Reply::Unknown` and `Reply::Commit(Outcome::Unknown)` retain the original
+source selection. The publisher checks its current authority and observes the
+exact source pin before proceeding. If no pin is observed, fresh authorization
+for the same selection permits resubmitting that idempotent control request.
+Neither reply proves that the original request was not submitted. The frozen
+generation remains retained while bounded apply and point reads continue;
+fencing or unavailable quorum observations preserve the failure. Tests exercise
+both replies before and after pin commitment, owner fencing, source backpressure,
+concurrent field updates and restart with an acknowledged WAL suffix.
+
 ## Resolving an uncertain confirmation
 
 A structured unknown Confirm holds the current publishing generation while the

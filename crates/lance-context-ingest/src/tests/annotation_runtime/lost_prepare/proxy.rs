@@ -89,6 +89,7 @@ enum Point {
     Pin {
         execute: bool,
         observe: bool,
+        rpc_unknown: bool,
     },
     Prepare {
         execute: bool,
@@ -295,7 +296,34 @@ impl Proxy {
         execute: bool,
         observe: bool,
     ) -> Result<Self> {
-        Self::open_at(c, root, Point::Pin { execute, observe }).await
+        Self::open_at(
+            c,
+            root,
+            Point::Pin {
+                execute,
+                observe,
+                rpc_unknown: false,
+            },
+        )
+        .await
+    }
+
+    pub async fn open_rpc_unknown_pin(
+        c: &network::Cluster,
+        root: &FsPath,
+        execute: bool,
+        observe: bool,
+    ) -> Result<Self> {
+        Self::open_at(
+            c,
+            root,
+            Point::Pin {
+                execute,
+                observe,
+                rpc_unknown: true,
+            },
+        )
+        .await
     }
 
     /// Restore catalog reads only after the owner has observed the full outage.
@@ -578,7 +606,12 @@ impl Proxy {
                                                 release.notified().await;
                                             }
                                             dropped.fetch_add(1, Ordering::SeqCst);
-                                            request.unknown_reply()?.write(&mut downstream).await?;
+                                            let reply = if matches!(point, Point::Pin { rpc_unknown: true, .. }) {
+                                                request.reply(Reply::Unknown)?
+                                            } else {
+                                                request.unknown_reply()?
+                                            };
+                                            reply.write(&mut downstream).await?;
                                             continue;
                                         }
                                     }
@@ -679,7 +712,12 @@ impl Proxy {
                                         release.notified().await;
                                         dropped.fetch_add(1, Ordering::SeqCst);
                                         if matches!(point, Point::Plan { .. } | Point::Advance { .. } | Point::Reserve { .. } | Point::Retire { .. } | Point::Confirm { .. } | Point::Append { .. } | Point::Pin { .. } | Point::Prepare { structured: true, .. }) {
-                                            request.unknown_reply()?.write(&mut downstream).await?;
+                                            let reply = if matches!(point, Point::Pin { rpc_unknown: true, .. }) {
+                                                request.reply(Reply::Unknown)?
+                                            } else {
+                                                request.unknown_reply()?
+                                            };
+                                            reply.write(&mut downstream).await?;
                                             continue;
                                         }
                                         return Ok::<_, anyhow::Error>(());
