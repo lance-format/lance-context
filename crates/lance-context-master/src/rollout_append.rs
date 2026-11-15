@@ -11,6 +11,23 @@ use std::{collections::HashSet, sync::Arc, time::Duration};
 
 type Result<T> = std::result::Result<T, String>;
 
+/// Completed append work only: cancellation does not produce a completed sample.
+/// Staging durations can overlap, so their sum is not wall-clock time.
+async fn time_append_phase<T, E>(
+    phase: &'static str,
+    work: impl std::future::Future<Output = std::result::Result<T, E>>,
+) -> std::result::Result<T, E> {
+    let started = std::time::Instant::now();
+    let result = work.await;
+    metrics::histogram!("master_rollout_append_phase_duration_seconds", "phase" => phase)
+        .record(started.elapsed().as_secs_f64());
+    if result.is_err() {
+        metrics::counter!("master_rollout_append_phase_errors_total", "phase" => phase)
+            .increment(1);
+    }
+    result
+}
+
 #[derive(Clone, Debug, clap::Args)]
 pub struct AppendConfig {
     /// Opt-in immutable rollout targets. '*' selects all owned rollouts.
@@ -343,14 +360,16 @@ async fn run_pass(
     coordinator: &mut AppendCoordinator,
 ) -> Result<usize> {
     let config = &state.config.append;
-    let (plans, mut reclaimed) = coordinator
-        .plan(
+    let (plans, mut reclaimed) = time_append_phase(
+        "plan",
+        coordinator.plan(
             shards,
             config.rollout_append_max_generations,
             config.rollout_append_max_bytes,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+        ),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     let local = state.local_append.clone().or_else(|| {
         state
             .config
@@ -373,7 +392,7 @@ async fn run_pass(
             if crate::local_merge::drain_requested(state, &target) {
                 return Ok(None);
             }
-            let result = if let Some(local) = local {
+            let result = time_append_phase("stage", async { if let Some(local) = local {
                 lance_context_core::rollout_append::stage(&uri, plan.clone(), local.budget, Some(local.session))
                     .await.map_err(|e| e.to_string())
             } else {
@@ -385,7 +404,7 @@ async fn run_pass(
                         stage_remote(&client, &fallback, &target, plan.clone()).await
                     }
                 }
-            };
+            }}).await;
             result.map(Some).map_err(|error| (plan, error))
         }.boxed()
     }).collect();
@@ -414,14 +433,18 @@ async fn run_pass(
         if group.len() >= config.rollout_append_concurrency
             || (!group.is_empty() && tokio::time::Instant::now() >= flush)
         {
-            reclaimed += coordinator
-                .commit(std::mem::take(&mut group))
-                .await
-                .map_err(|e| e.to_string())?;
+            reclaimed += time_append_phase(
+                "base_commit",
+                coordinator.commit(std::mem::take(&mut group)),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
         }
     }
     if !group.is_empty() {
-        reclaimed += coordinator.commit(group).await.map_err(|e| e.to_string())?;
+        reclaimed += time_append_phase("base_commit", coordinator.commit(group))
+            .await
+            .map_err(|e| e.to_string())?;
     }
     // This pass's speculative readers have dropped their reservations. Retry an
     // indivisible oversized generation serially within this pass. Other resident
@@ -431,17 +454,19 @@ async fn run_pass(
             break;
         }
         let local = local.as_ref().unwrap();
-        match lance_context_core::rollout_append::stage(
-            &state.rollout_uri(target),
-            plan,
-            local.budget.clone(),
-            Some(local.session.clone()),
+        match time_append_phase(
+            "stage",
+            lance_context_core::rollout_append::stage(
+                &state.rollout_uri(target),
+                plan,
+                local.budget.clone(),
+                Some(local.session.clone()),
+            ),
         )
         .await
         {
             Ok(part) => {
-                reclaimed += coordinator
-                    .commit(vec![part])
+                reclaimed += time_append_phase("base_commit", coordinator.commit(vec![part]))
                     .await
                     .map_err(|e| e.to_string())?
             }
