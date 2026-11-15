@@ -125,6 +125,16 @@ pub(crate) async fn run(
             // still act on native hints immediately.
             let suggested =
                 options.checkpoint_trailing_bytes == 0 && background.suggested.contains(&group);
+            // Producer admission can exhaust its smaller data window while a
+            // native rewrite still fits its independent scratch allowance.
+            // Successful rewrites cannot discard an uncheckpointed prefix;
+            // waiting for a rewrite failure would leave new writes blocked
+            // until the ordinary checkpoint age. Recheck retained bytes after
+            // preceding maintenance. Pending reservations alone cannot be
+            // reclaimed by checkpointing and must not trigger image churn.
+            let data_pressure = handle
+                .disk_budget()
+                .is_some_and(|disk| disk.accounted_disk_bytes >= disk.data_limit);
             // A refused native rewrite may still include an applied prefix
             // that a fresh image can replace. Do not retain that prefix until
             // the ordinary age/entry threshold while reclamation lacks room.
@@ -133,6 +143,7 @@ pub(crate) async fn run(
             if new == 0
                 || (!suggested
                     && !background.rewrite_blocked
+                    && !data_pressure
                     && new < options.checkpoint_entries
                     && checkpoints[&group].elapsed()
                         < Duration::from_millis(options.checkpoint_interval_ms))
