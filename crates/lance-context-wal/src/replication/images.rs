@@ -207,6 +207,10 @@ impl PreparedCheckpoint {
     pub fn group(&self) -> u64 {
         self.group
     }
+    #[cfg(feature = "runtime")]
+    pub(super) fn index(&self) -> u64 {
+        self.loaded.state.applied
+    }
     pub fn image(&self) -> Arc<Image> {
         self.loaded.image.clone()
     }
@@ -371,6 +375,64 @@ impl Node {
         g.image = Some(prepared.loaded.image);
         #[cfg(feature = "runtime")]
         g.resume_persistence()?;
+        Ok(())
+    }
+
+    /// The candidate covers already durable/applied state and its files are
+    /// synced. Make those bytes readable before native prefix compaction runs;
+    /// the runtime retains both image owners and withholds installation success.
+    #[cfg(feature = "runtime")]
+    pub(super) fn start_async_checkpoint(
+        &mut self,
+        prepared: &PreparedCheckpoint,
+        retained_bytes: u64,
+    ) -> Result<Option<Arc<Image>>> {
+        self.healthy()?;
+        ensure!(
+            Arc::ptr_eq(&prepared.permit.0, &self.images),
+            "foreign node image worker"
+        );
+        ensure!(
+            prepared.received.is_none(),
+            "received image needs step_snapshot"
+        );
+        let g = self
+            .groups
+            .get_mut(&prepared.group)
+            .context("unhosted group")?;
+        ensure!(
+            prepared.loaded.state.applied <= g.state.applied,
+            "checkpoint exceeds applied state"
+        );
+        if let Err(error) =
+            g.start_checkpoint_write(prepared.loaded.image.snapshot()?, retained_bytes)
+        {
+            // A staged view or an accepted task must never be discarded as if
+            // the original I/O had not happened. Shutdown joins the same writer.
+            self.failed = true;
+            return Err(error);
+        }
+        Ok(g.image.replace(prepared.loaded.image.clone()))
+    }
+
+    #[cfg(feature = "runtime")]
+    pub(super) fn finish_async_checkpoint(&mut self, prepared: &PreparedCheckpoint) -> Result<()> {
+        self.healthy()?;
+        let g = self.groups.get(&prepared.group).context("unhosted group")?;
+        ensure!(
+            g.raw.store().checkpoint_index()? == prepared.loaded.state.applied,
+            "checkpoint has no original durable receipt"
+        );
+        ensure!(
+            g.image
+                .as_ref()
+                .is_some_and(|image| Arc::ptr_eq(image, &prepared.loaded.image)),
+            "checkpoint image changed before completion"
+        );
+        if let Err(error) = self.images.installed(&prepared.loaded.image) {
+            self.failed = true;
+            return Err(error);
+        }
         Ok(())
     }
 

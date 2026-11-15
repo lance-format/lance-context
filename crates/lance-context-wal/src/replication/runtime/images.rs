@@ -12,6 +12,8 @@ pub(super) struct CheckpointWork {
     image: PreparedCheckpoint,
     retained_bytes: u64,
     reply: Completion<()>,
+    started: bool,
+    previous: Option<Arc<crate::replication::checkpoint::Image>>,
 }
 
 // Every queued result retains its original outgoing credit. The lane has as
@@ -102,28 +104,63 @@ impl Worker {
         self.checkpoint = Some(work);
     }
 
-    pub(super) fn install_drained_checkpoint(&mut self, after_poll: &mut Vec<AfterPoll>) -> bool {
-        if self.checkpoint.is_none() || !self.node.groups[&self.group].persistence_idle() {
-            return false;
+    pub(super) fn install_drained_checkpoint(
+        &mut self,
+        after_poll: &mut Vec<AfterPoll>,
+    ) -> Result<bool> {
+        let Some(work) = self.checkpoint.as_mut() else {
+            return Ok(false);
+        };
+        if work.started {
+            if self.node.checkpoint_index(self.group)? < work.image.index() {
+                return Ok(false);
+            }
+            let work = self.checkpoint.take().unwrap();
+            let result = self.node.finish_async_checkpoint(&work.image);
+            after_poll.push(Box::new(move || work.reply.finish(result)));
+            return Ok(true);
+        }
+        if !self.node.groups[&self.group].persistence_idle() {
+            return Ok(false);
+        }
+        if self.options.async_persistence {
+            match self
+                .node
+                .start_async_checkpoint(&work.image, work.retained_bytes)
+            {
+                Ok(previous) => {
+                    work.previous = previous;
+                    work.started = true;
+                }
+                Err(error) => {
+                    let work = self.checkpoint.take().unwrap();
+                    after_poll.push(Box::new(move || work.reply.finish(Err(error))));
+                }
+            }
+            self.node
+                .groups
+                .get_mut(&self.group)
+                .unwrap()
+                .drain_for_checkpoint(false);
+            return Ok(true);
         }
         let CheckpointWork {
             image,
             retained_bytes,
             reply,
+            ..
         } = *self.checkpoint.take().unwrap();
         self.node
             .groups
             .get_mut(&self.group)
             .unwrap()
             .drain_for_checkpoint(false);
-        // No original Ready write remains, so quiesce cannot wait on its native
-        // worker. The checkpoint's own metadata write still uses the existing
-        // synchronous installation protocol, followed by a successful poll.
+        // The synchronous runtime retains its original installation protocol.
         let result = self
             .node
             .install_checkpoint_retaining(image, retained_bytes);
         after_poll.push(Box::new(move || reply.finish(result)));
-        true
+        Ok(true)
     }
 
     pub(super) fn snapshot_feedback(&mut self, packet: &Packet) -> Result<SnapshotFeedback> {
@@ -257,6 +294,8 @@ impl Handle {
             Work::Checkpoint(Box::new(CheckpointWork {
                 image,
                 retained_bytes,
+                started: false,
+                previous: None,
                 reply: Completion {
                     reply,
                     _credit: credit,

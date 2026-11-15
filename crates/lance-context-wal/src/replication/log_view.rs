@@ -63,7 +63,7 @@ impl LogView {
     pub(super) fn synchronous(&mut self) -> Result<()> {
         if let Self::Buffered(log) = self {
             ensure!(
-                log.usage().readies == 0,
+                log.usage().readies == 0 && !log.checkpoint_pending(),
                 "cannot switch a pending log to synchronous storage"
             );
             *self = Self::Durable(log.durable_log().clone());

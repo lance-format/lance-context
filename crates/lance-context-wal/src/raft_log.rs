@@ -633,6 +633,17 @@ impl GroupLog {
         self.node.engine.last_index(self.group)
     }
 
+    // Observe the native append without taking the state lock held across sync.
+    // This is an injection boundary, not a durable checkpoint receipt.
+    #[cfg(all(test, feature = "runtime"))]
+    pub(crate) fn appended_checkpoint_for_test(&self) -> Result<Option<u64>> {
+        Ok(self
+            .node
+            .engine
+            .get_message::<Snapshot>(self.group, SNAPSHOT)?
+            .map(|snapshot| snapshot.get_metadata().index))
+    }
+
     #[cfg(all(test, feature = "replication"))]
     pub(crate) fn fail_next_sync_for_test(&self) {
         self.node.fault.fail_sync_for_test();

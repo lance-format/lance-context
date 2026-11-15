@@ -6,7 +6,8 @@
 //! snapshot publication still belong to the owning Raft driver.
 //!
 //! The owner must not otherwise mutate the underlying group while this view is
-//! live. Drain all writes and consume the view before logical checkpoint/install;
+//! live. Local checkpoints use the staged view/receipt below; other snapshot
+//! replacement must drain all writes and consume the view before installation.
 //! physical maintenance retains its normal native read guards. No pending entry
 //! bodies are decoded or copied: the cache and write task share protobuf Bytes.
 use super::*;
@@ -42,6 +43,12 @@ struct Cached {
     entry: Entry,
 }
 
+struct PendingCheckpoint {
+    snapshot: Snapshot,
+    previous: u64,
+    bytes: usize,
+}
+
 #[derive(Default)]
 struct Writer {
     last: Mutex<u64>,
@@ -60,6 +67,8 @@ pub struct BufferedLog {
     window: Window,
     last: u64,
     writer: Arc<Writer>,
+    checkpoint: Option<PendingCheckpoint>,
+    durable_checkpoint: u64,
 }
 
 /// One original persistence operation. Dropping a task is not cancellation of
@@ -77,6 +86,56 @@ pub struct WriteTask {
 pub struct Persisted {
     writer: Arc<Writer>,
     number: u64,
+}
+
+/// A local image of already durable, applied state. The owning application must
+/// install its readable immutable image before dispatching this task, retain
+/// both image generations, and wait for the receipt before publishing success.
+pub(crate) struct CheckpointWrite {
+    log: GroupLog,
+    writer: Arc<Writer>,
+    previous: u64,
+    snapshot: Snapshot,
+    retained_bytes: u64,
+    truncated: (u64, u64),
+}
+
+pub(crate) struct CheckpointPersisted {
+    writer: Arc<Writer>,
+    previous: u64,
+    snapshot: Snapshot,
+}
+
+impl CheckpointWrite {
+    pub(crate) fn persist(self) -> Result<CheckpointPersisted> {
+        let result = (|| {
+            let last = self
+                .writer
+                .last
+                .lock()
+                .map_err(|_| anyhow::anyhow!("writer poisoned"))?;
+            ensure!(
+                !self.writer.failed.load(Ordering::Acquire),
+                "buffered writer failed"
+            );
+            ensure!(*last == self.previous, "out-of-order checkpoint write");
+            self.log
+                .checkpoint_retaining(&self.snapshot, self.retained_bytes)?;
+            ensure!(
+                self.log.read()?.truncated == self.truncated,
+                "checkpoint truncation differs from staged view"
+            );
+            Ok(CheckpointPersisted {
+                writer: self.writer.clone(),
+                previous: self.previous,
+                snapshot: self.snapshot.clone(),
+            })
+        })();
+        if result.is_err() {
+            self.writer.failed.store(true, Ordering::Release);
+        }
+        result
+    }
 }
 
 impl WriteTask {
@@ -117,7 +176,69 @@ impl BufferedLog {
 
     pub(crate) fn checkpoint_index(&self) -> Result<u64> {
         self.check()?;
-        Ok(self.visible.snapshot.get_metadata().index)
+        Ok(self.durable_checkpoint)
+    }
+
+    pub(crate) fn checkpoint_pending(&self) -> bool {
+        self.checkpoint.is_some()
+    }
+
+    /// Speculate only the readable view of an already applied local image. No
+    /// checkpoint completion or durable observation advances until its receipt.
+    /// Reserve one native queue slot alongside Ready tasks, including on shutdown.
+    pub(crate) fn stage_checkpoint(
+        &mut self,
+        snapshot: Snapshot,
+        retained_bytes: u64,
+    ) -> Result<CheckpointWrite> {
+        self.check()?;
+        ensure!(
+            self.pending.is_empty() && self.checkpoint.is_none(),
+            "checkpoint requires drained writer"
+        );
+        let next = self.log.checkpoint_view(&snapshot, retained_bytes)?;
+        let bytes = 2 * snapshot.compute_size() as usize
+            + std::mem::size_of::<PendingCheckpoint>()
+            + std::mem::size_of::<CheckpointWrite>();
+        ensure!(
+            bytes <= self.window.bytes,
+            "checkpoint exceeds pending window"
+        );
+        let task = CheckpointWrite {
+            log: self.log.clone(),
+            writer: self.writer.clone(),
+            previous: self.last,
+            snapshot: snapshot.clone(),
+            retained_bytes,
+            truncated: next.truncated,
+        };
+        self.checkpoint = Some(PendingCheckpoint {
+            snapshot,
+            previous: self.last,
+            bytes,
+        });
+        self.usage.bytes += bytes;
+        self.visible = next;
+        Ok(task)
+    }
+
+    pub(crate) fn complete_checkpoint(&mut self, receipt: CheckpointPersisted) -> Result<()> {
+        self.check()?;
+        ensure!(
+            Arc::ptr_eq(&receipt.writer, &self.writer),
+            "foreign checkpoint receipt"
+        );
+        let pending = self
+            .checkpoint
+            .as_ref()
+            .context("unmatched checkpoint receipt")?;
+        ensure!(
+            pending.previous == receipt.previous && pending.snapshot == receipt.snapshot,
+            "checkpoint receipt differs from original task"
+        );
+        self.durable_checkpoint = receipt.snapshot.get_metadata().index;
+        self.usage.bytes -= self.checkpoint.take().unwrap().bytes;
+        Ok(())
     }
 
     pub fn new(log: GroupLog, window: Window) -> Result<Self> {
@@ -129,6 +250,7 @@ impl BufferedLog {
         );
         let visible = log.read()?.clone();
         Ok(Self {
+            durable_checkpoint: visible.snapshot.get_metadata().index,
             durable_hard: visible.hard.clone(),
             log,
             visible,
@@ -138,6 +260,7 @@ impl BufferedLog {
             window,
             last: 0,
             writer: Arc::new(Writer::default()),
+            checkpoint: None,
         })
     }
 
@@ -189,10 +312,12 @@ impl BufferedLog {
             .checked_add(Self::entry_charge(extra)? - std::mem::size_of::<Pending>())
             .and_then(|bytes| bytes.checked_add(reserved))
             .context("pending entry accounting overflow")?;
-        Ok(self.usage.readies < self.window.readies
-            && entries.len() + extra.len()
-                <= self.window.entries.saturating_sub(self.usage.entries)
-            && bytes <= self.window.bytes.saturating_sub(self.usage.bytes))
+        Ok(
+            self.usage.readies + usize::from(self.checkpoint.is_some()) < self.window.readies
+                && entries.len() + extra.len()
+                    <= self.window.entries.saturating_sub(self.usage.entries)
+                && bytes <= self.window.bytes.saturating_sub(self.usage.bytes),
+        )
     }
 
     /// Refuses before changing the view when the pending window is full. The
@@ -258,6 +383,10 @@ impl BufferedLog {
     pub fn complete(&mut self, receipt: Persisted) -> Result<u64> {
         self.check()?;
         ensure!(
+            self.checkpoint.is_none(),
+            "Ready completion preceded checkpoint receipt"
+        );
+        ensure!(
             Arc::ptr_eq(&receipt.writer, &self.writer),
             "foreign persistence receipt"
         );
@@ -291,7 +420,10 @@ impl BufferedLog {
     /// synchronous use. Pending writes must retain this view until resolved.
     pub fn into_durable(self) -> Result<GroupLog> {
         self.check()?;
-        ensure!(self.pending.is_empty(), "pending log writes remain");
+        ensure!(
+            self.pending.is_empty() && self.checkpoint.is_none(),
+            "pending log writes remain"
+        );
         Ok(self.log)
     }
 }
