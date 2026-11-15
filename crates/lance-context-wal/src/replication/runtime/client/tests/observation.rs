@@ -98,17 +98,19 @@ async fn append_disk_refusal_retains_decision_after_reservations_release() -> Re
     let file = budget.reserve_files(&[4097])?;
     let rewrite = budget.reserve_rewrite(16 << 10)?;
     let view = budget.snapshot();
-    let proposal_bytes = view.data_limit
-        - view.accounted_disk_bytes
-        - view.reserved_file_bytes
-        - view.reserved_rewrite_bytes;
+    // Fill the data window with ordinary proposals and images. Native rewrite
+    // scratch is independently charged against the protected total ceiling.
+    let proposal_bytes = view.data_limit - view.accounted_disk_bytes - view.reserved_file_bytes;
     let proposal = budget.reserve(proposal_bytes as usize, false)?;
     assert!(matches!(
         c.client.request(leader, request.clone()).await?.reply,
         Reply::AppendNotSubmittedDiskBudget
     ));
     let decision = handle.last_append_disk_refusal().unwrap();
-    assert_eq!(decision.limit_bytes, view.data_limit);
+    assert_eq!(
+        decision.limit_bytes,
+        view.data_limit + view.reserved_rewrite_bytes
+    );
     assert_eq!(decision.reserved_file_bytes, 8192);
     assert_eq!(decision.reserved_rewrite_bytes, 16 << 10);
     assert!(decision.reserved_proposal_bytes >= proposal_bytes + decision.reserved_rewrite_bytes);
