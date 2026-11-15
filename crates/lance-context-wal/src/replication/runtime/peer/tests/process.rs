@@ -521,16 +521,18 @@ impl Processes {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let ids: Vec<_> = self.nodes.keys().copied().collect();
-            let leaders: BTreeSet<_> = ids
+            let statuses = ids
                 .into_iter()
-                .map(|id| self.status(id, group).map(|s| s.leader))
-                .collect::<Result<_>>()?;
+                .map(|id| self.status(id, group).map(|s| (id, s)))
+                .collect::<Result<Vec<_>>>()?;
+            let leaders: BTreeSet<_> = statuses.iter().map(|(_, s)| s.leader).collect();
             if leaders.len() == 1 && self.nodes.contains_key(leaders.first().unwrap()) {
                 return Ok(*leaders.first().unwrap());
             }
             ensure!(
                 Instant::now() < deadline,
-                "TLS process election did not settle"
+                "TLS process election did not settle: group={group} statuses={statuses:?} artifacts={}",
+                self.root.display()
             );
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -551,16 +553,17 @@ impl Processes {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let ids: Vec<_> = self.nodes.keys().copied().collect();
-            let applied = ids
+            let statuses = ids
                 .into_iter()
-                .map(|id| self.status(id, group).map(|s| s.applied >= index))
+                .map(|id| self.status(id, group).map(|s| (id, s)))
                 .collect::<Result<Vec<_>>>()?;
-            if applied.into_iter().all(|yes| yes) {
+            if statuses.iter().all(|(_, s)| s.applied >= index) {
                 return Ok(());
             }
             ensure!(
                 Instant::now() < deadline,
-                "TLS process catchup did not finish"
+                "TLS process catchup did not finish: group={group} target={index} statuses={statuses:?} artifacts={}",
+                self.root.display()
             );
             std::thread::sleep(Duration::from_millis(10));
         }
