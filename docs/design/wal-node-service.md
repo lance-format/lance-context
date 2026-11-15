@@ -40,10 +40,13 @@ The per-group pending window bounds Ready records, entries and their encoded
 bytes/descriptors, including deferred application and message ownership. Its
 byte limit derives from the configured data, peer and control byte budgets;
 transport admission separately bounds backing allocations. A full window
-refuses new proposals and limits ticks and peer input until it drains. It does
-not guarantee uninterrupted heartbeats under exhausted capacity. Checkpoint and
-snapshot barriers still wait for original pending writes. Shutdown joins the
-native writers, and persistence failures stop the runtime.
+refuses new proposals and defers new read barriers. Leaders continue their
+heartbeat and quorum-check ticks, accept current-term heartbeat responses, and
+send the messages Raft permits before persistence. This does not advance durable
+indices or release commit/read completions. Other peer input and follower ticks
+remain capacity-limited; transport pressure and checkpoint/snapshot barriers can
+still interrupt progress. Those barriers wait for original pending writes.
+Shutdown joins native writers, and persistence failures stop the runtime.
 
 With this option enabled, each group's `persistence` status reports pending
 ownership and native-writer `io` timing separately from `durable_poll`, which
