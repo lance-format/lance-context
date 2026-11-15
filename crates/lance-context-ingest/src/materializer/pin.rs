@@ -14,10 +14,8 @@ impl Publisher {
                 Ok(Reply::Commit(Outcome::Committed(Applied::Source(source::Reply::Pinned {
                     ..
                 })))) => return Ok(()),
-                Ok(Reply::Commit(Outcome::Unknown)) => (
-                    anyhow::anyhow!(
-                        "durable command outcome unknown; reconcile the original operation"
-                    ),
+                Ok(Reply::Unknown) | Ok(Reply::Commit(Outcome::Unknown)) => (
+                    anyhow::anyhow!("source pin outcome unknown; reconcile the original operation"),
                     true,
                 ),
                 Ok(reply) => bail!("source pin rejected: {reply:?}"),
@@ -73,7 +71,7 @@ impl Publisher {
             match observed {
                 Ok(true) => return Ok(()),
                 Ok(false) => {
-                    // Structured Unknown plus fresh authority and the identical
+                    // Either Unknown reply plus fresh authority and the identical
                     // selected permit authorize this idempotent control request.
                     // Keep the caller's frozen generation while bounded apply
                     // and point reads remain live. No business write or file

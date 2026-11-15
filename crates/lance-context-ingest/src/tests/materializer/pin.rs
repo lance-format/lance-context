@@ -15,20 +15,29 @@ enum Case {
 }
 
 async fn exercise(case: Case) -> Result<()> {
+    for rpc_unknown in [false, true] {
+        exercise_reply(case, rpc_unknown)
+            .await
+            .with_context(|| format!("source pin RPC Unknown: {rpc_unknown}"))?;
+    }
+    Ok(())
+}
+
+async fn exercise_reply(case: Case, rpc_unknown: bool) -> Result<()> {
     let root = tempfile::tempdir()?;
     let path = root.path().join("pins.lance");
     let mut cluster = network::Cluster::open_signed(root.path(), layout()).await?;
     bootstrap(&cluster, &path, &binding()).await?;
-    let proxy = Proxy::open_pin(
-        &cluster,
-        root.path(),
-        matches!(
-            case,
-            Case::Committed | Case::CommittedFenced | Case::Unobservable
-        ),
-        !matches!(case, Case::Unobservable),
-    )
-    .await?;
+    let execute = matches!(
+        case,
+        Case::Committed | Case::CommittedFenced | Case::Unobservable
+    );
+    let observe = !matches!(case, Case::Unobservable);
+    let proxy = if rpc_unknown {
+        Proxy::open_rpc_unknown_pin(&cluster, root.path(), execute, observe).await?
+    } else {
+        Proxy::open_pin(&cluster, root.path(), execute, observe).await?
+    };
     let direct = std::mem::replace(&mut cluster.client, proxy.client.clone());
     let ingress = connect(&cluster, binding()).await?;
     let storage = Storage::resolve(

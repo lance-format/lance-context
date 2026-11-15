@@ -4,15 +4,25 @@ use std::sync::atomic::Ordering;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn persistent_unknown_pin_keeps_owner_live_and_drains() -> Result<()> {
-    tokio::time::timeout(Duration::from_secs(60), exercise(false)).await?
+    tokio::time::timeout(Duration::from_secs(60), exercise(false, false)).await?
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancelled_unknown_pin_recovers_original_plan_and_acked_suffix() -> Result<()> {
-    tokio::time::timeout(Duration::from_secs(60), exercise(true)).await?
+    tokio::time::timeout(Duration::from_secs(60), exercise(true, false)).await?
 }
 
-async fn exercise(restart: bool) -> Result<()> {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rpc_unknown_pin_keeps_owner_live_and_drains() -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(60), exercise(false, true)).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_rpc_unknown_pin_recovers_original_plan_and_acked_suffix() -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(60), exercise(true, true)).await?
+}
+
+async fn exercise(restart: bool, rpc_unknown: bool) -> Result<()> {
     let root = tempfile::tempdir()?;
     let storage = Storage::resolve(
         root.path().join("turns.lance").to_str().unwrap().into(),
@@ -30,7 +40,11 @@ async fn exercise(restart: bool) -> Result<()> {
         network::Cluster::open_signed(root.path(), annotation_publication::one_shard()).await?;
     annotation_publication::seed_contract(&c, &storage, Service::contract(&binding(), &limits)?)
         .await?;
-    let proxy = lost_prepare::proxy::Proxy::open_pin(&c, root.path(), false, true).await?;
+    let proxy = if rpc_unknown {
+        lost_prepare::proxy::Proxy::open_rpc_unknown_pin(&c, root.path(), false, true).await?
+    } else {
+        lost_prepare::proxy::Proxy::open_pin(&c, root.path(), false, true).await?
+    };
     let direct = std::mem::replace(&mut c.client, proxy.client.clone());
     let (service, runtime) = owner(&c, &storage, &limits).await?;
     let (stop, mut task) = run_owner(runtime);
