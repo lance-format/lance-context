@@ -17,6 +17,8 @@ mod lost_advance;
 #[cfg(feature = "service")]
 mod lost_confirm;
 #[cfg(feature = "service")]
+mod lost_pin;
+#[cfg(feature = "service")]
 mod lost_plan;
 #[cfg(feature = "service")]
 pub(super) mod lost_prepare;

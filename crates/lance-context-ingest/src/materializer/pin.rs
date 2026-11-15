@@ -4,11 +4,24 @@ use super::*;
 impl Publisher {
     pub(crate) async fn pin_source(&self, permit: source::Permit) -> Result<()> {
         let expected = permit.selection();
-        for attempt in 0..2 {
-            let error = match commit(&self.ingress.client, Command::Pin(permit.clone())).await {
-                Ok(Applied::Source(source::Reply::Pinned { .. })) => return Ok(()),
+        loop {
+            let response = self
+                .ingress
+                .client
+                .request_routed(Request::Commit(Box::new(Command::Pin(permit.clone()))))
+                .await;
+            let (error, uncertain) = match response.map(|r| r.reply) {
+                Ok(Reply::Commit(Outcome::Committed(Applied::Source(source::Reply::Pinned {
+                    ..
+                })))) => return Ok(()),
+                Ok(Reply::Commit(Outcome::Unknown)) => (
+                    anyhow::anyhow!(
+                        "durable command outcome unknown; reconcile the original operation"
+                    ),
+                    true,
+                ),
                 Ok(reply) => bail!("source pin rejected: {reply:?}"),
-                Err(error) => error,
+                Err(error) => (error, false),
             };
             let observed: Result<bool> = async {
                 // A source pin is not publisher authority. A fenced owner may
@@ -32,7 +45,7 @@ impl Publisher {
                     );
                     return Ok(true);
                 }
-                ensure!(attempt == 0, "original source pin remains unconfirmed");
+                ensure!(uncertain, "original source pin remains unconfirmed");
                 let query::Value::Pin(Some(current)) = query(
                     &self.ingress,
                     self.authority.group,
@@ -59,7 +72,14 @@ impl Publisher {
             .await;
             match observed {
                 Ok(true) => return Ok(()),
-                Ok(false) => continue,
+                Ok(false) => {
+                    // Structured Unknown plus fresh authority and the identical
+                    // selected permit authorize this idempotent control request.
+                    // Keep the caller's frozen generation while bounded apply
+                    // and point reads remain live. No business write or file
+                    // preparation is repeated; cancellation retains the plan.
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
                 Err(observation) => {
                     return Err(error).context(format!(
                         "original source pin not confirmed: {observation:#}"
@@ -67,6 +87,5 @@ impl Publisher {
                 }
             }
         }
-        unreachable!("only the first uncertain pin may be resubmitted")
     }
 }
