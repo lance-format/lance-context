@@ -9,7 +9,7 @@ use arrow_array::{Array, BooleanArray, RecordBatch, StringArray};
 use arrow_schema::Schema;
 use arrow_select::filter::filter_record_batch;
 use datafusion::prelude::{col, lit};
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use lance::dataset::{
     mem_wal::{DatasetMemWalExt, ShardManifestStore},
     transaction::{Operation, Transaction},
@@ -32,6 +32,8 @@ const REPLAY_RANGES_PREFIX: &str = "lance-context.rollout-append.replay-ranges."
 
 pub const MAX_PLAN_GENERATIONS: usize = 256;
 pub const MAX_STAGE_BYTES: usize = 256 * 1024 * 1024;
+// Bound both metadata fan-out and the number of retained shard manifests.
+const MAX_PLANNING_SHARDS: usize = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Generation {
@@ -502,13 +504,21 @@ impl AppendCoordinator {
         let mut cutovers = HashMap::new();
         let mut reclaimed = 0;
         let marks = watermarks(&self.dataset).await?;
-        for shard in shard_ids {
-            reclaimed += reconcile_shard(&self.dataset, shard, self.wal_collection).await?;
-            let Some(manifest) = shard_store(&self.dataset, shard)
-                .await?
-                .refresh_latest()
-                .await?
-            else {
+        let dataset = &self.dataset;
+        let wal_collection = self.wal_collection;
+        // Poll in this task so reconciliation keeps the current MergeWriteScope.
+        // buffered preserves sorted shard processing and limits speculative work;
+        // each shard still reconciles its committed prefix before refreshing it.
+        let mut inspections = futures::stream::iter(shard_ids)
+            .map(|shard| async move {
+                let reclaimed = reconcile_shard(dataset, shard, wal_collection).await?;
+                let manifest = shard_store(dataset, shard).await?.refresh_latest().await?;
+                Ok::<_, Error>((shard, reclaimed, manifest))
+            })
+            .buffered(MAX_PLANNING_SHARDS);
+        while let Some((shard, shard_reclaimed, manifest)) = inspections.try_next().await? {
+            reclaimed += shard_reclaimed;
+            let Some(manifest) = manifest else {
                 continue;
             };
             crate::merge_write_scope::checkpoint();
@@ -620,6 +630,8 @@ impl AppendCoordinator {
                 pending.push((shard, generations, cutoff));
             }
         }
+        // Release the dataset borrow and all inspections before publishing cutovers.
+        drop(inspections);
         if !cutovers.is_empty() {
             self.dataset
                 .update_metadata(cutovers.iter().map(|(k, v)| (k.as_str(), v.as_str())))
@@ -1030,6 +1042,356 @@ mod tests {
     }
     fn budget() -> Arc<MergeMemoryBudget> {
         MergeMemoryBudget::new(8 * 1024 * 1024)
+    }
+
+    mod planning_concurrency {
+        use super::*;
+        use async_trait::async_trait;
+        use futures::stream::BoxStream;
+        use lance_io::object_store::WrappingObjectStore;
+        use object_store::{
+            path::Path, CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload,
+            ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+            RenameOptions,
+        };
+        use std::sync::atomic::AtomicUsize;
+        use tokio::sync::{Notify, Semaphore};
+        use tokio::time::{timeout, Duration};
+
+        #[derive(Debug)]
+        struct Gate {
+            active: AtomicUsize,
+            maximum: AtomicUsize,
+            entered: AtomicUsize,
+            changed: Notify,
+            release: Semaphore,
+            fail: AtomicBool,
+        }
+        impl Gate {
+            fn new() -> Arc<Self> {
+                Arc::new(Self {
+                    active: AtomicUsize::new(0),
+                    maximum: AtomicUsize::new(0),
+                    entered: AtomicUsize::new(0),
+                    changed: Notify::new(),
+                    release: Semaphore::new(0),
+                    fail: AtomicBool::new(false),
+                })
+            }
+            async fn first_wave(&self) {
+                while self.entered.load(Ordering::SeqCst) < MAX_PLANNING_SHARDS {
+                    self.changed.notified().await;
+                }
+            }
+        }
+        struct Reading(Arc<Gate>);
+        impl Drop for Reading {
+            fn drop(&mut self) {
+                self.0.active.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        #[derive(Debug)]
+        struct Wrapper(Arc<Gate>);
+        impl WrappingObjectStore for Wrapper {
+            fn wrap_paginated(
+                &self,
+                _: &str,
+                store: Arc<dyn object_store::list::PaginatedListStore>,
+            ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+                Some(store)
+            }
+            fn wrap(&self, _: &str, store: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
+                Arc::new(GatedStore {
+                    inner: store,
+                    gate: self.0.clone(),
+                })
+            }
+        }
+        #[derive(Debug)]
+        struct GatedStore {
+            inner: Arc<dyn ObjectStore>,
+            gate: Arc<Gate>,
+        }
+        impl std::fmt::Display for GatedStore {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "PlanningGate({})", self.inner)
+            }
+        }
+        #[async_trait]
+        impl ObjectStore for GatedStore {
+            async fn put_opts(
+                &self,
+                path: &Path,
+                payload: PutPayload,
+                opts: PutOptions,
+            ) -> object_store::Result<PutResult> {
+                self.inner.put_opts(path, payload, opts).await
+            }
+            async fn put_multipart_opts(
+                &self,
+                path: &Path,
+                opts: PutMultipartOptions,
+            ) -> object_store::Result<Box<dyn MultipartUpload>> {
+                self.inner.put_multipart_opts(path, opts).await
+            }
+            async fn get_opts(
+                &self,
+                path: &Path,
+                opts: GetOptions,
+            ) -> object_store::Result<GetResult> {
+                if !opts.head
+                    && path.as_ref().contains("/_mem_wal/")
+                    && path.as_ref().ends_with(".binpb")
+                {
+                    let active = self.gate.active.fetch_add(1, Ordering::SeqCst) + 1;
+                    self.gate.maximum.fetch_max(active, Ordering::SeqCst);
+                    let _reading = Reading(self.gate.clone());
+                    self.gate.entered.fetch_add(1, Ordering::SeqCst);
+                    self.gate.changed.notify_one();
+                    self.gate.release.acquire().await.unwrap().forget();
+                    if self.gate.fail.load(Ordering::SeqCst) {
+                        return Err(object_store::Error::Generic {
+                            store: "planning-test",
+                            source: std::io::Error::other("injected shard manifest read failure")
+                                .into(),
+                        });
+                    }
+                }
+                assert!(
+                    !path.as_ref().contains("/data/"),
+                    "planning must not read payloads"
+                );
+                self.inner.get_opts(path, opts).await
+            }
+            fn delete_stream(
+                &self,
+                paths: BoxStream<'static, object_store::Result<Path>>,
+            ) -> BoxStream<'static, object_store::Result<Path>> {
+                self.inner.delete_stream(paths)
+            }
+            fn list(
+                &self,
+                prefix: Option<&Path>,
+            ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+                self.inner.list(prefix)
+            }
+            fn list_with_offset(
+                &self,
+                prefix: Option<&Path>,
+                offset: &Path,
+            ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+                self.inner.list_with_offset(prefix, offset)
+            }
+            async fn list_with_delimiter(
+                &self,
+                prefix: Option<&Path>,
+            ) -> object_store::Result<ListResult> {
+                self.inner.list_with_delimiter(prefix).await
+            }
+            async fn copy_opts(
+                &self,
+                from: &Path,
+                to: &Path,
+                opts: CopyOptions,
+            ) -> object_store::Result<()> {
+                self.inner.copy_opts(from, to, opts).await
+            }
+            async fn rename_opts(
+                &self,
+                from: &Path,
+                to: &Path,
+                opts: RenameOptions,
+            ) -> object_store::Result<()> {
+                self.inner.rename_opts(from, to, opts).await
+            }
+        }
+        #[derive(Debug, Default)]
+        struct Authority(AtomicUsize);
+        impl CommitAuthorizer for Authority {
+            fn authorize<'a>(
+                &'a self,
+                _: &'a str,
+                _: u64,
+            ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+                Box::pin(async move {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            }
+        }
+
+        async fn fixture() -> (tempfile::TempDir, String, Vec<RolloutStore>, Vec<String>) {
+            let dir = tempfile::tempdir().unwrap();
+            let uri = format!("file-object-store://{}", dir.path().display());
+            let names: Vec<String> = (0..9).map(|n| format!("planning-{n}")).collect();
+            let mut writers = Vec::new();
+            for name in &names {
+                let w = writer(&uri, name).await;
+                put(&w, name, 64).await;
+                writers.push(w);
+            }
+            (dir, uri, writers, names)
+        }
+
+        #[tokio::test]
+        async fn bounded_reads_keep_order_and_task_local_authority() {
+            let (_dir, uri, _writers, names) = fixture().await;
+            let gate = Gate::new();
+            let authority = Arc::new(Authority::default());
+            let scope = MergeWriteScope::with_preparation_authorizer_and_io_shim(
+                authority.clone(),
+                Arc::new(Wrapper(gate.clone())),
+            );
+            let plans = scope.run(async {
+                let mut coordinator = AppendCoordinator::open(&uri, None).await.unwrap();
+                let mut planning = Box::pin(coordinator.plan(&names, 64, 1024 * 1024));
+                timeout(Duration::from_secs(10), async {
+                    tokio::select! {
+                        result = &mut planning => panic!("finished before releasing metadata: {result:?}"),
+                        _ = gate.first_wave() => {}
+                    }
+                }).await.expect("serial planning cannot reach four blocked shards");
+                assert_eq!(gate.active.load(Ordering::SeqCst), MAX_PLANNING_SHARDS);
+                gate.release.add_permits(256);
+                let (plans, reclaimed) = timeout(Duration::from_secs(10), planning).await.unwrap().unwrap();
+                assert_eq!(reclaimed, 0);
+                plans
+            }).await;
+            scope.drain().await;
+            assert_eq!(gate.maximum.load(Ordering::SeqCst), MAX_PLANNING_SHARDS);
+            assert_eq!(gate.active.load(Ordering::SeqCst), 0);
+            assert!(
+                authority.0.load(Ordering::SeqCst) > 0,
+                "cutover lost its task-local authorizer"
+            );
+            let mut expected: Vec<_> = names.iter().map(|n| derive_shard_id(Some(n))).collect();
+            expected.sort();
+            assert_eq!(plans.iter().map(|p| p.shard).collect::<Vec<_>>(), expected);
+            assert!(plans.iter().all(|p| p.generations.len() == 1));
+            assert_eq!(rows(&uri).await, 0, "planning must not append data");
+        }
+
+        #[tokio::test]
+        async fn concurrent_reconciliation_keeps_shard_authorization_and_watermarks() {
+            let (_dir, uri, _writers, names) = fixture().await;
+            let denied =
+                MergeWriteScope::with_pinned_authorizer(Arc::new(FailDrain(AtomicBool::new(true))));
+            denied
+                .run(async {
+                    let mut coordinator = AppendCoordinator::open(&uri, None).await.unwrap();
+                    let (plans, _) = coordinator.plan(&names, 64, 1024 * 1024).await.unwrap();
+                    let mut staged = Vec::new();
+                    for plan in plans {
+                        staged.push(stage(&uri, plan, budget(), None).await.unwrap());
+                    }
+                    assert!(coordinator
+                        .commit(staged)
+                        .await
+                        .unwrap_err()
+                        .to_string()
+                        .contains("injected"));
+                })
+                .await;
+            denied.drain().await;
+            assert_eq!(rows(&uri).await, names.len());
+            let version = Dataset::open(&uri).await.unwrap().version().version;
+
+            let denied =
+                MergeWriteScope::with_pinned_authorizer(Arc::new(FailDrain(AtomicBool::new(true))));
+            denied
+                .run(async {
+                    let mut coordinator = AppendCoordinator::open(&uri, None).await.unwrap();
+                    let error = coordinator.plan(&names, 64, 1024 * 1024).await.unwrap_err();
+                    assert!(error.to_string().contains("injected"), "{error}");
+                })
+                .await;
+            denied.drain().await;
+            assert_eq!(denied.work().generations_reclaimed, 0);
+
+            let allowed = MergeWriteScope::with_pinned_authorizer(Arc::new(Authority::default()));
+            allowed
+                .run(async {
+                    let mut coordinator = AppendCoordinator::open(&uri, None).await.unwrap();
+                    let (plans, reclaimed) =
+                        coordinator.plan(&names, 64, 1024 * 1024).await.unwrap();
+                    assert!(plans.is_empty());
+                    assert_eq!(
+                        reclaimed,
+                        names.len(),
+                        "revoked planning must leave every committed generation for recovery"
+                    );
+                })
+                .await;
+            allowed.drain().await;
+            assert_eq!(allowed.work().generations_reclaimed, names.len() as u64);
+            assert_eq!(
+                rows(&uri).await,
+                names.len(),
+                "reconciliation must never reappend committed rows"
+            );
+            assert_eq!(
+                Dataset::open(&uri).await.unwrap().version().version,
+                version
+            );
+        }
+
+        #[tokio::test]
+        async fn metadata_failure_or_cancellation_never_publishes_partial_cutovers() {
+            for cancel in [false, true] {
+                let (_dir, uri, _writers, names) = fixture().await;
+                let version = Dataset::open(&uri).await.unwrap().version().version;
+                let gate = Gate::new();
+                let authority = Arc::new(Authority::default());
+                let scope = MergeWriteScope::with_preparation_authorizer_and_io_shim(
+                    authority.clone(),
+                    Arc::new(Wrapper(gate.clone())),
+                );
+                scope
+                    .run(async {
+                        let mut coordinator = AppendCoordinator::open(&uri, None).await.unwrap();
+                        let mut planning = Box::pin(coordinator.plan(&names, 64, 1024 * 1024));
+                        timeout(Duration::from_secs(10), async {
+                        tokio::select! {
+                            result = &mut planning => panic!("finished before fault: {result:?}"),
+                            _ = gate.first_wave() => {}
+                        }
+                    }).await.unwrap();
+                        if cancel {
+                            drop(planning);
+                        } else {
+                            gate.fail.store(true, Ordering::SeqCst);
+                            gate.release.add_permits(256);
+                            let error = timeout(Duration::from_secs(10), planning)
+                                .await
+                                .unwrap()
+                                .unwrap_err();
+                            assert!(
+                                error
+                                    .to_string()
+                                    .contains("injected shard manifest read failure"),
+                                "{error}"
+                            );
+                        }
+                    })
+                    .await;
+                scope.drain().await;
+                assert_eq!(gate.active.load(Ordering::SeqCst), 0);
+                assert_eq!(authority.0.load(Ordering::SeqCst), 0);
+                assert_eq!(scope.write_status().active_commits, 0);
+                assert_eq!(
+                    Dataset::open(&uri).await.unwrap().version().version,
+                    version
+                );
+                let mut retry = AppendCoordinator::open(&uri, None).await.unwrap();
+                let (plans, reclaimed) = retry.plan(&names, 64, 1024 * 1024).await.unwrap();
+                assert_eq!(reclaimed, 0);
+                assert_eq!(
+                    plans.len(),
+                    names.len(),
+                    "failed plan must preserve every pending shard"
+                );
+            }
+        }
     }
 
     #[tokio::test]
