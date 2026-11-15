@@ -175,7 +175,33 @@ impl Cluster {
             }
         })
         .await
-        .context("TLS replica election did not settle")
+        .with_context(|| {
+            format!(
+                "TLS replica election did not settle: {}",
+                self.progress(group)
+            )
+        })
+    }
+    fn progress(&self, group: u64) -> String {
+        self.nodes
+            .iter()
+            .map(|(id, node)| {
+                let stats = node.network.statistics();
+                match node.handle.observation(group) {
+                    Ok(o) => format!(
+                        "node={id} status={:?} checkpoint={} first_retained={} polling={} stopped={} failure={:?} sent={} received={} dropped={} exchanges_failed={} packets_rejected={}",
+                        o.status, o.checkpoint_index, o.first_retained_index, o.polling,
+                        o.stopped, o.failure, stats.sent_frames.load(Ordering::Relaxed),
+                        stats.received_frames.load(Ordering::Relaxed),
+                        stats.dropped_outbound.load(Ordering::Relaxed),
+                        stats.failed_exchanges.load(Ordering::Relaxed),
+                        stats.rejected_packets.load(Ordering::Relaxed),
+                    ),
+                    Err(e) => format!("node={id} observation failed: {e:#}"),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
     }
     pub(crate) async fn shutdown(mut self) -> Result<()> {
         let ids: Vec<_> = self.nodes.keys().copied().collect();

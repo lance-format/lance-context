@@ -56,15 +56,7 @@ impl LogMaintenance {
             }
             Err(error) => return Err(error),
         };
-        if self.node.budget.get().is_some_and(|budget| {
-            let observed = budget.snapshot();
-            observed
-                .accounted_disk_bytes
-                .saturating_add(observed.reserved_proposal_bytes)
-                .saturating_add(observed.reserved_file_bytes)
-                .saturating_add(self.node.target_file_bytes.saturating_mul(2))
-                > observed.data_limit
-        }) {
+        if self.data_under_pressure() {
             // Native rewrite eligibility counts dead entries, not their bytes.
             // A few compacted large records can keep admission closed while
             // many tiny live metadata values suppress the normal heuristic.
@@ -77,12 +69,24 @@ impl LogMaintenance {
         Ok(groups)
     }
 
+    fn data_under_pressure(&self) -> bool {
+        self.node.budget.get().is_some_and(|budget| {
+            let observed = budget.snapshot();
+            observed
+                .accounted_disk_bytes
+                .saturating_add(observed.reserved_proposal_bytes)
+                .saturating_add(observed.reserved_file_bytes)
+                .saturating_add(self.node.target_file_bytes.saturating_mul(2))
+                > observed.data_limit
+        })
+    }
+
     fn run_pass(&self, force_rewrite: bool) -> Result<Vec<u64>> {
         // Admission failure occurs before touching native storage and must not
         // fence a healthy node. Existing accepted traffic still owns its window.
         // Exclude writes while sizing live entries. Dead segments need deletion,
         // not another directory-sized reservation that can prevent their cleanup.
-        let (_reservation, boundary) = {
+        let (_reservation, boundary, force_append) = {
             // These two gates stabilize the append boundary and its sync.
             // Taking maintenance_gate here would block durable payload
             // reads for the entire sync, including reads on the Raft owner.
@@ -98,6 +102,11 @@ impl LogMaintenance {
                 .write()
                 .map_err(|_| anyhow::anyhow!("append gate poisoned"))?;
             self.node.check()?;
+            // Retained replication entries can pin old append files even after
+            // checkpointing. Under producer pressure, rewrite that eligible
+            // prefix now rather than waiting for more logical compaction.
+            // Observe pressure before adding this pass's own scratch allowance.
+            let force_append = !force_rewrite && self.data_under_pressure();
             // Freeze eligibility with the allowance. Later appends can move
             // the native ratio-based watermark, but not this pass's copy cap.
             let boundary = self.node.engine.purge_manager().capture_append_boundary();
@@ -106,7 +115,7 @@ impl LogMaintenance {
                 .budget
                 .get()
                 .map(|budget| {
-                    // Pressure reclamation touches only the rewrite queue.
+                    // The fallback pass touches only the rewrite queue.
                     // Charging the unrelated append tail again can itself close
                     // producer admission while this background pass runs.
                     let live = if force_rewrite {
@@ -131,16 +140,21 @@ impl LogMaintenance {
             }
             // Later appends and their tombstones stay outside this pass. Rewrite
             // queue values cannot grow while our node-wide job guard is held.
-            (reservation, boundary)
+            (reservation, boundary, force_append)
         };
-        let result = self.run_native(force_rewrite, boundary);
+        let result = self.run_native(force_rewrite, boundary, force_append);
         if result.is_err() {
             self.node.failed.store(true, Ordering::Release);
         }
         result
     }
 
-    fn run_native(&self, force_rewrite: bool, boundary: (u64, usize, u64)) -> Result<Vec<u64>> {
+    fn run_native(
+        &self,
+        force_rewrite: bool,
+        boundary: (u64, usize, u64),
+        force_append: bool,
+    ) -> Result<Vec<u64>> {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if force_rewrite {
                 self.node.engine.purge_manager().reclaim_rewrite_queue()?;
@@ -149,7 +163,7 @@ impl LogMaintenance {
                 self.node
                     .engine
                     .purge_manager()
-                    .purge_expired_files_before(boundary)
+                    .purge_expired_files_before(boundary, force_append)
             }
         }));
         let mut groups = match outcome {
