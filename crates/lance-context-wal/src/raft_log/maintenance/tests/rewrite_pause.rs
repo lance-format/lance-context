@@ -2,6 +2,51 @@ use super::*;
 use std::{sync::mpsc, time::Duration};
 
 #[test]
+fn maintenance_sync_keeps_durable_payload_reads_live() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let layout = layout();
+    let log = PhysicalLog::open_with_file_size(root.path(), &layout, 1, 64 << 20)?;
+    let group = log.group(10)?;
+    let sibling = log.group(20)?;
+    append(&group, 1, 4)?;
+    append(&sibling, 1, 4)?;
+
+    // Stop the real maintenance marker sync, after the production path has
+    // acquired its own locks. The durable sibling payload predates that marker.
+    let pause = group.node.fault.pause_sync_for_test();
+    let maintenance = group.maintenance();
+    let maintain = std::thread::spawn(move || maintenance.run());
+    if let Err(error) = pause.wait() {
+        drop(pause);
+        maintain.join().unwrap()?;
+        return Err(error);
+    }
+    let (completed, wait_completed) = mpsc::sync_channel(1);
+    let read = std::thread::spawn(move || {
+        completed
+            .send(sibling.entries(1, 5, None, GetEntriesContext::empty(false)))
+            .unwrap();
+    });
+    let observed = wait_completed.recv_timeout(Duration::from_millis(500));
+    let read_before_sync = observed.is_ok();
+    drop(pause);
+    maintain.join().unwrap()?;
+    read.join().unwrap();
+    let actual = observed.or_else(|_| wait_completed.recv_timeout(Duration::from_secs(5)))??;
+    assert_eq!(actual, (1..=4).map(|i| entry(20, i)).collect::<Vec<_>>());
+    drop((group, log));
+    let reopened = PhysicalLog::open(root.path(), &layout, 1)?;
+    verify(&reopened.group(10)?, 1, 4)?;
+    verify(&reopened.group(20)?, 1, 4)?;
+    eprintln!("maintenance marker sync: durable_read_before_sync={read_before_sync}; all 8 payloads reopened");
+    assert!(
+        read_before_sync,
+        "maintenance marker sync blocked durable payload read"
+    );
+    Ok(())
+}
+
+#[test]
 fn slow_background_rewrite_does_not_stop_foreground_append_or_retained_read() -> Result<()> {
     let root = tempfile::tempdir()?;
     let layout = layout();
