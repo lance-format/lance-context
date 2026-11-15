@@ -713,3 +713,62 @@ fn checkpoint_interrupted(fail_sync: bool) -> Result<()> {
     // engine/image owners; the already acknowledged prefix is still readable.
     reopen(root.path(), &[(first, 1)])
 }
+
+#[test]
+fn async_persistence_checkpoint_metadata_sync_keeps_leader_and_reads_live() -> Result<()> {
+    let executor = executor()?;
+    let root = tempfile::tempdir()?;
+    let (c, first) = executor.block_on(seeded(root.path()))?;
+    let prepared = executor.block_on(async {
+        let task = c.handles[&1]
+            .prepare_checkpoint(10, uuid::Uuid::new_v4())?
+            .await?;
+        tokio::task::spawn_blocking(move || task.run()).await?
+    })?;
+    let store = executor.block_on(c.handles[&1].local(10, |node| {
+        Ok(node.groups[&10].raw.store().durable_log().clone())
+    })?)?;
+    let term = c.handles[&1].observation(10)?.status.term;
+    let gate = store.block_sync_for_test();
+    let waiting = executor.block_on(async {
+        let checkpoint = c.handles[&1].install_checkpoint(prepared)?;
+        // Prove that it is the checkpoint metadata's own sync being held,
+        // rather than merely a pending Ready preceding its installation.
+        wait_for(|| store.appended_checkpoint_for_test().ok().flatten() == Some(first)).await?;
+        let read = c.handles[&1].local(10, move |node| node.read_accepted(10, first))?;
+        let deadline = Instant::now() + Duration::from_millis(2500);
+        let mut maximum_staleness = Duration::ZERO;
+        let mut first_leader_change = None;
+        while Instant::now() < deadline {
+            ensure!(checkpoint.0.is_empty(), "checkpoint ACK preceded its metadata sync");
+            for (id, handle) in c.handles.iter() {
+                let view = handle.observation(10)?;
+                maximum_staleness = maximum_staleness.max(view.observed_at.elapsed());
+                if (view.status.leader != 1 || view.status.term != term) && first_leader_change.is_none() {
+                    first_leader_change = Some((*id, view.status.leader, view.status.term));
+                }
+            }
+            ensure!(c.handles[&1].observation(10)?.checkpoint_index < first,
+                "durable checkpoint observation advanced before native sync");
+            sleep(Duration::from_millis(10)).await;
+        }
+        eprintln!("checkpoint_metadata_stall: hold_ms=2500 max_owner_age_ms={} first_leader_change={:?} read_completed={}",
+            maximum_staleness.as_millis(), first_leader_change, !read.0.is_empty());
+        ensure!(maximum_staleness < Duration::from_millis(500), "checkpoint metadata sync blocked owner");
+        ensure!(first_leader_change.is_none(), "checkpoint metadata sync changed leader visibility");
+        ensure!(!read.0.is_empty(), "stable-prefix read waited for checkpoint metadata sync");
+        ensure!(read.await? == Some(batch(1)));
+        Ok::<_, anyhow::Error>(checkpoint)
+    });
+    drop(gate);
+    let verified = executor.block_on(async {
+        timeout(Duration::from_secs(10), waiting?).await??;
+        ensure!(c.handles[&1].observation(10)?.checkpoint_index == first);
+        Ok::<_, anyhow::Error>(())
+    });
+    let stopped = executor.block_on(c.shutdown());
+    drop(store);
+    stopped?;
+    verified?;
+    reopen(root.path(), &[(first, 1)])
+}
