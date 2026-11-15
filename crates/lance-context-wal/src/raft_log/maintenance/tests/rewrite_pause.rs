@@ -218,7 +218,7 @@ fn rewrite_allowance_excludes_later_snapshot_entries_and_tombstones() -> Result<
             .engine
             .purge_manager()
             .capture_append_boundary()
-            .1
+            .tombstones
     });
     let after = budget.snapshot();
     let reserved_after = after.reserved_proposal_bytes;
@@ -238,7 +238,7 @@ fn rewrite_allowance_excludes_later_snapshot_entries_and_tombstones() -> Result<
             .engine
             .purge_manager()
             .capture_append_boundary()
-            .1,
+            .tombstones,
         1,
         "new snapshot tombstone consumed by an older rewrite allowance"
     );

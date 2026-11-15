@@ -211,7 +211,10 @@ fn rewrite_queue_allowance_covers_actual_bytes_and_preserves_both_queues() -> Re
         written > 0 && written <= allowance,
         "{written} > {allowance}"
     );
-    assert_eq!(engine.purge_manager().capture_append_boundary().1, 1);
+    assert_eq!(
+        engine.purge_manager().capture_append_boundary().tombstones,
+        1
+    );
     drop(engine);
     let reopened = Engine::open(config)?;
     assert!(reopened.get_entry::<EntryIndex>(10, 4)?.is_none());

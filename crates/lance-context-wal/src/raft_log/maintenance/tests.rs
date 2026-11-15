@@ -7,6 +7,7 @@ mod pressure_admission;
 mod rewrite_allowance;
 mod rewrite_concurrency_probe;
 mod rewrite_pause;
+mod selection;
 
 fn layout() -> Layout {
     Layout {

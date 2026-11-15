@@ -47,7 +47,7 @@ fn append_watermark_cannot_expand_after_its_rewrite_allowance_is_reserved() -> R
     let allowance = group
         .node
         .engine
-        .estimated_rewrite_bytes_through(boundary.2)
+        .estimated_rewrite_bytes_for(&boundary)
         .unwrap();
     assert!(group.node.engine.estimated_rewrite_bytes().unwrap() > allowance + (256 << 10));
     let pause = group.node.fault.pause_rewrite_sync_for_test();
@@ -99,7 +99,7 @@ fn append_watermark_cannot_expand_after_its_rewrite_allowance_is_reserved() -> R
             .engine
             .purge_manager()
             .capture_append_boundary()
-            .2
+            .append_watermark
     });
     drop(pause);
     maintain.join().unwrap()?;
@@ -110,9 +110,9 @@ fn append_watermark_cannot_expand_after_its_rewrite_allowance_is_reserved() -> R
         "append did not progress while native rewrite sync was paused"
     );
     assert!(
-        expanded.is_some_and(|watermark| watermark > boundary.2),
+        expanded.is_some_and(|watermark| watermark > boundary.append_watermark),
         "append watermark did not move: before={}, after={expanded:?}",
-        boundary.2
+        boundary.append_watermark
     );
     assert!(
         group.node.engine.estimated_rewrite_queue_bytes().unwrap() <= allowance,

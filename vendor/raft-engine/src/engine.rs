@@ -443,6 +443,18 @@ where
             .bounded_rewrite_size_hint(Some(append_watermark))
     }
 
+    /// Exclude an unchanged rewrite queue only when the captured pass is also
+    /// forbidden from copying it. Keep the existing append-prefix, metadata and
+    /// framing allowance; callers still reserve file rotation headroom.
+    #[cfg(feature = "internals")]
+    pub fn estimated_rewrite_bytes_for(
+        &self,
+        boundary: &crate::purge::PurgeBoundary,
+    ) -> Option<usize> {
+        self.memtables
+            .selected_rewrite_size_hint(Some(boundary.append_watermark), boundary.rewrite_queue)
+    }
+
     /// Conservative allowance for reclaiming only the rewrite queue.
     /// Excludes the untouched append tail and its pending tombstones. As with
     /// `estimated_rewrite_bytes`, capture while writes/maintenance are excluded;
