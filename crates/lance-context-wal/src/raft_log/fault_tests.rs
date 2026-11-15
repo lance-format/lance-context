@@ -18,6 +18,7 @@ pub(super) struct FaultControl {
     fail_once: AtomicBool,
     fail_rewrite_sync: AtomicBool,
     pause_rewrite_sync: AtomicBool,
+    pause_sync: AtomicBool,
     pause_payload_read: AtomicBool,
     sync_calls: AtomicU64,
     entered: Mutex<Option<mpsc::SyncSender<()>>>,
@@ -54,6 +55,10 @@ impl FaultControl {
 
     pub(super) fn pause_rewrite_sync_for_test(&self) -> FilePause {
         self.pause_for_test(&self.pause_rewrite_sync)
+    }
+
+    pub(super) fn pause_sync_for_test(&self) -> FilePause {
+        self.pause_for_test(&self.pause_sync)
     }
 
     pub(super) fn pause_payload_read_for_test(&self) -> FilePause {
@@ -130,11 +135,12 @@ impl Handle for FaultHandle {
     fn sync(&self) -> io::Result<()> {
         self.control.observe_allocated_peak()?;
         self.control.sync_calls.fetch_add(1, Ordering::Relaxed);
-        if self.rewrite
-            && self
-                .control
-                .pause_rewrite_sync
-                .swap(false, Ordering::AcqRel)
+        if self.control.pause_sync.swap(false, Ordering::AcqRel)
+            || (self.rewrite
+                && self
+                    .control
+                    .pause_rewrite_sync
+                    .swap(false, Ordering::AcqRel))
         {
             if let Some(entered) = self.control.entered.lock().unwrap().take() {
                 let _ = entered.send(());

@@ -16,9 +16,9 @@ impl LogMaintenance {
     /// deletes application snapshots or Lance objects.
     ///
     /// Pending appends and checkpoint metadata first cross a physical sync
-    /// barrier. Sizing and that barrier briefly exclude foreground work; the
-    /// native rewrite then overlaps appends and reads. Its eligible append prefix
-    /// and tombstones are captured with the rewrite reservation. Native payload
+    /// barrier. Sizing and that barrier exclude appends but allow retained
+    /// payload reads; the native rewrite then overlaps both. Its eligible append
+    /// prefix and tombstones are captured with the rewrite reservation. Native payload
     /// readers are excluded only for physical file retirement. An error or panic
     /// fences every group on the node. This API does not bound filesystem latency.
     pub fn run(&self) -> Result<Vec<u64>> {
@@ -83,11 +83,10 @@ impl LogMaintenance {
         // Exclude writes while sizing live entries. Dead segments need deletion,
         // not another directory-sized reservation that can prevent their cleanup.
         let (_reservation, boundary) = {
-            let _maintenance = self
-                .node
-                .maintenance_gate
-                .write()
-                .map_err(|_| anyhow::anyhow!("maintenance gate poisoned"))?;
+            // These two gates stabilize the append boundary and its sync.
+            // Taking maintenance_gate here would block durable payload
+            // reads for the entire sync, including reads on the Raft owner.
+            // Physical file retirement retains the engine's payload-read guard.
             let _sync = self
                 .node
                 .sync_gate
