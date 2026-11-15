@@ -31,6 +31,8 @@ use raft_proto::eraftpb::{ConfState, Entry, EntryType, HardState, Snapshot};
 use crate::placement::Layout;
 
 mod budget;
+#[cfg(feature = "runtime")]
+pub mod buffered;
 mod checkpoint;
 pub use budget::{DiskMeasurement, DiskOptions};
 mod maintenance;
@@ -40,6 +42,8 @@ mod observation;
 pub(crate) use observation::snapshot as wait_observation;
 #[cfg(feature = "runtime")]
 pub use observation::{StorageWaitObservation, WaitInterval};
+#[cfg(all(test, feature = "runtime"))]
+mod async_ready_tests;
 #[cfg(test)]
 mod fault_tests;
 
@@ -190,6 +194,7 @@ struct TermRange {
     term: u64,
 }
 
+#[derive(Clone)]
 struct GroupState {
     hard: HardState,
     conf: ConfState,
@@ -724,21 +729,53 @@ impl Storage for GroupLog {
         _: GetEntriesContext,
     ) -> raft::Result<Vec<Entry>> {
         let state = self.read().map_err(storage_error)?;
-        // Initial maintenance sizing/sync excludes us briefly. The native read
-        // guard then protects selected files against deletion during payload I/O.
-        let _read = self
-            .node
-            .maintenance_gate
-            .read()
-            .map_err(|_| storage_error("maintenance gate poisoned"))?;
-        self.node.check().map_err(storage_error)?;
         if low <= state.boundary() {
             return Err(StorageError::Compacted.into());
         }
         if low > high || high > state.last() + 1 {
             return Err(StorageError::Unavailable.into());
         }
-        let limit = max_size.into().unwrap_or(u64::MAX);
+        self.read_entries(low, high, max_size.into())
+    }
+
+    fn term(&self, index: u64) -> raft::Result<u64> {
+        let state = self.read().map_err(storage_error)?;
+        if index < state.boundary() {
+            return Err(StorageError::Compacted.into());
+        }
+        state.term(index).ok_or(StorageError::Unavailable.into())
+    }
+
+    fn first_index(&self) -> raft::Result<u64> {
+        Ok(self.read().map_err(storage_error)?.boundary() + 1)
+    }
+
+    fn last_index(&self) -> raft::Result<u64> {
+        Ok(self.read().map_err(storage_error)?.last())
+    }
+
+    fn snapshot(&self, request_index: u64, _: u64) -> raft::Result<Snapshot> {
+        let state = self.read().map_err(storage_error)?;
+        let index = state.snapshot.get_metadata().index;
+        if index == 0 || index < request_index {
+            return Err(StorageError::SnapshotTemporarilyUnavailable.into());
+        }
+        Ok(state.snapshot.clone())
+    }
+}
+
+impl GroupLog {
+    // Caller owns a validated stable range. Ordinary reads hold the group state
+    // lock; BufferedLog shadows every in-flight replacement in memory instead.
+    // Logical checkpoint/install must not race a buffered owner's reads.
+    fn read_entries(&self, low: u64, high: u64, max_size: Option<u64>) -> raft::Result<Vec<Entry>> {
+        let _read = self
+            .node
+            .maintenance_gate
+            .read()
+            .map_err(|_| storage_error("maintenance gate poisoned"))?;
+        self.node.check().map_err(storage_error)?;
+        let limit = max_size.unwrap_or(u64::MAX);
         let (mut cursor, mut bytes) = (low, 0u64);
         let mut entries = Vec::new();
         while cursor < high {
@@ -772,30 +809,5 @@ impl Storage for GroupLog {
             }
         }
         Ok(entries)
-    }
-
-    fn term(&self, index: u64) -> raft::Result<u64> {
-        let state = self.read().map_err(storage_error)?;
-        if index < state.boundary() {
-            return Err(StorageError::Compacted.into());
-        }
-        state.term(index).ok_or(StorageError::Unavailable.into())
-    }
-
-    fn first_index(&self) -> raft::Result<u64> {
-        Ok(self.read().map_err(storage_error)?.boundary() + 1)
-    }
-
-    fn last_index(&self) -> raft::Result<u64> {
-        Ok(self.read().map_err(storage_error)?.last())
-    }
-
-    fn snapshot(&self, request_index: u64, _: u64) -> raft::Result<Snapshot> {
-        let state = self.read().map_err(storage_error)?;
-        let index = state.snapshot.get_metadata().index;
-        if index == 0 || index < request_index {
-            return Err(StorageError::SnapshotTemporarilyUnavailable.into());
-        }
-        Ok(state.snapshot.clone())
     }
 }
