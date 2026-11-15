@@ -239,6 +239,10 @@ pub enum Reply {
     AppendNotSubmittedDiskBudget,
     /// Distinct from Query::Observed: this carries no fresh-quorum receipt.
     Source(source_read::Observation),
+    /// This append attempt exceeded the pending proposal/persistence budget
+    /// before Raft proposal. Earlier attempts with the same identity may have
+    /// committed; retain their identity and bytes until separately resolved.
+    AppendNotSubmittedPendingCapacity,
 }
 /// Holds receive credit through consumption of metadata and a fetched payload.
 /// Cloning body Bytes transfers shared ownership, so callers retaining clones
@@ -570,6 +574,15 @@ async fn serve_one<S: AsyncRead + AsyncWrite + Unpin>(
         // do not prove that the request was never submitted.
         Err(error) if append && error.is::<crate::admission::DiskBudgetExhausted>() => {
             (Reply::AppendNotSubmittedDiskBudget, Bytes::new())
+        }
+        Err(error)
+            if append
+                && matches!(
+                    error.downcast_ref::<super::super::ProposalRejection>(),
+                    Some(super::super::ProposalRejection::PendingCapacity)
+                ) =>
+        {
+            (Reply::AppendNotSubmittedPendingCapacity, Bytes::new())
         }
         Err(_) => (Reply::Unknown, Bytes::new()),
     };
@@ -1073,7 +1086,12 @@ impl Client {
                 ensure!(observed == expected, "foreign client response scope");
                 ensure!(
                     matches!(reply, Reply::Unknown | Reply::Redirect { .. })
-                        || (append && matches!(reply, Reply::AppendNotSubmittedDiskBudget))
+                        || (append
+                            && matches!(
+                                reply,
+                                Reply::AppendNotSubmittedDiskBudget
+                                    | Reply::AppendNotSubmittedPendingCapacity
+                            ))
                         || matches!(
                             (&reply, reply_kind),
                             (Reply::Commit(_), 0)

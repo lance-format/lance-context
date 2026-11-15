@@ -3,7 +3,7 @@ use super::*;
 use crate::tests::annotation_runtime::lost_prepare::proxy::Proxy;
 use std::sync::atomic::Ordering;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Case {
     Accepted,
     Absent,
@@ -12,6 +12,7 @@ enum Case {
     PreviousSequence,
     LateCommit,
     PersistentUnknown,
+    PendingCapacity,
     ProducerFenced,
     LostRetryReply,
     RetryRejectedMutation,
@@ -53,6 +54,11 @@ async fn unknown_append_resubmission_is_bounded_and_preserves_unknown() -> Resul
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pending_capacity_refusal_cannot_resolve_an_earlier_unknown_append() -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(60), exercise(Case::PendingCapacity)).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unknown_append_resubmission_cannot_bypass_producer_fence() -> Result<()> {
     tokio::time::timeout(Duration::from_secs(60), exercise(Case::ProducerFenced)).await?
 }
@@ -72,8 +78,9 @@ async fn unknown_append_resubmission_preserves_applied_rejection() -> Result<()>
 }
 
 async fn exercise(case: Case) -> Result<()> {
+    let prefix = format!("annotation-uncertain-append-{case:?}-");
     let mut builder = tempfile::Builder::new();
-    builder.prefix("annotation-uncertain-append-");
+    builder.prefix(&prefix);
     let root = match std::env::var("INGEST_TEST_ARTIFACTS") {
         Ok(parent) => builder.tempdir_in(parent)?,
         Err(_) => builder.tempdir()?,
@@ -88,12 +95,16 @@ async fn exercise(case: Case) -> Result<()> {
     .await?;
     let limits = Limits::default();
     annotation_publication::seed_contract(&c, &storage, Service::contract(&binding(), &limits)?)
-        .await?;
+        .await
+        .context("seed contract before append fault injection")?;
     let execute = matches!(case, Case::Accepted | Case::RejectedMutation);
     let proxy = Proxy::open_append(&c, &root, execute).await?;
     proxy
         .unknown_appends
         .store(case == Case::PersistentUnknown, Ordering::SeqCst);
+    proxy
+        .pending_capacity_appends
+        .store(case == Case::PendingCapacity, Ordering::SeqCst);
     proxy
         .pause_append_retry
         .store(case == Case::LateCommit, Ordering::SeqCst);
@@ -205,7 +216,10 @@ async fn exercise(case: Case) -> Result<()> {
     };
     let successful = !matches!(
         case,
-        Case::DifferentBytes | Case::PersistentUnknown | Case::ProducerFenced
+        Case::DifferentBytes
+            | Case::PersistentUnknown
+            | Case::PendingCapacity
+            | Case::ProducerFenced
     );
     if successful {
         tokio::time::timeout(Duration::from_secs(20), async {
@@ -310,23 +324,46 @@ async fn exercise(case: Case) -> Result<()> {
     );
     assert_eq!(
         proxy.dropped.load(Ordering::SeqCst),
-        if matches!(case, Case::PersistentUnknown | Case::LostRetryReply) {
+        if matches!(
+            case,
+            Case::PersistentUnknown | Case::PendingCapacity | Case::LostRetryReply
+        ) {
             2
         } else {
             1
         }
     );
     // Redirects may add wire attempts, but every attempt must retain the same
-    // full metadata and IPC payload. Persistent Unknown must stop after two.
+    // full metadata and IPC payload. An unresolved resubmission stops after two.
     {
         let attempts = proxy.append_requests.lock().unwrap();
         for (meta, body) in attempts.iter() {
             assert_eq!(meta, input.meta());
             assert_eq!(body.as_slice(), input.body().as_ref());
         }
-        if case == Case::PersistentUnknown {
+        if matches!(case, Case::PersistentUnknown | Case::PendingCapacity) {
             assert_eq!(attempts.len(), 2);
         }
+    }
+    if case == Case::PendingCapacity {
+        // A fresh call reports only its own pre-submission refusal, without
+        // another automatic resubmission. It cannot settle the earlier Unknown.
+        let error = service
+            .submit(&input, Duration::from_secs(10))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<AppendFailure>(),
+                Some(AppendFailure::PendingCapacityNotSubmitted)
+            ),
+            "{error:#}"
+        );
+        assert_eq!(proxy.appends.load(Ordering::SeqCst), 0);
+        let attempts = proxy.append_requests.lock().unwrap();
+        assert_eq!(attempts.len(), 3);
+        assert_eq!(&attempts[2].0, input.meta());
+        assert_eq!(attempts[2].1.as_slice(), input.body().as_ref());
     }
     stop.send(()).unwrap();
     task.await??;

@@ -465,6 +465,9 @@ async fn append_body(inner: &Inner, ingress: &Ingress, request: Request) -> Http
             Some(AppendFailure::DiskBudgetNotSubmitted) => {
                 Failure::unavailable("wal_disk_capacity", "not_submitted")
             }
+            Some(AppendFailure::PendingCapacityNotSubmitted) => {
+                Failure::unavailable("request_capacity", "not_submitted")
+            }
             Some(AppendFailure::Sequence { .. } | AppendFailure::ProducerFenced) => Failure {
                 status: StatusCode::CONFLICT,
                 code: "producer_sequence_rejected",

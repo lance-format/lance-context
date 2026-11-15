@@ -54,6 +54,7 @@ pub(in crate::tests) struct Proxy {
     pub appends: Arc<AtomicUsize>,
     pub append_requests: RecordedAppends,
     pub unknown_appends: Arc<AtomicBool>,
+    pub pending_capacity_appends: Arc<AtomicBool>,
     pub pause_append_retry: Arc<AtomicBool>,
     pub lose_append_retry_reply: Arc<AtomicBool>,
     pub closes: Arc<AtomicUsize>,
@@ -219,9 +220,12 @@ impl Frame {
             )))
     }
     fn unknown_reply(&self) -> Result<Self> {
+        self.reply(Reply::Commit(Outcome::Unknown))
+    }
+    fn reply(&self, reply: Reply) -> Result<Self> {
         let (scope, _): (WireScope, u32) =
             codec().allow_trailing_bytes().deserialize(&self.meta)?;
-        let meta = codec().serialize(&(scope, Reply::Commit(Outcome::Unknown)))?;
+        let meta = codec().serialize(&(scope, reply))?;
         let mut fixed = self.fixed;
         fixed[16..20].copy_from_slice(&u32::try_from(meta.len())?.to_le_bytes());
         fixed[20..24].fill(0);
@@ -422,6 +426,7 @@ impl Proxy {
         let appends = Arc::new(AtomicUsize::new(0));
         let append_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let unknown_appends = Arc::new(AtomicBool::new(false));
+        let pending_capacity_appends = Arc::new(AtomicBool::new(false));
         let pause_append_retry = Arc::new(AtomicBool::new(false));
         let lose_append_retry_reply = Arc::new(AtomicBool::new(false));
         let closes = Arc::new(AtomicUsize::new(0));
@@ -482,6 +487,7 @@ impl Proxy {
             let appends = appends.clone();
             let append_requests = append_requests.clone();
             let unknown_appends = unknown_appends.clone();
+            let pending_capacity_appends = pending_capacity_appends.clone();
             let pause_append_retry = pause_append_retry.clone();
             let lose_append_retry_reply = lose_append_retry_reply.clone();
             let closes = closes.clone();
@@ -519,6 +525,7 @@ impl Proxy {
                             let appends = appends.clone();
             let append_requests = append_requests.clone();
             let unknown_appends = unknown_appends.clone();
+            let pending_capacity_appends = pending_capacity_appends.clone();
             let pause_append_retry = pause_append_retry.clone();
             let lose_append_retry_reply = lose_append_retry_reply.clone();
                             let closes = closes.clone();
@@ -551,6 +558,11 @@ impl Proxy {
                                             if unknown_appends.load(Ordering::SeqCst) {
                                                 dropped.fetch_add(1, Ordering::SeqCst);
                                                 request.unknown_reply()?.write(&mut downstream).await?;
+                                                continue;
+                                            }
+                                            if pending_capacity_appends.load(Ordering::SeqCst) {
+                                                dropped.fetch_add(1, Ordering::SeqCst);
+                                                request.reply(Reply::AppendNotSubmittedPendingCapacity)?.write(&mut downstream).await?;
                                                 continue;
                                             }
                                         }
@@ -737,6 +749,7 @@ impl Proxy {
             appends,
             append_requests,
             unknown_appends,
+            pending_capacity_appends,
             pause_append_retry,
             lose_append_retry_reply,
             closes,
