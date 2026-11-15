@@ -7,7 +7,11 @@ use lance_context_core::{
     rollout_append::{AppendCoordinator, AppendPlan, StageEvent, StagedAppend},
 };
 use serde::Deserialize;
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{
+    collections::{HashSet, VecDeque},
+    sync::Arc,
+    time::Duration,
+};
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -409,13 +413,17 @@ async fn run_pass(
         }.boxed()
     }).collect();
     let mut work = stream::iter(stage_futures).buffer_unordered(config.rollout_append_concurrency);
+    let mut ready = VecDeque::new();
     let mut group = Vec::new();
     let mut errors = Vec::new();
     let mut memory_retries = Vec::new();
     let mut flush = tokio::time::Instant::now() + Duration::from_secs(2);
     loop {
         tokio::select! {
-            next = work.next() => match next {
+            next = async { match ready.pop_front() {
+                Some(part) => Some(part),
+                None => work.next().await,
+            }} => match next {
                 Some(Ok(Some(part))) => {
                     if group.is_empty() { flush = tokio::time::Instant::now() + Duration::from_secs(2); }
                     group.push(part);
@@ -433,9 +441,14 @@ async fn run_pass(
         if group.len() >= config.rollout_append_concurrency
             || (!group.is_empty() && tokio::time::Instant::now() >= flush)
         {
-            reclaimed += time_append_phase(
-                "base_commit",
-                coordinator.commit(std::mem::take(&mut group)),
+            reclaimed += commit_while_staging(
+                time_append_phase(
+                    "base_commit",
+                    coordinator.commit(std::mem::take(&mut group)),
+                ),
+                &mut work,
+                &mut ready,
+                config.rollout_append_concurrency,
             )
             .await
             .map_err(|e| e.to_string())?;
@@ -486,6 +499,37 @@ async fn run_pass(
     Ok(reclaimed)
 }
 
+/// Continue polling the bounded staging stream while publishing one group.
+/// These futures stay in the current merge task: no detached executor, new
+/// authority, or additional Arrow budget. Only immutable staging descriptors
+/// are queued, at most one further group. Prefer a ready commit (including an
+/// error) before admitting more staging; cancellation drops everything together.
+async fn commit_while_staging<F, S>(
+    commit: F,
+    work: &mut S,
+    ready: &mut VecDeque<S::Item>,
+    limit: usize,
+) -> F::Output
+where
+    F: std::future::Future,
+    S: futures::Stream + Unpin,
+{
+    tokio::pin!(commit);
+    let mut exhausted = false;
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut commit => return result,
+            next = work.next(), if !exhausted && ready.len() < limit => {
+                match next {
+                    Some(part) => ready.push_back(part),
+                    None => exhausted = true,
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -497,6 +541,118 @@ mod tests {
     use clap::Parser;
     use lance_context_core::{MergeMemoryBudget, RolloutStore, RolloutStoreOptions};
     use serde_json::json;
+
+    #[tokio::test]
+    async fn commit_polls_staging_before_publication_finishes() {
+        let (staged, observed) = tokio::sync::oneshot::channel();
+        let mut work = stream::iter([async move {
+            staged.send(()).unwrap();
+            7
+        }])
+        .buffer_unordered(4);
+        let mut ready = VecDeque::new();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            commit_while_staging(
+                async {
+                    observed.await.unwrap();
+                    11
+                },
+                &mut work,
+                &mut ready,
+                4,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, 11);
+        assert_eq!(ready.into_iter().collect::<Vec<_>>(), [7]);
+    }
+
+    #[tokio::test]
+    async fn commit_prefetch_is_bounded_and_preserves_every_result() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let polled = Arc::new(AtomicUsize::new(0));
+        let counter = polled.clone();
+        let mut work = stream::iter(0..12).map(move |i| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            i
+        });
+        // Existing ready results count toward the limit too.
+        let mut ready = VecDeque::from([100]);
+        let (release, gate) = tokio::sync::oneshot::channel();
+        {
+            let pending = commit_while_staging(gate, &mut work, &mut ready, 4);
+            tokio::pin!(pending);
+            assert!(futures::poll!(&mut pending).is_pending());
+            assert_eq!(polled.load(Ordering::SeqCst), 3);
+            release.send(()).unwrap();
+            pending.await.unwrap();
+        }
+        assert_eq!(ready.into_iter().collect::<Vec<_>>(), [100, 0, 1, 2]);
+        assert_eq!(work.collect::<Vec<_>>().await, (3..12).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn commit_error_does_not_admit_more_staging() {
+        let mut work = stream::poll_fn(|_| -> std::task::Poll<Option<()>> {
+            panic!("staging polled after commit failed")
+        });
+        let mut ready = VecDeque::new();
+        let result = commit_while_staging(
+            std::future::ready(Err::<(), _>("fenced")),
+            &mut work,
+            &mut ready,
+            4,
+        )
+        .await;
+        assert_eq!(result, Err("fenced"));
+        assert!(ready.is_empty());
+    }
+
+    #[tokio::test]
+    async fn commit_waits_after_staging_exhausts_without_repolling_it() {
+        let mut ended = false;
+        let mut work = stream::poll_fn(|_| -> std::task::Poll<Option<()>> {
+            assert!(!ended, "exhausted stream polled again");
+            ended = true;
+            std::task::Poll::Ready(None)
+        });
+        let mut ready = VecDeque::new();
+        let (release, gate) = tokio::sync::oneshot::channel();
+        let pending = commit_while_staging(gate, &mut work, &mut ready, 4);
+        tokio::pin!(pending);
+        assert!(futures::poll!(&mut pending).is_pending());
+        release.send(()).unwrap();
+        pending.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn commit_cancellation_drops_admitted_staging_with_the_task() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Held(Arc<AtomicUsize>);
+        impl Drop for Held {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicUsize::new(0));
+        {
+            let held = Held(dropped.clone());
+            let stage = async move {
+                let _held = held;
+                std::future::pending::<()>().await;
+            };
+            let mut work = stream::iter([stage]).buffer_unordered(4);
+            let mut ready = VecDeque::new();
+            let pending =
+                commit_while_staging(std::future::pending::<()>(), &mut work, &mut ready, 4);
+            tokio::pin!(pending);
+            assert!(futures::poll!(&mut pending).is_pending());
+            assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        }
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    }
 
     #[derive(Clone)]
     struct Workers {
