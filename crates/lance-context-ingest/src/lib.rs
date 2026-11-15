@@ -180,6 +180,9 @@ pub enum AppendFailure {
     /// Only this attempt was refused before proposal. Keep the original request
     /// identity and bytes, including when reconciling an earlier unknown reply.
     DiskBudgetNotSubmitted,
+    /// The pending proposal/persistence budget refused this attempt before
+    /// Raft proposal. This cannot resolve a previous unknown attempt.
+    PendingCapacityNotSubmitted,
     Unknown,
 }
 impl std::fmt::Display for AppendFailure {
@@ -192,6 +195,9 @@ impl std::fmt::Display for AppendFailure {
             Self::ProducerFenced => f.write_str("producer fenced"),
             Self::DiskBudgetNotSubmitted => {
                 f.write_str("WAL disk admission refused this append before submission")
+            }
+            Self::PendingCapacityNotSubmitted => {
+                f.write_str("WAL pending capacity refused this append before submission")
             }
             Self::Unknown => {
                 f.write_str("append outcome unknown; retain exact producer sequence and bytes")
@@ -461,6 +467,9 @@ impl Ingress {
         let index = match response.reply {
             Reply::AppendNotSubmittedDiskBudget => {
                 return Err(AppendFailure::DiskBudgetNotSubmitted.into())
+            }
+            Reply::AppendNotSubmittedPendingCapacity => {
+                return Err(AppendFailure::PendingCapacityNotSubmitted.into())
             }
             Reply::Commit(Outcome::Committed(Applied::Accepted { index })) => index,
             Reply::Commit(Outcome::Committed(Applied::Rejected { expected_sequence })) => {

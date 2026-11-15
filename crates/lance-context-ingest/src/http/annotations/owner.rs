@@ -146,6 +146,9 @@ impl Owner {
                     Some(AppendFailure::DiskBudgetNotSubmitted) => {
                         Failure::unavailable("wal_disk_capacity", "not_submitted")
                     }
+                    Some(AppendFailure::PendingCapacityNotSubmitted) => {
+                        Failure::unavailable("request_capacity", "not_submitted")
+                    }
                     // This is a committed WAL decision, not a local capacity
                     // guess or an ambiguous transport failure. Exact retained
                     // requests resolve before the WAL checks capacity.

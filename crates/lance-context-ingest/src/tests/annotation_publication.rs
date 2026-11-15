@@ -37,12 +37,16 @@ fn patch_schema() -> SchemaRef {
 }
 
 async fn command(c: &network::Cluster, command: Command) -> Result<Applied> {
+    let description = format!("{command:?}");
     let response = c
         .client
         .request_routed(Request::Commit(Box::new(command)))
         .await?;
     let Reply::Commit(Outcome::Committed(applied)) = response.reply else {
-        bail!("test command outcome unknown");
+        bail!(
+            "test command outcome unknown: {description}: {:?}",
+            response.reply
+        );
     };
     Ok(applied)
 }
