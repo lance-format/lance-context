@@ -27,8 +27,9 @@ fn sync_stall_election(pipeline_replication: bool) -> Result<()> {
             .all(|h| h.observation(10).is_ok_and(|o| o.status.applied >= first))
     }))?;
     let old_term = c.handles[&1].observation(10)?.status.term;
-    let store = executor
-        .block_on(c.handles[&1].local(10, |node| Ok(node.groups[&10].raw.store().clone()))?)?;
+    let store = executor.block_on(c.handles[&1].local(10, |node| {
+        Ok(node.groups[&10].raw.store().durable_log().clone())
+    })?)?;
     let before_append = store.appended_index_for_test();
     let sync_guard = store.block_sync_for_test();
     let started = std::time::Instant::now();

@@ -28,6 +28,7 @@ struct Group {
     stopped: bool,
     fetch: runtime::FetchObservation,
     durable_poll: runtime::PollObservation,
+    persistence: Option<runtime::PersistenceObservation>,
     append: runtime::AppendObservation,
 }
 #[derive(Serialize)]
@@ -79,6 +80,7 @@ impl State {
                     stopped: o.stopped,
                     fetch: o.fetch,
                     durable_poll: o.durable_poll,
+                    persistence: o.persistence,
                     append: o.append,
                 },
             );

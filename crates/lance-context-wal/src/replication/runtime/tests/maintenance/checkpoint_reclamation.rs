@@ -66,8 +66,9 @@ fn due_log_reclamation_precedes_another_groups_checkpoint() -> Result<()> {
         Ok::<_, anyhow::Error>(other)
     })?;
     let handle = &c.handles[&3];
-    let store =
-        executor.block_on(handle.local(10, |node| Ok(node.groups[&10].raw.store().clone()))?)?;
+    let store = executor.block_on(handle.local(10, |node| {
+        Ok(node.groups[&10].raw.store().durable_log().clone())
+    })?)?;
     let (release_other, held_other) = std::sync::mpsc::channel::<()>();
     let (entered, entered_other) = tokio::sync::oneshot::channel();
     let other_work = handle.local(20, move |_| {

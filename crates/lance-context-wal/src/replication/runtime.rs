@@ -69,6 +69,9 @@ pub struct Options {
     /// replies, snapshots and client completions retain their existing barriers.
     /// Experimental; disabled until a controlled comparison supports it.
     pub pipeline_replication: bool,
+    /// Run ordinary Ready writes on a bounded native worker. Checkpoint and
+    /// snapshot publication retain their ordered barriers. Experimental.
+    pub async_persistence: bool,
 }
 impl Default for Options {
     fn default() -> Self {
@@ -83,6 +86,7 @@ impl Default for Options {
             batch_requests: 32,
             batch_time: Duration::from_millis(1),
             pipeline_replication: false,
+            async_persistence: false,
         }
     }
 }
@@ -348,8 +352,21 @@ pub struct Observation {
     pub fetch: FetchObservation,
     /// Completed durable polls and native write timings on this worker thread.
     pub durable_poll: PollObservation,
+    /// Separate native-worker timing and pending ownership when asynchronous
+    /// persistence is enabled. Its I/O does not run inside durable_poll.
+    pub persistence: Option<PersistenceObservation>,
     /// Per-append completed intervals, grouped by the worker's outcome.
     pub append: AppendObservation,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct PersistenceObservation {
+    pub pending_readies: usize,
+    pub pending_entries: usize,
+    pub pending_bytes: usize,
+    pub deferred_bytes: usize,
+    /// Original I/O operations, excluding time queued before the native worker.
+    pub io: PollObservation,
 }
 
 /// Bounded cumulative timings for serviced local fetch requests, including
@@ -644,6 +661,9 @@ impl Runtime {
     pub fn spawn(node: Node, options: Options) -> Result<(Self, async_mpsc::Receiver<Outbound>)> {
         options.validate()?;
         node.healthy()?;
+        if options.async_persistence {
+            super::async_persist::window(&options, &node.limits)?;
+        }
         let shared = Arc::new(Shared {
             #[cfg(feature = "peer-transport")]
             appends: client::observation::Counters::default(),
@@ -699,6 +719,7 @@ impl Runtime {
             let observation = Arc::new(Mutex::new(Observation {
                 fetch: FetchObservation::default(),
                 durable_poll: PollObservation::default(),
+                persistence: None,
                 append: AppendObservation::default(),
                 status,
                 checkpoint_index,
@@ -904,9 +925,12 @@ impl Worker {
         }
     }
     fn drive(&mut self) -> Result<()> {
+        if self.options.async_persistence {
+            self.node.enable_async_persistence(&self.options)?;
+        }
         let mut next_tick = Instant::now() + self.options.tick_interval;
         while !self.shared.stopped.load(Ordering::Acquire) {
-            let mut activity = false;
+            let mut activity = self.node.take_persistence_notification();
             let mut peer_credits = Vec::new();
             let mut after_poll = Vec::new();
             let batch_started = Instant::now();
@@ -1073,6 +1097,7 @@ impl Worker {
                 observation.status = status;
                 observation.checkpoint_index = checkpoint_index;
                 observation.first_retained_index = first_retained_index;
+                observation.persistence = self.node.persistence_observation(self.group);
                 observation.observed_at = Instant::now();
                 observation.polling = false;
             }
@@ -1084,16 +1109,20 @@ impl Worker {
         Ok(())
     }
     fn run(mut self) -> Result<()> {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.drive()))
+        let mut result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.drive()))
             .unwrap_or_else(|_| {
                 Err(anyhow::anyhow!(
                     "replica worker panicked; outstanding outcomes unknown"
                 ))
             });
+        if let Err(error) = self.node.shutdown_persistence() {
+            result = Err(error);
+        }
         if result.is_err() {
             self.shared.stopped.store(true, Ordering::Release);
         }
         let mut observation = self.observation.lock().unwrap();
+        observation.persistence = self.node.persistence_observation(self.group);
         observation.polling = false;
         observation.stopped = true;
         observation.failure = result.as_ref().err().map(ToString::to_string);

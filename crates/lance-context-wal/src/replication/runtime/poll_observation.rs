@@ -6,7 +6,8 @@ fn micros(value: Duration) -> u64 {
     value.as_micros().min(u64::MAX as u128) as u64
 }
 
-/// Completed calls to the worker's durable Raft poll, including failures.
+/// Completed durable worker operations, including failures. On the Raft worker
+/// these are polls; in PersistenceObservation::io each is one original Ready write.
 /// Excludes lane queueing, proposal validation, and response delivery. A poll
 /// can process many requests, or no client request; these are not ACK timings.
 #[derive(Clone, Debug, Default, Serialize)]
@@ -39,7 +40,7 @@ pub struct EngineWriteObservation {
 }
 
 impl PollObservation {
-    pub(super) fn record(&mut self, elapsed: Duration, success: bool) {
+    pub(in crate::replication) fn record(&mut self, elapsed: Duration, success: bool) {
         let elapsed = micros(elapsed);
         self.completed = self.completed.saturating_add(1);
         self.elapsed_micros = self.elapsed_micros.saturating_add(elapsed);
