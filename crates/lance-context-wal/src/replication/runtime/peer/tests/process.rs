@@ -12,6 +12,13 @@ use std::{
     time::Instant,
 };
 
+#[cfg(unix)]
+mod listeners;
+#[cfg(unix)]
+type RestartEndpoints = Arc<listeners::Listeners>;
+#[cfg(not(unix))]
+type RestartEndpoints = (SocketAddr, SocketAddr);
+
 #[derive(Serialize, Deserialize)]
 struct Address {
     peer: SocketAddr,
@@ -116,11 +123,15 @@ async fn tls_peer_process_fixture() -> Result<()> {
     let root = PathBuf::from(std::env::var("CONTEXT_TLS_PEER_TEST_ROOT")?);
     let id: u64 = std::env::var("CONTEXT_TLS_PEER_TEST_ID")?.parse()?;
     let address_file = PathBuf::from(std::env::var("CONTEXT_TLS_PEER_TEST_ADDRESS")?);
+    #[cfg(unix)]
+    let (listener, image_listener) = listeners::receive()?;
+    #[cfg(not(unix))]
     let listener = TcpListener::bind(
         std::env::var("CONTEXT_TLS_PEER_BIND").unwrap_or_else(|_| "127.0.0.1:0".into()),
     )
     .await
     .context("bind peer listener")?;
+    #[cfg(not(unix))]
     let image_listener = TcpListener::bind(
         std::env::var("CONTEXT_TLS_IMAGE_BIND").unwrap_or_else(|_| "127.0.0.1:0".into()),
     )
@@ -290,8 +301,21 @@ struct Process {
     image_address: SocketAddr,
     rpc_data: SocketAddr,
     rpc_control: SocketAddr,
+    #[cfg(unix)]
+    endpoints: RestartEndpoints,
 }
 impl Process {
+    fn restart_endpoints(&self) -> RestartEndpoints {
+        #[cfg(unix)]
+        {
+            self.endpoints.clone()
+        }
+        #[cfg(not(unix))]
+        {
+            (self.address, self.image_address)
+        }
+    }
+
     fn spawn(root: &Path, id: u64, incarnation: u64) -> Result<Self> {
         Self::spawn_at(root, id, incarnation, None, None)
     }
@@ -299,11 +323,22 @@ impl Process {
         root: &Path,
         id: u64,
         incarnation: u64,
-        bind: Option<(SocketAddr, SocketAddr)>,
+        bind: Option<RestartEndpoints>,
         pause: Option<&Path>,
     ) -> Result<Self> {
         let address_file = root.join(format!("address-{id}-{incarnation}"));
         let mut command = ProcessCommand::new(std::env::current_exe()?);
+        #[cfg(unix)]
+        let endpoints = match bind {
+            Some(endpoints) => endpoints,
+            None => Arc::new(listeners::Listeners::bind()?),
+        };
+        #[cfg(unix)]
+        let bind = {
+            endpoints.inherit(&mut command);
+            Some(endpoints.addresses()?)
+        };
+        #[cfg(not(unix))]
         if let Some((peer, image)) = bind {
             command
                 .env("CONTEXT_TLS_PEER_BIND", peer.to_string())
@@ -367,6 +402,8 @@ impl Process {
                 image_address: address.image,
                 rpc_data: address.rpc_data,
                 rpc_control: address.rpc_control,
+                #[cfg(unix)]
+                endpoints,
             }),
             Err(e) => {
                 let _ = child.kill();
@@ -604,6 +641,27 @@ fn leader_crash_full_restart(pipeline_replication: bool, async_persistence: bool
 }
 
 #[test]
+#[cfg(unix)]
+fn tls_process_reserves_restart_endpoints_while_child_is_stopped() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let mut original = Process::spawn(root.path(), 1, 1)?;
+    let endpoints = original.restart_endpoints();
+    let addresses = (original.address, original.image_address);
+    original.kill()?;
+    drop(original);
+    // Unrelated parallel tests must not steal either endpoint during downtime.
+    for address in [addresses.0, addresses.1] {
+        let error = std::net::TcpListener::bind(address)
+            .expect_err("stopped peer endpoint was released for reuse");
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+    }
+    let mut restarted = Process::spawn_at(root.path(), 1, 2, Some(endpoints), None)?;
+    assert_eq!((restarted.address, restarted.image_address), addresses);
+    restarted.kill()?;
+    Ok(())
+}
+
+#[test]
 fn tls_snapshot_process_kill_mid_file_preserves_payloads_after_rejoin_and_full_restart(
 ) -> Result<()> {
     snapshot_process_kill_mid_file(false, false)
@@ -641,7 +699,7 @@ fn snapshot_process_kill_mid_file(
     let leader = c.leader(10)?;
     let follower = *c.nodes.keys().rfind(|&&id| id != leader).unwrap();
     let mut stopped = c.nodes.remove(&follower).unwrap();
-    let original_endpoints = (stopped.address, stopped.image_address);
+    let original_endpoints = stopped.restart_endpoints();
     stopped.kill()?;
     let mut expected = Vec::new();
     for sequence in 1..=8 {
@@ -657,7 +715,7 @@ fn snapshot_process_kill_mid_file(
         Reply::Ready
     ));
     let marker = root.join("received-payload-chunk");
-    restart_follower(&mut c, follower, original_endpoints, Some(&marker))?;
+    restart_follower(&mut c, follower, original_endpoints.clone(), Some(&marker))?;
     let deadline = Instant::now() + Duration::from_secs(10);
     while !marker.exists() {
         ensure!(
@@ -744,7 +802,7 @@ fn process_batch(sequence: u64) -> Batch {
 fn restart_follower(
     c: &mut Processes,
     id: u64,
-    endpoints: (SocketAddr, SocketAddr),
+    endpoints: RestartEndpoints,
     pause: Option<&Path>,
 ) -> Result<()> {
     c.incarnation += 1;
