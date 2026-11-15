@@ -15,6 +15,7 @@ use std::{
 const READY_BYTES: usize = 1024 * 1024;
 const READIES: usize = 128;
 const CONTROL_RESERVE: usize = 256 * 1024;
+const WRITE_BATCH: usize = 32;
 
 #[derive(Debug)]
 pub(super) struct PeerPersistenceCapacity;
@@ -43,10 +44,30 @@ enum Written {
     Checkpoint(CheckpointPersisted),
 }
 impl Write {
-    fn persist(self) -> Result<Written> {
+    fn persist(
+        self,
+        queue: &mpsc::Receiver<Write>,
+        held: &mut Option<Write>,
+    ) -> Result<Vec<Written>> {
         match self {
-            Self::Ready(task) => task.persist().map(Written::Ready),
-            Self::Checkpoint(task) => task.persist().map(Written::Checkpoint),
+            Self::Ready(task) => {
+                let mut tasks = vec![task];
+                while tasks.len() < WRITE_BATCH {
+                    match queue.try_recv() {
+                        Ok(Self::Ready(task)) => tasks.push(task),
+                        Ok(checkpoint @ Self::Checkpoint(_)) => {
+                            *held = Some(checkpoint);
+                            break;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                WriteTask::persist_batch(tasks)
+                    .map(|receipts| receipts.into_iter().map(Written::Ready).collect())
+            }
+            Self::Checkpoint(task) => task
+                .persist()
+                .map(|receipt| vec![Written::Checkpoint(receipt)]),
         }
     }
 }
@@ -94,25 +115,34 @@ impl Persistence {
         let writer = thread::Builder::new()
             .name(format!("wal-persist-{group}"))
             .spawn(move || {
-                while let Ok(task) = work.recv() {
+                let mut held = None;
+                while let Some(task) = held.take().or_else(|| work.recv().ok()) {
                     let started = std::time::Instant::now();
-                    let result =
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| task.persist()))
-                            .unwrap_or_else(|_| {
-                                Err(anyhow::anyhow!("native persistence worker panicked"))
-                            });
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        task.persist(&work, &mut held)
+                    }))
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("native persistence worker panicked")));
                     timing
                         .lock()
                         .unwrap()
                         .record(started.elapsed(), result.is_ok());
-                    let failure = result.as_ref().err().map(ToString::to_string);
-                    if done.send(result).is_err() {
-                        break;
-                    }
-                    signal.store(true, Ordering::Release);
-                    owner.unpark();
-                    if let Some(error) = failure {
-                        anyhow::bail!(error);
+                    match result {
+                        Ok(receipts) => {
+                            for receipt in receipts {
+                                if done.send(Ok(receipt)).is_err() {
+                                    return Ok(());
+                                }
+                                signal.store(true, Ordering::Release);
+                                owner.unpark();
+                            }
+                        }
+                        Err(error) => {
+                            let failure = error.to_string();
+                            let _ = done.send(Err(error));
+                            signal.store(true, Ordering::Release);
+                            owner.unpark();
+                            anyhow::bail!(failure);
+                        }
                     }
                 }
                 Ok(())
