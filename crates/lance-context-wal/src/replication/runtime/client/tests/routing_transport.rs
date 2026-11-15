@@ -99,13 +99,15 @@ async fn unavailable_voters_share_the_original_fetch_deadline() -> Result<()> {
     let mut endpoints = c.endpoints.clone();
     let mut unavailable = Vec::new();
     for endpoint in endpoints.values_mut() {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
-        endpoint.data_address = listener.local_addr()?.to_string();
-        unavailable.push(listener);
+        let socket = tokio::net::TcpSocket::new_v4()?;
+        socket.bind("127.0.0.1:0".parse()?)?;
+        endpoint.data_address = socket.local_addr()?.to_string();
+        unavailable.push(socket);
     }
     let deadline = Duration::from_millis(200);
     let client = client(&c, endpoints, deadline)?;
-    drop(unavailable);
+    // Keep each port bound without listening. Dropping a temporary listener
+    // lets another parallel test reuse that endpoint during this request.
     let started = tokio::time::Instant::now();
     let result = timeout(
         Duration::from_secs(2),
@@ -116,12 +118,16 @@ async fn unavailable_voters_share_the_original_fetch_deadline() -> Result<()> {
     )
     .await?;
     let error = result.err().context("unavailable fetch returned success")?;
-    assert!(error.to_string().contains("routed exchange timed out"));
+    assert!(
+        error.to_string().contains("routed exchange timed out"),
+        "unexpected unavailable-voter error: {error:#}"
+    );
     assert!(started.elapsed() >= deadline);
     assert_eq!(
         client.budgets.data.available_permits(),
         client.options.data_bytes
     );
+    drop(unavailable);
     c.shutdown().await
 }
 
@@ -243,25 +249,30 @@ async fn unavailable_voters_share_the_original_query_deadline() -> Result<()> {
     let mut endpoints = c.endpoints.clone();
     let mut unavailable = Vec::new();
     for endpoint in endpoints.values_mut() {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
-        endpoint.control_address = listener.local_addr()?.to_string();
-        unavailable.push(listener);
+        let socket = tokio::net::TcpSocket::new_v4()?;
+        socket.bind("127.0.0.1:0".parse()?)?;
+        endpoint.control_address = socket.local_addr()?.to_string();
+        unavailable.push(socket);
     }
     let deadline = Duration::from_millis(200);
     let client = client(&c, endpoints, deadline)?;
-    drop(unavailable);
+    // A bound non-listening socket refuses connections while reserving its port.
     let started = tokio::time::Instant::now();
     let result = timeout(Duration::from_secs(2), client.request_routed(query())).await?;
     let error = result
         .err()
         .context("unavailable quorum returned success")?;
-    assert!(error.to_string().contains("routed exchange timed out"));
+    assert!(
+        error.to_string().contains("routed exchange timed out"),
+        "unexpected unavailable-voter error: {error:#}"
+    );
     assert!(started.elapsed() >= deadline);
     assert_eq!(
         client.budgets.control.available_permits(),
         client.options.control_bytes
     );
-    Ok(())
+    drop(unavailable);
+    c.shutdown().await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
