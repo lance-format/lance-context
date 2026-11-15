@@ -139,6 +139,58 @@ impl CheckpointWrite {
 }
 
 impl WriteTask {
+    /// Coalesce already queued, consecutive writes from one owner. Payload
+    /// Bytes are moved, never decoded or copied. A suffix replacement starts
+    /// another native write, preserving its original validation boundary.
+    /// No receipt is released unless every original write in the batch succeeds.
+    pub(crate) fn persist_batch(tasks: Vec<Self>) -> Result<Vec<Persisted>> {
+        for pair in tasks.windows(2) {
+            ensure!(
+                Arc::ptr_eq(&pair[0].writer, &pair[1].writer) && pair[1].previous == pair[0].number,
+                "nonconsecutive buffered write batch"
+            );
+        }
+        let mut tasks = tasks.into_iter();
+        let Some(mut current) = tasks.next() else {
+            return Ok(Vec::new());
+        };
+        let mut numbers = vec![current.number];
+        let mut receipts = Vec::new();
+        for mut next in tasks {
+            let adjacent = current
+                .entries
+                .last()
+                .zip(next.entries.first())
+                .is_none_or(|(last, first)| last.index.checked_add(1) == Some(first.index));
+            if !adjacent {
+                Self::finish_batch(current, &mut numbers, &mut receipts)?;
+                current = next;
+            } else {
+                current.entries.append(&mut next.entries);
+                if next.hard.is_some() {
+                    current.hard = next.hard;
+                }
+                current.number = next.number;
+            }
+            numbers.push(current.number);
+        }
+        Self::finish_batch(current, &mut numbers, &mut receipts)?;
+        Ok(receipts)
+    }
+
+    fn finish_batch(
+        task: Self,
+        numbers: &mut Vec<u64>,
+        receipts: &mut Vec<Persisted>,
+    ) -> Result<()> {
+        let persisted = task.persist()?;
+        receipts.extend(numbers.drain(..).map(|number| Persisted {
+            writer: persisted.writer.clone(),
+            number,
+        }));
+        Ok(())
+    }
+
     pub fn number(&self) -> u64 {
         self.number
     }

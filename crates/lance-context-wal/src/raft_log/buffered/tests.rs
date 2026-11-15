@@ -47,6 +47,48 @@ fn read(store: &impl Storage, low: u64, high: u64) -> raft::Result<Vec<Entry>> {
 }
 
 #[test]
+fn queued_readies_share_one_sync_and_keep_original_receipts() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let physical = PhysicalLog::open(directory.path(), &layout(), 1)?;
+    let log = physical.group(10)?;
+    let mut buffered = view(log.clone())?;
+    let mut tasks = Vec::new();
+    for number in 1..=4 {
+        tasks.push(buffered.stage(
+            number,
+            vec![entry(number, 1, number as u8)],
+            Some(hard(1, number)),
+        )?);
+    }
+    let before = log.node.fault.sync_calls_for_test();
+    let receipts = WriteTask::persist_batch(tasks)?;
+    let syncs = log.node.fault.sync_calls_for_test() - before;
+    assert_eq!(receipts.len(), 4);
+    assert_eq!(buffered.durable_hard_state()?.commit, 0);
+    for (offset, receipt) in receipts.into_iter().enumerate() {
+        let number = offset as u64 + 1;
+        assert_eq!(buffered.complete(receipt)?, number);
+        assert_eq!(buffered.durable_hard_state()?.commit, number);
+        assert_eq!(buffered.usage().readies, 4 - number as usize);
+    }
+    assert_eq!(buffered.usage(), Usage::default());
+    drop(buffered.into_durable()?);
+    drop(log);
+    drop(physical);
+    let reopened = PhysicalLog::open(directory.path(), &layout(), 1)?.group(10)?;
+    assert_eq!(reopened.initial_state()?.hard_state.commit, 4);
+    assert_eq!(
+        read(&reopened, 1, 5)?,
+        (1..=4).map(|i| entry(i, 1, i as u8)).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        syncs, 1,
+        "already queued adjacent Ready writes should share one native sync"
+    );
+    Ok(())
+}
+
+#[test]
 fn older_completion_keeps_newer_overlapping_suffix_and_durable_boundary() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let physical = PhysicalLog::open(directory.path(), &layout(), 1)?;
@@ -85,6 +127,94 @@ fn older_completion_keeps_newer_overlapping_suffix_and_durable_boundary() -> Res
         read(&reopened, 1, 4)?,
         vec![entry(1, 1, 1), entry(2, 1, 2), entry(3, 2, 9)]
     );
+    Ok(())
+}
+
+#[test]
+fn queued_suffix_replacement_keeps_each_native_write_boundary() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let physical = PhysicalLog::open(directory.path(), &layout(), 1)?;
+    let log = physical.group(10)?;
+    log.persist(&[entry(1, 1, 1)], Some(&hard(1, 1)))?;
+    let mut buffered = view(log.clone())?;
+    let first = buffered.stage(10, vec![entry(2, 1, 2), entry(3, 1, 3)], Some(hard(1, 1)))?;
+    let newer = entry(2, 2, 9);
+    let pointer = newer.data.as_ptr();
+    let second = buffered.stage(11, vec![newer.clone()], Some(hard(2, 2)))?;
+    let before = log.node.fault.sync_calls_for_test();
+    let mut receipts = WriteTask::persist_batch(vec![first, second])?.into_iter();
+    assert_eq!(log.node.fault.sync_calls_for_test() - before, 2);
+    assert_eq!(buffered.complete(receipts.next().unwrap())?, 10);
+    let visible = read(&buffered, 2, 3)?;
+    assert_eq!(visible, vec![newer.clone()]);
+    assert_eq!(visible[0].data.as_ptr(), pointer);
+    assert_eq!(buffered.durable_hard_state()?.commit, 1);
+    assert_eq!(buffered.complete(receipts.next().unwrap())?, 11);
+    assert!(receipts.next().is_none());
+    assert_eq!(buffered.usage(), Usage::default());
+    drop(buffered.into_durable()?);
+    drop(log);
+    drop(physical);
+    let reopened = PhysicalLog::open(directory.path(), &layout(), 1)?.group(10)?;
+    assert_eq!(reopened.initial_state()?.hard_state, hard(2, 2));
+    assert_eq!(read(&reopened, 1, 3)?, vec![entry(1, 1, 1), newer]);
+    Ok(())
+}
+
+#[test]
+fn queued_readies_release_no_receipt_before_the_shared_sync() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let log = PhysicalLog::open(directory.path(), &layout(), 1)?.group(10)?;
+    let mut buffered = view(log.clone())?;
+    let mut tasks = Vec::new();
+    for number in 1..=4 {
+        tasks.push(buffered.stage(
+            number,
+            vec![entry(number, 1, number as u8)],
+            Some(hard(1, number)),
+        )?);
+    }
+    let gate = log.block_sync_for_test();
+    let writer = thread::spawn(move || WriteTask::persist_batch(tasks));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while log.appended_index_for_test() != Some(4) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(1));
+    }
+    let appended = log.appended_index_for_test();
+    let escaped = writer.is_finished();
+    let durable_before = buffered.durable_hard_state()?.commit;
+    // Always release and join the original native operation before assertions.
+    drop(gate);
+    let receipts = writer.join().unwrap()?;
+    assert_eq!(appended, Some(4));
+    assert!(!escaped, "batch receipts escaped the original sync");
+    assert_eq!(durable_before, 0);
+    for receipt in receipts {
+        buffered.complete(receipt)?;
+    }
+    assert_eq!(buffered.durable_hard_state()?.commit, 4);
+    assert_eq!(buffered.usage(), Usage::default());
+    Ok(())
+}
+
+#[test]
+fn queued_readies_release_no_receipt_after_sync_failure() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let log = PhysicalLog::open(directory.path(), &layout(), 1)?.group(10)?;
+    let mut buffered = view(log.clone())?;
+    let mut tasks = Vec::new();
+    for number in 1..=4 {
+        tasks.push(buffered.stage(
+            number,
+            vec![entry(number, 1, number as u8)],
+            Some(hard(1, number)),
+        )?);
+    }
+    log.fail_next_sync_for_test();
+    assert!(WriteTask::persist_batch(tasks).is_err());
+    assert_eq!(buffered.usage().readies, 4);
+    assert!(buffered.durable_hard_state().is_err());
+    assert!(log.initial_state().is_err());
     Ok(())
 }
 

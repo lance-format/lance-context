@@ -27,6 +27,11 @@ pub(super) struct FaultControl {
 }
 
 impl FaultControl {
+    #[cfg(feature = "runtime")]
+    pub(super) fn sync_calls_for_test(&self) -> u64 {
+        self.sync_calls.load(Ordering::Relaxed)
+    }
+
     pub(super) fn observe_allocated_peak_for_test(&self, directory: &Path) -> Arc<AtomicU64> {
         let peak = Arc::new(AtomicU64::new(0));
         *self.allocated_peak.lock().unwrap() = Some((directory.to_owned(), peak.clone()));

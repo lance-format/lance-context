@@ -36,6 +36,17 @@ status, application, persisted messages and client acknowledgments. Pending log
 payloads share buffers with their write tasks. This does not change the physical
 WAL format or eliminate decoding when application reads the persisted log.
 
+The native writer coalesces at most 32 Ready tasks already waiting in its queue.
+It does not wait for more work to arrive. Adjacent entries and their final
+HardState share one append/sync; their payload buffers are moved without decoding
+or copying the bodies. A suffix replacement begins a separate native write, and
+checkpoint tasks remain ordered barriers. Every original Ready keeps its own
+receipt and application boundary, released only after the batch succeeds. A
+failed write releases no successful receipt from that batch and stops the runtime.
+The existing pending window still accounts for every original task until its
+receipt is consumed. Native `io` timing counts writer batches; it is not an
+append request count. The synchronous runtime and persisted format are unchanged.
+
 The per-group pending window bounds Ready records, entries and their encoded
 bytes/descriptors, including deferred application and message ownership. Its
 byte limit derives from the configured data, peer and control byte budgets;
