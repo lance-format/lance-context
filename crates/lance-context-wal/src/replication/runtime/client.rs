@@ -923,7 +923,14 @@ impl Client {
                     ) {
                         let next = voters[(voters.iter().position(|id| *id == node).unwrap() + 1)
                             % voters.len()];
-                        self.leaders.lock().unwrap().insert(group, next);
+                        // An unknown mutation result can come from admission
+                        // pressure on the current leader. It says nothing about
+                        // leadership; keep the hint so the next independent
+                        // append does not send its body through a follower.
+                        // The original mutation still returns without replay.
+                        if !matches!(&request, Request::Append { .. } | Request::Commit(_)) {
+                            self.leaders.lock().unwrap().insert(group, next);
+                        }
                         if matches!(&request, Request::Query { .. } | Request::ReadSource { .. })
                             && matches!(
                                 response.reply,

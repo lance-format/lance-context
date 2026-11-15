@@ -15,6 +15,7 @@ mod observation;
 mod publication_window;
 mod reconnect;
 mod routing;
+mod routing_hint;
 mod routing_transport;
 mod source_read;
 
