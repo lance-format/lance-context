@@ -16,6 +16,15 @@ const READY_BYTES: usize = 1024 * 1024;
 const READIES: usize = 128;
 const CONTROL_RESERVE: usize = 256 * 1024;
 
+#[derive(Debug)]
+pub(super) struct PeerPersistenceCapacity;
+impl std::fmt::Display for PeerPersistenceCapacity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("pending persistence capacity")
+    }
+}
+impl std::error::Error for PeerPersistenceCapacity {}
+
 struct Deferred {
     number: u64,
     messages: Vec<Message>,
@@ -140,6 +149,24 @@ impl Drop for Persistence {
 }
 
 impl Group {
+    /// A heartbeat in the follower's already durable term carries no new log
+    /// payload or vote. Let Raft refresh its election timer even when a local
+    /// checkpoint or the bounded persistence window holds ordinary admission.
+    pub(super) fn accepts_durable_term_heartbeat(&self, message: &Message) -> Result<bool> {
+        if self.raw.raft.state != StateRole::Follower
+            || message.get_msg_type() != MessageType::MsgHeartbeat
+            || message.term != self.raw.raft.term
+            || message.from != self.raw.raft.leader_id
+            || !message.entries.is_empty()
+        {
+            return Ok(false);
+        }
+        let LogView::Buffered(log) = self.raw.store() else {
+            return Ok(false);
+        };
+        Ok(log.durable_hard_state()?.term == message.term)
+    }
+
     // Stop collecting new Ready records while the original pending writes
     // drain. The owner must keep polling and ticking; its existing safe-message
     // path still sends leader heartbeats without advancing durability.
@@ -360,6 +387,33 @@ impl Group {
             self.persistence.as_mut().unwrap().delivered_apply = self.state.applied;
             let window = self.persistence.as_ref().unwrap().window;
             self.raw.mut_store().buffered(window)?;
+        }
+        if self.raw.raft.state == StateRole::Follower {
+            let LogView::Buffered(log) = self.raw.store() else {
+                unreachable!()
+            };
+            let durable = log.durable_hard_state()?;
+            let (durable_term, durable_commit) = (durable.term, durable.commit);
+            if durable_term == self.raw.raft.term {
+                // Heartbeat responses do not advance the peer's matched index.
+                // Bound their advisory commit field by our durable boundary,
+                // and echo the read context without waiting for native writes. Term
+                // changes, votes, Append responses, read results and apply
+                // still use their original persisted Ready boundaries.
+                // Incoming peer credits cover these messages until the runtime
+                // transfers them to its bounded outbound queue in this poll.
+                self.raw.raft.msgs.retain_mut(|message| {
+                    if message.get_msg_type() == MessageType::MsgHeartbeatResponse
+                        && message.term == durable_term
+                    {
+                        message.commit = message.commit.min(durable_commit);
+                        outbound.push(std::mem::take(message));
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
         }
         if self.raw.raft.state == StateRole::Leader && !self.accepts_async(&[])? {
             // RawNode::ready classifies a leader's outbound messages as safe

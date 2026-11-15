@@ -83,6 +83,8 @@ async fn worker_reports_disk_refusal_separately_and_keeps_decision_after_reclaim
     let historical = handle.peer_rejections();
     assert_eq!(historical.disk_budget, 1);
     assert_eq!(historical.other, 1);
+    assert_eq!(historical.pending_persistence, 0);
+    assert_eq!(historical.pending_heartbeats, 0);
     assert_eq!(
         serde_json::to_value(&historical.last_disk_refusal)?,
         serde_json::to_value(&observed.last_disk_refusal)?

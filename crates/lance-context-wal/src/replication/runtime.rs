@@ -965,12 +965,13 @@ impl Worker {
                 }
                 if let Ok(peer) = self.peers.try_recv() {
                     let from = peer.packet.message.from;
+                    let kind = peer.packet.message.get_msg_type();
                     if let Err(error) = self.node.step(peer.packet) {
                         self.shared
                             .peer_rejections
                             .lock()
                             .unwrap()
-                            .record(self.group, from, &error);
+                            .record(self.group, from, kind, &error);
                         self.shared
                             .rejected_incoming
                             .fetch_add(1, Ordering::Relaxed);
