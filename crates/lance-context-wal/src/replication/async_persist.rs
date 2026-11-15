@@ -1,6 +1,8 @@
 //! Ordered bounded native I/O for the actual Node driver.
 use super::*;
-use crate::raft_log::buffered::{Persisted, Window, WriteTask};
+use crate::raft_log::buffered::{
+    CheckpointPersisted, CheckpointWrite, Persisted, Window, WriteTask,
+};
 use std::{
     collections::VecDeque,
     sync::{
@@ -23,10 +25,27 @@ struct Deferred {
     _reservations: Vec<crate::admission::Reservation>,
 }
 
+enum Write {
+    Ready(WriteTask),
+    Checkpoint(CheckpointWrite),
+}
+enum Written {
+    Ready(Persisted),
+    Checkpoint(CheckpointPersisted),
+}
+impl Write {
+    fn persist(self) -> Result<Written> {
+        match self {
+            Self::Ready(task) => task.persist().map(Written::Ready),
+            Self::Checkpoint(task) => task.persist().map(Written::Checkpoint),
+        }
+    }
+}
+
 pub(super) struct Persistence {
     window: Window,
-    tx: Option<mpsc::SyncSender<WriteTask>>,
-    rx: mpsc::Receiver<Result<Persisted>>,
+    tx: Option<mpsc::SyncSender<Write>>,
+    rx: mpsc::Receiver<Result<Written>>,
     writer: Option<JoinHandle<Result<()>>>,
     notified: Arc<AtomicBool>,
     pending: VecDeque<Deferred>,
@@ -56,7 +75,7 @@ pub(super) fn window(options: &runtime::Options, limits: &Limits) -> Result<Wind
 
 impl Persistence {
     fn new(group: u64, window: Window, applied: u64) -> Result<Self> {
-        let (tx, work) = mpsc::sync_channel::<WriteTask>(window.readies);
+        let (tx, work) = mpsc::sync_channel::<Write>(window.readies);
         let (done, rx) = mpsc::sync_channel(window.readies);
         let notified = Arc::new(AtomicBool::new(false));
         let signal = notified.clone();
@@ -189,6 +208,54 @@ impl Group {
         self.persistence
             .as_ref()
             .is_none_or(|p| p.pending.is_empty())
+            && !matches!(self.raw.store(), LogView::Buffered(log) if log.checkpoint_pending())
+    }
+
+    pub(super) fn start_checkpoint_write(
+        &mut self,
+        snapshot: raft_proto::eraftpb::Snapshot,
+        retained_bytes: u64,
+    ) -> Result<()> {
+        ensure!(self.persistence_idle(), "checkpoint writer is not drained");
+        let persistence = self
+            .persistence
+            .as_ref()
+            .context("missing persistence owner")?;
+        let task = self
+            .raw
+            .mut_store()
+            .buffered(persistence.window)?
+            .stage_checkpoint(snapshot, retained_bytes)?;
+        persistence
+            .tx
+            .as_ref()
+            .context("native writer stopped")?
+            .try_send(Write::Checkpoint(task))
+            .map_err(|_| anyhow::anyhow!("native checkpoint queue unavailable"))
+    }
+
+    fn finish_io(
+        &mut self,
+        id: u64,
+        limits: &Limits,
+        receipt: Written,
+        events: &mut Events,
+        outbound: &mut Vec<Message>,
+    ) -> Result<()> {
+        match receipt {
+            Written::Ready(receipt) => self.finish_write(id, limits, receipt, events, outbound),
+            Written::Checkpoint(receipt) => {
+                let window = self
+                    .persistence
+                    .as_ref()
+                    .context("missing persistence owner")?
+                    .window;
+                self.raw
+                    .mut_store()
+                    .buffered(window)?
+                    .complete_checkpoint(receipt)
+            }
+        }
     }
 
     fn finish_write(
@@ -240,7 +307,7 @@ impl Group {
                 .rx
                 .recv()
                 .context("native writer disconnected")??;
-            self.finish_write(id, limits, result, &mut events, &mut messages)?;
+            self.finish_io(id, limits, result, &mut events, &mut messages)?;
         }
         self.deferred_completions.extend(events.completions);
         self.deferred_messages.extend(messages);
@@ -262,7 +329,7 @@ impl Group {
                     anyhow::bail!("native writer disconnected")
                 }
             };
-            self.finish_write(id, limits, result, events, outbound)?;
+            self.finish_io(id, limits, result, events, outbound)?;
         }
         let persistence = self.persistence.as_ref().unwrap();
         self.raw.mut_store().buffered(persistence.window)?;
@@ -358,7 +425,7 @@ impl Group {
                 .tx
                 .as_ref()
                 .context("native writer stopped")?
-                .try_send(task)
+                .try_send(Write::Ready(task))
                 .map_err(|_| anyhow::anyhow!("native writer queue unavailable"))?;
         }
         Ok(())
@@ -386,6 +453,7 @@ impl Node {
         };
         Some(runtime::PersistenceObservation {
             pending_readies: usage.readies,
+            pending_checkpoint: matches!(group.raw.store(), LogView::Buffered(log) if log.checkpoint_pending()),
             pending_entries: usage.entries,
             pending_bytes: usage.bytes,
             deferred_bytes: persistence.deferred_bytes,

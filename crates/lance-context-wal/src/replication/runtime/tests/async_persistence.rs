@@ -1,5 +1,8 @@
 use super::*;
 
+#[cfg(unix)]
+mod checkpoint_crash;
+
 fn executor() -> Result<tokio::runtime::Runtime> {
     Ok(tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -736,11 +739,14 @@ fn async_persistence_checkpoint_metadata_sync_keeps_leader_and_reads_live() -> R
         // rather than merely a pending Ready preceding its installation.
         wait_for(|| store.appended_checkpoint_for_test().ok().flatten() == Some(first)).await?;
         let read = c.handles[&1].local(10, move |node| node.read_accepted(10, first))?;
+        let append = c.handles[&1].commit(Command::Append { group: 10, batch: batch(2) })?;
+        wait_for(|| c.handles[&1].observation(10).is_ok_and(|o| o.status.pending == 1)).await?;
         let deadline = Instant::now() + Duration::from_millis(2500);
         let mut maximum_staleness = Duration::ZERO;
         let mut first_leader_change = None;
         while Instant::now() < deadline {
             ensure!(checkpoint.0.is_empty(), "checkpoint ACK preceded its metadata sync");
+            ensure!(append.0.is_empty(), "suffix ACK preceded checkpoint metadata sync");
             for (id, handle) in c.handles.iter() {
                 let view = handle.observation(10)?;
                 maximum_staleness = maximum_staleness.max(view.observed_at.elapsed());
@@ -758,17 +764,198 @@ fn async_persistence_checkpoint_metadata_sync_keeps_leader_and_reads_live() -> R
         ensure!(first_leader_change.is_none(), "checkpoint metadata sync changed leader visibility");
         ensure!(!read.0.is_empty(), "stable-prefix read waited for checkpoint metadata sync");
         ensure!(read.await? == Some(batch(1)));
+        Ok::<_, anyhow::Error>((checkpoint, append))
+    });
+    drop(gate);
+    let verified = executor.block_on(async {
+        let (checkpoint, append) = waiting?;
+        timeout(Duration::from_secs(10), checkpoint).await??;
+        let index = index(timeout(Duration::from_secs(10), append).await??);
+        wait_for(|| {
+            c.handles
+                .values()
+                .all(|h| h.observation(10).is_ok_and(|o| o.status.applied >= index))
+        })
+        .await?;
+        ensure!(c.handles[&1].observation(10)?.checkpoint_index == first);
+        Ok::<_, anyhow::Error>(index)
+    });
+    let stopped = executor.block_on(c.shutdown());
+    drop(store);
+    stopped?;
+    reopen(root.path(), &[(first, 1), (verified?, 2)])
+}
+
+#[test]
+fn async_persistence_checkpoint_full_queue_shutdown_joins_original_metadata_write() -> Result<()> {
+    checkpoint_metadata_interrupted(false)
+}
+
+#[test]
+fn async_persistence_checkpoint_metadata_failure_fences_queued_suffix() -> Result<()> {
+    checkpoint_metadata_interrupted(true)
+}
+
+fn checkpoint_metadata_interrupted(fail_sync: bool) -> Result<()> {
+    let executor = executor()?;
+    let root = tempfile::tempdir()?;
+    let (c, first) = executor.block_on(seeded(root.path()))?;
+    let handle = c.handles[&1].clone();
+    let prepared = executor.block_on(async {
+        let task = handle.prepare_checkpoint(10, uuid::Uuid::new_v4())?.await?;
+        tokio::task::spawn_blocking(move || task.run()).await?
+    })?;
+    let store = executor.block_on(handle.local(10, |node| {
+        Ok(node.groups[&10].raw.store().durable_log().clone())
+    })?)?;
+    let gate = store.block_sync_for_test();
+    let held = executor.block_on(async {
+        let checkpoint = handle.install_checkpoint(prepared)?;
+        wait_for(|| store.appended_checkpoint_for_test().ok().flatten() == Some(first)).await?;
+        let mut requests = Vec::new();
+        for offset in 0..128 {
+            let mut input = batch(offset + 2);
+            input.meta.producer = uuid::Uuid::from_u128(1000 + u128::from(offset));
+            input.meta.sequence = 1;
+            requests.push(handle.commit(Command::Append {
+                group: 10,
+                batch: input,
+            })?);
+            wait_for(|| {
+                handle
+                    .observation(10)
+                    .is_ok_and(|o| o.status.pending >= requests.len())
+                    || requests.last().is_some_and(|request| !request.0.is_empty())
+            })
+            .await?;
+            if let Some(request) = requests.pop_if(|request| !request.0.is_empty()) {
+                ensure!(
+                    request.await.is_err(),
+                    "checkpoint-blocked write completed successfully"
+                );
+            }
+            let io = handle
+                .observation(10)?
+                .persistence
+                .context("missing persistence")?;
+            ensure!(io.pending_checkpoint && io.pending_readies < 128);
+            if io.pending_readies == 127 {
+                break;
+            }
+        }
+        let io = handle.observation(10)?.persistence.unwrap();
+        ensure!(
+            io.pending_checkpoint && io.pending_readies == 127,
+            "did not fill original native queue"
+        );
+        ensure!(checkpoint.0.is_empty() && requests.iter().all(|request| request.0.is_empty()));
+        let read = timeout(
+            Duration::from_millis(500),
+            handle.local(10, move |node| node.read_accepted(10, first))?,
+        )
+        .await??;
+        ensure!(
+            read == Some(batch(1)),
+            "full native queue lost readable checkpoint prefix"
+        );
+        ensure!(handle.admission().control.used_requests == 1);
+        if fail_sync {
+            store.fail_next_sync_for_test();
+        } else {
+            for runtime in &c.runtimes {
+                runtime.stop();
+            }
+        }
+        Ok::<_, anyhow::Error>((checkpoint, requests))
+    });
+    drop(gate);
+    let observed_failure = if fail_sync && held.is_ok() {
+        executor.block_on(wait_for(|| handle.observation(10).is_ok_and(|o| o.stopped)))
+    } else {
+        Ok(())
+    };
+    // Joining would deadlock if the checkpoint were allowed to overfill the
+    // original completion queue alongside 128 Ready tasks during shutdown.
+    let stopped = executor.block_on(async { timeout(Duration::from_secs(10), c.shutdown()).await });
+    let verified = executor.block_on(async {
+        let (checkpoint, requests) = held?;
+        ensure!(timeout(Duration::from_secs(5), checkpoint).await?.is_err());
+        for request in requests {
+            let result = timeout(Duration::from_secs(5), request).await?;
+            ensure!(result.is_err() || matches!(result, Ok(Outcome::Unknown)));
+        }
+        ensure!(
+            handle.admission().data.used_requests == 0
+                && handle.admission().control.used_requests == 0
+        );
+        Ok::<_, anyhow::Error>(())
+    });
+    drop(store);
+    observed_failure?;
+    verified?;
+    if fail_sync {
+        ensure!(stopped?.is_err(), "shutdown hid checkpoint sync failure");
+    } else {
+        stopped??;
+    }
+    reopen(root.path(), &[(first, 1)])
+}
+
+#[test]
+fn async_persistence_checkpoint_transfers_readable_image_before_metadata_receipt() -> Result<()> {
+    let executor = executor()?;
+    let root = tempfile::tempdir()?;
+    let (c, first) = executor.block_on(seeded(root.path()))?;
+    c.isolated.store(3, Ordering::Release);
+    let second = executor.block_on(commit(&c.handles[&1], 10, batch(2)))?;
+    let prepared = executor.block_on(async {
+        let task = c.handles[&1]
+            .prepare_checkpoint(10, uuid::Uuid::new_v4())?
+            .await?;
+        tokio::task::spawn_blocking(move || task.run()).await?
+    })?;
+    let store = executor.block_on(c.handles[&1].local(10, |node| {
+        Ok(node.groups[&10].raw.store().durable_log().clone())
+    })?)?;
+    let gate = store.block_sync_for_test();
+    let held = executor.block_on(async {
+        let checkpoint = c.handles[&1].install_checkpoint(prepared)?;
+        wait_for(|| store.appended_checkpoint_for_test().ok().flatten() == Some(second)).await?;
+        ensure!(c.handles[&3].observation(10)?.status.applied < second);
+        c.isolated.store(0, Ordering::Release);
+        wait_for(|| {
+            c.snapshot_transfers.load(Ordering::Acquire) > 0
+                && c.handles[&3]
+                    .observation(10)
+                    .is_ok_and(|o| o.status.applied >= second)
+        })
+        .await?;
+        // The sender's descriptor has not synced, but its image contains only
+        // previously acknowledged state. The receiver syncs its own descriptor.
+        ensure!(checkpoint.0.is_empty());
+        ensure!(c.handles[&1].observation(10)?.checkpoint_index < second);
+        for (index, sequence) in [(first, 1), (second, 2)] {
+            let value = timeout(
+                Duration::from_millis(500),
+                c.handles[&3].local(10, move |node| node.read_accepted(10, index))?,
+            )
+            .await??;
+            ensure!(
+                value == Some(batch(sequence)),
+                "transferred image lost payload"
+            );
+        }
         Ok::<_, anyhow::Error>(checkpoint)
     });
     drop(gate);
     let verified = executor.block_on(async {
-        timeout(Duration::from_secs(10), waiting?).await??;
-        ensure!(c.handles[&1].observation(10)?.checkpoint_index == first);
+        timeout(Duration::from_secs(10), held?).await??;
+        ensure!(commit(&c.handles[&1], 10, batch(2)).await? == second);
         Ok::<_, anyhow::Error>(())
     });
     let stopped = executor.block_on(c.shutdown());
     drop(store);
     stopped?;
     verified?;
-    reopen(root.path(), &[(first, 1)])
+    reopen(root.path(), &[(first, 1), (second, 2)])
 }

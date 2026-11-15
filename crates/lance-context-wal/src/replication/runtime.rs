@@ -363,6 +363,7 @@ pub struct Observation {
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct PersistenceObservation {
     pub pending_readies: usize,
+    pub pending_checkpoint: bool,
     pub pending_entries: usize,
     pub pending_bytes: usize,
     pub deferred_bytes: usize,
@@ -991,7 +992,7 @@ impl Worker {
                 next_tick = Instant::now() + self.options.tick_interval;
                 activity = true;
             }
-            activity |= self.install_drained_checkpoint(&mut after_poll);
+            activity |= self.install_drained_checkpoint(&mut after_poll)?;
             if activity {
                 self.observation.lock().unwrap().polling = true;
                 let poll_started = Instant::now();
