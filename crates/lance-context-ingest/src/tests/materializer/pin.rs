@@ -10,6 +10,7 @@ enum Case {
     CommittedFenced,
     AbsentFenced,
     PersistentUnknown,
+    PersistentFenced,
     Unobservable,
 }
 
@@ -69,7 +70,7 @@ async fn exercise(case: Case) -> Result<()> {
                 .await?;
         }
     }
-    let operation = tokio::spawn(async move {
+    let mut operation = tokio::spawn(async move {
         let result = publisher.prepare_next().await;
         (publisher, result)
     });
@@ -80,28 +81,52 @@ async fn exercise(case: Case) -> Result<()> {
         let successor = super::publisher(&ingress, &storage, &budget, authority.epoch).await?;
         assert_ne!(successor.authority(), &authority);
     }
-    if matches!(case, Case::PersistentUnknown) {
+    if matches!(case, Case::PersistentUnknown | Case::PersistentFenced) {
         proxy.unknown_pins.store(true, Ordering::SeqCst);
     }
     proxy.release.notify_one();
+    if matches!(case, Case::PersistentUnknown | Case::PersistentFenced) {
+        tokio::select! {
+            result = &mut operation => {
+                let (_, result) = result?;
+                bail!("uncertain Pin ended publication: {result:?}");
+            },
+            result = tokio::time::timeout(Duration::from_secs(5), async {
+                while proxy.pin_requests.lock().unwrap().len() < 3 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }) => result?,
+        }
+        if matches!(case, Case::PersistentFenced) {
+            cluster.client = direct.clone();
+            let ingress = connect(&cluster, binding()).await?;
+            let successor = super::publisher(&ingress, &storage, &budget, authority.epoch).await?;
+            assert_ne!(successor.authority(), &authority);
+        } else {
+            proxy.unknown_pins.store(false, Ordering::SeqCst);
+        }
+    }
     let (publisher, result) = tokio::time::timeout(Duration::from_secs(45), operation).await??;
     if matches!(case, Case::Unobservable) {
         proxy.restore_observations();
     }
     assert_eq!(
         result.is_ok(),
-        matches!(case, Case::Committed | Case::Absent),
+        matches!(
+            case,
+            Case::Committed | Case::Absent | Case::PersistentUnknown
+        ),
         "{result:?}"
     );
     let requests = proxy.pin_requests.lock().unwrap().clone();
-    assert_eq!(
-        requests.len(),
-        if matches!(case, Case::Absent | Case::PersistentUnknown) {
-            2
-        } else {
-            1
-        }
-    );
+    if matches!(case, Case::PersistentUnknown | Case::PersistentFenced) {
+        assert!(requests.len() >= 3);
+    } else {
+        assert_eq!(
+            requests.len(),
+            if matches!(case, Case::Absent) { 2 } else { 1 }
+        );
+    }
     assert!(
         requests.iter().all(|request| request == &requests[0]),
         "original pin command changed"
@@ -122,7 +147,7 @@ async fn exercise(case: Case) -> Result<()> {
     else {
         bail!("missing source observation");
     };
-    if matches!(case, Case::AbsentFenced | Case::PersistentUnknown) {
+    if matches!(case, Case::AbsentFenced | Case::PersistentFenced) {
         assert!(pin.is_none());
     } else {
         let pin = pin.context("original pin missing")?;
@@ -137,7 +162,10 @@ async fn exercise(case: Case) -> Result<()> {
             "duplicate pin did not preserve the first durable result"
         );
     }
-    if matches!(case, Case::Committed | Case::Absent) {
+    if matches!(
+        case,
+        Case::Committed | Case::Absent | Case::PersistentUnknown
+    ) {
         assert!(result?.is_some());
         assert!(publisher.commit_pending().await?.is_some());
         assert!(publisher.finish_pending().await?.is_some());
@@ -165,8 +193,12 @@ async fn absent_pin_is_not_resubmitted_after_owner_fencing() -> Result<()> {
     exercise(Case::AbsentFenced).await
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn repeatedly_unknown_pin_stops_after_one_exact_resubmission() -> Result<()> {
+async fn repeatedly_unknown_pin_retains_selection_and_eventually_publishes() -> Result<()> {
     exercise(Case::PersistentUnknown).await
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn repeatedly_unknown_pin_stops_after_owner_fencing() -> Result<()> {
+    exercise(Case::PersistentFenced).await
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unavailable_pin_observation_preserves_failure() -> Result<()> {

@@ -307,8 +307,9 @@ impl Runtime {
     }
 
     /// Publication/protocol failures stop this owner and its read barriers.
-    /// A structured uncertain Confirm holds its frozen batch while resolving
-    /// the exact selected publication; bounded apply and point reads stay live.
+    /// A structured uncertain Pin or Confirm holds its frozen batch while
+    /// resolving that exact selected operation; bounded apply and point reads
+    /// stay live under their existing budgets.
     /// An I/O failure writing an uncommitted body pauses publication while the
     /// bounded applier and owned point reads remain live. It does not retry the
     /// upload. A fenced restart reconciles the retained plan and replays its cut.
