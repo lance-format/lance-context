@@ -1166,7 +1166,7 @@ mod tests {
         {
             assert_eq!(reader.get_blob(&id).await.unwrap(), Some(vec![42; 4096]));
         }
-        for store in writers {
+        for mut store in writers {
             store.close().await.unwrap();
         }
     }
