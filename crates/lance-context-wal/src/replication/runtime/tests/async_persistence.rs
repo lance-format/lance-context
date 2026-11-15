@@ -3,6 +3,8 @@ use super::*;
 #[cfg(unix)]
 mod checkpoint_crash;
 
+mod follower_checkpoint;
+
 fn executor() -> Result<tokio::runtime::Runtime> {
     Ok(tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)

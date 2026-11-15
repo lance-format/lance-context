@@ -887,8 +887,9 @@ impl Node {
                 && message.term == group.raw.raft.term
                 && message.get_msg_type() == MessageType::MsgHeartbeatResponse
                 && message.entries.is_empty())
+                || group.accepts_durable_term_heartbeat(&message)?
                 || group.accepts_async(&message.entries)?,
-            "pending persistence capacity"
+            async_persist::PeerPersistenceCapacity
         );
         let reservation = if message.get_msg_type() == MessageType::MsgAppend
             && message.term >= group.raw.raft.term
