@@ -7,6 +7,7 @@ use uuid::Uuid;
 mod checkpoint_hints;
 mod checkpoint_pressure;
 mod checkpoint_reclamation;
+mod data_pressure;
 mod retired_images;
 
 fn disk() -> DiskOptions {

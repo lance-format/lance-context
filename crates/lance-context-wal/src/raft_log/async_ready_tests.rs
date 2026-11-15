@@ -80,21 +80,7 @@ impl Peer {
     fn poll(&mut self) -> Result<Vec<RaftMessage>> {
         let mut messages = Vec::new();
         while let Ok((number, result)) = self.rx.try_recv() {
-            // A failed sync cannot advance Raft, release durable messages or
-            // make the test application's committed value visible.
-            ensure!(self.raw.mut_store().complete(result?)? == number);
-            let done = self
-                .pending
-                .pop_front()
-                .context("unmatched persistence completion")?;
-            ensure!(done.number == number, "out-of-order persistence completion");
-            self.pending_bytes -= done.bytes;
-            self.raw.on_persist_ready(number);
-            messages.extend(done.messages);
-            if let Some(entry) = done.apply.last() {
-                self.raw.advance_apply_to(entry.index);
-            }
-            self.applied.extend(done.apply);
+            messages.extend(self.complete(number, result)?);
         }
         if self.raw.has_ready() {
             let mut ready = self.raw.ready();
@@ -146,6 +132,24 @@ impl Peer {
                 .try_send(write)?;
         }
         Ok(messages)
+    }
+
+    fn complete(&mut self, number: u64, result: Result<Persisted>) -> Result<Vec<RaftMessage>> {
+        // A failed sync cannot advance Raft, release durable messages or
+        // make the test application's committed value visible.
+        ensure!(self.raw.mut_store().complete(result?)? == number);
+        let done = self
+            .pending
+            .pop_front()
+            .context("unmatched persistence completion")?;
+        ensure!(done.number == number, "out-of-order persistence completion");
+        self.pending_bytes -= done.bytes;
+        self.raw.on_persist_ready(number);
+        if let Some(entry) = done.apply.last() {
+            self.raw.advance_apply_to(entry.index);
+        }
+        self.applied.extend(done.apply);
+        Ok(done.messages)
     }
 }
 impl Drop for Peer {
@@ -342,15 +346,32 @@ fn async_ready_sync_failure_never_advances_application() -> Result<()> {
     let layout = layout();
     let mut c = Cluster::open(root.path(), &layout)?;
     let first = c.start()?;
+    let gate = c.peers[0].log.node.fault.pause_sync_for_test();
     c.peers[0].log.fail_next_sync_for_test();
     let last = c.propose(2)?;
-    let result = c.until(|c| c.applied(0, last));
+    c.pump()?;
+    gate.wait()?;
+    ensure!(!c.applied(0, last));
+    let pending = c.peers[0].pending.len();
+    let pending_bytes = c.peers[0].pending_bytes;
+    ensure!(pending > 0 && pending_bytes > 0);
+    drop(gate);
+    // Observe the original completion deterministically. Polling RawNode here
+    // races its storage access with the worker fencing the failed engine, which
+    // raft-rs treats as a fatal panic before the receipt reaches try_recv().
+    // This mechanism fixture checks completion ordering; the runtime separately
+    // catches fatal owner panics and resolves outstanding outcomes as unknown.
+    let (number, receipt) = c.peers[0].rx.recv_timeout(Duration::from_secs(10))?;
+    ensure!(c.peers[0].pending.front().unwrap().number == number);
+    let result = c.peers[0].complete(number, receipt);
     let error = result.expect_err("failed fsync produced an applied value");
     ensure!(
         error.to_string().contains("engine write panicked"),
         "unexpected failure: {error:#}"
     );
     ensure!(!c.applied(0, last));
+    ensure!(c.peers[0].pending.len() == pending);
+    ensure!(c.peers[0].pending_bytes == pending_bytes);
     drop(c);
     let log = PhysicalLog::open(&root.path().join("1"), &layout, 1)?.group(10)?;
     ensure!(log.initial_state()?.hard_state.commit >= first);
