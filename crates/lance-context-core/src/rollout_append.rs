@@ -34,6 +34,21 @@ pub const MAX_PLAN_GENERATIONS: usize = 256;
 pub const MAX_STAGE_BYTES: usize = 256 * 1024 * 1024;
 // Bound both metadata fan-out and the number of retained shard manifests.
 const MAX_PLANNING_SHARDS: usize = 4;
+const MAX_COMMIT_METADATA_SHARDS: usize = 4;
+
+/// Keep the current ownership scope and join all submitted operations before
+/// returning an error. In particular, a failed drain must not abandon another
+/// shard's in-flight retirement or manifest write.
+async fn join_commit_metadata<T, F>(work: impl IntoIterator<Item = F>) -> Result<Vec<T>>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    let results = futures::stream::iter(work)
+        .buffered(MAX_COMMIT_METADATA_SHARDS)
+        .collect::<Vec<_>>()
+        .await;
+    results.into_iter().collect()
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Generation {
@@ -659,8 +674,8 @@ impl AppendCoordinator {
         self.dataset.checkout_latest().await?;
         let marks = watermarks(&self.dataset).await?;
         let mut shards = HashSet::new();
-        let mut fragments = Vec::new();
-        let mut merged = Vec::new();
+        let mut checked_versions = HashSet::new();
+        let mut pending_parts = Vec::new();
         for part in staged {
             part.plan.validate()?;
             if part.dataset_uri.trim_end_matches('/') != self.dataset.uri().trim_end_matches('/') {
@@ -687,30 +702,38 @@ impl AppendCoordinator {
                 }
             }
             // Require the version used to encode fields to have the same schema.
-            let snapshot = self
-                .dataset
-                .checkout_version(part.plan.base_version)
-                .await?;
-            // Dictionary values/offsets are loaded lazily and are file-local
-            // in V2. Raw Lance Schema equality compares that cache state too.
-            let options = lance::datatypes::SchemaCompareOptions {
-                compare_metadata: true,
-                compare_field_ids: true,
-                ..Default::default()
-            };
-            if snapshot.manifest().data_storage_format.version
-                != self.dataset.manifest().data_storage_format.version
-                || Schema::from(snapshot.schema()) != Schema::from(self.dataset.schema())
-                || snapshot
-                    .schema()
-                    .check_compatible(self.dataset.schema(), &options)
-                    .is_err()
-            {
-                return Err(Error::invalid_input(
-                    "schema changed during rollout staging; replan",
-                ));
+            if checked_versions.insert(part.plan.base_version) {
+                let snapshot = self
+                    .dataset
+                    .checkout_version(part.plan.base_version)
+                    .await?;
+                // Dictionary values/offsets are loaded lazily and are file-local
+                // in V2. Raw Lance Schema equality compares that cache state too.
+                let options = lance::datatypes::SchemaCompareOptions {
+                    compare_metadata: true,
+                    compare_field_ids: true,
+                    ..Default::default()
+                };
+                if snapshot.manifest().data_storage_format.version
+                    != self.dataset.manifest().data_storage_format.version
+                    || Schema::from(snapshot.schema()) != Schema::from(self.dataset.schema())
+                    || snapshot
+                        .schema()
+                        .check_compatible(self.dataset.schema(), &options)
+                        .is_err()
+                {
+                    return Err(Error::invalid_input(
+                        "schema changed during rollout staging; replan",
+                    ));
+                }
             }
-            let manifest = shard_store(&self.dataset, part.plan.shard)
+            pending_parts.push(part);
+        }
+        let dataset = &self.dataset;
+        let validated = join_commit_metadata(pending_parts.into_iter().map(|part| async move {
+            let selected = &part.plan.generations[..part.completed];
+            let high = selected.last().unwrap().number;
+            let manifest = shard_store(dataset, part.plan.shard)
                 .await?
                 .refresh_latest()
                 .await?
@@ -739,17 +762,25 @@ impl AppendCoordinator {
             {
                 return Err(Error::invalid_input("staged row count mismatch"));
             }
-            fragments.extend(part.fragments);
-            merged.push(CompactedSsTable::new(part.plan.shard, high));
+            Ok((part.fragments, CompactedSsTable::new(part.plan.shard, high)))
+        }))
+        .await?;
+        let mut fragments = Vec::new();
+        let mut merged = Vec::new();
+        for (files, watermark) in validated {
+            fragments.extend(files);
+            merged.push(watermark);
         }
         if !merged.is_empty() {
             commit_files(&mut self.dataset, fragments, merged).await?;
         }
-        let mut reclaimed = 0;
-        for shard in shards {
-            reclaimed += reconcile_shard(&self.dataset, shard, self.wal_collection).await?;
-        }
-        Ok(reclaimed)
+        let reclaimed = join_commit_metadata(
+            shards
+                .into_iter()
+                .map(|shard| reconcile_shard(&self.dataset, shard, self.wal_collection)),
+        )
+        .await?;
+        Ok(reclaimed.into_iter().sum())
     }
 }
 
@@ -972,6 +1003,173 @@ mod tests {
         pin::Pin,
         sync::atomic::{AtomicBool, Ordering},
     };
+
+    #[tokio::test]
+    async fn commit_metadata_bounds_concurrency_and_joins_after_failure() {
+        use std::sync::atomic::AtomicUsize;
+
+        let jobs = MAX_COMMIT_METADATA_SHARDS * 2 + 1;
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let work = (0..jobs).map(|index| {
+            let (active, maximum, completed, gate) = (
+                active.clone(),
+                maximum.clone(),
+                completed.clone(),
+                gate.clone(),
+            );
+            async move {
+                let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                maximum.fetch_max(count, Ordering::SeqCst);
+                let result = if index == 0 {
+                    Err(Error::io("first metadata operation failed"))
+                } else {
+                    let _permit = gate.acquire().await.unwrap();
+                    Ok(index)
+                };
+                active.fetch_sub(1, Ordering::SeqCst);
+                completed.fetch_add(1, Ordering::SeqCst);
+                result
+            }
+        });
+        let joined = join_commit_metadata(work);
+        tokio::pin!(joined);
+        assert!(futures::poll!(joined.as_mut()).is_pending());
+        assert_eq!(completed.load(Ordering::SeqCst), 1);
+        assert_eq!(active.load(Ordering::SeqCst), MAX_COMMIT_METADATA_SHARDS);
+        gate.add_permits(jobs);
+        assert!(joined
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("first metadata"));
+        assert_eq!(completed.load(Ordering::SeqCst), jobs);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(maximum.load(Ordering::SeqCst), MAX_COMMIT_METADATA_SHARDS);
+    }
+
+    #[tokio::test]
+    async fn commit_metadata_partial_drain_recovers_without_republishing() {
+        #[derive(Debug)]
+        struct FailOneDrain(Uuid);
+        impl CommitAuthorizer for FailOneDrain {
+            fn authorize<'a>(
+                &'a self,
+                resource: &'a str,
+                _version: u64,
+            ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+                Box::pin(async move {
+                    if resource == format!("shard:{}", self.0) {
+                        Err(Error::io("injected single shard drain failure"))
+                    } else {
+                        Ok(())
+                    }
+                })
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let names: Vec<String> = ["a", "b", "c", "d", "e"].map(String::from).into();
+        let mut writers = Vec::new();
+        for name in &names {
+            let store = writer(uri, name).await;
+            put(&store, &format!("{name}-first"), 4096).await;
+            writers.push(store);
+        }
+        let mut coordinator = AppendCoordinator::open(uri, None).await.unwrap();
+        let (plans, _) = coordinator.plan(&names, 64, 1024 * 1024).await.unwrap();
+        let parts = join_commit_metadata(
+            plans
+                .into_iter()
+                .map(|plan| stage(uri, plan, budget(), None)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(parts.len(), names.len());
+        let version = coordinator.version();
+        let mut invalid = parts.clone();
+        invalid.last_mut().unwrap().rows += 1;
+        assert!(coordinator
+            .commit(invalid)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("row count mismatch"));
+        assert_eq!(
+            rows(uri).await,
+            0,
+            "all shard validation precedes publication"
+        );
+        assert_eq!(Dataset::open(uri).await.unwrap().version().version, version);
+
+        let failed_shard = derive_shard_id(Some("a"));
+        let scope = MergeWriteScope::with_pinned_authorizer(Arc::new(FailOneDrain(failed_shard)));
+        scope
+            .run(async {
+                let mut guarded = AppendCoordinator::open(uri, None).await.unwrap();
+                assert!(guarded
+                    .commit(parts.clone())
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("injected single shard"));
+            })
+            .await;
+        scope.drain().await;
+        let committed = Dataset::open(uri).await.unwrap();
+        let published_version = committed.version().version;
+        assert_eq!(published_version, version + 1);
+        assert_eq!(rows(uri).await, names.len());
+        for name in &names {
+            let shard = derive_shard_id(Some(name));
+            let manifest = shard_store(&committed, shard)
+                .await
+                .unwrap()
+                .refresh_latest()
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                manifest.sstables.len(),
+                usize::from(shard == failed_shard),
+                "successful independent drains must finish even when another fails"
+            );
+        }
+        put(&writers[0], "a-tail", 4096).await;
+        put(&writers[1], "b-tail", 4096).await;
+        let mut recovered = AppendCoordinator::open(uri, None).await.unwrap();
+        assert_eq!(recovered.commit(parts).await.unwrap(), 1);
+        assert_eq!(recovered.version(), published_version);
+        assert_eq!(rows(uri).await, names.len());
+        let (plans, _) = recovered.plan(&names, 64, 1024 * 1024).await.unwrap();
+        assert_eq!(plans.len(), 2);
+        assert!(plans.iter().all(|plan| plan.generations.len() == 1));
+        let tail = join_commit_metadata(
+            plans
+                .into_iter()
+                .map(|plan| stage(uri, plan, budget(), None)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(recovered.commit(tail).await.unwrap(), 2);
+        assert_eq!(rows(uri).await, names.len() + 2);
+        let reader = RolloutStore::open_existing_with_options(uri, RolloutStoreOptions::default())
+            .await
+            .unwrap();
+        for id in names
+            .iter()
+            .map(|name| format!("{name}-first"))
+            .chain(["a-tail".to_owned(), "b-tail".to_owned()])
+        {
+            assert_eq!(reader.get_blob(&id).await.unwrap(), Some(vec![42; 4096]));
+        }
+        for store in writers {
+            store.close().await.unwrap();
+        }
+    }
     fn artifact_record(id: &str, bytes: &[u8]) -> RolloutRecord {
         RolloutRecord {
             id: id.to_string(),
