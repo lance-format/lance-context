@@ -43,6 +43,7 @@ struct View {
     append_receive: BTreeMap<&'static str, runtime::client::timing::Observation>,
     disk: Option<crate::admission::Snapshot>,
     maintenance: maintenance::Progress,
+    native_io_process: native_io::Observation,
     snapshots_sent: u64,
     snapshots_installed: u64,
     snapshots_failed: u64,
@@ -100,6 +101,7 @@ impl State {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("maintenance observation unavailable"))?
                 .clone(),
+            native_io_process: native_io::observe(),
             snapshots_sent: self.snapshots.sent.load(Ordering::Relaxed),
             snapshots_installed: self.snapshots.installed.load(Ordering::Relaxed),
             snapshots_failed: self.snapshots.failed.load(Ordering::Relaxed),

@@ -16,6 +16,7 @@ use tokio::{net::TcpListener, sync::watch, task::JoinHandle};
 pub mod config;
 mod health;
 pub mod maintenance;
+mod native_io;
 mod tls;
 pub use config::Config;
 

@@ -49,6 +49,11 @@ impl Options {
 pub struct Progress {
     pub checkpoints: u64,
     pub checkpoint_micros: u64,
+    /// Completed local builds, including candidates whose installation fails.
+    /// These exclude partial failed builds and received snapshot files.
+    pub checkpoint_builds: u64,
+    pub checkpoint_metadata_bytes: u64,
+    pub checkpoint_payload_bytes: u64,
     pub collected_files: u64,
     pub collected_bytes: u64,
     pub log_passes: u64,
@@ -162,6 +167,17 @@ pub(crate) async fn run(
                     return Ok(false);
                 };
                 let built = tokio::task::spawn_blocking(move || capture.run()).await??;
+                {
+                    let image = built.image();
+                    let mut p = progress.lock().unwrap();
+                    p.checkpoint_builds = p.checkpoint_builds.saturating_add(1);
+                    p.checkpoint_metadata_bytes = p.checkpoint_metadata_bytes.saturating_add(
+                        image.bytes(crate::replication::checkpoint::Part::Metadata),
+                    );
+                    p.checkpoint_payload_bytes = p
+                        .checkpoint_payload_bytes
+                        .saturating_add(image.bytes(crate::replication::checkpoint::Part::Payload));
+                }
                 handle
                     .install_checkpoint_retaining(built, options.checkpoint_trailing_bytes)?
                     .await?;
