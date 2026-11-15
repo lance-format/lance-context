@@ -280,6 +280,15 @@ impl Group {
             let window = self.persistence.as_ref().unwrap().window;
             self.raw.mut_store().buffered(window)?;
         }
+        if self.raw.raft.state == StateRole::Leader && !self.accepts_async(&[])? {
+            // RawNode::ready classifies a leader's outbound messages as safe
+            // before persistence. Send those messages without creating another
+            // Ready record when the bounded persistence window is full. This
+            // keeps heartbeats moving; it neither advances persisted/applied
+            // indices nor releases pending commit or read completions. Follower
+            // and candidate messages still require the ordinary Ready boundary.
+            outbound.append(&mut self.raw.raft.msgs);
+        }
         while self.raw.has_ready() && self.accepts_async(&[])? {
             let mut ready = self.raw.ready();
             ensure!(

@@ -294,6 +294,15 @@ fn async_persistence_native_sync_failure_never_returns_success() -> Result<()> {
 
 #[test]
 fn async_persistence_window_backpressures_then_drains_without_lost_acks() -> Result<()> {
+    full_window(Duration::ZERO)
+}
+
+#[test]
+fn async_persistence_full_window_keeps_quorum_live_during_slow_disk() -> Result<()> {
+    full_window(Duration::from_millis(2500))
+}
+
+fn full_window(sustain_for: Duration) -> Result<()> {
     let executor = executor()?;
     let root = tempfile::tempdir()?;
     let (c, first) = executor.block_on(seeded(root.path()))?;
@@ -372,6 +381,23 @@ fn async_persistence_window_backpressures_then_drains_without_lost_acks() -> Res
                 "window pressure fenced the runtime"
             );
         }
+        let original = handle.observation(10)?.status;
+        let held_until = Instant::now() + sustain_for;
+        while Instant::now() < held_until {
+            for (id, peer) in c.handles.iter() {
+                let view = peer.observation(10)?;
+                ensure!(
+                    view.status.leader == 1 && view.status.term == original.term,
+                    "full persistence window changed leadership: node={id}, initial={original:?}, observed={:?}, persistence={:?}, rejections={:?}",
+                    view.status, view.persistence, peer.peer_rejections()
+                );
+            }
+            ensure!(
+                requests.iter().all(|(_, request)| request.0.is_empty()),
+                "full-window test observed an ACK before the original native sync"
+            );
+            sleep(Duration::from_millis(10)).await;
+        }
         Ok::<_, anyhow::Error>(requests)
     });
     drop(gate);
@@ -423,4 +449,69 @@ fn async_persistence_window_backpressures_then_drains_without_lost_acks() -> Res
         }
     }
     Ok(())
+}
+
+#[test]
+fn async_persistence_full_window_still_steps_down_without_quorum() -> Result<()> {
+    let executor = executor()?;
+    let root = tempfile::tempdir()?;
+    let (c, first) = executor.block_on(seeded(root.path()))?;
+    let store = executor.block_on(c.handles[&1].local(10, |node| {
+        Ok(node.groups[&10].raw.store().durable_log().clone())
+    })?)?;
+    let gate = store.block_sync_for_test();
+    let checked = executor.block_on(async {
+        let handle = &c.handles[&1];
+        let mut requests = Vec::new();
+        for offset in 0..128 {
+            let mut input = batch(offset + 2);
+            input.meta.producer = uuid::Uuid::from_u128(1000 + u128::from(offset));
+            input.meta.sequence = 1;
+            requests.push(handle.commit(Command::Append {
+                group: 10,
+                batch: input,
+            })?);
+            wait_for(|| {
+                handle
+                    .observation(10)
+                    .is_ok_and(|o| o.status.pending >= requests.len())
+                    || requests.last().is_some_and(|r| !r.0.is_empty())
+            })
+            .await?;
+            if let Some(request) = requests.pop_if(|r| !r.0.is_empty()) {
+                ensure!(request.await.is_err());
+            }
+            if handle.observation(10)?.persistence.unwrap().pending_readies == 128 {
+                break;
+            }
+        }
+        ensure!(handle.observation(10)?.persistence.unwrap().pending_readies == 128);
+        c.isolated.store(1, Ordering::Release);
+        timeout(
+            Duration::from_secs(3),
+            wait_for(|| handle.observation(10).is_ok_and(|o| o.status.leader != 1)),
+        )
+        .await??;
+        let view = handle.observation(10)?;
+        ensure!(!view.stopped, "worker stopped instead of losing quorum");
+        ensure!(
+            view.persistence.unwrap().pending_readies == 128,
+            "test no longer held the full native persistence window"
+        );
+        for mut request in requests {
+            if let Ok(done) = request.0.try_recv() {
+                ensure!(
+                    !matches!(done.result, Ok(Outcome::Committed(_))),
+                    "commit ACK escaped blocked native persistence"
+                );
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    });
+    drop(gate);
+    let stopped = executor.block_on(c.shutdown());
+    drop(store);
+    stopped?;
+    checked?;
+    reopen(root.path(), &[(first, 1)])
 }

@@ -534,8 +534,10 @@ impl Node {
     pub fn tick(&mut self) -> Result<()> {
         self.healthy()?;
         for group in self.groups.values_mut() {
+            // The leader must keep sending heartbeats and checking quorum while
+            // data persistence is full. drive_async drains its safe messages.
             #[cfg(feature = "runtime")]
-            if !group.accepts_async(&[])? {
+            if !group.accepts_async(&[])? && group.raw.raft.state != StateRole::Leader {
                 continue;
             }
             group.raw.tick();
@@ -876,9 +878,16 @@ impl Node {
             .groups
             .get_mut(&packet.group)
             .context("unhosted group")?;
+        // Current-term heartbeat responses refresh the leader's quorum without
+        // adding log entries. Already admitted reads still wait for the normal
+        // persisted Ready/application boundary before reaching callers.
         #[cfg(feature = "runtime")]
         ensure!(
-            group.accepts_async(&message.entries)?,
+            (group.raw.raft.state == StateRole::Leader
+                && message.term == group.raw.raft.term
+                && message.get_msg_type() == MessageType::MsgHeartbeatResponse
+                && message.entries.is_empty())
+                || group.accepts_async(&message.entries)?,
             "pending persistence capacity"
         );
         let reservation = if message.get_msg_type() == MessageType::MsgAppend
