@@ -6,6 +6,7 @@ use crate::replication::{
 use std::path::Path;
 use tokio::time::{sleep, timeout};
 
+mod async_persistence;
 mod batching;
 mod early;
 #[cfg(feature = "peer-transport")]
@@ -146,10 +147,13 @@ impl Cluster {
             let _ = task.await;
         }
         self.held_snapshots.lock().unwrap().clear();
+        let mut result = Ok(());
         for runtime in self.runtimes.drain(..) {
-            runtime.shutdown().await?;
+            if let Err(error) = runtime.shutdown().await {
+                result = Err(error);
+            }
         }
-        Ok(())
+        result
     }
 }
 impl Drop for Cluster {

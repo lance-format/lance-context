@@ -27,6 +27,7 @@ enum Request {
         peers: BTreeMap<u64, SocketAddr>,
         images: BTreeMap<u64, SocketAddr>,
         pipeline_replication: bool,
+        async_persistence: bool,
     },
     Checkpoint(u64),
     ImageStatus,
@@ -146,6 +147,7 @@ async fn tls_peer_process_fixture() -> Result<()> {
         peers: addresses,
         images: image_addresses,
         pipeline_replication,
+        async_persistence,
     } = receive(&mut stream).await?
     else {
         anyhow::bail!("missing startup configuration");
@@ -162,6 +164,7 @@ async fn tls_peer_process_fixture() -> Result<()> {
         node,
         super::super::super::Options {
             pipeline_replication,
+            async_persistence,
             ..Default::default()
         },
     )?;
@@ -421,6 +424,7 @@ struct Processes {
     root: PathBuf,
     incarnation: u64,
     pipeline_replication: bool,
+    async_persistence: bool,
 }
 impl Processes {
     fn start_all(&mut self) -> Result<()> {
@@ -450,6 +454,7 @@ impl Processes {
                         peers: addresses.clone(),
                         images: images.clone(),
                         pipeline_replication: self.pipeline_replication,
+                        async_persistence: self.async_persistence,
                     })?,
                     Reply::Ready
                 ),
@@ -527,15 +532,20 @@ impl Processes {
 
 #[test]
 fn tls_process_leader_crash_full_restart_and_exact_retries_preserve_all_payloads() -> Result<()> {
-    leader_crash_full_restart(false)
+    leader_crash_full_restart(false, false)
 }
 
 #[test]
 fn pipelined_tls_process_leader_crash_full_restart_preserves_all_payloads() -> Result<()> {
-    leader_crash_full_restart(true)
+    leader_crash_full_restart(true, false)
 }
 
-fn leader_crash_full_restart(pipeline_replication: bool) -> Result<()> {
+#[test]
+fn async_persistence_tls_process_leader_crash_preserves_all_payloads() -> Result<()> {
+    leader_crash_full_restart(false, true)
+}
+
+fn leader_crash_full_restart(pipeline_replication: bool, async_persistence: bool) -> Result<()> {
     let root = tempfile::tempdir()?.keep();
     eprintln!("TLS process qualification artifacts: {}", root.display());
     provision(&root)?;
@@ -544,6 +554,7 @@ fn leader_crash_full_restart(pipeline_replication: bool) -> Result<()> {
         root: root.clone(),
         incarnation: 0,
         pipeline_replication,
+        async_persistence,
     };
     c.start_all()?;
     c.nodes.get_mut(&1).unwrap().call(Request::Campaign(10))?;
@@ -595,15 +606,23 @@ fn leader_crash_full_restart(pipeline_replication: bool) -> Result<()> {
 #[test]
 fn tls_snapshot_process_kill_mid_file_preserves_payloads_after_rejoin_and_full_restart(
 ) -> Result<()> {
-    snapshot_process_kill_mid_file(false)
+    snapshot_process_kill_mid_file(false, false)
 }
 
 #[test]
 fn pipelined_tls_snapshot_process_kill_mid_file_preserves_payloads_after_restart() -> Result<()> {
-    snapshot_process_kill_mid_file(true)
+    snapshot_process_kill_mid_file(true, false)
 }
 
-fn snapshot_process_kill_mid_file(pipeline_replication: bool) -> Result<()> {
+#[test]
+fn async_persistence_tls_snapshot_process_kill_mid_file_preserves_payloads() -> Result<()> {
+    snapshot_process_kill_mid_file(false, true)
+}
+
+fn snapshot_process_kill_mid_file(
+    pipeline_replication: bool,
+    async_persistence: bool,
+) -> Result<()> {
     let root = tempfile::tempdir()?.keep();
     eprintln!(
         "TLS snapshot process qualification artifacts: {}",
@@ -615,6 +634,7 @@ fn snapshot_process_kill_mid_file(pipeline_replication: bool) -> Result<()> {
         root: root.clone(),
         incarnation: 0,
         pipeline_replication,
+        async_persistence,
     };
     c.start_all()?;
     c.nodes.get_mut(&1).unwrap().call(Request::Campaign(10))?;
@@ -743,6 +763,7 @@ fn restart_follower(
             peers,
             images,
             pipeline_replication: c.pipeline_replication,
+            async_persistence: c.async_persistence,
         })?,
         Reply::Ready
     ));
@@ -751,15 +772,20 @@ fn restart_follower(
 
 #[test]
 fn client_rpc_survives_leader_sigkill_and_full_original_directory_restart() -> Result<()> {
-    client_rpc_leader_sigkill(false)
+    client_rpc_leader_sigkill(false, false)
 }
 
 #[test]
 fn pipelined_client_rpc_survives_leader_sigkill_and_original_directory_restart() -> Result<()> {
-    client_rpc_leader_sigkill(true)
+    client_rpc_leader_sigkill(true, false)
 }
 
-fn client_rpc_leader_sigkill(pipeline_replication: bool) -> Result<()> {
+#[test]
+fn async_persistence_client_rpc_survives_leader_sigkill_and_restart() -> Result<()> {
+    client_rpc_leader_sigkill(false, true)
+}
+
+fn client_rpc_leader_sigkill(pipeline_replication: bool, async_persistence: bool) -> Result<()> {
     let directory = tempfile::tempdir()?;
     provision(directory.path())?;
     let mut processes = Processes {
@@ -767,6 +793,7 @@ fn client_rpc_leader_sigkill(pipeline_replication: bool) -> Result<()> {
         root: directory.path().to_owned(),
         incarnation: 0,
         pipeline_replication,
+        async_persistence,
     };
     processes.start_all()?;
     let executor = tokio::runtime::Builder::new_multi_thread()

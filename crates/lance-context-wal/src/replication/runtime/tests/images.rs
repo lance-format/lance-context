@@ -72,17 +72,26 @@ async fn collect(handle: &Handle) -> Result<u64> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runtime_snapshot_catches_up_compacted_follower_and_preserves_restart_retries() -> Result<()>
 {
-    snapshot_restart_retries(false).await
+    snapshot_restart_retries(false, false).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pipelined_replication_keeps_snapshot_ownership_and_restart_retries() -> Result<()> {
-    snapshot_restart_retries(true).await
+    snapshot_restart_retries(true, false).await
 }
 
-async fn snapshot_restart_retries(pipeline_replication: bool) -> Result<()> {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_persistence_preserves_snapshot_ownership_and_restart_retries() -> Result<()> {
+    snapshot_restart_retries(false, true).await
+}
+
+async fn snapshot_restart_retries(
+    pipeline_replication: bool,
+    async_persistence: bool,
+) -> Result<()> {
     let options = Options {
         pipeline_replication,
+        async_persistence,
         ..Options::default()
     };
     let root = tempfile::tempdir()?;
@@ -301,7 +310,7 @@ async fn interrupted_snapshot_and_failed_install_never_acknowledge_or_release_pe
         2,
         Limits::default(),
     )?;
-    let store = node.groups[&10].raw.store().clone();
+    let store = node.groups[&10].raw.store().durable_log().clone();
     let (runtime, mut outbox) = Runtime::spawn(node, Options::default())?;
     let handle = runtime.handle();
     let mut message = Message {

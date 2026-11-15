@@ -111,6 +111,15 @@ impl WriteTask {
 }
 
 impl BufferedLog {
+    pub(crate) fn durable_log(&self) -> &GroupLog {
+        &self.log
+    }
+
+    pub(crate) fn checkpoint_index(&self) -> Result<u64> {
+        self.check()?;
+        Ok(self.visible.snapshot.get_metadata().index)
+    }
+
     pub fn new(log: GroupLog, window: Window) -> Result<Self> {
         ensure!(
             (1..=4096).contains(&window.readies)
@@ -166,10 +175,24 @@ impl BufferedLog {
     /// Only this owner can stage/complete, so a successful check remains valid
     /// until the owner changes the view again.
     pub fn can_stage(&self, entries: &[Entry]) -> Result<bool> {
+        self.can_stage_with(entries, &[], 0)
+    }
+
+    pub(crate) fn can_stage_with(
+        &self,
+        entries: &[Entry],
+        extra: &[Entry],
+        reserved: usize,
+    ) -> Result<bool> {
         self.check()?;
+        let bytes = Self::entry_charge(entries)?
+            .checked_add(Self::entry_charge(extra)? - std::mem::size_of::<Pending>())
+            .and_then(|bytes| bytes.checked_add(reserved))
+            .context("pending entry accounting overflow")?;
         Ok(self.usage.readies < self.window.readies
-            && entries.len() <= self.window.entries.saturating_sub(self.usage.entries)
-            && Self::entry_charge(entries)? <= self.window.bytes.saturating_sub(self.usage.bytes))
+            && entries.len() + extra.len()
+                <= self.window.entries.saturating_sub(self.usage.entries)
+            && bytes <= self.window.bytes.saturating_sub(self.usage.bytes))
     }
 
     /// Refuses before changing the view when the pending window is full. The

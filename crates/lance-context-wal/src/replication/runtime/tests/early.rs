@@ -19,7 +19,7 @@ fn pipelined_append_reaches_a_follower_during_blocked_leader_sync_without_ack() 
         nodes[0].campaign(10)?;
         crate::replication::tests::pump(&mut nodes)?;
         let node = nodes.remove(0);
-        let store = node.groups[&10].raw.store().clone();
+        let store = node.groups[&10].raw.store().durable_log().clone();
         let (runtime, mut outbox) = Runtime::spawn(
             node,
             Options {

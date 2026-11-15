@@ -261,7 +261,7 @@ pub(super) fn read_body(
 }
 
 pub(super) fn read_log_body(
-    store: &GroupLog,
+    store: &impl Storage,
     index: u64,
     meta: &BatchMeta,
 ) -> Result<bytes::Bytes> {
@@ -312,7 +312,7 @@ impl Node {
         };
         Ok(Some(CheckpointTask {
             permit,
-            store: g.raw.store().clone(),
+            store: g.raw.store().durable_log().clone(),
             previous: g.image.clone(),
             layout: self.layout.clone(),
             limits: self.limits.clone(),
@@ -354,6 +354,11 @@ impl Node {
             prepared.loaded.state.applied <= g.state.applied,
             "checkpoint exceeds applied state"
         );
+        #[cfg(feature = "runtime")]
+        if let Err(error) = g.quiesce(prepared.group, &self.limits) {
+            self.failed = true;
+            return Err(error);
+        }
         if let Err(error) = g
             .raw
             .store()
@@ -364,6 +369,8 @@ impl Node {
             return Err(error);
         }
         g.image = Some(prepared.loaded.image);
+        #[cfg(feature = "runtime")]
+        g.resume_persistence()?;
         Ok(())
     }
 
@@ -468,7 +475,15 @@ impl Node {
             g.incoming.is_none(),
             "poll the previous received snapshot first"
         );
-        g.raw.step(packet.message)?;
+        #[cfg(feature = "runtime")]
+        if let Err(error) = g.quiesce(prepared.group, &self.limits) {
+            self.failed = true;
+            return Err(error);
+        }
+        let stepped = g.raw.step(packet.message);
+        #[cfg(feature = "runtime")]
+        g.resume_persistence()?;
+        stepped?;
         if g.raw.raft.raft_log.unstable.snapshot.as_ref() == Some(&snapshot) {
             g.incoming = Some(prepared);
         }
