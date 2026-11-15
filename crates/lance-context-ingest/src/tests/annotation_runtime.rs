@@ -16,6 +16,7 @@ mod index_pipeline;
 mod lost_advance;
 #[cfg(feature = "service")]
 mod lost_confirm;
+#[cfg(feature = "service")]
 mod lost_pin;
 #[cfg(feature = "service")]
 mod lost_plan;
