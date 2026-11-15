@@ -121,7 +121,13 @@ running. Unanswered writes remain unknown, and clients must retry their exact
 persisted producer/sequence/body tuple.
 
 Disk admission is an application control window, not a filesystem quota or a
-promise of unlimited ingest. Replication can consume reserved headroom. Without
+promise of unlimited ingest. New local data proposals use the lower producer
+limit. Peer appends have already passed their leader's admission and may use
+reserved headroom up to the total node budget, even when they contain data.
+Applying the follower's producer limit would also block later control entries
+behind an admitted data prefix. Peer reservations still cover all new entries
+until persistence or discard; total-budget exhaustion refuses new peer payloads.
+Without
 publication/source retirement, acknowledged data must accumulate and admission
 must eventually stop; checkpoints cannot discard that data to improve a score.
 
