@@ -515,3 +515,201 @@ fn async_persistence_full_window_still_steps_down_without_quorum() -> Result<()>
     checked?;
     reopen(root.path(), &[(first, 1)])
 }
+
+#[test]
+fn async_persistence_checkpoint_sync_stall_keeps_leader_live() -> Result<()> {
+    checkpoint_stall(false)
+}
+
+#[test]
+fn async_persistence_checkpoint_bounds_admission_during_continuous_requests() -> Result<()> {
+    checkpoint_stall(true)
+}
+
+fn checkpoint_stall(continuous_requests: bool) -> Result<()> {
+    let executor = executor()?;
+    let root = tempfile::tempdir()?;
+    let (c, first) = executor.block_on(seeded(root.path()))?;
+    let prepared = executor.block_on(async {
+        let task = c.handles[&1]
+            .prepare_checkpoint(10, uuid::Uuid::new_v4())?
+            .await?;
+        tokio::task::spawn_blocking(move || task.run()).await?
+    })?;
+    let store = executor.block_on(
+        c.handles[&1].local(10, |n| Ok(n.groups[&10].raw.store().durable_log().clone()))?,
+    )?;
+    let term = c.handles[&1].observation(10)?.status.term;
+    let before = store.appended_index_for_test();
+    let gate = store.block_sync_for_test();
+    let waiting = executor.block_on(async {
+        let pending = c.handles[&1].commit(Command::Append {
+            group: 10,
+            batch: batch(2),
+        })?;
+        wait_for(|| store.appended_index_for_test() > before).await?;
+        let checkpoint = c.handles[&1].install_checkpoint(prepared)?;
+        let deadline = Instant::now() + Duration::from_millis(2500);
+        let mut maximum_staleness = Duration::ZERO;
+        let mut first_leader_change = None;
+        let mut refused = 0;
+        while Instant::now() < deadline {
+            ensure!(pending.0.is_empty(), "ACK preceded held native sync");
+            ensure!(checkpoint.0.is_empty(), "checkpoint preceded held native sync");
+            for (id, handle) in c.handles.iter() {
+                let observation = handle.observation(10)?;
+                maximum_staleness = maximum_staleness.max(observation.observed_at.elapsed());
+                if (observation.status.leader != 1 || observation.status.term != term)
+                    && first_leader_change.is_none()
+                {
+                    first_leader_change = Some((*id, observation.status.leader, observation.status.term));
+                }
+            }
+            if continuous_requests {
+                // Control admission precedes this data request. All subsequent
+                // writes must be bounded/refused before mutation while the
+                // checkpoint waits; an idle-window-only scheduler would keep
+                // accumulating Ready work instead of reaching its captured cut.
+                let next = c.handles[&1].commit(Command::Append {
+                    group: 10,
+                    batch: batch(3),
+                })?;
+                let result = timeout(Duration::from_millis(500), next).await?;
+                ensure!(result.as_ref().err().is_some_and(|error| {
+                    matches!(error.downcast_ref(), Some(crate::replication::ProposalRejection::PendingCapacity))
+                }), "checkpoint did not bound new admission: {result:?}");
+                refused += 1;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        eprintln!(
+            "checkpoint_stall_observation: hold_ms=2500 max_owner_age_ms={} first_leader_change={:?}",
+            maximum_staleness.as_millis(), first_leader_change
+        );
+        ensure!(
+            maximum_staleness < Duration::from_millis(500),
+            "checkpoint sync barrier blocked the owner event loop: max_age_ms={} first_leader_change={:?}",
+            maximum_staleness.as_millis(), first_leader_change
+        );
+        ensure!(first_leader_change.is_none(), "checkpoint sync barrier caused leader change");
+        ensure!(
+            pending.0.is_empty(),
+            "append escaped checkpoint barrier before sync"
+        );
+        ensure!(
+            checkpoint.0.is_empty(),
+            "checkpoint completed ahead of original write"
+        );
+        ensure!(!continuous_requests || refused >= 10);
+        Ok::<_, anyhow::Error>((pending, checkpoint))
+    });
+    drop(gate);
+    let verified = executor.block_on(async {
+        let (pending, checkpoint) = waiting?;
+        timeout(Duration::from_secs(10), checkpoint).await??;
+        let result = timeout(Duration::from_secs(10), pending).await??;
+        let Outcome::Committed(Applied::Accepted { index }) = result else {
+            anyhow::bail!("lost original completion {result:?}")
+        };
+        ensure!(c.handles[&1].observation(10)?.checkpoint_index == first);
+        wait_for(|| {
+            c.handles
+                .values()
+                .all(|h| h.observation(10).is_ok_and(|o| o.status.applied >= index))
+        })
+        .await?;
+        Ok::<_, anyhow::Error>(index)
+    });
+    let stopped = executor.block_on(c.shutdown());
+    drop(store);
+    stopped?;
+    reopen(root.path(), &[(first, 1), (verified?, 2)])
+}
+
+#[test]
+fn async_persistence_checkpoint_shutdown_retains_original_owners_until_sync() -> Result<()> {
+    checkpoint_interrupted(false)
+}
+
+#[test]
+fn async_persistence_checkpoint_native_failure_cannot_complete_successfully() -> Result<()> {
+    checkpoint_interrupted(true)
+}
+
+fn checkpoint_interrupted(fail_sync: bool) -> Result<()> {
+    let executor = executor()?;
+    let root = tempfile::tempdir()?;
+    let (c, first) = executor.block_on(seeded(root.path()))?;
+    let handle = c.handles[&1].clone();
+    let prepared = executor.block_on(async {
+        let task = handle.prepare_checkpoint(10, uuid::Uuid::new_v4())?.await?;
+        tokio::task::spawn_blocking(move || task.run()).await?
+    })?;
+    let store = executor.block_on(handle.local(10, |node| {
+        Ok(node.groups[&10].raw.store().durable_log().clone())
+    })?)?;
+    let before = store.appended_index_for_test();
+    let gate = store.block_sync_for_test();
+    let waiting = executor.block_on(async {
+        let append = handle.commit(Command::Append {
+            group: 10,
+            batch: batch(2),
+        })?;
+        wait_for(|| store.appended_index_for_test() > before).await?;
+        let checkpoint = handle.install_checkpoint(prepared)?;
+        // A following control round proves that the queued checkpoint has
+        // yielded the owner, without releasing its original image admission.
+        let second = handle.prepare_checkpoint(10, uuid::Uuid::new_v4())?;
+        ensure!(timeout(Duration::from_millis(500), second)
+            .await?
+            .as_ref()
+            .err()
+            .is_some_and(|error| error
+                .to_string()
+                .contains("node image builder/receiver busy")));
+        ensure!(checkpoint.0.is_empty() && append.0.is_empty());
+        ensure!(handle.admission().control.used_requests == 1);
+        if fail_sync {
+            store.fail_next_sync_for_test();
+        } else {
+            for runtime in &c.runtimes {
+                runtime.stop();
+            }
+        }
+        Ok::<_, anyhow::Error>((append, checkpoint))
+    });
+    // The fault/stop is applied before releasing the original native write.
+    drop(gate);
+    let observed_failure = if fail_sync && waiting.is_ok() {
+        executor.block_on(wait_for(|| handle.observation(10).is_ok_and(|o| o.stopped)))
+    } else {
+        Ok(())
+    };
+    let stopped = executor.block_on(c.shutdown());
+    let checked = executor.block_on(async {
+        let (append, checkpoint) = waiting?;
+        ensure!(timeout(Duration::from_secs(5), checkpoint).await?.is_err());
+        let result = timeout(Duration::from_secs(5), append).await?;
+        ensure!(result.is_err() || matches!(result, Ok(Outcome::Unknown)));
+        ensure!(handle.admission().control.used_requests == 0);
+        ensure!(handle.admission().data.used_requests == 0);
+        ensure!(handle.observation(10)?.stopped);
+        Ok::<_, anyhow::Error>(())
+    });
+    drop(store);
+    checked?;
+    observed_failure?;
+    if fail_sync {
+        ensure!(stopped.is_err(), "shutdown hid the original native failure");
+        ensure!(handle
+            .observation(10)?
+            .failure
+            .as_deref()
+            .is_some_and(|error| error.contains("engine write panicked")));
+    } else {
+        stopped?;
+    }
+    // Reopen proves that shutdown joined the original writer and released the
+    // engine/image owners; the already acknowledged prefix is still readable.
+    reopen(root.path(), &[(first, 1)])
+}
