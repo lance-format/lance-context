@@ -84,7 +84,7 @@ where
     }
 
     pub fn purge_expired_files(&self) -> Result<Vec<u64>> {
-        self.purge_expired_files_inner(None)
+        self.purge_expired_files_inner(None, false)
     }
 
     /// Capture the append purge barrier, tombstone count and inclusive rewrite
@@ -99,17 +99,22 @@ where
         )
     }
 
+    /// Reclaim the captured prefix. With `force_append`, retained entries do
+    /// not wait for logical compaction; the caller must reserve every live
+    /// value through the captured watermark before allowing this pass.
     #[cfg(feature = "internals")]
     pub fn purge_expired_files_before(
         &self,
         boundary: (FileSeq, usize, FileSeq),
+        force_append: bool,
     ) -> Result<Vec<u64>> {
-        self.purge_expired_files_inner(Some(boundary))
+        self.purge_expired_files_inner(Some(boundary), force_append)
     }
 
     fn purge_expired_files_inner(
         &self,
         boundary: Option<(FileSeq, usize, FileSeq)>,
+        force_append: bool,
     ) -> Result<Vec<u64>> {
         let _t = StopWatch::new(&*ENGINE_PURGE_DURATION_HISTOGRAM);
         let guard = self.force_rewrite_candidates.try_lock();
@@ -159,6 +164,7 @@ where
                     rewrite_watermark,
                     compact_watermark,
                     &mut rewrite_candidate_regions,
+                    force_append,
                 )?);
 
                 if append_queue_barrier == first_append && first_append < latest_append {
@@ -301,6 +307,7 @@ where
         rewrite_watermark: FileSeq,
         compact_watermark: FileSeq,
         rewrite_candidates: &mut HashMap<u64, u32>,
+        force_rewrite: bool,
     ) -> Result<Vec<u64>> {
         let _t = StopWatch::new(&*ENGINE_REWRITE_APPEND_DURATION_HISTOGRAM);
         debug_assert!(compact_watermark <= rewrite_watermark);
@@ -322,18 +329,19 @@ where
             // counter is the times that target region triggers force compact.
             let compact_counter = rewrite_candidates.get(&t.region_id()).unwrap_or(&0);
             if old && full_heavy {
-                if *compact_counter < MAX_COUNT_BEFORE_FORCE_REWRITE {
+                if !force_rewrite && *compact_counter < MAX_COUNT_BEFORE_FORCE_REWRITE {
                     // repeatedly ask user to compact these heavy regions.
                     should_compact.push(t.region_id());
                     new_candidates.insert(t.region_id(), *compact_counter + 1);
                     return false;
                 } else {
-                    // user is not responsive, do the rewrite ourselves.
+                    // The caller requests immediate rewriting, or logical
+                    // compaction has not shortened this region in time.
                     should_compact.push(t.region_id());
                     return has_something_to_rewrite;
                 }
             }
-            !append_heavy && has_something_to_rewrite
+            (force_rewrite || !append_heavy) && has_something_to_rewrite
         });
 
         self.rewrite_memtables(

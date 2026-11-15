@@ -4,6 +4,7 @@ use std::{fs, path::PathBuf};
 mod append_admission;
 mod pressure;
 mod pressure_admission;
+mod retained_tail;
 mod rewrite_allowance;
 mod rewrite_concurrency_probe;
 mod rewrite_pause;
