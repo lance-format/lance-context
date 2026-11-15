@@ -895,7 +895,6 @@ impl Node {
             && message.term >= group.raw.raft.term
         {
             let mut bytes = 0usize;
-            let mut data = false;
             for entry in &message.entries {
                 // A retransmission of an existing entry needs no new payload
                 // space. It must still reach Raft when the original ACK was lost.
@@ -908,10 +907,6 @@ impl Node {
                     .checked_add(entry.compute_size() as usize)
                     .and_then(|n| n.checked_add(4096))
                     .context("peer disk reservation overflow")?;
-                if !entry.context.is_empty() {
-                    data |=
-                        state::decode_meta(&entry.context)?.kind == crate::record::RecordKind::Data;
-                }
             }
             if bytes == 0 {
                 None
@@ -920,7 +915,12 @@ impl Node {
                     .raw
                     .store()
                     .disk_budget()
-                    .map(|budget| budget.reserve(bytes, data))
+                    // These entries have already passed their leader's
+                    // proposal admission. A follower's lower producer ceiling
+                    // must not block their durable quorum or later control
+                    // entries that permit publication and reclamation.
+                    // Keep every byte charged against the total node budget.
+                    .map(|budget| budget.reserve(bytes, false))
                     .transpose()?
             }
         } else {
