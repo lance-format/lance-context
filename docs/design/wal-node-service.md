@@ -29,6 +29,27 @@ transport/runtime JSON are integer milliseconds; memory/disk fields are bytes.
 All paths relative to a configuration file resolve against its containing
 directory. The executable reads at most 1 MiB of configuration.
 
+`runtime.async_persistence` defaults to `false`. When enabled, each hosted group
+has an ordered native writer for its Raft Ready operations. The original group
+worker retains Raft ownership; successful persistence receipts gate durable
+status, application, persisted messages and client acknowledgments. Pending log
+payloads share buffers with their write tasks. This does not change the physical
+WAL format or eliminate decoding when application reads the persisted log.
+
+The per-group pending window bounds Ready records, entries and their encoded
+bytes/descriptors, including deferred application and message ownership. Its
+byte limit derives from the configured data, peer and control byte budgets;
+transport admission separately bounds backing allocations. A full window
+refuses new proposals and limits ticks and peer input until it drains. It does
+not guarantee uninterrupted heartbeats under exhausted capacity. Checkpoint and
+snapshot barriers still wait for original pending writes. Shutdown joins the
+native writers, and persistence failures stop the runtime.
+
+With this option enabled, each group's `persistence` status reports pending
+ownership and native-writer `io` timing separately from `durable_poll`, which
+remains the Raft worker's timing. Moving a sync wait between these fields is not
+evidence of a throughput gain; validate the complete mixed workload and drain.
+
 Each advertised node has distinct peer, snapshot, data and control addresses, a
 TLS server name and a SHA-256 leaf-certificate pin. Prefer stable service names.
 Actual connection addresses in `endpoints` may be updated after Pod replacement;
