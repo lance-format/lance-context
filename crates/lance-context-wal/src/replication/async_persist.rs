@@ -34,6 +34,7 @@ pub(super) struct Persistence {
     delivered_apply: u64,
     max_application_record: usize,
     io: Arc<Mutex<runtime::PollObservation>>,
+    checkpoint_draining: bool,
 }
 
 pub(super) fn window(options: &runtime::Options, limits: &Limits) -> Result<Window> {
@@ -99,6 +100,7 @@ impl Persistence {
             delivered_apply: applied,
             max_application_record: 0,
             io,
+            checkpoint_draining: false,
         })
     }
 
@@ -119,6 +121,15 @@ impl Drop for Persistence {
 }
 
 impl Group {
+    // Stop collecting new Ready records while the original pending writes
+    // drain. The owner must keep polling and ticking; its existing safe-message
+    // path still sends leader heartbeats without advancing durability.
+    pub(super) fn drain_for_checkpoint(&mut self, draining: bool) {
+        if let Some(persistence) = &mut self.persistence {
+            persistence.checkpoint_draining = draining;
+        }
+    }
+
     pub(super) fn resume_persistence(&mut self) -> Result<()> {
         if let Some(persistence) = &self.persistence {
             self.raw.mut_store().buffered(persistence.window)?;
@@ -131,6 +142,9 @@ impl Group {
         let Some(persistence) = &self.persistence else {
             return Ok(true);
         };
+        if persistence.checkpoint_draining {
+            return Ok(false);
+        }
         let LogView::Buffered(log) = self.raw.store() else {
             return Ok(true);
         };

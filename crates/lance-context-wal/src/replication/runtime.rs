@@ -306,6 +306,7 @@ enum Work {
     #[cfg(feature = "peer-transport")]
     Fetch(u64, Instant, Completion<Option<Batch>>),
     Local(LocalWork),
+    Checkpoint(Box<images::CheckpointWork>),
 }
 type AfterPoll = Box<dyn FnOnce() + Send>;
 type LocalWork = Box<dyn FnOnce(&mut Node) -> AfterPoll + Send>;
@@ -749,6 +750,7 @@ impl Runtime {
                 options: options.clone(),
                 writes: BTreeMap::new(),
                 reads: BTreeMap::new(),
+                checkpoint: None,
             };
             let join = match thread::Builder::new()
                 .name(format!("wal-group-{group}"))
@@ -832,6 +834,7 @@ struct Worker {
     options: Options,
     writes: BTreeMap<u64, PendingWrite>,
     reads: BTreeMap<u64, Completion<query::Outcome>>,
+    checkpoint: Option<Box<images::CheckpointWork>>,
 }
 struct PendingWrite {
     reply: Completion<Outcome>,
@@ -922,6 +925,7 @@ impl Worker {
                 reply.finish(result);
             }
             Work::Local(work) => after_poll.push(work(&mut self.node)),
+            Work::Checkpoint(work) => self.queue_checkpoint(work),
         }
     }
     fn drive(&mut self) -> Result<()> {
@@ -987,6 +991,7 @@ impl Worker {
                 next_tick = Instant::now() + self.options.tick_interval;
                 activity = true;
             }
+            activity |= self.install_drained_checkpoint(&mut after_poll);
             if activity {
                 self.observation.lock().unwrap().polling = true;
                 let poll_started = Instant::now();
