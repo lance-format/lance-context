@@ -847,6 +847,22 @@ impl GenericStore {
         self.base.compact(options).await
     }
 
+    /// Prepare immutable compaction files without publishing a table version.
+    pub async fn prepare_compaction(
+        &self,
+        options: CompactionConfig,
+    ) -> LanceResult<crate::PreparedCompaction> {
+        self.base.prepare_compaction(options).await
+    }
+
+    /// Publish prepared files using a freshly opened, fenced handle.
+    pub async fn commit_prepared_compaction(
+        &mut self,
+        prepared: crate::PreparedCompaction,
+    ) -> LanceResult<CompactionMetrics> {
+        self.base.commit_prepared_compaction(prepared).await
+    }
+
     /// Whether the base table is fragmented enough to be worth compacting.
     #[must_use]
     pub fn should_compact(&self, config: &CompactionConfig) -> bool {
@@ -862,6 +878,24 @@ impl GenericStore {
     /// Build a BTree scalar index on `id`. Idempotent.
     pub async fn create_id_index(&mut self) -> LanceResult<()> {
         self.base.create_key_btree_index().await
+    }
+
+    /// Build the configured key index; the explicit BTree API is unchanged.
+    pub async fn create_id_key_index(&mut self) -> LanceResult<()> {
+        self.base.create_configured_key_index().await
+    }
+
+    /// Build immutable key-index files under a preparation-only write scope.
+    pub async fn prepare_id_key_index(&self) -> LanceResult<crate::PreparedKeyIndex> {
+        self.base.prepare_key_index().await
+    }
+
+    /// Publish prepared key-index files under fresh table write ownership.
+    pub async fn commit_prepared_id_key_index(
+        &mut self,
+        prepared: crate::PreparedKeyIndex,
+    ) -> LanceResult<()> {
+        self.base.commit_prepared_key_index(prepared).await
     }
 
     /// Row count of the base table. Excludes rows still in unmerged

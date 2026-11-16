@@ -444,13 +444,13 @@ pub struct MaintenanceConfig {
     /// worker admission or retroactively fence pre-upgrade writes.
     #[arg(long, env = "MASTER_FENCE_LEGACY_MAINTENANCE", default_value_t = false)]
     pub fence_legacy_maintenance: bool,
-    /// Prepare rollout compaction files without holding the table write lock.
-    /// Explicit rollout targets or '*'; empty keeps legacy behavior. Updates to
+    /// Prepare compaction files without holding the table write lock.
+    /// Exact rollout or `generic:<name>` targets or '*'; empty keeps legacy behavior. Updates to
     /// source fragments invalidate preparation instead of being overwritten.
     #[arg(long, env = "COMPACTION_PREPARE_TARGETS", value_delimiter = ',')]
     pub compaction_prepare_targets: Vec<String>,
-    /// Build rollout key-index files outside the table write lock. Exact
-    /// targets or '*'; empty retains legacy indexing. Commit remains fenced.
+    /// Build key-index files outside the table write lock. Exact rollout or
+    /// `generic:<name>` targets or '*'; empty retains legacy indexing. Commit remains fenced.
     #[arg(long, env = "INDEX_PREPARE_TARGETS", value_delimiter = ',')]
     pub index_prepare_targets: Vec<String>,
     /// Exact owned rollout targets whose dedicated publishers all use the

@@ -17,6 +17,7 @@ mod index_coverage;
 pub mod legacy_retirement;
 pub mod local_merge;
 mod maintenance_execution;
+mod maintenance_store;
 mod merge_capacity;
 mod merge_execution;
 mod native_failure_recovery;
