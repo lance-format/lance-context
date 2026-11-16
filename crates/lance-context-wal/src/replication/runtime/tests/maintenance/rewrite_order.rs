@@ -28,9 +28,14 @@ fn check_rewrite_order(hold_first_checkpoint: bool) -> Result<()> {
         )
     })?;
     let records = executor.block_on(async {
+        // Elect both test leaders before synchronous writes to the first
+        // group give the idle second group time to elect another leader.
+        // Campaigning later does not replace a healthy leader's lease.
+        for group in [10, 20] {
+            c.elect(1, group).await?;
+        }
         let mut records = Vec::new();
         for (group, bucket) in [(10, 0), (20, 1)] {
-            c.elect(1, group).await?;
             let value = Batch::new(
                 Uuid::from_u128(2),
                 bucket,
