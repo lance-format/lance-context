@@ -15,7 +15,7 @@ async fn rewrite_pressure_checkpoints_before_age_without_rebuilding_the_same_cut
     let index = commit(&c.handles[&1], 10, value.clone()).await?;
     // Exact retries enter Raft but leave one accepted record. This creates real
     // native rewrite work while the next application image stays small.
-    for _ in 0..384 {
+    for _ in 0..288 {
         ensure!(commit(&c.handles[&1], 10, value.clone()).await? == index);
     }
     let through = c.handles[&1].observation(10)?.status.applied;
@@ -34,6 +34,10 @@ async fn rewrite_pressure_checkpoints_before_age_without_rebuilding_the_same_cut
         usize::try_from(measured.max_log_bytes - measured.accounted_disk_bytes - (258 << 20))?,
         false,
     )?;
+    // Isolate a failed rewrite reservation: retained bytes must still lie
+    // outside the proactive two-file checkpoint window. A temporary reservation
+    // alone must not bypass the normal checkpoint cadence.
+    ensure!(!c.handles[&3].data_checkpoint_pressure());
     let progress = Arc::new(Mutex::new(maintenance::Progress::default()));
     let (stop, stopped) = tokio::sync::watch::channel(false);
     let task = tokio::spawn(maintenance::run(

@@ -431,6 +431,8 @@ impl Outbound {
 #[derive(Clone)]
 pub struct Handle {
     disk: Option<Arc<crate::admission::Budget>>,
+    #[cfg(feature = "service")]
+    log_file_headroom: u64,
     #[cfg(feature = "peer-transport")]
     images: std::sync::Weak<super::images::Owner>,
     routes: Arc<BTreeMap<u64, Route>>,
@@ -682,6 +684,8 @@ impl Runtime {
         let (outbox, receive) = async_mpsc::channel(options.peer_requests);
         let mut handle = Handle {
             disk: node.images.store().disk_budget().cloned(),
+            #[cfg(feature = "service")]
+            log_file_headroom: node.images.store().allocation_headroom()?,
             #[cfg(feature = "peer-transport")]
             images: Arc::downgrade(&node.images),
             routes: Arc::new(BTreeMap::new()),

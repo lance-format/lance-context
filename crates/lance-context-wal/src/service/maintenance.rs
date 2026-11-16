@@ -106,8 +106,13 @@ pub(crate) async fn run(
             // A previous checkpoint can make native segments reclaimable.
             // Do not defer an already due pass behind every remaining group's
             // image capture/build/install; those files still occupy producer
-            // admission. Keep the existing cadence and joined worker lane.
-            if background.last_log.elapsed() >= Duration::from_millis(options.log_interval_ms) {
+            // admission. Under data pressure, first capture the groups whose
+            // applied prefixes that pass would otherwise have to copy. The
+            // node-wide pass still runs after this sweep, and independently
+            // while waiting for image admission.
+            if background.last_log.elapsed() >= Duration::from_millis(options.log_interval_ms)
+                && !handle.data_checkpoint_pressure()
+            {
                 background.maintain().await;
                 if *background.stop.borrow() {
                     return Ok(());
@@ -135,8 +140,9 @@ pub(crate) async fn run(
             // Successful rewrites cannot discard an uncheckpointed prefix;
             // waiting for a rewrite failure would leave new writes blocked
             // until the ordinary checkpoint age. Leave room for a maximum-size
-            // proposal: admission can close before accounted bytes reach the
-            // ceiling. Recheck retained bytes after preceding maintenance.
+            // proposal and the native two-file pressure threshold: neither
+            // waits for accounted bytes to reach the ceiling. Recheck retained
+            // bytes after preceding maintenance.
             // Pending reservations alone cannot be reclaimed by checkpointing
             // and must not trigger image churn.
             let data_pressure = handle.data_checkpoint_pressure();
@@ -287,6 +293,10 @@ impl Background<'_> {
                 return None;
             }
             tokio::select! {
+                // A slow preceding image can leave this tick overdue. Admit
+                // ready image work before starting a potentially long native
+                // rewrite; maintenance remains eligible while admission waits.
+                biased;
                 _ = self.stop.changed() => return None,
                 result = &mut admission => return Some(result),
                 _ = self.tick.tick() => self.maintain().await,

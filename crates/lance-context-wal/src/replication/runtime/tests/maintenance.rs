@@ -9,6 +9,7 @@ mod checkpoint_pressure;
 mod checkpoint_reclamation;
 mod data_pressure;
 mod retired_images;
+mod rewrite_order;
 
 fn disk() -> DiskOptions {
     DiskOptions {
