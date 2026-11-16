@@ -171,7 +171,6 @@ async fn read_io_native_tables_retain_shared_store_and_classify_both_data_paths(
         session.clone(),
     )
     .await?;
-    let _uploads = super::super::metadata_upload::Scope::install(&narrow)?;
     let body = Storage::resolve(
         format!("file-object-store://{}/body", dir.path().display()),
         Default::default(),
@@ -186,8 +185,10 @@ async fn read_io_native_tables_retain_shared_store_and_classify_both_data_paths(
         registry.calculate_object_store_prefix(&narrow.uri, Some(&narrow.options))?,
         original_prefix
     );
+    let _uploads = super::super::metadata_upload::Scope::install(&narrow)?;
     let params = ObjectStoreParams::default();
-    let (first, _) = LanceStore::from_uri_and_params(registry.clone(), &narrow.uri, &params).await?;
+    let (first, _) =
+        LanceStore::from_uri_and_params(registry.clone(), &narrow.uri, &params).await?;
     let (second, _) = LanceStore::from_uri_and_params(registry, &body.uri, &params).await?;
     assert!(
         Arc::ptr_eq(&first, &second),
@@ -230,5 +231,87 @@ async fn read_io_native_tables_retain_shared_store_and_classify_both_data_paths(
     let serialized = serde_json::to_string(&rows)?;
     assert!(!serialized.contains(dir.path().to_str().unwrap()));
     assert!(!serialized.contains("file-object-store"));
+    Ok(())
+}
+
+#[derive(Debug)]
+struct AccountProvider(Arc<dyn ObjectStoreProvider>);
+
+#[async_trait::async_trait]
+impl ObjectStoreProvider for AccountProvider {
+    async fn new_store(
+        &self,
+        uri: url::Url,
+        params: &ObjectStoreParams,
+    ) -> lance::Result<LanceStore> {
+        self.0.new_store(uri, params).await
+    }
+    fn calculate_object_store_prefix(
+        &self,
+        _: &url::Url,
+        options: Option<&HashMap<String, String>>,
+    ) -> lance::Result<String> {
+        Ok(format!(
+            "memory${}",
+            options.unwrap().get("test_account").unwrap()
+        ))
+    }
+}
+
+#[tokio::test]
+async fn read_io_distinguishes_equal_paths_in_separate_backend_accounts() -> Result<()> {
+    use lance_io::object_store::{ObjectStoreRegistry, StorageOptionsAccessor};
+    let registry = Arc::new(ObjectStoreRegistry::default());
+    registry.insert(
+        "memory",
+        Arc::new(AccountProvider(registry.get_provider("memory").unwrap())),
+    );
+    let session = Arc::new(lance::session::Session::new(
+        1 << 20,
+        1 << 20,
+        registry.clone(),
+    ));
+    let narrow = Storage::resolve(
+        "memory://bucket/table".into(),
+        HashMap::from([("test_account".into(), "a".into())]),
+        session.clone(),
+    )
+    .await?;
+    let body = Storage::resolve(
+        narrow.uri.clone(),
+        HashMap::from([("test_account".into(), "b".into())]),
+        session,
+    )
+    .await?;
+    let scope = Scope::install(&narrow, Some(&body))?;
+    // This wrapper has the default prefix implementation. The diagnostic
+    // provider beneath it must still match each backend's original identity.
+    let _uploads = super::super::metadata_upload::Scope::install(&narrow)?;
+    for storage in [&narrow, &body] {
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                storage.options.clone(),
+            ))),
+            ..Default::default()
+        };
+        let (store, _) =
+            LanceStore::from_uri_and_params(registry.clone(), &storage.uri, &params).await?;
+        let path = Path::from("table/data/file.lance");
+        store
+            .inner
+            .put(&path, Bytes::from_static(b"data").into())
+            .await?;
+        assert_eq!(
+            store.inner.get(&path).await?.bytes().await?,
+            Bytes::from_static(b"data")
+        );
+    }
+    let rows = scope.observation();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].class, "narrow_data");
+    assert_eq!(rows[1].class, "body_data");
+    for row in rows {
+        assert_eq!((row.started, row.completed, row.bytes), (1, 1, 4));
+    }
     Ok(())
 }

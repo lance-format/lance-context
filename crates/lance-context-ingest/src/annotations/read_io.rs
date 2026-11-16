@@ -64,6 +64,8 @@ struct Target {
 pub(crate) struct Scope(Arc<[Counts; 5]>);
 
 impl Scope {
+    // Install below the existing upload wrapper so target matching uses the
+    // backend's own identity (including Azure's account), not wrapper defaults.
     pub(crate) fn install(narrow: &Storage, body: Option<&Storage>) -> Result<Self> {
         let registry = narrow.session.store_registry();
         ensure!(
