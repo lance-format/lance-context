@@ -183,6 +183,18 @@ async fn prepared_annotations_release_validation_workspace_before_submit() -> Re
         assert_eq!(upload_budget.reserved(), 4 * body.len());
         drop(held);
         assert_eq!(upload_budget.reserved(), 0);
+        // Owned input charges spare Vec capacity as well as visible IPC bytes,
+        // while retaining the original pointer across preparation.
+        let mut owned = Vec::with_capacity(2 * body.len());
+        owned.extend_from_slice(&body);
+        let capacity = owned.capacity();
+        let pointer = owned.as_ptr();
+        let upload = service.reserve_upload(owned.len()).await?;
+        let prepared = service.prepare_owned(upload, owned, &producer, 5).await?;
+        assert_eq!(prepared.body().as_ptr(), pointer);
+        assert_eq!(upload_budget.reserved(), capacity);
+        drop(prepared);
+        assert_eq!(upload_budget.reserved(), 0);
         // A shared slice does not establish its parent's allocation size. Keep
         // the original allowance without copying or claiming exact accounting.
         let mut parent = vec![0; body.len()];

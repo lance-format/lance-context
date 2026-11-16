@@ -7,7 +7,7 @@ fn large_create(ids: &[&str]) -> Result<Vec<u8>> {
         LargeBinaryArray::from_iter_values((0..ids.len()).map(|_| vec![7; 256 << 10])),
     );
     let batch = RecordBatch::try_new(source.schema(), columns)?;
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(ids.len() * (256 << 10) + (64 << 10));
     let mut writer = FileWriter::try_new(&mut bytes, &batch.schema())?;
     writer.write(&batch)?;
     writer.finish()?;
