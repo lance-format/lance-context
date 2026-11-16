@@ -1,7 +1,7 @@
 use super::*;
 use lance::index::DatasetIndexInternalExt;
 
-fn batch(ids: Vec<String>, status: &str) -> Result<RecordBatch> {
+pub(super) fn batch(ids: Vec<String>, status: &str) -> Result<RecordBatch> {
     let rows = ids.len();
     let mut labels = ListBuilder::new(StringBuilder::new());
     for _ in 0..rows {
