@@ -1,6 +1,30 @@
 use super::*;
 use crate::replication::runtime::Work;
 
+// Close the real listener's idle connections and reopen the same endpoint.
+// This tests the pool's EOF handling without shortening the next request's
+// durability deadline just to make an idle timeout arrive sooner.
+pub(super) async fn close_idle(cluster: &mut RpcCluster, node: u64, data: bool) -> Result<()> {
+    let index = node as usize - 1;
+    cluster.servers.remove(index).shutdown().await?;
+    let endpoint = &cluster.endpoints[&node];
+    let data_listener = TcpListener::bind(&endpoint.data_address).await?;
+    let control_listener = TcpListener::bind(&endpoint.control_address).await?;
+    let mut config = (*cluster.net.tls[&node].server).clone();
+    config.alpn_protocols = vec![ALPN.to_vec()];
+    let server = Server::spawn(
+        cluster.net.nodes[&node].handle.clone(),
+        data_listener,
+        control_listener,
+        BTreeSet::from([cluster.net.tls[&4].certificate]),
+        Arc::new(config),
+        Options::default(),
+    )?;
+    cluster.servers.insert(index, server);
+    let pools = &cluster.client.nodes[&node];
+    wait_for_idle_close(if data { &pools.data } else { &pools.control }).await
+}
+
 pub(super) async fn delayed_append(
     cluster: &RpcCluster,
     leader: u64,
