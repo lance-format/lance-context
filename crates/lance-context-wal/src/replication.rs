@@ -51,6 +51,8 @@ use crate::{
 pub use images::{CheckpointTask, PreparedCheckpoint, SnapshotReceiver};
 use state::State;
 
+const PROPOSAL_DISK_OVERHEAD: usize = 4096;
+
 /// Immutable, replicated-state bounds. All peers and reopens must use the same
 /// policy. These bounds do not account for queues in the caller's transport.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -794,7 +796,7 @@ impl Node {
                 let bytes = batch
                     .body
                     .len()
-                    .checked_add(4096)
+                    .checked_add(PROPOSAL_DISK_OVERHEAD)
                     .context("proposal disk reservation overflow")?;
                 budget.reserve(bytes, batch.meta.kind == crate::record::RecordKind::Data)
             })
