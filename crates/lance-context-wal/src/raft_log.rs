@@ -627,6 +627,11 @@ impl GroupLog {
         self.node.sync_gate.lock().unwrap()
     }
 
+    #[cfg(all(test, feature = "service"))]
+    pub(crate) fn pause_rewrite_sync_for_test(&self) -> fault_tests::FilePause {
+        self.node.fault.pause_rewrite_sync_for_test()
+    }
+
     /// Engine append visibility is deliberately not a sync/durability receipt.
     #[cfg(all(test, feature = "runtime"))]
     pub(crate) fn appended_index_for_test(&self) -> Option<u64> {

@@ -93,13 +93,13 @@ impl FaultControl {
     }
 }
 
-pub(super) struct FilePause {
+pub(crate) struct FilePause {
     entered: mpsc::Receiver<()>,
     release: mpsc::Sender<()>,
 }
 
 impl FilePause {
-    pub(super) fn wait(&self) -> Result<()> {
+    pub(crate) fn wait(&self) -> Result<()> {
         self.entered.recv_timeout(Duration::from_secs(10))?;
         Ok(())
     }

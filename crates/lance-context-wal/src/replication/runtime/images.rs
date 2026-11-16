@@ -211,7 +211,12 @@ impl Handle {
             let proposal = self
                 .max_record
                 .saturating_add(crate::replication::PROPOSAL_DISK_OVERHEAD);
-            disk.data_limit.saturating_sub(disk.accounted_disk_bytes) < proposal as u64
+            // Native pressure rewriting starts with two target files of room
+            // left. Checkpoint before copying a prefix that the image can
+            // retire, even if another maximum-size proposal still fits.
+            // Reservations alone cannot be reclaimed by a checkpoint.
+            disk.data_limit.saturating_sub(disk.accounted_disk_bytes)
+                < self.log_file_headroom.max(proposal as u64)
         })
     }
 
