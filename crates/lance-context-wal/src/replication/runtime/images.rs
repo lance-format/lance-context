@@ -204,6 +204,17 @@ impl Handle {
     pub fn disk_budget(&self) -> Option<crate::admission::Snapshot> {
         self.disk.as_ref().map(|budget| budget.snapshot())
     }
+
+    #[cfg(feature = "service")]
+    pub(crate) fn data_checkpoint_pressure(&self) -> bool {
+        self.disk_budget().is_some_and(|disk| {
+            let proposal = self
+                .max_record
+                .saturating_add(crate::replication::PROPOSAL_DISK_OVERHEAD);
+            disk.data_limit.saturating_sub(disk.accounted_disk_bytes) < proposal as u64
+        })
+    }
+
     /// Capture a blocking directory measurement retaining the physical engine.
     /// Run this on the maintenance worker, never on an async executor thread.
     pub fn prepare_disk_measurement(&self) -> Result<Pending<crate::raft_log::DiskMeasurement>> {

@@ -129,12 +129,12 @@ pub(crate) async fn run(
             // native rewrite still fits its independent scratch allowance.
             // Successful rewrites cannot discard an uncheckpointed prefix;
             // waiting for a rewrite failure would leave new writes blocked
-            // until the ordinary checkpoint age. Recheck retained bytes after
-            // preceding maintenance. Pending reservations alone cannot be
-            // reclaimed by checkpointing and must not trigger image churn.
-            let data_pressure = handle
-                .disk_budget()
-                .is_some_and(|disk| disk.accounted_disk_bytes >= disk.data_limit);
+            // until the ordinary checkpoint age. Leave room for a maximum-size
+            // proposal: admission can close before accounted bytes reach the
+            // ceiling. Recheck retained bytes after preceding maintenance.
+            // Pending reservations alone cannot be reclaimed by checkpointing
+            // and must not trigger image churn.
+            let data_pressure = handle.data_checkpoint_pressure();
             // A refused native rewrite may still include an applied prefix
             // that a fresh image can replace. Do not retain that prefix until
             // the ordinary age/entry threshold while reclamation lacks room.

@@ -2,6 +2,15 @@ use super::*;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn data_pressure_checkpoints_before_age_without_rewrite_admission_failure() -> Result<()> {
+    check_data_pressure(false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn insufficient_proposal_room_checkpoints_before_data_limit() -> Result<()> {
+    check_data_pressure(true).await
+}
+
+async fn check_data_pressure(below_limit: bool) -> Result<()> {
     let root = tempfile::tempdir()?;
     let c = Cluster::open_with_storage(
         root.path(),
@@ -39,7 +48,15 @@ async fn data_pressure_checkpoints_before_age_without_rewrite_admission_failure(
     // new data lacks room while native rewriting still has its reserved headroom.
     // Lower only this test's follower data ceiling after building the log; no
     // outstanding reservation is released or converted into fictitious free space.
-    budget.limit_data(16 << 20)?;
+    let data_limit = if below_limit {
+        measured.accounted_disk_bytes + (512 << 10)
+    } else {
+        16 << 20
+    };
+    budget.limit_data(usize::try_from(data_limit)?)?;
+    if below_limit {
+        ensure!(budget.snapshot().accounted_disk_bytes < data_limit);
+    }
     ensure!(budget.reserve(1 << 20, true).is_err());
     let progress = Arc::new(Mutex::new(maintenance::Progress::default()));
     let (stop, stopped) = tokio::sync::watch::channel(false);
