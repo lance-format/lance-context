@@ -3,8 +3,10 @@ use super::*;
 #[cfg(unix)]
 mod checkpoint_crash;
 
+mod checkpoint_peers;
 mod checkpoint_queue;
 mod follower_checkpoint;
+mod ready_window;
 
 fn executor() -> Result<tokio::runtime::Runtime> {
     Ok(tokio::runtime::Builder::new_multi_thread()

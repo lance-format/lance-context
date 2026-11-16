@@ -215,12 +215,27 @@ impl Group {
 
     /// Includes Ready application/read/message ownership, not just staged I/O.
     pub(super) fn accepts_async(&self, extra: &[Entry]) -> Result<bool> {
+        if self
+            .persistence
+            .as_ref()
+            .is_some_and(|p| p.checkpoint_draining)
+        {
+            return Ok(false);
+        }
+        if matches!(self.raw.store(), LogView::Buffered(log) if !log.has_ready_slot()) {
+            return Ok(false);
+        }
+        self.accepts_peer_async(extra)
+    }
+
+    /// A checkpoint or full task queue pauses Ready collection, not bounded input.
+    /// Peers may still fill the existing unstable-entry/message window while
+    /// original writes drain. New input waits for drive_async to resume Ready
+    /// collection before persisted replies or apply. No queue or budget grows.
+    pub(super) fn accepts_peer_async(&self, extra: &[Entry]) -> Result<bool> {
         let Some(persistence) = &self.persistence else {
             return Ok(true);
         };
-        if persistence.checkpoint_draining {
-            return Ok(false);
-        }
         let LogView::Buffered(log) = self.raw.store() else {
             return Ok(true);
         };
@@ -254,7 +269,7 @@ impl Group {
                 .map(|m| m.compute_size() as usize + std::mem::size_of::<Message>())
                 .sum()
         };
-        log.can_stage_with(
+        log.can_buffer_with(
             &self.raw.raft.raft_log.unstable.entries,
             extra,
             persistence.deferred_bytes + application + reads + messages,

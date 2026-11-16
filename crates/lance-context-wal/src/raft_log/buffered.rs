@@ -359,15 +359,28 @@ impl BufferedLog {
         extra: &[Entry],
         reserved: usize,
     ) -> Result<bool> {
+        Ok(self.can_buffer_with(entries, extra, reserved)? && self.has_ready_slot())
+    }
+
+    pub(crate) fn has_ready_slot(&self) -> bool {
+        self.usage.readies + usize::from(self.checkpoint.is_some()) < self.window.readies
+    }
+
+    /// Peer input may wait in bounded Raft memory without allocating a native
+    /// task. Ready collection separately requires an available task slot.
+    pub(crate) fn can_buffer_with(
+        &self,
+        entries: &[Entry],
+        extra: &[Entry],
+        reserved: usize,
+    ) -> Result<bool> {
         self.check()?;
         let bytes = Self::entry_charge(entries)?
             .checked_add(Self::entry_charge(extra)? - std::mem::size_of::<Pending>())
             .and_then(|bytes| bytes.checked_add(reserved))
             .context("pending entry accounting overflow")?;
         Ok(
-            self.usage.readies + usize::from(self.checkpoint.is_some()) < self.window.readies
-                && entries.len() + extra.len()
-                    <= self.window.entries.saturating_sub(self.usage.entries)
+            entries.len() + extra.len() <= self.window.entries.saturating_sub(self.usage.entries)
                 && bytes <= self.window.bytes.saturating_sub(self.usage.bytes),
         )
     }

@@ -890,7 +890,7 @@ impl Node {
                 && message.get_msg_type() == MessageType::MsgHeartbeatResponse
                 && message.entries.is_empty())
                 || group.accepts_durable_term_heartbeat(&message)?
-                || group.accepts_async(&message.entries)?,
+                || group.accepts_peer_async(&message.entries)?,
             async_persist::PeerPersistenceCapacity
         );
         let reservation = if message.get_msg_type() == MessageType::MsgAppend
