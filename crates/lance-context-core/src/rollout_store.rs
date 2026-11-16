@@ -76,6 +76,7 @@ use lance::{Error as LanceError, Result as LanceResult};
 use lance_index::mem_wal::ShardManifest;
 use serde_json::Value;
 use uuid::Uuid;
+use tracing::Instrument;
 
 use crate::merge_budget::MergeMemoryBudget;
 use crate::rollout::RolloutRecord;
@@ -221,6 +222,7 @@ impl RolloutFilters {
         (!clauses.is_empty()).then(|| clauses.join(" AND "))
     }
 
+    #[cfg(test)]
     fn matches_record(&self, record: &RolloutRecord) -> bool {
         fn matches_required(actual: &str, expected: Option<&str>) -> bool {
             match expected {
@@ -253,6 +255,69 @@ impl RolloutFilters {
             && self
                 .include_in_training
                 .is_none_or(|expected| record.include_in_training == Some(expected))
+    }
+
+    /// Evaluate the narrow selection projection without allocating a complete
+    /// owned record (and its strings) for every row in the dataset.
+    fn matches_selection_batch(&self, batch: &RecordBatch) -> LanceResult<Vec<bool>> {
+        let ids = column_as::<StringArray>(batch, "id")?;
+        let rollout_ids = column_as::<StringArray>(batch, "rollout_id")?;
+        let problem_ids = column_as::<StringArray>(batch, "problem_id")?;
+        let datasets = column_as_optional::<StringArray>(batch, "dataset");
+        // Retain the decoder's required-column and per-row validation even for
+        // columns that the current filter does not compare.
+        column_as::<Int32Array>(batch, "sequence_order")?;
+        let roles = column_as::<DictionaryArray<Int8Type>>(batch, "role")?;
+        let created_at = column_as::<TimestampMicrosecondArray>(batch, "created_at")?;
+        let content_types = column_as::<StringArray>(batch, "content_type")?;
+        let policies = column_as_optional::<StringArray>(batch, "policy_version");
+        let artifacts = column_as_optional::<StringArray>(batch, "artifact_type");
+        let training = column_as_optional::<BooleanArray>(batch, "include_in_training");
+        let required = |actual: &str, expected: Option<&str>| {
+            expected
+                .filter(|value| !value.is_empty())
+                .is_none_or(|value| actual == value)
+        };
+        let optional = |array: Option<&StringArray>, row: usize, expected: Option<&str>| {
+            expected
+                .filter(|value| !value.is_empty())
+                .is_none_or(|value| {
+                    array.is_some_and(|array| !array.is_null(row) && array.value(row) == value)
+                })
+        };
+        (0..batch.num_rows())
+            .map(|row| {
+                timestamp_from_micros(created_at.value(row), "created_at")?;
+                let role_values = roles
+                    .values()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| {
+                        LanceError::from(ArrowError::InvalidArgumentError(
+                            "role dictionary values are not strings".to_string(),
+                        ))
+                    })?;
+                if roles.is_null(row) {
+                    return Err(LanceError::from(ArrowError::InvalidArgumentError(
+                        "role column contains null values".to_string(),
+                    )));
+                }
+                let role = role_values.value(roles.keys().value(row) as usize);
+                Ok(required(ids.value(row), self.id.as_deref())
+                    && required(rollout_ids.value(row), self.rollout_id.as_deref())
+                    && required(problem_ids.value(row), self.problem_id.as_deref())
+                    && optional(datasets, row, self.dataset.as_deref())
+                    && required(role, self.role.as_deref())
+                    && required(content_types.value(row), self.content_type.as_deref())
+                    && optional(policies, row, self.policy_version.as_deref())
+                    && optional(artifacts, row, self.artifact_type.as_deref())
+                    && self.include_in_training.is_none_or(|expected| {
+                        training.is_some_and(|array| {
+                            !array.is_null(row) && array.value(row) == expected
+                        })
+                    }))
+            })
+            .collect()
     }
 }
 
@@ -435,6 +500,8 @@ pub struct RolloutStore {
     observation_pause: std::sync::Mutex<Option<Arc<PointReadPause>>>,
     #[cfg(test)]
     selected_list_pause: std::sync::Mutex<Option<Arc<SelectedListPause>>>,
+    #[cfg(test)]
+    selection_decoder_reference: bool,
 }
 
 #[cfg(test)]
@@ -582,6 +649,8 @@ impl RolloutStore {
             observation_pause: Default::default(),
             #[cfg(test)]
             selected_list_pause: Default::default(),
+            #[cfg(test)]
+            selection_decoder_reference: false,
         })
     }
     /// URI of the underlying Lance dataset.
@@ -1025,12 +1094,28 @@ impl RolloutStore {
             return Ok(Vec::new());
         }
         if limit.is_some() || filters.is_some() {
-            return self
-                .base
-                .read_consistent(ListSource::All, |dataset, snapshots| {
-                    self.list_selected_snapshot(dataset, snapshots, limit, offset, filters)
-                })
-                .await;
+            // Correlate core-stage timings without recording filter values or
+            // row payloads. The span is scoped to this existing read future.
+            let span = tracing::info_span!("rollout_selected_read", read_id = %Uuid::now_v7());
+            return async {
+                let started = std::time::Instant::now();
+                let result = self
+                    .base
+                    .read_consistent(ListSource::All, |dataset, snapshots| {
+                        self.list_selected_snapshot(dataset, snapshots, limit, offset, filters)
+                    })
+                    .await;
+                let elapsed = started.elapsed();
+                if elapsed >= std::time::Duration::from_secs(5) {
+                    tracing::warn!(uri = %self.base.dataset.uri(), ?limit, ?offset,
+                        filtered = filters.is_some(), success = result.is_ok(),
+                        elapsed_ms = elapsed.as_millis() as u64,
+                        "rollout selected read total timing");
+                }
+                result
+            }
+            .instrument(span)
+            .await;
         }
         Ok(self
             .list_all_non_blob_records()
@@ -1048,6 +1133,7 @@ impl RolloutStore {
         offset: Option<usize>,
         filters: Option<&RolloutFilters>,
     ) -> LanceResult<Vec<RolloutRecord>> {
+        let started = std::time::Instant::now();
         #[cfg(test)]
         let selected_pause = self.selected_list_pause.lock().unwrap().clone();
         #[cfg(test)]
@@ -1107,6 +1193,8 @@ impl RolloutStore {
             pause.resume.notified().await;
         }
 
+        let sources_opened = std::time::Instant::now();
+        let mut selection_rows = 0usize;
         let mut positions = HashMap::new();
         let mut selections = Vec::new();
         for (source_index, dataset) in sources.iter().enumerate() {
@@ -1121,6 +1209,7 @@ impl RolloutStore {
             while let Some(batch) = stream.try_next().await.inspect_err(|_| {
                 report_source_failure("selection_stream", source_kind);
             })? {
+                selection_rows = selection_rows.saturating_add(batch.num_rows());
                 let row_ids = column_as::<UInt64Array>(&batch, "_rowid")?.clone();
                 let selection_indices = batch
                     .schema()
@@ -1135,12 +1224,18 @@ impl RolloutStore {
                 )?;
                 let matches = filters
                     .map(|filters| {
-                        batch_to_rollout_records(&aligned).map(|records| {
-                            records
-                                .into_iter()
-                                .map(|record| filters.matches_record(&record))
-                                .collect::<Vec<_>>()
-                        })
+                        // Keep the prior implementation available only for local
+                        // end-to-end benchmark comparisons on the same snapshot.
+                        #[cfg(test)]
+                        if self.selection_decoder_reference {
+                            return batch_to_rollout_records(&aligned).map(|records| {
+                                records
+                                    .into_iter()
+                                    .map(|row| filters.matches_record(&row))
+                                    .collect()
+                            });
+                        }
+                        filters.matches_selection_batch(&aligned)
                     })
                     .transpose()?;
                 let ids = column_as::<StringArray>(&aligned, "id")?;
@@ -1159,6 +1254,7 @@ impl RolloutStore {
                 }
             }
         }
+        let selection_finished = std::time::Instant::now();
         // The winning row may fail the filter even if an older row passed it.
         // Do not filter sources independently or fetch rows by id again.
         drop(positions);
@@ -1207,12 +1303,24 @@ impl RolloutStore {
                 }
             }
         }
-        results
+        let result = results
             .into_iter()
             .map(|record| {
                 record.ok_or_else(|| LanceError::io("rollout page row was not materialized"))
             })
-            .collect()
+            .collect::<LanceResult<Vec<_>>>();
+        let finished = std::time::Instant::now();
+        if finished.duration_since(started) >= std::time::Duration::from_secs(5) {
+            tracing::warn!(uri = %self.base.dataset.uri(), ?limit, ?offset,
+                filtered = filters.is_some(), source_count = sources.len(), selection_rows,
+                selected_rows = count, success = result.is_ok(),
+                source_open_ms = sources_opened.duration_since(started).as_millis() as u64,
+                selection_ms = selection_finished.duration_since(sources_opened).as_millis() as u64,
+                materialize_ms = finished.duration_since(selection_finished).as_millis() as u64,
+                elapsed_ms = finished.duration_since(started).as_millis() as u64,
+                "rollout selected read stage timings");
+        }
+        result
     }
 
     /// Return one complete trajectory in deterministic message order.
@@ -4465,6 +4573,8 @@ mod tests {
             observation_pause: Default::default(),
             #[cfg(test)]
             selected_list_pause: Default::default(),
+            #[cfg(test)]
+            selection_decoder_reference: false,
             base: StorageBase::open(
                 &uri,
                 StorageBaseOptions {
@@ -4881,6 +4991,411 @@ mod tests {
             assert_eq!(obs.row_count, 2);
             assert!(obs.last_updated > 0);
         });
+    }
+
+    fn selection_predicate_fixture() -> RecordBatch {
+        RecordBatch::try_from_iter(vec![
+            (
+                "id",
+                Arc::new(StringArray::from(vec!["one", "two", "three", "four"])) as ArrayRef,
+            ),
+            (
+                "rollout_id",
+                Arc::new(StringArray::from(vec!["r", "other", "r", "r"])),
+            ),
+            (
+                "problem_id",
+                Arc::new(StringArray::from(vec!["p", "p", "other", "p"])),
+            ),
+            (
+                "sequence_order",
+                Arc::new(Int32Array::from(vec![0, 1, 2, 3])),
+            ),
+            (
+                "role",
+                Arc::new(DictionaryArray::<Int8Type>::from_iter(vec![
+                    "assistant",
+                    "artifact",
+                    "assistant",
+                    "user",
+                ])),
+            ),
+            (
+                "created_at",
+                Arc::new(TimestampMicrosecondArray::from(vec![
+                    1_700_000_000_000_000;
+                    4
+                ])),
+            ),
+            (
+                "content_type",
+                Arc::new(StringArray::from(vec![
+                    "text/plain",
+                    "image/png",
+                    "text/plain",
+                    "text/plain",
+                ])),
+            ),
+            (
+                "dataset",
+                Arc::new(StringArray::from(vec![
+                    Some("d'quoted"),
+                    None,
+                    Some(""),
+                    Some("other"),
+                ])),
+            ),
+            (
+                "policy_version",
+                Arc::new(StringArray::from(vec![
+                    Some("v"),
+                    Some("other"),
+                    None,
+                    Some(""),
+                ])),
+            ),
+            (
+                "artifact_type",
+                Arc::new(StringArray::from(vec![None, Some("image"), Some(""), None])),
+            ),
+            (
+                "include_in_training",
+                Arc::new(BooleanArray::from(vec![
+                    Some(true),
+                    Some(false),
+                    None,
+                    Some(false),
+                ])),
+            ),
+        ])
+        .unwrap()
+    }
+
+    fn selection_predicate_replace(
+        batch: &RecordBatch,
+        name: &str,
+        value: ArrayRef,
+    ) -> RecordBatch {
+        RecordBatch::try_from_iter(batch.schema().fields().iter().zip(batch.columns()).map(
+            |(field, column)| {
+                (
+                    field.name().clone(),
+                    if field.name() == name {
+                        value.clone()
+                    } else {
+                        column.clone()
+                    },
+                )
+            },
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn selection_predicate_matches_decoder_for_all_filters_and_nulls() {
+        let batch = selection_predicate_fixture();
+        let mut filters = vec![RolloutFilters::default()];
+        for field in [
+            "id",
+            "rollout_id",
+            "problem_id",
+            "role",
+            "content_type",
+            "dataset",
+            "policy_version",
+            "artifact_type",
+        ] {
+            let actual = match field {
+                "id" => "one",
+                "rollout_id" => "r",
+                "problem_id" => "p",
+                "role" => "assistant",
+                "content_type" => "text/plain",
+                "dataset" => "d'quoted",
+                "policy_version" => "v",
+                _ => "image",
+            };
+            for value in [actual, "", "absent"] {
+                let mut filter = RolloutFilters::default();
+                match field {
+                    "id" => filter.id = Some(value.into()),
+                    "rollout_id" => filter.rollout_id = Some(value.into()),
+                    "problem_id" => filter.problem_id = Some(value.into()),
+                    "role" => filter.role = Some(value.into()),
+                    "content_type" => filter.content_type = Some(value.into()),
+                    "dataset" => filter.dataset = Some(value.into()),
+                    "policy_version" => filter.policy_version = Some(value.into()),
+                    "artifact_type" => filter.artifact_type = Some(value.into()),
+                    _ => unreachable!(),
+                }
+                filters.push(filter);
+            }
+        }
+        for value in [true, false] {
+            filters.push(RolloutFilters {
+                include_in_training: Some(value),
+                ..Default::default()
+            });
+        }
+        // Every string filter also participates in a conjunction with nullable bools.
+        let singles = filters.clone();
+        for filter in singles {
+            for value in [true, false] {
+                filters.push(RolloutFilters {
+                    include_in_training: Some(value),
+                    ..filter.clone()
+                });
+            }
+        }
+        filters.push(RolloutFilters {
+            id: Some("one".into()),
+            rollout_id: Some("r".into()),
+            problem_id: Some("p".into()),
+            dataset: Some("d'quoted".into()),
+            role: Some("assistant".into()),
+            content_type: Some("text/plain".into()),
+            policy_version: Some("v".into()),
+            artifact_type: Some("".into()),
+            include_in_training: Some(true),
+        });
+        let required_only = batch.project(&(0..7).collect::<Vec<_>>()).unwrap();
+        for batch in [batch.clone(), required_only, batch.slice(0, 0)] {
+            let records = batch_to_rollout_records(&batch).unwrap();
+            for filter in &filters {
+                let reference: Vec<_> = records
+                    .iter()
+                    .map(|record| filter.matches_record(record))
+                    .collect();
+                assert_eq!(
+                    filter.matches_selection_batch(&batch).unwrap(),
+                    reference,
+                    "{filter:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn selection_predicate_preserves_validation_for_rejected_rows() {
+        let batch = selection_predicate_fixture();
+        let filter = RolloutFilters {
+            id: Some("never-matches".into()),
+            ..Default::default()
+        };
+        let invalid = [
+            selection_predicate_replace(
+                &batch,
+                "created_at",
+                Arc::new(TimestampMicrosecondArray::from(vec![0, 0, 0, i64::MAX])),
+            ),
+            selection_predicate_replace(
+                &batch,
+                "role",
+                Arc::new(DictionaryArray::<Int8Type>::from_iter(vec![
+                    Some("assistant"),
+                    Some("artifact"),
+                    None,
+                    Some("user"),
+                ])),
+            ),
+            selection_predicate_replace(
+                &batch,
+                "role",
+                Arc::new(
+                    DictionaryArray::<Int8Type>::try_new(
+                        Int8Array::from(vec![0, 0, 0, 0]),
+                        Arc::new(Int32Array::from(vec![1])),
+                    )
+                    .unwrap(),
+                ),
+            ),
+            selection_predicate_replace(
+                &batch,
+                "sequence_order",
+                Arc::new(StringArray::from(vec!["0"; 4])),
+            ),
+            batch.project(&[0, 1, 2, 4, 5, 6]).unwrap(),
+        ];
+        for batch in invalid {
+            let reference = batch_to_rollout_records(&batch).unwrap_err();
+            let actual = filter.matches_selection_batch(&batch).unwrap_err();
+            match (actual, reference) {
+                (
+                    LanceError::Arrow {
+                        message: actual, ..
+                    },
+                    LanceError::Arrow {
+                        message: reference, ..
+                    },
+                ) => assert_eq!(actual, reference),
+                errors => panic!("expected matching Arrow validation errors: {errors:?}"),
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "isolated CPU benchmark; run with --ignored --nocapture"]
+    fn selection_predicate_benchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let small = selection_predicate_fixture();
+        let batch = arrow_select::concat::concat_batches(
+            &small.schema(),
+            std::iter::repeat_n(&small, 2048),
+        )
+        .unwrap();
+        let filter = RolloutFilters {
+            policy_version: Some("v".into()),
+            include_in_training: Some(true),
+            ..Default::default()
+        };
+        let expected: Vec<_> = batch_to_rollout_records(&batch)
+            .unwrap()
+            .iter()
+            .map(|record| filter.matches_record(record))
+            .collect();
+        assert_eq!(filter.matches_selection_batch(&batch).unwrap(), expected);
+        for round in 0..7 {
+            let mut measurements = [0u128; 2];
+            for kind in if round % 2 == 0 { [0, 1] } else { [1, 0] } {
+                let start = Instant::now();
+                for _ in 0..32 {
+                    let actual = if kind == 0 {
+                        batch_to_rollout_records(black_box(&batch))
+                            .unwrap()
+                            .iter()
+                            .map(|record| filter.matches_record(record))
+                            .collect::<Vec<_>>()
+                    } else {
+                        filter.matches_selection_batch(black_box(&batch)).unwrap()
+                    };
+                    black_box(actual);
+                }
+                measurements[kind] = start.elapsed().as_nanos();
+            }
+            println!(
+                "selection_predicate round={round} rows={} decoder_ns={} direct_ns={}",
+                batch.num_rows() * 32,
+                measurements[0],
+                measurements[1]
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "isolated local listing benchmark; run with --ignored --nocapture"]
+    async fn selected_list_performance_benchmark() {
+        use std::time::Instant;
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut writer = RolloutStore::open_with_options(
+            uri,
+            RolloutStoreOptions {
+                merge_after_generations: Some(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let total_rows = 262_144usize;
+        let fragment_rows = 4096usize;
+        for start in (0..total_rows).step_by(fragment_rows) {
+            let records = (start..start + fragment_rows)
+                .map(|row| {
+                    let mut record = assistant_record(&format!("benchmark-record-{row:020}"));
+                    record.rollout_id = format!("trajectory-{:020}", row / 16);
+                    record.problem_id = format!("problem-{:020}", row / 64);
+                    record.content = Some("synthetic content ".repeat(32));
+                    record.policy_version =
+                        Some(if row % 1000 == 0 { "selected" } else { "other" }.into());
+                    record
+                })
+                .collect::<Vec<_>>();
+            let batch = writer.records_to_batch(&records).unwrap();
+            let schema = batch.schema();
+            writer
+                .base
+                .dataset
+                .append(
+                    RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        // Exercise last-winner resolution across the base and two immutable WALs.
+        for (id, policy) in [(0usize, "other"), (1000, "selected")] {
+            let mut record = assistant_record(&format!("benchmark-record-{id:020}"));
+            record.policy_version = Some(policy.into());
+            writer.add(&[record]).await.unwrap();
+            writer.flush().await.unwrap();
+        }
+        let mut reference = RolloutStore::open(uri).await.unwrap();
+        reference.selection_decoder_reference = true;
+        let mut direct = RolloutStore::open(uri).await.unwrap();
+        for (name, filter, limit) in [
+            (
+                "small_match",
+                RolloutFilters {
+                    policy_version: Some("selected".into()),
+                    ..Default::default()
+                },
+                3,
+            ),
+            (
+                "large_page",
+                RolloutFilters {
+                    policy_version: Some("selected".into()),
+                    ..Default::default()
+                },
+                5000,
+            ),
+            (
+                "empty",
+                RolloutFilters {
+                    policy_version: Some("absent".into()),
+                    ..Default::default()
+                },
+                5000,
+            ),
+        ] {
+            let expected = reference
+                .list_with_filters(Some(limit), None, Some(&filter))
+                .await
+                .unwrap();
+            let actual = direct
+                .list_with_filters(Some(limit), None, Some(&filter))
+                .await
+                .unwrap();
+            assert_eq!(actual.len(), expected.len());
+            for (actual, expected) in actual.iter().zip(&expected) {
+                assert_records_eq(actual, expected);
+            }
+            let expected_count = match name {
+                "small_match" => 3,
+                "large_page" => 262,
+                _ => 0,
+            };
+            assert_eq!(expected.len(), expected_count);
+            for round in 0..5 {
+                let mut timings = [0u128; 2];
+                for kind in if round % 2 == 0 { [0, 1] } else { [1, 0] } {
+                    let store = if kind == 0 { &reference } else { &direct };
+                    let start = Instant::now();
+                    let rows = store
+                        .list_with_filters(Some(limit), None, Some(&filter))
+                        .await
+                        .unwrap();
+                    timings[kind] = start.elapsed().as_nanos();
+                    assert_eq!(rows.len(), expected_count);
+                    std::hint::black_box(rows);
+                }
+                println!("selected_list case={name} round={round} source_rows={total_rows} decoder_ns={} direct_ns={}", timings[0], timings[1]);
+            }
+        }
+        direct.close().await.unwrap();
+        reference.close().await.unwrap();
+        writer.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -5501,17 +6016,22 @@ mod tests {
                 policy_version: Some(version.into()),
                 ..Default::default()
             };
-            let actual = store
-                .list_with_filters(Some(2), None, Some(&filters))
-                .await
-                .unwrap();
-            let expected = expected
+            let matching = expected
                 .iter()
                 .filter(|row| filters.matches_record(row))
                 .collect::<Vec<_>>();
-            assert_eq!(actual.len(), expected.len());
-            for (actual, expected) in actual.iter().zip(expected) {
-                assert_records_eq(actual, expected);
+            for limit in [0, 1, 2] {
+                for offset in [0, 1, 3] {
+                    let actual = store
+                        .list_with_filters(Some(limit), Some(offset), Some(&filters))
+                        .await
+                        .unwrap();
+                    let page = matching.iter().skip(offset).take(limit).collect::<Vec<_>>();
+                    assert_eq!(actual.len(), page.len());
+                    for (actual, expected) in actual.iter().zip(page) {
+                        assert_records_eq(actual, expected);
+                    }
+                }
             }
         }
     }
