@@ -15,7 +15,7 @@ async fn rewrite_pressure_checkpoints_before_age_without_rebuilding_the_same_cut
     let index = commit(&c.handles[&1], 10, value.clone()).await?;
     // Exact retries enter Raft but leave one accepted record. This creates real
     // native rewrite work while the next application image stays small.
-    for _ in 0..288 {
+    for _ in 0..352 {
         ensure!(commit(&c.handles[&1], 10, value.clone()).await? == index);
     }
     let through = c.handles[&1].observation(10)?.status.applied;
@@ -25,11 +25,38 @@ async fn rewrite_pressure_checkpoints_before_age_without_rebuilding_the_same_cut
             .all(|h| h.observation(10).unwrap().status.applied >= through)
     })
     .await?;
-    let measured = c.handles[&3].prepare_disk_measurement()?.await?.run()?;
+    // Seed the independent rewrite queue with real native passes. A later pass
+    // must reserve that live queue as well as its bounded append prefix. None
+    // of these exact retries has been covered by an application checkpoint.
     let budget = c.handles[&3].disk.as_ref().unwrap();
-    // Real admission leaves room for the small captured application image, but
-    // not the retained native entries plus segment allowance. Do not enlarge the
-    // budget or release this reservation until the scheduler checkpoints.
+    let pressure = budget.reserve(128 << 20, false)?;
+    for _ in 0..2 {
+        let rewritten = c.handles[&3].prepare_log_maintenance()?.await?;
+        tokio::task::spawn_blocking(move || rewritten.run()).await??;
+    }
+    drop(pressure);
+    let rewrite_bytes = std::fs::read_dir(root.path().join("3"))?
+        .map(|entry| {
+            let entry = entry?;
+            if entry.path().extension().is_some_and(|ext| ext == "rewrite") {
+                Ok(entry.metadata()?.len())
+            } else {
+                Ok(0)
+            }
+        })
+        .collect::<std::io::Result<Vec<_>>>()?
+        .into_iter()
+        .sum::<u64>();
+    ensure!(
+        rewrite_bytes > 128 << 20,
+        "fixture did not seed live rewrite data"
+    );
+    let measured = c.handles[&3].prepare_disk_measurement()?.await?.run()?;
+    // Leave the required 256 MiB control headroom plus 2 MiB for the small
+    // application image. The independent rewrite queue plus bounded append
+    // prefix and segment allowance must not fit. Keep this reservation until
+    // the scheduler checkpoints; reducing it below the control headroom would
+    // also block the image and could not exercise checkpoint-driven recovery.
     let held = budget.reserve(
         usize::try_from(measured.max_log_bytes - measured.accounted_disk_bytes - (258 << 20))?,
         false,

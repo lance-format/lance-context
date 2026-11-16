@@ -109,7 +109,7 @@ impl LogMaintenance {
             let force_append = !force_rewrite && self.data_under_pressure();
             // Freeze eligibility with the allowance. Later appends can move
             // the native ratio-based watermark, but not this pass's copy cap.
-            let boundary = self.node.engine.purge_manager().capture_append_boundary();
+            let boundary = self.append_boundary()?;
             let reservation = self
                 .node
                 .budget
@@ -147,6 +147,43 @@ impl LogMaintenance {
             self.node.failed.store(true, Ordering::Release);
         }
         result
+    }
+
+    // Select by live copy bytes, not file count: tiny live metadata must not
+    // keep a large obsolete prefix pinned across hundreds of scheduler ticks.
+    // Return after a bounded append copy so newer checkpoints can discard the
+    // remaining payloads. Existing rewrite-queue work and an oversized oldest
+    // file retain their own semantics; this does not bound filesystem latency.
+    fn append_boundary(&self) -> Result<(u64, usize, u64)> {
+        let engine = &self.node.engine;
+        let mut boundary = engine.purge_manager().capture_append_boundary();
+        let estimate = |through| {
+            engine
+                .estimated_rewrite_bytes_through(through)
+                .context("native rewrite sizing overflow")
+        };
+        // Through zero includes the independent rewrite queue and tombstones.
+        // Only the additional append-prefix bytes consume this scheduling cap.
+        let limit = estimate(0)?
+            .checked_add(128 << 20)
+            .context("append rewrite copy limit overflow")?;
+        if estimate(boundary.2)? <= limit {
+            return Ok(boundary);
+        }
+        let first = engine.file_span(raft_engine::internals::LogQueue::Append).0;
+        let (mut low, mut high) = (first.saturating_sub(1), boundary.2);
+        while low < high {
+            let middle = low + (high - low).div_ceil(2);
+            if estimate(middle)? <= limit {
+                low = middle;
+            } else {
+                high = middle - 1;
+            }
+        }
+        // One native batch can exceed the target file size. Preserve progress
+        // even when the oldest closed file alone exceeds the copy allowance.
+        boundary.2 = boundary.2.min(low.max(first));
+        Ok(boundary)
     }
 
     fn run_native(
