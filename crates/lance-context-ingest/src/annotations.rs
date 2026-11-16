@@ -26,6 +26,8 @@ mod local_payload;
 pub(crate) mod metadata_upload;
 pub mod mixed;
 mod prefetch;
+#[cfg(all(feature = "service", feature = "lance-io-metrics"))]
+pub(crate) mod read_io;
 pub mod runtime;
 mod shard;
 #[cfg(feature = "http")]
