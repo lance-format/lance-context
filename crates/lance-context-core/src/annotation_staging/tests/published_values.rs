@@ -5,12 +5,20 @@ use lance::{dataset::builder::DatasetBuilder, dataset::ReadParams, session::Sess
 use lance_io::object_store::ObjectStoreParams;
 use std::{sync::atomic::Ordering, time::Duration};
 
+mod cold_batches;
 mod cold_reads;
 mod current_reads;
 mod reads;
 
 async fn opened(path: &std::path::Path, cache_bytes: usize) -> Result<(Arc<Dataset>, Throttle)> {
     fixture(path).await?;
+    open_existing(path, cache_bytes).await
+}
+
+async fn open_existing(
+    path: &std::path::Path,
+    cache_bytes: usize,
+) -> Result<(Arc<Dataset>, Throttle)> {
     let throttle = Throttle::new(Duration::ZERO);
     let base = DatasetBuilder::from_uri(format!("file-object-store://{}", path.display()))
         .with_session(Arc::new(Session::new(
