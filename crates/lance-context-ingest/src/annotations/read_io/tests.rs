@@ -180,7 +180,8 @@ async fn read_io_native_tables_retain_shared_store_and_classify_both_data_paths(
     let registry = session.store_registry();
     let original_prefix =
         registry.calculate_object_store_prefix(&narrow.uri, Some(&narrow.options))?;
-    let scope = Scope::install(&narrow, Some(&body))?;
+    let identities = Providers::capture(&narrow, Some(&body.uri))?;
+    let scope = Scope::install(&narrow, Some(&body), identities)?;
     assert_eq!(
         registry.calculate_object_store_prefix(&narrow.uri, Some(&narrow.options))?,
         original_prefix
@@ -283,10 +284,19 @@ async fn read_io_distinguishes_equal_paths_in_separate_backend_accounts() -> Res
         session,
     )
     .await?;
-    let scope = Scope::install(&narrow, Some(&body))?;
+    let identities = Providers::capture(&narrow, Some(&body.uri))?;
     // This wrapper has the default prefix implementation. The diagnostic
     // provider beneath it must still match each backend's original identity.
     let _uploads = super::super::metadata_upload::Scope::install(&narrow)?;
+    let before = registry.get_provider("memory").unwrap();
+    let scope = Scope::install(&narrow, Some(&body), identities)?;
+    let after = registry.get_provider("memory").unwrap();
+    let uri = lance_io::object_store::uri_to_url(&narrow.uri)?;
+    assert_eq!(before.extract_path(&uri)?, after.extract_path(&uri)?);
+    assert_eq!(
+        before.calculate_object_store_prefix(&uri, Some(&narrow.options))?,
+        after.calculate_object_store_prefix(&uri, Some(&narrow.options))?
+    );
     for storage in [&narrow, &body] {
         let params = ObjectStoreParams {
             storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(

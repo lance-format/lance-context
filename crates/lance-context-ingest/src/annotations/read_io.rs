@@ -63,10 +63,33 @@ struct Target {
 
 pub(crate) struct Scope(Arc<[Counts; 5]>);
 
+/// Capture backend identity before the existing upload wrapper is installed.
+/// Install counters afterward, preserving the owner's original URI resolution.
+pub(crate) struct Providers(HashMap<String, Arc<dyn ObjectStoreProvider>>);
+
+impl Providers {
+    pub(crate) fn capture(narrow: &Storage, body: Option<&str>) -> Result<Self> {
+        let registry = narrow.session.store_registry();
+        let mut providers = HashMap::new();
+        for uri in std::iter::once(narrow.uri.as_str()).chain(body) {
+            let uri = lance_io::object_store::uri_to_url(uri)?;
+            providers.insert(
+                uri.scheme().to_owned(),
+                registry
+                    .get_provider(uri.scheme())
+                    .context("read observation provider missing")?,
+            );
+        }
+        Ok(Self(providers))
+    }
+}
+
 impl Scope {
-    // Install below the existing upload wrapper so target matching uses the
-    // backend's own identity (including Azure's account), not wrapper defaults.
-    pub(crate) fn install(narrow: &Storage, body: Option<&Storage>) -> Result<Self> {
+    pub(crate) fn install(
+        narrow: &Storage,
+        body: Option<&Storage>,
+        identities: Providers,
+    ) -> Result<Self> {
         let registry = narrow.session.store_registry();
         ensure!(
             registry.active_stores().is_empty(),
@@ -80,18 +103,19 @@ impl Scope {
                 Arc::ptr_eq(&narrow.session, &storage.session),
                 "read observation requires the shared session"
             );
-            let scheme = storage
-                .uri
-                .split_once("://")
-                .map_or_else(|| "file".to_owned(), |(s, _)| s.to_ascii_lowercase());
+            let uri = lance_io::object_store::uri_to_url(&storage.uri)?;
+            let scheme = uri.scheme().to_owned();
             providers.entry(scheme.clone()).or_insert(
                 registry
                     .get_provider(&scheme)
                     .context("read observation provider missing")?,
             );
             targets.push(Target {
-                store: registry
-                    .calculate_object_store_prefix(&storage.uri, Some(&storage.options))?,
+                store: identities
+                    .0
+                    .get(&scheme)
+                    .context("read identity provider missing")?
+                    .calculate_object_store_prefix(&uri, Some(&storage.options))?,
                 base: if storage.base.as_ref().is_empty() {
                     String::new()
                 } else {
@@ -108,6 +132,11 @@ impl Scope {
                 &scheme,
                 Arc::new(Provider {
                     inner,
+                    identity: identities
+                        .0
+                        .get(&scheme)
+                        .context("read identity provider missing")?
+                        .clone(),
                     targets: targets.clone(),
                     counts: counts.clone(),
                 }),
@@ -142,6 +171,7 @@ impl Scope {
 #[derive(Debug)]
 struct Provider {
     inner: Arc<dyn ObjectStoreProvider>,
+    identity: Arc<dyn ObjectStoreProvider>,
     targets: Arc<Vec<Target>>,
     counts: Arc<[Counts; 5]>,
 }
@@ -154,7 +184,7 @@ impl ObjectStoreProvider for Provider {
         params: &ObjectStoreParams,
     ) -> lance::Result<LanceStore> {
         let prefix = self
-            .inner
+            .identity
             .calculate_object_store_prefix(&uri, params.storage_options())?;
         let mut store = self.inner.new_store(uri, params).await?;
         store.inner = Arc::new(ReadStore {

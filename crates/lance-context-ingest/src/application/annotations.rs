@@ -262,13 +262,15 @@ pub async fn serve_owner(
                 Arc::default(),
             )),
         ).await?;
+        #[cfg(feature = "lance-io-metrics")]
+        let read_providers = annotations::read_io::Providers::capture(&storage, a.body.as_ref().map(|body| body.uri.as_str()))?;
+        let mut metadata_uploads = annotations::metadata_upload::Scope::install(&storage)?;
         let body = match &a.body {
             Some(body) => Some(Storage::resolve(body.uri.clone(), body.storage_options.clone(), storage.session.clone()).await?),
             None => None,
         };
         #[cfg(feature = "lance-io-metrics")]
-        let read_io = annotations::read_io::Scope::install(&storage, body.as_ref())?;
-        let mut metadata_uploads = annotations::metadata_upload::Scope::install(&storage)?;
+        let read_io = annotations::read_io::Scope::install(&storage, body.as_ref(), read_providers)?;
         let configuration = runtime::Configuration {
                 limits: a.staging.clone(),
                 upload_budget: ingress.budget.clone(),
