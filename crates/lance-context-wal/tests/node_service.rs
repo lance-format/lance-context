@@ -242,6 +242,24 @@ async fn run_cluster(f: &mut Fixture) -> Result<()> {
                 && status["maintenance"]["log_passes"].as_u64().unwrap_or(0) > 0
                 && status["peer_failed_exchanges"].as_u64().unwrap_or(0) > failed_exchanges
             {
+                // Real process counters must cover the full accepted bodies
+                // through the checkpoint cut, independently of native writes.
+                let maintenance = &status["maintenance"];
+                assert!(
+                    maintenance["checkpoint_builds"].as_u64().unwrap()
+                        >= maintenance["checkpoints"].as_u64().unwrap()
+                );
+                assert!(maintenance["checkpoint_metadata_bytes"].as_u64().unwrap() > 0);
+                assert!(
+                    maintenance["checkpoint_payload_bytes"].as_u64().unwrap() >= 16 * (256 << 10)
+                );
+                let native = &status["native_io_process"];
+                assert!(native["append"]["bytes"].as_f64().unwrap() >= (16 * (256 << 10)) as f64);
+                assert!(native["append"]["batches"].as_u64().unwrap() >= 16);
+                for queue in ["rewrite_from_append", "rewrite_from_rewrite"] {
+                    assert!(native[queue]["bytes"].as_f64().unwrap() >= 0.0);
+                    assert!(native[queue]["batches"].is_u64());
+                }
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;

@@ -7,7 +7,7 @@ publish = false
 description = "Independent Rust WAL experiments owned by lance-context"
 
 [features]
-service = ["peer-transport", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:clap", "tokio/signal", "tokio/rt-multi-thread"]
+service = ["peer-transport", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:clap", "dep:prometheus", "tokio/signal", "tokio/rt-multi-thread"]
 peer-transport = ["runtime", "vectored-io", "dep:tokio-rustls", "tokio/net", "tokio/time", "tokio/macros"]
 runtime = ["replication", "dep:tokio", "tokio/sync", "tokio/rt"]
 # Real Lance materialization/recovery qualification; normal WAL replicas do not link Lance.
@@ -26,6 +26,7 @@ ipc = ["dep:anyhow", "dep:arrow-array", "dep:arrow-buffer", "dep:arrow-ipc", "de
 lab = ["ipc", "dep:clap", "dep:hdrhistogram", "dep:raft-engine", "raft-engine/internals", "dep:raft-proto", "dep:serde_json"]
 
 [dependencies]
+prometheus = { version = "0.13", optional = true }
 hyper = { version = "1", features = ["server", "http1"], optional = true }
 hyper-util = { version = "0.1", features = ["tokio"], optional = true }
 http-body-util = { version = "0.1", optional = true }
