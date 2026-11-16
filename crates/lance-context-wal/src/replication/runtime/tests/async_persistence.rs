@@ -3,6 +3,7 @@ use super::*;
 #[cfg(unix)]
 mod checkpoint_crash;
 
+mod checkpoint_queue;
 mod follower_checkpoint;
 
 fn executor() -> Result<tokio::runtime::Runtime> {
@@ -558,6 +559,7 @@ fn checkpoint_stall(continuous_requests: bool) -> Result<()> {
         let mut maximum_staleness = Duration::ZERO;
         let mut first_leader_change = None;
         let mut refused = 0;
+        let mut queued = Vec::new();
         while Instant::now() < deadline {
             ensure!(pending.0.is_empty(), "ACK preceded held native sync");
             ensure!(checkpoint.0.is_empty(), "checkpoint preceded held native sync");
@@ -572,18 +574,21 @@ fn checkpoint_stall(continuous_requests: bool) -> Result<()> {
             }
             if continuous_requests {
                 // Control admission precedes this data request. All subsequent
-                // writes must be bounded/refused before mutation while the
-                // checkpoint waits; an idle-window-only scheduler would keep
-                // accumulating Ready work instead of reaching its captured cut.
-                let next = c.handles[&1].commit(Command::Append {
+                // writes retain existing data credits without adding Ready
+                // work. Once full, the original request limit rejects callers.
+                match c.handles[&1].commit(Command::Append {
                     group: 10,
-                    batch: batch(3),
-                })?;
-                let result = timeout(Duration::from_millis(500), next).await?;
-                ensure!(result.as_ref().err().is_some_and(|error| {
-                    matches!(error.downcast_ref(), Some(crate::replication::ProposalRejection::PendingCapacity))
-                }), "checkpoint did not bound new admission: {result:?}");
-                refused += 1;
+                    batch: batch(queued.len() as u64 + 3),
+                }) {
+                    Ok(next) => queued.push(next),
+                    Err(error) => {
+                        ensure!(matches!(error.downcast_ref(), Some(SubmissionFailure::RequestCredits)),
+                            "unexpected checkpoint admission error: {error}");
+                        refused += 1;
+                    }
+                }
+                ensure!(queued.iter().all(|request| request.0.is_empty()),
+                    "checkpoint drain completed an admitted request prematurely");
             }
             sleep(Duration::from_millis(10)).await;
         }
@@ -606,29 +611,41 @@ fn checkpoint_stall(continuous_requests: bool) -> Result<()> {
             "checkpoint completed ahead of original write"
         );
         ensure!(!continuous_requests || refused >= 10);
-        Ok::<_, anyhow::Error>((pending, checkpoint))
+        ensure!(!continuous_requests || queued.len() + 1 == options().data_requests);
+        Ok::<_, anyhow::Error>((pending, checkpoint, queued))
     });
     drop(gate);
+    let mut accepted = vec![(first, 1)];
     let verified = executor.block_on(async {
-        let (pending, checkpoint) = waiting?;
+        let (pending, checkpoint, queued) = waiting?;
         timeout(Duration::from_secs(10), checkpoint).await??;
         let result = timeout(Duration::from_secs(10), pending).await??;
         let Outcome::Committed(Applied::Accepted { index }) = result else {
             anyhow::bail!("lost original completion {result:?}")
         };
+        accepted.push((index, 2));
+        for (offset, request) in queued.into_iter().enumerate() {
+            let result = timeout(Duration::from_secs(10), request).await??;
+            let Outcome::Committed(Applied::Accepted { index }) = result else {
+                anyhow::bail!("lost queued completion {result:?}")
+            };
+            accepted.push((index, offset as u64 + 3));
+        }
         ensure!(c.handles[&1].observation(10)?.checkpoint_index == first);
+        let last = accepted.last().unwrap().0;
         wait_for(|| {
             c.handles
                 .values()
-                .all(|h| h.observation(10).is_ok_and(|o| o.status.applied >= index))
+                .all(|h| h.observation(10).is_ok_and(|o| o.status.applied >= last))
         })
         .await?;
-        Ok::<_, anyhow::Error>(index)
+        Ok::<_, anyhow::Error>(())
     });
     let stopped = executor.block_on(c.shutdown());
     drop(store);
     stopped?;
-    reopen(root.path(), &[(first, 1), (verified?, 2)])
+    reopen(root.path(), &accepted)?;
+    verified
 }
 
 #[test]
@@ -674,6 +691,10 @@ fn checkpoint_interrupted(fail_sync: bool) -> Result<()> {
                 .contains("node image builder/receiver busy")));
         ensure!(checkpoint.0.is_empty() && append.0.is_empty());
         ensure!(handle.admission().control.used_requests == 1);
+        let queued = handle.commit(Command::Append {
+            group: 10,
+            batch: batch(3),
+        })?;
         if fail_sync {
             store.fail_next_sync_for_test();
         } else {
@@ -681,7 +702,7 @@ fn checkpoint_interrupted(fail_sync: bool) -> Result<()> {
                 runtime.stop();
             }
         }
-        Ok::<_, anyhow::Error>((append, checkpoint))
+        Ok::<_, anyhow::Error>((append, checkpoint, queued))
     });
     // The fault/stop is applied before releasing the original native write.
     drop(gate);
@@ -692,9 +713,11 @@ fn checkpoint_interrupted(fail_sync: bool) -> Result<()> {
     };
     let stopped = executor.block_on(c.shutdown());
     let checked = executor.block_on(async {
-        let (append, checkpoint) = waiting?;
+        let (append, checkpoint, queued) = waiting?;
         ensure!(timeout(Duration::from_secs(5), checkpoint).await?.is_err());
         let result = timeout(Duration::from_secs(5), append).await?;
+        ensure!(result.is_err() || matches!(result, Ok(Outcome::Unknown)));
+        let result = timeout(Duration::from_secs(5), queued).await?;
         ensure!(result.is_err() || matches!(result, Ok(Outcome::Unknown)));
         ensure!(handle.admission().control.used_requests == 0);
         ensure!(handle.admission().data.used_requests == 0);
