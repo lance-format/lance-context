@@ -88,6 +88,10 @@ impl Drop for Outbound {
 }
 
 impl Worker {
+    pub(super) fn checkpoint_draining(&self) -> bool {
+        self.checkpoint.as_ref().is_some_and(|work| !work.started)
+    }
+
     pub(super) fn queue_checkpoint(&mut self, work: Box<CheckpointWork>) {
         if self.checkpoint.is_some() {
             work.reply

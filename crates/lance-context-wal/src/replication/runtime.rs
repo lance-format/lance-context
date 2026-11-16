@@ -61,7 +61,8 @@ pub struct Options {
     /// Maximum commands from each lane before polling durable Raft progress.
     pub batch_requests: usize,
     /// Bound the control prefix, then end the batch after a peer/data round
-    /// consumes this wall-time budget. Every batch visits peer/data at least once.
+    /// consumes this wall-time budget. Every batch visits peers and, unless
+    /// draining a checkpoint, data at least once.
     /// Cannot preempt a single operation or bound a poll's persistence latency.
     #[cfg_attr(feature = "service", serde(with = "crate::service::duration_millis"))]
     pub batch_time: Duration,
@@ -953,8 +954,8 @@ impl Worker {
                 if round == 0 {
                     // Already queued reads can share this poll's fresh quorum
                     // barrier before expensive data work consumes the budget.
-                    // Bound both count and time, and always visit peer/data
-                    // below before polling so a busy control lane cannot starve
+                    // Bound both count and time, and visit peers and eligible
+                    // data below so a busy control lane cannot starve
                     // replication or writes. Later arrivals wait for a new poll.
                     for _ in 0..self.options.batch_requests {
                         let Ok(work) = self.control.try_recv() else {
@@ -983,9 +984,15 @@ impl Worker {
                     peer_credits.push(peer.credit);
                     any = true;
                 }
-                if let Ok(work) = self.data.try_recv() {
-                    self.work(work, &mut after_poll);
-                    any = true;
+                // Keep admitted writes in their bounded lane until the old
+                // persistence window drains. Dequeuing them here would turn
+                // our own checkpoint pause into PendingCapacity refusals.
+                // Peer/control work and ticks must keep making progress.
+                if !self.checkpoint_draining() {
+                    if let Ok(work) = self.data.try_recv() {
+                        self.work(work, &mut after_poll);
+                        any = true;
+                    }
                 }
                 activity |= any;
                 if !any || batch_started.elapsed() >= self.options.batch_time {
