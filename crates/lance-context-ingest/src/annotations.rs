@@ -1023,12 +1023,16 @@ impl Driver {
         // No await between applying the batch, retaining its outcome, and
         // publishing progress to waiters. Cancellation cannot split this handoff.
         let pending = self.pending.take().unwrap();
-        if let mixed::Decoded::Creates { bodies, .. } = pending.decoded {
+        if let mixed::Decoded::Creates { bodies, rows } = pending.decoded {
+            // Release decoded narrow rows before returning transient decode
+            // credit. The retained body frame keeps every shared IPC allocation.
+            drop(rows);
             if result == MutationResult::Applied {
                 service.shared.frames.lock().unwrap().record(
                     pending.index,
                     bodies,
                     pending._reservation,
+                    pending.meta.body_bytes as usize,
                 );
             }
         }

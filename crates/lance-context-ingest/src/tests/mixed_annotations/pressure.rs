@@ -75,8 +75,8 @@ async fn mixed_frame_pressure_withholds_ack_until_published_readers_release_capa
     let narrow = storage(root.path(), "annotations.lance").await?;
     let body = storage(root.path(), "body.lance").await?;
     seed(&c, &narrow, &body).await?;
-    // The maximum legal decode fits, but two three-row payloads do not.
-    // Lower the apply budget; do not make room by expanding the limits.
+    // One retained payload plus the next decode fits after transient credit is
+    // returned. Two retained payloads plus a third decode must still wait.
     let apply = MergeMemoryBudget::new(4 << 20);
     let (a, driver) = Service::connect_mixed(
         c.client.clone(),
@@ -94,7 +94,10 @@ async fn mixed_frame_pressure_withholds_ack_until_published_readers_release_capa
     let first = request(&a, &p, 1, large_create(&["A", "B", "C"])?).await?;
     a.submit(&first, Duration::from_secs(10)).await?;
     let held = a.get_turn("A", Duration::from_secs(10)).await?.unwrap();
-    let second = Arc::new(request(&a, &p, 2, large_create(&["D", "E", "F"])?).await?);
+    let more = request(&a, &p, 2, large_create(&["G", "H", "I"])?).await?;
+    a.submit(&more, Duration::from_secs(10)).await?;
+    let also_held = a.get_turn("G", Duration::from_secs(10)).await?.unwrap();
+    let second = Arc::new(request(&a, &p, 3, large_create(&["D", "E", "F"])?).await?);
     let submit = tokio::spawn({
         let a = a.clone();
         let second = second.clone();
@@ -114,7 +117,7 @@ async fn mixed_frame_pressure_withholds_ack_until_published_readers_release_capa
         "a durable but unapplied import must not succeed"
     );
     assert!(apply.reserved() <= apply.limit());
-    assert_eq!(a.source_observation().records, 1);
+    assert_eq!(a.source_observation().records, 2);
     publish(&c, &a, &narrow, &body).await?;
     assert_eq!(a.retained_body_frames(), (0, 0));
     assert!(apply.reserved() > 0);
@@ -132,7 +135,7 @@ async fn mixed_frame_pressure_withholds_ack_until_published_readers_release_capa
             .value(0),
         vec![7; 256 << 10]
     );
-    drop(held);
+    drop((held, also_held));
     let result = submit.await??;
     assert_eq!(result.result, service::MutationResult::Applied);
     assert!(apply.reserved() <= apply.limit());
@@ -146,7 +149,7 @@ async fn mixed_frame_pressure_withholds_ack_until_published_readers_release_capa
             .await?
             .count_rows(None)
             .await?,
-        6
+        9
     );
     stop.send(()).unwrap();
     task.await??;
