@@ -187,7 +187,7 @@ async fn read_io_native_tables_retain_shared_store_and_classify_both_data_paths(
         original_prefix
     );
     let params = ObjectStoreParams::default();
-    let (first, _) = LanceStore::from_uri_and_params(registry, &narrow.uri, &params).await?;
+    let (first, _) = LanceStore::from_uri_and_params(registry.clone(), &narrow.uri, &params).await?;
     let (second, _) = LanceStore::from_uri_and_params(registry, &body.uri, &params).await?;
     assert!(
         Arc::ptr_eq(&first, &second),

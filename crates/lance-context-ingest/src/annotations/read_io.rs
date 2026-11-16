@@ -118,9 +118,9 @@ impl Scope {
         self.0
             .iter()
             .enumerate()
-            .filter_map(|(i, c)| {
+            .map(|(i, c)| {
                 let started = c.started.load(Ordering::Relaxed);
-                (started != 0).then(|| Observation {
+                Observation {
                     class: CLASSES[i],
                     started,
                     completed: c.completed.load(Ordering::Relaxed),
@@ -130,8 +130,9 @@ impl Scope {
                     heads: c.heads.load(Ordering::Relaxed),
                     ranges: c.ranges.load(Ordering::Relaxed),
                     file_payloads: c.file_payloads.load(Ordering::Relaxed),
-                })
+                }
             })
+            .filter(|row| row.started != 0)
             .collect()
     }
 }
