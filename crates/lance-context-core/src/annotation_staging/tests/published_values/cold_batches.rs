@@ -123,7 +123,7 @@ async fn cancelled_cold_points_keep_admission_and_gc_roots_through_native_io() -
         for task in &tasks {
             task.abort();
         }
-        for task in &mut tasks {
+        for task in tasks.drain(..) {
             assert!(task.await.unwrap_err().is_cancelled());
         }
         assert_eq!(staging.observation().await.readers, 3);
@@ -135,6 +135,11 @@ async fn cancelled_cold_points_keep_admission_and_gc_roots_through_native_io() -
     drop((frozen, prepared));
     let protected = staging.protected_bases().await?.datasets().count();
     throttle.frozen.store(false, Ordering::Relaxed);
+    // A failed entry check must release/join the original tasks too.
+    for task in tasks {
+        task.abort();
+        let _ = task.await;
+    }
     check?;
     assert_eq!(
         protected, 2,
@@ -149,6 +154,42 @@ async fn cancelled_cold_points_keep_admission_and_gc_roots_through_native_io() -
     .map_err(|_| invalid("completed/cancelled reads leaked admission"))?;
     assert_eq!(staging.protected_bases().await?.datasets().count(), 1);
     assert_eq!(current(&staging, "T").await?.score, Some(0.9));
+    Ok(())
+}
+
+#[tokio::test]
+async fn concurrent_cold_points_keep_old_and_new_publications_separate() -> Result<()> {
+    for cache_bytes in [0, 8 << 20] {
+        let root = tempfile::tempdir()?;
+        let (base, _) = opened(&root.path().join("turns.lance"), cache_bytes).await?;
+        let session = base.session().clone();
+        let staging = AnnotationStaging::new(base, scope(), 0, Limits::default())?;
+        let old = staging.capture("T").await?;
+        staging
+            .apply(
+                0,
+                1,
+                "T",
+                &TurnAnnotationPatch {
+                    status: Set("reviewed".into()),
+                    score: Set(0.9),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        publish(&staging).await?;
+        let new = staging.capture("T").await?;
+        session.file_metadata_cache().clear().await;
+        let (before, after) = tokio::try_join!(old.resolve(), new.resolve())?;
+        assert_eq!(before.unwrap().status.as_deref(), Some("pending"));
+        let after = after.unwrap();
+        assert_eq!(after.status.as_deref(), Some("reviewed"));
+        assert_eq!(after.score, Some(0.9));
+        assert_eq!(current(&staging, "T").await?, after);
+        drop((old, new));
+        assert_eq!(staging.observation().await.readers, 0);
+        assert_eq!(staging.protected_bases().await?.datasets().count(), 1);
+    }
     Ok(())
 }
 
