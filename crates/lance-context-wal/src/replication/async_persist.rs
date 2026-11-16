@@ -445,13 +445,14 @@ impl Group {
                 });
             }
         }
-        if self.raw.raft.state == StateRole::Leader && !self.accepts_async(&[])? {
+        if self.raw.raft.state == StateRole::Leader {
             // RawNode::ready classifies a leader's outbound messages as safe
             // before persistence. Send those messages without creating another
-            // Ready record when the bounded persistence window is full. This
-            // keeps heartbeats moving; it neither advances persisted/applied
-            // indices nor releases pending commit or read completions. Follower
-            // and candidate messages still require the ordinary Ready boundary.
+            // Ready record just for outgoing heartbeats or replication. This
+            // also keeps heartbeats moving when the persistence window is full.
+            // It neither advances persisted/applied indices nor releases pending
+            // commit or read completions. Follower and candidate messages still
+            // require the ordinary Ready boundary.
             outbound.append(&mut self.raw.raft.msgs);
         }
         while self.raw.has_ready() && self.accepts_async(&[])? {
