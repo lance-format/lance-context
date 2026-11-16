@@ -293,6 +293,10 @@ impl Background<'_> {
                 return None;
             }
             tokio::select! {
+                // A slow preceding image can leave this tick overdue. Admit
+                // ready image work before starting a potentially long native
+                // rewrite; maintenance remains eligible while admission waits.
+                biased;
                 _ = self.stop.changed() => return None,
                 result = &mut admission => return Some(result),
                 _ = self.tick.tick() => self.maintain().await,
