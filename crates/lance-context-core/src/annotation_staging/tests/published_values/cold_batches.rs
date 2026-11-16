@@ -102,30 +102,34 @@ async fn cancelled_cold_points_keep_admission_and_gc_roots_through_native_io() -
         .await?;
     let selected = commit(&prepared).await?;
     // Cold old bases, not staged T: these reads must stay pinned after install.
+    let mut reads = Vec::new();
+    for key in ["U", "o'hara", "missing"] {
+        reads.push(staging.capture(key).await?);
+    }
+    let before = throttle.ops.load(Ordering::Relaxed);
     throttle.frozen.store(true, Ordering::Relaxed);
-    let mut tasks = Vec::new();
+    let mut pending = reads
+        .iter()
+        .map(|read| Box::pin(read.resolve()))
+        .collect::<Vec<_>>();
+    // Poll every caller to its result wait before the native workers run.
+    // Distinct keys may share Lance's in-flight file IO, so another data-store
+    // operation is not evidence that another caller reached the cold queue.
+    for future in &mut pending {
+        assert!(futures::poll!(future.as_mut()).is_pending());
+    }
+    let entered = tokio::time::timeout(Duration::from_secs(5), async {
+        while throttle.ops.load(Ordering::Relaxed) == before {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    // Cancel the three result waits and release the original PointReads while
+    // their shared native scan is still blocked inside the real data store.
+    drop(pending);
+    drop(reads);
     let check = async {
-        for key in ["U", "o'hara"] {
-            let before = throttle.ops.load(Ordering::Relaxed);
-            let read = staging.capture(key).await?;
-            tasks.push(tokio::spawn(async move { read.resolve().await }));
-            tokio::time::timeout(Duration::from_secs(5), async {
-                while throttle.ops.load(Ordering::Relaxed) == before {
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-            })
-            .await
-            .map_err(|_| invalid("cold scan did not enter data IO"))?;
-        }
-        let read = staging.capture("missing").await?;
-        tasks.push(tokio::spawn(async move { read.resolve().await }));
-        tokio::task::yield_now().await;
-        for task in &tasks {
-            task.abort();
-        }
-        for task in tasks.drain(..) {
-            assert!(task.await.unwrap_err().is_cancelled());
-        }
+        entered.map_err(|_| invalid("cold batch did not enter data IO"))?;
         assert_eq!(staging.observation().await.readers, 3);
         assert!(staging.capture("T").await.is_err());
         staging.install_published(&prepared, selected).await?;
@@ -135,11 +139,6 @@ async fn cancelled_cold_points_keep_admission_and_gc_roots_through_native_io() -
     drop((frozen, prepared));
     let protected = staging.protected_bases().await?.datasets().count();
     throttle.frozen.store(false, Ordering::Relaxed);
-    // A failed entry check must release/join the original tasks too.
-    for task in tasks {
-        task.abort();
-        let _ = task.await;
-    }
     check?;
     assert_eq!(
         protected, 2,
