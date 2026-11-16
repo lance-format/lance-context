@@ -7,7 +7,7 @@ use std::{
 
 /// Keep the existing row workspace allowance as well as Arrow's retained
 /// allocations. Do not sum per-array buffer sizes: every slice of an IPC input
-/// reports the capacity of the same complete input allocation.
+/// reports the size of the same visible input. Bytes may retain a larger parent.
 ///
 /// This is only used for the fixed mixed-body schema decoded from bounded,
 /// uncompressed IPC. Unknown allocation capacity or overflow keeps the original
@@ -17,8 +17,16 @@ pub(super) fn retained_bytes(
     batches: &Vec<RecordBatch>,
     input_bytes: usize,
     original: usize,
+    input_allocation: Option<(usize, usize)>,
 ) -> Option<usize> {
-    let mut bytes = original.checked_sub(input_bytes.checked_mul(3)?)?;
+    // Only the allocation owner can provide this bound. Arrow's Bytes-backed
+    // capacity alone cannot establish it, even when nonzero.
+    let (input_address, input_capacity) = input_allocation?;
+    if input_capacity < input_bytes {
+        return None;
+    }
+    let mut bytes =
+        original.checked_sub(input_bytes.checked_mul(2)?.checked_add(input_capacity)?)?;
     bytes = bytes.checked_add(batches.capacity().checked_mul(size_of::<RecordBatch>())?)?;
     let mut allocations = BTreeMap::<usize, usize>::new();
     for batch in batches {
@@ -54,7 +62,12 @@ pub(super) fn retained_bytes(
                 .iter()
                 .chain(data.nulls().map(|n| n.buffer()))
             {
-                let capacity = buffer.capacity();
+                let address = buffer.data_ptr().as_ptr() as usize;
+                let capacity = if address == input_address {
+                    input_capacity.max(buffer.capacity())
+                } else {
+                    buffer.capacity()
+                };
                 if capacity == 0 {
                     if !buffer.is_empty() {
                         return None;
@@ -63,7 +76,7 @@ pub(super) fn retained_bytes(
                 }
                 let allocation = capacity.checked_add(bookkeeping)?;
                 allocations
-                    .entry(buffer.data_ptr().as_ptr() as usize)
+                    .entry(address)
                     .and_modify(|old| *old = (*old).max(allocation))
                     .or_insert(allocation);
             }
@@ -75,5 +88,5 @@ pub(super) fn retained_bytes(
     let buffers = allocations
         .values()
         .try_fold(0usize, |n, b| n.checked_add(*b))?;
-    bytes.checked_add(buffers.max(input_bytes))
+    bytes.checked_add(buffers.max(input_capacity))
 }

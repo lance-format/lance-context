@@ -112,6 +112,8 @@ pub struct PreparedAppend {
     rows: u32,
     #[cfg(feature = "materializer")]
     annotation_kind: Option<annotations::WriteKind>,
+    #[cfg(feature = "materializer")]
+    payload_capacity: Option<usize>,
     _reservation: MergeReservation,
 }
 impl PreparedAppend {
@@ -595,6 +597,8 @@ fn prepare(
         rows,
         #[cfg(feature = "materializer")]
         annotation_kind: None,
+        #[cfg(feature = "materializer")]
+        payload_capacity: None,
         _reservation: upload.reservation,
     })
 }

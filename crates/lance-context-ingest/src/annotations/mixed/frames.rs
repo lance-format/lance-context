@@ -111,8 +111,11 @@ impl Window {
         batches: Vec<RecordBatch>,
         mut reservation: MergeReservation,
         input_bytes: usize,
+        input_allocation: Option<(usize, usize)>,
     ) {
-        if let Some(bytes) = memory::retained_bytes(&batches, input_bytes, reservation.bytes()) {
+        if let Some(bytes) =
+            memory::retained_bytes(&batches, input_bytes, reservation.bytes(), input_allocation)
+        {
             reservation.shrink_to(bytes);
         }
         assert!(self
@@ -197,30 +200,43 @@ mod tests {
         }
         writer.finish()?;
         drop(writer);
-        for prefix in [0, 1] {
-            let mut input = vec![0; prefix];
+        for (prefix, known) in [(0, true), (1, true), (0, false), (1, false)] {
+            let mut input =
+                Vec::with_capacity((if known { 1 } else { 2 }) * encoded.len() + prefix);
+            input.resize(prefix, 0);
             input.extend_from_slice(&encoded);
+            let capacity = input.capacity();
             let input = Bytes::from(input).slice(prefix..);
             let begin = input.as_ptr() as usize;
             let length = input.len();
             let batches = ipc::decode(input, schema.clone())?;
             let budget = MergeMemoryBudget::new(4 << 20);
-            let reservation = budget.reserve(3 * length + (64 << 10)).await;
+            let original = 2 * length + if known { capacity } else { length } + (64 << 10);
+            let reservation = budget.reserve(original).await;
             assert!(budget.try_reserve(1 << 20).is_none());
             let mut window = Window::default();
-            window.record(12, batches, reservation, length);
+            window.record(
+                12,
+                batches,
+                reservation,
+                length,
+                known.then_some((begin, capacity)),
+            );
             let retained = window.retained().1;
             assert!(
                 retained >= length,
                 "the full input backing must remain charged"
             );
-            assert!(
-                retained < 2 * length,
-                "shared input was counted more than once"
-            );
+            if known {
+                assert!(retained < 2 * length, "shared input counted more than once");
+            } else {
+                assert_eq!(retained, original, "unknown input must not shrink credit");
+            }
             // The returned transient capacity can admit independent work even
             // while the original body is still active and queryable.
-            let other = budget.try_reserve(2 << 20).expect("released decode credit");
+            let other = budget.try_reserve(2 << 20);
+            assert_eq!(other.is_some(), known);
+            let other_bytes = other.as_ref().map_or(0, |r| r.bytes());
             let held = window.row(
                 lance_context_core::annotation_staging::NewTurnSource {
                     record_index: 12,
@@ -232,7 +248,7 @@ mod tests {
             window.retire(&frozen);
             drop(frozen);
             assert_eq!(window.retained(), (0, 0));
-            assert_eq!(budget.reserved(), retained + other.bytes());
+            assert_eq!(budget.reserved(), retained + other_bytes);
             assert!(budget.try_reserve(1).is_none());
             let value = held
                 .batch
@@ -244,7 +260,7 @@ mod tests {
             assert!(pointer >= begin && pointer + value.value_data().len() <= begin + length);
             assert_eq!(value.value(0), payload);
             drop(held);
-            assert_eq!(budget.reserved(), other.bytes());
+            assert_eq!(budget.reserved(), other_bytes);
             drop(other);
             assert_eq!(budget.reserved(), 0);
         }
@@ -274,6 +290,7 @@ mod tests {
             vec![batch.slice(0, 2), batch.slice(2, 2)],
             budget.reserve(1 << 20).await,
             0,
+            None,
         );
         let held = window.row(
             lance_context_core::annotation_staging::NewTurnSource {

@@ -32,14 +32,14 @@ pub(super) async fn fetch(
         bytes <= ingress.scope.contract.max_record_bytes as usize,
         "oversized annotation WAL record"
     );
-    let Some(reservation) = service.apply_budget.try_reserve(decode_workspace(
+    let Some(mut reservation) = service.apply_budget.try_reserve(decode_workspace(
         &ingress.scope.contract,
         &service.limits,
         bytes,
     )?) else {
         return Ok(None);
     };
-    let body = match service.shared.local_payloads.body(producer_slot, &meta) {
+    let (body, capacity) = match service.shared.local_payloads.body(producer_slot, &meta) {
         Some(body) => body,
         None => {
             let group = service.group()?;
@@ -57,10 +57,27 @@ pub(super) async fn fetch(
                 matches!(response.reply, Reply::Record(Some(ref observed)) if observed == &meta),
                 "committed annotation payload unavailable"
             );
-            response.body
+            // runtime::client::receive allocates vec![0; bytes] for each body;
+            // this is a complete allocation, unlike a caller's Bytes slice.
+            (response.body, Some(bytes))
         }
     };
     meta.check_body_length(body.len(), ingress.scope.contract.max_record_bytes as usize)?;
+    if let Some(capacity) = capacity {
+        let extra = capacity
+            .checked_sub(bytes)
+            .context("invalid local allocation size")?;
+        let workspace = reservation
+            .bytes()
+            .checked_add(extra)
+            .context("apply workspace overflow")?;
+        if (extra > 0 && workspace > service.apply_budget.limit())
+            || !reservation.try_grow_to(workspace)
+        {
+            return Ok(None);
+        }
+    }
+    let input_allocation = capacity.map(|capacity| (body.as_ptr() as usize, capacity));
     let schema = ingress.schema.clone();
     let max_rows = ingress.scope.contract.max_rows;
     let value_bytes = service.limits.value_bytes;
@@ -84,6 +101,7 @@ pub(super) async fn fetch(
                         index,
                         meta,
                         decoded,
+                        input_allocation,
                         _reservation: reservation,
                     })
                 })

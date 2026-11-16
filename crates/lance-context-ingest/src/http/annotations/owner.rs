@@ -125,17 +125,17 @@ impl Owner {
                 .map_err(|_| self.gate.write_memory_refusal())?
                 .map_err(|_| Failure::bad("invalid_upload_size"))?
             };
-            let bytes = self
+            let (bytes, capacity) = self
                 .service
                 .phase_counters()
                 .measure(
                     Phase::AnnotationUploadRead,
-                    body::read_exact(request, length, options),
+                    body::read_exact_accounted(request, length, options),
                 )
                 .await?;
             let prepared = self
                 .service
-                .prepare(upload, bytes, &producer, sequence)
+                .prepare_received(upload, bytes, capacity, &producer, sequence)
                 .await
                 .map_err(|_| Failure::bad("invalid_annotation_ipc"))?;
             let completion = self

@@ -168,10 +168,12 @@ async fn prepared_annotations_release_validation_workspace_before_submit() -> Re
         // A three-body charge exhausts this budget on the third large upload,
         // even though earlier validation allocations have already been dropped.
         for sequence in 1..=4 {
-            let prepared = tokio::time::timeout(
-                Duration::from_secs(2),
-                request(&service, &producer, sequence, Bytes::copy_from_slice(&body)),
-            )
+            let prepared = tokio::time::timeout(Duration::from_secs(2), async {
+                let upload = service.reserve_upload(body.len()).await?;
+                service
+                    .prepare_owned(upload, body.to_vec(), &producer, sequence)
+                    .await
+            })
             .await
             .context("retained payloads must not retain discarded validation workspace")??;
             assert_eq!(prepared.rows(), 2048);
@@ -180,6 +182,19 @@ async fn prepared_annotations_release_validation_workspace_before_submit() -> Re
         }
         assert_eq!(upload_budget.reserved(), 4 * body.len());
         drop(held);
+        assert_eq!(upload_budget.reserved(), 0);
+        // A shared slice does not establish its parent's allocation size. Keep
+        // the original allowance without copying or claiming exact accounting.
+        let mut parent = vec![0; body.len()];
+        parent.extend_from_slice(&body);
+        let shared = Bytes::from(parent).slice(body.len()..);
+        let pointer = shared.as_ptr();
+        let upload = service.reserve_upload(shared.len()).await?;
+        let reserved = upload_budget.reserved();
+        let prepared = service.prepare(upload, shared, &producer, 5).await?;
+        assert_eq!(prepared.body().as_ptr(), pointer);
+        assert_eq!(upload_budget.reserved(), reserved);
+        drop(prepared);
         assert_eq!(upload_budget.reserved(), 0);
     }
     c.shutdown().await?;

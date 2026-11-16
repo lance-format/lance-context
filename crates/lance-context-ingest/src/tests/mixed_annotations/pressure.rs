@@ -1,12 +1,33 @@
 use super::*;
 
-fn large_create(ids: &[&str]) -> Result<Bytes> {
+fn large_create(ids: &[&str]) -> Result<Vec<u8>> {
     let source = create(ids, &vec!["s"; ids.len()], &vec![7; ids.len()])?;
     let mut columns = source.columns().to_vec();
     columns[source.schema().index_of("binary_payload")?] = Arc::new(
         LargeBinaryArray::from_iter_values((0..ids.len()).map(|_| vec![7; 256 << 10])),
     );
-    encoded(RecordBatch::try_new(source.schema(), columns)?)
+    let batch = RecordBatch::try_new(source.schema(), columns)?;
+    let mut bytes = Vec::new();
+    let mut writer = FileWriter::try_new(&mut bytes, &batch.schema())?;
+    writer.write(&batch)?;
+    writer.finish()?;
+    drop(writer);
+    Ok(bytes)
+}
+
+async fn received_request(
+    service: &Service,
+    producer: &Producer,
+    sequence: u64,
+    body: Vec<u8>,
+) -> Result<PreparedAppend> {
+    let upload = service.reserve_upload(body.len()).await?;
+    let original = body.as_ptr();
+    let prepared = service
+        .prepare_owned(upload, body, producer, sequence)
+        .await?;
+    assert_eq!(original, prepared.body().as_ptr());
+    Ok(prepared)
 }
 
 pub(super) async fn publish(
@@ -91,13 +112,13 @@ async fn mixed_frame_pressure_withholds_ack_until_published_readers_release_capa
     .await?;
     let (stop, task) = run(driver);
     let p = producer(&a, 1).await?;
-    let first = request(&a, &p, 1, large_create(&["A", "B", "C"])?).await?;
+    let first = received_request(&a, &p, 1, large_create(&["A", "B", "C"])?).await?;
     a.submit(&first, Duration::from_secs(10)).await?;
     let held = a.get_turn("A", Duration::from_secs(10)).await?.unwrap();
-    let more = request(&a, &p, 2, large_create(&["G", "H", "I"])?).await?;
+    let more = received_request(&a, &p, 2, large_create(&["G", "H", "I"])?).await?;
     a.submit(&more, Duration::from_secs(10)).await?;
     let also_held = a.get_turn("G", Duration::from_secs(10)).await?.unwrap();
-    let second = Arc::new(request(&a, &p, 3, large_create(&["D", "E", "F"])?).await?);
+    let second = Arc::new(received_request(&a, &p, 3, large_create(&["D", "E", "F"])?).await?);
     let submit = tokio::spawn({
         let a = a.clone();
         let second = second.clone();
