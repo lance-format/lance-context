@@ -65,6 +65,12 @@ async fn rewrite_pressure_checkpoints_before_age_without_rebuilding_the_same_cut
     // outside the proactive two-file checkpoint window. A temporary reservation
     // alone must not bypass the normal checkpoint cadence.
     ensure!(!c.handles[&3].data_checkpoint_pressure());
+    // Hold image admission until the failed rewrite is observed. Without this
+    // boundary, maintenance can checkpoint and reclaim before the test task
+    // next runs, so log_passes need no longer be zero when it reads the failure.
+    let checkpoint = c.handles[&3]
+        .prepare_checkpoint(10, Uuid::new_v4())?
+        .await?;
     let progress = Arc::new(Mutex::new(maintenance::Progress::default()));
     let (stop, stopped) = tokio::sync::watch::channel(false);
     let task = tokio::spawn(maintenance::run(
@@ -80,8 +86,20 @@ async fn rewrite_pressure_checkpoints_before_age_without_rebuilding_the_same_cut
         stopped,
     ));
     let checked: Result<()> = async {
-        failure_has_occurred(&progress).await?;
-        ensure!(progress.lock().unwrap().log_passes == 0);
+        let blocked: Result<()> = async {
+            failure_has_occurred(&progress).await?;
+            // An arbitrarily delayed observer still sees the pre-checkpoint
+            // state while the original image permit remains held.
+            sleep(Duration::from_millis(250)).await;
+            let observed = progress.lock().unwrap().clone();
+            ensure!(observed.log_passes == 0);
+            ensure!(observed.checkpoints == 0);
+            ensure!(c.handles[&3].observation(10)?.checkpoint_index < through);
+            Ok(())
+        }
+        .await;
+        drop(checkpoint);
+        blocked?;
         timeout(Duration::from_secs(2), async {
             loop {
                 if c.handles[&3].observation(10)?.checkpoint_index >= through {
