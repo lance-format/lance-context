@@ -66,7 +66,8 @@ async fn point_reads_check_the_whole_unindexed_tail_and_keep_the_captured_base()
         )
         .await?;
         assert_eq!(appended.unindexed_fragments("turn_id").await?.len(), 1);
-        let current = AnnotationStaging::new(Arc::new(appended), scope(), 0, Limits::default())?;
+        let appended = Arc::new(appended);
+        let current = AnnotationStaging::new(appended.clone(), scope(), 0, Limits::default())?;
         for id in ["new-0", "new-2048", "new-4095"] {
             assert_eq!(
                 current.capture(id).await?.resolve().await?.unwrap(),
@@ -90,6 +91,33 @@ async fn point_reads_check_the_whole_unindexed_tail_and_keep_the_captured_base()
             held.resolve().await?.unwrap().status.as_deref(),
             Some("base")
         );
+
+        // Repeat through the transparent cold batch path, with a separate
+        // value-cache namespace so the earlier single reads cannot mask IO.
+        let cold = AnnotationStaging::new(appended.clone(), scope(), 0, Limits::default())?;
+        let values = futures::future::try_join_all(
+            ["new-0", "new-2048", "new-4095", "missing"]
+                .into_iter()
+                .map(|key| async { cold.capture(key).await?.resolve().await }),
+        )
+        .await?;
+        assert!(values[..3]
+            .iter()
+            .all(|v| v.as_ref().unwrap().status.as_deref() == Some("tail")));
+        assert!(values[3].is_none());
+        let cold = AnnotationStaging::new(appended, scope(), 0, Limits::default())?;
+        let results = futures::future::join_all(
+            ["seed", "new-7"]
+                .into_iter()
+                .map(|key| async { cold.capture(key).await?.resolve().await }),
+        )
+        .await;
+        for result in results {
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate annotation turn key"));
+        }
     }
     Ok(())
 }

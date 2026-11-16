@@ -194,6 +194,46 @@ async fn concurrent_cold_points_keep_old_and_new_publications_separate() -> Resu
 }
 
 #[tokio::test]
+async fn repeated_resolve_of_one_handle_cannot_bypass_cold_admission() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let (base, throttle) = opened(&root.path().join("turns.lance"), 0).await?;
+    let staging = AnnotationStaging::new(
+        base,
+        scope(),
+        0,
+        Limits {
+            readers: 1,
+            ..Default::default()
+        },
+    )?;
+    let read = Arc::new(staging.capture("T").await?);
+    let before = throttle.ops.load(Ordering::Relaxed);
+    throttle.frozen.store(true, Ordering::Relaxed);
+    let pending = tokio::spawn({
+        let read = read.clone();
+        async move { read.resolve().await }
+    });
+    let checked = tokio::time::timeout(Duration::from_secs(5), async {
+        while throttle.ops.load(Ordering::Relaxed) == before {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let entered = throttle.ops.load(Ordering::Relaxed);
+        for _ in 0..16 {
+            assert!(read.resolve().await.is_err());
+        }
+        assert_eq!(throttle.ops.load(Ordering::Relaxed), entered);
+    })
+    .await;
+    throttle.frozen.store(false, Ordering::Relaxed);
+    let value = pending.await.map_err(|e| invalid(e.to_string()))??;
+    checked.map_err(|_| invalid("repeated resolves bypassed cold admission"))?;
+    assert_eq!(value.unwrap().status.as_deref(), Some("pending"));
+    drop(read);
+    assert_eq!(staging.observation().await.readers, 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn cold_point_batches_reject_duplicate_rows_without_caching_partial_values() -> Result<()> {
     let root = tempfile::tempdir()?;
     let base = fixture(&root.path().join("turns.lance")).await?;
