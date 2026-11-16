@@ -262,7 +262,15 @@ pub async fn serve_owner(
                 Arc::default(),
             )),
         ).await?;
+        #[cfg(feature = "lance-io-metrics")]
+        let read_providers = annotations::read_io::Providers::capture(&storage, a.body.as_ref().map(|body| body.uri.as_str()))?;
         let mut metadata_uploads = annotations::metadata_upload::Scope::install(&storage)?;
+        let body = match &a.body {
+            Some(body) => Some(Storage::resolve(body.uri.clone(), body.storage_options.clone(), storage.session.clone()).await?),
+            None => None,
+        };
+        #[cfg(feature = "lance-io-metrics")]
+        let read_io = annotations::read_io::Scope::install(&storage, body.as_ref(), read_providers)?;
         let configuration = runtime::Configuration {
                 limits: a.staging.clone(),
                 upload_budget: ingress.budget.clone(),
@@ -270,8 +278,7 @@ pub async fn serve_owner(
                 publication_budget: MergeMemoryBudget::new(config.materializer_memory_bytes),
                 publication: config.worker.publication.clone(),
             };
-        let (service, runtime) = if let Some(body) = &a.body {
-            let body = Storage::resolve(body.uri.clone(), body.storage_options.clone(), storage.session.clone()).await?;
+        let (service, runtime) = if let Some(body) = body {
             if let Some(shard) = a.shard {
                 runtime::Runtime::connect_mixed_shard(
                     ingress.client.clone(), ingress.layout.clone(), table.binding.clone(),
@@ -317,9 +324,14 @@ pub async fn serve_owner(
                 let (view, _) = service.observation().await;
                 let pressure = service.apply_backpressure();
                 let source = service.source_observation();
+                let observed_unix_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+                #[cfg(feature = "lance-io-metrics")]
+                eprintln!("{}", serde_json::json!({"annotation_read_io": {
+                    "observed_unix_ms": observed_unix_ms, "classes": read_io.observation(),
+                }}));
                 eprintln!("{}", serde_json::json!({"annotation": {
-                    "observed_unix_ms": std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis()),
+                    "observed_unix_ms": observed_unix_ms,
                     "table": table.binding.table,
                     "applied": view.applied, "materialized": view.materialized,
                     "active_entries": view.active_entries, "frozen_entries": view.frozen_entries,
