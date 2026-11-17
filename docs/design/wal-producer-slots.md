@@ -54,3 +54,8 @@ round trips, an interrupted snapshot transfer between real Raft processes, and a
 real Lance publication/retirement fixture. The latter closes a producer before
 publication, rejects premature reuse, then reuses it after signed source closure
 and verifies old-request fencing, new-generation leader failover and full restart.
+An asynchronous-checkpoint regression holds native persistence during the drain,
+checks that a preproposal Open refusal changes neither the log nor its slot, and
+resolves the same saved Open after the drain. It also checks competing operation
+IDs and a duplicate Open after revocation, then reopens all three native stores
+to verify the acknowledged records and closed generation.

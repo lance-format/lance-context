@@ -48,6 +48,15 @@ impl Cluster {
         disk: Option<crate::raft_log::DiskOptions>,
         storage: crate::raft_log::LogOptions,
     ) -> Result<Self> {
+        Self::open_with_limits(root, options, disk, storage, Limits::default())
+    }
+    fn open_with_limits(
+        root: &Path,
+        options: Options,
+        disk: Option<crate::raft_log::DiskOptions>,
+        storage: crate::raft_log::LogOptions,
+        limits: Limits,
+    ) -> Result<Self> {
         let mut runtimes = Vec::new();
         let mut handles = BTreeMap::new();
         let mut outboxes = Vec::new();
@@ -56,7 +65,7 @@ impl Cluster {
                 &root.join(id.to_string()),
                 layout(),
                 id,
-                Limits::default(),
+                limits.clone(),
                 storage,
             )?;
             if let Some(disk) = disk {
