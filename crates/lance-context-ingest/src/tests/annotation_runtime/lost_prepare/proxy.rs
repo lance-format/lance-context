@@ -113,6 +113,7 @@ enum Point {
     },
     Retire {
         execute: bool,
+        rpc_unknown: bool,
     },
     Confirm {
         execute: bool,
@@ -395,8 +396,21 @@ impl Proxy {
         Self::open_at(c, root, Point::Reserve { execute }).await
     }
 
-    pub async fn open_retire(c: &network::Cluster, root: &FsPath, execute: bool) -> Result<Self> {
-        Self::open_at(c, root, Point::Retire { execute }).await
+    pub async fn open_retire(
+        c: &network::Cluster,
+        root: &FsPath,
+        execute: bool,
+        rpc_unknown: bool,
+    ) -> Result<Self> {
+        Self::open_at(
+            c,
+            root,
+            Point::Retire {
+                execute,
+                rpc_unknown,
+            },
+        )
+        .await
     }
 
     pub async fn open_confirm(c: &network::Cluster, root: &FsPath, execute: bool) -> Result<Self> {
@@ -662,13 +676,23 @@ impl Proxy {
                                     }
                                     if hold && matches!(point, Point::Retire { .. }) && unknown_retirements.load(Ordering::SeqCst) {
                                         dropped.fetch_add(1, Ordering::SeqCst);
-                                        request.unknown_reply()?.write(&mut downstream).await?;
+                                        let reply = if matches!(point, Point::Retire { rpc_unknown: true, .. }) {
+                                            request.reply(Reply::Unknown)?
+                                        } else {
+                                            request.unknown_reply()?
+                                        };
+                                        reply.write(&mut downstream).await?;
                                         continue;
                                     }
-                                    if hold && matches!(point, Point::Append { execute: false } | Point::Close { execute: false } | Point::Reserve { execute: false } | Point::Retire { execute: false }) && armed.swap(false, Ordering::SeqCst) {
+                                    if hold && matches!(point, Point::Append { execute: false } | Point::Close { execute: false } | Point::Reserve { execute: false } | Point::Retire { execute: false, .. }) && armed.swap(false, Ordering::SeqCst) {
                                         committed.notify_one(); release.notified().await;
                                         dropped.fetch_add(1, Ordering::SeqCst);
-                                        request.unknown_reply()?.write(&mut downstream).await?;
+                                        let reply = if matches!(point, Point::Retire { rpc_unknown: true, .. }) {
+                                            request.reply(Reply::Unknown)?
+                                        } else {
+                                            request.unknown_reply()?
+                                        };
+                                        reply.write(&mut downstream).await?;
                                         continue;
                                     }
                                     if hold && matches!(point, Point::Advance { .. }) {
@@ -712,7 +736,7 @@ impl Proxy {
                                         release.notified().await;
                                         dropped.fetch_add(1, Ordering::SeqCst);
                                         if matches!(point, Point::Plan { .. } | Point::Advance { .. } | Point::Reserve { .. } | Point::Retire { .. } | Point::Confirm { .. } | Point::Append { .. } | Point::Pin { .. } | Point::Prepare { structured: true, .. }) {
-                                            let reply = if matches!(point, Point::Pin { rpc_unknown: true, .. }) {
+                                            let reply = if matches!(point, Point::Pin { rpc_unknown: true, .. } | Point::Retire { rpc_unknown: true, .. }) {
                                                 request.reply(Reply::Unknown)?
                                             } else {
                                                 request.unknown_reply()?
