@@ -2,6 +2,12 @@
 
 Tracking issue: [#832](https://github.com/lance-format/lance-context/issues/832).
 
+This document describes the custom typed-column/residual-JSON `DocumentStore`
+baseline. The separate [Arrow Variant implementation](arrow-variant-auto-shredding.md)
+uses canonical Variant arrays and Apache Arrow's shredding kernels. See the
+[dual assessment](automatic-shredding-dual-assessment.md) for their measured
+behavior and limitations.
+
 The `shredding` module and `DocumentStore` select scalar object paths
 automatically. Callers supply JSON values and resource limits, not extraction
 paths. The embedded Rust and Python APIs persist the layout, reconstruct complete

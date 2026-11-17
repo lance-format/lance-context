@@ -1,5 +1,9 @@
 # Automatic shredding: release benchmark results
 
+These historical results concern the custom `DocumentStore` baseline, not Arrow
+Variant. The [dual assessment](../../design/automatic-shredding-dual-assessment.md)
+compares the repaired baseline with the separate `VariantDocumentStore`.
+
 Measured on 2026-11-13. The benchmark is in [#869](https://github.com/lance-format/lance-context/pull/869); the parent roadmap is [#832](https://github.com/lance-format/lance-context/issues/832).
 
 The fixes remove two measured regressions: residual filters no longer fetch unrelated extracted text, and a one-row backfill page no longer expands compressed large text into a raw constant value. In the 8 × 20 MiB case, the filter median falls from 247.086 ms to 0.430 ms and requests 720 bytes instead of 39,797,813 bytes. Current data after maintenance falls from 160.004 MiB to 37.957 MiB. All 54 baseline/candidate runs passed their reconstruction, projection, filtering, search, historical promotion and reopen assertions.
