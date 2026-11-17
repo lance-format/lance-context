@@ -94,6 +94,17 @@ paths. Explicit null and missing remain distinct. `checkout` pins both the layou
 and documents to a read-only version; `refresh` restores the latest view. Field
 selection, projection, and round-trip semantics are covered by real Lance tests.
 
+Writes automatically maintain a BTree index on generated IDs after committing
+records. New append fragments are indexed incrementally; index deltas are
+periodically consolidated to bound lookup fanout. Backfill rebuilds the index
+for rewritten data. Index maintenance errors are logged without reporting an
+already committed append as failed: reads still scan any unindexed tail correctly.
+`prepare_point_reads()` explicitly builds/repairs the index and reports errors;
+use it for stores created by earlier releases or before latency-sensitive reads.
+Pinned snapshots use their existing index or scan without mutating storage.
+Residual `get_path` reads only the relevant subtree and scalar ancestors, so a
+small metadata read does not fetch unrelated extracted text.
+
 ## Logical queries and text search
 
 `filter_eq(path, value, limit)` returns matching generated IDs. A compatible

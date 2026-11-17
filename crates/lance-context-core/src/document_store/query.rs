@@ -58,15 +58,7 @@ impl DocumentStore {
         }
         // Reconstruct only the queried subtree and its scalar ancestors. Other
         // extracted fields can hold megabytes of text unrelated to this filter.
-        let projected_layout = ShredLayout {
-            fields: self
-                .layout
-                .fields
-                .iter()
-                .filter(|field| field.path.starts_with(path) || path.starts_with(&field.path))
-                .cloned()
-                .collect(),
-        };
+        let projected_layout = self.projected_layout(path);
         let mut columns = vec![ID.to_string(), RESIDUAL.to_string()];
         columns.extend(projected_layout.fields.iter().map(column_name));
         scanner.project(&columns)?;
@@ -146,6 +138,7 @@ impl DocumentStore {
             .execute(transaction)
             .await?;
         *self = Self::from_dataset(dataset, false)?;
+        self.maintain_point_reads().await;
         Ok(())
     }
 
