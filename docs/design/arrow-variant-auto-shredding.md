@@ -71,6 +71,13 @@ Both paths encode batches targeting 4 MiB/1024 rows, allowing one oversized row;
 caller-owned inputs, IDs and Lance buffers are outside this target. Rewrites
 cost O(existing data), and retained snapshots keep their old data files.
 
+The adapter disables cross-batch column buffering through Lance's existing
+writer options. Otherwise many historical nulls followed by one large text
+value can become an uncompressed null-padded constant page. Keeping the bounded
+batches separate lets the existing large-singleton compression path apply.
+This adds no Lance source change, but smaller pages can add metadata overhead;
+the equivalent benchmarks include that cost.
+
 A BTree index on ID is maintained after a durable data commit. Failure of that
 maintenance is logged without reporting the committed append as failed;
 `prepare_point_reads` explicitly retries and reports indexing errors. Whole reads
@@ -82,4 +89,3 @@ for that row. The adapter therefore unshreds the projected representation with
 Arrow before invoking its `variant_get` kernel. Unrelated extracted text is not
 part of that projection. This adds reconstruction work for the selected fields;
 it does not require a Lance patch or a custom Variant decoder.
-

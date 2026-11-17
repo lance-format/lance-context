@@ -129,3 +129,71 @@ async fn stale_layout_rewrite_never_discards_a_later_append() {
     let reopened = VariantDocumentStore::open(uri, None).await.unwrap();
     assert_eq!(reopened.get(&kept).await.unwrap(), Some(json!({"a":2})));
 }
+
+#[tokio::test]
+async fn sparse_large_text_stays_compressed_across_migration_and_append() {
+    fn retained_bytes(path: &std::path::Path) -> u64 {
+        std::fs::read_dir(path)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    retained_bytes(&path)
+                } else {
+                    path.metadata().unwrap().len()
+                }
+            })
+            .sum()
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("sparse.lance");
+    let mut store = VariantDocumentStore::create(
+        uri.to_str().unwrap(),
+        ShredPolicy {
+            max_columns: 1,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let ids = store
+        .add((0..1000).map(|i| json!({"n":i})).collect())
+        .await
+        .unwrap();
+    let first = store.version();
+    let body = "late text ".repeat(400_000);
+    let text_id = store.add(vec![json!({"body":body})]).await.unwrap()[0].clone();
+    assert_eq!(store.get(&ids[0]).await.unwrap(), Some(json!({"n":0})));
+    assert_eq!(
+        store.get(&text_id).await.unwrap(),
+        Some(json!({"body":body}))
+    );
+    let bytes = retained_bytes(&uri);
+    assert!(
+        bytes < 1024 * 1024,
+        "sparse migrated text stored raw: {bytes} bytes"
+    );
+    let mut documents = vec![json!({}); 1000];
+    documents.push(json!({"body":body}));
+    let appended = store.add(documents).await.unwrap();
+    assert_eq!(
+        store.get(appended.last().unwrap()).await.unwrap(),
+        Some(json!({"body":body}))
+    );
+    let bytes = retained_bytes(&uri);
+    assert!(
+        bytes < 1024 * 1024,
+        "sparse appended text stored raw: {bytes} bytes"
+    );
+    store.checkout(first).await.unwrap();
+    assert!(store.get(&text_id).await.unwrap().is_none());
+    store.refresh().await.unwrap();
+    let reopened = VariantDocumentStore::open(uri.to_str().unwrap(), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened.get(&text_id).await.unwrap(),
+        Some(json!({"body":body}))
+    );
+}

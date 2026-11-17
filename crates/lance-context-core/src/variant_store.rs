@@ -178,6 +178,13 @@ impl VariantDocumentStore {
             Box::pin(RecordBatchStreamAdapter::new(schema.clone(), incoming))
         };
         let params = WriteParams {
+            // Preserve encoded batch boundaries. Buffering old null children
+            // together with a later large value creates a null-padded constant
+            // page that bypasses compression in the current Lance encoder.
+            file_writer_options: Some(lance_file::writer::FileWriterOptions {
+                data_cache_bytes: Some(0),
+                ..Default::default()
+            }),
             mode: if rewrite {
                 WriteMode::Overwrite
             } else {
