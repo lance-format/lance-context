@@ -131,6 +131,166 @@ async fn stale_layout_rewrite_never_discards_a_later_append() {
 }
 
 #[tokio::test]
+async fn text_search_indexes_variant_children_and_covers_residuals_without_copies() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("search.lance");
+    let mut store = VariantDocumentStore::create(
+        uri.to_str().unwrap(),
+        ShredPolicy {
+            max_columns: 1,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let first = store
+        .add(vec![json!({"body":"otter indexed"})])
+        .await
+        .unwrap()[0]
+        .clone();
+    store.prepare_text_search().await.unwrap();
+    let added = store
+        .add(vec![
+            json!({"body":"otter both","tags":["otter"]}),
+            json!({"tags":["otter residual"]}),
+            json!({"keyonly":987654}),
+            json!("rootword"),
+        ])
+        .await
+        .unwrap();
+    let before = store.version();
+    store.prepare_text_search().await.unwrap();
+    assert_eq!(
+        store.version(),
+        before,
+        "preparation of unchanged layout must be a no-op"
+    );
+    let hits = store.search("OTTER", 10).await.unwrap();
+    assert_eq!(hits.len(), 3);
+    let ids = hits
+        .iter()
+        .map(|hit| hit.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(ids.len(), 3);
+    assert!(ids.contains(first.as_str()));
+    assert!(ids.contains(added[0].as_str()));
+    assert_eq!(hits.last().unwrap().id, added[1]);
+    assert_eq!(hits.last().unwrap().score, 0.0);
+    assert_eq!(store.search("rootword", 10).await.unwrap()[0].id, added[3]);
+    for query in ["keyonly", "987654", "ott", "unmatchedneedle"] {
+        assert!(store.search(query, 10).await.unwrap().is_empty());
+    }
+    assert_eq!(
+        store.dataset.schema().fields.len(),
+        2,
+        "only ID plus the standard Variant column"
+    );
+    let version = store.version();
+    store.checkout(version).await.unwrap();
+    assert_eq!(store.search("otter", 10).await.unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn variant_equality_preserves_missing_null_and_residual_containers() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("filter.lance");
+    let mut store =
+        VariantDocumentStore::create(uri.to_str().unwrap(), ShredPolicy::default(), None)
+            .await
+            .unwrap();
+    let ids = store
+        .add(vec![
+            json!({"v":null}),
+            json!({}),
+            json!({"v":1}),
+            json!({"v":[1,null]}),
+        ])
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .filter_eq(&["v".into()], &Value::Null, 10)
+            .await
+            .unwrap(),
+        vec![ids[0].clone()]
+    );
+    assert_eq!(
+        store.filter_eq(&["v".into()], &json!(1), 10).await.unwrap(),
+        vec![ids[2].clone()]
+    );
+    assert_eq!(
+        store
+            .filter_eq(&["v".into()], &json!([1, null]), 10)
+            .await
+            .unwrap(),
+        vec![ids[3].clone()]
+    );
+}
+
+#[tokio::test]
+async fn nested_and_literal_text_paths_are_searchable() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("nested_search.lance");
+    let mut store =
+        VariantDocumentStore::create(uri.to_str().unwrap(), ShredPolicy::default(), None)
+            .await
+            .unwrap();
+    let record = json!({"nested":{"body":"indexedotter"}, "a.b":{"":"literalotter"}, "back`tick":"tickotter", "quote\"":"quoteotter"});
+    let id = store.add(vec![record.clone()]).await.unwrap()[0].clone();
+    assert_eq!(store.layout().fields().len(), 4);
+    for query in ["indexedotter", "literalotter", "tickotter", "quoteotter"] {
+        let hits = store.search(query, 10).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, id);
+    }
+    assert_eq!(
+        store
+            .get_path(&id, &["a.b".into(), "".into()])
+            .await
+            .unwrap(),
+        Some(json!("literalotter"))
+    );
+    assert_eq!(store.get(&id).await.unwrap(), Some(record));
+}
+
+#[tokio::test]
+async fn text_search_survives_layout_replacement_and_pinned_snapshots() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("replace_index.lance");
+    let mut store = VariantDocumentStore::create(
+        uri.to_str().unwrap(),
+        ShredPolicy {
+            max_columns: 1,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let old = store
+        .add(vec![json!({"body":"originalotter"})])
+        .await
+        .unwrap()[0]
+        .clone();
+    assert_eq!(store.search("originalotter", 10).await.unwrap()[0].id, old);
+    let version = store.version();
+    let new = store
+        .add(vec![json!({"later":"recentotter"})])
+        .await
+        .unwrap()[0]
+        .clone();
+    assert_eq!(store.layout().fields()[0].path, ["later"]);
+    assert_eq!(store.search("originalotter", 10).await.unwrap()[0].id, old);
+    assert_eq!(store.search("recentotter", 10).await.unwrap()[0].id, new);
+    store.checkout(version).await.unwrap();
+    assert_eq!(store.search("originalotter", 10).await.unwrap()[0].id, old);
+    assert!(store.search("recentotter", 10).await.unwrap().is_empty());
+    store.refresh().await.unwrap();
+    assert_eq!(store.search("recentotter", 10).await.unwrap()[0].id, new);
+}
+
+#[tokio::test]
 async fn sparse_large_text_stays_compressed_across_migration_and_append() {
     fn retained_bytes(path: &std::path::Path) -> u64 {
         std::fs::read_dir(path)

@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
 
 mod documents;
+mod variant_documents;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -3829,6 +3830,7 @@ fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<DatagenItemId>()?;
     m.add_class::<GenericStore>()?;
     m.add_class::<documents::DocumentStore>()?;
+    m.add_class::<variant_documents::VariantDocumentStore>()?;
     m.add("ContextStoreError", m.py().get_type::<ContextStoreError>())?;
     m.add("NotFoundError", m.py().get_type::<NotFoundError>())?;
     m.add(

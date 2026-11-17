@@ -89,3 +89,22 @@ for that row. The adapter therefore unshreds the projected representation with
 Arrow before invoking its `variant_get` kernel. Unrelated extracted text is not
 part of that projection. This adds reconstruction work for the selected fields;
 it does not require a Lance patch or a custom Variant decoder.
+
+## Text search and Python
+
+Text indexes target standard `document.typed_value...typed_value` children.
+Preparation builds missing indexes without a data backfill. Native matches rank
+first; remaining result slots use the same OR tokenizer over standard residual
+values, with score zero and unspecified order. This fallback reads root and
+nested residual fields, excluding text covered by native indexes. The current
+Lance nested-index traversal supports plain ASCII identifier components here;
+typed strings under other keys use the fallback scan too, preserving coverage
+without copying their text into a separate column. It can scan all residuals
+on rare/no-hit queries and does not provide global BM25 ranking across both sets.
+Equality uses Arrow's path kernel over projected columns; scalar predicate
+pushdown remains a performance limitation.
+
+Python exports `VariantDocumentStore` alongside the baseline `DocumentStore`.
+Their ordinary add/get/get_path/filter_eq/search and snapshot interfaces align.
+The Variant wrapper delegates to the separate native Variant implementation;
+it does not adapt the baseline's JSON-residual codec.

@@ -15,7 +15,7 @@ pub struct DocumentStore {
     runtime: Runtime,
 }
 
-fn json_to_py(py: Python<'_>, value: &impl Serialize) -> PyResult<PyObject> {
+pub(super) fn json_to_py(py: Python<'_>, value: &impl Serialize) -> PyResult<PyObject> {
     let encoded = serde_json::to_string(value).map_err(to_py_err)?;
     Ok(py
         .import("json")?
@@ -24,7 +24,7 @@ fn json_to_py(py: Python<'_>, value: &impl Serialize) -> PyResult<PyObject> {
 }
 
 // Large text should cross into Python once, without JSON escaping and reparsing.
-fn document_to_py(py: Python<'_>, value: &Value) -> PyResult<PyObject> {
+pub(super) fn document_to_py(py: Python<'_>, value: &Value) -> PyResult<PyObject> {
     match value {
         Value::Null => Ok(py.None()),
         Value::Bool(value) => Ok(PyBool::new(py, *value).to_owned().into_any().unbind()),
@@ -66,7 +66,7 @@ fn document_to_py(py: Python<'_>, value: &Value) -> PyResult<PyObject> {
 // Keep Python integers exact and reject non-JSON values before mutating storage.
 // The generic dumps/parser helper can round integers outside the JSON codec's
 // 64-bit range, so document inputs use a strict conversion instead.
-fn py_any_to_json(value: &Bound<'_, PyAny>) -> PyResult<Value> {
+pub(super) fn py_any_to_json(value: &Bound<'_, PyAny>) -> PyResult<Value> {
     convert_json(value, 0)
 }
 
