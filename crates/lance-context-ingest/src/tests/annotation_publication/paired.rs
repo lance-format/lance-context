@@ -254,7 +254,7 @@ async fn recover(lose_publication_reply: bool, maintenance_stage: Option<u8>) ->
     assert_eq!(latest.score, Some(0.9));
     if lose_publication_reply {
         assert!(annotations::mixed::publish(
-            Arc::new(LostReply(Arc::new(c.client.manifest_catalog()))),
+            Arc::new(LostReply::new(Arc::new(c.client.manifest_catalog()))),
             &one_shard(),
             &narrow,
             &body,

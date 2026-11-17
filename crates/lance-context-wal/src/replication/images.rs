@@ -207,6 +207,10 @@ impl PreparedCheckpoint {
     pub fn group(&self) -> u64 {
         self.group
     }
+    #[cfg(feature = "runtime")]
+    pub(super) fn index(&self) -> u64 {
+        self.loaded.state.applied
+    }
     pub fn image(&self) -> Arc<Image> {
         self.loaded.image.clone()
     }
@@ -261,7 +265,7 @@ pub(super) fn read_body(
 }
 
 pub(super) fn read_log_body(
-    store: &GroupLog,
+    store: &impl Storage,
     index: u64,
     meta: &BatchMeta,
 ) -> Result<bytes::Bytes> {
@@ -312,7 +316,7 @@ impl Node {
         };
         Ok(Some(CheckpointTask {
             permit,
-            store: g.raw.store().clone(),
+            store: g.raw.store().durable_log().clone(),
             previous: g.image.clone(),
             layout: self.layout.clone(),
             limits: self.limits.clone(),
@@ -354,6 +358,11 @@ impl Node {
             prepared.loaded.state.applied <= g.state.applied,
             "checkpoint exceeds applied state"
         );
+        #[cfg(feature = "runtime")]
+        if let Err(error) = g.quiesce(prepared.group, &self.limits) {
+            self.failed = true;
+            return Err(error);
+        }
         if let Err(error) = g
             .raw
             .store()
@@ -364,6 +373,66 @@ impl Node {
             return Err(error);
         }
         g.image = Some(prepared.loaded.image);
+        #[cfg(feature = "runtime")]
+        g.resume_persistence()?;
+        Ok(())
+    }
+
+    /// The candidate covers already durable/applied state and its files are
+    /// synced. Make those bytes readable before native prefix compaction runs;
+    /// the runtime retains both image owners and withholds installation success.
+    #[cfg(feature = "runtime")]
+    pub(super) fn start_async_checkpoint(
+        &mut self,
+        prepared: &PreparedCheckpoint,
+        retained_bytes: u64,
+    ) -> Result<Option<Arc<Image>>> {
+        self.healthy()?;
+        ensure!(
+            Arc::ptr_eq(&prepared.permit.0, &self.images),
+            "foreign node image worker"
+        );
+        ensure!(
+            prepared.received.is_none(),
+            "received image needs step_snapshot"
+        );
+        let g = self
+            .groups
+            .get_mut(&prepared.group)
+            .context("unhosted group")?;
+        ensure!(
+            prepared.loaded.state.applied <= g.state.applied,
+            "checkpoint exceeds applied state"
+        );
+        if let Err(error) =
+            g.start_checkpoint_write(prepared.loaded.image.snapshot()?, retained_bytes)
+        {
+            // A staged view or an accepted task must never be discarded as if
+            // the original I/O had not happened. Shutdown joins the same writer.
+            self.failed = true;
+            return Err(error);
+        }
+        Ok(g.image.replace(prepared.loaded.image.clone()))
+    }
+
+    #[cfg(feature = "runtime")]
+    pub(super) fn finish_async_checkpoint(&mut self, prepared: &PreparedCheckpoint) -> Result<()> {
+        self.healthy()?;
+        let g = self.groups.get(&prepared.group).context("unhosted group")?;
+        ensure!(
+            g.raw.store().checkpoint_index()? == prepared.loaded.state.applied,
+            "checkpoint has no original durable receipt"
+        );
+        ensure!(
+            g.image
+                .as_ref()
+                .is_some_and(|image| Arc::ptr_eq(image, &prepared.loaded.image)),
+            "checkpoint image changed before completion"
+        );
+        if let Err(error) = self.images.installed(&prepared.loaded.image) {
+            self.failed = true;
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -468,7 +537,15 @@ impl Node {
             g.incoming.is_none(),
             "poll the previous received snapshot first"
         );
-        g.raw.step(packet.message)?;
+        #[cfg(feature = "runtime")]
+        if let Err(error) = g.quiesce(prepared.group, &self.limits) {
+            self.failed = true;
+            return Err(error);
+        }
+        let stepped = g.raw.step(packet.message);
+        #[cfg(feature = "runtime")]
+        g.resume_persistence()?;
+        stepped?;
         if g.raw.raft.raft_log.unstable.snapshot.as_ref() == Some(&snapshot) {
             g.incoming = Some(prepared);
         }

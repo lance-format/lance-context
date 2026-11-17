@@ -33,6 +33,7 @@ pub(in crate::tests) enum Action {
 
 #[derive(Debug, Default)]
 pub(in crate::tests) struct Faults {
+    pub azure_delete: Option<Arc<dyn ObjectStore>>,
     pub body_write_failure: std::sync::atomic::AtomicBool,
     pub body_write_attempts: AtomicUsize,
     actions: Mutex<BTreeMap<Path, Action>>,
@@ -70,6 +71,12 @@ struct FailedListing {
 }
 
 impl Faults {
+    pub(super) fn with_azure_delete(store: Arc<dyn ObjectStore>) -> Self {
+        let mut faults = Self::default();
+        faults.azure_delete = Some(store);
+        faults
+    }
+
     fn body_write(&self, path: &Path) -> object_store::Result<()> {
         if path.as_ref().contains("/data/") {
             self.body_write_attempts.fetch_add(1, Ordering::SeqCst);
@@ -222,6 +229,21 @@ impl ObjectStoreProvider for Provider {
             inner: store.inner,
             faults: self.faults.clone(),
         });
+        if self.faults.azure_delete.is_some() {
+            // Real local Lance IO, with Azure SDK DELETE transport interception.
+            // Advertise the actual deletion backend to the collector.
+            store = LanceStore::new(
+                store.inner,
+                url::Url::parse("az://container@account/owned").unwrap(),
+                Some(64 << 10),
+                None,
+                false,
+                false,
+                2,
+                0,
+                None,
+            );
+        }
         Ok(store)
     }
 }
@@ -434,6 +456,9 @@ impl ObjectStore for FaultStore {
         &self,
         locations: BoxStream<'static, object_store::Result<Path>>,
     ) -> BoxStream<'static, object_store::Result<Path>> {
+        if let Some(store) = &self.faults.azure_delete {
+            return store.delete_stream(locations);
+        }
         let inner = self.inner.clone();
         let faults = self.faults.clone();
         locations

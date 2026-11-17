@@ -101,7 +101,17 @@ async fn successful_slow_snapshot(
             .accepted_records
             == 12
     })
-    .await?;
+    .await
+    .with_context(|| {
+        format!(
+            "resumed snapshot follower={follower} expected_records=12 original_index={original_index} latest_index={latest_index} expected_images={expected_images} sent={} send_failed={} installed={} receive_failed={}; {}",
+            statistics.sent.load(Ordering::Acquire),
+            statistics.failed.load(Ordering::Acquire),
+            receiver.installed.load(Ordering::Acquire),
+            receiver.failed.load(Ordering::Acquire),
+            c.net.progress(10),
+        )
+    })?;
     // A nonzero tail is insufficient when the checkpoint has discarded the
     // start of this image's suffix. Only a complete suffix avoids a new image.
     wait_for(|| {

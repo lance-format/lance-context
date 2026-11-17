@@ -49,3 +49,38 @@ Sustained batch sizing, changing hot-key sets, compaction cost and current-turn
 query cost remain necessary before finalizing the physical annotation layout.
 In particular, this experiment does not prove that ordinary full-row compaction
 will preserve the same body I/O savings.
+
+## Larger fragments and narrow rows
+
+Use `--rows-per-fragment` to vary the original layout; its default remains 16.
+Verification still checks every value, targeting 8 MiB of body data per batch
+with at least one and at most 4,096 rows. For example:
+
+```bash
+target/release/examples/annotation_column_update \
+  --output /tmp/annotations-narrow --rows 262144 --body-bytes 64 \
+  --rounds 4 --stride 256 --rows-per-fragment 65536
+```
+
+A Lance 14.0.2 local run used fragment sizes 4,096 / 65,536 / 65,536 / 4,096,
+with the other arguments above unchanged. All 48 narrow-table rounds passed
+the existing value, snapshot and publication checks. The original 64-row,
+1 MiB-body sparse case also passed all 12 rounds.
+
+For the 65,536-row fragments, each round updated 1,024 of 262,144 rows:
+
+| Mode | New data bytes, score null | New data bytes, score set | Prepare requested read bytes |
+| --- | ---: | ---: | ---: |
+| RewriteRows | 85,106 | 85,112 | 20.88–20.93 MB |
+| RewriteColumns | 13,392 | 537,752 | 1.84–2.39 MB |
+
+Column replacement covers every row of a touched fragment, so a sparse update
+can write more annotation bytes. That alone does not justify switching modes:
+row rewriting read about ten times more data here and did not improve local
+preparation time. Larger fragments also reduced file overhead in this fixture.
+
+This fixture has a small immutable binary column and scalar annotations, no ID
+index or label array, and no concurrent ingestion, compaction, WAL or Blob I/O.
+Mode order remains sequential with warm OS caches. These are layout-cost
+observations, not a distributed throughput comparison; production ID-layout
+and index-preservation requirements still need separate validation.

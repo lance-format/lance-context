@@ -182,6 +182,7 @@ async fn exercise(selected: bool) -> Result<()> {
     assert!(originals[0].1.len() > 512);
     proxy.release.notify_one();
     let error = preparing.await?.unwrap_err();
+    proxy.restore_observations();
     assert!(format!("{error:#}").contains("outcome unknown"));
     c.client = direct;
     if selected {
@@ -197,7 +198,7 @@ async fn exercise(selected: bool) -> Result<()> {
             target: pending.plan.target_version()?,
         };
         assert!(publication::mixed::publish(
-            Arc::new(annotation_publication::LostReply(Arc::new(
+            Arc::new(annotation_publication::LostReply::new(Arc::new(
                 c.client.manifest_catalog()
             ))),
             &annotation_publication::one_shard(),

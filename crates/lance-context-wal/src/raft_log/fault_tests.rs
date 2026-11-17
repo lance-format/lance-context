@@ -18,6 +18,7 @@ pub(super) struct FaultControl {
     fail_once: AtomicBool,
     fail_rewrite_sync: AtomicBool,
     pause_rewrite_sync: AtomicBool,
+    pause_sync: AtomicBool,
     pause_payload_read: AtomicBool,
     sync_calls: AtomicU64,
     entered: Mutex<Option<mpsc::SyncSender<()>>>,
@@ -26,6 +27,11 @@ pub(super) struct FaultControl {
 }
 
 impl FaultControl {
+    #[cfg(feature = "runtime")]
+    pub(super) fn sync_calls_for_test(&self) -> u64 {
+        self.sync_calls.load(Ordering::Relaxed)
+    }
+
     pub(super) fn observe_allocated_peak_for_test(&self, directory: &Path) -> Arc<AtomicU64> {
         let peak = Arc::new(AtomicU64::new(0));
         *self.allocated_peak.lock().unwrap() = Some((directory.to_owned(), peak.clone()));
@@ -56,6 +62,10 @@ impl FaultControl {
         self.pause_for_test(&self.pause_rewrite_sync)
     }
 
+    pub(super) fn pause_sync_for_test(&self) -> FilePause {
+        self.pause_for_test(&self.pause_sync)
+    }
+
     pub(super) fn pause_payload_read_for_test(&self) -> FilePause {
         self.pause_for_test(&self.pause_payload_read)
     }
@@ -83,13 +93,13 @@ impl FaultControl {
     }
 }
 
-pub(super) struct FilePause {
+pub(crate) struct FilePause {
     entered: mpsc::Receiver<()>,
     release: mpsc::Sender<()>,
 }
 
 impl FilePause {
-    pub(super) fn wait(&self) -> Result<()> {
+    pub(crate) fn wait(&self) -> Result<()> {
         self.entered.recv_timeout(Duration::from_secs(10))?;
         Ok(())
     }
@@ -130,11 +140,12 @@ impl Handle for FaultHandle {
     fn sync(&self) -> io::Result<()> {
         self.control.observe_allocated_peak()?;
         self.control.sync_calls.fetch_add(1, Ordering::Relaxed);
-        if self.rewrite
-            && self
-                .control
-                .pause_rewrite_sync
-                .swap(false, Ordering::AcqRel)
+        if self.control.pause_sync.swap(false, Ordering::AcqRel)
+            || (self.rewrite
+                && self
+                    .control
+                    .pause_rewrite_sync
+                    .swap(false, Ordering::AcqRel))
         {
             if let Some(entered) = self.control.entered.lock().unwrap().take() {
                 let _ = entered.send(());

@@ -33,7 +33,7 @@ fn committed_fetch_and_source_finish_before_a_later_failed_sync_without_acknowle
         );
         let proposed_index = original_index + 1;
         let node = nodes.remove(0);
-        let store = node.groups[&10].raw.store().clone();
+        let store = node.groups[&10].raw.store().durable_log().clone();
         let (runtime, outbox) = Runtime::spawn(
             node,
             Options {

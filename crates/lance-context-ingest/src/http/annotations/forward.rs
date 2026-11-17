@@ -162,7 +162,13 @@ impl Forwarder {
                 ingress.budget.reserve(length + maximum_reply),
             )
             .await
-            .map_err(|_| Failure::unavailable("memory_capacity", "not_submitted"))?
+            .map_err(|_| {
+                if matches!(operation, Operation::Update) {
+                    self.gate.write_memory_refusal()
+                } else {
+                    Failure::unavailable("memory_capacity", "not_submitted")
+                }
+            })?
         };
         let deadline = Instant::now() + options.body_total_timeout;
         let (request, mut url) = self.routes[table]

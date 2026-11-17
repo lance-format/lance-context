@@ -96,7 +96,7 @@ async fn source_pages_preserve_apply_order_pressure_and_concurrent_publication()
     assert_eq!(completed(&service, "annotation_observe"), 1);
 
     // Publish the first update while the second is active and the remainder
-    // is still only committed metadata. Retirement cannot discard either.
+    // is queued but unapplied. Retirement cannot discard either.
     let (prepared, selection, descriptors, commit) =
         crate::tests::annotation_checkpoint::prepare(&c, &frozen, 0).await?;
     let published = crate::annotation_publication::publish(
@@ -135,7 +135,10 @@ async fn source_pages_preserve_apply_order_pressure_and_concurrent_publication()
         }
         driver.step_for_test().await?;
         assert_eq!(service.observation().await.0.applied, *index);
-        assert_eq!(completed(&service, "annotation_fetch"), offset as u64 + 1);
+        // Payload lookahead may be ahead of apply, within its eight-request
+        // prefix. The final count below still forbids duplicate or skipped fetches.
+        let fetched = completed(&service, "annotation_fetch") as usize;
+        assert!((offset + 1..=(offset + 8).min(indices.len())).contains(&fetched));
         assert_eq!(
             completed(&service, "annotation_observe"),
             offset as u64 / 32 + 1

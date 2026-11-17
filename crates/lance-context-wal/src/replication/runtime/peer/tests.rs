@@ -14,6 +14,7 @@ use rustls::{
 };
 use std::{net::SocketAddr, path::Path};
 
+mod batching;
 mod enqueue;
 mod idle;
 mod process;
@@ -175,7 +176,33 @@ impl Cluster {
             }
         })
         .await
-        .context("TLS replica election did not settle")
+        .with_context(|| {
+            format!(
+                "TLS replica election did not settle: {}",
+                self.progress(group)
+            )
+        })
+    }
+    fn progress(&self, group: u64) -> String {
+        self.nodes
+            .iter()
+            .map(|(id, node)| {
+                let stats = node.network.statistics();
+                match node.handle.observation(group) {
+                    Ok(o) => format!(
+                        "node={id} status={:?} checkpoint={} first_retained={} polling={} stopped={} failure={:?} sent={} received={} dropped={} exchanges_failed={} packets_rejected={}",
+                        o.status, o.checkpoint_index, o.first_retained_index, o.polling,
+                        o.stopped, o.failure, stats.sent_frames.load(Ordering::Relaxed),
+                        stats.received_frames.load(Ordering::Relaxed),
+                        stats.dropped_outbound.load(Ordering::Relaxed),
+                        stats.failed_exchanges.load(Ordering::Relaxed),
+                        stats.rejected_packets.load(Ordering::Relaxed),
+                    ),
+                    Err(e) => format!("node={id} observation failed: {e:#}"),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
     }
     pub(crate) async fn shutdown(mut self) -> Result<()> {
         let ids: Vec<_> = self.nodes.keys().copied().collect();
@@ -193,6 +220,7 @@ async fn a_follower_that_stops_reading_cannot_consume_the_healthy_quorums_outbox
         dir.path(),
         Options {
             io_timeout: Duration::from_secs(60),
+            send_batch_frames: 8,
             ..Options::default()
         },
     )
@@ -312,7 +340,14 @@ async fn append(handle: &Handle, group: u64, batch: Batch) -> Result<u64> {
 async fn mutual_tls_replication_reconnects_and_retains_exact_payloads_after_all_engines_reopen(
 ) -> Result<()> {
     let dir = tempfile::tempdir()?;
-    let mut c = Cluster::open(dir.path()).await?;
+    let mut c = Cluster::with_options(
+        dir.path(),
+        Options {
+            send_batch_frames: 8,
+            ..Options::default()
+        },
+    )
+    .await?;
     c.nodes[&1].handle.campaign(10)?.await?;
     c.nodes[&2].handle.campaign(20)?.await?;
     let leader = c.leader(10).await?;

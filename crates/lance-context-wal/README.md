@@ -246,3 +246,21 @@ That wrapper is absent from ordinary builds. A RawNode test drives persistence,
 elections, minority isolation and restart with deterministic in-process message
 delivery. These tests establish component contracts; they do not establish
 power-loss recovery or distributed quorum durability.
+
+## Thread CPU observations
+
+The Linux experiment sampler accepts `--threads` to include thread names,
+states, start ticks and CPU ticks from the recorded process. This can distinguish
+`lance-cpu` activity from other runtime threads before changing worker counts.
+
+```bash
+context-wal-resource --operation /path/to/recorded-operation --interval-ms 1000 --threads
+```
+
+Compare counter deltas only for matching `(tid, start_ticks)` pairs, dividing by
+`ticks_per_second` and elapsed seconds. Thread snapshots are not atomic and omit
+threads that exit between samples; their sum is not total process CPU. Entries
+that disappear during a snapshot are counted in `threads.vanished`. More than
+1024 enumerated threads fails the observation rather than silently truncating it.
+Sampling cost remains included in `sample_wall_seconds`; thread reads are disabled
+unless requested. A thread name identifies a pool label, not a particular request.

@@ -115,27 +115,27 @@ impl Owner {
                     .try_reserve_upload(length)
                     .await
                     .map_err(|_| Failure::bad("invalid_upload_size"))?
-                    .ok_or_else(|| Failure::unavailable("memory_capacity", "not_submitted"))?
+                    .ok_or_else(|| self.gate.write_memory_refusal())?
             } else {
                 tokio::time::timeout(
                     options.admission_timeout,
                     self.service.reserve_upload(length),
                 )
                 .await
-                .map_err(|_| Failure::unavailable("memory_capacity", "not_submitted"))?
+                .map_err(|_| self.gate.write_memory_refusal())?
                 .map_err(|_| Failure::bad("invalid_upload_size"))?
             };
-            let bytes = self
+            let (bytes, capacity) = self
                 .service
                 .phase_counters()
                 .measure(
                     Phase::AnnotationUploadRead,
-                    body::read_exact(request, length, options),
+                    body::read_exact_accounted(request, length, options),
                 )
                 .await?;
             let prepared = self
                 .service
-                .prepare(upload, bytes, &producer, sequence)
+                .prepare_received(upload, bytes, capacity, &producer, sequence)
                 .await
                 .map_err(|_| Failure::bad("invalid_annotation_ipc"))?;
             let completion = self
@@ -145,6 +145,9 @@ impl Owner {
                 .map_err(|error| match error.downcast_ref::<AppendFailure>() {
                     Some(AppendFailure::DiskBudgetNotSubmitted) => {
                         Failure::unavailable("wal_disk_capacity", "not_submitted")
+                    }
+                    Some(AppendFailure::PendingCapacityNotSubmitted) => {
+                        Failure::unavailable("request_capacity", "not_submitted")
                     }
                     // This is a committed WAL decision, not a local capacity
                     // guess or an ambiguous transport failure. Exact retained
@@ -159,7 +162,14 @@ impl Owner {
                             outcome: "rejected",
                         }
                     }
-                    _ => Failure::unavailable("annotation_outcome_unknown", "unknown"),
+                    _ => {
+                        let meta = prepared.meta();
+                        eprintln!(
+                            "annotation mutation outcome unknown: table={} bucket={} producer={} sequence={}: {error:#}",
+                            meta.stream, meta.bucket, meta.producer, meta.sequence
+                        );
+                        Failure::unavailable("annotation_outcome_unknown", "unknown")
+                    }
                 })?;
             let accepted = AcceptedAppend {
                 scope: ingress.scope.clone(),

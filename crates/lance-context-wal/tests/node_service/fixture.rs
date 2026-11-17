@@ -34,6 +34,7 @@ pub struct Fixture {
     pub configs: BTreeMap<u64, Config>,
     pub client: Arc<Client>,
     pub layout: Arc<Layout>,
+    client_tls: Arc<rustls::ClientConfig>,
 }
 impl Fixture {
     pub fn new() -> Result<Self> {
@@ -232,11 +233,12 @@ impl Fixture {
                 )
             })
             .collect();
+        let client_tls = Arc::new(tls);
         let client = Arc::new(Client::new(
             &layout,
             &limits,
             endpoints,
-            Arc::new(tls),
+            client_tls.clone(),
             client::Options {
                 timeout: Duration::from_secs(2),
                 ..client::Options::default()
@@ -248,7 +250,92 @@ impl Fixture {
             configs,
             client,
             layout,
+            client_tls,
         })
+    }
+    pub fn rebind(&mut self) -> Result<()> {
+        let identity = self.client.identity();
+        let previous = self.configs.clone();
+        let mut leases = Vec::new();
+        let old_addresses: BTreeSet<_> = previous
+            .values()
+            .flat_map(|c| {
+                [
+                    c.listen.peer,
+                    c.listen.snapshot,
+                    c.listen.data,
+                    c.listen.control,
+                    c.listen.health,
+                ]
+            })
+            .collect();
+        let mut endpoints = self.configs[&1].endpoints.clone();
+        for (&node, config) in &mut self.configs {
+            let mut ports = Vec::new();
+            while ports.len() < 5 {
+                let lease = TcpListener::bind("127.0.0.1:0")?;
+                let address = lease.local_addr()?;
+                if !old_addresses.contains(&address) {
+                    ports.push(address);
+                }
+                // Keep even rejected old addresses reserved while allocating.
+                leases.push(lease);
+            }
+            config.listen = Listen {
+                peer: ports[0],
+                snapshot: ports[1],
+                data: ports[2],
+                control: ports[3],
+                health: ports[4],
+            };
+            let endpoint = endpoints.get_mut(&node).context("missing endpoint")?;
+            endpoint.peer = ports[0].to_string();
+            endpoint.snapshot = ports[1].to_string();
+            endpoint.data = ports[2].to_string();
+            endpoint.control = ports[3].to_string();
+        }
+        for (&node, config) in &mut self.configs {
+            config.endpoints = endpoints.clone();
+            config.validate()?;
+            let old = &previous[&node];
+            assert_eq!(config.layout.fingerprint()?, identity.1);
+            assert_eq!(config.directory, old.directory);
+            assert_eq!(config.tls.certificate, old.tls.certificate);
+            assert_eq!(config.tls.private_key, old.tls.private_key);
+            assert_eq!(
+                config.endpoints[&node].certificate,
+                old.endpoints[&node].certificate
+            );
+            fs::write(
+                self.root.path().join(format!("{node}.json")),
+                serde_json::to_vec_pretty(config)?,
+            )?;
+        }
+        self.client = Arc::new(Client::new(
+            &self.layout,
+            &self.configs[&1].limits,
+            endpoints
+                .iter()
+                .map(|(&id, e)| {
+                    (
+                        id,
+                        client::Endpoint {
+                            data_address: e.data.clone(),
+                            control_address: e.control.clone(),
+                            server_name: e.server_name.clone(),
+                            certificate: e.certificate,
+                        },
+                    )
+                })
+                .collect(),
+            self.client_tls.clone(),
+            client::Options {
+                timeout: Duration::from_secs(2),
+                ..client::Options::default()
+            },
+        )?);
+        assert_eq!(self.client.identity(), identity);
+        Ok(())
     }
     pub fn spawn(&self, node: u64, incarnation: u64) -> Result<ChildNode> {
         let log = self

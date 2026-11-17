@@ -112,6 +112,8 @@ pub struct PreparedAppend {
     rows: u32,
     #[cfg(feature = "materializer")]
     annotation_kind: Option<annotations::WriteKind>,
+    #[cfg(feature = "materializer")]
+    payload_capacity: Option<usize>,
     _reservation: MergeReservation,
 }
 impl PreparedAppend {
@@ -180,6 +182,9 @@ pub enum AppendFailure {
     /// Only this attempt was refused before proposal. Keep the original request
     /// identity and bytes, including when reconciling an earlier unknown reply.
     DiskBudgetNotSubmitted,
+    /// The pending proposal/persistence budget refused this attempt before
+    /// Raft proposal. This cannot resolve a previous unknown attempt.
+    PendingCapacityNotSubmitted,
     Unknown,
 }
 impl std::fmt::Display for AppendFailure {
@@ -192,6 +197,9 @@ impl std::fmt::Display for AppendFailure {
             Self::ProducerFenced => f.write_str("producer fenced"),
             Self::DiskBudgetNotSubmitted => {
                 f.write_str("WAL disk admission refused this append before submission")
+            }
+            Self::PendingCapacityNotSubmitted => {
+                f.write_str("WAL pending capacity refused this append before submission")
             }
             Self::Unknown => {
                 f.write_str("append outcome unknown; retain exact producer sequence and bytes")
@@ -462,6 +470,9 @@ impl Ingress {
             Reply::AppendNotSubmittedDiskBudget => {
                 return Err(AppendFailure::DiskBudgetNotSubmitted.into())
             }
+            Reply::AppendNotSubmittedPendingCapacity => {
+                return Err(AppendFailure::PendingCapacityNotSubmitted.into())
+            }
             Reply::Commit(Outcome::Committed(Applied::Accepted { index })) => index,
             Reply::Commit(Outcome::Committed(Applied::Rejected { expected_sequence })) => {
                 return Err(AppendFailure::Sequence {
@@ -475,7 +486,10 @@ impl Ingress {
             Reply::Commit(Outcome::Committed(Applied::ProducerFenced)) => {
                 return Err(AppendFailure::ProducerFenced.into())
             }
-            _ => return Err(AppendFailure::Unknown.into()),
+            reply => {
+                return Err(anyhow::Error::new(AppendFailure::Unknown)
+                    .context(format!("append returned {reply:?}")))
+            }
         };
         ensure!(index > 0 && index < u64::MAX, "invalid accepted index");
         Ok(AcceptedAppend {
@@ -583,6 +597,8 @@ fn prepare(
         rows,
         #[cfg(feature = "materializer")]
         annotation_kind: None,
+        #[cfg(feature = "materializer")]
+        payload_capacity: None,
         _reservation: upload.reservation,
     })
 }

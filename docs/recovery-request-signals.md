@@ -10,11 +10,18 @@ The existing schema 1 response now also includes slow-read observations:
 | `read_slow_at_unix_millis` | Completion time of the latest qualifying read. |
 | `read_slow_status` | That read's HTTP status, including 2xx or 4xx. |
 | `read_slow_header_millis` | Time from middleware entry until response headers. |
+| `read_slow_method`, `read_slow_route` | HTTP method and matched route template for that slow read. |
+| `read_error_method`, `read_error_route` | HTTP method and matched route template for the retained 5xx read. |
 
 These fields are additive. Consumers of older workers must treat absent fields
 as unavailable observations, not proof of fast reads. A null per-table field
 means there is no retained slow-read observation in the five-minute window.
 Successful activity does not clear unexpired errors or slow-read observations.
+Route and method follow their own error or slow-read event, including when
+different events for one table are combined. Routes contain placeholders, such
+as `/api/v1/rollouts/{name}/records/{id}/blob`, so consumers can distinguish list,
+point, blob, and search reads without retaining IDs or query parameters. Missing
+route or method on older workers means unknown operation.
 
 This catches cases such as a `/records` request that spends four minutes scanning
 before returning 404: it was absent from the 5xx hints and could not be assigned

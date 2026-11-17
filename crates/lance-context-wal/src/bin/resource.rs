@@ -13,6 +13,8 @@ use std::{
 };
 #[path = "resource/tcp.rs"]
 mod tcp;
+#[path = "resource/threads.rs"]
+mod threads;
 
 #[derive(Parser)]
 struct Args {
@@ -27,6 +29,9 @@ struct Args {
     /// Port counts distinguish local endpoints from remote endpoints.
     #[arg(long)]
     tcp_port: Option<u16>,
+    /// Include bounded per-thread CPU counters and names for runtime profiling.
+    #[arg(long)]
+    threads: bool,
 }
 #[derive(Deserialize)]
 struct Identity {
@@ -224,12 +229,17 @@ fn main() -> Result<()> {
                 .tcp_port
                 .map(|port| tcp::observe(identity.pid, port))
                 .transpose()?;
+            let threads = args
+                .threads
+                .then(|| threads::observe(identity.pid, page as u64))
+                .transpose()?;
             Ok(
                 serde_json::json!({"kind":"resource_sample", "pid":identity.pid,"start_ticks":identity.start_ticks,
                 "timestamp_ms":SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
                 "seconds":started.elapsed().as_secs_f64(),"process":initial,"ticks_per_second":ticks,
                 "io":io,"cgroup_cpu":cpu,"cgroup_memory_bytes":memory,"cgroup_memory_events":memory_events,
-                "allocated_directory_bytes":disk,"tcp":tcp,"sample_wall_seconds":begin.elapsed().as_secs_f64()}),
+                "allocated_directory_bytes":disk,"tcp":tcp,"threads":threads,
+                "sample_wall_seconds":begin.elapsed().as_secs_f64()}),
             )
         })();
         // Ignore incomplete samples only when this incarnation ended or is exiting.

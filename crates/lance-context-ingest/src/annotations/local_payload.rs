@@ -4,19 +4,32 @@ use std::{collections::BTreeMap, sync::Weak};
 
 /// One weak entry per bounded producer slot, never a retained payload cache.
 #[derive(Default)]
-pub(super) struct Registry(Mutex<BTreeMap<usize, Weak<Batch>>>);
+pub(super) struct Registry(Mutex<BTreeMap<usize, Weak<Payload>>>);
+
+struct Payload {
+    batch: Batch,
+    capacity: Option<usize>,
+}
 
 pub(super) struct Registration<'a> {
     registry: &'a Registry,
     slot: usize,
-    batch: Arc<Batch>,
+    batch: Arc<Payload>,
 }
 
 impl Registry {
-    pub(super) fn register(&self, slot: usize, prepared: &Batch) -> Registration<'_> {
+    pub(super) fn register(
+        &self,
+        slot: usize,
+        prepared: &Batch,
+        capacity: Option<usize>,
+    ) -> Registration<'_> {
         // Batch::clone shares Bytes; PreparedAppend's upload reservation remains
         // alive for this entire submission. No new payload buffer is allocated.
-        let batch = Arc::new(prepared.clone());
+        let batch = Arc::new(Payload {
+            batch: prepared.clone(),
+            capacity,
+        });
         self.0.lock().unwrap().insert(slot, Arc::downgrade(&batch));
         Registration {
             registry: self,
@@ -27,12 +40,16 @@ impl Registry {
 
     /// Call only after reserving the apply workspace. The returned Bytes may
     /// then outlive the upload, backed by that workspace or retained body frame.
-    pub(super) fn body(&self, slot: usize, committed: &BatchMeta) -> Option<Bytes> {
+    pub(super) fn body(
+        &self,
+        slot: usize,
+        committed: &BatchMeta,
+    ) -> Option<(Bytes, Option<usize>)> {
         let batch = self.0.lock().unwrap().get(&slot)?.upgrade()?;
         // A producer slot can be reused, and a conflicting same-sequence
         // request can race the accepted one. Match the complete WAL identity,
         // including its existing digest, without rehashing or copying payloads.
-        (batch.meta == *committed).then(|| batch.body.clone())
+        (batch.batch.meta == *committed).then(|| (batch.batch.body.clone(), batch.capacity))
     }
 }
 
@@ -62,8 +79,9 @@ mod tests {
             1,
             Bytes::from(vec![7; 4096]),
         );
-        let registration = registry.register(1, &input);
-        let body = registry.body(1, &input.meta).unwrap();
+        let registration = registry.register(1, &input, Some(4096));
+        let (body, capacity) = registry.body(1, &input.meta).unwrap();
+        assert_eq!(capacity, Some(4096));
         assert_eq!(body.as_ptr(), input.body.as_ptr());
         for field in 0..7 {
             let mut other = input.meta.clone();
@@ -97,14 +115,14 @@ mod tests {
         );
         let mut next = first.clone();
         next.meta.producer = producer::producer_id(1, 2);
-        let old = registry.register(1, &first);
-        let new = registry.register(1, &next);
+        let old = registry.register(1, &first, None);
+        let new = registry.register(1, &next, None);
         assert_eq!(registry.0.lock().unwrap().len(), 1);
         drop(old);
         assert!(registry.body(1, &first.meta).is_none());
         assert!(registry.body(1, &next.meta).is_some());
         // Even identical duplicate submissions have distinct lifetimes.
-        let duplicate = registry.register(1, &next);
+        let duplicate = registry.register(1, &next, None);
         drop(new);
         assert!(registry.body(1, &next.meta).is_some());
         drop(duplicate);

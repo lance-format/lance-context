@@ -10,6 +10,7 @@ pub(super) struct PublishedValues {
     // Serialize current-value insertion with publication warming, without
     // retaining a staging view or holding a lock during native reads.
     current_cut: Arc<Mutex<u64>>,
+    cold: cold_points::ColdPoints,
 }
 
 pub(super) struct Cached {
@@ -68,7 +69,7 @@ impl DeepSizeOf for SnapshotValue {
 }
 
 impl PublishedValues {
-    pub fn new(base: &Dataset, materialized: u64) -> Self {
+    pub fn new(base: &Dataset, materialized: u64, readers: usize) -> Self {
         let session = base.session();
         let cache = session.file_metadata_cache();
         // A custom backend without a reported byte bound is not a suitable
@@ -81,6 +82,7 @@ impl PublishedValues {
         Self {
             cache,
             current_cut: Arc::new(Mutex::new(materialized)),
+            cold: cold_points::ColdPoints::new(readers),
         }
     }
 
@@ -105,13 +107,14 @@ impl PublishedValues {
     /// Both caches share the existing byte bound and own no base/reader pins.
     pub async fn read_base(
         &self,
-        base: &Dataset,
-        turn: &str,
+        base: &Arc<views::Base>,
+        turn: &Arc<str>,
         materialized: u64,
         value_bytes: usize,
+        reader: &Arc<OwnedSemaphorePermit>,
     ) -> Result<Option<TurnAnnotation>> {
         let Some(cache) = &self.cache else {
-            return super::read_base(base, turn, value_bytes).await;
+            return self.cold.read(base, turn, value_bytes, reader).await;
         };
         let value = cache
             .get_or_insert_with_key(
@@ -120,7 +123,7 @@ impl PublishedValues {
                     turn,
                 },
                 || async {
-                    let value = super::read_base(base, turn, value_bytes).await?;
+                    let value = self.cold.read(base, turn, value_bytes, reader).await?;
                     let charge = match &value {
                         Some(value) => charge(turn, value)?,
                         None => 512 + turn.len(),

@@ -44,7 +44,7 @@ fn sample_process(tcp: bool) -> Result<()> {
         .args(["--interval-ms", "100"])
         .stdout(Stdio::piped());
     if tcp {
-        command.args(["--tcp-port", "7800"]);
+        command.args(["--tcp-port", "7800", "--threads"]);
     }
     let mut sampler = OwnedChild(command.spawn()?);
     let mut out = BufReader::new(sampler.0.stdout.take().unwrap());
@@ -59,8 +59,15 @@ fn sample_process(tcp: bool) -> Result<()> {
             assert_eq!(sample["tcp"]["port"], 7800);
             assert_eq!(sample["tcp"]["owned_tcp_sockets"], 0);
             assert_eq!(sample["tcp"]["remote_port_states"], serde_json::json!({}));
+            let threads = sample["threads"]["observed"].as_array().unwrap();
+            assert_eq!(threads.len(), 1);
+            assert_eq!(threads[0]["tid"], target.0.id());
+            assert_eq!(threads[0]["name"], "sleep");
+            assert_eq!(threads[0]["start_ticks"], sample["start_ticks"]);
+            assert_eq!(sample["threads"]["vanished"], 0);
         } else {
             assert!(sample["tcp"].is_null());
+            assert!(sample["threads"].is_null());
         }
     }
     target.0.kill()?;

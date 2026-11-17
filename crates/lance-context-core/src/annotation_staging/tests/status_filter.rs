@@ -203,9 +203,14 @@ async fn status_filter_bounds_rows_escaped_response_bytes_and_retained_readers()
     assert!(bounded.truncated && !bounded.ids.is_empty() && bounded.ids.len() < 3);
     assert!(::serde_json::to_vec(&bounded).unwrap().len() <= 1024);
     drop(read);
-    let read = staging
+    let mut read = staging
         .capture_status(Some("pending".into()), 1, 64 << 10)
         .await?;
+    // A small caller budget must still serve the same captured query, while
+    // preserving the response bound and refusing an unusable workspace.
+    assert!(read.cap_scan_workspace(1024).is_err());
+    read.cap_scan_workspace(8 << 20)?;
+    assert!(read.workspace_bytes()? <= 8 << 20);
     let limited = read.resolve().await?;
     assert_eq!(limited.ids.len(), 1);
     assert!(limited.truncated);

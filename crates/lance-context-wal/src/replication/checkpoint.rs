@@ -1,7 +1,9 @@
 //! Immutable application images and bounded file transfer. Payloads stay opaque;
 //! building and loading an image never decode Arrow or concatenate its bodies.
 //! File I/O belongs on a bounded worker, outside the Raft owner. Only a later
-//! durable Raft transition can install a prepared image. Files are retained on
+//! durable Raft transition can durably install a prepared image. A local image
+//! of already applied state may serve reads while its metadata sync is pending;
+//! the owner retains both generations until the original receipt. Files are retained on
 //! errors; images omit retired bodies but physical collection is separate.
 
 use super::*;

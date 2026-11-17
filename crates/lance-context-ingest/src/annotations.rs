@@ -11,7 +11,7 @@ use crate::{
 use lance::dataset::builder::DatasetBuilder;
 use lance_context_api::annotation::TurnAnnotation;
 use lance_context_core::annotation_staging::{
-    AnnotationStaging, ApplyOutcome, Limits, Mutation, RegistrationLookup, Rejection,
+    AnnotationStaging, ApplyOutcome, Limits, Mutation, PatchLookup, RegistrationLookup, Rejection,
     Scope as StagingScope,
 };
 use lance_context_wal::replication::publication::lance::ManagedManifest;
@@ -26,6 +26,8 @@ mod local_payload;
 pub(crate) mod metadata_upload;
 pub mod mixed;
 mod prefetch;
+#[cfg(all(feature = "service", feature = "lance-io-metrics"))]
+pub(crate) mod read_io;
 pub mod runtime;
 mod shard;
 #[cfg(feature = "http")]
@@ -108,6 +110,8 @@ struct Pending {
     index: u64,
     meta: BatchMeta,
     decoded: mixed::Decoded,
+    // Input address and complete allocation size, when known at reception.
+    input_allocation: Option<(usize, usize)>,
     _reservation: MergeReservation,
 }
 
@@ -115,7 +119,7 @@ pub struct Driver {
     service: Service,
     pending: Option<Pending>,
     lookahead: VecDeque<Pending>,
-    registration_lookup: Option<RegistrationLookup>,
+    lookup: prefetch::Lookup,
     source_page: Option<lance_context_wal::replication::Page>,
     staging_pressure: Option<(u64, usize, usize)>,
 }
@@ -410,7 +414,7 @@ impl Service {
             service: service.clone(),
             pending: None,
             lookahead: VecDeque::new(),
-            registration_lookup: None,
+            lookup: prefetch::Lookup::default(),
             source_page: None,
             staging_pressure: None,
         };
@@ -485,6 +489,9 @@ impl Service {
         decode_workspace(contract, &self.limits, bytes)
     }
 
+    /// Prepare shared input without assuming its visible length is the backing
+    /// allocation size. The caller must keep the backing within its upload
+    /// allowance; use `prepare_owned` to release validation credit precisely.
     pub async fn prepare(
         &self,
         upload: Upload,
@@ -492,19 +499,48 @@ impl Service {
         producer: &Producer,
         sequence: u64,
     ) -> Result<PreparedAppend> {
+        self.prepare_received(upload, body, None, producer, sequence)
+            .await
+    }
+
+    /// Transfer a complete allocation without copying its payload. Capacity,
+    /// including unused space, remains charged after validation.
+    pub async fn prepare_owned(
+        &self,
+        upload: Upload,
+        body: Vec<u8>,
+        producer: &Producer,
+        sequence: u64,
+    ) -> Result<PreparedAppend> {
+        let capacity = body.capacity();
+        self.prepare_received(upload, body.into(), Some(capacity), producer, sequence)
+            .await
+    }
+
+    /// Only receive paths that own the complete allocation may supply capacity.
+    /// A caller's Bytes length (or an Arrow buffer capacity) is not that proof.
+    pub(crate) async fn prepare_received(
+        &self,
+        upload: Upload,
+        body: Bytes,
+        payload_capacity: Option<usize>,
+        producer: &Producer,
+        sequence: u64,
+    ) -> Result<PreparedAppend> {
         self.shared
             .phases
             .measure(
                 Phase::AnnotationUploadPrepare,
-                self.prepare_observed(upload, body, producer, sequence),
+                self.prepare_observed(upload, body, payload_capacity, producer, sequence),
             )
             .await
     }
 
     async fn prepare_observed(
         &self,
-        upload: Upload,
+        mut upload: Upload,
         body: Bytes,
+        payload_capacity: Option<usize>,
         producer: &Producer,
         sequence: u64,
     ) -> Result<PreparedAppend> {
@@ -517,6 +553,22 @@ impl Service {
                 && upload.bytes == body.len(),
             "invalid annotation request identity or upload"
         );
+        ensure!(
+            payload_capacity.is_none_or(|capacity| capacity >= body.len()),
+            "invalid received allocation size"
+        );
+        if let Some(capacity) = payload_capacity {
+            let workspace = upload
+                .reservation
+                .bytes()
+                .checked_add(capacity - body.len())
+                .context("received allocation workspace overflow")?;
+            ensure!(
+                (capacity == body.len() || workspace <= self.ingress.budget.limit())
+                    && upload.reservation.try_grow_to(workspace),
+                "received allocation exceeds available upload workspace"
+            );
+        }
         let schema = self.ingress.schema.clone();
         let producer = producer.id();
         let value_bytes = self.limits.value_bytes;
@@ -548,14 +600,19 @@ impl Service {
             });
             drop(decoded);
             // Validation owns decoded patches only inside this blocking task.
-            // Keep the existing encoded-body allowance through WAL submission
-            // and applied visibility, but release the discarded decode workspace.
+            // The prepared batch and local apply registration share these Bytes.
+            // WAL transport and apply decoding have their own reservations, so
+            // only a known complete payload allocation may release decode credit.
+            // Unknown caller-owned Bytes can retain a larger parent allocation.
             let mut reservation = upload.reservation;
-            reservation.shrink_to(body.len() * 3);
+            if let Some(capacity) = payload_capacity {
+                reservation.shrink_to(capacity);
+            }
             Ok(PreparedAppend {
                 batch: Batch::new(upload.scope.table, bucket, producer, sequence, body),
                 rows,
                 annotation_kind,
+                payload_capacity,
                 scope: upload.scope,
                 _reservation: reservation,
             })
@@ -589,10 +646,11 @@ impl Service {
         // Share the upload only while its caller awaits apply. This registration
         // proves neither acceptance nor ordering; the driver still checks the
         // committed source metadata and closure, then reserves apply workspace.
-        let _local = self
-            .shared
-            .local_payloads
-            .register(producer_slot, &prepared.batch);
+        let _local = self.shared.local_payloads.register(
+            producer_slot,
+            &prepared.batch,
+            prepared.payload_capacity,
+        );
         tokio::time::timeout(deadline, async {
             let accepted = self
                 .shared
@@ -663,12 +721,18 @@ impl Service {
             // HTTP admission already bounds these requests. A transient lack
             // of staging readers must wait within the same request deadline,
             // without holding an old read view or blocking ordered apply.
+            let view = self
+                .shared
+                .phases
+                .measure(
+                    Phase::AnnotationPointCapture,
+                    self.shared.staging.capture_when_available(turn),
+                )
+                .await?;
             Ok(self
                 .shared
-                .staging
-                .capture_when_available(turn)
-                .await?
-                .resolve()
+                .phases
+                .measure(Phase::AnnotationPointResolve, view.resolve())
                 .await?)
         })
         .await
@@ -777,7 +841,7 @@ impl Driver {
         if self.pending.is_none() {
             self.pending = self.lookahead.pop_front();
             if self.pending.is_none() {
-                self.registration_lookup = None;
+                self.lookup = prefetch::Lookup::default();
             }
         }
         if self.pending.is_none() {
@@ -869,7 +933,7 @@ impl Driver {
                 // Keep the entry until fetch/decode succeeds. Cancellation or
                 // admission pressure must not skip the next committed record.
                 self.source_page.as_mut().unwrap().entries.remove(0);
-                self.registration_lookup = prefetch::prepare(
+                self.lookup = prefetch::prepare(
                     service,
                     self.pending.as_ref().unwrap(),
                     self.source_page.as_mut().unwrap(),
@@ -936,13 +1000,29 @@ impl Driver {
                 service
                     .shared
                     .phases
-                    .measure(
-                        Phase::AnnotationPatch,
-                        service
-                            .shared
-                            .staging
-                            .apply_committed(after, pending.index, &mutations),
-                    )
+                    .measure(Phase::AnnotationPatch, async {
+                        match &self.lookup.patches {
+                            Some(lookup) => {
+                                service
+                                    .shared
+                                    .staging
+                                    .apply_committed_with_lookup(
+                                        after,
+                                        pending.index,
+                                        &mutations,
+                                        lookup,
+                                    )
+                                    .await
+                            }
+                            _ => {
+                                service
+                                    .shared
+                                    .staging
+                                    .apply_committed(after, pending.index, &mutations)
+                                    .await
+                            }
+                        }
+                    })
                     .await?
             }
             mixed::Decoded::Creates { rows, .. } => {
@@ -958,7 +1038,7 @@ impl Driver {
                     .shared
                     .phases
                     .measure(Phase::AnnotationCreate, async {
-                        match &self.registration_lookup {
+                        match &self.lookup.registrations {
                             Some(lookup) => {
                                 service
                                     .shared
@@ -971,7 +1051,7 @@ impl Driver {
                                     )
                                     .await
                             }
-                            None => {
+                            _ => {
                                 service
                                     .shared
                                     .staging
@@ -998,12 +1078,17 @@ impl Driver {
         // No await between applying the batch, retaining its outcome, and
         // publishing progress to waiters. Cancellation cannot split this handoff.
         let pending = self.pending.take().unwrap();
-        if let mixed::Decoded::Creates { bodies, .. } = pending.decoded {
+        if let mixed::Decoded::Creates { bodies, rows } = pending.decoded {
+            // Release decoded narrow rows before returning transient decode
+            // credit. The retained body frame keeps every shared IPC allocation.
+            drop(rows);
             if result == MutationResult::Applied {
                 service.shared.frames.lock().unwrap().record(
                     pending.index,
                     bodies,
                     pending._reservation,
+                    pending.meta.body_bytes as usize,
+                    pending.input_allocation,
                 );
             }
         }

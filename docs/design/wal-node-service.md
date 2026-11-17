@@ -29,9 +29,48 @@ transport/runtime JSON are integer milliseconds; memory/disk fields are bytes.
 All paths relative to a configuration file resolve against its containing
 directory. The executable reads at most 1 MiB of configuration.
 
+`runtime.async_persistence` defaults to `false`. When enabled, each hosted group
+has an ordered native writer for its Raft Ready operations. The original group
+worker retains Raft ownership; successful persistence receipts gate durable
+status, application, persisted messages and client acknowledgments. Pending log
+payloads share buffers with their write tasks. This does not change the physical
+WAL format or eliminate decoding when application reads the persisted log.
+
+The native writer coalesces at most 32 Ready tasks already waiting in its queue.
+It does not wait for more work to arrive. Adjacent entries and their final
+HardState share one append/sync; their payload buffers are moved without decoding
+or copying the bodies. A suffix replacement begins a separate native write, and
+checkpoint tasks remain ordered barriers. Every original Ready keeps its own
+receipt and application boundary, released only after the batch succeeds. A
+failed write releases no successful receipt from that batch and stops the runtime.
+The existing pending window still accounts for every original task until its
+receipt is consumed. Native `io` timing counts writer batches; it is not an
+append request count. The synchronous runtime and persisted format are unchanged.
+
+The per-group pending window bounds Ready records, entries and their encoded
+bytes/descriptors, including deferred application and message ownership. Its
+byte limit derives from the configured data, peer and control byte budgets;
+transport admission separately bounds backing allocations. A full window
+refuses new proposals and defers new read barriers. Leaders continue their
+heartbeat and quorum-check ticks, accept current-term heartbeat responses, and
+send the messages Raft permits before persistence. This does not advance durable
+indices or release commit/read completions. Other peer input and follower ticks
+remain capacity-limited; transport pressure and checkpoint/snapshot barriers can
+still interrupt progress. Those barriers wait for original pending writes.
+Shutdown joins native writers, and persistence failures stop the runtime.
+
+With this option enabled, each group's `persistence` status reports pending
+ownership and native-writer `io` timing separately from `durable_poll`, which
+remains the Raft worker's timing. Moving a sync wait between these fields is not
+evidence of a throughput gain; validate the complete mixed workload and drain.
+
 Each advertised node has distinct peer, snapshot, data and control addresses, a
-TLS server name and a SHA-256 leaf-certificate pin. Addresses are stable service
-names; changing the durable layout is a migration. Listeners may bind wildcard
+TLS server name and a SHA-256 leaf-certificate pin. Prefer stable service names.
+Actual connection addresses in `endpoints` may be updated after Pod replacement;
+keep the original `layout`, node IDs, certificate pins and persistent directories.
+The layout's original addresses remain part of its durable identity and are not
+rewritten to match new Pod IPs. This does not add voters, transfer ownership or
+rotate certificates. Changing the durable layout is a migration. Listeners may bind wildcard
 addresses, but must have distinct, nonzero ports. Only voters sharing a hosted
 group have peer queues and certificate authorization on a physical node; adding
 unrelated groups does not create a full mesh of peer tasks.
@@ -82,7 +121,13 @@ running. Unanswered writes remain unknown, and clients must retry their exact
 persisted producer/sequence/body tuple.
 
 Disk admission is an application control window, not a filesystem quota or a
-promise of unlimited ingest. Replication can consume reserved headroom. Without
+promise of unlimited ingest. New local data proposals use the lower producer
+limit. Peer appends have already passed their leader's admission and may use
+reserved headroom up to the total node budget, even when they contain data.
+Applying the follower's producer limit would also block later control entries
+behind an admitted data prefix. Peer reservations still cover all new entries
+until persistence or discard; total-budget exhaustion refuses new peer payloads.
+Without
 publication/source retirement, acknowledged data must accumulate and admission
 must eventually stop; checkpoints cannot discard that data to improve a score.
 

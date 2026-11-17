@@ -19,6 +19,10 @@ use crate::state::AppState;
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route(
+            "/api/v1/internal/flush-health",
+            get(|| async { axum::Json(lance_context_core::flush_health::snapshot()) }),
+        )
+        .route(
             "/api/v1/internal/legacy-merges",
             get(crate::legacy_merge::status),
         )

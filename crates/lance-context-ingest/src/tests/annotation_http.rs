@@ -23,6 +23,7 @@ mod read_cut;
 mod shards;
 mod source_admission;
 mod status_admission;
+mod status_read_admission;
 mod transport;
 mod upload_admission;
 

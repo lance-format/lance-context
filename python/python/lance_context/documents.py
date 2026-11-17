@@ -8,7 +8,9 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from os import PathLike
 
-from ._internal import DocumentStore as _DocumentStore  # pyright: ignore[reportMissingImports]
+from ._internal import (
+    DocumentStore as _DocumentStore,  # pyright: ignore[reportMissingImports]
+)
 
 
 class DocumentStore:

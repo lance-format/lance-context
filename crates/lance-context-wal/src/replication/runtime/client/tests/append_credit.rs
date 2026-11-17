@@ -12,6 +12,7 @@ fn append_reply_limit_covers_every_valid_wire_outcome() -> Result<()> {
         Reply::Redirect { leader: u64::MAX },
         Reply::Unknown,
         Reply::AppendNotSubmittedDiskBudget,
+        Reply::AppendNotSubmittedPendingCapacity,
         Reply::Commit(Outcome::Unknown),
         Reply::Commit(Outcome::Committed(Applied::Accepted { index: u64::MAX })),
         Reply::Commit(Outcome::Committed(Applied::Rejected {
@@ -21,7 +22,7 @@ fn append_reply_limit_covers_every_valid_wire_outcome() -> Result<()> {
         Reply::Commit(Outcome::Committed(Applied::ProducerFenced)),
     ];
     for reply in replies {
-        // Keep the existing generic encoding: no new wire format or reply type.
+        // Every append outcome fits the existing bounded metadata encoding.
         let encoded = codec().serialize(&(&identity, &reply))?;
         assert!(encoded.len() <= MAX_APPEND_META);
         let (actual_scope, actual_reply): (Scope, Reply) = codec()

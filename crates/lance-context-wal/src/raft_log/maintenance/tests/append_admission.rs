@@ -3,6 +3,15 @@ use std::{sync::mpsc, time::Duration};
 
 #[test]
 fn append_watermark_cannot_expand_after_its_rewrite_allowance_is_reserved() -> Result<()> {
+    check_append_watermark(16 << 20)
+}
+
+#[test]
+fn pressure_append_rewrite_cannot_expand_its_reserved_watermark() -> Result<()> {
+    check_append_watermark(4 << 20)
+}
+
+fn check_append_watermark(data_bytes: usize) -> Result<()> {
     let root = tempfile::tempdir()?;
     let layout = layout();
     let log = PhysicalLog::open_with_file_size(root.path(), &layout, 1, 64 << 10)?;
@@ -39,10 +48,11 @@ fn append_watermark_cannot_expand_after_its_rewrite_allowance_is_reserved() -> R
     }
     group.configure_disk(DiskOptions {
         max_bytes: 32 << 20,
-        data_bytes: 16 << 20,
+        data_bytes,
         headroom_bytes: 4 << 20,
     })?;
     let budget = group.disk_budget().unwrap().clone();
+    assert_eq!(budget.reserve(4096, true).is_err(), data_bytes == 4 << 20);
     let boundary = group.node.engine.purge_manager().capture_append_boundary();
     let allowance = group
         .node

@@ -10,11 +10,14 @@ mod admission;
 mod append_credit;
 mod binding_credit;
 mod binding_timing;
+mod closed_connection;
 mod deadline;
 mod observation;
 mod publication_window;
 mod reconnect;
 mod routing;
+mod routing_hint;
+mod routing_transport;
 mod source_read;
 
 struct RpcCluster {
@@ -142,21 +145,13 @@ async fn wait_for_idle_close(pool: &Pool) -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn closed_control_connection_is_discarded_before_read_or_mutation() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    let c = RpcCluster::open_with_options(
-        dir.path(),
-        Options {
-            timeout: Duration::from_millis(500),
-            ..Options::default()
-        },
-        Options::default(),
-    )
-    .await?;
+    let mut c = RpcCluster::open(dir.path(), Options::default()).await?;
     let leader = c.leader().await?;
     assert_eq!(producer(&c.client, leader, &batch(1)).await?, None);
-    wait_for_idle_close(&c.client.nodes[&leader].control).await?;
+    closed_connection::close_idle(&mut c, leader, false).await?;
     let observed = producer(&c.client, leader, &batch(1)).await;
     assert_eq!(observed?, None);
-    wait_for_idle_close(&c.client.nodes[&leader].control).await?;
+    closed_connection::close_idle(&mut c, leader, false).await?;
     let response = c
         .client
         .request_routed(Request::Query {
@@ -173,7 +168,7 @@ async fn closed_control_connection_is_discarded_before_read_or_mutation() -> Res
         Reply::Query(query::Outcome::Observed { .. })
     ));
     drop(response);
-    wait_for_idle_close(&c.client.nodes[&leader].control).await?;
+    closed_connection::close_idle(&mut c, leader, false).await?;
     let response = c
         .client
         .request(leader, Request::Status { group: 10 })
@@ -184,7 +179,7 @@ async fn closed_control_connection_is_discarded_before_read_or_mutation() -> Res
         c.client.budgets.control.available_permits(),
         c.client.options.control_bytes
     );
-    wait_for_idle_close(&c.client.nodes[&leader].control).await?;
+    closed_connection::close_idle(&mut c, leader, false).await?;
     let command = Command::Acquire(crate::replication::publication::Acquire {
         table: batch(1).meta.stream,
         destination: crate::replication::publication::Destination {
@@ -224,15 +219,7 @@ async fn closed_control_connection_is_discarded_before_read_or_mutation() -> Res
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn closed_data_connection_is_discarded_before_fetch_or_append() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    let c = RpcCluster::open_with_options(
-        dir.path(),
-        Options {
-            timeout: Duration::from_millis(500),
-            ..Options::default()
-        },
-        Options::default(),
-    )
-    .await?;
+    let mut c = RpcCluster::open(dir.path(), Options::default()).await?;
     let leader = c.leader().await?;
     let first = batch(1);
     let response = c
@@ -247,7 +234,7 @@ async fn closed_data_connection_is_discarded_before_fetch_or_append() -> Result<
         .await?;
     let index = accepted(&response);
     drop(response);
-    wait_for_idle_close(&c.client.nodes[&leader].data).await?;
+    closed_connection::close_idle(&mut c, leader, true).await?;
     let response = c
         .client
         .request(leader, Request::Fetch { group: 10, index })
@@ -256,18 +243,9 @@ async fn closed_data_connection_is_discarded_before_fetch_or_append() -> Result<
     assert!(matches!(&response.reply, Reply::Record(Some(meta)) if meta == &first.meta));
     assert!(c.client.budgets.data.available_permits() < c.client.options.data_bytes);
     drop(response);
-    wait_for_idle_close(&c.client.nodes[&leader].data).await?;
+    closed_connection::close_idle(&mut c, leader, true).await?;
     let second = batch(2);
-    let response = c
-        .client
-        .request(
-            leader,
-            Request::Append {
-                group: 10,
-                batch: second.clone(),
-            },
-        )
-        .await?;
+    let response = closed_connection::delayed_append(&c, leader, second.clone(), index + 1).await?;
     let second_index = accepted(&response);
     assert!(second_index > index);
     drop(response);

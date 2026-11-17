@@ -35,6 +35,9 @@ struct Args {
     stride: usize,
     #[arg(long, default_value_t = 3)]
     rounds: usize,
+    /// Rows in each original fragment; controls sparse-update amplification.
+    #[arg(long, default_value_t = 16)]
+    rows_per_fragment: usize,
 }
 
 fn fixture(rows: usize, body_bytes: usize) -> Result<RecordBatch> {
@@ -146,7 +149,10 @@ async fn verify(
         .downcast_ref::<LargeBinaryArray>()
         .unwrap();
     let mut scan = dataset.scan();
-    scan.batch_size(8);
+    // Keep the original 8 MiB body window for wide rows, while allowing larger
+    // narrow-table fixtures to verify all values without tiny scan batches.
+    let body_bytes = original_bodies.value(0).len();
+    scan.batch_size(((8 << 20) / body_bytes).clamp(1, 4096));
     let mut stream = scan.try_into_stream().await?;
     let mut seen = BTreeSet::new();
     while let Some(batch) = stream.try_next().await? {
@@ -194,6 +200,9 @@ async fn run(args: Args) -> Result<()> {
     if args.rows == 0 || args.stride == 0 || args.rounds == 0 || args.body_bytes == 0 {
         return Err("rows, stride, rounds and body bytes must be positive".into());
     }
+    if !(1..=65_536).contains(&args.rows_per_fragment) {
+        return Err("rows per fragment must be between 1 and 65536".into());
+    }
     if args
         .rows
         .checked_mul(args.body_bytes)
@@ -224,8 +233,8 @@ async fn run(args: Args) -> Result<()> {
                 reader,
                 uri,
                 Some(WriteParams {
-                    max_rows_per_file: 16,
-                    max_rows_per_group: 16,
+                    max_rows_per_file: args.rows_per_fragment,
+                    max_rows_per_group: args.rows_per_fragment,
                     enable_stable_row_ids: true,
                     ..Default::default()
                 }),
@@ -296,6 +305,7 @@ async fn run(args: Args) -> Result<()> {
         }
     }
     let report = json!({"rows": args.rows, "body_bytes_per_row": args.body_bytes,
+        "rows_per_original_fragment": args.rows_per_fragment,
         "stride": args.stride, "rounds": args.rounds, "debug": cfg!(debug_assertions),
         "results": results,
         "verified": "one row per turn, all body bytes and current annotations, explicit null clearing, unpublished preparation, old snapshots, reopen, unchanged body files for RewriteColumns",

@@ -200,6 +200,30 @@ impl BacklogMetrics {
             snapshot.failed_observations as f64,
             "Registry entries not successfully observed; these are unknown, not zero backlog.",
         );
+        // Recorded observations remain useful during a long scan or partial
+        // failure, but must never be confused with the usable fleet gauges.
+        // Require a recent shared-key read so a disconnected replica cannot
+        // keep masking newer snapshots with an indefinitely cached high value.
+        if readable && age_ms >= 0 && snapshot.committed_ms <= wall_ms {
+            for (suffix, value) in [
+                ("generations", snapshot.generations),
+                ("largest_store_generations", snapshot.largest_store),
+                ("stores_over_1000", snapshot.stores_over_1000),
+                ("largest_shard_generations", snapshot.largest_shard),
+                (
+                    "stores_with_shard_over_4096",
+                    snapshot.stores_with_shard_over_4096,
+                ),
+                ("observed_stores", snapshot.stores),
+            ] {
+                gauge(
+                    &mut out,
+                    &format!("recorded_{suffix}"),
+                    value as f64,
+                    "Last committed scan value; may be stale or incomplete. Interpret with snapshot_age_seconds, snapshot_failed_stores and snapshot_available, not as current fleet health.",
+                );
+            }
+        }
         if available {
             gauge(&mut out, "generations", snapshot.generations as f64, "Pending WAL generations summed across stores in the shared scan. Gauge, not a rate.");
             gauge(
@@ -336,6 +360,38 @@ mod tests {
         assert!(metrics
             .render_at(now, 120_000)
             .contains("master_wal_backlog_snapshot_readable 0\n"));
+    }
+
+    #[test]
+    fn recorded_values_survive_scan_expiry_and_partial_observation_not_reader_failure() {
+        let now = Instant::now();
+        let metrics = BacklogMetrics::new(Duration::from_secs(300));
+        let recorded = "master_wal_backlog_recorded_generations ";
+        assert!(!metrics.render_at(now, 120_000).contains(recorded));
+        metrics.update(Ok(Some((snapshot(3913), 10))), now);
+        let expired = metrics.render_at(now, 401_000);
+        assert!(expired.contains("master_wal_backlog_recorded_generations 3913\n"));
+        assert!(expired.contains("master_wal_backlog_snapshot_available 0\n"));
+        assert!(!expired.contains("master_wal_backlog_generations "));
+        let mut partial = snapshot(1964);
+        partial.failed_observations = 2;
+        metrics.update(Ok(Some((partial, 11))), now);
+        let rendered = metrics.render_at(now, 120_000);
+        assert!(rendered.contains("master_wal_backlog_recorded_generations 1964\n"));
+        assert!(rendered.contains("master_wal_backlog_recorded_observed_stores 2\n"));
+        assert!(rendered.contains("master_wal_backlog_snapshot_failed_stores 2\n"));
+        assert!(rendered.contains("master_wal_backlog_snapshot_available 0\n"));
+        assert!(!rendered.contains("master_wal_backlog_generations "));
+        assert!(!metrics.render_at(now, 90_000).contains(recorded));
+        assert!(!metrics
+            .render_at(now + Duration::from_secs(66), 186_000)
+            .contains(recorded));
+        metrics.update(Err(()), now);
+        assert!(!metrics.render_at(now, 120_000).contains(recorded));
+        metrics.update(Ok(Some((snapshot(100), 12))), now);
+        assert!(metrics
+            .render_at(now, 120_000)
+            .contains("master_wal_backlog_recorded_generations 100\n"));
     }
 
     #[test]

@@ -16,9 +16,9 @@ impl LogMaintenance {
     /// deletes application snapshots or Lance objects.
     ///
     /// Pending appends and checkpoint metadata first cross a physical sync
-    /// barrier. Sizing and that barrier briefly exclude foreground work; the
-    /// native rewrite then overlaps appends and reads. Its eligible append prefix
-    /// and tombstones are captured with the rewrite reservation. Native payload
+    /// barrier. Sizing and that barrier exclude appends but allow retained
+    /// payload reads; the native rewrite then overlaps both. Its eligible append
+    /// prefix and tombstones are captured with the rewrite reservation. Native payload
     /// readers are excluded only for physical file retirement. An error or panic
     /// fences every group on the node. This API does not bound filesystem latency.
     pub fn run(&self) -> Result<Vec<u64>> {
@@ -56,15 +56,7 @@ impl LogMaintenance {
             }
             Err(error) => return Err(error),
         };
-        if self.node.budget.get().is_some_and(|budget| {
-            let observed = budget.snapshot();
-            observed
-                .accounted_disk_bytes
-                .saturating_add(observed.reserved_proposal_bytes)
-                .saturating_add(observed.reserved_file_bytes)
-                .saturating_add(self.node.target_file_bytes.saturating_mul(2))
-                > observed.data_limit
-        }) {
+        if self.data_under_pressure() {
             // Native rewrite eligibility counts dead entries, not their bytes.
             // A few compacted large records can keep admission closed while
             // many tiny live metadata values suppress the normal heuristic.
@@ -77,17 +69,28 @@ impl LogMaintenance {
         Ok(groups)
     }
 
+    fn data_under_pressure(&self) -> bool {
+        self.node.budget.get().is_some_and(|budget| {
+            let observed = budget.snapshot();
+            observed
+                .accounted_disk_bytes
+                .saturating_add(observed.reserved_proposal_bytes)
+                .saturating_add(observed.reserved_file_bytes)
+                .saturating_add(self.node.target_file_bytes.saturating_mul(2))
+                > observed.data_limit
+        })
+    }
+
     fn run_pass(&self, force_rewrite: bool) -> Result<Vec<u64>> {
         // Admission failure occurs before touching native storage and must not
         // fence a healthy node. Existing accepted traffic still owns its window.
         // Exclude writes while sizing live entries. Dead segments need deletion,
         // not another directory-sized reservation that can prevent their cleanup.
-        let (_reservation, boundary) = {
-            let _maintenance = self
-                .node
-                .maintenance_gate
-                .write()
-                .map_err(|_| anyhow::anyhow!("maintenance gate poisoned"))?;
+        let (_reservation, boundary, force_append) = {
+            // These two gates stabilize the append boundary and its sync.
+            // Taking maintenance_gate here would block durable payload
+            // reads for the entire sync, including reads on the Raft owner.
+            // Physical file retirement retains the engine's payload-read guard.
             let _sync = self
                 .node
                 .sync_gate
@@ -99,15 +102,20 @@ impl LogMaintenance {
                 .write()
                 .map_err(|_| anyhow::anyhow!("append gate poisoned"))?;
             self.node.check()?;
+            // Retained replication entries can pin old append files even after
+            // checkpointing. Under producer pressure, rewrite that eligible
+            // prefix now rather than waiting for more logical compaction.
+            // Observe pressure before adding this pass's own scratch allowance.
+            let force_append = !force_rewrite && self.data_under_pressure();
             // Freeze eligibility with the allowance. Later appends can move
             // the native ratio-based watermark, but not this pass's copy cap.
-            let boundary = self.node.engine.purge_manager().capture_append_boundary();
+            let boundary = self.append_boundary()?;
             let reservation = self
                 .node
                 .budget
                 .get()
                 .map(|budget| {
-                    // Pressure reclamation touches only the rewrite queue.
+                    // The fallback pass touches only the rewrite queue.
                     // Charging the unrelated append tail again can itself close
                     // producer admission while this background pass runs.
                     let live = if force_rewrite {
@@ -132,16 +140,58 @@ impl LogMaintenance {
             }
             // Later appends and their tombstones stay outside this pass. Rewrite
             // queue values cannot grow while our node-wide job guard is held.
-            (reservation, boundary)
+            (reservation, boundary, force_append)
         };
-        let result = self.run_native(force_rewrite, boundary);
+        let result = self.run_native(force_rewrite, boundary, force_append);
         if result.is_err() {
             self.node.failed.store(true, Ordering::Release);
         }
         result
     }
 
-    fn run_native(&self, force_rewrite: bool, boundary: (u64, usize, u64)) -> Result<Vec<u64>> {
+    // Select by live copy bytes, not file count: tiny live metadata must not
+    // keep a large obsolete prefix pinned across hundreds of scheduler ticks.
+    // Return after a bounded append copy so newer checkpoints can discard the
+    // remaining payloads. Existing rewrite-queue work and an oversized oldest
+    // file retain their own semantics; this does not bound filesystem latency.
+    fn append_boundary(&self) -> Result<(u64, usize, u64)> {
+        let engine = &self.node.engine;
+        let mut boundary = engine.purge_manager().capture_append_boundary();
+        let estimate = |through| {
+            engine
+                .estimated_rewrite_bytes_through(through)
+                .context("native rewrite sizing overflow")
+        };
+        // Through zero includes the independent rewrite queue and tombstones.
+        // Only the additional append-prefix bytes consume this scheduling cap.
+        let limit = estimate(0)?
+            .checked_add(128 << 20)
+            .context("append rewrite copy limit overflow")?;
+        if estimate(boundary.2)? <= limit {
+            return Ok(boundary);
+        }
+        let first = engine.file_span(raft_engine::internals::LogQueue::Append).0;
+        let (mut low, mut high) = (first.saturating_sub(1), boundary.2);
+        while low < high {
+            let middle = low + (high - low).div_ceil(2);
+            if estimate(middle)? <= limit {
+                low = middle;
+            } else {
+                high = middle - 1;
+            }
+        }
+        // One native batch can exceed the target file size. Preserve progress
+        // even when the oldest closed file alone exceeds the copy allowance.
+        boundary.2 = boundary.2.min(low.max(first));
+        Ok(boundary)
+    }
+
+    fn run_native(
+        &self,
+        force_rewrite: bool,
+        boundary: (u64, usize, u64),
+        force_append: bool,
+    ) -> Result<Vec<u64>> {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if force_rewrite {
                 self.node.engine.purge_manager().reclaim_rewrite_queue()?;
@@ -150,7 +200,7 @@ impl LogMaintenance {
                 self.node
                     .engine
                     .purge_manager()
-                    .purge_expired_files_before(boundary)
+                    .purge_expired_files_before(boundary, force_append)
             }
         }));
         let mut groups = match outcome {

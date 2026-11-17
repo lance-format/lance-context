@@ -175,7 +175,7 @@ fn benchmark_peer_disk_pressure_rejection() -> Result<()> {
     nodes[0].campaign(10)?;
     pump(&mut nodes)?;
     let occupied = root.path().join("3").join("retained-space-fixture");
-    std::fs::write(&occupied, vec![7_u8; 9 << 20])?;
+    std::fs::write(&occupied, vec![7_u8; 65 << 20])?;
     nodes[2].prepare_disk_measurement()?.run()?;
     let body_bytes = 4 << 20;
     nodes[0].propose(
@@ -219,7 +219,62 @@ fn benchmark_peer_disk_pressure_rejection() -> Result<()> {
 }
 
 #[test]
-fn pressured_follower_defers_new_data_and_catches_up_after_space_is_reclaimed() -> Result<()> {
+fn replica_pressure_preserves_admitted_data_and_following_control() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let mut nodes = (1..=3)
+        .map(|id| open(root.path(), id))
+        .collect::<Result<Vec<_>>>()?;
+    nodes[0].campaign(10)?;
+    nodes[1].campaign(20)?;
+    pump(&mut nodes)?;
+    for id in [2, 3] {
+        // Replicas can retain different physical files despite the same log.
+        // Both exceed producer admission but retain room in the total budget.
+        std::fs::write(
+            root.path()
+                .join(id.to_string())
+                .join("retained-space-fixture"),
+            vec![7_u8; 9 << 20],
+        )?;
+        let view = nodes[id - 1].prepare_disk_measurement()?.run()?;
+        assert!(view.accounted_disk_bytes > view.data_limit);
+        assert!(view.accounted_disk_bytes < view.max_log_bytes);
+    }
+    // The same replica leads a sibling group: its new producer data must still
+    // be refused. Only previously admitted peer traffic may use the headroom.
+    assert!(nodes[1]
+        .propose(20, 200, payload(20, 1))
+        .unwrap_err()
+        .is::<crate::admission::DiskBudgetExhausted>());
+    nodes[0].propose(10, 100, payload(10, 1))?;
+    nodes[0].acquire_publisher(101, acquisition())?;
+    let completed = pump(&mut nodes)
+        .context("replica producer pressure blocked admitted data and following control")?;
+    let Outcome::Committed(Applied::Accepted { index }) = completed
+        .iter()
+        .find(|c| c.request == 100)
+        .context("admitted data never reached a durable quorum")?
+        .outcome
+    else {
+        anyhow::bail!("admitted data was not accepted");
+    };
+    assert!(completed.iter().any(|c| c.request == 101));
+    for node in &nodes {
+        assert_eq!(node.read_accepted(10, index)?, Some(payload(10, 1)));
+        assert!(node.publisher(Uuid::from_u128(100))?.is_some());
+        assert_eq!(node.disk_budget().unwrap().reserved_proposal_bytes, 0);
+    }
+    drop(nodes);
+    for id in 1..=3 {
+        let reopened = open(root.path(), id)?;
+        assert_eq!(reopened.read_accepted(10, index)?, Some(payload(10, 1)));
+        assert!(reopened.publisher(Uuid::from_u128(100))?.is_some());
+    }
+    Ok(())
+}
+
+#[test]
+fn total_budget_pressure_defers_replication_until_space_is_reclaimed() -> Result<()> {
     let root = tempfile::tempdir()?;
     let mut nodes = (1..=3)
         .map(|id| open(root.path(), id))
@@ -229,9 +284,9 @@ fn pressured_follower_defers_new_data_and_catches_up_after_space_is_reclaimed() 
     // Consume real space in this replica's owned directory. Its two peers have
     // room, so a healthy quorum must remain able to accept the append.
     let occupied = root.path().join("3").join("retained-space-fixture");
-    std::fs::write(&occupied, vec![7_u8; 9 << 20])?;
+    std::fs::write(&occupied, vec![7_u8; 33 << 20])?;
     let before = nodes[2].prepare_disk_measurement()?.run()?;
-    assert!(before.accounted_disk_bytes > before.data_limit);
+    assert!(before.accounted_disk_bytes > before.max_log_bytes);
     nodes[0].propose(10, 100, payload(10, 1))?;
     let events = nodes[0].poll()?;
     let deferred = events
@@ -242,7 +297,7 @@ fn pressured_follower_defers_new_data_and_catches_up_after_space_is_reclaimed() 
         .clone();
     assert!(
         nodes[2].step(deferred.clone()).is_err(),
-        "follower accepted a new payload despite exhausted data admission"
+        "follower accepted a new payload despite exhausted total budget"
     );
     let mut corrupt = deferred.clone();
     let mut changed = corrupt.message.entries[0].data.to_vec();
