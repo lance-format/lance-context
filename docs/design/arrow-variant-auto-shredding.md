@@ -52,3 +52,34 @@ interoperability tests. Persistent automatic layout migration, document access,
 index integration, Python bindings, and equivalent baseline/Variant benchmarks
 are follow-ups tracked in #832. The kernel milestone alone does not establish a
 complete automatic document store or a performance advantage.
+
+## Persistent Variant document adapter
+
+`VariantDocumentStore` keeps `id` and one canonical `document` Variant column.
+The schema stores the selection policy and selected layout; Variant value
+reconstruction uses only the standard representation. Every append samples its
+incoming documents. Sampled string paths have priority over numeric paths; new
+paths precede retained paths of the same kind. The bounded remainder retains
+old paths. This is a deterministic recent-batch policy, not a global workload
+optimizer. Conflicting ancestor/descendant selections are never combined.
+
+When the selected physical layout changes, old Variant batches are unshredded
+and reshredded with Arrow kernels, then committed together with the incoming
+batch in one overwrite. No partial migration becomes visible. A stale rewrite
+fails rather than rebasing over later writes. Ordinary appends avoid rewrites.
+Both paths encode batches targeting 4 MiB/1024 rows, allowing one oversized row;
+caller-owned inputs, IDs and Lance buffers are outside this target. Rewrites
+cost O(existing data), and retained snapshots keep their old data files.
+
+A BTree index on ID is maintained after a durable data commit. Failure of that
+maintenance is logged without reporting the committed append as failed;
+`prepare_point_reads` explicitly retries and reports indexing errors. Whole reads
+use upstream unshred/JSON conversion. Path reads project ancestor residuals and
+the requested typed subtree. Physical projection resolves literal keys to field
+IDs, including dots, quotes and empty keys. Arrow 58's direct shredded path
+traversal can miss an ancestor residual when a typed child exists but is null
+for that row. The adapter therefore unshreds the projected representation with
+Arrow before invoking its `variant_get` kernel. Unrelated extracted text is not
+part of that projection. This adds reconstruction work for the selected fields;
+it does not require a Lance patch or a custom Variant decoder.
+
