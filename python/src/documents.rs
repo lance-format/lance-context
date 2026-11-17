@@ -218,6 +218,11 @@ impl DocumentStore {
             .map_err(to_py_err)
     }
 
+    fn prepare_point_reads(&mut self, py: Python<'_>) -> PyResult<()> {
+        py.allow_threads(|| self.runtime.block_on(self.store.prepare_point_reads()))
+            .map_err(to_py_err)
+    }
+
     fn layout(&self, py: Python<'_>) -> PyResult<PyObject> {
         json_to_py(py, self.store.layout())
     }

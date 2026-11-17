@@ -69,4 +69,18 @@ async fn residual_filter_does_not_read_unrelated_megabyte_text() {
         bytes < 1024 * 1024,
         "small residual predicate read {bytes} bytes, including unrelated text"
     );
+    let before = read_bytes(&snapshotter);
+    assert_eq!(
+        store.get_path(&ids[0], &["tags".into()]).await.unwrap(),
+        Some(json!(["wanted"]))
+    );
+    assert_eq!(
+        store.get_path(&ids[0], &["absent".into()]).await.unwrap(),
+        None
+    );
+    let bytes = read_bytes(&snapshotter) - before;
+    assert!(
+        bytes < 1024 * 1024,
+        "residual point reads fetched {bytes} bytes of unrelated text"
+    );
 }

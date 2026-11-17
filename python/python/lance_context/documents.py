@@ -143,6 +143,15 @@ class DocumentStore:
         """Prepare historical text and indexes before serving text searches."""
         self._backend.prepare_text_search()
 
+    def prepare_point_reads(self) -> None:
+        """Build/extend the ID index, including on stores from earlier releases.
+
+        Writes maintain it automatically after committing data. An automatic
+        maintenance failure is logged and leaves correct scan-based reads;
+        this explicit method reports failures and can be retried safely.
+        """
+        self._backend.prepare_point_reads()
+
     def layout(self) -> dict[str, Any]:
         """Inspect the automatically selected paths and scalar types."""
         return self._backend.layout()

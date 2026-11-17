@@ -195,14 +195,16 @@ impl DocumentStore {
         self.dataset
             .append(RecordBatchIterator::new(batches, schema), None)
             .await?;
+        self.maintain_point_reads().await;
         Ok(ids)
     }
 
     pub async fn get(&self, id: &str) -> Result<Option<Value>> {
         let mut scanner = self.dataset.scan();
         scanner.filter_expr(col(ID).eq(lit(id)));
-        let batches: Vec<RecordBatch> = scanner.try_into_stream().await?.try_collect().await?;
-        for batch in batches {
+        scanner.limit(Some(1), None)?;
+        let mut stream = scanner.try_into_stream().await?;
+        while let Some(batch) = stream.try_next().await? {
             if batch.num_rows() > 0 {
                 return Ok(Some(decode(&batch, 0, &self.layout)?));
             }
@@ -225,8 +227,9 @@ impl DocumentStore {
             scanner
                 .project(&[name.as_str()])?
                 .filter_expr(col(ID).eq(lit(id)));
-            let batches: Vec<RecordBatch> = scanner.try_into_stream().await?.try_collect().await?;
-            for batch in batches {
+            scanner.limit(Some(1), None)?;
+            let mut stream = scanner.try_into_stream().await?;
+            while let Some(batch) = stream.try_next().await? {
                 if batch.num_rows() > 0 {
                     if let Some(value) =
                         scalar_value(batch.column(0), 0, self.layout.fields[index].data_type)?
@@ -236,7 +239,21 @@ impl DocumentStore {
                 }
             }
         }
-        let Some(mut value) = self.get(id).await? else {
+        let layout = self.projected_layout(path);
+        let mut columns = vec![RESIDUAL.to_owned()];
+        columns.extend(layout.fields.iter().map(column_name));
+        let mut scanner = self.dataset.scan();
+        scanner.project(&columns)?.filter_expr(col(ID).eq(lit(id)));
+        scanner.limit(Some(1), None)?;
+        let mut stream = scanner.try_into_stream().await?;
+        let mut found = None;
+        while let Some(batch) = stream.try_next().await? {
+            if batch.num_rows() > 0 {
+                found = Some(decode(&batch, 0, &layout)?);
+                break;
+            }
+        }
+        let Some(mut value) = found else {
             return Ok(None);
         };
         for component in path {
@@ -249,6 +266,18 @@ impl DocumentStore {
             value = child;
         }
         Ok(Some(value))
+    }
+
+    fn projected_layout(&self, path: &[String]) -> ShredLayout {
+        ShredLayout {
+            fields: self
+                .layout
+                .fields
+                .iter()
+                .filter(|field| field.path.starts_with(path) || path.starts_with(&field.path))
+                .cloned()
+                .collect(),
+        }
     }
 
     pub async fn checkout(&mut self, version: u64) -> Result<()> {
@@ -411,6 +440,7 @@ fn validate_depth(value: &Value, depth: usize) -> Result<()> {
     Ok(())
 }
 
+mod point_reads;
 mod query;
 mod residual_search;
 pub use query::DocumentSearchHit;
