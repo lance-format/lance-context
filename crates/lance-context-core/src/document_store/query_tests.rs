@@ -209,3 +209,108 @@ async fn projected_residual_filters_preserve_containers_ancestors_and_batch_boun
     store.checkout(version).await.unwrap();
     assert_eq!(store.get(&ids[1029]).await.unwrap().as_ref(), Some(last));
 }
+
+fn current_data_files(store: &DocumentStore) -> Vec<String> {
+    let mut files: Vec<_> = store
+        .dataset
+        .manifest()
+        .fragments
+        .iter()
+        .flat_map(|fragment| fragment.files.iter().map(|file| file.path.clone()))
+        .collect();
+    files.sort();
+    files
+}
+
+#[tokio::test]
+async fn text_preparation_preserves_files_when_no_historical_text_needs_promotion() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("no-rewrite.lance");
+    let uri = uri.to_str().unwrap();
+    let mut store = DocumentStore::create(uri, ShredPolicy::default(), None)
+        .await
+        .unwrap();
+    let first = store
+        .add(vec![json!({"body": "otter original"})])
+        .await
+        .unwrap();
+    let files = current_data_files(&store);
+    store.prepare_text_search().await.unwrap();
+    assert_eq!(
+        current_data_files(&store),
+        files,
+        "fresh extracted text must not be rewritten"
+    );
+    let prepared = store.version();
+    store.prepare_text_search().await.unwrap();
+    assert_eq!(store.version(), prepared);
+
+    let second = store
+        .add(vec![json!({"body": "otter later", "counter": 42})])
+        .await
+        .unwrap();
+    let files = current_data_files(&store);
+    let version = store.version();
+    store.prepare_text_search().await.unwrap();
+    assert_eq!(
+        store.version(),
+        version,
+        "numeric growth requires no text maintenance"
+    );
+    assert_eq!(current_data_files(&store), files);
+    let mut store = DocumentStore::open(uri, None).await.unwrap();
+    assert_eq!(store.search("otter", 10).await.unwrap().len(), 2);
+    assert_eq!(store.version(), version);
+    store.checkout(prepared).await.unwrap();
+    assert_eq!(store.search("otter", 10).await.unwrap()[0].id, first[0]);
+    assert!(store.get(&second[0]).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn legacy_backfill_marker_survives_numeric_growth_and_new_text_still_backfills() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("legacy.lance");
+    let uri = uri.to_str().unwrap();
+    let mut store = DocumentStore::create(uri, ShredPolicy::default(), None)
+        .await
+        .unwrap();
+    store.add(vec![json!({"body": "otter"})]).await.unwrap();
+    store.backfill().await.unwrap();
+    store.prepare_text_search().await.unwrap();
+    // Reproduce metadata written by the previous release.
+    store
+        .dataset
+        .update_schema_metadata([("lance-context:shred-backfilled-text-columns", None::<&str>)])
+        .await
+        .unwrap();
+    store
+        .add(vec![json!({"body": "otter", "counter": 42})])
+        .await
+        .unwrap();
+    let files = current_data_files(&store);
+    let version = store.version();
+    store.prepare_text_search().await.unwrap();
+    assert_eq!(current_data_files(&store), files);
+    assert_eq!(store.version(), version);
+
+    // A rare text path remains residual in old rows and is promoted later.
+    let mut docs = vec![json!({"body": "otter", "late": "historical platypus"})];
+    docs.extend((0..3).map(|_| json!({"body": "otter"})));
+    let old = store.add(docs).await.unwrap();
+    assert!(!store
+        .layout
+        .fields
+        .iter()
+        .any(|field| field.path == ["late"]));
+    store
+        .add(vec![json!({"body": "otter", "late": "new platypus"})])
+        .await
+        .unwrap();
+    let before = current_data_files(&store);
+    assert_eq!(store.search("platypus", 10).await.unwrap().len(), 2);
+    assert_ne!(current_data_files(&store), before);
+    assert_eq!(
+        store.get_path(&old[0], &["late".into()]).await.unwrap(),
+        Some(json!("historical platypus"))
+    );
+}

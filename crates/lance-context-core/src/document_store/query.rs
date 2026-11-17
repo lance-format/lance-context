@@ -14,6 +14,7 @@ use lance_index::IndexType;
 use serde::{Deserialize, Serialize};
 
 const BACKFILLED_KEY: &str = "lance-context:shred-backfilled-columns";
+const TEXT_BACKFILLED_KEY: &str = "lance-context:shred-backfilled-text-columns";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentSearchHit {
@@ -102,6 +103,10 @@ impl DocumentStore {
         let mut schema = Schema::from(self.dataset.schema());
         let mut metadata = schema.metadata().clone();
         metadata.insert(BACKFILLED_KEY.into(), self.layout.fields.len().to_string());
+        metadata.insert(
+            TEXT_BACKFILLED_KEY.into(),
+            serde_json::to_string(&self.text_columns()).map_err(invalid)?,
+        );
         schema = schema.with_metadata(metadata);
         let schema = Arc::new(schema);
         let mut scanner = self.dataset.scan();
@@ -144,28 +149,94 @@ impl DocumentStore {
         Ok(())
     }
 
-    /// Index automatically selected text columns. Before building indexes,
-    /// migrate historical residual values so searches cannot silently miss them.
-    /// Called automatically by `search`; can be run ahead of latency-sensitive reads.
-    pub async fn prepare_text_search(&mut self) -> Result<()> {
-        let columns: Vec<_> = self
-            .layout
+    fn text_columns(&self) -> Vec<String> {
+        self.layout
             .fields
             .iter()
             .filter(|field| field.data_type == ShredType::String)
             .map(column_name)
-            .collect();
+            .collect()
+    }
+
+    async fn has_historical_text(&self, pending: &[&ShredField]) -> Result<bool> {
+        let mut scanner = self.dataset.scan();
+        scanner.project(&[RESIDUAL])?;
+        scanner
+            .batch_size(1024)
+            .batch_size_bytes(4 * 1024 * 1024)
+            .batch_readahead(1);
+        let mut stream = scanner.try_into_stream().await?;
+        while let Some(batch) = stream.try_next().await? {
+            let residuals = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .ok_or_else(|| Error::invalid_input("missing document residual"))?;
+            for residual in residuals.iter() {
+                let document: Value = serde_json::from_str(
+                    residual.ok_or_else(|| Error::invalid_input("null document residual"))?,
+                )
+                .map_err(invalid)?;
+                if pending.iter().any(|field| {
+                    logical_value(&document, &field.path).is_some_and(Value::is_string)
+                }) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Index automatically selected text columns. Before building indexes,
+    /// migrate historical residual values so searches cannot silently miss them.
+    /// Called automatically by `search`; can be run ahead of latency-sensitive reads.
+    pub async fn prepare_text_search(&mut self) -> Result<()> {
+        let columns = self.text_columns();
         if columns.is_empty() {
             return Ok(());
         }
-        let backfilled = self
-            .dataset
-            .schema()
-            .metadata
-            .get(BACKFILLED_KEY)
-            .and_then(|value| value.parse::<usize>().ok());
-        if backfilled != Some(self.layout.fields.len()) {
-            self.backfill().await?;
+        // Old stores recorded an additive layout prefix. New stores track text
+        // columns explicitly, so numeric schema growth never invalidates it.
+        let metadata = &self.dataset.schema().metadata;
+        let prepared: Vec<String> = match metadata.get(TEXT_BACKFILLED_KEY) {
+            Some(value) => serde_json::from_str(value).map_err(invalid)?,
+            None => {
+                let prefix = metadata
+                    .get(BACKFILLED_KEY)
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(0);
+                self.layout
+                    .fields
+                    .iter()
+                    .take(prefix)
+                    .filter(|field| field.data_type == ShredType::String)
+                    .map(column_name)
+                    .collect()
+            }
+        };
+        let pending: Vec<_> = self
+            .layout
+            .fields
+            .iter()
+            .filter(|field| {
+                field.data_type == ShredType::String && !prepared.contains(&column_name(field))
+            })
+            .collect();
+        if !pending.is_empty() {
+            if self.pinned {
+                return Err(Error::invalid_input(
+                    "pinned snapshot has unprepared text columns",
+                ));
+            }
+            if self.has_historical_text(&pending).await? {
+                self.backfill().await?;
+            } else {
+                // No data rewrite: all matching text is already extracted.
+                let marker = serde_json::to_string(&columns).map_err(invalid)?;
+                self.dataset
+                    .update_schema_metadata([(TEXT_BACKFILLED_KEY, marker.as_str())])
+                    .await?;
+            }
         }
         let indices = self.dataset.load_indices().await?;
         for column in columns {
