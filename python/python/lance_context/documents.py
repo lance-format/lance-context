@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+import math
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -67,6 +68,45 @@ class DocumentStore:
             raise TypeError("add expects a sequence of JSON documents")
         return self._backend.add(list(documents))
 
+    def add_iter(
+        self,
+        documents: Iterable[Any],
+        *,
+        max_batch_bytes: int = 4 * 1024 * 1024,
+        max_batch_rows: int = 1024,
+    ) -> Iterator[list[str]]:
+        """Consume documents incrementally, yielding IDs after each batch commits.
+
+        Each yielded batch is atomic; the entire iterable is not. Earlier batches
+        remain committed if a later document or source raises. Iteration advances
+        only as batches are requested, with at most one lookahead document.
+        The byte target is a conservative estimate, not a process memory cap.
+        A single oversized document is accepted as its own batch.
+        """
+        if isinstance(documents, (str, bytes, Mapping)):
+            raise TypeError("add_iter expects an iterable of JSON documents")
+        if any(
+            not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0
+            for limit in (max_batch_bytes, max_batch_rows)
+        ):
+            raise ValueError("batch byte and row limits must be positive integers")
+        batch: list[Any] = []
+        size = 0
+        for document in documents:
+            document_size = _document_size(document)
+            if batch and size + document_size > max_batch_bytes:
+                yield self.add(batch)
+                batch = []
+                size = 0
+            batch.append(document)
+            size += document_size
+            if len(batch) >= max_batch_rows or size >= max_batch_bytes:
+                yield self.add(batch)
+                batch = []
+                size = 0
+        if batch:
+            yield self.add(batch)
+
     def get(self, record_id: str) -> Any:
         """Reconstruct a document; raise KeyError if the record is missing."""
         return self._backend.get(record_id)
@@ -119,3 +159,31 @@ def _path(path: Sequence[str]) -> list[str]:
     if isinstance(path, str):
         raise TypeError("path must be a sequence of literal object keys")
     return list(path)
+
+
+def _document_size(value: Any, depth: int = 0) -> int:
+    # Upper estimate for UTF-8/escaping without materializing another JSON string.
+    if value is None or isinstance(value, bool):
+        return 32
+    if isinstance(value, str):
+        return 32 + 24 * len(value)
+    if isinstance(value, int):
+        if not -(2**63) <= value <= 2**64 - 1:
+            raise ValueError("JSON integers must fit signed or unsigned 64 bits")
+        return 32
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("JSON numbers must be finite")
+        return 32
+    if depth >= 127:
+        raise ValueError("document exceeds 127 JSON nesting levels")
+    if isinstance(value, dict):
+        size = 32
+        for key, child in value.items():
+            if not isinstance(key, str):
+                raise TypeError("JSON object keys must be strings")
+            size += 32 + 24 * len(key) + _document_size(child, depth + 1)
+        return size
+    if isinstance(value, (list, tuple)):
+        return 32 + sum(_document_size(child, depth + 1) for child in value)
+    raise TypeError("expected a JSON-compatible value")

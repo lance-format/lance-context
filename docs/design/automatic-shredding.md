@@ -220,3 +220,25 @@ capacity guarantees.
 Both baseline arms store serialized JSON in a `LargeUtf8` column. This isolates
 extraction and duplication costs using the same string encoding as the document
 residual; it is not a benchmark of Lance's JSONB extension or Arrow Variant.
+
+
+## Bounded ingestion
+
+`add` keeps its single atomic document append, but converts input into Arrow
+batches lazily, targeting at most 1,024 rows and approximately 4 MiB of conservatively
+estimated payload. It no longer creates an Arrow batch for the entire input at
+once. The caller-owned input vector, returned IDs, Lance buffers, and a single
+oversized record are outside that target; this is not a process memory cap.
+All input nesting validation still runs before schema or data mutation.
+
+Python `add_iter(documents, max_batch_bytes=4*1024*1024, max_batch_rows=1024)`
+consumes an iterable incrementally and yields an ID list after each batch commits.
+The whole iterable is **not atomic**: if a later input or source fails, previously
+yielded batches remain committed. It keeps at most one lookahead document and
+allows a single oversized document as its own batch. The estimate avoids allocating
+a second serialized JSON string and can split before the actual byte target.
+
+```python
+for committed_ids in store.add_iter(document_generator, max_batch_bytes=4 * 1024 * 1024):
+    record_progress(committed_ids)
+```
