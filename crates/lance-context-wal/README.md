@@ -209,6 +209,14 @@ error or an unwinding write panic invalidates every handle on the physical node;
 stop its driver and reopen all handles to resolve the uncertain durable state.
 Validation errors before engine submission leave the log usable.
 
+With `runtime`, each group's cached `durable_poll.storage_write` reports completed
+append batches, encoded append bytes, explicit sync-marker barriers and marker
+bytes on its worker. Compare interval deltas summed across group workers to
+observe batch size and shared-barrier amortization. Counters exclude work on
+other threads, including background maintenance, and retain the last successful
+poll's sample on failure. They are not client QPS or filesystem sync-call counts;
+native file rotation can perform additional syncs.
+
 Uncommitted suffixes may be replaced. Committed entries, votes in the same term,
 and monotonic term/commit state are protected. Term lookup uses small cached
 ranges rather than reading and decoding entry bodies. Range reads request at

@@ -48,10 +48,12 @@ fn real_write_counts_each_gate_without_leaking_to_another_thread() -> Result<()>
     let log = PhysicalLog::open(directory.path(), &layout, 1)?;
     let group = log.group(10)?;
     let observer_before = snapshot();
+    let writes_before = write_snapshot();
     let writer = std::thread::spawn(move || -> Result<StorageWaitObservation> {
         assert_eq!(snapshot(), StorageWaitObservation::default());
         group.persist(&[], None)?;
         assert_eq!(snapshot(), StorageWaitObservation::default());
+        assert_eq!(write_snapshot(), StorageWriteObservation::default());
         group.persist(
             &[Entry {
                 index: 1,
@@ -66,6 +68,14 @@ fn real_write_counts_each_gate_without_leaking_to_another_thread() -> Result<()>
             }),
         )?;
         assert_eq!(group.initial_state()?.hard_state.commit, 1);
+        let writes = write_snapshot();
+        assert_eq!(writes.append_batches, 1);
+        assert_eq!(writes.sync_barriers, 1);
+        assert!(writes.append_bytes >= b"opaque record".len() as u64);
+        assert!(writes.sync_marker_bytes > 0);
+        // A rejected write never reaches the engine or changes its counters.
+        assert!(group.persist(&[], Some(&HardState::default())).is_err());
+        assert_eq!(write_snapshot(), writes);
         let observed = snapshot();
         for interval in [
             &observed.maintenance,
@@ -80,6 +90,7 @@ fn real_write_counts_each_gate_without_leaking_to_another_thread() -> Result<()>
     });
     let observed = writer.join().unwrap()?;
     assert_eq!(snapshot(), observer_before);
+    assert_eq!(write_snapshot(), writes_before);
     let json = serde_json::to_value(observed)?;
     assert_eq!(json["sync"]["attempts"], 1);
     drop(log);
