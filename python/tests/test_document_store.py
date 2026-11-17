@@ -80,3 +80,30 @@ def test_reject_non_string_keys_and_cycles(tmp_path):
     cycle.append(cycle)
     with pytest.raises(ValueError, match="nesting"):
         store.add([cycle])
+
+
+def test_search_covers_late_text_and_type_changes_after_budget_exhaustion(tmp_path):
+    store = DocumentStore.create(tmp_path / "search-coverage.lance")
+    store.add([{f"field{i}": i for i in range(32)}])
+    document = {"body": "lateotter " * 8192, "field0": "typedrift"}
+    record_id = store.add([document])[0]
+    for query in ["LATEOTTER", "typedrift", "missing lateotter"]:
+        assert store.search(query) == [{"id": record_id, "score": 0.0}]
+    assert store.get(record_id) == document
+    reopened = DocumentStore.open(tmp_path / "search-coverage.lance")
+    assert reopened.search("lateotter")[0]["id"] == record_id
+
+
+def test_residual_search_only_matches_string_values(tmp_path):
+    store = DocumentStore.create(
+        tmp_path / "residual-search.lance", policy={"max_columns": 1}
+    )
+    store.add([{"slot": 1}])
+    ids = store.add(
+        [{"keyonly": 987654, "body": "mixed\nquoted"}, ["arrayotter"], "roototter"]
+    )
+    assert store.search("MIXED")[0]["id"] == ids[0]
+    assert store.search("arrayotter")[0]["id"] == ids[1]
+    assert store.search("roototter")[0]["id"] == ids[2]
+    for query in ["keyonly", "987654", "nquoted", "!!!"]:
+        assert store.search(query) == []

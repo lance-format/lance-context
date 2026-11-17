@@ -314,3 +314,114 @@ async fn legacy_backfill_marker_survives_numeric_growth_and_new_text_still_backf
         Some(json!("historical platypus"))
     );
 }
+
+#[tokio::test]
+async fn search_covers_exhausted_layout_and_type_changes_without_duplicate_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("coverage.lance");
+    let uri = uri.to_str().unwrap();
+    let mut store = DocumentStore::create(uri, ShredPolicy::default(), None)
+        .await
+        .unwrap();
+    let numeric: serde_json::Map<String, Value> =
+        (0..32).map(|i| (format!("field{i}"), json!(i))).collect();
+    store.add(vec![Value::Object(numeric)]).await.unwrap();
+    let document = json!({"body": "LATEOTTER ".repeat(8192), "field0": "typedrift"});
+    let id = store.add(vec![document.clone()]).await.unwrap()[0].clone();
+    assert_eq!(store.layout.fields.len(), 32);
+    assert!(!store
+        .layout
+        .fields
+        .iter()
+        .any(|field| field.data_type == ShredType::String));
+    let version = store.version();
+    for query in ["lateotter", "TYPEDRIFT", "missing lateotter"] {
+        let hits = store.search(query, 10).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, id);
+        assert_eq!(hits[0].score, 0.0);
+    }
+    assert_eq!(
+        store.version(),
+        version,
+        "residual search must not rewrite documents"
+    );
+    let mut reopened = DocumentStore::open(uri, None).await.unwrap();
+    assert_eq!(reopened.get(&id).await.unwrap(), Some(document));
+    reopened.checkout(version).await.unwrap();
+    assert_eq!(reopened.search("typedrift", 1).await.unwrap()[0].id, id);
+}
+
+#[tokio::test]
+async fn residual_search_matches_string_values_not_keys_or_json_escape_syntax() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("tokens.lance");
+    let mut store = DocumentStore::create(
+        uri.to_str().unwrap(),
+        ShredPolicy {
+            max_columns: 1,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    store.add(vec![json!({"slot": 1})]).await.unwrap();
+    let ids = store
+        .add(vec![
+            json!({"keyonly": 987654, "body": "MiXeD\nquoted\t世界"}),
+            json!([{"inner": "arrayotter"}]),
+            json!("roototter"),
+            json!({"body": "not a substringmatch"}),
+        ])
+        .await
+        .unwrap();
+    assert_eq!(store.search("MIXED", 10).await.unwrap()[0].id, ids[0]);
+    assert_eq!(store.search("世界", 10).await.unwrap()[0].id, ids[0]);
+    assert_eq!(store.search("arrayotter", 10).await.unwrap()[0].id, ids[1]);
+    assert_eq!(store.search("roototter", 10).await.unwrap()[0].id, ids[2]);
+    for query in ["keyonly", "987654", "nquoted", "substring", "!!!"] {
+        assert!(
+            store.search(query, 10).await.unwrap().is_empty(),
+            "false positive for {query}"
+        );
+    }
+    assert!(store.search("mixed", 0).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn indexed_and_residual_search_deduplicates_and_preserves_native_ranking() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("mixed-search.lance");
+    let mut store = DocumentStore::create(
+        uri.to_str().unwrap(),
+        ShredPolicy {
+            max_columns: 1,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let indexed = store
+        .add(vec![json!({"body": "otter indexed"})])
+        .await
+        .unwrap();
+    store.prepare_text_search().await.unwrap();
+    let tail = store
+        .add(vec![
+            json!({"body": "otter", "extra": "otter"}),
+            json!({"extra": "otter residual"}),
+        ])
+        .await
+        .unwrap();
+    let hits = store.search("OTTER", 10).await.unwrap();
+    assert_eq!(hits.len(), 3);
+    let unique: std::collections::HashSet<_> = hits.iter().map(|hit| hit.id.as_str()).collect();
+    assert_eq!(unique.len(), 3);
+    assert!(unique.contains(indexed[0].as_str()));
+    assert!(unique.contains(tail[0].as_str()));
+    assert_eq!(hits.last().unwrap().id, tail[1]);
+    assert_eq!(hits.last().unwrap().score, 0.0);
+    assert_eq!(store.search("otter", 1).await.unwrap().len(), 1);
+}

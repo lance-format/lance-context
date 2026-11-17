@@ -249,11 +249,7 @@ impl DocumentStore {
                     "pinned snapshot has no prepared text index",
                 ));
             }
-            let params = InvertedIndexParams::new("simple".into(), Language::English)
-                .lower_case(true)
-                .stem(false)
-                .remove_stop_words(false)
-                .max_token_length(None);
+            let params = text_index_params();
             self.dataset
                 .create_index(
                     &[column.as_str()],
@@ -267,23 +263,23 @@ impl DocumentStore {
         Ok(())
     }
 
-    /// Full-text search over automatically selected string fields. The first
-    /// search after layout growth prepares historical data and indexes; later
-    /// appends use Lance's indexed-plus-unindexed-tail search. Arrays and paths
-    /// outside the column budget remain available through logical field queries.
+    /// Search JSON string values, including text outside the selected layout.
+    /// Native indexed matches rank first. Remaining slots are filled by residual
+    /// matches with score zero, using the same tokenization and OR semantics.
+    /// Residual matches have no relevance ordering; no second text copy is stored.
     pub async fn search(&mut self, query: &str, limit: usize) -> Result<Vec<DocumentSearchHit>> {
         if limit == 0 || query.trim().is_empty() {
             return Ok(Vec::new());
         }
-        let limit = i64::try_from(limit).map_err(invalid)?;
+        let native_limit = i64::try_from(limit).map_err(invalid)?;
         self.prepare_text_search().await?;
-        let columns: Vec<_> = self
-            .layout
-            .fields
-            .iter()
-            .filter(|field| field.data_type == ShredType::String)
-            .map(column_name)
-            .collect();
+        let mut hits = self.search_indexed(query, native_limit).await?;
+        self.search_residual(query, limit, &mut hits).await?;
+        Ok(hits)
+    }
+
+    async fn search_indexed(&self, query: &str, limit: i64) -> Result<Vec<DocumentSearchHit>> {
+        let columns = self.text_columns();
         if columns.is_empty() {
             return Ok(Vec::new());
         }
@@ -342,4 +338,12 @@ fn scalar_literal(value: &Value) -> Result<Expr> {
         Value::Number(value) => Ok(lit(value.as_f64().unwrap())),
         _ => Err(Error::invalid_input("expected a scalar filter value")),
     }
+}
+
+pub(super) fn text_index_params() -> InvertedIndexParams {
+    InvertedIndexParams::new("simple".into(), Language::English)
+        .lower_case(true)
+        .stem(false)
+        .remove_stop_words(false)
+        .max_token_length(None)
 }

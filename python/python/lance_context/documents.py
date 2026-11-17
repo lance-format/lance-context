@@ -127,11 +127,15 @@ class DocumentStore:
         return self._backend.filter_eq(_path(path), value, limit)
 
     def search(self, query: str, *, limit: int = 10) -> list[dict[str, Any]]:
-        """Search automatically selected string fields and return IDs and scores.
+        """Search JSON string values and return IDs and scores.
 
         The first search after layout growth backfills historical values and
         builds indexes. Call prepare_text_search ahead of latency-sensitive reads.
-        Arrays and paths outside the shredding budget are not full-text indexed.
+        Indexed matches rank first. If fewer than ``limit`` are found, residual
+        strings (including type changes, arrays, and fields outside the column
+        budget) are scanned with the same tokenizer. Residual-only matches have
+        score 0 and no relevance ordering. This fallback may read large residuals;
+        it stores no duplicate text.
         """
         return self._backend.search(query, limit)
 

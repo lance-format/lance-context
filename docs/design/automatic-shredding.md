@@ -109,11 +109,16 @@ that residual. Fallback scans and backfill target batches of 4 MiB and at most
 1,024 rows with one batch of readahead. The byte target is approximate; one large
 document can exceed it, and it is not a process memory limit.
 
-`search(query, limit)` searches the automatically selected string paths and
-returns IDs with native Lance full-text scores. It uses a lowercase simple
-tokenizer without stemming or stop-word removal. Arrays, root scalar documents,
-and paths outside the extraction budget are not full-text indexed in this
-increment; they remain available through document reads and logical filtering.
+`search(query, limit)` returns native indexed matches first. If fewer than
+`limit` match, it scans residual JSON string values using the same lowercase
+simple tokenizer, with OR semantics and no stemming or stop-word removal.
+This covers budget exhaustion, type changes, arrays, and root strings without
+storing another text copy. Keys and non-string JSON values are not searched.
+Residual-only matches have score zero and unspecified order; native scores are
+unchanged, and IDs are deduplicated. This is indexed-first ranking, not a global
+BM25 ranking over all residual and extracted values. Rare or absent terms can
+require a residual scan, including large text that was not extracted. Scans
+use bounded batches; an individual oversized document can exceed the target.
 
 The first search after text-layout growth checks historical residuals and
 backfills only when matching text remains there, then builds missing inverted

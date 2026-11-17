@@ -412,6 +412,7 @@ fn validate_depth(value: &Value, depth: usize) -> Result<()> {
 }
 
 mod query;
+mod residual_search;
 pub use query::DocumentSearchHit;
 
 #[cfg(test)]
