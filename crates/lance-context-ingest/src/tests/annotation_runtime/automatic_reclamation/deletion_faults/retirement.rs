@@ -5,15 +5,25 @@ use std::sync::atomic::Ordering;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn committed_retirement_unknown_bounds_gc_and_preserves_live_updates() -> Result<()> {
-    tokio::time::timeout(Duration::from_secs(60), uncertain_fence(true)).await?
+    tokio::time::timeout(Duration::from_secs(60), uncertain_fence(true, false)).await?
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn uncommitted_retirement_unknown_bounds_gc_and_preserves_live_updates() -> Result<()> {
-    tokio::time::timeout(Duration::from_secs(60), uncertain_fence(false)).await?
+    tokio::time::timeout(Duration::from_secs(60), uncertain_fence(false, false)).await?
 }
 
-async fn uncertain_fence(execute: bool) -> Result<()> {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn committed_retirement_rpc_unknown_bounds_gc_and_preserves_live_updates() -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(60), uncertain_fence(true, true)).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn uncommitted_retirement_rpc_unknown_bounds_gc_and_preserves_live_updates() -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(60), uncertain_fence(false, true)).await?
+}
+
+async fn uncertain_fence(execute: bool, rpc_unknown: bool) -> Result<()> {
     let root = root()?;
     let path = root.path().join("turns.lance");
     let mut c =
@@ -21,7 +31,7 @@ async fn uncertain_fence(execute: bool) -> Result<()> {
     let faults = Arc::new(Faults::default());
     let storage = fault_store::storage(&path, faults.clone()).await?;
     let (first, completed, abandoned) = acknowledged_orphan_count(&c, &storage, &path, 1).await?;
-    let proxy = Proxy::open_retire(&c, root.path(), execute).await?;
+    let proxy = Proxy::open_retire(&c, root.path(), execute, rpc_unknown).await?;
     c.client = proxy.client.clone();
     let (service, runtime) = owned(&c, &storage, &limits()).await?;
     let (_, _, recovery_cut) = runtime.http_binding();
