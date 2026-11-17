@@ -26,6 +26,7 @@ from .documents import DocumentStore
 from .embeddings import (  # pyright: ignore[reportMissingImports]
     MultiModalEmbeddingProvider,
 )
+from .variant_documents import VariantDocumentStore
 
 __all__ = [
     "AlreadyExistsError",
@@ -40,6 +41,7 @@ __all__ = [
     "DatagenStreamWriter",
     "GenericStore",
     "DocumentStore",
+    "VariantDocumentStore",
     "EmbeddingProvider",
     "InternalError",
     "InvalidRequestError",

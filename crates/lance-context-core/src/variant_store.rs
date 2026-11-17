@@ -436,5 +436,7 @@ fn invalid(error: impl std::fmt::Display) -> Error {
     Error::invalid_input(error.to_string())
 }
 
+mod query;
+
 #[cfg(test)]
 mod tests;
