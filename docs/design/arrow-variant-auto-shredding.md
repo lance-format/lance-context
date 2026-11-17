@@ -36,6 +36,15 @@ Nested view arrays are converted to offset arrays in the adapter before writing
 to the current Lance version. This milestone adds no vendored Lance changes.
 The existing baseline encoder patch remains part of the shared dependency.
 
+Arrow 58.3's full validation rejects legal empty object keys in an unsorted
+dictionary because it requires strictly increasing offsets. A pinned
+`parquet-variant` patch changes this comparison to nondecreasing offsets and
+adds a regression test that still rejects decreasing offsets. The source is
+`beinan/arrow-rs` at `3b82666c986414727c20b05d1cbb1c63a71a5877`; its manifest
+uses the released Arrow dependencies to avoid introducing a second Arrow type
+universe. No Arrow source is copied into lance-context. Remove the pin after
+upgrading to an upstream release with the fix.
+
 ## Delivery boundaries
 
 The initial PR delivers the kernel/selection adapter and standard-array storage
