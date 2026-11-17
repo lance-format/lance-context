@@ -32,10 +32,15 @@ base64 = "0.22"
 bytes = "1"
 roaring = "0.11"
 arrow-array = "58"
+arrow-buffer = "58"
+arrow-cast = "58"
 arrow-ipc = "58"
 arrow-json = "58"
 arrow-schema = "58"
 arrow-select = "58"
+parquet-variant = "=58.3.0"
+parquet-variant-compute = "=58.3.0"
+parquet-variant-json = "=58.3.0"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 datafusion = { version = "54", default-features = false, features = ["nested_expressions"] }
 lance = { version = "14.0.2", path = "../../vendor/lance" }
