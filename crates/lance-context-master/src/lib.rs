@@ -21,6 +21,7 @@ mod merge_capacity;
 mod merge_execution;
 mod native_failure_recovery;
 mod periodic_sweep;
+mod registered_store;
 mod resident_recovery;
 pub mod rollout_append;
 pub mod routes;

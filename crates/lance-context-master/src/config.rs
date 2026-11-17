@@ -28,6 +28,10 @@ pub struct MasterConfig {
     #[arg(long, env = "DATA_DIR", default_value = "./data")]
     pub data_dir: String,
 
+    /// Additional named store registry to maintain using its persisted table schema.
+    #[arg(long, env = "MANAGED_STORE_KIND")]
+    pub managed_store_kind: Option<String>,
+
     /// Host to bind the admin API + UI to.
     #[arg(long, env = "MASTER_HOST", default_value = "0.0.0.0")]
     pub host: String,
@@ -283,6 +287,39 @@ pub struct MasterConfig {
 }
 
 impl MasterConfig {
+    pub(crate) fn validate_registered_store(&self) -> lance::Result<()> {
+        let Some(kind) = &self.managed_store_kind else {
+            return Ok(());
+        };
+        if kind.is_empty()
+            || matches!(kind.as_str(), "rollout" | "generic")
+            || !kind
+                .bytes()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
+        {
+            return Err(lance::Error::invalid_input("invalid managed store kind"));
+        }
+        let prefix = format!("{kind}:");
+        if self
+            .merge_rollout
+            .owned_targets
+            .iter()
+            .chain(&self.merge_rollout.drain_targets)
+            .chain(&self.maintenance.compaction_prepare_targets)
+            .chain(&self.maintenance.index_prepare_targets)
+            .chain(&self.local_merge.master_local_merge_targets)
+            .any(|target| target == "*" || target.starts_with(&prefix))
+            || self.merge_rollout.fence_legacy
+            || self.maintenance.fence_legacy_maintenance
+            || self.local_merge.master_local_merge_auto
+        {
+            return Err(lance::Error::invalid_input(
+                "registered stores require worker-owned legacy maintenance",
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn admits_automatic_wal(&self, target: &str) -> bool {
         self.merge_wal_admission_targets.is_empty()
             || self
@@ -294,6 +331,49 @@ impl MasterConfig {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn registered_store_rejects_unsupported_ownership_before_opening() {
+        use super::*;
+        for extra in [
+            vec!["--merge-owned-targets", "events:table"],
+            vec!["--merge-drain-targets", "events:table"],
+            vec!["--compaction-prepare-targets", "*"],
+            vec!["--index-prepare-targets", "events:table"],
+            vec!["--fence-legacy"],
+            vec!["--fence-legacy-maintenance"],
+            vec!["--master-local-merge-targets", "events:table"],
+            vec!["--master-local-merge-auto"],
+        ] {
+            let args = ["master", "--managed-store-kind", "events"]
+                .into_iter()
+                .chain(extra);
+            let config = MasterConfig::parse_from(args);
+            assert!(matches!(crate::state::MasterState::new(config).await,
+                Err(lance::Error::InvalidInput { source, .. })
+                if source.to_string() == "registered stores require worker-owned legacy maintenance"));
+        }
+    }
+
+    #[test]
+    fn registered_store_kind_must_be_unambiguous() {
+        use super::*;
+        for kind in [
+            "",
+            "rollout",
+            "generic",
+            "Events",
+            "events:table",
+            "../events",
+        ] {
+            let config = MasterConfig::parse_from(["master", "--managed-store-kind", kind]);
+            assert!(config.validate_registered_store().is_err(), "{kind}");
+        }
+        for kind in ["events", "events_v2", "datagen"] {
+            let config = MasterConfig::parse_from(["master", "--managed-store-kind", kind]);
+            config.validate_registered_store().unwrap();
+        }
+    }
+
     #[test]
     fn scoped_wal_admission_uses_exact_names_and_keeps_default_unrestricted() {
         let cfg =

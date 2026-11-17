@@ -266,6 +266,7 @@ async fn run_legacy(state: &Arc<MasterState>, claim: &TaskClaim) -> Result<Strin
         // A manually submitted legacy task has no automatic demand consumer.
         // Keep its original full pass rather than silently abandoning its tail.
         (state.config.merge_wal_interval_secs > 0).then_some(&state.admission),
+        state.registered_target(&claim.task.target),
     )
     .await
 }
@@ -422,7 +423,7 @@ async fn run_legacy_workers_inner(
     target: &str,
     ownership: LegacyOwnership<'_>,
 ) -> Result<String, String> {
-    run_legacy_workers_admitted(http, endpoints, target, ownership, None).await
+    run_legacy_workers_admitted(http, endpoints, target, ownership, None, None).await
 }
 
 // A task may span many workers. Admission is reserved separately at each turn
@@ -433,6 +434,7 @@ async fn run_legacy_workers_admitted(
     target: &str,
     ownership: LegacyOwnership<'_>,
     admission: Option<&Arc<crate::admission::Admission>>,
+    registered: Option<(&str, &str)>,
 ) -> Result<String, String> {
     let mut reclaimed = 0u64;
     let mut completed = 0usize;
@@ -463,10 +465,15 @@ async fn run_legacy_workers_admitted(
             WorkerRetry::Eligible { capabilities, .. } => capabilities,
         };
         let started = std::time::Instant::now();
-        match ownership
-            .upgraded_worker(http, target, endpoint, reprobed)
-            .await
-        {
+        let upgraded = if registered.is_some() {
+            // Registered schemas are maintained through their application worker route.
+            Ok(None)
+        } else {
+            ownership
+                .upgraded_worker(http, target, endpoint, reprobed)
+                .await
+        };
+        match upgraded {
             Ok(Some(n)) => {
                 metrics::histogram!("master_merge_wal_worker_duration_seconds")
                     .record(started.elapsed().as_secs_f64());
@@ -491,21 +498,32 @@ async fn run_legacy_workers_admitted(
                 return Err(format!("merged {reclaimed} generations across {completed}/{} workers; {endpoint}: {error}", endpoints.len()));
             }
         }
-        let url = match target.strip_prefix("generic:") {
-            Some(name) => format!("{endpoint}/api/v1/generic/{name}/merge-wal"),
-            None => format!("{endpoint}/api/v1/internal/merge-wal/{target}"),
+        let url = if let Some((kind, name)) = registered {
+            let mut url = reqwest::Url::parse(endpoint).map_err(|e| e.to_string())?;
+            url.path_segments_mut()
+                .map_err(|_| "worker endpoint cannot be a base URL")?
+                .pop_if_empty()
+                .extend(["api", "v1", kind, name, "merge-wal"]);
+            url.to_string()
+        } else {
+            match target.strip_prefix("generic:") {
+                Some(name) => format!("{endpoint}/api/v1/generic/{name}/merge-wal"),
+                None => format!("{endpoint}/api/v1/internal/merge-wal/{target}"),
+            }
         };
         let execution = ownership.admit(target, endpoint).await?;
         let started = std::time::Instant::now();
         let result = crate::merge_capacity::observe(async {
-            let mut response = http.post(url).send().await.map_err(|error| {
+            let request = http.post(url);
+            let request = if registered.is_some() { request.timeout(Duration::from_secs(600)) } else { request };
+            let mut response = request.send().await.map_err(|error| {
                 // The shared worker client must disable redirects: a failed
                 // connection AFTER a redirected POST could hide an execution.
                 // Keep a table name such as "schema" or "invalid" out of
                 // failure classification; target/endpoint are separate fields.
                 (error.is_connect(), error.without_url().to_string())
             })?;
-            if response.status() == reqwest::StatusCode::NOT_FOUND {
+            if response.status() == reqwest::StatusCode::NOT_FOUND && registered.is_none() {
                 return Ok(0);
             }
             if response.status().is_redirection() {
@@ -741,6 +759,9 @@ pub(crate) async fn recover_execution(
                 .ok_or_else(|| "merge reservation or recovery claim changed before cancellation".to_string())?;
             return coordinator.release(proof, &terminal).await?.then_some(())
                 .ok_or_else(|| "claim lost before releasing cancelled merge reservation".to_string());
+        }
+        if state.registered_target(&old.target).is_some() {
+            return Err("unresolved registered-store execution requires owner reconciliation; rollout storage recovery does not apply".into());
         }
         let frozen = coordinator.freeze(proof, &old).await?
             .ok_or_else(|| "merge execution changed while freezing commit admission".to_string())?;
@@ -1238,6 +1259,81 @@ async fn reconcile_with_grace(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn registered_workers_require_success_and_have_a_request_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let signal = entered.clone();
+        let app = Router::new()
+            .route(
+                "/api/v1/events/table/merge-wal",
+                post(|| async { Json(serde_json::json!({"reclaimed": 3})) }),
+            )
+            .route(
+                "/api/v1/events/stalled/merge-wal",
+                post(move || {
+                    let signal = signal.clone();
+                    async move {
+                        signal.notify_one();
+                        std::future::pending::<()>().await;
+                        Json(serde_json::json!({"reclaimed": 0}))
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let http = crate::state::worker_http_client().unwrap();
+        let endpoints = vec![endpoint.clone(), endpoint.clone()];
+        let result = run_legacy_workers_admitted(
+            &http,
+            &endpoints,
+            "events:table",
+            LegacyOwnership::HttpTest,
+            None,
+            Some(("events", "table")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, "merged 6 generations across 2/2 workers (legacy)");
+        let endpoints = vec![endpoint.clone(), format!("{endpoint}/missing")];
+        assert!(run_legacy_workers_admitted(
+            &http,
+            &endpoints,
+            "events:table",
+            LegacyOwnership::HttpTest,
+            None,
+            Some(("events", "table"))
+        )
+        .await
+        .is_err());
+        assert!(run_legacy_workers(&http, &endpoints, "unregistered")
+            .await
+            .is_ok());
+        let pending = tokio::spawn(async move {
+            run_legacy_workers_admitted(
+                &http,
+                &[endpoint],
+                "events:stalled",
+                LegacyOwnership::HttpTest,
+                None,
+                Some(("events", "stalled")),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), entered.notified())
+            .await
+            .unwrap();
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(601)).await;
+        tokio::time::resume();
+        let result = tokio::time::timeout(Duration::from_secs(10), pending).await;
+        server.abort();
+        assert!(result
+            .expect("stalled worker must hit its deadline")
+            .unwrap()
+            .is_err());
+    }
+
     #[test]
     fn queue_execution_and_real_progress_have_independent_deadlines() {
         use super::*;
@@ -1576,6 +1672,7 @@ mod tests {
                         proof: &proof,
                     },
                     Some(&admission),
+                    None,
                 )
                 .await
             } else {

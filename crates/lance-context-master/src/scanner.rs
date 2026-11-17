@@ -288,7 +288,7 @@ pub async fn maintain_stats(state: &Arc<MasterState>) -> lance::Result<()> {
 /// any version a worker may still be reading.
 async fn maintain_registry(
     state: &Arc<MasterState>,
-    label: &'static str,
+    label: &str,
     registry: &Arc<dyn StoreRegistry>,
 ) -> lance::Result<()> {
     // etcd-backed registries need no maintenance.
@@ -310,9 +310,9 @@ async fn maintain_registry(
         (Err(e), _) | (Ok(_), Err(e)) => return Err(e),
     };
     let version = table.lock().await.version();
-    metrics::counter!("master_registry_versions_removed_total", "registry" => label)
+    metrics::counter!("master_registry_versions_removed_total", "registry" => label.to_string())
         .increment(removal.old_versions);
-    metrics::gauge!("master_registry_version", "registry" => label).set(version as f64);
+    metrics::gauge!("master_registry_version", "registry" => label.to_string()).set(version as f64);
     tracing::info!(
         registry = label,
         fragments_removed = compaction.fragments_removed,
@@ -366,11 +366,23 @@ async fn try_scan_once(state: &Arc<MasterState>, maintain: bool) -> lance::Resul
         if let Err(e) = maintain_stats(state).await {
             tracing::warn!(error = %e, "stats maintenance failed");
         }
+        let mut maintained = HashSet::new();
         for (label, registry) in [
             ("rollout", &state.registry),
             ("generic", &state.generic_registry),
             ("datagen", &state.datagen_registry),
-        ] {
+        ]
+        .into_iter()
+        .chain(
+            state
+                .config
+                .managed_store_kind
+                .as_deref()
+                .zip(state.managed_registry.as_ref()),
+        ) {
+            if !maintained.insert(label) {
+                continue;
+            }
             if !state.admission.is_accepting() {
                 break;
             }
@@ -441,6 +453,18 @@ async fn scan_once_inner(
                 kind: ScanKind::Generic,
             }),
     );
+    if let Some(registry) = &state.managed_registry {
+        let kind = state
+            .config
+            .managed_store_kind
+            .as_deref()
+            .expect("configured registry");
+        entries.extend(registry.list().await?.into_iter().map(|entry| ScanEntry {
+            name: format!("{kind}:{}", entry.name),
+            uri: entry.uri,
+            kind: ScanKind::Registered,
+        }));
+    }
     let live: HashSet<String> = entries.iter().map(|e| e.name.clone()).collect();
     let (entries, ambiguous) = unique_scan_entries(entries);
     let entries = Arc::new(entries);
@@ -488,6 +512,10 @@ async fn scan_once_inner(
             async move {
                 let prev = previous.get(&entry.name);
                 let observed = match entry.kind {
+                    ScanKind::Registered => {
+                        crate::registered_store::observe(&state, &entry.name, &entry.uri, prev)
+                            .await
+                    }
                     ScanKind::Rollout => {
                         observe_one_with_shards(
                             &entry.name,
@@ -608,7 +636,9 @@ async fn scan_once_inner(
     let rollout_rows: Vec<StatRow> = snapshot
         .iter()
         .filter(|row| !ambiguous.contains(&row.name))
-        .filter(|row| !row.name.starts_with("generic:"))
+        .filter(|row| {
+            !row.name.starts_with("generic:") && state.registered_target(&row.name).is_none()
+        })
         .cloned()
         .collect();
     operation.phase("retire_cold_tables");
@@ -759,6 +789,7 @@ async fn publish_snapshot(
 /// Which registry a scan entry came from, which decides how it is opened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ScanKind {
+    Registered,
     Rollout,
     Generic,
 }

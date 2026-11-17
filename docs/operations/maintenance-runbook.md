@@ -6,6 +6,10 @@ metric or etcd key to look at and what the answer means. Design background:
 `docs/design/unified-maintenance-scheduler.md`; defect list and roadmap:
 `docs/design/scheduler-improvement-backlog.md`; tracking: issue #333.
 
+For tables with an application-defined schema, see
+[registered-store maintenance](registered-stores.md) for the opt-in registry and
+worker protocol.
+
 `P` below is `ETCD_PREFIX` (default `/lance-context/master`). `<hex>` is the
 lowercase hex of the target name's UTF-8 bytes; `generic:<name>` targets
 include the prefix in the hex.

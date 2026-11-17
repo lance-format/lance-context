@@ -6793,6 +6793,7 @@ pub(crate) mod tests {
             legacy_retirement_request: None,
             local_merge: Default::default(),
             append: Default::default(),
+            managed_store_kind: None,
             catchup: Default::default(),
             wal_tail: Default::default(),
             planner: Default::default(),
