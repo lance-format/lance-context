@@ -22,6 +22,8 @@ use serde_json::Value;
 
 use crate::shredding::{ShredField, ShredLayout, ShredPolicy, ShredType, ShreddedDocument};
 
+mod ingestion;
+
 const FORMAT_KEY: &str = "lance-context:document-format";
 const POLICY_KEY: &str = "lance-context:shred-policy";
 const FIELD_KEY: &str = "lance-context:shred-field";
@@ -181,14 +183,17 @@ impl DocumentStore {
             self.layout = next;
         }
         let ids: Vec<_> = documents.iter().map(|_| crate::generate_id()).collect();
-        let encoded = documents
-            .into_iter()
-            .map(|document| self.layout.shred(document).map_err(Error::invalid_input))
-            .collect::<Result<Vec<_>>>()?;
         let schema = Arc::new(Schema::from(self.dataset.schema()));
-        let batch = encode(&ids, &encoded, &self.layout, schema.clone())?;
+        let batches = ingestion::DocumentBatches::new(
+            ids.clone(),
+            documents,
+            self.layout.clone(),
+            schema.clone(),
+        );
+        // Encode one bounded batch at a time; Lance publishes the complete
+        // iterator in a single append commit, preserving add's atomicity.
         self.dataset
-            .append(RecordBatchIterator::new(vec![Ok(batch)], schema), None)
+            .append(RecordBatchIterator::new(batches, schema), None)
             .await?;
         Ok(ids)
     }
