@@ -1,6 +1,8 @@
 use super::{lookup::opened_rows, *};
 use std::{sync::atomic::Ordering, time::Duration};
 
+mod indexed;
+
 fn score(value: f32) -> TurnAnnotationPatch {
     TurnAnnotationPatch {
         score: Set(value),

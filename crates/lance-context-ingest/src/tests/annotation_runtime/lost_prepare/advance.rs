@@ -1,0 +1,157 @@
+//! Advance uncertainty must preserve a live owner and updates after the published cut.
+use super::*;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unrecorded_advance_keeps_owner_live_and_preserves_concurrent_update() -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(60), exercise(false)).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn committed_unknown_advance_keeps_owner_live_and_preserves_concurrent_update() -> Result<()>
+{
+    tokio::time::timeout(Duration::from_secs(60), exercise(true)).await?
+}
+
+async fn exercise(recorded: bool) -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let storage = Storage::resolve(
+        root.path().join("turns.lance").to_str().unwrap().into(),
+        Default::default(),
+        Arc::default(),
+    )
+    .await?;
+    // One published value occupies the entire entry budget. The later value
+    // can fit only after the installed generation releases its actual permits.
+    let limits = Limits {
+        retained_bytes: 256 << 10,
+        retained_entries: 1,
+        value_bytes: 4096,
+        readers: 16,
+    };
+    let mut c =
+        network::Cluster::open_signed(root.path(), annotation_publication::one_shard()).await?;
+    annotation_publication::seed_contract(&c, &storage, Service::contract(&binding(), &limits)?)
+        .await?;
+    let proxy = proxy::Proxy::open_advance(&c, root.path(), recorded).await?;
+    proxy
+        .pause_uncommitted_advance
+        .store(true, Ordering::SeqCst);
+    let direct = std::mem::replace(&mut c.client, proxy.client.clone());
+    let (service, runtime) = owner(&c, &storage, &limits).await?;
+    let (stop, task) = run_owner(runtime);
+    let a = producer(&service, 1).await?;
+    let b = producer(&service, 2).await?;
+    let first = request(
+        &service,
+        &a,
+        1,
+        wire(&limits, &["T"], 1, Some("reviewed"), 0, None)?,
+    )
+    .await?;
+    let first_result = service.submit(&first, Duration::from_secs(30)).await?;
+    assert_eq!(first_result.result, MutationResult::Applied);
+    tokio::time::timeout(Duration::from_secs(30), proxy.committed.notified()).await?;
+    let observed = service.observation().await.0;
+    assert_eq!(observed.materialized, first_result.index);
+    assert_eq!(observed.frozen_entries, 0);
+    let retained = annotation_publication::state(&c).await?;
+    assert_eq!(retained.progress.pending.is_some(), !recorded);
+    assert_eq!(retained.progress.published.is_some(), !recorded);
+    assert_eq!(
+        retained.progress.checkpoint.get(&10).copied().unwrap_or(0) >= first_result.index,
+        recorded
+    );
+    let original = proxy.advance_requests.lock().unwrap()[0].clone();
+    let target = retained.manifests.as_ref().unwrap().head;
+    let transaction = annotation_publication::read(&c, &storage, Some(target))
+        .await?
+        .read_transaction()
+        .await?;
+
+    let suffix = request(
+        &service,
+        &b,
+        1,
+        wire(&limits, &["T"], 0, None, 1, Some(0.9))?,
+    )
+    .await?;
+    let suffix_result = tokio::time::timeout(
+        Duration::from_secs(3),
+        service.submit(&suffix, Duration::from_secs(30)),
+    )
+    .await;
+    // Always release the held reply before reporting a regression failure.
+    let current = if matches!(&suffix_result, Ok(Ok(_))) {
+        Some(service.get("T", Duration::from_secs(1)).await?.unwrap())
+    } else {
+        None
+    };
+    proxy.release.notify_one();
+    let suffix_result = suffix_result
+        .context("confirmed publication retained staging capacity while advancement waited")??;
+    assert_eq!(suffix_result.result, MutationResult::Applied);
+    let current = current.unwrap();
+    assert_eq!(current.status.as_deref(), Some("reviewed"));
+    assert_eq!(current.score, Some(0.9));
+    drained(&c, &service, suffix_result.index).await?;
+    assert!(!task.is_finished(), "unknown Advance stopped the owner");
+    assert_eq!(proxy.dropped.load(Ordering::SeqCst), 1);
+    let advances = proxy.advance_requests.lock().unwrap().clone();
+    let original_advances: Vec<_> = advances
+        .iter()
+        .filter(|a| a.published_index == original.published_index)
+        .collect();
+    assert_eq!(original_advances.len(), if recorded { 1 } else { 2 });
+    assert!(original_advances.iter().all(|a| **a == original));
+    assert_eq!(
+        annotation_publication::read(&c, &storage, Some(target))
+            .await?
+            .read_transaction()
+            .await?,
+        transaction
+    );
+    assert_eq!(
+        service.get("T", Duration::from_secs(1)).await?,
+        Some(current.clone())
+    );
+    // Both publications have advanced; their payload can retire while point
+    // reads and retained request results continue to work from the new base.
+    assert!(matches!(
+        direct
+            .request_routed(Request::Fetch {
+                group: 10,
+                index: suffix_result.index,
+            })
+            .await?
+            .reply,
+        Reply::Record(None)
+    ));
+    stop.send(()).unwrap();
+    task.await??;
+    drop(service);
+    c.client = direct;
+    drop(proxy);
+    c.shutdown().await?;
+
+    let c = network::Cluster::open_signed(root.path(), annotation_publication::one_shard()).await?;
+    let (service, runtime) = owner(&c, &storage, &limits).await?;
+    let (stop, task) = run_owner(runtime);
+    assert_eq!(
+        service.get("T", Duration::from_secs(30)).await?,
+        Some(current.clone())
+    );
+    drained(&c, &service, suffix_result.index).await?;
+    for (request, result) in [(&first, &first_result), (&suffix, &suffix_result)] {
+        assert_eq!(
+            &service.submit(request, Duration::from_secs(30)).await?,
+            result
+        );
+    }
+    assert_eq!(
+        service.get("T", Duration::from_secs(30)).await?,
+        Some(current)
+    );
+    stop.send(()).unwrap();
+    task.await??;
+    c.shutdown().await
+}

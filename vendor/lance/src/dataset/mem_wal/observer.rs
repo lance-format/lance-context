@@ -34,6 +34,11 @@ pub trait WalObserver: Send + Sync + Debug {
     /// generation that keeps failing is reported on every retry.
     fn on_memtable_flush_failure(&self, _generation: u64, _error: &Error) {}
 
+    /// Coarse durable checkpoints for one generation. `started` is only an
+    /// attempt notification; `wal_durable` and `prepared` report completed work.
+    /// Repeating a checkpoint on retry must not be interpreted as new progress.
+    fn on_memtable_flush_stage(&self, _generation: u64, _stage: &'static str) {}
+
     /// A generation flush attempt failed (including background retries).
     fn on_memtable_flush_error(&self) {}
 

@@ -8,6 +8,14 @@ use crate::{
     replication::{CheckpointTask, ImageCollection, PreparedCheckpoint, SnapshotReceiver},
 };
 
+pub(super) struct CheckpointWork {
+    image: PreparedCheckpoint,
+    retained_bytes: u64,
+    reply: Completion<()>,
+    started: bool,
+    previous: Option<Arc<crate::replication::checkpoint::Image>>,
+}
+
 // Every queued result retains its original outgoing credit. The lane has as
 // many slots as the entire physical node's outgoing allowance, so it cannot
 // fill while another valid owner is trying to return its slot. Control-lane
@@ -80,6 +88,85 @@ impl Drop for Outbound {
 }
 
 impl Worker {
+    pub(super) fn checkpoint_draining(&self) -> bool {
+        self.checkpoint.as_ref().is_some_and(|work| !work.started)
+    }
+
+    pub(super) fn queue_checkpoint(&mut self, work: Box<CheckpointWork>) {
+        if self.checkpoint.is_some() {
+            work.reply
+                .finish(Err(anyhow::anyhow!("checkpoint already queued")));
+            return;
+        }
+        self.node
+            .groups
+            .get_mut(&self.group)
+            .unwrap()
+            .drain_for_checkpoint(true);
+        // Retain the original completion, control credit and physical-node
+        // image permit across every poll. No task or waiter is spawned here.
+        self.checkpoint = Some(work);
+    }
+
+    pub(super) fn install_drained_checkpoint(
+        &mut self,
+        after_poll: &mut Vec<AfterPoll>,
+    ) -> Result<bool> {
+        let Some(work) = self.checkpoint.as_mut() else {
+            return Ok(false);
+        };
+        if work.started {
+            if self.node.checkpoint_index(self.group)? < work.image.index() {
+                return Ok(false);
+            }
+            let work = self.checkpoint.take().unwrap();
+            let result = self.node.finish_async_checkpoint(&work.image);
+            after_poll.push(Box::new(move || work.reply.finish(result)));
+            return Ok(true);
+        }
+        if !self.node.groups[&self.group].persistence_idle() {
+            return Ok(false);
+        }
+        if self.options.async_persistence {
+            match self
+                .node
+                .start_async_checkpoint(&work.image, work.retained_bytes)
+            {
+                Ok(previous) => {
+                    work.previous = previous;
+                    work.started = true;
+                }
+                Err(error) => {
+                    let work = self.checkpoint.take().unwrap();
+                    after_poll.push(Box::new(move || work.reply.finish(Err(error))));
+                }
+            }
+            self.node
+                .groups
+                .get_mut(&self.group)
+                .unwrap()
+                .drain_for_checkpoint(false);
+            return Ok(true);
+        }
+        let CheckpointWork {
+            image,
+            retained_bytes,
+            reply,
+            ..
+        } = *self.checkpoint.take().unwrap();
+        self.node
+            .groups
+            .get_mut(&self.group)
+            .unwrap()
+            .drain_for_checkpoint(false);
+        // The synchronous runtime retains its original installation protocol.
+        let result = self
+            .node
+            .install_checkpoint_retaining(image, retained_bytes);
+        after_poll.push(Box::new(move || reply.finish(result)));
+        Ok(true)
+    }
+
     pub(super) fn snapshot_feedback(&mut self, packet: &Packet) -> Result<SnapshotFeedback> {
         self.snapshot_attempt = self
             .snapshot_attempt
@@ -121,6 +208,22 @@ impl Handle {
     pub fn disk_budget(&self) -> Option<crate::admission::Snapshot> {
         self.disk.as_ref().map(|budget| budget.snapshot())
     }
+
+    #[cfg(feature = "service")]
+    pub(crate) fn data_checkpoint_pressure(&self) -> bool {
+        self.disk_budget().is_some_and(|disk| {
+            let proposal = self
+                .max_record
+                .saturating_add(crate::replication::PROPOSAL_DISK_OVERHEAD);
+            // Native pressure rewriting starts with two target files of room
+            // left. Checkpoint before copying a prefix that the image can
+            // retire, even if another maximum-size proposal still fits.
+            // Reservations alone cannot be reclaimed by a checkpoint.
+            disk.data_limit.saturating_sub(disk.accounted_disk_bytes)
+                < self.log_file_headroom.max(proposal as u64)
+        })
+    }
+
     /// Capture a blocking directory measurement retaining the physical engine.
     /// Run this on the maintenance worker, never on an async executor thread.
     pub fn prepare_disk_measurement(&self) -> Result<Pending<crate::raft_log::DiskMeasurement>> {
@@ -194,7 +297,7 @@ impl Handle {
     /// Install a completed local image and logically compact its prefix. The
     /// completion follows persistence. Later suffix entries stay in the log.
     pub fn install_checkpoint(&self, image: PreparedCheckpoint) -> Result<Pending<()>> {
-        self.local(image.group(), move |node| node.install_checkpoint(image))
+        self.install_checkpoint_retaining(image, 0)
     }
 
     /// Install an application checkpoint with a byte-bounded replication tail.
@@ -203,9 +306,24 @@ impl Handle {
         image: PreparedCheckpoint,
         retained_bytes: u64,
     ) -> Result<Pending<()>> {
-        self.local(image.group(), move |node| {
-            node.install_checkpoint_retaining(image, retained_bytes)
-        })
+        let route = self.route(image.group())?;
+        let credit = self.shared.control.reserve(4096)?;
+        let (reply, receive) = oneshot::channel();
+        self.enqueue(
+            route,
+            Work::Checkpoint(Box::new(CheckpointWork {
+                image,
+                retained_bytes,
+                started: false,
+                previous: None,
+                reply: Completion {
+                    reply,
+                    _credit: credit,
+                },
+            })),
+            false,
+        )?;
+        Ok(Pending(receive))
     }
 
     /// Create an authenticated snapshot receiver after the caller has reserved

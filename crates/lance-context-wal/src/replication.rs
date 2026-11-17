@@ -1,7 +1,8 @@
-//! Synchronous, transport-independent Raft ingestion for static RF3 groups.
+//! Transport-independent Raft ingestion for static RF3 groups.
 //!
 //! `propose` queues input; only `poll` can return a committed result. All outgoing
-//! messages and completions follow durable Ready/LightReady persistence. Exact
+//! persistence-dependent messages and completions follow durable Ready persistence.
+//! Runtime may offload ordinary Ready writes while preserving those barriers. Exact
 //! retries enter consensus again and return the original accepted index after
 //! commit. An isolated former leader cannot answer retries from local state.
 //!
@@ -16,6 +17,10 @@
 
 pub mod checkpoint;
 mod images;
+mod log_view;
+use log_view::LogView;
+#[cfg(feature = "runtime")]
+mod async_persist;
 pub use images::{ImageCollection, ImageCollectionProgress};
 pub mod producer;
 pub mod publication;
@@ -45,6 +50,8 @@ use crate::{
 };
 pub use images::{CheckpointTask, PreparedCheckpoint, SnapshotReceiver};
 use state::State;
+
+const PROPOSAL_DISK_OVERHEAD: usize = 4096;
 
 /// Immutable, replicated-state bounds. All peers and reopens must use the same
 /// policy. These bounds do not account for queues in the caller's transport.
@@ -263,7 +270,13 @@ pub struct Page {
 }
 
 struct Group {
-    raw: RawNode<GroupLog>,
+    raw: RawNode<LogView>,
+    #[cfg(feature = "runtime")]
+    persistence: Option<async_persist::Persistence>,
+    #[cfg(feature = "runtime")]
+    deferred_completions: Vec<Completion>,
+    #[cfg(feature = "runtime")]
+    deferred_messages: Vec<Message>,
     state: State,
     // Index AND term prevents suffix replacement from completing another input.
     pending: BTreeMap<(u64, u64), (u64, BatchMeta, Option<crate::admission::Reservation>)>,
@@ -431,11 +444,17 @@ impl Node {
                 max_committed_size_per_ready: 1024 * 1024,
                 ..Default::default()
             };
-            let raw = RawNode::new(&config, store, &logger)?;
+            let raw = RawNode::new(&config, LogView::Durable(store), &logger)?;
             groups.insert(
                 *group,
                 Group {
                     raw,
+                    #[cfg(feature = "runtime")]
+                    persistence: None,
+                    #[cfg(feature = "runtime")]
+                    deferred_completions: Vec::new(),
+                    #[cfg(feature = "runtime")]
+                    deferred_messages: Vec::new(),
                     state,
                     pending: BTreeMap::new(),
                     peer_reservations: Vec::new(),
@@ -517,6 +536,12 @@ impl Node {
     pub fn tick(&mut self) -> Result<()> {
         self.healthy()?;
         for group in self.groups.values_mut() {
+            // The leader must keep sending heartbeats and checking quorum while
+            // data persistence is full. drive_async drains its safe messages.
+            #[cfg(feature = "runtime")]
+            if !group.accepts_async(&[])? && group.raw.raft.state != StateRole::Leader {
+                continue;
+            }
             group.raw.tick();
         }
         Ok(())
@@ -524,6 +549,14 @@ impl Node {
 
     pub fn campaign(&mut self, group: u64) -> Result<()> {
         self.healthy()?;
+        #[cfg(feature = "runtime")]
+        ensure!(
+            self.groups
+                .get(&group)
+                .context("unhosted group")?
+                .accepts_async(&[])?,
+            ProposalRejection::PendingCapacity
+        );
         self.groups
             .get_mut(&group)
             .context("unhosted group")?
@@ -538,7 +571,7 @@ impl Node {
         Ok(Status {
             leader: g.raw.raft.leader_id,
             term: g.raw.raft.term,
-            committed: g.raw.store().initial_state()?.hard_state.commit,
+            committed: g.raw.store().durable_commit()?,
             applied: g.state.applied,
             accepted_records: g.state.accepted.len(),
             producers: g.state.producers.len(),
@@ -558,9 +591,12 @@ impl Node {
     }
 
     fn request_pending(&self, request: u64) -> bool {
-        self.groups
-            .values()
-            .any(|g| g.pending.values().any(|p| p.0 == request) || g.reads.contains(request))
+        self.groups.values().any(|g| {
+            let active = g.pending.values().any(|p| p.0 == request) || g.reads.contains(request);
+            #[cfg(feature = "runtime")]
+            let active = active || g.deferred_completions.iter().any(|c| c.request == request);
+            active
+        })
     }
 
     /// Queue a bounded safe read-index request at this group's leader. Only a
@@ -760,7 +796,7 @@ impl Node {
                 let bytes = batch
                     .body
                     .len()
-                    .checked_add(4096)
+                    .checked_add(PROPOSAL_DISK_OVERHEAD)
                     .context("proposal disk reservation overflow")?;
                 budget.reserve(bytes, batch.meta.kind == crate::record::RecordKind::Data)
             })
@@ -768,10 +804,17 @@ impl Node {
         // RawNode::propose accepts Vec and would copy the opaque Bytes. This is
         // the equivalent raft-rs proposal path with shared entry.data ownership.
         let entry = Entry {
+            index,
+            term,
             context: state::encode_meta(&batch.meta)?.into(),
             data: batch.body,
             ..Default::default()
         };
+        #[cfg(feature = "runtime")]
+        ensure!(
+            g.accepts_async(std::slice::from_ref(&entry))?,
+            ProposalRejection::PendingCapacity
+        );
         let mut message = Message::default();
         message.set_msg_type(MessageType::MsgPropose);
         message.from = self.id;
@@ -837,11 +880,23 @@ impl Node {
             .groups
             .get_mut(&packet.group)
             .context("unhosted group")?;
+        // Current-term heartbeat responses refresh the leader's quorum without
+        // adding log entries. Already admitted reads still wait for the normal
+        // persisted Ready/application boundary before reaching callers.
+        #[cfg(feature = "runtime")]
+        ensure!(
+            (group.raw.raft.state == StateRole::Leader
+                && message.term == group.raw.raft.term
+                && message.get_msg_type() == MessageType::MsgHeartbeatResponse
+                && message.entries.is_empty())
+                || group.accepts_durable_term_heartbeat(&message)?
+                || group.accepts_peer_async(&message.entries)?,
+            async_persist::PeerPersistenceCapacity
+        );
         let reservation = if message.get_msg_type() == MessageType::MsgAppend
             && message.term >= group.raw.raft.term
         {
             let mut bytes = 0usize;
-            let mut data = false;
             for entry in &message.entries {
                 // A retransmission of an existing entry needs no new payload
                 // space. It must still reach Raft when the original ACK was lost.
@@ -854,10 +909,6 @@ impl Node {
                     .checked_add(entry.compute_size() as usize)
                     .and_then(|n| n.checked_add(4096))
                     .context("peer disk reservation overflow")?;
-                if !entry.context.is_empty() {
-                    data |=
-                        state::decode_meta(&entry.context)?.kind == crate::record::RecordKind::Data;
-                }
             }
             if bytes == 0 {
                 None
@@ -866,7 +917,12 @@ impl Node {
                     .raw
                     .store()
                     .disk_budget()
-                    .map(|budget| budget.reserve(bytes, data))
+                    // These entries have already passed their leader's
+                    // proposal admission. A follower's lower producer ceiling
+                    // must not block their durable quorum or later control
+                    // entries that permit publication and reclamation.
+                    // Keep every byte charged against the total node budget.
+                    .map(|budget| budget.reserve(bytes, false))
                     .transpose()?
             }
         } else {
@@ -888,7 +944,9 @@ impl Node {
         Ok(())
     }
 
-    /// Performs blocking storage I/O. The transport may drop output messages;
+    /// Drives Ready work. Storage is synchronous by default; runtime may offload
+    /// ordinary writes, while checkpoint/snapshot barriers may still block.
+    /// The transport may drop output messages;
     /// Raft will retransmit. On error NONE of this call's events are released.
     pub fn poll(&mut self) -> Result<Events> {
         self.poll_inner(None)
@@ -913,6 +971,12 @@ impl Node {
             self.failed = true;
         } else {
             for group in self.groups.values_mut() {
+                #[cfg(feature = "runtime")]
+                if group.persistence.is_some()
+                    && !group.raw.raft.raft_log.unstable.entries.is_empty()
+                {
+                    continue;
+                }
                 group.peer_reservations.clear();
             }
         }
@@ -922,15 +986,38 @@ impl Node {
     fn drive(&mut self, mut early: Option<&mut dyn FnMut(Packet)>) -> Result<Events> {
         let mut events = Events::default();
         for (id, group) in &mut self.groups {
+            let mut outbound = Vec::new();
+            #[cfg(feature = "runtime")]
+            {
+                events.completions.append(&mut group.deferred_completions);
+                outbound.append(&mut group.deferred_messages);
+                if group.persistence.is_some() {
+                    group.drive_async(*id, &self.limits, &mut events, &mut outbound)?;
+                }
+            }
             // Every member arrived before this fresh quorum barrier. Seal the
             // batch before sending: later arrivals cannot reuse its responses.
             if group.raw.raft.state == StateRole::Leader {
-                if let Some(context) = group.reads.take_barrier(group.raw.raft.term) {
+                #[cfg(feature = "runtime")]
+                let admitted = group.accepts_async(&[])?;
+                #[cfg(not(feature = "runtime"))]
+                let admitted = true;
+                if let Some(context) = admitted
+                    .then(|| group.reads.take_barrier(group.raw.raft.term))
+                    .flatten()
+                {
                     group.raw.read_index(context);
                 }
             }
-            let mut outbound = Vec::new();
-            while group.raw.has_ready() {
+            #[cfg(feature = "runtime")]
+            let synchronous = group.persistence.is_none();
+            #[cfg(not(feature = "runtime"))]
+            let synchronous = true;
+            #[cfg(feature = "runtime")]
+            if !synchronous {
+                group.drive_async(*id, &self.limits, &mut events, &mut outbound)?;
+            }
+            while synchronous && group.raw.has_ready() {
                 let mut ready = group.raw.ready();
                 if let Some(send) = early.as_deref_mut() {
                     // raft-rs separates these from persisted_messages. Keep
@@ -992,6 +1079,10 @@ impl Node {
                 .keys()
                 .copied()
                 .filter(|(_, term)| {
+                    #[cfg(feature = "runtime")]
+                    if !group.persistence_idle() {
+                        return false;
+                    }
                     group.raw.raft.state != StateRole::Leader || *term != group.raw.raft.term
                 })
                 .collect();
@@ -1089,7 +1180,7 @@ fn apply(
     limits: &Limits,
     events: &mut Events,
 ) -> Result<()> {
-    let durable = group.raw.store().initial_state()?.hard_state.commit;
+    let durable = group.raw.store().durable_commit()?;
     for entry in entries {
         ensure!(
             entry.index <= durable,

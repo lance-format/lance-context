@@ -695,6 +695,17 @@ impl Default for TaskExecutor {
     }
 }
 
+impl Drop for TaskExecutor {
+    fn drop(&mut self) {
+        // A handler can retain a sender into its own mailbox (notably the WAL
+        // flusher), so dropping the writer does not close those channels.
+        // Stop dispatching after the current operation settles. Do not abort
+        // an in-flight storage commit or delete WAL: acknowledged rows remain
+        // recoverable by the next writer. Call close() for a graceful flush.
+        self.cancellation_token.cancel();
+    }
+}
+
 // ============================================================================
 // Durability and Backpressure Types
 // ============================================================================
@@ -2927,7 +2938,9 @@ impl ShardWriter {
         // Fence the predecessor before replay (see `write_fence_sentinel`).
         // Epoch 1 is a fresh shard with no predecessor to fence.
         if epoch >= 2 {
-            wal_appender.write_fence_sentinel().await?;
+            let sentinel_position = wal_appender.write_fence_sentinel().await?;
+            tracing::info!(uri = %base_uri, %shard_id, epoch, sentinel_position,
+                "WAL predecessor fence persisted before replay");
         }
 
         // Create WAL flusher backed by the shared appender.
@@ -3075,6 +3088,11 @@ impl ShardWriter {
         // it is a hint for other readers, and `position_hint_seed` already
         // tolerates it lagging behind `replay_after_wal_entry_position`.
         let replayed_through = next_wal_position.saturating_sub(1);
+        tracing::info!(uri = %base_uri, %shard_id, epoch,
+            replay_after = manifest.replay_after_wal_entry_position,
+            replayed_through, active_generation = memtable.generation(),
+            active_rows = memtable.row_count(),
+            "WAL replay completed; active rows still require flush publication");
         if replayed_through > manifest.wal_entry_position_last_seen
             && let Err(error) = manifest_store
                 .commit_update(epoch, |current| ShardManifest {
@@ -5089,6 +5107,9 @@ impl MemTableFlushHandler {
         pending: &mut PendingMemTableFlush,
     ) -> Result<super::memtable::flush::FlushResult> {
         let memtable = &pending.memtable;
+        if let Some(observer) = &self.observer {
+            observer.on_memtable_flush_stage(memtable.generation(), "started");
+        }
         if pending.wal_boundary.is_none() {
             // The freeze-time snapshot can predate an in-flight WAL append.
             // Its queued request can then coalesce to entry=None, so even after
@@ -5120,6 +5141,9 @@ impl MemTableFlushHandler {
             .unwrap()
             .clone()
             .map_err(WalFlushFailure::into_error)?;
+        if let Some(observer) = &self.observer {
+            observer.on_memtable_flush_stage(memtable.generation(), "wal_durable");
+        }
         if pending.prepared.is_none() {
             if !pending.index_specs.is_empty()
                 && let Some(indexes) = memtable.indexes_arc()
@@ -5147,6 +5171,9 @@ impl MemTableFlushHandler {
             // Retain immutable files before awaiting publication, so lost ACKs
             // never lead to rewriting sidecars a merger may already be reading.
             pending.prepared = Some(prepared);
+        }
+        if let Some(observer) = &self.observer {
+            observer.on_memtable_flush_stage(memtable.generation(), "prepared");
         }
         self.flusher
             .publish_prepared(pending.prepared.as_ref().unwrap(), self.epoch)

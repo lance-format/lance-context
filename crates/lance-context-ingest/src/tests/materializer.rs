@@ -10,6 +10,11 @@ mod advance;
 mod close;
 mod compaction;
 #[cfg(feature = "service")]
+mod confirm;
+mod external_transaction;
+#[cfg(feature = "service")]
+mod pin;
+#[cfg(feature = "service")]
 mod plan;
 #[cfg(feature = "service")]
 mod prepare;

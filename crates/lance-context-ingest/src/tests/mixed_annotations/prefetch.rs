@@ -2,6 +2,7 @@
 use super::*;
 
 mod large;
+mod patches;
 
 fn completed(service: &Service, phase: &str) -> u64 {
     service

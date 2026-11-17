@@ -200,6 +200,7 @@ pub(crate) use {
 #[cfg(feature = "metrics")]
 #[derive(Debug)]
 pub(crate) struct MemtableFlushMetrics {
+    health: crate::flush_health::WriterHealth,
     // Gauges are additive across resident retry queues in this process.
     pending: std::sync::Mutex<(usize, usize)>,
 }
@@ -212,18 +213,39 @@ impl Default for MemtableFlushMetrics {
                 .increment(0);
         }
         ::metrics::counter!("rollout_memtable_flush_retries_total").increment(0);
+        ::metrics::counter!("rollout_memtable_flush_unresolved_writer_drops_total").increment(0);
+        ::metrics::counter!("rollout_memtable_flush_rows_total").increment(0);
+        ::metrics::counter!("rollout_wal_persisted_bytes_total").increment(0);
         ::metrics::counter!("rollout_memtable_flush_backpressure_rejections_total").increment(0);
         ::metrics::gauge!("rollout_memtable_flush_retry_generations").increment(0.0);
         ::metrics::gauge!("rollout_memtable_flush_retry_bytes").increment(0.0);
         Self {
+            health: crate::flush_health::WriterHealth::new(String::new(), String::new()),
             pending: std::sync::Mutex::new((0, 0)),
         }
     }
 }
 
 #[cfg(feature = "metrics")]
+impl MemtableFlushMetrics {
+    pub(crate) fn new(uri: &str, shard: uuid::Uuid) -> Self {
+        let mut metrics = Self::default();
+        metrics.health = crate::flush_health::WriterHealth::new(uri.to_owned(), shard.to_string());
+        metrics
+    }
+}
+
+#[cfg(feature = "metrics")]
 impl lance::dataset::mem_wal::observer::WalObserver for MemtableFlushMetrics {
-    fn on_memtable_flush(&self, _duration: std::time::Duration, _rows: usize) {
+    fn on_wal_flush(&self, _duration: std::time::Duration, bytes: usize) {
+        ::metrics::counter!("rollout_wal_persisted_bytes_total").increment(bytes as u64);
+    }
+
+    fn on_memtable_flush(&self, duration: std::time::Duration, rows: usize) {
+        self.health.completed();
+        ::metrics::counter!("rollout_memtable_flush_rows_total").increment(rows as u64);
+        ::metrics::histogram!("rollout_memtable_flush_duration_seconds")
+            .record(duration.as_secs_f64());
         ::metrics::counter!("rollout_memtable_flush_attempts_total", "result" => "ok").increment(1);
     }
 
@@ -232,11 +254,25 @@ impl lance::dataset::mem_wal::observer::WalObserver for MemtableFlushMetrics {
             .increment(1);
     }
 
+    fn on_memtable_flush_stage(&self, generation: u64, stage: &'static str) {
+        self.health.stage(generation, stage);
+    }
+
+    fn on_memtable_flush_failure(&self, generation: u64, error: &lance_core::Error) {
+        self.health.failed(
+            generation,
+            error.fence_reason().is_some(),
+            &error.to_string(),
+        );
+    }
+
     fn on_memtable_flush_retry(&self) {
+        self.health.retry();
         ::metrics::counter!("rollout_memtable_flush_retries_total").increment(1);
     }
 
     fn on_memtable_flush_retry_state(&self, generations: usize, bytes: usize) {
+        self.health.queue(generations, bytes);
         let mut previous = self.pending.lock().unwrap();
         ::metrics::gauge!("rollout_memtable_flush_retry_generations")
             .increment(generations as f64 - previous.0 as f64);

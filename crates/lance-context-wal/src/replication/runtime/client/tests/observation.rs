@@ -1,6 +1,63 @@
 use super::*;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pending_capacity_refusal_preserves_the_original_append_outcome() -> Result<()> {
+    async fn set_limit(handle: &Handle, limit: u64) -> Result<u64> {
+        let (sent, received) = tokio::sync::oneshot::channel();
+        handle.enqueue(
+            handle.route(10)?,
+            Work::Local(Box::new(move |node| {
+                let previous = std::mem::replace(&mut node.limits.max_pending, limit);
+                Box::new(move || {
+                    let _ = sent.send(previous);
+                })
+            })),
+            false,
+        )?;
+        Ok(received.await?)
+    }
+
+    let dir = tempfile::tempdir()?;
+    let c = RpcCluster::open(dir.path(), Options::default()).await?;
+    let leader = c.leader().await?;
+    let handle = &c.net.nodes[&leader].handle;
+    let request = Request::Append {
+        group: 10,
+        batch: batch(1),
+    };
+    // Exhaust the proposal admission budget in the actual group worker. The
+    // request still traverses the real TLS server and Node::propose.
+    let previous = set_limit(handle, 0).await?;
+    let refused = c.client.request_routed(request.clone()).await;
+    set_limit(handle, previous).await?;
+    assert_eq!(
+        serde_json::to_value(refused?.reply)?,
+        serde_json::json!("AppendNotSubmittedPendingCapacity")
+    );
+    assert_eq!(producer(&c.client, leader, &batch(1)).await?, None);
+    assert_eq!(handle.append_observation()["pending_capacity"], 1);
+
+    let accepted_reply = c.client.request_routed(request.clone()).await?;
+    let index = accepted(&accepted_reply);
+    drop(accepted_reply);
+    let previous = set_limit(handle, 0).await?;
+    let refused = c.client.request_routed(request.clone()).await;
+    set_limit(handle, previous).await?;
+    assert_eq!(
+        serde_json::to_value(refused?.reply)?,
+        serde_json::json!("AppendNotSubmittedPendingCapacity")
+    );
+    // Refusing this attempt must not deny a previous durable acceptance of the
+    // same identity, or turn it into a committed application-capacity outcome.
+    assert_eq!(producer(&c.client, leader, &batch(1)).await?, Some(index));
+    let retried = c.client.request_routed(request).await?;
+    assert_eq!(accepted(&retried), index);
+    drop(retried);
+    assert_eq!(handle.observation(10)?.status.accepted_records, 1);
+    c.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn append_diagnostics_distinguish_disk_refusals_from_unknown_outcomes() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let c = RpcCluster::open(dir.path(), Options::default()).await?;
@@ -98,17 +155,19 @@ async fn append_disk_refusal_retains_decision_after_reservations_release() -> Re
     let file = budget.reserve_files(&[4097])?;
     let rewrite = budget.reserve_rewrite(16 << 10)?;
     let view = budget.snapshot();
-    let proposal_bytes = view.data_limit
-        - view.accounted_disk_bytes
-        - view.reserved_file_bytes
-        - view.reserved_rewrite_bytes;
+    // Fill the data window with ordinary proposals and images. Native rewrite
+    // scratch is independently charged against the protected total ceiling.
+    let proposal_bytes = view.data_limit - view.accounted_disk_bytes - view.reserved_file_bytes;
     let proposal = budget.reserve(proposal_bytes as usize, false)?;
     assert!(matches!(
         c.client.request(leader, request.clone()).await?.reply,
         Reply::AppendNotSubmittedDiskBudget
     ));
     let decision = handle.last_append_disk_refusal().unwrap();
-    assert_eq!(decision.limit_bytes, view.data_limit);
+    assert_eq!(
+        decision.limit_bytes,
+        view.data_limit + view.reserved_rewrite_bytes
+    );
     assert_eq!(decision.reserved_file_bytes, 8192);
     assert_eq!(decision.reserved_rewrite_bytes, 16 << 10);
     assert!(decision.reserved_proposal_bytes >= proposal_bytes + decision.reserved_rewrite_bytes);

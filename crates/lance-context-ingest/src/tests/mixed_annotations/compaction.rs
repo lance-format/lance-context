@@ -142,20 +142,62 @@ pub(in crate::tests) async fn fragmented_with_slot(
 #[tokio::test]
 async fn mixed_automatic_compaction_drains_both_tables_and_preserves_ids_and_updates() -> Result<()>
 {
-    tokio::time::timeout(Duration::from_secs(60), automatic()).await?
+    tokio::time::timeout(Duration::from_secs(60), automatic(None)).await?
 }
 
-async fn automatic() -> Result<()> {
+#[cfg(feature = "service")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mixed_compaction_resolves_committed_reservation_and_preserves_live_updates() -> Result<()>
+{
+    tokio::time::timeout(Duration::from_secs(60), automatic(Some(true))).await?
+}
+
+#[cfg(feature = "service")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mixed_compaction_resumes_uncommitted_reservation_and_preserves_live_updates() -> Result<()>
+{
+    tokio::time::timeout(Duration::from_secs(60), automatic(Some(false))).await?
+}
+
+async fn automatic(reserve_fault: Option<bool>) -> Result<()> {
     let root = artifact_root()?;
     let c = network::Cluster::open_signed(root.path(), annotation_publication::one_shard()).await?;
+    #[cfg(feature = "service")]
+    let mut c = c;
+    #[cfg(not(feature = "service"))]
+    assert!(reserve_fault.is_none());
     let narrow = storage(root.path(), "annotations.lance").await?;
     let body = storage(root.path(), "body.lance").await?;
     let (last, result) = fragmented(&c, &narrow, &body).await?;
     let original_body = selected_body(&c, &narrow, &body).await?;
     assert_eq!(original_body.fragments().len(), 3);
     let original_ids = ids(&original_body).await?;
+    #[cfg(feature = "service")]
+    let original_client = c.client.clone();
+    #[cfg(feature = "service")]
+    let proxy = if let Some(execute) = reserve_fault {
+        let proxy =
+            annotation_runtime::lost_prepare::proxy::Proxy::open_reserve(&c, root.path(), execute)
+                .await?;
+        c.client = proxy.client.clone();
+        Some(proxy)
+    } else {
+        None
+    };
     let (a, runtime) = compact_owner(&c, &narrow, &body).await?;
     let (stop, task) = annotation_runtime::run_owner(runtime);
+    #[cfg(feature = "service")]
+    if let Some(proxy) = &proxy {
+        tokio::time::timeout(Duration::from_secs(10), proxy.committed.notified()).await?;
+        assert!(annotation_publication::state(&c)
+            .await?
+            .progress
+            .pending
+            .as_ref()
+            .unwrap()
+            .plan
+            .is_maintenance());
+    }
     let held = a.get_turn("A", Duration::from_secs(10)).await?.unwrap();
     let p = producer(&a, 2).await?;
     let update = request(
@@ -169,6 +211,11 @@ async fn automatic() -> Result<()> {
     )
     .await?;
     let outcome = a.submit(&update, Duration::from_secs(10)).await?;
+    #[cfg(feature = "service")]
+    if let Some(proxy) = &proxy {
+        check(&a, "A", "s", 1, "reviewed", Some(0.9)).await?;
+        proxy.release.notify_one();
+    }
     annotation_runtime::drained(&c, &a, outcome.index).await?;
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
@@ -210,6 +257,14 @@ async fn automatic() -> Result<()> {
     assert_eq!(a.submit(&update, Duration::from_secs(10)).await?, outcome);
     stop.send(()).unwrap();
     task.await??;
+    #[cfg(feature = "service")]
+    {
+        if let Some(proxy) = &proxy {
+            assert_eq!(proxy.dropped.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+        drop(proxy);
+        c.client = original_client;
+    }
     let (a, runtime) = compact_owner(&c, &narrow, &body).await?;
     let (stop, task) = annotation_runtime::run_owner(runtime);
     check(&a, "A", "s", 1, "reviewed", Some(0.9)).await?;

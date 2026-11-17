@@ -61,7 +61,8 @@ pub struct Options {
     /// Maximum commands from each lane before polling durable Raft progress.
     pub batch_requests: usize,
     /// Bound the control prefix, then end the batch after a peer/data round
-    /// consumes this wall-time budget. Every batch visits peer/data at least once.
+    /// consumes this wall-time budget. Every batch visits peers and, unless
+    /// draining a checkpoint, data at least once.
     /// Cannot preempt a single operation or bound a poll's persistence latency.
     #[cfg_attr(feature = "service", serde(with = "crate::service::duration_millis"))]
     pub batch_time: Duration,
@@ -69,6 +70,9 @@ pub struct Options {
     /// replies, snapshots and client completions retain their existing barriers.
     /// Experimental; disabled until a controlled comparison supports it.
     pub pipeline_replication: bool,
+    /// Run ordinary Ready writes on a bounded native worker. Checkpoint and
+    /// snapshot publication retain their ordered barriers. Experimental.
+    pub async_persistence: bool,
 }
 impl Default for Options {
     fn default() -> Self {
@@ -83,6 +87,7 @@ impl Default for Options {
             batch_requests: 32,
             batch_time: Duration::from_millis(1),
             pipeline_replication: false,
+            async_persistence: false,
         }
     }
 }
@@ -302,6 +307,7 @@ enum Work {
     #[cfg(feature = "peer-transport")]
     Fetch(u64, Instant, Completion<Option<Batch>>),
     Local(LocalWork),
+    Checkpoint(Box<images::CheckpointWork>),
 }
 type AfterPoll = Box<dyn FnOnce() + Send>;
 type LocalWork = Box<dyn FnOnce(&mut Node) -> AfterPoll + Send>;
@@ -348,8 +354,22 @@ pub struct Observation {
     pub fetch: FetchObservation,
     /// Completed durable polls and native write timings on this worker thread.
     pub durable_poll: PollObservation,
+    /// Separate native-worker timing and pending ownership when asynchronous
+    /// persistence is enabled. Its I/O does not run inside durable_poll.
+    pub persistence: Option<PersistenceObservation>,
     /// Per-append completed intervals, grouped by the worker's outcome.
     pub append: AppendObservation,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct PersistenceObservation {
+    pub pending_readies: usize,
+    pub pending_checkpoint: bool,
+    pub pending_entries: usize,
+    pub pending_bytes: usize,
+    pub deferred_bytes: usize,
+    /// Original I/O operations, excluding time queued before the native worker.
+    pub io: PollObservation,
 }
 
 /// Bounded cumulative timings for serviced local fetch requests, including
@@ -412,6 +432,8 @@ impl Outbound {
 #[derive(Clone)]
 pub struct Handle {
     disk: Option<Arc<crate::admission::Budget>>,
+    #[cfg(feature = "service")]
+    log_file_headroom: u64,
     #[cfg(feature = "peer-transport")]
     images: std::sync::Weak<super::images::Owner>,
     routes: Arc<BTreeMap<u64, Route>>,
@@ -644,6 +666,9 @@ impl Runtime {
     pub fn spawn(node: Node, options: Options) -> Result<(Self, async_mpsc::Receiver<Outbound>)> {
         options.validate()?;
         node.healthy()?;
+        if options.async_persistence {
+            super::async_persist::window(&options, &node.limits)?;
+        }
         let shared = Arc::new(Shared {
             #[cfg(feature = "peer-transport")]
             appends: client::observation::Counters::default(),
@@ -660,6 +685,8 @@ impl Runtime {
         let (outbox, receive) = async_mpsc::channel(options.peer_requests);
         let mut handle = Handle {
             disk: node.images.store().disk_budget().cloned(),
+            #[cfg(feature = "service")]
+            log_file_headroom: node.images.store().allocation_headroom()?,
             #[cfg(feature = "peer-transport")]
             images: Arc::downgrade(&node.images),
             routes: Arc::new(BTreeMap::new()),
@@ -699,6 +726,7 @@ impl Runtime {
             let observation = Arc::new(Mutex::new(Observation {
                 fetch: FetchObservation::default(),
                 durable_poll: PollObservation::default(),
+                persistence: None,
                 append: AppendObservation::default(),
                 status,
                 checkpoint_index,
@@ -728,6 +756,7 @@ impl Runtime {
                 options: options.clone(),
                 writes: BTreeMap::new(),
                 reads: BTreeMap::new(),
+                checkpoint: None,
             };
             let join = match thread::Builder::new()
                 .name(format!("wal-group-{group}"))
@@ -811,6 +840,7 @@ struct Worker {
     options: Options,
     writes: BTreeMap<u64, PendingWrite>,
     reads: BTreeMap<u64, Completion<query::Outcome>>,
+    checkpoint: Option<Box<images::CheckpointWork>>,
 }
 struct PendingWrite {
     reply: Completion<Outcome>,
@@ -901,12 +931,16 @@ impl Worker {
                 reply.finish(result);
             }
             Work::Local(work) => after_poll.push(work(&mut self.node)),
+            Work::Checkpoint(work) => self.queue_checkpoint(work),
         }
     }
     fn drive(&mut self) -> Result<()> {
+        if self.options.async_persistence {
+            self.node.enable_async_persistence(&self.options)?;
+        }
         let mut next_tick = Instant::now() + self.options.tick_interval;
         while !self.shared.stopped.load(Ordering::Acquire) {
-            let mut activity = false;
+            let mut activity = self.node.take_persistence_notification();
             let mut peer_credits = Vec::new();
             let mut after_poll = Vec::new();
             let batch_started = Instant::now();
@@ -920,8 +954,8 @@ impl Worker {
                 if round == 0 {
                     // Already queued reads can share this poll's fresh quorum
                     // barrier before expensive data work consumes the budget.
-                    // Bound both count and time, and always visit peer/data
-                    // below before polling so a busy control lane cannot starve
+                    // Bound both count and time, and visit peers and eligible
+                    // data below so a busy control lane cannot starve
                     // replication or writes. Later arrivals wait for a new poll.
                     for _ in 0..self.options.batch_requests {
                         let Ok(work) = self.control.try_recv() else {
@@ -936,12 +970,13 @@ impl Worker {
                 }
                 if let Ok(peer) = self.peers.try_recv() {
                     let from = peer.packet.message.from;
+                    let kind = peer.packet.message.get_msg_type();
                     if let Err(error) = self.node.step(peer.packet) {
                         self.shared
                             .peer_rejections
                             .lock()
                             .unwrap()
-                            .record(self.group, from, &error);
+                            .record(self.group, from, kind, &error);
                         self.shared
                             .rejected_incoming
                             .fetch_add(1, Ordering::Relaxed);
@@ -949,9 +984,15 @@ impl Worker {
                     peer_credits.push(peer.credit);
                     any = true;
                 }
-                if let Ok(work) = self.data.try_recv() {
-                    self.work(work, &mut after_poll);
-                    any = true;
+                // Keep admitted writes in their bounded lane until the old
+                // persistence window drains. Dequeuing them here would turn
+                // our own checkpoint pause into PendingCapacity refusals.
+                // Peer/control work and ticks must keep making progress.
+                if !self.checkpoint_draining() {
+                    if let Ok(work) = self.data.try_recv() {
+                        self.work(work, &mut after_poll);
+                        any = true;
+                    }
                 }
                 activity |= any;
                 if !any || batch_started.elapsed() >= self.options.batch_time {
@@ -963,6 +1004,7 @@ impl Worker {
                 next_tick = Instant::now() + self.options.tick_interval;
                 activity = true;
             }
+            activity |= self.install_drained_checkpoint(&mut after_poll)?;
             if activity {
                 self.observation.lock().unwrap().polling = true;
                 let poll_started = Instant::now();
@@ -1073,6 +1115,7 @@ impl Worker {
                 observation.status = status;
                 observation.checkpoint_index = checkpoint_index;
                 observation.first_retained_index = first_retained_index;
+                observation.persistence = self.node.persistence_observation(self.group);
                 observation.observed_at = Instant::now();
                 observation.polling = false;
             }
@@ -1084,16 +1127,20 @@ impl Worker {
         Ok(())
     }
     fn run(mut self) -> Result<()> {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.drive()))
+        let mut result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.drive()))
             .unwrap_or_else(|_| {
                 Err(anyhow::anyhow!(
                     "replica worker panicked; outstanding outcomes unknown"
                 ))
             });
+        if let Err(error) = self.node.shutdown_persistence() {
+            result = Err(error);
+        }
         if result.is_err() {
             self.shared.stopped.store(true, Ordering::Release);
         }
         let mut observation = self.observation.lock().unwrap();
+        observation.persistence = self.node.persistence_observation(self.group);
         observation.polling = false;
         observation.stopped = true;
         observation.failure = result.as_ref().err().map(ToString::to_string);

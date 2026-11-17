@@ -42,10 +42,10 @@ async fn worker_reports_disk_refusal_separately_and_keeps_decision_after_reclaim
         .clone();
     let appended_index = append.message.entries.last().unwrap().index;
 
-    // Real retained files exhaust the follower's data budget. The worker must
+    // Real retained files exhaust the follower's total budget. The worker must
     // report that decision, not a later filesystem sample or a queue refusal.
     let occupied = root.path().join("2/retained-space-fixture");
-    std::fs::write(&occupied, vec![7_u8; 9 << 20])?;
+    std::fs::write(&occupied, vec![7_u8; 33 << 20])?;
     let mut follower = nodes.remove(1);
     follower.prepare_disk_measurement()?.run()?;
     let expected = follower
@@ -83,6 +83,8 @@ async fn worker_reports_disk_refusal_separately_and_keeps_decision_after_reclaim
     let historical = handle.peer_rejections();
     assert_eq!(historical.disk_budget, 1);
     assert_eq!(historical.other, 1);
+    assert_eq!(historical.pending_persistence, 0);
+    assert_eq!(historical.pending_heartbeats, 0);
     assert_eq!(
         serde_json::to_value(&historical.last_disk_refusal)?,
         serde_json::to_value(&observed.last_disk_refusal)?

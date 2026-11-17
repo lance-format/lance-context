@@ -15,6 +15,10 @@ mod index_pipeline;
 #[cfg(feature = "service")]
 mod lost_advance;
 #[cfg(feature = "service")]
+mod lost_confirm;
+#[cfg(feature = "service")]
+mod lost_pin;
+#[cfg(feature = "service")]
 mod lost_plan;
 #[cfg(feature = "service")]
 pub(super) mod lost_prepare;
@@ -177,7 +181,7 @@ async fn resume(stage: u8) -> Result<()> {
         let original = prepared.annotations().merge().transaction.clone();
         if stage == 2 {
             let result = publication::publish(
-                Arc::new(annotation_publication::LostReply(Arc::new(
+                Arc::new(annotation_publication::LostReply::new(Arc::new(
                     c.client.manifest_catalog(),
                 ))),
                 &annotation_publication::one_shard(),

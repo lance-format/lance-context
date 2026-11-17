@@ -49,6 +49,11 @@ impl Options {
 pub struct Progress {
     pub checkpoints: u64,
     pub checkpoint_micros: u64,
+    /// Completed local builds, including candidates whose installation fails.
+    /// These exclude partial failed builds and received snapshot files.
+    pub checkpoint_builds: u64,
+    pub checkpoint_metadata_bytes: u64,
+    pub checkpoint_payload_bytes: u64,
     pub collected_files: u64,
     pub collected_bytes: u64,
     pub log_passes: u64,
@@ -87,6 +92,7 @@ pub(crate) async fn run(
         tick,
         last_log: Instant::now(),
         suggested: BTreeSet::new(),
+        rewrite_blocked: false,
     };
     loop {
         tokio::select! { _ = background.stop.changed() => return Ok(()), _ = background.tick.tick() => {} }
@@ -100,8 +106,13 @@ pub(crate) async fn run(
             // A previous checkpoint can make native segments reclaimable.
             // Do not defer an already due pass behind every remaining group's
             // image capture/build/install; those files still occupy producer
-            // admission. Keep the existing cadence and joined worker lane.
-            if background.last_log.elapsed() >= Duration::from_millis(options.log_interval_ms) {
+            // admission. Under data pressure, first capture the groups whose
+            // applied prefixes that pass would otherwise have to copy. The
+            // node-wide pass still runs after this sweep, and independently
+            // while waiting for image admission.
+            if background.last_log.elapsed() >= Duration::from_millis(options.log_interval_ms)
+                && !handle.data_checkpoint_pressure()
+            {
                 background.maintain().await;
                 if *background.stop.borrow() {
                     return Ok(());
@@ -124,8 +135,26 @@ pub(crate) async fn run(
             // still act on native hints immediately.
             let suggested =
                 options.checkpoint_trailing_bytes == 0 && background.suggested.contains(&group);
+            // Producer admission can exhaust its smaller data window while a
+            // native rewrite still fits its independent scratch allowance.
+            // Successful rewrites cannot discard an uncheckpointed prefix;
+            // waiting for a rewrite failure would leave new writes blocked
+            // until the ordinary checkpoint age. Leave room for a maximum-size
+            // proposal and the native two-file pressure threshold: neither
+            // waits for accounted bytes to reach the ceiling. Recheck retained
+            // bytes after preceding maintenance.
+            // Pending reservations alone cannot be reclaimed by checkpointing
+            // and must not trigger image churn.
+            let data_pressure = handle.data_checkpoint_pressure();
+            // A refused native rewrite may still include an applied prefix
+            // that a fresh image can replace. Do not retain that prefix until
+            // the ordinary age/entry threshold while reclamation lacks room.
+            // This uses the same bounded builder and disk admission; it never
+            // enlarges headroom or rebuilds an already checkpointed cut.
             if new == 0
                 || (!suggested
+                    && !background.rewrite_blocked
+                    && !data_pressure
                     && new < options.checkpoint_entries
                     && checkpoints[&group].elapsed()
                         < Duration::from_millis(options.checkpoint_interval_ms))
@@ -144,6 +173,17 @@ pub(crate) async fn run(
                     return Ok(false);
                 };
                 let built = tokio::task::spawn_blocking(move || capture.run()).await??;
+                {
+                    let image = built.image();
+                    let mut p = progress.lock().unwrap();
+                    p.checkpoint_builds = p.checkpoint_builds.saturating_add(1);
+                    p.checkpoint_metadata_bytes = p.checkpoint_metadata_bytes.saturating_add(
+                        image.bytes(crate::replication::checkpoint::Part::Metadata),
+                    );
+                    p.checkpoint_payload_bytes = p
+                        .checkpoint_payload_bytes
+                        .saturating_add(image.bytes(crate::replication::checkpoint::Part::Payload));
+                }
                 handle
                     .install_checkpoint_retaining(built, options.checkpoint_trailing_bytes)?
                     .await?;
@@ -198,6 +238,7 @@ struct Background<'a> {
     tick: tokio::time::Interval,
     last_log: Instant,
     suggested: BTreeSet<u64>,
+    rewrite_blocked: bool,
 }
 impl Background<'_> {
     async fn collect_images(&mut self) -> Result<bool> {
@@ -252,6 +293,10 @@ impl Background<'_> {
                 return None;
             }
             tokio::select! {
+                // A slow preceding image can leave this tick overdue. Admit
+                // ready image work before starting a potentially long native
+                // rewrite; maintenance remains eligible while admission waits.
+                biased;
                 _ = self.stop.changed() => return None,
                 result = &mut admission => return Some(result),
                 _ = self.tick.tick() => self.maintain().await,
@@ -272,6 +317,7 @@ impl Background<'_> {
             .await;
             match result {
                 Ok(next) => {
+                    self.rewrite_blocked = false;
                     self.last_log = Instant::now();
                     self.suggested
                         .extend(next.into_iter().filter(|group| self.groups.contains(group)));
@@ -279,7 +325,12 @@ impl Background<'_> {
                     p.log_passes = p.log_passes.saturating_add(1);
                     p.log_micros = p.log_micros.saturating_add(micros(start));
                 }
-                Err(e) => error(self.progress, e),
+                Err(e) => {
+                    if e.is::<crate::admission::DiskBudgetExhausted>() {
+                        self.rewrite_blocked = true;
+                    }
+                    error(self.progress, e);
+                }
             }
         }
         if *self.stop.borrow() {

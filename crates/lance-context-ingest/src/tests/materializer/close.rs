@@ -7,8 +7,11 @@ enum Case {
     Committed,
     Timeout,
     Absent,
+    PreviousClosure,
+    PersistentUnknown,
     DifferentClosure,
     Fenced,
+    AbsentFenced,
 }
 
 async fn exercise(case: Case) -> Result<()> {
@@ -16,6 +19,33 @@ async fn exercise(case: Case) -> Result<()> {
     let path = root.path().join("closures.lance");
     let mut cluster = network::Cluster::open_signed(root.path(), layout()).await?;
     bootstrap(&cluster, &path, &binding()).await?;
+    let storage = Storage::resolve(
+        path.to_str().unwrap().into(),
+        Default::default(),
+        Arc::default(),
+    )
+    .await?;
+    let budget = MergeMemoryBudget::new(32 << 20);
+    let open = ProducerOpen {
+        bucket: 0,
+        slot: 0,
+        expected_generation: 0,
+        operation: Uuid::new_v4(),
+    };
+    let previous = matches!(case, Case::PreviousClosure);
+    let epoch = if previous {
+        let ingress = connect(&cluster, binding()).await?;
+        let mut first = publisher(&ingress, &storage, &budget, 1).await?;
+        append(&ingress, &open, 1, &["prefix"]).await?;
+        first
+            .run_once()
+            .await?
+            .context("first publication missing")?;
+        assert!(first.state().await?.progress.pending.is_none());
+        first.authority().epoch
+    } else {
+        1
+    };
     let execute = matches!(case, Case::Committed | Case::Timeout | Case::Fenced);
     let proxy = Proxy::close_fault(
         &cluster,
@@ -30,21 +60,8 @@ async fn exercise(case: Case) -> Result<()> {
     .await?;
     let direct = std::mem::replace(&mut cluster.client, proxy.client.clone());
     let ingress = connect(&cluster, binding()).await?;
-    let storage = Storage::resolve(
-        path.to_str().unwrap().into(),
-        Default::default(),
-        Arc::default(),
-    )
-    .await?;
-    let budget = MergeMemoryBudget::new(32 << 20);
-    let mut publisher = publisher(&ingress, &storage, &budget, 1).await?;
-    let open = ProducerOpen {
-        bucket: 0,
-        slot: 0,
-        expected_generation: 0,
-        operation: Uuid::new_v4(),
-    };
-    append(&ingress, &open, 1, &["turn"]).await?;
+    let mut publisher = publisher(&ingress, &storage, &budget, epoch).await?;
+    append(&ingress, &open, if previous { 2 } else { 1 }, &["turn"]).await?;
     publisher.prepare_next().await?.unwrap();
     let pending = publisher.state().await?.progress.pending.unwrap();
     publisher.commit_pending().await?.unwrap();
@@ -79,11 +96,14 @@ async fn exercise(case: Case) -> Result<()> {
     let authority = publisher.authority().clone();
     let operation = tokio::spawn(async move { publisher.close_source(permit).await });
     tokio::time::timeout(Duration::from_secs(10), proxy.committed.notified()).await?;
-    if matches!(case, Case::Fenced) {
+    if matches!(case, Case::Fenced | Case::AbsentFenced) {
         cluster.client = direct.clone();
         let ingress = connect(&cluster, binding()).await?;
         let successor = super::publisher(&ingress, &storage, &budget, authority.epoch).await?;
         assert_ne!(successor.authority(), &authority);
+    }
+    if matches!(case, Case::PersistentUnknown) {
+        proxy.unknown_closes.store(true, Ordering::SeqCst);
     }
     if !matches!(case, Case::Timeout) {
         proxy.release.notify_one();
@@ -91,25 +111,45 @@ async fn exercise(case: Case) -> Result<()> {
     let result = tokio::time::timeout(Duration::from_secs(10), operation).await??;
     assert_eq!(
         result.is_ok(),
-        matches!(case, Case::Committed | Case::Timeout),
+        matches!(
+            case,
+            Case::Committed | Case::Timeout | Case::Absent | Case::PreviousClosure
+        ),
         "{result:?}"
     );
     match result {
         Ok(proof) => assert_eq!(proof.closed().permit.closure(), &expected),
         Err(error) => {
             let reason = match case {
-                Case::Absent => "source closure proof unavailable",
+                Case::PersistentUnknown => "source closure proof unavailable",
                 Case::DifferentClosure => "foreign source closure proof",
-                Case::Fenced => "publisher fenced or table incarnation changed",
+                Case::Fenced | Case::AbsentFenced => {
+                    "publisher fenced or table incarnation changed"
+                }
                 _ => unreachable!(),
             };
             assert!(format!("{error:#}").contains(reason), "{error:#}");
         }
     }
-    assert_eq!(proxy.closes.load(Ordering::SeqCst), 1, "Close resubmitted");
+    let resumed = matches!(
+        case,
+        Case::Absent | Case::PreviousClosure | Case::PersistentUnknown
+    );
+    assert_eq!(
+        proxy.closes.load(Ordering::SeqCst),
+        if resumed { 2 } else { 1 }
+    );
+    let permits = proxy.close_permits.lock().unwrap().clone();
+    assert_eq!(permits.len(), if resumed { 2 } else { 1 });
+    assert!(
+        permits.iter().all(|p| p == &permits[0]),
+        "original permit changed"
+    );
+    assert_eq!(permits[0].closure(), &expected);
     assert_eq!(
         proxy.dropped.load(Ordering::SeqCst),
-        usize::from(!matches!(case, Case::Timeout)),
+        usize::from(!matches!(case, Case::Timeout))
+            + usize::from(matches!(case, Case::PersistentUnknown)),
         "timeout case must finish while the original reply is still held"
     );
     // Let the held proxy task exit even when the real client deadline expired.
@@ -130,8 +170,18 @@ async fn committed_close_after_client_timeout_is_observed_without_resubmission()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn absent_unknown_close_remains_unknown() -> Result<()> {
+async fn absent_unknown_close_resumes_the_exact_authorized_command() -> Result<()> {
     exercise(Case::Absent).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn previous_closure_does_not_stop_the_next_authorized_publication() -> Result<()> {
+    exercise(Case::PreviousClosure).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn repeatedly_unknown_close_stops_after_one_exact_resubmission() -> Result<()> {
+    exercise(Case::PersistentUnknown).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -142,4 +192,9 @@ async fn unknown_close_requires_the_exact_closure() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unknown_close_cannot_bypass_owner_fencing() -> Result<()> {
     exercise(Case::Fenced).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn absent_unknown_close_is_not_resubmitted_after_owner_fencing() -> Result<()> {
+    exercise(Case::AbsentFenced).await
 }

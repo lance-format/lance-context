@@ -124,11 +124,9 @@ impl Config {
         );
         let mut certificates = BTreeSet::new();
         let mut addresses = BTreeSet::new();
-        for (&node, endpoint) in &self.endpoints {
-            ensure!(
-                endpoint.peer == self.layout.nodes[&node],
-                "advertised peer address differs from durable layout"
-            );
+        // Connection addresses can change when a Pod is replaced. The durable
+        // layout, node IDs and certificate pins still identify the same voters.
+        for endpoint in self.endpoints.values() {
             for value in [
                 &endpoint.peer,
                 &endpoint.snapshot,

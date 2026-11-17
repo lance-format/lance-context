@@ -136,6 +136,7 @@ pub(super) async fn qualify(uri: &str, handler: Arc<Managed>) -> Result<()> {
                 scope,
                 tokens: Arc::new(AtomicU64::new(9_000_000)),
                 lose_reply: Arc::new(AtomicBool::new(false)),
+                lose_observation: Arc::new(AtomicBool::new(false)),
                 pause: None,
             });
         }
@@ -264,14 +265,17 @@ pub(super) async fn qualify(uri: &str, handler: Arc<Managed>) -> Result<()> {
             },
             tokens: Arc::new(AtomicU64::new(10_000_000 + version * 1000)),
             lose_reply: Arc::new(AtomicBool::new(version == 64)),
+            lose_observation: Arc::new(AtomicBool::new(false)),
             pause: None,
         });
-        let committed = commit(base, tx, run.handler.clone()).await;
+        let committed = commit(base, tx, run.handler.clone()).await?;
+        assert_eq!(committed.version().version, version);
         if version == 64 {
-            assert!(committed.is_err(), "injected lost reply was not observed");
+            assert!(
+                !run.handler.lose_reply.load(Ordering::SeqCst),
+                "lost-reply injection did not run"
+            );
             run.restart()?;
-        } else {
-            committed?;
         }
         let selected = run
             .handler

@@ -7,11 +7,11 @@ publish = false
 description = "Independent Rust WAL experiments owned by lance-context"
 
 [features]
-service = ["peer-transport", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:clap", "tokio/signal", "tokio/rt-multi-thread"]
+service = ["peer-transport", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:clap", "dep:prometheus", "tokio/signal", "tokio/rt-multi-thread"]
 peer-transport = ["runtime", "vectored-io", "dep:tokio-rustls", "tokio/net", "tokio/time", "tokio/macros"]
 runtime = ["replication", "dep:tokio", "tokio/sync", "tokio/rt"]
 # Real Lance materialization/recovery qualification; normal WAL replicas do not link Lance.
-lance-integration = ["replication", "ipc", "arrow-contract", "dep:lance", "dep:lance-table", "dep:lance-io", "dep:object_store", "dep:async-trait", "dep:futures", "dep:serde_json"]
+lance-integration = ["replication", "ipc", "arrow-contract", "dep:lance", "dep:lance-table", "dep:lance-io", "dep:object_store", "dep:async-trait", "dep:futures", "dep:serde_json", "dep:prost"]
 client-journal = ["dep:anyhow", "dep:raft-engine", "raft-engine/internals", "dep:bytes", "dep:serde", "dep:serde_json", "dep:tokio", "tokio/sync"]
 replication = ["raft-log", "record", "contract", "dep:bincode", "dep:slog", "dep:ring", "uuid/v4", "serde/rc"]
 raft-log = ["placement", "admission", "dep:raft", "dep:raft-engine", "raft-engine/internals", "dep:raft-proto", "dep:protobuf"]
@@ -26,6 +26,7 @@ ipc = ["dep:anyhow", "dep:arrow-array", "dep:arrow-buffer", "dep:arrow-ipc", "de
 lab = ["ipc", "dep:clap", "dep:hdrhistogram", "dep:raft-engine", "raft-engine/internals", "dep:raft-proto", "dep:serde_json"]
 
 [dependencies]
+prometheus = { version = "0.13", optional = true }
 hyper = { version = "1", features = ["server", "http1"], optional = true }
 hyper-util = { version = "0.1", features = ["tokio"], optional = true }
 http-body-util = { version = "0.1", optional = true }
@@ -34,6 +35,7 @@ lance = { version = "14.0.2", optional = true }
 lance-table = { version = "14.0.2", optional = true }
 lance-io = { version = "14.0.2", optional = true }
 object_store = { version = "0.14.2", optional = true }
+prost = { version = "0.14", optional = true }
 async-trait = { version = "0.1.92", optional = true }
 futures = { version = "0.3", optional = true }
 ring = { version = "0.17", optional = true }

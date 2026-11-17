@@ -174,7 +174,7 @@ pub(super) async fn recover(
     assert_eq!(latest.score, Some(0.9));
     if stage > 0 {
         assert!(annotations::mixed::publish(
-            Arc::new(LostReply(Arc::new(c.client.manifest_catalog()))),
+            Arc::new(LostReply::new(Arc::new(c.client.manifest_catalog()))),
             &one_shard(),
             narrow,
             body,

@@ -71,6 +71,7 @@ pub(super) struct Attempt {
 pub(super) enum Mode {
     Normal,
     LostReply,
+    LostReplyAndObservation,
     Takeover,
     Retention,
     ProducerSlots,
@@ -90,6 +91,7 @@ struct Managed {
     scope: ReserveManifest,
     tokens: Arc<AtomicU64>,
     lose_reply: Arc<AtomicBool>,
+    lose_observation: Arc<AtomicBool>,
     pause: Option<Arc<Pause>>,
 }
 impl std::fmt::Debug for Managed {
@@ -188,6 +190,11 @@ impl Managed {
 impl lance_context_wal::replication::publication::lance::ManifestCatalog for Managed {
     async fn read_manifest(&self, table: Uuid, version: Option<u64>) -> Result<ReadOutcome> {
         ensure!(table == self.scope.authority.table, "foreign fixture table");
+        if !self.lose_reply.load(Ordering::SeqCst)
+            && self.lose_observation.swap(false, Ordering::SeqCst)
+        {
+            anyhow::bail!("injected unavailable observation after lost reservation reply");
+        }
         let mut c = self.cluster.lock().unwrap();
         let leader = c.elect(1, 10, &[1, 2, 3])?;
         let token = self.tokens.fetch_add(1, Ordering::Relaxed);
@@ -344,7 +351,11 @@ pub(super) async fn publish_and_recover(c: Cluster, attempt: Attempt, mode: Mode
             object: attempt.bootstrap.1.object.clone(),
         },
         tokens: Arc::new(AtomicU64::new(6000)),
-        lose_reply: Arc::new(AtomicBool::new(mode == Mode::LostReply)),
+        lose_reply: Arc::new(AtomicBool::new(matches!(
+            mode,
+            Mode::LostReply | Mode::LostReplyAndObservation
+        ))),
+        lose_observation: Arc::new(AtomicBool::new(mode == Mode::LostReplyAndObservation)),
         pause: pause.clone(),
     });
     if let Some(pause) = pause {
@@ -381,6 +392,7 @@ pub(super) async fn publish_and_recover(c: Cluster, attempt: Attempt, mode: Mode
             scope,
             tokens: Arc::new(AtomicU64::new(10000)),
             lose_reply: Arc::new(AtomicBool::new(false)),
+            lose_observation: Arc::new(AtomicBool::new(false)),
             pause: None,
         });
         let base = lance::dataset::builder::DatasetBuilder::from_uri(&attempt.uri)
@@ -394,14 +406,18 @@ pub(super) async fn publish_and_recover(c: Cluster, attempt: Attempt, mode: Mode
         );
     } else {
         let result = commit(Arc::new(attempt.base), attempt.tx, handler.clone()).await;
-        if mode == Mode::LostReply {
+        if mode == Mode::LostReplyAndObservation {
             assert!(
                 result.is_err(),
-                "lost response should remain ambiguous to the caller"
+                "lost reply with unavailable observation must remain ambiguous"
             );
+            assert!(!handler.lose_observation.load(Ordering::SeqCst));
         } else {
             result?;
         }
+        // A lost transport reply can now resolve through the durable catalog.
+        // Check that fault injection ran even when the caller receives success.
+        assert!(!handler.lose_reply.load(Ordering::SeqCst));
     }
     let selected = handler.read(Some(2))?.context("missing committed target")?;
     assert!(selected.object.path.contains(".manifest-"));

@@ -239,6 +239,10 @@ pub enum Reply {
     AppendNotSubmittedDiskBudget,
     /// Distinct from Query::Observed: this carries no fresh-quorum receipt.
     Source(source_read::Observation),
+    /// This append attempt exceeded the pending proposal/persistence budget
+    /// before Raft proposal. Earlier attempts with the same identity may have
+    /// committed; retain their identity and bytes until separately resolved.
+    AppendNotSubmittedPendingCapacity,
 }
 /// Holds receive credit through consumption of metadata and a fetched payload.
 /// Cloning body Bytes transfers shared ownership, so callers retaining clones
@@ -571,6 +575,15 @@ async fn serve_one<S: AsyncRead + AsyncWrite + Unpin>(
         Err(error) if append && error.is::<crate::admission::DiskBudgetExhausted>() => {
             (Reply::AppendNotSubmittedDiskBudget, Bytes::new())
         }
+        Err(error)
+            if append
+                && matches!(
+                    error.downcast_ref::<super::super::ProposalRejection>(),
+                    Some(super::super::ProposalRejection::PendingCapacity)
+                ) =>
+        {
+            (Reply::AppendNotSubmittedPendingCapacity, Bytes::new())
+        }
         Err(_) => (Reply::Unknown, Bytes::new()),
     };
     let metadata = codec()
@@ -830,7 +843,8 @@ impl Client {
     /// the same read-only query with backoff within that deadline. Mutation
     /// outcomes are never replayed.
     /// Read-only pooled disconnects may reconnect once per exchange, within this
-    /// method's single overall deadline.
+    /// method's single overall deadline. Queries, source reads and payload fetches
+    /// can move to another configured voter after a disconnect or refused connection.
     pub async fn request_routed(&self, request: Request) -> Result<Response> {
         timeout(self.options.timeout, async {
             let group = match &request {
@@ -858,6 +872,26 @@ impl Client {
                         let next = voters[(voters.iter().position(|id| *id == node).unwrap() + 1)
                             % voters.len()];
                         self.leaders.lock().unwrap().insert(group, next);
+                        if matches!(
+                            &request,
+                            Request::Query { .. }
+                                | Request::ReadSource { .. }
+                                | Request::Fetch { .. }
+                        ) && (disconnected(&error)
+                            || error
+                                .downcast_ref::<std::io::Error>()
+                                .is_some_and(|e| e.kind() == std::io::ErrorKind::ConnectionRefused))
+                        {
+                            // Only retry the same read. Exchange has released its
+                            // connection and byte credits; the outer deadline still
+                            // bounds all voters. Protocol and identity errors escape.
+                            node = next;
+                            if visited.len() == voters.len() {
+                                visited.clear();
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                            }
+                            continue;
+                        }
                         return Err(error);
                     }
                 };
@@ -889,7 +923,14 @@ impl Client {
                     ) {
                         let next = voters[(voters.iter().position(|id| *id == node).unwrap() + 1)
                             % voters.len()];
-                        self.leaders.lock().unwrap().insert(group, next);
+                        // An unknown mutation result can come from admission
+                        // pressure on the current leader. It says nothing about
+                        // leadership; keep the hint so the next independent
+                        // append does not send its body through a follower.
+                        // The original mutation still returns without replay.
+                        if !matches!(&request, Request::Append { .. } | Request::Commit(_)) {
+                            self.leaders.lock().unwrap().insert(group, next);
+                        }
                         if matches!(&request, Request::Query { .. } | Request::ReadSource { .. })
                             && matches!(
                                 response.reply,
@@ -1052,7 +1093,12 @@ impl Client {
                 ensure!(observed == expected, "foreign client response scope");
                 ensure!(
                     matches!(reply, Reply::Unknown | Reply::Redirect { .. })
-                        || (append && matches!(reply, Reply::AppendNotSubmittedDiskBudget))
+                        || (append
+                            && matches!(
+                                reply,
+                                Reply::AppendNotSubmittedDiskBudget
+                                    | Reply::AppendNotSubmittedPendingCapacity
+                            ))
                         || matches!(
                             (&reply, reply_kind),
                             (Reply::Commit(_), 0)

@@ -32,7 +32,8 @@ pub struct Options {
     pub max_objects: usize,
     pub max_bytes: usize,
     /// Concurrent SDK delete calls. S3/Azure calls contain at most 256 paths;
-    /// other backends retain one path per call.
+    /// Failed Azure pages retry one path per call through native DELETE;
+    /// other backends retain their original batch size.
     pub delete_parallelism: usize,
     /// Minimum delay after a completed collection pass. Slow object storage I/O
     /// does not consume this cooldown. Reference and data listings yield after
@@ -80,11 +81,14 @@ pub struct Observation {
     /// Failed read-only LIST attempts; no candidates from these attempts are deleted.
     #[serde(default)]
     pub list_failures: u64,
+    /// Uncertain catalog retirement replies; no deletion is authorized by them.
+    #[serde(default)]
+    pub fence_failures: u64,
     /// Collection is waiting for a fresh LIST after a failure. Publication can
     /// continue: the failed attempt did not seal a page or issue any DELETE.
     #[serde(default)]
     pub listing_blocked: bool,
-    /// Unresolved immutable paths in the one sealed page blocking publication.
+    /// Immutable paths awaiting a confirmed fence or deletion in one bounded page.
     #[serde(default)]
     pub pending_objects: usize,
     #[serde(default)]
@@ -95,6 +99,7 @@ struct SealedPage {
     store: Arc<dyn object_store::ObjectStore>,
     paths: Vec<(Path, u64)>,
     batch_size: usize,
+    single_delete_retry: bool,
     failed: bool,
     _workspace: MergeReservation,
 }
@@ -112,6 +117,10 @@ pub(super) struct Collector {
     listing: Option<BoxStream<'static, object_store::Result<ObjectMeta>>>,
     deferred: Option<(Path, u64)>,
     sealed: Option<SealedPage>,
+    // Retain one closed, charged page until this exact owner/boundary command
+    // receives a committed result. No native preparation or DELETE runs meanwhile.
+    fencing: Option<(p::RetireManifestHistory, p::HistoryBoundary)>,
+    retirement_blocked: bool,
     deleting: Mutex<Option<DeleteJob>>,
     listing_blocked: bool,
     // At most one retained SDK stream/deferred object per destination, but only
@@ -143,6 +152,8 @@ impl Collector {
             listing: None,
             deferred: None,
             sealed: None,
+            fencing: None,
+            retirement_blocked: false,
             deleting: Mutex::new(None),
             listing_blocked: false,
             other_listing: None,
@@ -169,7 +180,9 @@ impl Collector {
             return Ok(self.may_publish());
         }
         let result = if tokio::time::Instant::now() < self.next_run {
-            return Ok(self.sealed.is_none());
+            return Ok(self.sealed.is_none() && !self.retirement_blocked);
+        } else if self.fencing.is_some() {
+            self.fence_page(service).await
         } else if self.sealed.is_some() {
             // Reissue only unresolved immutable DELETE requests from the original,
             // successfully fenced page. Never relist or add paths here.
@@ -188,6 +201,19 @@ impl Collector {
         // iteration eligible for another pass, starving materialization.
         self.next_run = tokio::time::Instant::now() + self.options.interval;
         if let Err(error) = &result {
+            if error.is::<materializer::retirement::HistoryUnknown>() {
+                // RetireHistory is a monotonic metadata operation. Reobserve
+                // retirement, or resubmit the held page's exact owner/boundary
+                // after the cooldown. It never executes a business mutation.
+                self.retirement_blocked = true;
+                let mut observed = service.shared.reclamation.lock().unwrap();
+                observed.fence_failures += 1;
+                if let Some(page) = &self.sealed {
+                    observed.pending_objects = page.paths.len();
+                    observed.pending_bytes = page.paths.iter().map(|(_, bytes)| bytes).sum();
+                }
+                return Ok(false);
+            }
             if error.is::<ListingFailure>() {
                 // The failed stream may have advanced its SDK continuation or
                 // yielded a partial candidate page. Discard both and enumerate
@@ -204,6 +230,9 @@ impl Collector {
                 // That attempt captures current protection roots before sealing.
                 return Ok(self.sealed.is_none());
             }
+        }
+        if result.is_ok() {
+            self.retirement_blocked = false;
         }
         if result.is_ok()
             && self.sealed.is_none()
@@ -223,7 +252,7 @@ impl Collector {
         // actual failed outcome, retain the existing publication backpressure
         // through its retry attempts; otherwise a persistent outage could keep
         // producing obsolete files every time another request becomes pending.
-        self.sealed.as_ref().is_none_or(|page| !page.failed)
+        self.fencing.is_none() && self.sealed.as_ref().is_none_or(|page| !page.failed)
     }
 
     pub(super) fn has_pending_delete(&self) -> bool {
@@ -543,24 +572,19 @@ impl Collector {
         if candidates.is_empty() {
             return Ok(());
         }
-        let reply = materializer::commit(
-            &service.ingress.client,
-            Command::RetireHistory(p::RetireManifestHistory {
+        self.fencing = Some((
+            p::RetireManifestHistory {
                 authority: catalog.authority().clone(),
                 incarnation: service.ingress.scope.incarnation,
                 retain_from: boundary.retained_from,
-            }),
-        )
-        .await?;
-        ensure!(
-            matches!(reply, Applied::Publisher(p::Reply::ManifestHistory(ref actual)) if *actual == boundary),
-            "annotation collection fence rejected: {reply:?}"
-        );
-        // An unknown fence result returns above without deleting anything. A
-        // subsequent owner enumerates again; it never guesses the old outcome.
+            },
+            boundary,
+        ));
+        // Unknown retains this same finite page and blocks publication. A
+        // subsequent owner still enumerates afresh; no DELETE was authorized.
         // Each cloud chunk fits a single native batch (Azure: 256, S3: 1000).
         // Keep the same sealed page and configured call concurrency. Passing
-        // one path to ObjectStoreExt::delete would defeat SDK bulk deletion.
+        // one path uses native Azure DELETE in the pinned SDK.
         let batch_size = if matches!(object_store.scheme(), "az" | "s3") {
             256
         } else {
@@ -570,9 +594,23 @@ impl Collector {
             store,
             paths: candidates.into_iter().collect(),
             batch_size,
+            single_delete_retry: object_store.scheme() == "az",
             failed: false,
             _workspace: workspace,
         });
+        self.fence_page(service).await
+    }
+
+    async fn fence_page(&mut self, service: &Service) -> Result<()> {
+        let (request, expected) = self.fencing.as_ref().unwrap();
+        let actual =
+            materializer::retirement::retire(&service.ingress.client, request.clone()).await?;
+        ensure!(
+            actual == *expected,
+            "annotation collection fence boundary changed"
+        );
+        self.fencing = None;
+        self.retirement_blocked = false;
         self.delete_page(service).await?;
         Ok(())
     }
@@ -582,11 +620,22 @@ impl Collector {
     /// local future, while the existing sealed-page protocol covers remote I/O
     /// that outlives that owner. This does not spawn a detached worker or resend.
     async fn delete_page(&mut self, service: &Service) -> Result<bool> {
+        ensure!(
+            self.fencing.is_none(),
+            "annotation deletion fence unconfirmed"
+        );
         if self.deleting.get_mut().unwrap().is_none() {
             let page = self.sealed.as_mut().unwrap();
             let paths = std::mem::take(&mut page.paths);
             let store = page.store.clone();
-            let batch_size = page.batch_size;
+            // Retry only unresolved paths from this sealed page. Azure's
+            // singleton SDK path bypasses Blob Batch; do not bypass the page's
+            // fences, cooldown, memory budget or publication backpressure.
+            let batch_size = if page.failed && page.single_delete_retry {
+                1
+            } else {
+                page.batch_size
+            };
             let parallelism = self.options.delete_parallelism;
             let phases = service.shared.phases.clone();
             *self.deleting.get_mut().unwrap() = Some(Box::pin(async move {

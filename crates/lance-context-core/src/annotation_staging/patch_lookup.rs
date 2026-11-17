@@ -2,7 +2,7 @@
 use super::*;
 use crate::{MergeMemoryBudget, MergeReservation};
 
-/// Temporary narrow annotations from one staging instance's exact base.
+/// Temporary narrow annotations from one staging instance's base values.
 /// The existing GC registry, read-view permit and caller's workspace protect
 /// these values until dropped. This carries no progress or write authority.
 pub struct PatchLookup {
@@ -15,7 +15,7 @@ pub struct PatchLookup {
 
 impl PatchLookup {
     pub(super) fn matches(&self, base: &Arc<views::Base>) -> bool {
-        Arc::ptr_eq(&self.base, base)
+        self.base.same_values(base)
     }
 
     pub(super) fn get(&self, turn: &str) -> Option<&Option<TurnAnnotation>> {
@@ -120,9 +120,10 @@ impl AnnotationStaging {
     }
 
     /// Apply one original committed request with a captured base lookup.
-    /// Current active/frozen/cache state wins; a different base or unqueried key
-    /// uses the ordinary query path. Ordering, rejection, backpressure and
-    /// durable result retention have the same contract as `apply_committed`.
+    /// Current active/frozen/cache state wins. Index-only publications retain
+    /// the lookup; changed data, compaction, another staging instance or an
+    /// unqueried key uses the ordinary query path. Ordering, rejection,
+    /// backpressure and durable results follow `apply_committed`.
     pub async fn apply_committed_with_lookup(
         &self,
         after: u64,

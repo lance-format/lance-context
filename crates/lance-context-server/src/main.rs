@@ -80,7 +80,8 @@ async fn main() {
     }
 
     // Install the Prometheus recorder once, before any metrics are emitted.
-    let metrics_handle = lance_context_metrics::install_recorder();
+    let metrics_handle = lance_context_metrics::install_recorder()
+        .with_extra_metrics(lance_context_core::flush_health::render);
     #[cfg(feature = "lance-io-metrics")]
     lance_context_core::metrics::describe_lance_io_metrics();
 

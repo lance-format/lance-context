@@ -8,6 +8,12 @@ const MAX_REQUESTS: usize = 8;
 const MAX_ROWS: usize = 2048;
 const MAX_PAYLOAD_BYTES: u64 = 32 << 20;
 
+#[derive(Default)]
+pub(super) struct Lookup {
+    pub(super) registrations: Option<RegistrationLookup>,
+    pub(super) patches: Option<PatchLookup>,
+}
+
 pub(super) async fn fetch(
     service: &Service,
     index: u64,
@@ -26,14 +32,14 @@ pub(super) async fn fetch(
         bytes <= ingress.scope.contract.max_record_bytes as usize,
         "oversized annotation WAL record"
     );
-    let Some(reservation) = service.apply_budget.try_reserve(decode_workspace(
+    let Some(mut reservation) = service.apply_budget.try_reserve(decode_workspace(
         &ingress.scope.contract,
         &service.limits,
         bytes,
     )?) else {
         return Ok(None);
     };
-    let body = match service.shared.local_payloads.body(producer_slot, &meta) {
+    let (body, capacity) = match service.shared.local_payloads.body(producer_slot, &meta) {
         Some(body) => body,
         None => {
             let group = service.group()?;
@@ -51,10 +57,27 @@ pub(super) async fn fetch(
                 matches!(response.reply, Reply::Record(Some(ref observed)) if observed == &meta),
                 "committed annotation payload unavailable"
             );
-            response.body
+            // runtime::client::receive allocates vec![0; bytes] for each body;
+            // this is a complete allocation, unlike a caller's Bytes slice.
+            (response.body, Some(bytes))
         }
     };
     meta.check_body_length(body.len(), ingress.scope.contract.max_record_bytes as usize)?;
+    if let Some(capacity) = capacity {
+        let extra = capacity
+            .checked_sub(bytes)
+            .context("invalid local allocation size")?;
+        let workspace = reservation
+            .bytes()
+            .checked_add(extra)
+            .context("apply workspace overflow")?;
+        if (extra > 0 && workspace > service.apply_budget.limit())
+            || !reservation.try_grow_to(workspace)
+        {
+            return Ok(None);
+        }
+    }
+    let input_allocation = capacity.map(|capacity| (body.as_ptr() as usize, capacity));
     let schema = ingress.schema.clone();
     let max_rows = ingress.scope.contract.max_rows;
     let value_bytes = service.limits.value_bytes;
@@ -78,6 +101,7 @@ pub(super) async fn fetch(
                         index,
                         meta,
                         decoded,
+                        input_allocation,
                         _reservation: reservation,
                     })
                 })
@@ -92,13 +116,12 @@ pub(super) async fn prepare(
     head: &Pending,
     page: &mut lance_context_wal::replication::Page,
     queued: &mut VecDeque<Pending>,
-) -> Result<Option<RegistrationLookup>> {
+) -> Result<Lookup> {
     if head.meta.body_bytes > MAX_PAYLOAD_BYTES
         || head.decoded.rows() > MAX_ROWS
-        || !matches!(head.decoded, mixed::Decoded::Creates { .. })
         || !service.shared.window.lock().unwrap().admits(&head.meta)
     {
-        return Ok(None);
+        return Ok(Lookup::default());
     }
     let mut rows = head.decoded.rows();
     let mut payload_bytes = head.meta.body_bytes;
@@ -120,28 +143,65 @@ pub(super) async fn prepare(
         page.entries.remove(0);
     }
     if queued.is_empty() || rows > MAX_ROWS {
-        return Ok(None);
+        return Ok(Lookup::default());
     }
-    let mut requests = 0;
+    let mut registrations = 0;
+    let mut patches = 0;
     let mut turns = Vec::new();
+    let mut patch_turns = Vec::new();
     for pending in std::iter::once(head).chain(queued.iter()) {
-        if let mixed::Decoded::Creates { rows, .. } = &pending.decoded {
-            requests += 1;
-            turns.extend(rows.iter().map(|row| row.turn.as_str()));
+        match &pending.decoded {
+            mixed::Decoded::Patches(rows) => {
+                patches += 1;
+                patch_turns.extend(rows.iter().map(|row| row.turn.as_str()));
+            }
+            mixed::Decoded::Creates { rows, .. } => {
+                registrations += 1;
+                turns.extend(rows.iter().map(|row| row.turn.as_str()));
+            }
         }
     }
-    if requests < 2 {
-        return Ok(None);
-    }
-    Ok(service
-        .shared
-        .phases
-        .measure(
-            Phase::AnnotationRegistrationLookup,
-            service
-                .shared
-                .staging
-                .prepare_registration_lookup(&turns, &service.apply_budget),
-        )
-        .await?)
+    // Keep registration sharing even when the head is a patch. The two optional
+    // lookups share the existing workspace/read admission and total key bound.
+    // Each captures a protected base without applying any request.
+    // Ordered application rechecks active/frozen values and base identity, so
+    // interleaved creates, later patches and publication cannot reuse stale values.
+    let registration_lookup = async {
+        if registrations < 2 {
+            return Ok(None);
+        }
+        service
+            .shared
+            .phases
+            .measure(
+                Phase::AnnotationRegistrationLookup,
+                service
+                    .shared
+                    .staging
+                    .prepare_registration_lookup(&turns, &service.apply_budget),
+            )
+            .await
+    };
+    let patch_lookup = async {
+        if patches < 2 {
+            return Ok(None);
+        }
+        service
+            .shared
+            .phases
+            .measure(
+                Phase::AnnotationPatchLookup,
+                service
+                    .shared
+                    .staging
+                    .prepare_patch_lookup(&patch_turns, &service.apply_budget),
+            )
+            .await
+    };
+    let (registrations, patches) =
+        futures::future::try_join(registration_lookup, patch_lookup).await?;
+    Ok(Lookup {
+        registrations,
+        patches,
+    })
 }

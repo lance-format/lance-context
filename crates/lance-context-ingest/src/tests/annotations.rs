@@ -137,12 +137,13 @@ async fn prepared_annotations_release_validation_workspace_before_submit() -> Re
         ..Limits::default()
     };
     let binding = TableBinding {
+        max_record_bytes: 5 << 20,
         max_rows: 2048,
         ..binding()
     };
     annotation_publication::seed_contract(&c, &storage, Service::contract(&binding, &limits)?)
         .await?;
-    let upload_budget = MergeMemoryBudget::new(32 << 20);
+    let upload_budget = MergeMemoryBudget::new(40 << 20);
     let (service, _driver) = Service::connect(
         c.client.clone(),
         annotation_publication::one_shard(),
@@ -156,25 +157,58 @@ async fn prepared_annotations_release_validation_workspace_before_submit() -> Re
     let producer = producer(&service, 1).await?;
     let ids = (0..2048).map(|n| format!("t{n:08}")).collect::<Vec<_>>();
     let ids = ids.iter().map(String::as_str).collect::<Vec<_>>();
-    let body = wire(&limits, &ids, 1, Some("reviewed"), 0, None)?;
-    let mut held = Vec::new();
-    // Keep all original payloads alive without an applier or ACK releasing them.
-    // Previously each retained the worst-case decode workspace (~9 MiB), so
-    // the fourth request could not enter a 32 MiB budget.
-    for sequence in 1..=4 {
-        let prepared = tokio::time::timeout(
-            Duration::from_secs(2),
-            request(&service, &producer, sequence, body.clone()),
-        )
-        .await
-        .context("retained payloads must not retain discarded validation workspace")??;
-        assert_eq!(prepared.rows(), 2048);
-        assert_eq!(prepared.body(), &body);
-        held.push(prepared);
+    let large_status = "s".repeat(2048);
+    for status in [large_status.as_str(), "reviewed"] {
+        let body = wire(&limits, &ids, 1, Some(status), 0, None)?;
+        if status == large_status {
+            assert!((4 << 20..5 << 20).contains(&body.len()));
+        }
+        let mut held = Vec::new();
+        // Four independent payloads remain live without any applier or ACK.
+        // A three-body charge exhausts this budget on the third large upload,
+        // even though earlier validation allocations have already been dropped.
+        for sequence in 1..=4 {
+            let prepared = tokio::time::timeout(Duration::from_secs(2), async {
+                let upload = service.reserve_upload(body.len()).await?;
+                service
+                    .prepare_owned(upload, body.to_vec(), &producer, sequence)
+                    .await
+            })
+            .await
+            .context("retained payloads must not retain discarded validation workspace")??;
+            assert_eq!(prepared.rows(), 2048);
+            assert_eq!(prepared.body(), &body);
+            held.push(prepared);
+        }
+        assert_eq!(upload_budget.reserved(), 4 * body.len());
+        drop(held);
+        assert_eq!(upload_budget.reserved(), 0);
+        // Owned input charges spare Vec capacity as well as visible IPC bytes,
+        // while retaining the original pointer across preparation.
+        let mut owned = Vec::with_capacity(2 * body.len());
+        owned.extend_from_slice(&body);
+        let capacity = owned.capacity();
+        let pointer = owned.as_ptr();
+        let upload = service.reserve_upload(owned.len()).await?;
+        let prepared = service.prepare_owned(upload, owned, &producer, 5).await?;
+        assert_eq!(prepared.body().as_ptr(), pointer);
+        assert_eq!(upload_budget.reserved(), capacity);
+        drop(prepared);
+        assert_eq!(upload_budget.reserved(), 0);
+        // A shared slice does not establish its parent's allocation size. Keep
+        // the original allowance without copying or claiming exact accounting.
+        let mut parent = vec![0; body.len()];
+        parent.extend_from_slice(&body);
+        let shared = Bytes::from(parent).slice(body.len()..);
+        let pointer = shared.as_ptr();
+        let upload = service.reserve_upload(shared.len()).await?;
+        let reserved = upload_budget.reserved();
+        let prepared = service.prepare(upload, shared, &producer, 5).await?;
+        assert_eq!(prepared.body().as_ptr(), pointer);
+        assert_eq!(upload_budget.reserved(), reserved);
+        drop(prepared);
+        assert_eq!(upload_budget.reserved(), 0);
     }
-    assert_eq!(upload_budget.reserved(), 4 * body.len() * 3);
-    drop(held);
-    assert_eq!(upload_budget.reserved(), 0);
     c.shutdown().await?;
     Ok(())
 }

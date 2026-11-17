@@ -22,6 +22,7 @@ pub(super) fn length(request: &Request, maximum: usize, content_type: &str) -> H
         .filter(|n| *n > 0 && *n <= maximum)
         .ok_or_else(|| Failure::bad("invalid_content_length"))
 }
+
 pub(super) async fn read(
     request: Request,
     maximum: usize,
@@ -36,6 +37,14 @@ pub(super) async fn read_exact(
     length: usize,
     options: &Options,
 ) -> HttpResult<Bytes> {
+    Ok(read_exact_accounted(request, length, options).await?.0)
+}
+
+pub(super) async fn read_exact_accounted(
+    request: Request,
+    length: usize,
+    options: &Options,
+) -> HttpResult<(Bytes, Option<usize>)> {
     let deadline = Instant::now() + options.body_total_timeout;
     let mut body = request.into_body();
     let mut first: Option<Bytes> = None;
@@ -78,5 +87,45 @@ pub(super) async fn read_exact(
     }
     // A single HTTP frame retains its existing buffer. Fragmented bodies are
     // coalesced once; subsequent validation and WAL transport share these Bytes.
-    Ok(combined.map(BytesMut::freeze).or(first).unwrap_or_default())
+    Ok(match combined {
+        Some(buffer) => {
+            let capacity = buffer.capacity();
+            (buffer.freeze(), Some(capacity))
+        }
+        // HTTP frames can be slices of a larger connection buffer. Keep the
+        // zero-copy path, but do not claim their length is the allocation size.
+        None => (first.unwrap_or_default(), None),
+    })
+}
+
+#[cfg(all(test, feature = "materializer"))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn receive_keeps_shared_frames_unknown_and_counts_coalesced_allocations() {
+        let parent = Bytes::from(vec![7; 8192]);
+        let slice = parent.slice(4096..5120);
+        let pointer = slice.as_ptr();
+        let (received, capacity) = read_exact_accounted(
+            Request::new(axum::body::Body::from(slice)),
+            1024,
+            &Options::default(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("valid single frame"));
+        assert_eq!(received.as_ptr(), pointer);
+        assert_eq!(capacity, None);
+        let chunks = [parent.slice(0..512), parent.slice(512..1024)].map(Ok::<_, std::io::Error>);
+        let (received, capacity) = read_exact_accounted(
+            Request::new(axum::body::Body::from_stream(futures::stream::iter(chunks))),
+            1024,
+            &Options::default(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("valid fragmented body"));
+        assert_eq!(received.as_ref(), &[7; 1024]);
+        assert_eq!(capacity, Some(1024));
+        assert_ne!(received.as_ptr(), parent.as_ptr());
+    }
 }

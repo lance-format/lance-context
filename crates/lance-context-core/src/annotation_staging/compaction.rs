@@ -158,7 +158,14 @@ impl AnnotationStaging {
                 "annotation base changed during maintenance installation",
             ));
         }
-        state.base = state.views.install(selected);
+        state.base = if maintenance == Maintenance::Index {
+            // Fragments, schema, cut and request results were checked above.
+            // Keep decoded patch values usable, while readers still retain
+            // their original physical base for reclamation protection.
+            state.views.install_indexed(selected, &base)
+        } else {
+            state.views.install(selected)
+        };
         Ok(())
     }
 }

@@ -11,6 +11,9 @@ use std::sync::{
 use anyhow::{ensure, Result};
 use serde::{Deserialize, Serialize};
 
+#[cfg(all(test, feature = "raft-log"))]
+mod rewrite_tests;
+
 /// Byte values captured together under the accounting lock at a refused reservation.
 #[derive(Clone, Debug, Serialize)]
 pub struct DiskBudgetExhausted {
@@ -20,6 +23,8 @@ pub struct DiskBudgetExhausted {
     pub reserved_rewrite_bytes: u64,
     pub reserved_file_bytes: u64,
     pub requested_bytes: u64,
+    /// Effective limit for this decision, including any separately reserved
+    /// native rewrite scratch and the producer ceiling that protects control.
     pub limit_bytes: u64,
 }
 impl std::fmt::Display for DiskBudgetExhausted {
@@ -74,6 +79,9 @@ enum Purpose {
 pub struct Budget {
     directory: PathBuf,
     written: Arc<AtomicU64>,
+    // Always retain the original producer ceiling that protects control, even
+    // when a lower configured data limit excludes temporary rewrite scratch.
+    producer_ceiling: u64,
     data_limit: AtomicU64,
     file_limit: AtomicU64,
     failed: AtomicBool,
@@ -82,9 +90,11 @@ pub struct Budget {
     filesystem: Arc<RwLock<()>>,
 }
 impl Budget {
-    /// `written` must count every encoded engine append and rewrite, across all
-    /// groups and peer/control traffic. It must never reset during this budget's
-    /// lifetime. Files are direct children of `directory`; no recursive scan.
+    /// `written` counts encoded foreground appends across all groups and
+    /// peer/control traffic, and never resets during this budget's lifetime.
+    /// Uncounted native rewrites must hold their full scratch reservation and
+    /// the exclusive filesystem lifecycle until a refresh measures their result.
+    /// Files are direct children of `directory`; no recursive scan.
     /// Hold `filesystem` for writing during file deletion/purge/rename. Appends
     /// may overlap refresh, provided the counter includes their encoded bytes.
     pub fn new(
@@ -105,6 +115,7 @@ impl Budget {
             written,
             filesystem,
             max: max as u64,
+            producer_ceiling: (max - reserve) as u64,
             data_limit: AtomicU64::new((max - reserve) as u64),
             file_limit: AtomicU64::new(max as u64),
             failed: AtomicBool::new(false),
@@ -142,9 +153,17 @@ impl Budget {
     /// write counts include peer traffic and control/HardState writes across all
     /// groups; pending proposals are charged atomically on top of that baseline.
     pub fn reserve(self: &Arc<Self>, bytes: usize, data: bool) -> Result<Reservation> {
-        self.reserve_below(bytes, Purpose::Proposal, || {
+        self.reserve_below(bytes, Purpose::Proposal, |state| {
             if data {
-                self.data_limit.load(Ordering::Acquire)
+                // The native rewrite already owns its complete scratch bound.
+                // It remains charged against the total producer ceiling, but
+                // does not also consume the lower steady-data window. Measured
+                // files, ordinary proposals and image reservations stay charged
+                // against both; no existing reservation is released early.
+                self.data_limit
+                    .load(Ordering::Acquire)
+                    .saturating_add(state.pending_rewrite)
+                    .min(self.producer_ceiling)
             } else {
                 self.max
             }
@@ -155,14 +174,14 @@ impl Budget {
     /// rewrite share retained in snapshots and refused-admission observations.
     #[cfg(feature = "raft-log")]
     pub(crate) fn reserve_rewrite(self: &Arc<Self>, bytes: usize) -> Result<Reservation> {
-        self.reserve_below(bytes, Purpose::Rewrite, || self.max)
+        self.reserve_below(bytes, Purpose::Rewrite, |_| self.max)
     }
 
     fn reserve_below(
         self: &Arc<Self>,
         bytes: usize,
         purpose: Purpose,
-        limit: impl FnOnce() -> u64,
+        limit: impl FnOnce(&Accounting) -> u64,
     ) -> Result<Reservation> {
         let bytes = u64::try_from(bytes)?;
         let mut state = self.accounting.lock().unwrap();
@@ -171,7 +190,7 @@ impl Budget {
             "disk accounting failed"
         );
         let accounted_bytes = self.accounted(&state);
-        let limit_bytes = limit();
+        let limit_bytes = limit(&state);
         ensure!(
             accounted_bytes
                 .checked_add(state.pending)
@@ -233,7 +252,7 @@ impl Budget {
         Ok(FileReservation(self.reserve_below(
             usize::try_from(bytes)?,
             Purpose::File,
-            || self.file_limit.load(Ordering::Acquire),
+            |_| self.file_limit.load(Ordering::Acquire),
         )?))
     }
     /// Refresh after persistence and on explicit status reads. Sampling the

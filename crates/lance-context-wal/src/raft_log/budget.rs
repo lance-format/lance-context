@@ -5,7 +5,10 @@ use crate::admission::Budget;
 use crate::admission::Snapshot;
 
 /// Local admission policy, independent of replicated layout/state. Producer
-/// proposals and new replicated payloads stop at `data_bytes`; new images
+/// proposals and new replicated payloads stop at `data_bytes` of measured files
+/// and non-rewrite reservations. Temporary native rewrite scratch remains fully
+/// charged against the original producer ceiling, preserving its control window.
+/// New images
 /// preserve `headroom_bytes` for accepted Raft/control traffic and physical
 /// rewrites. Existing entries can still be acknowledged and control traffic
 /// can consume this window. This is not a hard filesystem quota.

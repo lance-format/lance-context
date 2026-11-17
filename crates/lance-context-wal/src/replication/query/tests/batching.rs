@@ -12,6 +12,88 @@ fn deliver(nodes: &mut [Node], packets: Vec<Packet>) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "runtime")]
+#[test]
+fn async_read_heartbeats_preserve_persistence_capacity_and_wait_for_quorum() -> Result<()> {
+    use std::time::{Duration, Instant};
+
+    let (_root, mut nodes) = nodes(Limits::default())?;
+    nodes[0].campaign(10)?;
+    pump(&mut nodes)?;
+    let batch = super::super::super::tests::batch(1);
+    nodes[0].propose(10, 100, batch.clone())?;
+    assert_eq!(pump(&mut nodes)?.completions.len(), 1);
+    let last_index = nodes[0].groups[&10].raw.store().last_index()?;
+    nodes[0].enable_async_persistence(&crate::replication::runtime::Options::default())?;
+
+    for round in 0..32 {
+        for offset in 1..=4 {
+            nodes[0].query(10, round * 4 + offset, accepted())?;
+        }
+        let first = nodes[0].poll()?;
+        assert!(first.reads.is_empty(), "read bypassed its fresh quorum");
+        for peer in [2, 3] {
+            assert_eq!(
+                first
+                    .messages
+                    .iter()
+                    .filter(|p| p.message.to == peer
+                        && p.message.get_msg_type() == MessageType::MsgHeartbeat
+                        && !p.message.context.is_empty())
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(
+            nodes[0]
+                .persistence_observation(10)
+                .unwrap()
+                .pending_readies,
+            0,
+            "outgoing read heartbeats consumed native persistence capacity"
+        );
+        // Withhold all quorum responses. Skipping a message-only Ready must
+        // not confirm the read or allow it to reuse a previous round's cut.
+        assert!(nodes[0].poll()?.reads.is_empty());
+        assert_eq!(nodes[0].status(10)?.pending_reads, 4);
+        deliver(&mut nodes, first.messages)?;
+        let mut reads = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while reads.len() < 4 {
+            let mut messages = Vec::new();
+            for node in &mut nodes {
+                let events = node.poll()?;
+                reads.extend(events.reads);
+                messages.extend(events.messages);
+            }
+            deliver(&mut nodes, messages)?;
+            ensure!(
+                Instant::now() < deadline,
+                "fresh quorum read did not complete"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let mut requests = BTreeSet::new();
+        for read in reads {
+            assert!(requests.insert(read.request));
+            assert!((round * 4 + 1..=round * 4 + 4).contains(&read.request));
+            let Outcome::Observed {
+                cut,
+                value: Value::Accepted(page),
+            } = read.outcome
+            else {
+                anyhow::bail!("missing fresh quorum result");
+            };
+            assert!(cut.applied >= cut.quorum_index && cut.quorum_index >= last_index);
+            assert_eq!(page.entries.len(), 1);
+            assert_eq!(page.entries[0].1, batch.meta);
+        }
+        assert_eq!(nodes[0].status(10)?.pending_reads, 0);
+        assert_eq!(nodes[0].groups[&10].raw.store().last_index()?, last_index);
+    }
+    Ok(())
+}
+
 #[test]
 fn one_poll_shares_a_fresh_quorum_barrier_for_all_admitted_reads() -> Result<()> {
     let (_root, mut nodes) = nodes(Limits::default())?;

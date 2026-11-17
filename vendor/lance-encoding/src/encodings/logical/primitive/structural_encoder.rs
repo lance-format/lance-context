@@ -2590,6 +2590,19 @@ impl PrimitivePageEncodingBehavior for ConstantPrimitiveEncoding {
         else {
             return Ok(PrimitiveEncodeAttempt::Unhandled(page));
         };
+        // A singleton cannot save repeated values. Large variable-width scalars
+        // would be stored raw by the constant layout, bypassing per-value
+        // compression (notably when a rewrite streams one large document at a time).
+        let scalar_bytes = match scalar.data_type() {
+            DataType::Utf8 => scalar.as_string::<i32>().value(0).len(),
+            DataType::LargeUtf8 => scalar.as_string::<i64>().value(0).len(),
+            DataType::Binary => scalar.as_binary::<i32>().value(0).len(),
+            DataType::LargeBinary => scalar.as_binary::<i64>().value(0).len(),
+            _ => 0,
+        };
+        if num_values == 1 && scalar_bytes > 32 * 1024 {
+            return Ok(PrimitiveEncodeAttempt::Unhandled(page));
+        }
         let PrimitivePageData {
             structure: PrimitivePageStructure::Dense { repdef, .. },
             row_number,

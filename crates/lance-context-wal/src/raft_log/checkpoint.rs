@@ -123,14 +123,56 @@ impl GroupLog {
     /// binaries cannot open a directory with a tail preceding its checkpoint;
     /// checkpoint with a zero allowance before downgrading.
     pub fn checkpoint_retaining(&self, snapshot: &Snapshot, retained_bytes: u64) -> Result<()> {
-        ensure!(
-            retained_bytes <= 2 << 30,
-            "checkpoint log tail exceeds maximum allowance"
-        );
         let mut state = self
             .state
             .write()
             .map_err(|_| anyhow::anyhow!("group state lock poisoned"))?;
+        let next = self.checkpoint_state(&state, snapshot, retained_bytes)?;
+        if next.snapshot == state.snapshot && next.truncated == state.truncated {
+            return self.node.check();
+        }
+        let metadata = snapshot.get_metadata();
+        let first = next.boundary() + 1;
+        let truncated = next.truncated;
+        let mut batch = LogBatch::default();
+        batch.put_message(self.group, SNAPSHOT.to_vec(), snapshot)?;
+        batch.put(
+            self.group,
+            TRUNCATED.to_vec(),
+            encode_boundary(truncated, metadata.index),
+        )?;
+        batch.put(self.group, TERMS.to_vec(), encode_terms(&next.terms)?)?;
+        // Engine::compact_to writes without sync and suppresses errors. Keep
+        // the command and its recovery metadata under our shared failure fence.
+        batch.add_command(self.group, raft_engine::Command::Compact { index: first });
+        self.node.write(&mut batch)?;
+        *state = next;
+        Ok(())
+    }
+
+    // Predict the readable checkpoint view while the owning buffered writer is
+    // drained. The native worker repeats this calculation before persisting;
+    // no payload is loaded and no durable state is changed here.
+    #[cfg(feature = "runtime")]
+    pub(super) fn checkpoint_view(
+        &self,
+        snapshot: &Snapshot,
+        retained_bytes: u64,
+    ) -> Result<GroupState> {
+        let state = self.read()?;
+        self.checkpoint_state(&state, snapshot, retained_bytes)
+    }
+
+    fn checkpoint_state(
+        &self,
+        state: &GroupState,
+        snapshot: &Snapshot,
+        retained_bytes: u64,
+    ) -> Result<GroupState> {
+        ensure!(
+            retained_bytes <= 2 << 30,
+            "checkpoint log tail exceeds maximum allowance"
+        );
         self.node.check()?;
         validate(snapshot, &state.conf)?;
         ensure!(
@@ -164,7 +206,7 @@ impl GroupLog {
             state.term(first - 1).context("missing truncation term")?,
         );
         if metadata.index == state.snapshot.get_metadata().index && truncated == state.truncated {
-            return self.node.check();
+            return Ok(state.clone());
         }
         let mut terms = state.terms.clone();
         terms.retain(|range| range.last > truncated.0);
@@ -179,20 +221,7 @@ impl GroupLog {
             truncated,
         };
         next.validate()?;
-        let mut batch = LogBatch::default();
-        batch.put_message(self.group, SNAPSHOT.to_vec(), snapshot)?;
-        batch.put(
-            self.group,
-            TRUNCATED.to_vec(),
-            encode_boundary(truncated, metadata.index),
-        )?;
-        batch.put(self.group, TERMS.to_vec(), encode_terms(&next.terms)?)?;
-        // Engine::compact_to writes without sync and suppresses errors. Keep
-        // the command and its recovery metadata under our shared failure fence.
-        batch.add_command(self.group, raft_engine::Command::Compact { index: first });
-        self.node.write(&mut batch)?;
-        *state = next;
-        Ok(())
+        Ok(next)
     }
 
     /// Application recovery cut, independent of the retained replication log.

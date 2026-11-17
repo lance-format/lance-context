@@ -39,7 +39,7 @@ async fn idle_time_does_not_consume_the_next_requests_durability_deadline() -> R
     handle.enqueue(
         handle.route(10)?,
         Work::Local(Box::new(move |node| {
-            let store = node.groups[&10].raw.store().clone();
+            let store = node.groups[&10].raw.store().durable_log().clone();
             Box::new(move || {
                 let _ = send_store.send(store);
             })

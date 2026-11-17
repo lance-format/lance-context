@@ -12,11 +12,14 @@ mod advance;
 pub(crate) mod annotation_index;
 mod close;
 pub(crate) mod compaction;
+mod confirm;
 pub mod observation;
+mod pin;
 mod pipeline;
 mod plan;
 mod prepare;
 mod read_policy;
+pub(crate) mod retirement;
 mod session_index;
 pub(crate) mod stage;
 pub(crate) mod status_index;
@@ -600,9 +603,8 @@ impl Publisher {
                 && selected.descriptor_digest == prepared.descriptors.digest,
             "fixed target belongs to another publication"
         );
-        let reply = commit(
-            &self.ingress.client,
-            Command::Confirm(p::ConfirmPublication {
+        let published = self
+            .confirm_publication(p::ConfirmPublication {
                 authority: self.authority.clone(),
                 incarnation: self.ingress.scope.incarnation,
                 transaction: pending.plan.transaction,
@@ -611,12 +613,8 @@ impl Publisher {
                 descriptor_digest: prepared.descriptors.digest,
                 target,
                 manifest_identity: selected.identity,
-            }),
-        )
-        .await?;
-        let Applied::Publisher(p::Reply::Published(published)) = reply else {
-            bail!("publication confirmation rejected: {reply:?}");
-        };
+            })
+            .await?;
         Ok(Some(published))
     }
 
@@ -724,11 +722,7 @@ impl Publisher {
                             && selected.range == pending.plan.sources[&group],
                         "pin differs from selected prefix"
                     );
-                    let reply = commit(&self.ingress.client, Command::Pin(*permit)).await?;
-                    ensure!(
-                        matches!(reply, Applied::Source(source::Reply::Pinned { .. })),
-                        "source pin rejected: {reply:?}"
-                    );
+                    self.pin_source(*permit).await?;
                     Ok::<_, anyhow::Error>(())
                 }),
         )
@@ -749,19 +743,15 @@ impl Publisher {
             .head
             .saturating_sub(self.options.retained_manifest_versions as u64 - 2)
             .max(manifests.initial_version);
-        let reply = commit(
+        retirement::retire(
             &self.ingress.client,
-            Command::RetireHistory(p::RetireManifestHistory {
+            p::RetireManifestHistory {
                 authority: self.authority.clone(),
                 incarnation: self.ingress.scope.incarnation,
                 retain_from,
-            }),
+            },
         )
         .await?;
-        ensure!(
-            matches!(reply, Applied::Publisher(p::Reply::ManifestHistory(_))),
-            "manifest history retirement rejected: {reply:?}"
-        );
         Ok(())
     }
     async fn select(&mut self, view: &p::Table) -> Result<Option<p::Plan>> {

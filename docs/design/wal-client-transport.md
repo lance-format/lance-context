@@ -28,15 +28,17 @@ cancelled exchange discards its connection. Keep the original producer sequence
 and payload for explicit reconciliation; errors do not prove non-commit.
 
 A disk-budget refusal before `Raft::step` returns
-`AppendNotSubmittedDiskBudget`. Only this attempt is known not to have been
+`AppendNotSubmittedDiskBudget`; a pending-proposal or persistence-capacity
+refusal at the same boundary returns `AppendNotSubmittedPendingCapacity`.
+Only this attempt is known not to have been
 submitted; a prior attempt with the same identity may already have committed.
 Retain the original identity and bytes. The client returns the refusal without
 automatically replaying it. Other execution errors, cancellation and lost replies
 retain the unknown outcome.
 
-This reply is appended to the existing RPC enum; existing messages and persisted
+These replies are appended to the existing RPC enum; existing messages and persisted
 WAL records are unchanged. Upgrade WAL clients before replicas. An older client
-cannot decode the new reply and conservatively sees a transport error/unknown
+cannot decode a new reply and conservatively sees a transport error/unknown
 outcome; it must not treat that error as a successful append or definite rejection.
 
 Routing follows only configured-voter hints returned before command submission.
@@ -52,6 +54,18 @@ their existing handling. The
 source-fetch API returns local committed data; a quorum-confirmed source pin and
 matching metadata are required before materialization. Missing local data does
 not prove that an uncertain append was rejected.
+
+A disconnected or refused connection to a cached voter also lets routed quorum
+queries and source reads try another configured voter. The same overall deadline
+bounds all attempts, with a 20 ms pause after exhausting the voters. Each failed
+exchange releases its connection and byte credits before the next attempt.
+Successful quorum queries still carry the normal validated observation; a leader
+hint alone is insufficient. Invalid identities, scopes, framing and other protocol
+errors remain errors. Appends and publication commands keep their unknown-outcome
+contract and are never automatically resubmitted by this transport after a
+transport error. The higher-level annotation owner separately implements one
+bounded exact-request resolution after a fresh quorum observation, as described
+in [Annotation HTTP routing](annotation-owner-http.md).
 
 With `lance-integration`, `Client::manifest_catalog()` implements the actual
 `ManagedManifest` catalog interface over these RPCs. This supplies networked

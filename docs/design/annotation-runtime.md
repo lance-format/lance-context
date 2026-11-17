@@ -18,8 +18,24 @@ publisher releases its frozen/prepared handles before awaiting source retirement
 Their dirty-value and workspace permits must not keep the next update waiting
 on a slow closure RPC. Other held readers or handles keep their own charges.
 WAL reclamation still requires the existing durable closure authorization and
-advancement proofs. An unknown retirement result still stops the owner; recovery
-uses the selected value/result checkpoint and retained WAL suffix.
+advancement proofs. After an unknown source `Close`, an exact quorum proof
+resolves a lost reply without resubmission. If the proof is absent for the first
+source range, or covers exactly the preceding range, the owner can submit the
+original `Close` once more after freshly checking the same catalog closure and
+publisher authority. The original signed permit is unchanged; the WAL state
+machine applies an identical closure idempotently. A foreign proof, changed
+publication, fenced owner, or unresolved second attempt still stops the owner.
+Recovery uses the selected value/result checkpoint and retained WAL suffix.
+
+The applier can share one bounded base-annotation lookup across a queued prefix
+of separate patch requests. It uses the existing limits of eight requests,
+2,048 rows and 32 MiB of payload, and never waits for more requests or lookup
+workspace. The lookup holds a protected base and carries no application progress.
+Each request still applies and acknowledges independently in WAL order. Current
+active/frozen values win, and a changed base falls back to the ordinary lookup.
+The `annotation_patch_lookup` phase reports this read work separately from apply.
+Mixed prefixes also retain the existing registration lookup. Both optional reads
+can run concurrently under the same workspace and read-view budgets.
 
 The upload, apply and publication budgets are independent. Publication admission
 must accommodate a fully occupied dirty-value generation and result metadata;
@@ -67,6 +83,15 @@ previously applied values. Each later collection interval checks ownership and
 reissues only unresolved DELETE requests from that original page. Successful paths are
 removed; an absent path resolves a lost reply. An unknown whole-batch response
 retains all paths in that batch. Paths are never added after sealing.
+
+Healthy Azure collection uses SDK batches of up to 256 paths. Once a sealed
+Azure page fails, its subsequent attempts use native single-object DELETE,
+bounded by the same `delete_parallelism`. The pinned object_store SDK sends a
+singleton stream to that endpoint; `ObjectStoreExt::delete` in the previous SDK
+still used Blob Batch and would not provide this fallback. Only unresolved paths
+are retried, and a 404 resolves an already removed object. If native DELETE also
+fails, the same page and publication backpressure remain. Other backends keep
+their existing batching. This does not extend timeouts or retry mutations.
 
 This behavior covers any DELETE error, including a permission failure: it does
 not guess whether an opaque SDK error is transient. A persistent failure keeps

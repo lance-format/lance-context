@@ -2,6 +2,7 @@
 //! and admitted reads. Dropping a window never frees a reader's reservation.
 use super::*;
 use std::collections::BTreeMap;
+mod memory;
 
 pub(crate) struct Frame {
     pub batches: Vec<RecordBatch>,
@@ -104,7 +105,19 @@ pub(crate) struct Window {
 }
 
 impl Window {
-    pub fn record(&mut self, index: u64, batches: Vec<RecordBatch>, reservation: MergeReservation) {
+    pub fn record(
+        &mut self,
+        index: u64,
+        batches: Vec<RecordBatch>,
+        mut reservation: MergeReservation,
+        input_bytes: usize,
+        input_allocation: Option<(usize, usize)>,
+    ) {
+        if let Some(bytes) =
+            memory::retained_bytes(&batches, input_bytes, reservation.bytes(), input_allocation)
+        {
+            reservation.shrink_to(bytes);
+        }
         assert!(self
             .active
             .insert(
@@ -168,6 +181,93 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
 
     #[tokio::test]
+    async fn shared_ipc_credit_is_released_only_after_the_last_reader() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("binary_payload", DataType::LargeBinary, false),
+        ]));
+        let payload = vec![7; 256 << 10];
+        let mut encoded = Vec::new();
+        let mut writer = arrow_ipc::writer::FileWriter::try_new(&mut encoded, &schema)?;
+        for ids in [["a", "b"], ["c", "d"]] {
+            writer.write(&RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(Vec::from(ids))),
+                    Arc::new(LargeBinaryArray::from_iter_values([payload.as_slice(); 2])),
+                ],
+            )?)?;
+        }
+        writer.finish()?;
+        drop(writer);
+        for (prefix, known) in [(0, true), (1, true), (0, false), (1, false)] {
+            let mut input =
+                Vec::with_capacity((if known { 1 } else { 2 }) * encoded.len() + prefix);
+            input.resize(prefix, 0);
+            input.extend_from_slice(&encoded);
+            let capacity = input.capacity();
+            let input = Bytes::from(input).slice(prefix..);
+            let begin = input.as_ptr() as usize;
+            let length = input.len();
+            let batches = ipc::decode(input, schema.clone())?;
+            let budget = MergeMemoryBudget::new(4 << 20);
+            let original = 2 * length + if known { capacity } else { length } + (64 << 10);
+            let reservation = budget.reserve(original).await;
+            assert!(budget.try_reserve(1 << 20).is_none());
+            let mut window = Window::default();
+            window.record(
+                12,
+                batches,
+                reservation,
+                length,
+                known.then_some((begin, capacity)),
+            );
+            let retained = window.retained().1;
+            assert!(
+                retained >= length,
+                "the full input backing must remain charged"
+            );
+            if known {
+                assert!(retained < 2 * length, "shared input counted more than once");
+            } else {
+                assert_eq!(retained, original, "unknown input must not shrink credit");
+            }
+            // The returned transient capacity can admit independent work even
+            // while the original body is still active and queryable.
+            let other = budget.try_reserve(2 << 20);
+            assert_eq!(other.is_some(), known);
+            let other_bytes = other.as_ref().map_or(0, |r| r.bytes());
+            let held = window.row(
+                lance_context_core::annotation_staging::NewTurnSource {
+                    record_index: 12,
+                    row: 2,
+                },
+                "c",
+            )?;
+            let frozen = window.freeze();
+            window.retire(&frozen);
+            drop(frozen);
+            assert_eq!(window.retained(), (0, 0));
+            assert_eq!(budget.reserved(), retained + other_bytes);
+            assert!(budget.try_reserve(1).is_none());
+            let value = held
+                .batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .unwrap();
+            let pointer = value.value_data().as_ptr() as usize;
+            assert!(pointer >= begin && pointer + value.value_data().len() <= begin + length);
+            assert_eq!(value.value(0), payload);
+            drop(held);
+            assert_eq!(budget.reserved(), other_bytes);
+            drop(other);
+            assert_eq!(budget.reserved(), 0);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn sliced_body_read_retains_buffers_and_budget_after_window_retirement() -> Result<()> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
@@ -189,6 +289,8 @@ mod tests {
             12,
             vec![batch.slice(0, 2), batch.slice(2, 2)],
             budget.reserve(1 << 20).await,
+            0,
+            None,
         );
         let held = window.row(
             lance_context_core::annotation_staging::NewTurnSource {

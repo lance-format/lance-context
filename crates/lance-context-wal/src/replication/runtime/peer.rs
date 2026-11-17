@@ -6,6 +6,17 @@
 //! rustls configurations with mutual authentication and the required ALPN.
 //! Optional snapshots use a separate listener and bounded transfer workers.
 //! No client ingestion is exposed here.
+//!
+//! Service JSON can coalesce already-queued frames for one destination with
+//! `peer.send_batch_frames` (1–64; default 1, batching disabled) and
+//! `peer.send_batch_bytes` (4 KiB–16 MiB; default 1 MiB of charged logical bytes).
+//! There is no batching timer. A first frame above the byte target travels alone.
+//! Frames retain both byte credits through the shared write and flush; failures
+//! discard the uncertain connection and release the entire batch for Raft retry.
+//! The wire format and durable ACK boundary are unchanged. Destination diagnostics
+//! report `sent_batches` alongside `sent_frames`; `send` measures batches, while
+//! `queue_wait` still measures individual frames. Benchmark this opt-in setting
+//! with the actual payload mix before changing its default.
 use super::{client::timing, Handle, Outbound, Packet};
 use anyhow::{ensure, Context, Result};
 use bytes::{Bytes, BytesMut};
@@ -59,7 +70,13 @@ pub struct Options {
     /// Queued and actively transmitting logical bytes per destination. A slow
     /// follower cannot retain the entire runtime outbox's byte allowance.
     pub peer_bytes: usize,
-    /// Deadline for a complete handshake or frame, including bounded admission.
+    /// Maximum already-queued frames per send. One preserves individual sends.
+    pub send_batch_frames: usize,
+    /// Charged logical bytes per send batch. A larger first frame travels alone.
+    /// Existing per-destination and runtime credits still cover every frame.
+    pub send_batch_bytes: usize,
+    /// Deadline for a complete handshake, send batch or received frame,
+    /// including bounded admission.
     /// Receive framing starts with its first byte; authenticated peers may idle
     /// between frames (for example, two followers of the same leader).
     #[cfg_attr(feature = "service", serde(with = "crate::service::duration_millis"))]
@@ -74,6 +91,8 @@ impl Default for Options {
             connections: 64,
             peer_queue: 32,
             peer_bytes: 16 << 20,
+            send_batch_frames: 1,
+            send_batch_bytes: 1 << 20,
             io_timeout: Duration::from_secs(5),
             reconnect_delay: Duration::from_millis(100),
         }
@@ -86,6 +105,8 @@ impl Options {
                 && (1..=128).contains(&self.connections)
                 && (1..=256).contains(&self.peer_queue)
                 && (4096..=128 << 20).contains(&self.peer_bytes)
+                && (1..=64).contains(&self.send_batch_frames)
+                && (4096..=16 << 20).contains(&self.send_batch_bytes)
                 && (Duration::from_millis(100)..=Duration::from_secs(60))
                     .contains(&self.io_timeout)
                 && (Duration::from_millis(10)..=Duration::from_secs(5))
@@ -121,15 +142,18 @@ struct DestinationStatistics {
     send: timing::Counter,
     sent_frames: AtomicU64,
     sent_payload_bytes: AtomicU64,
+    sent_batches: AtomicU64,
 }
 
 /// Local transport intervals, not remote receive or durable commit latency.
 #[derive(serde::Serialize)]
 pub struct DestinationObservation {
     pub queue_wait: timing::Observation,
+    /// One interval per send batch; a batch contains one or more peer frames.
     pub send: timing::Observation,
     pub sent_frames: u64,
     pub sent_payload_bytes: u64,
+    pub sent_batches: u64,
 }
 
 impl Statistics {
@@ -145,6 +169,7 @@ impl Statistics {
                         send: s.send.snapshot(),
                         sent_frames: s.sent_frames.load(Ordering::Relaxed),
                         sent_payload_bytes: s.sent_payload_bytes.load(Ordering::Relaxed),
+                        sent_batches: s.sent_batches.load(Ordering::Relaxed),
                     },
                 )
             })
@@ -396,6 +421,8 @@ async fn send_loop(
 ) -> Result<()> {
     let (statistics, timing) = statistics;
     let mut connection = None;
+    let mut batch = Vec::with_capacity(options.send_batch_frames);
+    let mut deferred = None;
     loop {
         if connection.is_none() {
             // Connect independently of a Raft message. Offline destinations do
@@ -437,24 +464,35 @@ async fn send_loop(
                 }
             }
         }
-        let packet = tokio::select! {
-            _ = stop.changed() => return Ok(()),
-            packet = receive.recv() => match packet { Some(p) => p, None => return Ok(()) },
+        let packet = match deferred.take() {
+            Some(packet) => packet,
+            None => tokio::select! {
+                _ = stop.changed() => return Ok(()),
+                packet = receive.recv() => match packet { Some(p) => p, None => return Ok(()) },
+            },
         };
+        batch.push(packet);
+        deferred = fill_batch(&mut batch, &mut receive, &options);
         // Retain both physical-runtime and per-destination credits through send.
-        let exchange = send_queued(connection.as_mut().unwrap(), &packet, &timing);
+        let exchange = send_queued(connection.as_mut().unwrap(), &batch, &timing);
         let outcome = tokio::select! {
             _ = stop.changed() => return Ok(()),
             result = timeout(options.io_timeout, exchange) => result,
         };
         if matches!(outcome, Ok(Ok(()))) {
-            statistics.sent_frames.fetch_add(1, Ordering::Relaxed);
+            statistics
+                .sent_frames
+                .fetch_add(batch.len() as u64, Ordering::Relaxed);
+            batch.clear();
         } else {
             ready.store(false, Ordering::Release);
             connection = None; // Never reuse an uncertain partial frame.
             statistics.failed_exchanges.fetch_add(1, Ordering::Relaxed);
-            statistics.dropped_outbound.fetch_add(1, Ordering::Relaxed);
-            drop(packet);
+            let dropped = batch.len() + usize::from(deferred.take().is_some());
+            statistics
+                .dropped_outbound
+                .fetch_add(dropped as u64, Ordering::Relaxed);
+            batch.clear();
             while receive.try_recv().is_ok() {
                 statistics.dropped_outbound.fetch_add(1, Ordering::Relaxed);
             }
@@ -466,22 +504,63 @@ async fn send_loop(
     }
 }
 
+// Drain only ready frames. A byte-limited overflow keeps its credits and FIFO
+// position for the next send; no timer delays a sparse stream to fill a batch.
+fn fill_batch(
+    batch: &mut Vec<Queued>,
+    receive: &mut mpsc::Receiver<Queued>,
+    options: &Options,
+) -> Option<Queued> {
+    let mut bytes = batch[0]._bytes.num_permits();
+    while batch.len() < options.send_batch_frames && bytes < options.send_batch_bytes {
+        let Ok(next) = receive.try_recv() else {
+            break;
+        };
+        let size = next._bytes.num_permits();
+        if size > options.send_batch_bytes - bytes {
+            return Some(next);
+        }
+        bytes += size;
+        batch.push(next);
+    }
+    None
+}
+
 async fn send_queued<W: AsyncWrite + Unpin>(
     writer: &mut W,
-    queued: &Queued,
+    queued: &[Queued],
     statistics: &DestinationStatistics,
 ) -> Result<()> {
     // Only dequeued frames contribute queue intervals. Reconnect purges and
     // rejected enqueues remain in the existing drop counters.
-    statistics.queue_wait.record(queued.enqueued.elapsed());
+    for frame in queued {
+        statistics.queue_wait.record(frame.enqueued.elapsed());
+    }
     let _send = statistics.send.start();
-    let packet = queued.packet.packet();
-    write_packet(writer, packet).await?;
-    statistics.sent_frames.fetch_add(1, Ordering::Relaxed);
-    let payload: u64 = packet
-        .message
-        .entries
+    if queued.len() == 1 {
+        write_packet(writer, queued[0].packet.packet()).await?;
+    } else {
+        let mut parts = Vec::new();
+        for frame in queued {
+            let (header, bodies) = encode(frame.packet.packet())?;
+            let mut prefix = Vec::with_capacity(4 + header.len());
+            prefix.extend_from_slice(&(header.len() as u32).to_be_bytes());
+            prefix.extend_from_slice(&header);
+            parts.push(Bytes::from(prefix));
+            parts.extend(bodies);
+        }
+        // Preserve the existing frame stream and share payload owners. The
+        // transport writer bounds each scatter/gather call to 64 descriptors.
+        crate::transport_io::write_bodies(writer, &parts, None).await?;
+        writer.flush().await?;
+    }
+    statistics.sent_batches.fetch_add(1, Ordering::Relaxed);
+    statistics
+        .sent_frames
+        .fetch_add(queued.len() as u64, Ordering::Relaxed);
+    let payload: u64 = queued
         .iter()
+        .flat_map(|frame| &frame.packet.packet().message.entries)
         .map(|e| e.data.len() as u64)
         .sum();
     statistics

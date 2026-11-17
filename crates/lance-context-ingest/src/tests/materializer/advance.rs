@@ -10,6 +10,11 @@ enum Case {
     DifferentPublication,
     DifferentClosures,
     Fenced,
+    AbsentFenced,
+    PersistentUnknown,
+    Unobservable,
+    PendingPublicationChanged,
+    PendingClosuresChanged,
 }
 
 async fn exercise(case: Case) -> Result<()> {
@@ -20,9 +25,19 @@ async fn exercise(case: Case) -> Result<()> {
     let proxy = Proxy::open_advance(
         &cluster,
         root.path(),
-        matches!(case, Case::Committed | Case::Fenced),
+        matches!(case, Case::Committed | Case::Fenced | Case::Unobservable),
     )
     .await?;
+    if matches!(case, Case::AbsentFenced | Case::PersistentUnknown) {
+        proxy
+            .pause_uncommitted_advance
+            .store(true, Ordering::SeqCst);
+    }
+    if matches!(case, Case::Unobservable) {
+        proxy
+            .block_advance_observations
+            .store(true, Ordering::SeqCst);
+    }
     let direct = std::mem::replace(&mut cluster.client, proxy.client.clone());
     let ingress = connect(&cluster, binding()).await?;
     let storage = Storage::resolve(
@@ -92,34 +107,73 @@ async fn exercise(case: Case) -> Result<()> {
             request.published_index += 1;
         }
     }
+    match case {
+        Case::PendingPublicationChanged => request.published_index += 1,
+        Case::PendingClosuresChanged => request.proofs.clear(),
+        _ => {}
+    }
+    let original = request.clone();
     let authority = publisher.authority().clone();
     let operation = tokio::spawn(async move { publisher.record_advance(request).await });
-    if matches!(case, Case::Committed | Case::Fenced) {
+    if matches!(
+        case,
+        Case::Committed
+            | Case::Fenced
+            | Case::Unobservable
+            | Case::AbsentFenced
+            | Case::PersistentUnknown
+    ) {
         tokio::time::timeout(Duration::from_secs(10), proxy.committed.notified()).await?;
-        if matches!(case, Case::Fenced) {
+        if matches!(case, Case::Fenced | Case::AbsentFenced) {
             cluster.client = direct.clone();
             let ingress = connect(&cluster, binding()).await?;
             let successor = super::publisher(&ingress, &storage, &budget, authority.epoch).await?;
             assert_ne!(successor.authority(), &authority);
         }
+        if matches!(case, Case::PersistentUnknown) {
+            proxy.unknown_advances.store(true, Ordering::SeqCst);
+        }
         proxy.release.notify_one();
     }
-    let result = tokio::time::timeout(Duration::from_secs(10), operation).await??;
+    let result = tokio::time::timeout(Duration::from_secs(45), operation).await??;
+    if matches!(case, Case::Unobservable) {
+        proxy.restore_observations();
+    }
     assert_eq!(
         result.is_ok(),
-        matches!(case, Case::Committed),
+        matches!(case, Case::Committed | Case::Absent),
         "{result:?}"
     );
     if let Ok(receipt) = result {
         assert_eq!(receipt.publication, published);
         assert_eq!(receipt.sources[&10], pending.plan.sources[&10].through);
     }
-    assert_eq!(proxy.dropped.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        proxy.dropped.load(Ordering::SeqCst),
+        if matches!(case, Case::PersistentUnknown) {
+            2
+        } else {
+            1
+        }
+    );
     assert_eq!(
         proxy.advances.load(Ordering::SeqCst),
-        1,
-        "Advance resubmitted"
+        if matches!(case, Case::Absent | Case::PersistentUnknown) {
+            2
+        } else {
+            1
+        },
+        "unexpected Advance submissions"
     );
+    let requests = proxy.advance_requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), proxy.advances.load(Ordering::SeqCst));
+    assert!(
+        requests.iter().all(|r| r == &original),
+        "original advancement changed"
+    );
+    if !matches!(case, Case::Unobservable) {
+        assert_eq!(proxy.blocked_reads.load(Ordering::SeqCst), 0);
+    }
     let response = direct
         .request_routed(Request::Query {
             group: authority.group,
@@ -137,11 +191,23 @@ async fn exercise(case: Case) -> Result<()> {
     };
     assert_eq!(
         view.progress.advanced.is_none(),
-        matches!(case, Case::Absent)
+        matches!(
+            case,
+            Case::AbsentFenced
+                | Case::PersistentUnknown
+                | Case::PendingPublicationChanged
+                | Case::PendingClosuresChanged
+        )
     );
     assert_eq!(
         view.progress.pending.is_some(),
-        matches!(case, Case::Absent)
+        matches!(
+            case,
+            Case::AbsentFenced
+                | Case::PersistentUnknown
+                | Case::PendingPublicationChanged
+                | Case::PendingClosuresChanged
+        )
     );
     cluster.client = direct;
     drop(proxy);
@@ -153,7 +219,7 @@ async fn committed_unknown_advance_is_observed_without_resubmission() -> Result<
     exercise(Case::Committed).await
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn absent_unknown_advance_remains_unknown() -> Result<()> {
+async fn absent_unknown_advance_resumes_original_publication() -> Result<()> {
     exercise(Case::Absent).await
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -167,4 +233,29 @@ async fn unknown_advance_requires_same_closures() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unknown_advance_cannot_bypass_owner_fencing() -> Result<()> {
     exercise(Case::Fenced).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unrecorded_advance_is_not_resubmitted_after_owner_fencing() -> Result<()> {
+    exercise(Case::AbsentFenced).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn repeatedly_unknown_advance_stops_after_one_exact_resubmission() -> Result<()> {
+    exercise(Case::PersistentUnknown).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unavailable_advance_observation_preserves_failure() -> Result<()> {
+    exercise(Case::Unobservable).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unknown_advance_does_not_resubmit_a_different_pending_publication() -> Result<()> {
+    exercise(Case::PendingPublicationChanged).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unknown_advance_does_not_resubmit_a_different_pending_closure_set() -> Result<()> {
+    exercise(Case::PendingClosuresChanged).await
 }

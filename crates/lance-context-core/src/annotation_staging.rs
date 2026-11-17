@@ -16,6 +16,7 @@ use lance_context_api::annotation::{TurnAnnotation, TurnAnnotationPatch};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
 
 mod body;
+mod cold_points;
 mod compaction;
 mod patch_lookup;
 mod preserve_id;
@@ -239,7 +240,8 @@ impl AnnotationStaging {
         {
             return Err(invalid("invalid annotation staging scope or limits"));
         }
-        let published_values = published_values::PublishedValues::new(&base, materialized);
+        let published_values =
+            published_values::PublishedValues::new(&base, materialized, limits.readers);
         let (base, views) = views::Registry::new(base);
         Ok(Self {
             scope,
@@ -624,14 +626,14 @@ impl AnnotationStaging {
                 source: value.map_or_else(
                     || PointSource::Base {
                         base: state.base.clone(),
-                        turn: turn.to_owned(),
+                        turn: Arc::from(turn),
                         published: self.published_values.clone(),
                         materialized: state.materialized,
                     },
                     PointSource::Staged,
                 ),
                 value_bytes: self.limits.value_bytes,
-                _reader: permit,
+                _reader: Arc::new(permit),
             },
             body,
         ))
@@ -668,7 +670,7 @@ enum PointSource {
     Staged(Arc<Stored>),
     Base {
         base: Arc<views::Base>,
-        turn: String,
+        turn: Arc<str>,
         published: published_values::PublishedValues,
         materialized: u64,
     },
@@ -678,7 +680,7 @@ pub struct PointRead {
     pub base_version: u64,
     source: PointSource,
     value_bytes: usize,
-    _reader: OwnedSemaphorePermit,
+    _reader: Arc<OwnedSemaphorePermit>,
 }
 impl PointRead {
     /// Resolve only id/labels/status/score. No body projection or WAL access.
@@ -696,7 +698,7 @@ impl PointRead {
                 Some(value) => Ok(Some(value.value.clone())),
                 None => {
                     published
-                        .read_base(base, turn, *materialized, self.value_bytes)
+                        .read_base(base, turn, *materialized, self.value_bytes, &self._reader)
                         .await
                 }
             },
@@ -747,6 +749,25 @@ async fn read_existing<'a>(
     turns: &std::collections::BTreeSet<&'a str>,
     projection: &[&str],
 ) -> Result<BTreeMap<&'a str, RecordBatch>> {
+    read_existing_with_scan_rows(
+        base,
+        turns,
+        projection,
+        if projection == ["id"] {
+            COLD_LOOKUP_KEYS
+        } else {
+            COLD_LOOKUP_ROWS
+        },
+    )
+    .await
+}
+
+async fn read_existing_with_scan_rows<'a>(
+    base: &Dataset,
+    turns: &std::collections::BTreeSet<&'a str>,
+    projection: &[&str],
+    scan_rows: usize,
+) -> Result<BTreeMap<&'a str, RecordBatch>> {
     let mut rows = BTreeMap::new();
     if turns.is_empty() {
         return Ok(rows);
@@ -759,11 +780,7 @@ async fn read_existing<'a>(
     scan.limit(Some(turns.len() as i64 + 1), None)?;
     // Existence probes decode only IDs. Amortize scanning a growing base over
     // the existing key window without increasing annotation/body projections.
-    scan.batch_size(if projection == ["id"] {
-        COLD_LOOKUP_KEYS
-    } else {
-        COLD_LOOKUP_ROWS
-    });
+    scan.batch_size(scan_rows);
     let mut stream = scan.try_into_stream().await?;
     while let Some(batch) = stream.try_next().await? {
         let ids = batch

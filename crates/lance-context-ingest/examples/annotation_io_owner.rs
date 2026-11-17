@@ -1,5 +1,10 @@
 //! Runs the real annotation owner with existing object-store metrics enabled.
 //! The additional listener is loopback-only and serves diagnostic reads.
+//! Owner status also reports annotation_read_io with fixed file classes: narrow
+//! data, body data, indices, metadata and other. These are process-wide store API
+//! calls and delivered bytes, not caller attribution or HTTP/wire accounting.
+//! Failed and dropped reads are separate; local file payload bytes are unknown.
+//! The existing scheme-level metrics and shared store/cache identity are retained.
 use anyhow::{bail, Context, Result};
 use lance_context_ingest::application::{annotations, Config};
 use std::{future::IntoFuture, net::SocketAddr, path::Path};

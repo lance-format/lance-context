@@ -307,6 +307,9 @@ impl Runtime {
     }
 
     /// Publication/protocol failures stop this owner and its read barriers.
+    /// A structured uncertain Pin or Confirm holds its frozen batch while
+    /// resolving that exact selected operation; bounded apply and point reads
+    /// stay live under their existing budgets.
     /// An I/O failure writing an uncommitted body pauses publication while the
     /// bounded applier and owned point reads remain live. It does not retry the
     /// upload. A fenced restart reconciles the retained plan and replays its cut.
@@ -314,7 +317,9 @@ impl Runtime {
     /// An in-flight sealed DELETE retains one bounded page while publication
     /// continues. Failed outcomes pause new publication until that sealed page
     /// clears; applied values remain readable. Only immutable DELETE requests repeat;
-    /// this loop never invents a request or blindly retries failed mutations.
+    /// an uncertain deletion fence first repeats its exact monotonic catalog
+    /// retirement, with no DELETE or new publication until confirmed. This loop
+    /// never invents a request or blindly retries failed business mutations.
     /// One admitted native annotation index writer can outlive cancellation, retaining
     /// its workspace until completion. It cannot publish a manifest itself.
     pub async fn run(mut self, shutdown: impl Future<Output = ()>) -> Result<()> {
@@ -383,6 +388,13 @@ impl Publisher {
                 self.publish_next().await
             };
             if let Err(error) = result {
+                if error.is::<materializer::retirement::HistoryUnknown>() {
+                    // Retirement runs before freezing or preparing a new
+                    // publication. Keep the bounded apply/read path alive;
+                    // the next iteration captures fresh catalog authority.
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    continue;
+                }
                 if error.is::<mixed::BodyWriteFailed>() {
                     // This upload never reached a native commit. Retain the
                     // frozen generation and WAL instead of dropping the whole
@@ -673,28 +685,21 @@ impl Publisher {
                 Ok::<_, anyhow::Error>((selected, record.identity))
             })
             .await?;
-        let reply = phases
+        phases
             .measure(
                 Phase::AnnotationCommitConfirm,
-                materializer::commit(
-                    &self.service.ingress.client,
-                    Command::Confirm(p::ConfirmPublication {
-                        authority: self.catalog.authority().clone(),
-                        incarnation: self.service.ingress.scope.incarnation,
-                        transaction: pending.plan.transaction,
-                        plan_index: pending.index,
-                        prepared_index: prepared.index,
-                        descriptor_digest: prepared.descriptors.digest,
-                        target,
-                        manifest_identity,
-                    }),
-                ),
+                self.catalog.confirm_publication(p::ConfirmPublication {
+                    authority: self.catalog.authority().clone(),
+                    incarnation: self.service.ingress.scope.incarnation,
+                    transaction: pending.plan.transaction,
+                    plan_index: pending.index,
+                    prepared_index: prepared.index,
+                    descriptor_digest: prepared.descriptors.digest,
+                    target,
+                    manifest_identity,
+                }),
             )
             .await?;
-        ensure!(
-            matches!(reply, Applied::Publisher(p::Reply::Published(_))),
-            "annotation confirmation rejected: {reply:?}"
-        );
         Ok(selected)
     }
 }

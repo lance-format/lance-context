@@ -238,15 +238,20 @@ pub fn is_pending_generations_exceeded(err: &LanceError) -> bool {
     err.to_string().contains(PENDING_GENERATIONS_EXCEEDED)
 }
 
-/// What a [`StorageBase::flush`] actually did, for the `outcome` metric label.
+/// Result of a [`StorageBase::flush_with_outcome`] operation.
+///
+/// This describes the writer operation, not a receipt for a particular append
+/// or a publication watermark. In particular, recovery does not identify which
+/// in-flight requests were included in the replayed WAL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FlushOutcome {
+#[non_exhaustive]
+pub enum FlushOutcome {
     /// A memtable was sealed and drained into a flushed generation.
     Sealed,
     /// No resident writer, so nothing to seal (the common case).
     Noop,
-    /// The writer's epoch was superseded by a merge; nothing to flush.
-    Fenced,
+    /// A fenced writer was reopened and its durable WAL replayed and sealed.
+    RecoveredFence,
 }
 
 /// Which physical sources a read scans.
@@ -384,7 +389,8 @@ impl PreparedMerge {
 
 /// Configuration for opening a [`StorageBase`].
 #[derive(Clone)]
-pub(crate) struct StorageBaseOptions {
+#[non_exhaustive]
+pub struct StorageBaseOptions {
     /// Object-store credentials/config (e.g. S3), forwarded to Lance.
     pub storage_options: Option<HashMap<String, String>>,
     /// Stable identity of the writing server instance. Writes go to the MemWAL
@@ -455,23 +461,54 @@ pub(crate) struct StorageBaseOptions {
     pub seal_on_put: bool,
 }
 
-/// Schema-agnostic Lance storage: dataset handle, MemWAL write path, WAL merge,
-/// compaction, indexing, and LSM reads. See the module docs.
-pub(crate) struct StorageBase {
+impl StorageBaseOptions {
+    /// Configure an application-owned Arrow schema and merge key.
+    ///
+    /// Writes seal before returning by default. Set `seal_on_put = false` only
+    /// when the application drives publication separately. Concurrent writer
+    /// instances must supply distinct, stable `shard_id` values.
+    pub fn new(schema: Arc<Schema>, key_column: impl Into<String>) -> Self {
+        Self {
+            storage_options: None,
+            shard_id: None,
+            merge_after_generations: None,
+            merge_max_generations: None,
+            merge_max_bytes: None,
+            key_index_type: crate::KeyIndexType::default(),
+            pending_generations_warn: None,
+            pending_generations_max: None,
+            merge_budget: None,
+            session: None,
+            schema,
+            key_column: key_column.into(),
+            latest_schema: None,
+            seal_on_put: true,
+        }
+    }
+}
+
+/// Schema-agnostic storage for applications that own their Arrow schema and
+/// domain logic. Provides WAL writes, consistent base/WAL reads and maintenance.
+///
+/// Each live writer must own a distinct, stable shard identity. Configure it
+/// with [`StorageBaseOptions::shard_id`]; opening a successor writer is not a
+/// distributed ownership protocol. Reads should use [`Self::read_consistent`]
+/// to include published WAL and refresh the base manifest together.
+pub struct StorageBase {
     /// The base table. `pub(crate)` because concrete stores build their own
     /// schema-specific scans and projections directly against it.
-    pub dataset: Dataset,
+    pub(crate) dataset: Dataset,
     /// MemWAL shard this instance writes to (derived from `shard_id`).
-    pub write_shard: Uuid,
+    pub(crate) write_shard: Uuid,
     /// Object-store options, retained so a self-merge can re-append flushed
     /// generation data into the base table with the same credentials.
-    pub storage_options: Option<HashMap<String, String>>,
+    pub(crate) storage_options: Option<HashMap<String, String>>,
     /// Shared Lance session used for the base dataset and every reload
     /// (compact, index, generation reads), so all resident stores share one
     /// capacity-bounded cache.
-    pub session: Option<Arc<Session>>,
+    pub(crate) session: Option<Arc<Session>>,
     /// Merge/primary key column; the LSM dedup key and indexed column.
-    pub key_column: String,
+    pub(crate) key_column: String,
     /// Latest expected schema for merge-time evolution; see the option.
     latest_schema: Option<Arc<Schema>>,
     /// Whether `put` seals before returning; see [`StorageBaseOptions::seal_on_put`].
@@ -513,8 +550,8 @@ pub(crate) struct StorageBase {
     deleted: bool,
     /// Resident MemWAL writer for this instance's shard, wrapped for `&self`
     /// concurrent access. The [`tokio::sync::Mutex`] is held only to
-    /// fetch-or-open and clone the `Arc` (see [`Self::resident_writer`]) and to
-    /// invalidate a fenced writer (see [`Self::invalidate_writer`]); it is
+    /// fetch-or-open and clone the `Arc`, including replacement of a fenced
+    /// writer (see [`Self::resident_writer`]); it is
     /// **never** held across `put`, so steady-state appends run concurrently.
     write_writer: tokio::sync::Mutex<Option<Arc<ShardWriter>>>,
 }
@@ -674,6 +711,19 @@ impl StorageBase {
         self.dataset.uri()
     }
 
+    /// Base-table handle for metadata inspection. Its fragments alone do not
+    /// include pending WAL; use `read_consistent` for a complete read view.
+    #[must_use]
+    pub fn dataset(&self) -> &Dataset {
+        &self.dataset
+    }
+
+    /// Column used to deduplicate WAL and base-table rows.
+    #[must_use]
+    pub fn key_column(&self) -> &str {
+        &self.key_column
+    }
+
     /// Current base dataset manifest version.
     #[must_use]
     pub fn version(&self) -> u64 {
@@ -747,8 +797,9 @@ impl StorageBase {
     /// connection is pooled, rather than paying a cold DNS resolution + TCP/TLS
     /// handshake + epoch claim per append.
     ///
-    /// Retried exactly once on a fence: a fence means a merge superseded our
-    /// epoch, and invalidating + reopening re-claims the current one. Rows are
+    /// Retried exactly once on a fence: either this writer self-fenced after a
+    /// persistence failure or a successor superseded its epoch. Reopening
+    /// claims a new epoch and replays durable WAL. Rows are
     /// de-duplicated by the key column at read time, so a retried append can
     /// never double-count.
     pub async fn put(&self, batches: Vec<RecordBatch>) -> LanceResult<()> {
@@ -790,14 +841,16 @@ impl StorageBase {
     }
 
     async fn put_inner(&self, batches: Vec<RecordBatch>) -> LanceResult<()> {
-        let writer = self.resident_writer().await?;
+        let writer = self.resident_writer(None).await?;
         match writer.put(batches.clone()).await {
             Ok(_) => Ok(()),
             Err(err) if is_fenced_error(&err) => {
-                // Drop the fenced writer without close() — its epoch is already
-                // dead — and reopen against the current epoch for a single retry.
-                self.invalidate_writer(&writer).await;
-                let writer = self.resident_writer().await?;
+                warn!(uri = %self.uri(), shard = %self.write_shard,
+                    fence_reason = ?err.fence_reason(), error = %err,
+                    "reopening fenced writer after put failure; replaying durable WAL");
+                // Last-owner drop cancels the old background tasks without
+                // trying to flush against its dead epoch. Reopen replays WAL.
+                let writer = self.resident_writer(Some(&writer)).await?;
                 writer.put(batches).await?;
                 Ok(())
             }
@@ -809,15 +862,26 @@ impl StorageBase {
     /// held only to read-or-open and clone the `Arc`; it is released before the
     /// caller `put`s, so steady-state appends run concurrently. Opening under the
     /// lock serializes only the (rare) first open / post-fence reopen.
-    async fn resident_writer(&self) -> LanceResult<Arc<ShardWriter>> {
+    /// When replacing a fence, reuse an already-installed successor. Keep the
+    /// old slot until opening succeeds so a failed or cancelled reopen remains
+    /// visible to the next periodic flush, even without another append.
+    async fn resident_writer(
+        &self,
+        replace: Option<&Arc<ShardWriter>>,
+    ) -> LanceResult<Arc<ShardWriter>> {
         let mut guard = self.write_writer.lock().await;
         if let Some(writer) = guard.as_ref() {
-            return Ok(writer.clone());
+            if replace.is_none_or(|stale| !Arc::ptr_eq(writer, stale)) {
+                return Ok(writer.clone());
+            }
         }
         let config = ShardWriterConfig {
             shard_id: self.write_shard,
             #[cfg(feature = "metrics")]
-            observer: Some(Arc::new(crate::metrics::MemtableFlushMetrics::default())),
+            observer: Some(Arc::new(crate::metrics::MemtableFlushMetrics::new(
+                self.uri(),
+                self.write_shard,
+            ))),
             ..Default::default()
         };
         let writer = Arc::new(
@@ -829,19 +893,6 @@ impl StorageBase {
         Ok(writer)
     }
 
-    /// Invalidate a fenced writer so the next [`Self::resident_writer`] reopens.
-    /// Identity-checked: only clears the slot if it still holds `stale`, so when
-    /// N concurrent appends all fence on the same writer, the first
-    /// clears+reopens and the rest observe a fresh writer and reuse it — exactly
-    /// one reopen, and no append installs a writer another append just
-    /// invalidated.
-    async fn invalidate_writer(&self, stale: &Arc<ShardWriter>) {
-        let mut guard = self.write_writer.lock().await;
-        if guard.as_ref().is_some_and(|cur| Arc::ptr_eq(cur, stale)) {
-            *guard = None;
-        }
-    }
-
     /// Materialize the active memtable into a flushed, queryable generation:
     /// `force_freeze_active` freezes it and hands it to the background flusher,
     /// then `wait_for_flush_drain` blocks until every frozen memtable has landed
@@ -851,6 +902,13 @@ impl StorageBase {
     /// This is the visibility half of the write path, decoupled from the durable
     /// append in [`Self::put`]. A no-op when no writer is resident.
     pub async fn flush(&self) -> LanceResult<()> {
+        self.flush_with_outcome().await.map(|_| ())
+    }
+
+    /// Publish the resident writer's buffered rows and report whether it sealed,
+    /// had no resident writer, or recovered a fenced writer. This has the same
+    /// publication behavior as [`Self::flush`]; see [`FlushOutcome`] for limits.
+    pub async fn flush_with_outcome(&self) -> LanceResult<FlushOutcome> {
         let started = timer_start!();
         let result = self.flush_inner().await;
         // `outcome` is worth its cardinality: the three paths differ by orders of
@@ -864,13 +922,13 @@ impl StorageBase {
                     "outcome" => match _outcome {
                         FlushOutcome::Sealed => "sealed",
                         FlushOutcome::Noop => "noop",
-                        FlushOutcome::Fenced => "fenced",
+                        FlushOutcome::RecoveredFence => "recovered_fence",
                     },
                 );
             }
             Err(_) => count!(crate::metrics::ROLLOUT_FLUSH_ERRORS),
         }
-        result.map(|_| ())
+        result
     }
 
     /// Recover a restarted instance's durable WAL before its cleanup merge.
@@ -911,7 +969,7 @@ impl StorageBase {
         // this writer remains resident. One indivisible entry can exceed the
         // configured soft memory ceiling.
         info!(shard = %self.write_shard, "recovering own WAL before cleanup merge");
-        self.resident_writer().await?;
+        self.resident_writer(None).await?;
         // Keep the recovered writer resident so concurrent ingest shares it;
         // a later cheap flush can also finish sealing if this caller is cancelled.
         self.flush().await?;
@@ -926,24 +984,27 @@ impl StorageBase {
         let Some(writer) = writer else {
             return Ok(FlushOutcome::Noop);
         };
-        let fence = match writer.force_freeze_active().await {
-            Ok(fence) => fence,
-            // A fence means a merge superseded our epoch; the next `put` reopens
-            // and replays. Nothing to flush against the dead epoch.
+        let seal = async { writer.force_freeze_active().await?.wait().await }.await;
+        match seal {
+            Ok(()) => Ok(FlushOutcome::Sealed),
+            // Either the freeze or its asynchronous flush can discover a fence.
+            // Recover here, even when no new put arrives to reopen the writer.
             Err(err) if is_fenced_error(&err) => {
-                self.invalidate_writer(&writer).await;
-                return Ok(FlushOutcome::Fenced);
+                warn!(uri = %self.uri(), shard = %self.write_shard,
+                    fence_reason = ?err.fence_reason(), error = %err,
+                    "reopening fenced writer after flush failure; replaying durable WAL");
+                let writer = self.resident_writer(Some(&writer)).await?;
+                writer.force_freeze_active().await?.wait().await?;
+                Ok(FlushOutcome::RecoveredFence)
             }
-            Err(err) => return Err(err),
-        };
-        fence.wait().await?;
-        Ok(FlushOutcome::Sealed)
+            Err(err) => Err(err),
+        }
     }
 
     /// Gracefully close the resident writer, draining its background tasks.
     ///
-    /// [`ShardWriter`] has no `Drop`, so its background tasks are only reclaimed
-    /// by an explicit `close().await`. Call this before dropping a store on a
+    /// Dropping the last writer cancels its tasks but does not seal its WAL.
+    /// Call this before dropping a store on a
     /// path that can `await` (e.g. an LRU eviction that owns the last handle).
     /// Idempotent: a no-op when no writer is resident.
     pub async fn close(&mut self) -> LanceResult<()> {
@@ -2698,6 +2759,13 @@ impl StorageBase {
     /// Payload retries similarly start at the first missing-file failure: a
     /// slow initial read must still be able to recover WAL reclaimed by a merge.
     /// The retry budget limits starting another attempt, not a valid scan.
+    ///
+    /// The callback must complete the actual read before its future returns:
+    /// await `try_collect` or fully consume any stream inside the callback.
+    /// Do not return a lazy scanner, stream, or future, or retain the captured
+    /// dataset or shard snapshots for later reads. Read protection and retries
+    /// do not cover reads performed after the callback returns. The callback
+    /// may be invoked more than once, so keep it free of business side effects.
     pub async fn read_consistent<T, F, Fut>(&self, source: ListSource, read: F) -> LanceResult<T>
     where
         F: FnMut(Dataset, Vec<ShardSnapshot>) -> Fut,
@@ -3104,8 +3172,8 @@ impl StorageBase {
 impl Drop for StorageBase {
     /// Best-effort drain of a still-resident writer's background tasks.
     ///
-    /// [`ShardWriter`] has no `Drop`, so dropping it without `close().await`
-    /// leaks its background tasks. The graceful path is [`Self::close`], but a
+    /// Dropping the last writer cancels its tasks without sealing its WAL.
+    /// The graceful path is [`Self::close`], but a
     /// store can also be dropped without an `await` (e.g. LRU eviction). When a
     /// Tokio runtime is available we move the writer into a detached task that
     /// closes it; otherwise we can only drop it.
@@ -3140,7 +3208,8 @@ impl Drop for StorageBase {
                             tracing::debug!(
                                 shard = %shard,
                                 "dropped writer is still shared by an in-flight append; \
-                                 close deferred to the last Arc holder"
+                                 task cancellation deferred to the last Arc holder; \
+                                 unsealed rows require WAL replay"
                             );
                         }
                     }
@@ -3148,8 +3217,8 @@ impl Drop for StorageBase {
             } else {
                 warn!(
                     shard = %shard,
-                    "writer dropped with no Tokio runtime available; its background tasks \
-                     leak and unflushed rows remain invisible until the next WAL replay"
+                    "writer dropped with no Tokio runtime available for close; \
+                     unflushed rows remain invisible until the next WAL replay"
                 );
             }
         }
