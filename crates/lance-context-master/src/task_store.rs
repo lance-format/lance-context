@@ -10,9 +10,7 @@
 use lance_context_metrics::etcd::{ObserveEtcd, Operation};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-#[cfg(test)]
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -267,6 +265,8 @@ struct EtcdTaskStore {
     claim_owner_swap: std::sync::Mutex<Option<(String, String)>>,
     #[cfg(test)]
     lose_claim_response: AtomicBool,
+    #[cfg(test)]
+    lose_finish_response: AtomicBool,
 }
 
 /// Ownership of one running task. Dropping the claim stops lease renewal; etcd
@@ -274,9 +274,20 @@ struct EtcdTaskStore {
 pub struct TaskClaim {
     pub task: TaskRecord,
     backend: ClaimBackend,
+    execution: OnceLock<String>,
+    ambiguous_execution: AtomicBool,
 }
 
 impl TaskClaim {
+    /// Retain only one actual started execution; several under a claim are not proof.
+    pub(crate) fn record_execution(&self, execution: &str) {
+        if self.execution.set(execution.to_owned()).is_err()
+            && self.execution.get().map(String::as_str) != Some(execution)
+        {
+            self.ambiguous_execution.store(true, Ordering::Release);
+        }
+    }
+
     pub(crate) fn recovering_orphaned_catchup(&self) -> bool {
         self.backend.orphaned_catchup
     }
@@ -1986,6 +1997,8 @@ impl EtcdTaskStore {
             claim_owner_swap: Default::default(),
             #[cfg(test)]
             lose_claim_response: AtomicBool::new(false),
+            #[cfg(test)]
+            lose_finish_response: AtomicBool::new(false),
             prefix: config.etcd.prefix().to_string(),
             lease_ttl: config.etcd_lease_ttl_secs,
             prepare_targets: config.maintenance.compaction_prepare_targets.clone(),
@@ -2963,6 +2976,8 @@ impl EtcdTaskStore {
                     return Ok((
                         Some(TaskClaim {
                             task,
+                            execution: OnceLock::new(),
+                            ambiguous_execution: AtomicBool::new(false),
                             backend: ClaimBackend {
                                 token,
                                 lease_id,
@@ -2997,6 +3012,16 @@ impl EtcdTaskStore {
     }
 
     async fn finish(&self, claim: TaskClaim, outcome: Result<String, String>) -> lance::Result<()> {
+        let ambiguous = claim.ambiguous_execution.load(Ordering::Acquire);
+        let execution = claim.execution.into_inner();
+        let attempt_binding = if ambiguous {
+            "multiple"
+        } else if execution.is_some() {
+            "single"
+        } else {
+            "unobserved"
+        };
+        let execution = execution.filter(|_| !ambiguous);
         let ClaimBackend {
             token,
             lease_id,
@@ -3063,15 +3088,36 @@ impl EtcdTaskStore {
         let completed = client
             .txn(Txn::new().when(compares).and_then(operations))
             .observed(Operation::TaskFinish)
-            .await
-            .map(|response| response.succeeded())
+            .await;
+        #[cfg(test)]
+        let completed = if self.lose_finish_response.swap(false, Ordering::AcqRel) {
+            Err(etcd_client::Error::Internal(
+                "injected lost finish response".into(),
+            ))
+        } else {
+            completed
+        };
+        let completed = completed
+            .map(|response| {
+                (
+                    response.succeeded(),
+                    response.header().map(|header| header.revision()),
+                )
+            })
             .map_err(etcd_error("complete task"));
         drop(keepalive);
         // Cleanup cannot change whether the terminal-state CAS committed. In
         // particular, lease expiry must not hide a rejected CAS or turn a
         // committed merge into a failure/backoff in a dedicated executor.
         let cleanup = self.revoke_lease(lease_id).await;
-        completion_result(&task, lease_id, completed, cleanup)
+        completion_result(
+            &task,
+            lease_id,
+            execution.as_deref(),
+            attempt_binding,
+            completed,
+            cleanup,
+        )
     }
 
     async fn resolve_claim_response(
@@ -4025,24 +4071,41 @@ fn decode_task(value: &[u8], key: &str) -> lance::Result<TaskRecord> {
 fn completion_result(
     task: &TaskRecord,
     lease_id: i64,
-    completed: lance::Result<bool>,
+    execution: Option<&str>,
+    attempt_binding: &str,
+    completed: lance::Result<(bool, Option<i64>)>,
     cleanup: lance::Result<()>,
 ) -> lance::Result<()> {
     let outcome = match &completed {
-        Ok(true) => "committed",
-        Ok(false) => "claim_lost",
+        Ok((true, _)) => "committed",
+        Ok((false, _)) => "claim_lost",
         Err(_) => "unknown",
     };
     metrics::counter!("master_task_completion_total", "outcome" => outcome).increment(1);
-    tracing::info!(task = %task.id, target = %task.target, lease_id, outcome, "task completion transaction result");
+    // A terminal record is proof only at the revision acknowledged by its CAS.
+    // Missing headers, rejected claims and lost responses retain no positive fields.
+    let terminal_revision = match &completed {
+        Ok((true, Some(revision))) if *revision > 0 => Some(*revision),
+        _ => None,
+    };
+    let terminal_state = terminal_revision.and_then(|_| match task.state {
+        TaskState::Done => Some("done"),
+        TaskState::Failed => Some("failed"),
+        _ => None,
+    });
+    let finished_at_ms = terminal_state.and(task.finished_at);
+    tracing::info!(task = %task.id, target = %task.target, lease_id, outcome,
+        proof_version = 1, attempt_binding, execution,
+        terminal_revision, terminal_state, finished_at_ms,
+        "task completion transaction result");
     if let Err(error) = cleanup {
         metrics::counter!("master_task_completion_cleanup_failed_total").increment(1);
         tracing::warn!(task = %task.id, target = %task.target, lease_id, outcome, %error,
             "task lease cleanup failed; preserving completion transaction result");
     }
     match completed {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(lance::Error::io(format!(
+        Ok((true, _)) => Ok(()),
+        Ok((false, _)) => Err(lance::Error::io(format!(
             "task '{}' lost its etcd claim before completion",
             task.id
         ))),
@@ -6279,16 +6342,159 @@ pub(crate) mod tests {
             .unwrap();
     }
 
+    #[derive(Clone, Default)]
+    pub(crate) struct CompletionLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CompletionLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl CompletionLog {
+        pub(crate) fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync {
+            let log = self.clone();
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || log.clone())
+                .finish()
+        }
+
+        pub(crate) fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn native_completion_proof_tracks_real_terminal_cas() {
+        use tracing::instrument::WithSubscriber;
+        for case in ["done", "failed", "lost", "multiple", "reclaimed"] {
+            let (_dir, _cfg, store) = preparation_test_store().await;
+            let task = store
+                .enqueue(TaskKind::MergeWal, "hot", vec![])
+                .await
+                .unwrap();
+            let mut claim = store.claim_next().await.unwrap().unwrap();
+            let first_execution = generate_id();
+            claim.record_execution(&first_execution);
+            let first_lease = claim.backend.lease_id;
+            let log = CompletionLog::default();
+            async {
+                if case == "reclaimed" {
+                    store.inner.revoke_lease(first_lease).await.unwrap();
+                    store.recover_orphaned().await.unwrap();
+                    let replacement = store.claim_next().await.unwrap().unwrap();
+                    assert_eq!(replacement.task.id, task.id);
+                    assert_ne!(replacement.backend.lease_id, first_lease);
+                    assert!(store.finish(claim, Ok("stale".into())).await.is_err());
+                    claim = replacement;
+                    claim.record_execution(&generate_id());
+                }
+                if case == "multiple" {
+                    claim.record_execution(&generate_id());
+                }
+                if case == "lost" {
+                    store
+                        .inner
+                        .lose_finish_response
+                        .store(true, Ordering::Release);
+                }
+                let result = if case == "failed" {
+                    Err("failed after work".into())
+                } else {
+                    Ok("finished".into())
+                };
+                assert_eq!(store.finish(claim, result).await.is_err(), case == "lost");
+            }
+            .with_subscriber(log.subscriber())
+            .await;
+            let raw = store
+                .inner
+                .client
+                .clone()
+                .get(store.inner.task_key(&task.id), None)
+                .await
+                .unwrap();
+            let row = &raw.kvs()[0];
+            let terminal: TaskRecord = serde_json::from_slice(row.value()).unwrap();
+            let expected = if case == "failed" { "failed" } else { "done" };
+            assert_eq!(
+                terminal.state,
+                if case == "failed" {
+                    TaskState::Failed
+                } else {
+                    TaskState::Done
+                }
+            );
+            let text = log.text();
+            println!("CASE {case}\n{text}");
+            let events: Vec<_> = text
+                .lines()
+                .filter(|line| line.contains("task completion transaction result"))
+                .collect();
+            let event = events.last().unwrap();
+            if case == "lost" {
+                assert!(event.contains("outcome=\"unknown\""));
+                assert!(!event.contains("terminal_revision="));
+                assert!(!event.contains("terminal_state="));
+                assert!(!event.contains("finished_at_ms="));
+            } else {
+                assert!(event.contains("outcome=\"committed\""));
+                assert!(event.contains(&format!("terminal_revision={}", row.mod_revision())));
+                assert!(event.contains(&format!("terminal_state=\"{expected}\"")));
+                assert!(
+                    event.contains(&format!("finished_at_ms={}", terminal.finished_at.unwrap()))
+                );
+                if case == "multiple" {
+                    assert!(event.contains("attempt_binding=\"multiple\""));
+                    assert!(!event.contains(" execution="));
+                } else {
+                    assert!(event.contains("attempt_binding=\"single\""));
+                }
+            }
+            if case == "reclaimed" {
+                assert_eq!(events.len(), 2);
+                assert!(events[0].contains("outcome=\"claim_lost\""));
+                assert!(!events[0].contains("terminal_revision="));
+                assert!(!event.contains(&format!("lease_id={first_lease} ")));
+                assert!(!event.contains(&first_execution));
+            }
+        }
+    }
+
     #[test]
     fn completion_cleanup_never_changes_the_transaction_outcome() {
         let task = new_task(TaskKind::MergeWal, "hot", Vec::new());
         let cleanup_error = || Err(lance::Error::io("injected lease revoke timeout"));
-        assert!(completion_result(&task, 1, Ok(true), cleanup_error()).is_ok());
-        let lost = completion_result(&task, 1, Ok(false), cleanup_error()).unwrap_err();
+        assert!(completion_result(
+            &task,
+            1,
+            None,
+            "unobserved",
+            Ok((true, Some(1))),
+            cleanup_error()
+        )
+        .is_ok());
+        let lost = completion_result(
+            &task,
+            1,
+            None,
+            "unobserved",
+            Ok((false, Some(1))),
+            cleanup_error(),
+        )
+        .unwrap_err();
         assert!(lost.to_string().contains("lost its etcd claim"));
         let unknown = completion_result(
             &task,
             1,
+            None,
+            "unobserved",
             Err(lance::Error::io("injected completion response loss")),
             cleanup_error(),
         )

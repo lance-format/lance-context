@@ -407,6 +407,7 @@ where
         .start(&reserved)
         .await?
         .ok_or("maintenance start lost")?;
+    claim.record_execution(&running.id);
     let worker_failures = if maintenance == MaintenanceKind::Catchup
         && crate::local_merge::selected(&state.config, &claim.task.target)
     {
@@ -440,7 +441,8 @@ where
     .await
     .unwrap_or_else(|_| Err("maintenance executor panicked".into()));
     tracing::info!(target = %running.target, execution = %running.id,
-        task_id = %claim.task.id, %executor_id, work = ?scope.work(),
+        task_id = %claim.task.id, %executor_id, proof_version = 1, lease_id = proof.lease_id,
+        work = ?scope.work(),
         success = outcome.is_ok(), "maintenance work outcome before commit drain");
     // The work future has been dropped, so no returned staged committer can
     // run. Owned preparation children retain their memory until completion;
@@ -898,6 +900,70 @@ mod tests {
         assert!(!fenced(&enabled, "datagen:legacy"));
         assert!(!enabled.merge_rollout.owned("new-hot-table"));
         assert!(!enabled.merge_rollout.owned("generic:new-hot-table"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn native_completion_proof_binds_actual_started_work() {
+        use crate::task_store::tests::CompletionLog;
+        use tracing::instrument::WithSubscriber;
+        let (_dir, state) = fixture().await;
+        let claim = claim(&state, TaskKind::MergeWal).await;
+        let lease = state.task_store.merge_claim(&claim).lease_id;
+        let task = claim.task.id.clone();
+        let log = CompletionLog::default();
+        async {
+            let outcome = run_as(&state, &claim, MaintenanceKind::Catchup, async {
+                Ok("isolated successful work".into())
+            })
+            .await;
+            assert!(outcome.is_ok(), "{outcome:?}");
+            state.task_store.finish(claim, outcome).await.unwrap();
+        }
+        .with_subscriber(log.subscriber())
+        .await;
+        let text = log.text();
+        println!("ACTUAL START\n{text}");
+        let work = text
+            .lines()
+            .find(|line| line.contains("maintenance work outcome before commit drain"))
+            .unwrap();
+        let completion = text
+            .lines()
+            .find(|line| line.contains("task completion transaction result"))
+            .unwrap();
+        for event in [work, completion] {
+            assert!(event.contains("proof_version=1"));
+            assert!(event.contains(&format!("lease_id={lease} ")));
+            assert!(event.contains(&task));
+        }
+        let execution = work
+            .split("execution=")
+            .nth(1)
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap();
+        assert!(completion.contains(&format!("execution=\"{execution}\"")));
+        assert!(completion.contains("attempt_binding=\"single\""));
+        assert!(completion.contains("terminal_state=\"done\""));
+        let mut client = state.config.etcd.connect().await.unwrap();
+        let response = client
+            .get(format!("{}/tasks/{task}", state.config.etcd.prefix()), None)
+            .await
+            .unwrap();
+        let row = &response.kvs()[0];
+        let terminal: serde_json::Value = serde_json::from_slice(row.value()).unwrap();
+        assert_eq!(terminal["state"], "done");
+        assert!(completion.contains(&format!("terminal_revision={}", row.mod_revision())));
+        println!(
+            "CANONICAL {}",
+            serde_json::json!({
+                "revision": row.mod_revision(),
+                "observed_at": chrono::Utc::now().timestamp_millis() as f64 / 1000.0,
+                "task": terminal,
+            })
+        );
     }
 
     async fn fixture() -> (tempfile::TempDir, Arc<MasterState>) {
