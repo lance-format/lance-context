@@ -115,8 +115,11 @@ tokenizer without stemming or stop-word removal. Arrays, root scalar documents,
 and paths outside the extraction budget are not full-text indexed in this
 increment; they remain available through document reads and logical filtering.
 
-The first search after layout growth automatically backfills historical values
-and builds missing inverted indexes. `prepare_text_search` performs that work in
+The first search after text-layout growth checks historical residuals and
+backfills only when matching text remains there, then builds missing inverted
+indexes. Fresh already-extracted text and numeric-only layout growth do not
+rewrite data. A persisted per-text-column marker avoids repeating this check;
+legacy backfill-prefix metadata remains readable. `prepare_text_search` performs that work in
 advance. Preparation can be expensive: it streams a rewrite of the dataset and
 creates an index for each selected string path. Subsequent appends with the same
 layout use Lance's indexed-plus-unindexed-tail search. Selection is automatic;
