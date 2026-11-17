@@ -35,6 +35,8 @@ mod storage;
 mod store;
 mod store_base;
 pub mod variant_shredding;
+mod variant_store;
+pub use variant_store::VariantDocumentStore;
 mod wal_gc;
 pub use wal_gc::{
     discover_retired_wal_at_uri, discover_retired_wal_under_root, wal_collection_enabled,

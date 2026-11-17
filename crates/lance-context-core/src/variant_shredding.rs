@@ -130,6 +130,32 @@ impl AutoVariantLayout {
         &self.fields
     }
 
+    /// Reconsider sampled paths on every append. String paths take priority;
+    /// new sampled paths precede old paths of the same kind. Keep old paths in
+    /// remaining slots and sort the result to avoid order-only migrations.
+    /// Stores must rewrite atomically when this returns a different layout.
+    pub fn evolve(&self, documents: &[Value], policy: &ShredPolicy) -> Result<Self> {
+        self.target_type()?;
+        let proposed = Self::infer(documents, policy)?;
+        let mut candidates = proposed.fields;
+        candidates.extend(self.fields.iter().cloned());
+        candidates.sort_by_key(|field| field.data_type != ShredType::String);
+        let mut fields: Vec<ShredField> = Vec::new();
+        for field in candidates {
+            if fields.len() == policy.max_columns {
+                break;
+            }
+            if fields.iter().any(|other| {
+                other.path.starts_with(&field.path) || field.path.starts_with(&other.path)
+            }) {
+                continue;
+            }
+            fields.push(field);
+        }
+        fields.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(Self { fields })
+    }
+
     pub fn target_type(&self) -> Result<DataType> {
         let layout = ShredLayout {
             fields: self.fields.clone(),
