@@ -62,6 +62,7 @@ pub(crate) async fn spawn_scan_demand(
         let _permit = permit;
         let result = tokio::time::timeout(SCAN_PUBLISH_TIMEOUT, async {
             let marks = match kind {
+                ScanKind::Registered => return Ok(0),
                 ScanKind::Rollout => {
                     RolloutStore::open_existing_with_options(&uri, rollout_options)
                         .await

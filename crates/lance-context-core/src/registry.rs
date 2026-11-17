@@ -117,7 +117,7 @@ impl StoreRegistry for LanceRegistry {
 pub struct MirroredRegistry {
     pub primary: Arc<dyn StoreRegistry>,
     pub mirror: Arc<dyn StoreRegistry>,
-    pub label: &'static str,
+    pub label: String,
 }
 
 impl MirroredRegistry {

@@ -518,7 +518,7 @@ mod tests {
         let mirrored = MirroredRegistry {
             primary: lance.clone(),
             mirror: etcd_dyn.clone(),
-            label: "rollout",
+            label: "rollout".into(),
         };
         mirrored.upsert("new", "/n").await.unwrap();
         mirrored.remove("pre-1").await.unwrap();

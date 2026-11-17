@@ -311,8 +311,11 @@ async fn schedule_repair(state: &Arc<MasterState>, failed: &TaskRecord) {
 async fn run_repair(state: &Arc<MasterState>, claim: &TaskClaim) -> Result<String, String> {
     let task = &claim.task;
     let (kind, name) = parse_target(&task.target);
-    if kind != StoreKind::Rollout {
-        return Err(format!("repair is not implemented for {kind:?} stores"));
+    if kind != StoreKind::Rollout || state.registered_target(&task.target).is_some() {
+        return Err(format!(
+            "repair is not implemented for target '{}'",
+            task.target
+        ));
     }
     let uri = state.rollout_uri(name);
     let mut store = RolloutStore::open_existing_with_options(&uri, state.rollout_store_options())
@@ -778,7 +781,11 @@ async fn run_compaction(state: &Arc<MasterState>, task: &TaskRecord) -> Result<S
         // through the rollout code path with the wrong URI and schema.
         return Err(format!("compaction is not scheduled for {kind:?} stores"));
     }
-    let metrics = compact_inner(state, name).await?;
+    let metrics = if state.registered_target(&task.target).is_some() {
+        crate::registered_store::compact(state, &task.target).await?
+    } else {
+        compact_inner(state, name).await?
+    };
     finish_compaction(state, task, metrics).await
 }
 
@@ -787,7 +794,10 @@ async fn finish_compaction(
     task: &TaskRecord,
     metrics: lance::dataset::optimize::CompactionMetrics,
 ) -> Result<String, String> {
-    if state.config.index_after_compaction && metrics.fragments_added > 0 {
+    if state.registered_target(&task.target).is_none()
+        && state.config.index_after_compaction
+        && metrics.fragments_added > 0
+    {
         // Best-effort: the compaction itself is done; the next compaction of
         // this target re-enqueues the index anyway.
         if let Err(error) = enqueue_with_deps(
@@ -812,6 +822,28 @@ async fn finish_compaction(
 /// `Compact` for the same experiment never commit concurrently (`CreateIndex`
 /// vs `Rewrite` can conflict). Distinct experiments index concurrently.
 async fn run_index_id(state: &Arc<MasterState>, target: &str) -> Result<String, String> {
+    if state.registered_target(target).is_some() {
+        let uri = state
+            .target_uri(target)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("unknown maintenance target '{target}'"))?;
+        let mut store = crate::registered_store::open(state, &uri)
+            .await
+            .map_err(|e| e.to_string())?;
+        store
+            .create_configured_key_index()
+            .await
+            .map_err(|e| e.to_string())?;
+        crate::registered_store::maintain_indexes(&mut store)
+            .await
+            .map_err(|e| e.to_string())?;
+        return Ok(format!(
+            "built {} index on {}",
+            state.config.key_index_type.as_str(),
+            store.key_column()
+        ));
+    }
     let (kind, name) = parse_target(target);
     if kind != StoreKind::Rollout {
         return Err(format!("id indexing is not scheduled for {kind:?} stores"));
@@ -1086,7 +1118,7 @@ async fn sweep_candidates_inner(
             if hint.cooling_down()? {
                 continue;
             }
-            if hint.unchanged(&state.rollout_uri(&row.name), row.version, &options)? {
+            if hint.unchanged(&row.uri, row.version, &options)? {
                 metrics::counter!("master_compact_noop_suppressed_total").increment(1);
                 continue;
             }
@@ -1189,11 +1221,7 @@ async fn sweep_merge_wal_inner(
             // shard manifests before recreating work from those counts. Any
             // remaining generation (even below the trigger) keeps a partial
             // pass moving. Recovery and fresh writer/frontier paths bypass this.
-            let (kind, name) = parse_target(&row.name);
-            let uri = match kind {
-                StoreKind::Rollout => state.rollout_uri(name),
-                StoreKind::Generic => state.generic_uri(name),
-            };
+            let uri = row.uri.clone();
             if refresh.confirmed_empty(&row.name, &uri).await {
                 continue;
             }
@@ -1679,6 +1707,7 @@ mod tests {
             legacy_retirement_request: None,
             local_merge: Default::default(),
             append: Default::default(),
+            managed_store_kind: None,
             catchup: Default::default(),
             wal_tail: Default::default(),
             planner: Default::default(),
@@ -2768,12 +2797,22 @@ mod tests {
     #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn compact_sweep_reaches_useful_tail_after_suppressed_leaders() {
         let dir = TempDir::new().unwrap();
-        let state = MasterState::new(config(&dir)).await.unwrap();
+        let mut cfg = config(&dir);
+        cfg.managed_store_kind = Some("events".into());
+        let state = MasterState::new(cfg).await.unwrap();
         let options = compact_options_key(&state.compaction_config());
         let mut rows = Vec::new();
         for i in 0..=MAX_SWEEP_ENQUEUE {
-            let name = format!("noop-{i}");
-            let uri = state.rollout_uri(&name);
+            let (name, uri) = if i % 2 == 0 {
+                (
+                    format!("events:noop-{i}"),
+                    format!("{}/noop-{i}.events.lance", dir.path().display()),
+                )
+            } else {
+                let name = format!("noop-{i}");
+                let uri = state.rollout_uri(&name);
+                (name, uri)
+            };
             state
                 .task_store
                 .record_compact_noop(&name, &uri, 1, &options)
@@ -5868,6 +5907,142 @@ mod tests {
         assert_eq!(queued, 1, "only the rollout row is compacted");
         let tasks = state.task_store.list().await.unwrap();
         assert!(tasks.iter().all(|t| t.target == "r"), "{tasks:?}");
+    }
+
+    /// Discover a non-rollout table by its registry URI, build its declared key
+    /// index, and preserve indexed queries while compacting newly appended rows.
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn registered_store_maintenance_preserves_custom_key_queries() {
+        use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
+        use arrow_schema::{DataType, Field, Schema};
+        use lance::dataset::{Dataset, WriteMode, WriteParams};
+        use lance::index::DatasetIndexExt;
+
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.managed_store_kind = Some("events".into());
+        cfg.key_index_type = lance_context_core::KeyIndexType::Btree;
+        let state = MasterState::new(cfg).await.unwrap();
+        let uri = format!("{}/application-chosen-location.lance", dir.path().display());
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "sequence",
+            DataType::Int32,
+            false,
+        )
+        .with_metadata(
+            [("lance-schema:unenforced-primary-key".into(), "true".into())].into(),
+        )]));
+        let batch = |range| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from_iter_values(range))],
+            )
+            .unwrap()
+        };
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch(0..4))], schema.clone()),
+            &uri,
+            Some(WriteParams {
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        state
+            .managed_registry
+            .as_ref()
+            .unwrap()
+            .upsert("table", &uri)
+            .await
+            .unwrap();
+        crate::scanner::scan_once(&state).await.unwrap();
+        let row = state
+            .stats
+            .lock()
+            .await
+            .get("events:table")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.uri, uri);
+        assert_eq!(row.row_count, 4);
+        assert_eq!(row.fragment_count, 4);
+        assert!(state
+            .stats
+            .lock()
+            .await
+            .get("table")
+            .await
+            .unwrap()
+            .is_none());
+
+        let index = enqueue(&state, TaskKind::IndexId, "events:table")
+            .await
+            .unwrap();
+        let worker = spawn_scheduler(&state);
+        let indexed = await_terminal(&state, &index.id).await;
+        assert_eq!(indexed.state, TaskState::Done, "{indexed:?}");
+        let before = Dataset::open(&uri).await.unwrap();
+        let indexes = before.load_indices().await.unwrap();
+        let indexes: Vec<_> = indexes
+            .iter()
+            .filter(|index| {
+                index
+                    .index_details
+                    .as_ref()
+                    .is_some_and(|details| details.type_url.ends_with("BTreeIndexDetails"))
+            })
+            .collect();
+        assert_eq!(indexes.len(), 1);
+        assert_eq!(indexes[0].fields, vec![0]);
+
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch(4..8))], schema),
+            &uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let compact = enqueue(&state, TaskKind::Compact, "events:table")
+            .await
+            .unwrap();
+        let compacted = await_terminal(&state, &compact.id).await;
+        worker.abort();
+        assert_eq!(compacted.state, TaskState::Done, "{compacted:?}");
+        let after = Dataset::open(&uri).await.unwrap();
+        assert!(after.get_fragments().len() < 8);
+        assert_eq!(after.count_rows(None).await.unwrap(), 8);
+        for sequence in 0..8 {
+            assert_eq!(
+                after
+                    .count_rows(Some(format!("sequence = {sequence}")))
+                    .await
+                    .unwrap(),
+                1
+            );
+        }
+        let indexes = after.load_indices().await.unwrap();
+        let indexes: Vec<_> = indexes
+            .iter()
+            .filter(|index| {
+                index
+                    .index_details
+                    .as_ref()
+                    .is_some_and(|details| details.type_url.ends_with("BTreeIndexDetails"))
+            })
+            .collect();
+        assert_eq!(indexes.len(), 1);
+        let covered = indexes[0].fragment_bitmap.as_ref().unwrap();
+        assert!(after
+            .get_fragments()
+            .iter()
+            .all(|fragment| covered.contains(fragment.id() as u32)));
     }
 
     /// A `Compact` runs even while every `MergeWal` slot is occupied by slow

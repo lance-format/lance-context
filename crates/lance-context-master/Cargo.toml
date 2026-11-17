@@ -26,6 +26,7 @@ clap = { version = "4", features = ["derive", "env"] }
 etcd-client = { version = "0.19", features = ["tls"] }
 futures = "0.3"
 lance = "14.0.2"
+lance-index = "14.0.2"
 lance-table = "14.0.2"
 lru = "0.12"
 metrics = "0.24"
@@ -38,6 +39,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 async-trait = "0.1.92"
 lance-io = { version = "14.0.2", path = "../../vendor/lance-io" }
 object_store = "0.14.2"

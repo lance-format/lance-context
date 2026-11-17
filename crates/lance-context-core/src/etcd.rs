@@ -141,7 +141,7 @@ pub struct RegistryConfig {
 /// `EtcdConfig` is configured. Returns the mirrored composite when a mirror is
 /// requested. Fails when a requested backend is not available.
 pub async fn open_registry(
-    kind: &'static str,
+    kind: &str,
     lance_uri: &str,
     etcd: Option<(&Client, &str)>,
     config: &RegistryConfig,
@@ -151,7 +151,7 @@ pub async fn open_registry(
 
     async fn build(
         backend: RegistryBackend,
-        kind: &'static str,
+        kind: &str,
         lance_uri: &str,
         etcd: Option<(&Client, &str)>,
     ) -> LanceResult<Arc<dyn StoreRegistry>> {
@@ -192,6 +192,6 @@ pub async fn open_registry(
     Ok(Arc::new(MirroredRegistry {
         primary,
         mirror,
-        label: kind,
+        label: kind.to_string(),
     }))
 }

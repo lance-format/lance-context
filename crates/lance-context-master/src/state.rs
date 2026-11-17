@@ -73,6 +73,7 @@ pub struct MasterState {
     pub generic_registry: Arc<dyn StoreRegistry>,
     /// Datagen participates in the same registry migration as the worker.
     pub datagen_registry: Arc<dyn StoreRegistry>,
+    pub(crate) managed_registry: Option<Arc<dyn StoreRegistry>>,
     /// Periodically-refreshed per-experiment metrics (master-owned).
     pub stats: Mutex<StatsStore>,
     /// Last snapshot written to the stats table, kept in memory so
@@ -95,7 +96,7 @@ pub struct MasterState {
     record_stores: Mutex<LruCache<String, Arc<RwLock<RolloutStore>>>>,
     /// Process-wide Lance cache session attached to every rollout store opened
     /// by this master. `None` is only used when the configured budget is `0`.
-    rollout_session: Option<Arc<Session>>,
+    pub(crate) rollout_session: Option<Arc<Session>>,
     /// Shared data directory / object-store prefix.
     pub base_uri: String,
     /// Effective configuration.
@@ -148,6 +149,7 @@ impl MasterState {
         mut config: MasterConfig,
         before_init_release: impl std::future::Future<Output = ()>,
     ) -> lance::Result<Arc<Self>> {
+        config.validate_registered_store()?;
         config.merge_rollout.validate().map_err(lance::Error::io)?;
         config.catchup.validate().map_err(lance::Error::io)?;
         config
@@ -176,6 +178,7 @@ impl MasterState {
         // Protocol activation covers every master maintenance writer as well
         // as workers; a flag rollback must not restore unrecorded rewrites.
         config.maintenance.fence_legacy_maintenance |= config.merge_rollout.fence_legacy;
+        config.validate_registered_store()?;
         crate::local_merge::validate(&config).map_err(lance::Error::io)?;
         // Serialize first-time registry/stats creation and legacy backfill in
         // etcd mode. Followers wait briefly rather than racing Lance creates.
@@ -207,6 +210,18 @@ impl MasterState {
             &config.registry,
         )
         .await?;
+        let managed_registry = match &config.managed_store_kind {
+            Some(kind) => Some(
+                open_registry(
+                    kind,
+                    &join_uri(&base_uri, &format!("_registry.{kind}.lance")),
+                    etcd,
+                    &config.registry,
+                )
+                .await?,
+            ),
+            None => None,
+        };
         // A dedicated one-table executor must not scan/backfill the whole
         // registry or delay ordinary master startup behind its initialization.
         if !dedicated {
@@ -220,11 +235,22 @@ impl MasterState {
             // With a mirror configured, seed it from the primary so a backend
             // switch finds every store already there. Repeated on every
             // maintenance round; this covers the very first start.
+            let mut initialized = std::collections::HashSet::new();
             for (label, reg) in [
                 ("rollout", &registry),
                 ("generic", &generic_registry),
                 ("datagen", &datagen_registry),
-            ] {
+            ]
+            .into_iter()
+            .chain(
+                config
+                    .managed_store_kind
+                    .as_deref()
+                    .zip(managed_registry.as_ref()),
+            ) {
+                if !initialized.insert(label) {
+                    continue;
+                }
                 if let Some(m) = reg.as_any().downcast_ref::<MirroredRegistry>() {
                     match backfill_registry(&*m.primary, &*m.mirror).await {
                         Ok(copied) if copied > 0 => {
@@ -258,6 +284,7 @@ impl MasterState {
             registry,
             generic_registry,
             datagen_registry,
+            managed_registry,
             stats: Mutex::new(stats),
             stats_cache: RwLock::new(Arc::new(Vec::new())),
             record_stores: Mutex::new(LruCache::new(
@@ -289,6 +316,25 @@ impl MasterState {
     /// `generic_uri` convention (`{name}.generic.lance`).
     pub fn generic_uri(&self, name: &str) -> String {
         join_uri(&self.base_uri, &format!("{}.generic.lance", name))
+    }
+
+    pub(crate) fn registered_target<'a>(&'a self, target: &'a str) -> Option<(&'a str, &'a str)> {
+        let kind = self.config.managed_store_kind.as_deref()?;
+        Some((kind, target.strip_prefix(kind)?.strip_prefix(':')?))
+    }
+
+    pub(crate) async fn target_uri(&self, target: &str) -> lance::Result<Option<String>> {
+        let (registry, name) = if let Some((_, name)) = self.registered_target(target) {
+            (
+                self.managed_registry.as_ref().expect("configured registry"),
+                name,
+            )
+        } else if let Some(name) = target.strip_prefix("generic:") {
+            (&self.generic_registry, name)
+        } else {
+            (&self.registry, target)
+        };
+        Ok(registry.get(name).await?.map(|entry| entry.uri))
     }
 
     /// Options for every generic store opened by the master (read-only
@@ -357,6 +403,7 @@ mod tests {
             legacy_retirement_request: None,
             local_merge: Default::default(),
             append: Default::default(),
+            managed_store_kind: None,
             catchup: Default::default(),
             wal_tail: Default::default(),
             planner: Default::default(),

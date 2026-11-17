@@ -500,10 +500,10 @@ pub async fn compact_experiment(
 ) -> Result<(StatusCode, Json<CompactJobStatus>), MasterError> {
     // Only enqueue known experiments.
     let exists = state
-        .registry
-        .contains(&name)
+        .target_uri(&name)
         .await
-        .map_err(MasterError::from_lance)?;
+        .map_err(MasterError::from_lance)?
+        .is_some();
     if !exists {
         return Err(MasterError::NotFound(format!(
             "experiment '{}' does not exist",
@@ -539,21 +539,15 @@ pub async fn enqueue_task(
     State(state): State<Arc<MasterState>>,
     Json(req): Json<EnqueueTaskRequest>,
 ) -> Result<(StatusCode, Json<TaskRecord>), MasterError> {
-    // Use the executor's target parser for registry lookup, but retain the
-    // canonical target below so generic and rollout tasks never share a lock
-    // or dedupe key merely because their bare names match.
-    let (kind, name) = scheduler::parse_target(&req.target);
-    let (registry, label) = match kind {
-        scheduler::StoreKind::Rollout => (&state.registry, "experiment"),
-        scheduler::StoreKind::Generic => (&state.generic_registry, "generic store"),
-    };
-    let exists = registry
-        .contains(name)
+    if state
+        .target_uri(&req.target)
         .await
-        .map_err(MasterError::from_lance)?;
-    if !exists {
+        .map_err(MasterError::from_lance)?
+        .is_none()
+    {
         return Err(MasterError::NotFound(format!(
-            "{label} '{name}' does not exist"
+            "maintenance target '{}' does not exist",
+            req.target
         )));
     }
     let task = scheduler::enqueue_with_deps(&state, req.kind, &req.target, req.depends_on)
@@ -1098,6 +1092,7 @@ mod tests {
             legacy_retirement_request: None,
             local_merge: Default::default(),
             append: Default::default(),
+            managed_store_kind: None,
             catchup: Default::default(),
             wal_tail: Default::default(),
             planner: Default::default(),
@@ -1161,7 +1156,13 @@ mod tests {
         use tower::ServiceExt;
 
         let dir = TempDir::new().unwrap();
-        let state = MasterState::new(test_config(&dir)).await.unwrap();
+        let state = MasterState::new({
+            let mut cfg = test_config(&dir);
+            cfg.managed_store_kind = Some("events".into());
+            cfg
+        })
+        .await
+        .unwrap();
         state
             .generic_registry
             .upsert("shared", &state.generic_uri("shared"))
@@ -1201,6 +1202,9 @@ mod tests {
             "generic:rollout-only",
             "generic:missing",
             "missing",
+            "events:shared",
+            "events:rollout-only",
+            "events:missing",
         ] {
             let response = router.clone().oneshot(request(target)).await.unwrap();
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "{target}");
@@ -1221,7 +1225,31 @@ mod tests {
         assert_eq!(rollout.target, "shared");
         assert_ne!(generic.id, rollout.id);
 
-        for expected in [&generic, &rollout] {
+        state
+            .managed_registry
+            .as_ref()
+            .unwrap()
+            .upsert(
+                "shared",
+                &format!("{}/custom-location.lance", dir.path().display()),
+            )
+            .await
+            .unwrap();
+        let response = router
+            .clone()
+            .oneshot(request("events:shared"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let registered: TaskRecord = serde_json::from_slice(&body).unwrap();
+        assert_eq!(registered.target, "events:shared");
+        assert_ne!(registered.id, generic.id);
+        assert_ne!(registered.id, rollout.id);
+
+        for expected in [&generic, &rollout, &registered] {
             let response = router
                 .clone()
                 .oneshot(request(&expected.target))
@@ -1235,7 +1263,7 @@ mod tests {
             assert_eq!(task.id, expected.id);
             assert_eq!(task.target, expected.target);
         }
-        assert_eq!(state.task_store.list().await.unwrap().len(), 2);
+        assert_eq!(state.task_store.list().await.unwrap().len(), 3);
     }
 
     #[tokio::test]
