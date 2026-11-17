@@ -47,11 +47,12 @@ upgrading to an upstream release with the fix.
 
 ## Delivery boundaries
 
-The initial PR delivers the kernel/selection adapter and standard-array storage
-interoperability tests. Persistent automatic layout migration, document access,
-index integration, Python bindings, and equivalent baseline/Variant benchmarks
-are follow-ups tracked in #832. The kernel milestone alone does not establish a
-complete automatic document store or a performance advantage.
+The kernel/selection layer, persistent document store, and query/Python APIs are
+separate increments tracked in #832. The embedded Rust/Python implementation
+supports automatic layout migration, reconstruction, path access and text search.
+The [dual assessment](automatic-shredding-dual-assessment.md) records validation
+and equivalent baseline/Variant benchmarks. Background migration, coordinated
+WAL/HTTP service integration and query-aware selection remain future work.
 
 ## Persistent Variant document adapter
 
