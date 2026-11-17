@@ -22,7 +22,7 @@ pub(crate) async fn retire(
         Reply::Commit(Outcome::Committed(Applied::Publisher(p::Reply::ManifestHistory(
             boundary,
         )))) => Ok(boundary),
-        Reply::Commit(Outcome::Unknown) => Err(HistoryUnknown.into()),
+        Reply::Unknown | Reply::Commit(Outcome::Unknown) => Err(HistoryUnknown.into()),
         reply => bail!("manifest history retirement rejected: {reply:?}"),
     }
 }
