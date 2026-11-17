@@ -59,7 +59,16 @@ async fn fetch(f: &Fixture, node: u64, group: u64, index: u64, batch: &Batch) ->
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shared_engine_data_groups_catch_up_and_survive_full_process_crash() -> Result<()> {
-    let f = Fixture::shared_groups()?;
+    run_fixture(false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn async_shared_engine_data_groups_catch_up_and_survive_full_process_crash() -> Result<()> {
+    run_fixture(true).await
+}
+
+async fn run_fixture(async_persistence: bool) -> Result<()> {
+    let f = Fixture::shared_groups(async_persistence)?;
     let result = run(&f).await;
     if result.is_err() {
         eprintln!(

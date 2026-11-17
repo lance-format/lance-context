@@ -43,11 +43,20 @@ impl Fixture {
             vec![10, 20, 10, 20],
         )
     }
-    pub fn shared_groups() -> Result<Self> {
-        Self::with_groups(
+    pub fn shared_groups(async_persistence: bool) -> Result<Self> {
+        let mut fixture = Self::with_groups(
             BTreeMap::from([(5, vec![1, 2, 3]), (10, vec![1, 2, 3]), (11, vec![1, 2, 3])]),
             vec![10, 5, 11, 5],
-        )
+        )?;
+        for (&node, config) in &mut fixture.configs {
+            config.runtime.async_persistence = async_persistence;
+            config.validate()?;
+            fs::write(
+                fixture.root.path().join(format!("{node}.json")),
+                serde_json::to_vec_pretty(config)?,
+            )?;
+        }
+        Ok(fixture)
     }
     fn with_groups(groups: BTreeMap<u64, Vec<u64>>, buckets: Vec<u64>) -> Result<Self> {
         let nodes: BTreeSet<_> = groups.values().flatten().copied().collect();
