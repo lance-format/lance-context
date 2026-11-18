@@ -373,6 +373,9 @@ jobs:
     timeout-minutes: 60
     env:
       CARGO_LLVM_COV_TARGET_DIR: ${{ github.workspace }}/target/llvm-cov-target
+      # Instrumented large-annotation recovery traverses deep Lance plans and
+      # overflows the ordinary test job's 8 MiB stack. Keep the tests enabled.
+      RUST_MIN_STACK: "16777216"
     steps:
       - uses: actions/checkout@v4
       - name: Setup rust toolchain
