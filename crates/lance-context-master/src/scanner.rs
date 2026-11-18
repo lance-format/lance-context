@@ -346,7 +346,10 @@ pub async fn scan_once(state: &Arc<MasterState>) -> lance::Result<usize> {
     }
 }
 
-async fn try_scan_once(state: &Arc<MasterState>, maintain: bool) -> lance::Result<Option<usize>> {
+pub(crate) async fn try_scan_once(
+    state: &Arc<MasterState>,
+    maintain: bool,
+) -> lance::Result<Option<usize>> {
     let Some(operation) = state.admission.try_admit_named("stats_scan") else {
         return Ok(None);
     };
