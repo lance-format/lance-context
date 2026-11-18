@@ -33,7 +33,7 @@ struct FaultyRenewal {
     renewals: AtomicUsize,
     attempted: tokio::sync::Notify,
     renewed: tokio::sync::Notify,
-    initial_attempted: tokio::sync::Notify,
+    initial_published: tokio::sync::Notify,
     registration_paths: Mutex<Vec<Path>>,
 }
 
@@ -84,7 +84,6 @@ impl object_store::ObjectStore for FaultyRenewal {
                 paths.push(path.clone());
                 paths.len()
             };
-            self.initial_attempted.notify_one();
             if matches!(self.fault, Fault::InitialFailure) {
                 return Err(object_store::Error::Generic {
                     store: "injected registration",
@@ -96,6 +95,7 @@ impl object_store::ObjectStore for FaultyRenewal {
                 | (Fault::InitialAlwaysTimeout, _) => {
                     // Acceptance is real but its acknowledgement never arrives.
                     self.inner.put_opts(path, payload, options).await?;
+                    self.initial_published.notify_one();
                     return std::future::pending().await;
                 }
                 (Fault::InitialErrorOnce, 1) => {
@@ -193,7 +193,7 @@ async fn fixture(
         renewals: AtomicUsize::new(0),
         attempted: tokio::sync::Notify::new(),
         renewed: tokio::sync::Notify::new(),
-        initial_attempted: tokio::sync::Notify::new(),
+        initial_published: tokio::sync::Notify::new(),
         registration_paths: Mutex::new(Vec::new()),
     });
     let mut wrapped = store.as_ref().clone();
@@ -305,7 +305,12 @@ async fn cancelling_initial_publication_cleans_up_without_retrying_or_reading() 
             .await
         }
     });
-    faulty.initial_attempted.notified().await;
+    // Cancel after the ambiguous write is accepted. Cancelling an in-flight
+    // filesystem PUT can let it finish after cleanup's DELETE; that abandoned
+    // registration is safely expired, but does not promise immediate removal.
+    faulty.initial_published.notified().await;
+    let path = faulty.registration_paths.lock().unwrap()[0].clone();
+    store.inner.head(&path).await.unwrap();
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
     registrations_cleaned(&store, &root).await;

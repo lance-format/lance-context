@@ -45,7 +45,7 @@ use object_store::{
     UploadPart,
 };
 use rand::Rng;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tracing::{debug, warn};
 
 use object_store::list::{PaginatedListOptions, PaginatedListResult, PaginatedListStore};
@@ -328,10 +328,21 @@ struct TokenBucketState {
     rate: f64,
 }
 
+impl TokenBucketState {
+    fn refill(&mut self, capacity: f64) {
+        let now = tokio::time::Instant::now();
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * self.rate).min(capacity);
+        self.last_refill = now;
+    }
+}
+
 /// Per-category throttle state: an AIMD controller paired with a token bucket.
 struct OperationThrottle {
     controller: AimdController,
     bucket: Mutex<TokenBucketState>,
+    admission: Mutex<()>,
+    rate_changed: Notify,
     burst_capacity: f64,
     max_retries: usize,
     min_backoff_ms: u64,
@@ -355,6 +366,8 @@ impl OperationThrottle {
                 last_refill: tokio::time::Instant::now(),
                 rate: initial_rate,
             }),
+            admission: Mutex::new(()),
+            rate_changed: Notify::new(),
             burst_capacity,
             max_retries,
             min_backoff_ms,
@@ -364,36 +377,38 @@ impl OperationThrottle {
 
     /// Acquire a token from the bucket, sleeping if none are available.
     ///
-    /// Each caller reserves a token immediately (allowing `tokens` to go
-    /// negative) so that concurrent waiters queue behind each other instead
-    /// of all waking at the same instant (thundering herd).
+    /// Only the FIFO queue's head waits for refill. Charge a token when the
+    /// operation is admitted, so dropping a queued or sleeping future leaves
+    /// no debt. The admission guard is released before backend I/O begins.
     async fn acquire_token(&self) {
-        let sleep_duration = {
-            let mut bucket = self.bucket.lock().await;
-            let now = tokio::time::Instant::now();
-            let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
-            bucket.tokens = (bucket.tokens + elapsed * bucket.rate).min(self.burst_capacity);
-            bucket.last_refill = now;
-
-            // Reserve a token (may go negative to queue behind other waiters)
-            bucket.tokens -= 1.0;
-
-            if bucket.tokens >= 0.0 {
-                // Had a token available, no need to sleep
-                return;
+        let _admission = self.admission.lock().await;
+        let mut capacity = self.burst_capacity;
+        loop {
+            let sleep_duration = {
+                let mut bucket = self.bucket.lock().await;
+                bucket.refill(capacity);
+                if bucket.tokens >= 1.0 {
+                    bucket.tokens -= 1.0;
+                    return;
+                }
+                std::time::Duration::from_secs_f64((1.0 - bucket.tokens) / bucket.rate)
+            };
+            // A zero-burst configuration still earns one token while waiting,
+            // but never starts a new acquisition with an accumulated burst.
+            capacity = self.burst_capacity.max(1.0);
+            tokio::select! {
+                _ = tokio::time::sleep(sleep_duration) => {},
+                _ = self.rate_changed.notified() => {},
             }
-
-            // Sleep proportional to our position in the queue
-            std::time::Duration::from_secs_f64(-bucket.tokens / bucket.rate)
-        };
-
-        tokio::time::sleep(sleep_duration).await;
+        }
     }
 
     /// Update the bucket's fill rate from the controller.
     async fn update_bucket_rate(&self, new_rate: f64) {
         let mut bucket = self.bucket.lock().await;
+        bucket.refill(self.burst_capacity.max(1.0));
         bucket.rate = new_rate;
+        self.rate_changed.notify_one();
     }
 
     /// Classify a result and feed it back to the AIMD controller without
@@ -419,7 +434,9 @@ impl OperationThrottle {
             .map(|error| error as &dyn std::fmt::Display);
         let new_rate = self.record_outcome(outcome, error);
         if let Ok(mut bucket) = self.bucket.try_lock() {
+            bucket.refill(self.burst_capacity.max(1.0));
             bucket.rate = new_rate;
+            self.rate_changed.notify_one();
         }
     }
 
@@ -1747,6 +1764,78 @@ mod tests {
             "Expected delay for token refill, but elapsed was {:?}",
             elapsed
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_cancelled_waiters_preserve_rate_and_fifo() {
+        use std::time::Duration;
+        let throttle =
+            OperationThrottle::new(AimdConfig::default().with_initial_rate(10.0), 1.0, 0, 0, 0)
+                .unwrap();
+        throttle.acquire_token().await;
+        let mut head = Box::pin(throttle.acquire_token());
+        let mut cancelled = Box::pin(throttle.acquire_token());
+        let mut tail = Box::pin(throttle.acquire_token());
+        assert!(futures::poll!(&mut head).is_pending());
+        assert!(futures::poll!(&mut cancelled).is_pending());
+        assert!(futures::poll!(&mut tail).is_pending());
+        tokio::time::advance(Duration::from_millis(40)).await;
+        drop(head);
+        drop(cancelled);
+        assert!(futures::poll!(&mut tail).is_pending());
+        tokio::time::advance(Duration::from_millis(61)).await;
+        assert!(futures::poll!(&mut tail).is_ready());
+        // Cancellation must not refund an already admitted operation or
+        // admit the next request before another token has been earned.
+        let mut next = Box::pin(throttle.acquire_token());
+        assert!(futures::poll!(&mut next).is_pending());
+        tokio::time::advance(Duration::from_millis(101)).await;
+        assert!(futures::poll!(&mut next).is_ready());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_waiting_admission_tracks_rate_changes() {
+        use std::time::Duration;
+        let throttle =
+            OperationThrottle::new(AimdConfig::default().with_initial_rate(1.0), 1.0, 0, 0, 0)
+                .unwrap();
+        throttle.acquire_token().await;
+        let mut waiting = Box::pin(throttle.acquire_token());
+        assert!(futures::poll!(&mut waiting).is_pending());
+        tokio::time::advance(Duration::from_millis(100)).await;
+        throttle.update_bucket_rate(10.0).await;
+        assert!(futures::poll!(&mut waiting).is_pending());
+        tokio::time::advance(Duration::from_millis(91)).await;
+        assert!(futures::poll!(&mut waiting).is_ready());
+
+        let mut next = Box::pin(throttle.acquire_token());
+        assert!(futures::poll!(&mut next).is_pending());
+        throttle.update_bucket_rate(1.0).await;
+        assert!(futures::poll!(&mut next).is_pending());
+        tokio::time::advance(Duration::from_millis(100)).await;
+        assert!(futures::poll!(&mut next).is_pending());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(futures::poll!(&mut next).is_ready());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_admission_does_not_serialize_backend_operations() {
+        let throttle =
+            OperationThrottle::new(AimdConfig::default().with_initial_rate(10.0), 2.0, 0, 0, 0)
+                .unwrap();
+        let both_started = tokio::sync::Barrier::new(2);
+        let operation = || async {
+            both_started.wait().await;
+            Ok::<_, object_store::Error>(())
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            let (left, right) =
+                tokio::join!(throttle.throttled(operation), throttle.throttled(operation));
+            left.unwrap();
+            right.unwrap();
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

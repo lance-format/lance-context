@@ -1182,5 +1182,9 @@ mod tests {
 mod azure_tests;
 
 #[cfg(test)]
+#[path = "wal_read_admission_tests.rs"]
+mod admission_tests;
+
+#[cfg(test)]
 #[path = "wal_read_renewal_tests.rs"]
 mod renewal_tests;
