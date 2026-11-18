@@ -17,6 +17,8 @@ use uuid::Uuid;
 #[path = "node_service/fixture.rs"]
 mod fixture;
 use fixture::Fixture;
+#[path = "node_service/benchmark_bootstrap.rs"]
+mod benchmark_bootstrap;
 
 #[test]
 fn configuration_rejects_missing_signers_unknown_fields_and_listener_aliases() -> Result<()> {

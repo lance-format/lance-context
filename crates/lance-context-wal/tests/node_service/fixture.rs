@@ -347,11 +347,25 @@ impl Fixture {
         Ok(())
     }
     pub fn spawn(&self, node: u64, incarnation: u64) -> Result<ChildNode> {
+        self.spawn_with(
+            node,
+            incarnation,
+            env!("CARGO_BIN_EXE_context-wal-node"),
+            &["--io-threads", "2"],
+        )
+    }
+    pub fn spawn_with(
+        &self,
+        node: u64,
+        incarnation: u64,
+        binary: &str,
+        args: &[&str],
+    ) -> Result<ChildNode> {
         let log = self
             .root
             .path()
             .join(format!("node-{node}-{incarnation}.log"));
-        let child = Command::new(env!("CARGO_BIN_EXE_context-wal-node"))
+        let child = Command::new(binary)
             .args([
                 "--config",
                 self.root
@@ -359,9 +373,8 @@ impl Fixture {
                     .join(format!("{node}.json"))
                     .to_str()
                     .unwrap(),
-                "--io-threads",
-                "2",
             ])
+            .args(args)
             .stdin(Stdio::null())
             .stdout(fs::File::create(&log)?)
             .stderr(fs::OpenOptions::new().append(true).open(&log)?)

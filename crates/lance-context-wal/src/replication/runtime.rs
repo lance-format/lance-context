@@ -606,6 +606,14 @@ impl Handle {
         )?;
         Ok(Pending(receive))
     }
+
+    /// Ask this group's local leader to transfer through ordinary Raft. False
+    /// means this node is not the leader or is already the target. True means
+    /// only that the request was issued, not that the target became leader.
+    /// No client transport endpoint exposes this local operation.
+    pub fn transfer_leader(&self, group: u64, target: u64) -> Result<Pending<bool>> {
+        self.local(group, move |node| node.transfer_leader(group, target))
+    }
     /// Authenticated transport enqueues a bounded decoded packet. Only the
     /// worker validates entry payloads; Ok here is not peer persistence.
     pub fn step(&self, packet: Packet) -> Result<()> {

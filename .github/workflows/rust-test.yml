@@ -23,9 +23,9 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-C debuginfo=1"
-  # See .cargo/config.toml: debug-build DataFusion plan walks in the WAL
-  # merge need more than the 2 MiB default test-thread stack.
-  RUST_MIN_STACK: "8388608"
+  # Large annotation recovery traverses deep Lance plans. Both the debug HA
+  # suite and coverage overflow an 8 MiB test-thread stack; keep all tests enabled.
+  RUST_MIN_STACK: "16777216"
   # See .cargo/config.toml: blob-row merges in tests need more than the
   # 150 MB-per-partition DataFusion default.
   LANCE_MEM_POOL_SIZE: "1073741824"

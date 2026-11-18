@@ -257,6 +257,18 @@ power-loss recovery or distributed quorum durability.
 
 ## Thread CPU observations
 
+For controlled service benchmarks, `context-wal-bench-node` (`service` feature)
+accepts the normal node's configuration and thread counts, plus `--leader-plan`
+(a JSON map such as `{"5":1,"10":1,"11":1}`), `--ready-file`, and
+`--bootstrap-timeout-ms`. It requires a new WAL directory and receipt path.
+Start the designated leaders before followers. The launcher campaigns only
+during bounded startup and exits on a different observed leader or timeout.
+After three seconds of stable local observations it writes a receipt and stops
+intervening; normal Raft elections continue. Before sending work, the benchmark
+driver must verify receipts, live processes and the intended leaders on every
+replica, then monitor placement throughout measurement. A receipt is not a
+quorum read. Keep failed attempts and use `context-wal-node` for store recovery.
+
 The Linux experiment sampler accepts `--threads` to include thread names,
 states, start ticks and CPU ticks from the recorded process. This can distinguish
 `lance-cpu` activity from other runtime threads before changing worker counts.

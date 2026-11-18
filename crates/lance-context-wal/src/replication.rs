@@ -565,6 +565,24 @@ impl Node {
         Ok(())
     }
 
+    #[cfg(feature = "runtime")]
+    fn transfer_leader(&mut self, group: u64, target: u64) -> Result<bool> {
+        self.healthy()?;
+        let voters = self.layout.groups.get(&group).context("unhosted group")?;
+        ensure!(
+            voters.contains(&target),
+            "transfer target is not a group voter"
+        );
+        let g = self.groups.get_mut(&group).context("unhosted group")?;
+        // A stale local observation must not forward a transfer to a new leader.
+        if g.raw.raft.state != StateRole::Leader || target == self.id {
+            return Ok(false);
+        }
+        ensure!(g.accepts_async(&[])?, ProposalRejection::PendingCapacity);
+        g.raw.transfer_leader(target);
+        Ok(true)
+    }
+
     pub fn status(&self, group: u64) -> Result<Status> {
         self.healthy()?;
         let g = self.groups.get(&group).context("unhosted group")?;
@@ -869,6 +887,7 @@ impl Node {
                     | MessageType::MsgRequestVoteResponse
                     | MessageType::MsgRequestPreVote
                     | MessageType::MsgRequestPreVoteResponse
+                    | MessageType::MsgTimeoutNow
             ),
             "unsupported peer message"
         );
@@ -880,6 +899,14 @@ impl Node {
             .groups
             .get_mut(&packet.group)
             .context("unhosted group")?;
+        if message.get_msg_type() == MessageType::MsgTimeoutNow {
+            ensure!(
+                message.from == group.raw.raft.leader_id
+                    && message.term == group.raw.raft.term
+                    && message.entries.is_empty(),
+                "leader transfer must come from the current-term leader"
+            );
+        }
         // Current-term heartbeat responses refresh the leader's quorum without
         // adding log entries. Already admitted reads still wait for the normal
         // persisted Ready/application boundary before reaching callers.
