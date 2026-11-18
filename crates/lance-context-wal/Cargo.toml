@@ -76,6 +76,11 @@ path = "src/bin/node.rs"
 required-features = ["service"]
 
 [[bin]]
+name = "context-wal-bench-node"
+path = "src/bin/bench_node.rs"
+required-features = ["service"]
+
+[[bin]]
 name = "context-wal-runner"
 path = "src/bin/runner.rs"
 required-features = ["runner"]
