@@ -405,6 +405,41 @@ pub async fn rescan(
     Ok(Json(serde_json::json!({ "scanned": n })))
 }
 
+#[derive(Deserialize)]
+struct TryRescanRequest {
+    executor_id: String,
+}
+
+/// Try one scan on this exact executor. A busy writer returns 409 without
+/// waiting or retrying lease acquisition. A successful scan still runs to
+/// completion under the existing writer lock and publication fence.
+async fn try_rescan(
+    State(state): State<Arc<MasterState>>,
+    Json(request): Json<TryRescanRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), MasterError> {
+    let status = state.admission.status();
+    let conflict = |reason| {
+        (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": reason })),
+        )
+    };
+    if status.executor_id != request.executor_id {
+        return Ok(conflict("executor_id_mismatch"));
+    }
+    if !status.accepting {
+        return Ok(conflict("executor_draining"));
+    }
+    match scanner::try_scan_once(&state, false)
+        .await
+        .map_err(MasterError::from_lance)?
+    {
+        Some(n) => Ok((StatusCode::OK, Json(serde_json::json!({ "scanned": n })))),
+        // Admission can close after the status check above, too.
+        None => Ok(conflict("scanner_unavailable")),
+    }
+}
+
 /// `POST /api/v1/experiments/{name}/rescan`
 ///
 /// Re-observe one store now and persist its stats row, so the next merge
@@ -1037,6 +1072,7 @@ pub fn api_router() -> Router<Arc<MasterState>> {
         .route("/tasks/{id}", get(get_task))
         .route("/tasks/{id}/admission", get(task_admission))
         .route("/rescan", post(rescan))
+        .route("/rescan/try", post(try_rescan))
 }
 
 async fn open_registered_store(
@@ -1151,6 +1187,135 @@ mod tests {
         std::env::var("ETCD_TEST_ENDPOINTS")
             .map(|value| value.split(',').map(str::to_string).collect())
             .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn try_rescan_http_rejects_busy_or_wrong_executor_without_scanning() {
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let dir = TempDir::new().unwrap();
+        let state = MasterState::new(test_config(&dir)).await.unwrap();
+        let router = api_router().with_state(state.clone());
+        let executor_id = state.admission.status().executor_id;
+        let version = state.stats.lock().await.version();
+        let owner = state
+            .task_store
+            .coordination_lock("stats-writer")
+            .await
+            .unwrap();
+        for (id, reason) in [
+            ("different-executor", "executor_id_mismatch"),
+            (executor_id.as_str(), "scanner_unavailable"),
+        ] {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/rescan/try")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"executor_id": id}).to_string()))
+                .unwrap();
+            // The writer remains held throughout; a waiting/retrying scan
+            // cannot pass this assertion by eventually acquiring the lock.
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                router.clone().oneshot(request),
+            )
+            .await
+            .expect("busy scanner request must not wait for the owner")
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                json!({"error": reason})
+            );
+            assert_eq!(state.stats.lock().await.version(), version);
+            assert!(state.admission.status().operations.is_empty());
+            assert!(state
+                .task_store
+                .read_backlog_snapshot()
+                .await
+                .unwrap()
+                .is_none());
+        }
+        assert!(state
+            .task_store
+            .try_coordination_lock("stats-writer")
+            .await
+            .unwrap()
+            .is_none());
+        state
+            .task_store
+            .release_coordination_lock(owner)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn try_rescan_http_publishes_when_idle_and_rejects_after_drain() {
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let dir = TempDir::new().unwrap();
+        let state = MasterState::new(test_config(&dir)).await.unwrap();
+        let router = api_router().with_state(state.clone());
+        let executor_id = state.admission.status().executor_id;
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/rescan/try")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"executor_id": executor_id}).to_string()))
+                .unwrap()
+        };
+        let response = router.clone().oneshot(request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            json!({"scanned": 0})
+        );
+        let summary = state
+            .task_store
+            .read_backlog_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(state.admission.status().operations.is_empty());
+        let guard = state
+            .task_store
+            .try_coordination_lock("stats-writer")
+            .await
+            .unwrap()
+            .expect("successful HTTP scan must release the writer lock");
+        state
+            .task_store
+            .release_coordination_lock(guard)
+            .await
+            .unwrap();
+
+        state.admission.begin_drain();
+        let response = router.oneshot(request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            serde_json::to_value(
+                state
+                    .task_store
+                    .read_backlog_snapshot()
+                    .await
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
+            serde_json::to_value(summary).unwrap()
+        );
+        assert!(state.admission.status().operations.is_empty());
     }
 
     #[tokio::test]
