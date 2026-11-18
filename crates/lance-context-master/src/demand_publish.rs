@@ -13,12 +13,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use lance_context_core::{GenericStore, GenericStoreOptions, RolloutStore, RolloutStoreOptions};
+use lance_context_core::{GenericStore, RolloutStore};
 use lance_context_merge::demand::{DemandEvent, EventSource, ShardMerged, SCHEMA_VERSION};
 use lance_context_merge::Coordinator;
 use tokio::sync::Semaphore;
 
-use crate::scanner::ScanKind;
 use crate::state::MasterState;
 
 /// Manifest reads, bounded batches of etcd reads, and per-changed-shard CAS.
@@ -33,13 +32,28 @@ async fn scan_slot(slots: Arc<Semaphore>) -> Option<tokio::sync::OwnedSemaphoreP
     slots.acquire_owned().await.ok()
 }
 
+/// Reuse the store opened by the bounded scan observation. Waiting stores stay
+/// inside that stream; only four admitted stores move into detached publishers.
+/// Preserve its storage options and avoid a second base-manifest open. Shard
+/// watermarks are still read after admission, including for cold tables.
+pub(crate) enum ObservedScanStore {
+    Rollout(RolloutStore),
+    Generic(GenericStore),
+}
+
+impl ObservedScanStore {
+    async fn watermarks(self) -> lance::Result<Vec<lance_context_core::ShardWatermark>> {
+        match self {
+            Self::Rollout(store) => store.all_shard_watermarks().await,
+            Self::Generic(store) => store.all_shard_watermarks().await,
+        }
+    }
+}
+
 pub(crate) async fn spawn_scan_demand(
     state: Arc<MasterState>,
     target: String,
-    uri: String,
-    kind: ScanKind,
-    rollout_options: RolloutStoreOptions,
-    generic_options: GenericStoreOptions,
+    store: ObservedScanStore,
 ) {
     let permit = tokio::select! {
         permit = scan_slot(SCAN_PUBLISH_SLOTS.clone()) => permit,
@@ -61,22 +75,7 @@ pub(crate) async fn spawn_scan_demand(
     tokio::spawn(async move {
         let _permit = permit;
         let result = tokio::time::timeout(SCAN_PUBLISH_TIMEOUT, async {
-            let marks = match kind {
-                ScanKind::Rollout => {
-                    RolloutStore::open_existing_with_options(&uri, rollout_options)
-                        .await
-                        .map_err(|e| e.to_string())?
-                        .all_shard_watermarks()
-                        .await
-                        .map_err(|e| e.to_string())?
-                }
-                ScanKind::Generic => GenericStore::open_existing(&uri, generic_options)
-                    .await
-                    .map_err(|e| e.to_string())?
-                    .all_shard_watermarks()
-                    .await
-                    .map_err(|e| e.to_string())?,
-            };
+            let marks = store.watermarks().await.map_err(|e| e.to_string())?;
             let coordinator = state.task_store.merge_coordinator();
             let now_ms = chrono::Utc::now().timestamp_millis();
             let events: Vec<_> = marks
@@ -321,7 +320,67 @@ pub(crate) fn spawn_merged_demand(coordinator: Coordinator, target: String, uri:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lance_context_core::GenericStoreOptions;
     use std::task::Poll;
+
+    #[tokio::test]
+    async fn observed_store_reuses_base_manifest_and_reads_new_shard_watermarks() {
+        use lance_context_api::{ColumnSpec, ColumnType, SchemaSpec, ID_COLUMN};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("observed.generic.lance");
+        let uri = path.to_string_lossy().into_owned();
+        let spec = SchemaSpec::new(vec![(
+            ID_COLUMN.to_string(),
+            ColumnSpec::required(ColumnType::String { large: false }),
+        )]);
+        let writer = GenericStore::open(
+            &uri,
+            spec,
+            GenericStoreOptions {
+                seal_on_add: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        writer
+            .add(&[serde_json::json!({"id": "first"})
+                .as_object()
+                .unwrap()
+                .clone()])
+            .await
+            .unwrap();
+        let observed = GenericStore::open_existing(&uri, GenericStoreOptions::default())
+            .await
+            .unwrap();
+        // A writer can seal another generation while the observation waits for
+        // a publishing permit. Reusing the base must not freeze shard progress.
+        writer
+            .add(&[serde_json::json!({"id": "second"})
+                .as_object()
+                .unwrap()
+                .clone()])
+            .await
+            .unwrap();
+        // Make a second base-manifest open fail, while keeping the observed
+        // dataset and latest shard manifests available to the publisher.
+        std::fs::rename(path.join("_versions"), path.join("versions-unavailable")).unwrap();
+        assert!(
+            GenericStore::open_existing(&uri, GenericStoreOptions::default())
+                .await
+                .is_err()
+        );
+        let marks = ObservedScanStore::Generic(observed)
+            .watermarks()
+            .await
+            .unwrap();
+        assert_eq!(
+            marks.iter().map(|m| m.pending_generations).sum::<usize>(),
+            2
+        );
+        assert!(marks.iter().any(|m| m.sealed_through >= 2));
+    }
 
     #[tokio::test]
     #[ignore = "requires isolated loopback ETCD_TEST_ENDPOINTS and ETCD_TEST_EXCLUSIVE=1"]
