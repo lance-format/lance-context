@@ -11,6 +11,38 @@ use std::{collections::HashSet, sync::Arc, time::Duration};
 
 type Result<T> = std::result::Result<T, String>;
 
+mod pipeline;
+
+type StageResult = std::result::Result<Option<StagedAppend>, (AppendPlan, String)>;
+
+fn collect_stage(
+    result: StageResult,
+    local: bool,
+    group: &mut Vec<StagedAppend>,
+    errors: &mut Vec<String>,
+    memory_retries: &mut Vec<AppendPlan>,
+    flush: &mut tokio::time::Instant,
+) {
+    match result {
+        Ok(Some(part)) => {
+            if group.is_empty() {
+                *flush = tokio::time::Instant::now() + Duration::from_secs(2);
+            }
+            group.push(part);
+        }
+        Ok(None) => {}
+        Err((plan, error)) => {
+            if local
+                && error.contains("merge memory budget busy while reading first generation; retry")
+            {
+                memory_retries.push(plan);
+            } else {
+                errors.push(error);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, clap::Args)]
 pub struct AppendConfig {
     /// Opt-in immutable rollout targets. '*' selects all owned rollouts.
@@ -389,7 +421,7 @@ async fn run_pass(
             result.map(Some).map_err(|error| (plan, error))
         }.boxed()
     }).collect();
-    let mut work = stream::iter(stage_futures).buffer_unordered(config.rollout_append_concurrency);
+    let (admission, mut work) = pipeline::staging(stage_futures, config.rollout_append_concurrency);
     let mut group = Vec::new();
     let mut errors = Vec::new();
     let mut memory_retries = Vec::new();
@@ -397,16 +429,7 @@ async fn run_pass(
     loop {
         tokio::select! {
             next = work.next() => match next {
-                Some(Ok(Some(part))) => {
-                    if group.is_empty() { flush = tokio::time::Instant::now() + Duration::from_secs(2); }
-                    group.push(part);
-                },
-                Some(Ok(None)) => {},
-                Some(Err((plan, error))) => {
-                    if local.is_some() && error.contains("merge memory budget busy while reading first generation; retry") {
-                        memory_retries.push(plan);
-                    } else { errors.push(error); }
-                },
+                Some(result) => collect_stage(result, local.is_some(), &mut group, &mut errors, &mut memory_retries, &mut flush),
                 None => break,
             },
             _ = tokio::time::sleep_until(flush), if !group.is_empty() => {},
@@ -414,10 +437,19 @@ async fn run_pass(
         if group.len() >= config.rollout_append_concurrency
             || (!group.is_empty() && tokio::time::Instant::now() >= flush)
         {
-            reclaimed += coordinator
-                .commit(std::mem::take(&mut group))
-                .await
-                .map_err(|e| e.to_string())?;
+            let commit = coordinator.commit(std::mem::take(&mut group));
+            reclaimed += pipeline::commit_while_polling(&admission, commit, &mut work, |result| {
+                collect_stage(
+                    result,
+                    local.is_some(),
+                    &mut group,
+                    &mut errors,
+                    &mut memory_retries,
+                    &mut flush,
+                );
+            })
+            .await
+            .map_err(|e| e.to_string())?;
         }
     }
     if !group.is_empty() {
