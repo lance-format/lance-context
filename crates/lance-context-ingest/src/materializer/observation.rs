@@ -88,8 +88,15 @@ pub enum Phase {
     AnnotationPointCapture,
     /// Resolving a captured point view from staging, cache, or narrow Lance data.
     AnnotationPointResolve,
+    /// Maintenance selection, including candidate checks, completed-index rebasing,
+    /// and recording its plan/preparation; excludes retained-plan completion.
+    AnnotationMaintenanceSelect,
+    /// Preparing the retained maintenance plan, including native rewrite work.
+    AnnotationMaintenancePrepare,
+    /// Resolving, installing and finishing the prepared maintenance publication.
+    AnnotationMaintenancePublish,
 }
-const NAMES: [&str; 48] = [
+const NAMES: [&str; 51] = [
     "claim",
     "acquire",
     "state",
@@ -138,6 +145,9 @@ const NAMES: [&str; 48] = [
     "annotation_patch_lookup",
     "annotation_point_capture",
     "annotation_point_resolve",
+    "annotation_maintenance_select",
+    "annotation_maintenance_prepare",
+    "annotation_maintenance_publish",
 ];
 pub const PHASE_COUNT: usize = NAMES.len();
 

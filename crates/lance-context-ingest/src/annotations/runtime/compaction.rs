@@ -8,6 +8,31 @@ impl Publisher {
     }
 
     pub(super) async fn compact_next(&mut self, view: &p::Table) -> Result<bool> {
+        let phases = self.service.shared.phases.clone();
+        if !phases
+            .measure(
+                Phase::AnnotationMaintenanceSelect,
+                self.select_compaction(view),
+            )
+            .await?
+        {
+            return Ok(false);
+        }
+        phases
+            .measure(
+                Phase::AnnotationMaintenancePrepare,
+                self.prepare_compaction(),
+            )
+            .await?;
+        phases
+            .measure(
+                Phase::AnnotationMaintenancePublish,
+                self.finish_compaction(),
+            )
+            .await
+    }
+
+    async fn select_compaction(&mut self, view: &p::Table) -> Result<bool> {
         if let Some(job) = &self.index_preparation {
             ensure!(
                 view.progress.pending.is_none(),
@@ -69,7 +94,7 @@ impl Publisher {
                     descriptors,
                 })
                 .await?;
-            return self.finish_compaction().await;
+            return Ok(true);
         }
         if let Some(pending) = &view.progress.pending {
             if !pending.plan.is_maintenance() {
@@ -185,10 +210,10 @@ impl Publisher {
             self.catalog.retire_history(view).await?;
             self.catalog.record_plan(plan).await?;
         }
-        self.finish_compaction().await
+        Ok(true)
     }
 
-    async fn finish_compaction(&mut self) -> Result<bool> {
+    async fn prepare_compaction(&mut self) -> Result<()> {
         // A maintenance plan already exists, so the ordinary publisher only
         // prepares that exact plan. It cannot select an ingestion append here.
         let current = self.catalog.state().await?;
@@ -208,6 +233,10 @@ impl Publisher {
                 .await?
                 .context("annotation compaction preparation missing")?;
         }
+        Ok(())
+    }
+
+    async fn finish_compaction(&mut self) -> Result<bool> {
         let ready = self.catalog.state().await?;
         let selected = self.resolve_prepared(&ready).await?;
         let transaction = selected
