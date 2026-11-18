@@ -1,15 +1,25 @@
 use super::*;
 
-async fn open(f: &Fixture, group: u64, bucket: u32, table: Uuid) -> Result<()> {
+pub(super) async fn open(f: &Fixture, group: u64, bucket: u32, table: Uuid) -> Result<()> {
+    open_slot(f, group, bucket, table, 0).await
+}
+
+pub(super) async fn open_slot(
+    f: &Fixture,
+    group: u64,
+    bucket: u32,
+    table: Uuid,
+    slot: u32,
+) -> Result<()> {
     let command = Command::Producer(producer::Command {
         cluster: f.layout.cluster,
         layout: f.layout.fingerprint()?,
         group,
         table,
-        slot: 0,
+        slot,
         action: producer::Action::Open {
             expected_generation: 0,
-            operation: Uuid::from_u128(group.into()),
+            operation: Uuid::from_u128(u128::from(group) | (u128::from(slot) << 64)),
             bucket,
         },
     });
@@ -36,7 +46,13 @@ async fn open(f: &Fixture, group: u64, bucket: u32, table: Uuid) -> Result<()> {
     Ok(())
 }
 
-async fn fetch(f: &Fixture, node: u64, group: u64, index: u64, batch: &Batch) -> Result<()> {
+pub(super) async fn fetch(
+    f: &Fixture,
+    node: u64,
+    group: u64,
+    index: u64,
+    batch: &Batch,
+) -> Result<()> {
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             if let Ok(response) = f
