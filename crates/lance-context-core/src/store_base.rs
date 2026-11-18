@@ -646,6 +646,20 @@ impl StorageBase {
     /// request) before it knows what schema to hand the base. [`Self::open`] is
     /// the simpler path when the schema is known up front.
     pub async fn from_dataset(dataset: Dataset, options: StorageBaseOptions) -> LanceResult<Self> {
+        let mut base = Self::from_dataset_for_read(dataset, options)?;
+        // `ensure_mem_wal` may reload the dataset on a concurrent first-writer
+        // race, which is why it must run here where we hold `&mut`.
+        base.ensure_mem_wal().await?;
+        Ok(base)
+    }
+
+    /// Wrap an existing dataset without initializing WAL metadata or opening a writer.
+    /// Reads still publish reader registrations to protect captured WAL files.
+    /// Use [`Self::from_dataset`] to prepare a store for writing.
+    pub fn from_dataset_for_read(
+        dataset: Dataset,
+        options: StorageBaseOptions,
+    ) -> LanceResult<Self> {
         let StorageBaseOptions {
             storage_options,
             shard_id,
@@ -670,7 +684,7 @@ impl StorageBase {
             .into());
         }
 
-        let mut base = Self {
+        let base = Self {
             dataset,
             write_shard: derive_shard_id(shard_id.as_deref()),
             storage_options,
@@ -699,9 +713,6 @@ impl StorageBase {
             deleted: false,
             write_writer: tokio::sync::Mutex::new(None),
         };
-        // `ensure_mem_wal` may reload the dataset on a concurrent first-writer
-        // race, which is why it must run here where we hold `&mut`.
-        base.ensure_mem_wal().await?;
         Ok(base)
     }
 
