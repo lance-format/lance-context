@@ -1,4 +1,4 @@
-//! Fresh-store benchmark launcher. Campaigns only during startup; use the normal
+//! Fresh-store benchmark launcher. Campaigns/transfers only during startup; use the normal
 //! node binary for restarts. A local bootstrap receipt is not a quorum read or a
 //! durability receipt. The driver must verify every replica before sending work.
 use anyhow::{ensure, Context, Result};
@@ -11,7 +11,7 @@ use std::{collections::BTreeMap, fs, path::PathBuf, time::Duration};
 use tokio::time::Instant;
 
 #[derive(Parser)]
-#[command(about = "Fresh-store WAL benchmark node with bounded startup campaigns")]
+#[command(about = "Fresh-store WAL benchmark node with bounded startup placement")]
 struct Args {
     #[arg(long)]
     config: PathBuf,
@@ -43,6 +43,7 @@ async fn bootstrap(
         .collect();
     let mut previous = BTreeMap::new();
     let mut stable_since = None;
+    let mut transferred = BTreeMap::<u64, Instant>::new();
     loop {
         let mut current = BTreeMap::new();
         for &group in &hosted {
@@ -53,16 +54,23 @@ async fn bootstrap(
                 observation.failure
             );
             let status = observation.status;
-            ensure!(
-                status.leader == 0 || status.leader == plan[&group],
-                "bootstrap leader mismatch for group {group}: expected {}, observed {}",
-                plan[&group],
-                status.leader
-            );
             if status.leader == 0 && plan[&group] == config.node {
                 // This only starts an election. Its completion says nothing
                 // about leadership; subsequent observations decide readiness.
                 handle.campaign(group)?.await?;
+            }
+            if status.leader == config.node
+                && status.leader != plan[&group]
+                && transferred
+                    .get(&group)
+                    .is_none_or(|at| at.elapsed() >= Duration::from_secs(2))
+            {
+                // Starting first does not guarantee election victory when peer
+                // connections arrive at different times. Let the actual leader
+                // use Raft's caught-up-voter transfer, with its normal timeout.
+                // This receipt is not evidence that the transfer succeeded.
+                handle.transfer_leader(group, plan[&group])?.await?;
+                transferred.insert(group, Instant::now());
             }
             if status.leader == plan[&group]
                 && status.committed > 0
@@ -150,7 +158,7 @@ fn main() -> Result<()> {
                 stopped.context(format!("bootstrap failed: {error:#}"))?;
                 return Err(error);
             }
-            // The bootstrap future is gone. Nothing campaigns or enforces the
+            // The bootstrap future is gone. Nothing campaigns, transfers or enforces the
             // plan during the workload; ordinary Raft elections remain enabled.
             tokio::select! {
                 result=signal()=>result.and(service.shutdown().await),

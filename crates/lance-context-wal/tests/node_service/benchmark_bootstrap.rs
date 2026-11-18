@@ -33,7 +33,7 @@ fn launch(
 async fn benchmark_bootstrap_fixes_placement_then_stops_campaigning() -> Result<()> {
     for (threads, chosen) in [("2", 2), ("4", 2)] {
         let f = Fixture::shared_groups(false)?;
-        let result = run(&f, threads, chosen).await;
+        let result = run(&f, threads, chosen, false).await;
         if result.is_err() {
             eprintln!("failed bootstrap fixture: {}", f.root.keep().display());
         }
@@ -42,24 +42,56 @@ async fn benchmark_bootstrap_fixes_placement_then_stops_campaigning() -> Result<
     Ok(())
 }
 
-async fn run(f: &Fixture, threads: &str, chosen: u64) -> Result<()> {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn benchmark_bootstrap_transfers_to_a_late_preferred_node() -> Result<()> {
+    for threads in ["2", "4"] {
+        let f = Fixture::shared_groups(false)?;
+        let result = run(&f, threads, 3, true).await;
+        if result.is_err() {
+            eprintln!("failed bootstrap fixture: {}", f.root.keep().display());
+        }
+        result?;
+    }
+    Ok(())
+}
+
+async fn run(f: &Fixture, threads: &str, chosen: u64, late: bool) -> Result<()> {
     fs::write(
         f.root.path().join("leaders.json"),
         serde_json::to_vec(&BTreeMap::from([(5, chosen), (10, chosen), (11, chosen)]))?,
     )?;
-    let mut children = BTreeMap::from([(chosen, launch(f, chosen, 1, threads, "30000")?)]);
-    // Start the intended leader first; followers use the same real Service/TLS
-    // transport. No manually relayed packets or altered Raft timeouts.
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while f.status(chosen).await.is_err() {
-            children.get_mut(&chosen).unwrap().assert_live()?;
-            tokio::time::sleep(Duration::from_millis(20)).await;
+    let mut children = BTreeMap::new();
+    if late {
+        for node in [1, 2, 3].into_iter().filter(|&node| node != chosen) {
+            children.insert(node, launch(f, node, 1, threads, "30000")?);
         }
-        Ok::<_, anyhow::Error>(())
-    })
-    .await??;
-    for node in [1, 2, 3].into_iter().filter(|&node| node != chosen) {
-        children.insert(node, launch(f, node, 1, threads, "30000")?);
+        for group in [5, 10, 11] {
+            ensure!(leader(f, group).await? != chosen);
+        }
+        // Let at least one attempted transfer time out before the target starts.
+        // The existing leaders must keep serving Raft instead of exiting on the
+        // first different leader observation, as the original launcher did.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        for (&node, child) in &mut children {
+            child.assert_live()?;
+            ensure!(!f.root.path().join(format!("ready-{node}.json")).exists());
+        }
+        children.insert(chosen, launch(f, chosen, 1, threads, "30000")?);
+    } else {
+        children.insert(chosen, launch(f, chosen, 1, threads, "30000")?);
+        // Start the intended leader first; followers use the same real Service/TLS
+        // transport. No manually relayed packets or altered Raft timeouts.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while f.status(chosen).await.is_err() {
+                children.get_mut(&chosen).unwrap().assert_live()?;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+        for node in [1, 2, 3].into_iter().filter(|&node| node != chosen) {
+            children.insert(node, launch(f, node, 1, threads, "30000")?);
+        }
     }
     let receipts = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
@@ -96,7 +128,7 @@ async fn run(f: &Fixture, threads: &str, chosen: u64) -> Result<()> {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let mut changed = true;
-            for node in [1, 3] {
+            for node in [1, 2, 3].into_iter().filter(|&node| node != chosen) {
                 children.get_mut(&node).unwrap().assert_live()?;
                 let status = f.status(node).await?;
                 for group in [5, 10, 11] {
@@ -119,12 +151,12 @@ async fn run(f: &Fixture, threads: &str, chosen: u64) -> Result<()> {
     // A restart uses the production node, never this fresh-store launcher.
     // Retain the original receipt elsewhere so the directory check is exercised.
     fs::rename(
-        f.root.path().join("ready-2.json"),
-        f.root.path().join("original-ready-2.json"),
+        f.root.path().join(format!("ready-{chosen}.json")),
+        f.root.path().join(format!("original-ready-{chosen}.json")),
     )?;
     let mut refused = launch(f, chosen, 2, threads, "30000")?;
     expect_failure(&mut refused, "fresh WAL directory").await?;
-    assert!(!f.root.path().join("ready-2.json").exists());
+    assert!(!f.root.path().join(format!("ready-{chosen}.json")).exists());
     Ok(())
 }
 
@@ -158,7 +190,7 @@ async fn benchmark_bootstrap_without_quorum_exits_without_readiness() -> Result<
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn benchmark_bootstrap_rejects_an_existing_different_leader() -> Result<()> {
+async fn benchmark_bootstrap_cannot_move_a_nonparticipating_leader() -> Result<()> {
     let f = Fixture::shared_groups(false)?;
     let result = async {
         let mut first = f.spawn(1, 1)?;
@@ -170,8 +202,8 @@ async fn benchmark_bootstrap_rejects_an_existing_different_leader() -> Result<()
             f.root.path().join("leaders.json"),
             br#"{"5":3,"10":3,"11":3}"#,
         )?;
-        let mut unexpected = launch(&f, 3, 1, "2", "30000")?;
-        expect_failure(&mut unexpected, "bootstrap leader mismatch").await?;
+        let mut unexpected = launch(&f, 3, 1, "2", "1500")?;
+        expect_failure(&mut unexpected, "bootstrap deadline exceeded").await?;
         ensure!(!f.root.path().join("ready-3.json").exists());
         first.terminate().await?;
         second.terminate().await?;
