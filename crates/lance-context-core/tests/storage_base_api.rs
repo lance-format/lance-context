@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow_array::{LargeBinaryArray, RecordBatch, StringArray};
@@ -22,6 +23,30 @@ fn options() -> StorageBaseOptions {
     let mut options = StorageBaseOptions::new(schema(), "entry_key");
     options.shard_id = Some("writer".to_string());
     options
+}
+
+async fn open_reader(uri: &str, options: StorageBaseOptions) -> StorageBase {
+    let dataset = StorageBase::load_with_options(uri, None, None)
+        .await
+        .unwrap();
+    StorageBase::from_dataset_for_read(dataset, options).unwrap()
+}
+
+fn checkpoint_files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    let mut files = BTreeMap::new();
+    for entry in std::fs::read_dir(root).unwrap() {
+        let path = entry.unwrap().path();
+        // Reader coordination is allowed; checkpoint data and metadata must stay unchanged.
+        if path.file_name().unwrap() == "_wal_readers_v1" {
+            continue;
+        }
+        if path.is_dir() {
+            files.extend(checkpoint_files(&path));
+        } else {
+            files.insert(path.clone(), std::fs::read(path).unwrap());
+        }
+    }
+    files
 }
 
 async fn read_batches(
@@ -92,9 +117,7 @@ async fn external_store_reads_custom_keys_and_binary_columns_across_wal_merge_an
     let mut options = options();
     let mut writer = StorageBase::open(uri, options.clone(), true).await.unwrap();
     options.shard_id = Some("reader".to_string());
-    let mut reader = StorageBase::open(uri, options.clone(), false)
-        .await
-        .unwrap();
+    let mut reader = open_reader(uri, options.clone()).await;
 
     // Warm a reader before another writer publishes to its WAL.
     assert!(read_batches(&reader, None, None).await.is_empty());
@@ -140,7 +163,7 @@ async fn external_store_reads_custom_keys_and_binary_columns_across_wal_merge_an
 
     writer.close().await.unwrap();
     reader.close().await.unwrap();
-    let mut reopened = StorageBase::open(uri, options, false).await.unwrap();
+    let mut reopened = open_reader(uri, options).await;
     assert_eq!(
         payloads(&read_batches(&reopened, None, None).await),
         expected
@@ -156,7 +179,7 @@ async fn deferred_writes_become_readable_after_explicit_publication() {
     options.seal_on_put = false;
     let mut writer = StorageBase::open(uri, options.clone(), true).await.unwrap();
     options.shard_id = Some("reader".to_string());
-    let mut reader = StorageBase::open(uri, options, false).await.unwrap();
+    let mut reader = open_reader(uri, options).await;
 
     assert_eq!(
         writer.flush_with_outcome().await.unwrap(),
@@ -180,4 +203,62 @@ async fn deferred_writes_become_readable_after_explicit_publication() {
     );
     writer.close().await.unwrap();
     reader.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn read_open_leaves_checkpoint_unchanged_and_writer_open_still_initializes_wal() {
+    let directory = TempDir::new().unwrap();
+    let uri = directory.path().to_str().unwrap();
+    let dataset = StorageBase::create_with_options(uri, schema(), None, None)
+        .await
+        .unwrap();
+    let before = checkpoint_files(directory.path());
+    let mut reader = StorageBase::from_dataset_for_read(dataset, options()).unwrap();
+    assert!(read_batches(&reader, None, None).await.is_empty());
+    reader.close().await.unwrap();
+    assert_eq!(checkpoint_files(directory.path()), before);
+
+    let dataset = StorageBase::load_with_options(uri, None, None)
+        .await
+        .unwrap();
+    let mut writer = StorageBase::from_dataset(dataset, options()).await.unwrap();
+    assert_ne!(checkpoint_files(directory.path()), before);
+    writer
+        .put(vec![batch("new", "selected", b"value")])
+        .await
+        .unwrap();
+    assert_eq!(
+        payloads(&read_batches(&open_reader(uri, options()).await, None, None).await),
+        BTreeMap::from([("new".to_string(), b"value".to_vec())])
+    );
+    writer.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn read_open_preserves_reader_registration_and_fails_closed() {
+    let directory = TempDir::new().unwrap();
+    let uri = directory.path().to_str().unwrap();
+    let dataset = StorageBase::create_with_options(uri, schema(), None, None)
+        .await
+        .unwrap();
+    let reader = StorageBase::from_dataset_for_read(dataset, options()).unwrap();
+    let registrations = directory.path().join("_wal_readers_v1");
+    reader
+        .read_consistent(ListSource::All, |_, _| async {
+            assert!(std::fs::read_dir(&registrations).unwrap().next().is_some());
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let blocked = directory.path().join("blocked");
+    let dataset = StorageBase::create_with_options(blocked.to_str().unwrap(), schema(), None, None)
+        .await
+        .unwrap();
+    std::fs::write(blocked.join("_wal_readers_v1"), b"not a directory").unwrap();
+    let reader = StorageBase::from_dataset_for_read(dataset, options()).unwrap();
+    assert!(reader
+        .read_consistent(ListSource::All, |_, _| async { Ok(()) })
+        .await
+        .is_err());
 }

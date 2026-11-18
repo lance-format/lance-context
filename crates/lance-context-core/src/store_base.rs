@@ -705,6 +705,69 @@ impl StorageBase {
         Ok(base)
     }
 
+    /// Wrap an existing dataset without initializing WAL metadata or opening a writer.
+    /// Reads still publish reader registrations to protect captured WAL files.
+    /// Use [`Self::from_dataset`] to prepare a store for writing.
+    pub fn from_dataset_for_read(
+        dataset: Dataset,
+        options: StorageBaseOptions,
+    ) -> LanceResult<Self> {
+        let StorageBaseOptions {
+            storage_options,
+            shard_id,
+            merge_after_generations,
+            merge_max_generations,
+            merge_max_bytes,
+            key_index_type,
+            pending_generations_warn,
+            pending_generations_max,
+            merge_budget,
+            session,
+            schema,
+            key_column,
+            latest_schema,
+            seal_on_put,
+        } = options;
+
+        if schema.field_with_name(&key_column).is_err() {
+            return Err(ArrowError::SchemaError(format!(
+                "key column '{key_column}' is not present in the store schema"
+            ))
+            .into());
+        }
+
+        let base = Self {
+            dataset,
+            write_shard: derive_shard_id(shard_id.as_deref()),
+            storage_options,
+            session,
+            key_column,
+            latest_schema,
+            seal_on_put,
+            merge_after_generations: merge_after_generations.unwrap_or(0),
+            merge_max_generations: merge_max_generations.unwrap_or(DEFAULT_MERGE_MAX_GENERATIONS),
+            merge_max_bytes: merge_max_bytes.unwrap_or(DEFAULT_MERGE_MAX_BYTES),
+            key_index_type,
+            pending_generations_warn: pending_generations_warn
+                .unwrap_or(DEFAULT_PENDING_GENERATIONS_WARN),
+            pending_generations_max: pending_generations_max
+                .unwrap_or(DEFAULT_PENDING_GENERATIONS_MAX),
+            merge_budget,
+            wal_read_protection: true,
+            wal_collection: crate::wal_gc::Mode::configured()?,
+            #[cfg(test)]
+            wal_snapshot_pause: std::sync::Mutex::new(None),
+            merge_preparation_gate: Arc::new(tokio::sync::Mutex::new(())),
+            last_compaction: None,
+            total_compactions: 0,
+            last_compaction_error: None,
+            pinned_version: None,
+            deleted: false,
+            write_writer: tokio::sync::Mutex::new(None),
+        };
+        Ok(base)
+    }
+
     /// URI of the underlying Lance dataset.
     #[must_use]
     pub fn uri(&self) -> &str {

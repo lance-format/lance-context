@@ -23,6 +23,12 @@ opening many stores. The options default to `seal_on_put = true`: a successful
 nonempty `put` durably writes and publishes its rows before returning. Setting
 this to `false` defers visibility until an explicit or background flush.
 
+For inspection, load an existing dataset with `StorageBase::load_with_options`
+and wrap it with `from_dataset_for_read` to avoid initializing WAL metadata or
+opening a writer. Consistent reads still create, renew and delete temporary
+reader registrations under `_wal_readers_v1`; credentials need access to those
+coordination writes as well as data reads.
+
 Read through `read_consistent(ListSource::All, ...)`, building the scan with
 `lsm_scanner_for_dataset` from the dataset and shard snapshots passed into the
 callback. Complete the read inside the callback: await `try_collect` or fully
