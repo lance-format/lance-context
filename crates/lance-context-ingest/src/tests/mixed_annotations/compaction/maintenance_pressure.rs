@@ -43,6 +43,16 @@ async fn exercise(body_pause: bool, restart: bool) -> Result<()> {
     assert!(pending.plan.is_maintenance());
     assert!(before.progress.prepared.is_none());
     let cut = before.progress.checkpoint[&10];
+    // The real blocked native write belongs to preparation. Earlier maintenance
+    // turns may have completed, but this preparation has not reached publication.
+    let phases = a.phase_observation();
+    let phase = |name| phases.iter().find(|p| p.phase == name).unwrap();
+    assert!(phase("annotation_maintenance_select").completed > 0);
+    let preparation = phase("annotation_maintenance_prepare");
+    assert!(preparation.started > preparation.completed + preparation.cancelled);
+    let publication = phase("annotation_maintenance_publish");
+    assert_eq!(preparation.started, publication.started + 1);
+    assert_eq!(publication.started, publication.completed);
 
     // Four actual mixed WAL frames fit the original fixture's source bound.
     // Each successful return must be visible while maintenance still owns its
