@@ -189,6 +189,11 @@ pub struct MasterConfig {
     #[arg(long, env = "WORKER_ENDPOINTS", value_delimiter = ',')]
     pub worker_endpoints: Vec<String>,
 
+    /// Deadline for synchronous registered-table publication, including all workers.
+    /// Keep this below the caller's HTTP timeout. Publication does not enqueue a merge.
+    #[arg(long, env = "TABLE_FLUSH_TIMEOUT_SECS", default_value_t = 20, value_parser = clap::value_parser!(u64).range(1..))]
+    pub table_flush_timeout_secs: u64,
+
     /// Maximum number of scheduler tasks executing concurrently. Compaction of
     /// the *same* experiment is always serialized regardless of this value
     /// (two `Rewrite`s on one dataset conflict); this only bounds how many

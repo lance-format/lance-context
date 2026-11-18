@@ -6824,6 +6824,7 @@ pub(crate) mod tests {
             merge_wal_min_generations: 8,
             merge_wal_admission_targets: vec![],
             worker_endpoints: vec![],
+            table_flush_timeout_secs: 20,
             task_concurrency: 4,
             merge_wal_concurrency: 4,
             legacy_merge_wait_concurrency: 32,
