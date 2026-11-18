@@ -384,3 +384,6 @@ async fn run_cluster(f: &mut Fixture) -> Result<()> {
 
 #[path = "node_service/shared_groups.rs"]
 mod shared_groups;
+
+#[path = "node_service/live_quorum.rs"]
+mod live_quorum;
