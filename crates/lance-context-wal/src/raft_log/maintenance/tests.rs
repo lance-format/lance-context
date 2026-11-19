@@ -3,6 +3,7 @@ use std::{fs, path::PathBuf};
 
 mod append_admission;
 mod bounded_pass;
+mod byte_garbage_probe;
 mod pressure;
 mod pressure_admission;
 mod retained_tail;
