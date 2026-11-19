@@ -283,6 +283,11 @@ jobs:
       - name: Materializer worker feature checks
         if: matrix.suite == 'http'
         run: cargo clippy -p lance-context-ingest --features worker --all-targets -- -D warnings
+      - name: Build isolated commit permit regressions
+        if: matrix.suite == 'coordination'
+        # The harness caps its build at ten minutes. The old serial job warmed
+        # these dependencies first; explicitly build them on this fresh runner.
+        run: cargo test --locked -p lance-context-merge --test private_permit_rpc --no-run
       - name: Start etcd for HA scheduler test
         # Each matrix job has its own runner and etcd. In particular, compaction
         # cannot invalidate watches or global RPC counts in the other suites.
