@@ -45,6 +45,10 @@ struct Process {
     flags: u64,
     start_ticks: u64,
     cpu_ticks: u64,
+    user_ticks: u64,
+    system_ticks: u64,
+    minor_faults: u64,
+    major_faults: u64,
     rss_bytes: u64,
 }
 impl Process {
@@ -62,14 +66,20 @@ fn stat(text: &str, page_bytes: u64) -> Result<Process> {
     let (_, rest) = text.rsplit_once(") ").context("invalid process stat")?;
     let fields: Vec<_> = rest.split_whitespace().collect();
     ensure!(fields.len() >= 22, "truncated process stat");
+    let user_ticks: u64 = fields[11].parse()?;
+    let system_ticks: u64 = fields[12].parse()?;
     Ok(Process {
         state: fields[0].chars().next().context("empty process state")?,
         flags: fields[6].parse()?,
         start_ticks: fields[19].parse()?,
-        cpu_ticks: fields[11]
-            .parse::<u64>()?
-            .checked_add(fields[12].parse()?)
+        cpu_ticks: user_ticks
+            .checked_add(system_ticks)
             .context("CPU count overflow")?,
+        user_ticks,
+        system_ticks,
+        // Fields 10 and 12 exclude the adjacent waited-for child counters.
+        minor_faults: fields[7].parse()?,
+        major_faults: fields[9].parse()?,
         rss_bytes: fields[21]
             .parse::<u64>()?
             .checked_mul(page_bytes)
@@ -374,15 +384,15 @@ mod tests {
     }
     #[test]
     fn process_stat_handles_spaces_and_parentheses_and_rejects_truncation() -> Result<()> {
-        let text = format!(
-            "42 (worker ) x) S {} 11 12 0 0 0 0 0 0 99 1024 7",
-            ["0"; 10].join(" ")
-        );
-        let p = stat(&text, 4096)?;
+        let text =
+            "42 (worker ) x) S 1 2 3 4 5 0 101 202 303 404 11 12 13 14 15 16 17 18 99 1024 7";
+        let p = stat(text, 4096)?;
         assert_eq!(
             (p.start_ticks, p.cpu_ticks, p.rss_bytes),
             (99, 23, 7 * 4096)
         );
+        assert_eq!((p.user_ticks, p.system_ticks), (11, 12));
+        assert_eq!((p.minor_faults, p.major_faults), (101, 303));
         assert!(stat("42 (truncated) S 1", 4096).is_err());
         assert_eq!(
             counters("read_bytes: 4\nwrite_bytes: 8\n")?["write_bytes"],
@@ -390,6 +400,45 @@ mod tests {
         );
         assert!(counters("bad counter fields").is_err());
         Ok(())
+    }
+
+    #[test]
+    fn anonymous_page_touches_increase_recorded_minor_faults() -> Result<()> {
+        let page_bytes = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        ensure!(page_bytes > 0);
+        let length = page_bytes as usize * 512;
+        // A fresh mapping avoids depending on allocator reuse. Disable huge
+        // pages so each first write faults a separate base page.
+        let mapping = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                length,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        ensure!(mapping != libc::MAP_FAILED);
+        let result = (|| -> Result<()> {
+            ensure!(unsafe { libc::madvise(mapping, length, libc::MADV_NOHUGEPAGE) } == 0);
+            let read = || stat(&fs::read_to_string("/proc/self/stat")?, page_bytes as u64);
+            let before = read()?;
+            for offset in (0..length).step_by(page_bytes as usize) {
+                // Every address lies in the writable mapping above.
+                unsafe { mapping.cast::<u8>().add(offset).write_volatile(1) };
+            }
+            let after = read()?;
+            assert_eq!(after.start_ticks, before.start_ticks);
+            assert!(after.minor_faults >= before.minor_faults + 512);
+            assert!(after.major_faults >= before.major_faults);
+            assert!(after.user_ticks >= before.user_ticks);
+            assert!(after.system_ticks >= before.system_ticks);
+            Ok(())
+        })();
+        let unmapped = unsafe { libc::munmap(mapping, length) };
+        ensure!(unmapped == 0);
+        result
     }
     #[test]
     fn directory_accounting_does_not_follow_links_or_hide_nested_data() -> Result<()> {

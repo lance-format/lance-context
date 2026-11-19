@@ -55,6 +55,13 @@ fn sample_process(tcp: bool) -> Result<()> {
         assert_eq!(sample["kind"], "resource_sample");
         assert_eq!(sample["pid"], target.0.id());
         assert!(sample["cgroup_memory_bytes"].as_u64().unwrap() > 0);
+        let process = &sample["process"];
+        assert_eq!(
+            process["cpu_ticks"].as_u64().unwrap(),
+            process["user_ticks"].as_u64().unwrap() + process["system_ticks"].as_u64().unwrap()
+        );
+        assert!(process["minor_faults"].as_u64().is_some());
+        assert!(process["major_faults"].as_u64().is_some());
         if tcp {
             assert_eq!(sample["tcp"]["port"], 7800);
             assert_eq!(sample["tcp"]["owned_tcp_sockets"], 0);
@@ -64,6 +71,13 @@ fn sample_process(tcp: bool) -> Result<()> {
             assert_eq!(threads[0]["tid"], target.0.id());
             assert_eq!(threads[0]["name"], "sleep");
             assert_eq!(threads[0]["start_ticks"], sample["start_ticks"]);
+            assert!(threads[0]["minor_faults"].as_u64().is_some());
+            assert!(threads[0]["major_faults"].as_u64().is_some());
+            assert_eq!(
+                threads[0]["cpu_ticks"].as_u64().unwrap(),
+                threads[0]["user_ticks"].as_u64().unwrap()
+                    + threads[0]["system_ticks"].as_u64().unwrap()
+            );
             assert_eq!(sample["threads"]["vanished"], 0);
         } else {
             assert!(sample["tcp"].is_null());
