@@ -247,6 +247,21 @@ where
         self.global_stats.deleted_rewrite_entries() > 0
     }
 
+    /// Apply the existing rewrite size/garbage thresholds to a conservative
+    /// live-byte allowance instead of entry counts. The caller must stabilize
+    /// the allowance against writes and other maintenance. This is only a
+    /// scheduling hint; reclamation still requires its own reservation/sync.
+    #[cfg(feature = "internals")]
+    pub fn rewrite_bytes_need_reclamation(&self, live_bytes: usize) -> bool {
+        let (first, active) = self.pipe_log.file_span(LogQueue::Rewrite);
+        let total = self.pipe_log.total_size(LogQueue::Rewrite);
+        first != active
+            && self.has_obsolete_rewrite_entries()
+            && total > self.cfg.purge_rewrite_threshold.unwrap().0 as usize
+            && (total.saturating_sub(live_bytes) as f64 / total as f64)
+                > self.cfg.purge_rewrite_garbage_ratio
+    }
+
     pub fn must_purge_all_stale(&self) {
         let _lk = self.force_rewrite_candidates.try_lock().unwrap();
         self.pipe_log.rotate(LogQueue::Rewrite).unwrap();

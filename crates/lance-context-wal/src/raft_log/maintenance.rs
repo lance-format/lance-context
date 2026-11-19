@@ -56,7 +56,7 @@ impl LogMaintenance {
             }
             Err(error) => return Err(error),
         };
-        if self.data_under_pressure() {
+        if self.data_under_pressure() || self.reclaimable_rewrite_bytes()? {
             // Native rewrite eligibility counts dead entries, not their bytes.
             // A few compacted large records can keep admission closed while
             // many tiny live metadata values suppress the normal heuristic.
@@ -67,6 +67,44 @@ impl LogMaintenance {
             self.run_pass(true)?;
         }
         Ok(groups)
+    }
+
+    fn reclaimable_rewrite_bytes(&self) -> Result<bool> {
+        if self.node.budget.get().is_none()
+            || !self
+                .node
+                .engine
+                .purge_manager()
+                .has_obsolete_rewrite_entries()
+        {
+            return Ok(false);
+        }
+        // A few large expired bodies can dominate bytes while small live
+        // metadata keeps the entry-count ratio low. Reclaim that space before
+        // it closes producer admission. Stabilize the metadata-only size hint
+        // with the same lock order used when reserving a rewrite; no payload
+        // files are read here. The subsequent pass obtains its own allowance.
+        let _sync = self
+            .node
+            .sync_gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("sync gate poisoned"))?;
+        let _append = self
+            .node
+            .append_gate
+            .write()
+            .map_err(|_| anyhow::anyhow!("append gate poisoned"))?;
+        self.node.check()?;
+        let live = self
+            .node
+            .engine
+            .estimated_rewrite_queue_bytes()
+            .context("rewrite live-byte estimate overflow")?;
+        Ok(self
+            .node
+            .engine
+            .purge_manager()
+            .rewrite_bytes_need_reclamation(live))
     }
 
     fn data_under_pressure(&self) -> bool {
