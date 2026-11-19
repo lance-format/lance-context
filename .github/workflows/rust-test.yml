@@ -136,7 +136,17 @@ jobs:
         run: |
           cargo clippy -p lance-context-wal --features service --all-targets -- -D warnings
           cargo test -p lance-context-wal --features service --lib replication::runtime::tests::maintenance -- --test-threads=1
-          cargo test -p lance-context-wal --features service --test node_service
+          mkdir -p "$RUNNER_TEMP/wal-node-service-fixtures"
+          TMPDIR="$RUNNER_TEMP/wal-node-service-fixtures" cargo test -p lance-context-wal --features service --test node_service
+      - name: Retain failed WAL process fixtures
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wal-node-service-fixtures
+          path: ${{ runner.temp }}/wal-node-service-fixtures/
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
       - name: WAL resource observation in a container cgroup namespace
         run: |
           cargo test -p lance-context-wal --features runner --test resource --no-run --message-format=json > "$RUNNER_TEMP/wal-resource-build.jsonl"

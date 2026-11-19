@@ -53,23 +53,48 @@ pub(super) async fn fetch(
     index: u64,
     batch: &Batch,
 ) -> Result<()> {
-    tokio::time::timeout(Duration::from_secs(30), async {
+    let mut last_reply = String::from("no completed request");
+    let result = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
-            if let Ok(response) = f
+            match f
                 .client
                 .request(node, Request::Fetch { group, index })
                 .await
             {
-                if let Reply::Record(Some(meta)) = response.reply {
-                    assert_eq!(meta, batch.meta);
-                    assert_eq!(response.body, batch.body);
-                    return;
+                Ok(response) => {
+                    if let Reply::Record(Some(meta)) = response.reply {
+                        ensure!(
+                            meta == batch.meta,
+                            "record metadata mismatch: node={node} group={group} index={index}"
+                        );
+                        ensure!(
+                            response.body == batch.body,
+                            "record body mismatch: node={node} group={group} index={index}"
+                        );
+                        return Ok(());
+                    }
+                    last_reply = format!("{:?}", response.reply);
                 }
+                Err(error) => last_reply = format!("{error:#}"),
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
-    .await?;
+    .await;
+    match result {
+        Ok(result) => result?,
+        Err(error) => {
+            // Observe the still-running node before unwinding drops the child
+            // processes. Do not retry the test or extend its original deadline.
+            let status = f.status(node).await;
+            return Err(error).with_context(|| {
+                format!(
+                    "fetch timed out: node={node} group={group} index={index}; \
+                     last reply={last_reply}; status={status:?}"
+                )
+            });
+        }
+    }
     Ok(())
 }
 
